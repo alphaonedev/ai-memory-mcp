@@ -98,6 +98,7 @@ fn serialised_output_is_flat_no_substruct_keys_on_wire() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(7),
+            required_scope: None,
         },
         atomisation: ai_memory::models::AtomisationPolicy {
             auto_atomise: Some(true),

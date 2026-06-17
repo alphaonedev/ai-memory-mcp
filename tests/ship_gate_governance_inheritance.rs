@@ -107,6 +107,7 @@ fn approve_write_policy() -> GovernancePolicy {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     }
@@ -121,6 +122,7 @@ fn any_policy_no_inherit() -> GovernancePolicy {
             approver: ApproverType::Human,
             inherit: false,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     }

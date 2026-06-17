@@ -1802,6 +1802,7 @@ mod tests {
                 approver: ApproverType::Consensus(0),
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -1819,6 +1820,7 @@ mod tests {
                 approver: ApproverType::Agent("has space".to_string()),
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -1832,6 +1834,7 @@ mod tests {
                 approver: ApproverType::Agent("alice".to_string()),
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -2226,6 +2229,7 @@ mod tests {
                 approver: ApproverType::Consensus(0),
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };

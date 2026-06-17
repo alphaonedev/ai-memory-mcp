@@ -490,6 +490,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             atomisation: AtomisationPolicy {
                 auto_atomise: Some(true),

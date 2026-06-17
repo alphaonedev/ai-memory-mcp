@@ -20,6 +20,15 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1720 C — per-namespace `required_scope` (refuse-only) governance knob, both adapters + SDK parity.**
+  A new `CorePolicy.required_scope: Option<MemoryScope>` knob (rides in the existing
+  `metadata.governance` blob; no schema migration). When a namespace standard pins it, a
+  `Store` whose effective scope (`metadata.scope`; absent ⇒ `private`) does not match is
+  REFUSED at the CorePolicy governance gate — fail-closed, refuse-only (the gate never
+  coerces the write). Enforced on BOTH backends (sqlite `storage::enforce_governance` +
+  postgres `PostgresStore::enforce_governance_action`), honoring the existing
+  Advisory(warn-only)/Enforce(block) `permissions.mode` handling. Python SDK
+  `GovernancePolicy` gains `required_scope: str | None`.
 - **§22 Policy-Engine V08-PE-5 — `Decision::Escalate` governance verdict primitive**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
   epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).
