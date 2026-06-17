@@ -751,8 +751,7 @@ async fn via_store_dispatcher_rejects_non_postgres_store() {
     }
     // Build a non-postgres trait object (the sqlite adapter) and confirm
     // the dispatcher refuses it rather than panicking on the downcast.
-    let tmp = std::env::temp_dir(); // unused; sqlite store uses an in-proc path
-    let _ = tmp;
+    // (No scratch dir needed — the sqlite store below uses an in-proc path.)
     // A fresh in-memory-equivalent sqlite store is the cheapest non-pg
     // MemoryStore. If construction is unavailable in this build, the
     // BackendUnavailable arm is still covered by the production handler

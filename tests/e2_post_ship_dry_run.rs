@@ -55,7 +55,13 @@ fn build_verifier_once() -> PathBuf {
         manifest_path.display()
     );
 
-    let target_dir = std::env::temp_dir().join(format!(
+    // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    let scratch_root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("e2-post-ship-dry-run");
+    std::fs::create_dir_all(&scratch_root).ok();
+    let target_dir = scratch_root.join(format!(
         "ai-memory-post-ship-converge-target-{}",
         std::process::id()
     ));

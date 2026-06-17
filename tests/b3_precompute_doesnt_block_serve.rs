@@ -42,6 +42,16 @@ use std::time::{Duration, Instant};
 mod common;
 use common::free_port;
 
+/// #1721 — project-local scratch DB path (no /tmp writes; CLAUDE.md hard rule).
+fn scratch_db(infix: &str) -> std::path::PathBuf {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("b3-precompute-doesnt-block-serve");
+    std::fs::create_dir_all(&root).ok();
+    root.join(format!("{infix}-{}.db", uuid::Uuid::new_v4()))
+}
+
 /// Poll `GET /api/v1/health` until it returns `200` or `budget`
 /// elapses. Returns `Some(elapsed)` on success, `None` on timeout.
 fn wait_for_health_within(port: u16, budget: Duration) -> Option<Duration> {
@@ -71,11 +81,7 @@ fn wait_for_health_within(port: u16, budget: Duration) -> Option<Duration> {
 
 #[test]
 fn b3_precompute_does_not_block_serve_health() {
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-b3-precompute-block-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = scratch_db("ai-memory-b3-precompute-block");
     let port = free_port();
 
     // `AI_MEMORY_NO_CONFIG=1` mirrors the project's standard test env
