@@ -164,6 +164,11 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,
         ("DELETE", p) if namespace_standard_delete_path(p) => true,
+        // #1655 — path-form GET /api/v1/namespaces/{ns}/standard is now
+        // SAL-backed (delegates to get_namespace_standard_qs → the postgres
+        // `get_namespace_standard` arm), so it no longer 501s on postgres.
+        // Same path shape as the POST/DELETE arms above.
+        ("GET", p) if namespace_standard_post_path(p) => true,
         ("POST", super::routes::NAMESPACES) => true,
         ("DELETE", super::routes::NAMESPACES) => true,
         // Wave-3 Continuation 3 — lifecycle write paths (Phase 13/14/16/17/18/19).
@@ -899,6 +904,26 @@ mod transport_postgres_gate_tests {
         assert!(postgres_endpoint_supported(
             &Method::POST,
             crate::handlers::routes::MEMORY_RECALL_OBSERVATIONS
+        ));
+    }
+
+    #[test]
+    fn postgres_gate_passes_namespace_standard_path_form_1655() {
+        // #1655 — the path-form GET /api/v1/namespaces/{ns}/standard now
+        // delegates to the SAL-backed qs handler, so the gate must pass it
+        // on postgres (pre-#1655 it fell through to the 501 default). POST /
+        // DELETE on the same path shape were already supported.
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            "/api/v1/namespaces/team-eng/standard"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/namespaces/team-eng/standard"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::DELETE,
+            "/api/v1/namespaces/team-eng/standard"
         ));
     }
 
