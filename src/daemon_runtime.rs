@@ -384,6 +384,13 @@ pub enum Command {
     /// JSONL audit log). Exit 0 if the chain holds; 1 on chain
     /// break.
     VerifySignedEventsChain(VerifySignedEventsChainArgs),
+    /// v0.8.0 §22 Policy-Engine PE-8 (#697 / EPIC #1709) — verify the
+    /// append-only `signed_events` V-4 cross-row hash chain end-to-end
+    /// and surface any gaps for operator review. `--since <RFC3339>`
+    /// scopes by timestamp (chain still verified across the boundary);
+    /// `--json` emits the structured report. Exit 0 if intact + no
+    /// gaps, 1 on any break/gap.
+    VerifyAuditTrail(crate::cli::verify_audit_trail::VerifyAuditTrailArgs),
     /// v0.7.0 L2-5 (issue #670) — export a procurement-grade forensic
     /// evidence bundle (signed tarball) for a memory and its
     /// reflection chain. The OSS surface for the `AgenticMem Attest`
@@ -1510,6 +1517,17 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             match cli::verify_signed_events::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::VerifyAuditTrail(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::verify_audit_trail::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
