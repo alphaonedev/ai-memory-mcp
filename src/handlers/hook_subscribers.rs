@@ -394,6 +394,7 @@ async fn set_namespace_standard_inner(
                     confidence_signals: None,
                     confidence_decayed_at: None,
                     version: 1,
+                    lifecycle_state: crate::models::LifecycleState::Open,
                 };
                 match app.store.store(&ctx, &placeholder).await {
                     Ok(id) => id,
@@ -688,6 +689,7 @@ async fn set_namespace_standard_inner(
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             match db::insert(&lock.0, &placeholder) {
                 Ok(id) => id,

@@ -970,6 +970,29 @@ pub fn validate_kind(kind: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// v0.8.0 Pillar 2 (#1709) — validate an optional caller-supplied
+/// `lifecycle_state` wire value. An explicit, non-parseable value is
+/// REJECTED naming the valid set (mirrors [`validate_kind`]); `None`
+/// (omitted) is the default-`open` case and passes.
+///
+/// # Errors
+///
+/// Returns an error when `state` is `Some` and not one of the
+/// [`crate::models::LifecycleState`] wire strings.
+pub fn validate_lifecycle_state(state: Option<&str>) -> Result<()> {
+    if let Some(s) = state
+        && crate::models::LifecycleState::from_str(s).is_none()
+    {
+        let expected = crate::models::LifecycleState::all()
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("invalid lifecycle_state '{s}' (expected one of: {expected})");
+    }
+    Ok(())
+}
+
 /// Validate a full Memory (used for import).
 pub fn validate_memory(mem: &Memory) -> Result<()> {
     validate_id(&mem.id)?;

@@ -158,6 +158,8 @@ pub const IS_REFLECTION: &str = "is_reflection";
 pub const KEY_SOURCE: &str = "key_source";
 /// `last_accessed_at` — wire/row field name.
 pub const LAST_ACCESSED_AT: &str = "last_accessed_at";
+/// `lifecycle_state` — wire/row field name (v0.8.0 Pillar 2 #1709, schema v64).
+pub const LIFECYCLE_STATE: &str = "lifecycle_state";
 /// `last_seen_at` — wire/row field name.
 pub const LAST_SEEN_AT: &str = "last_seen_at";
 /// `latency_ms` — wire/row field name.

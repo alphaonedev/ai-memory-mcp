@@ -794,6 +794,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).expect("db::insert standard");
         db::set_namespace_standard(&conn, namespace, &id, None).expect("set_namespace_standard");

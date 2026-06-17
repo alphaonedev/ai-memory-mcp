@@ -649,6 +649,7 @@ fn synth_memory(namespace: &str, i: usize, prefix: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     }
 }
 

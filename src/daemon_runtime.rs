@@ -6392,6 +6392,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -6444,6 +6445,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             let id = db::insert(&conn, &mem).unwrap();
             let mut v = [0.0_f32; 3];
@@ -6530,6 +6532,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -7692,6 +7695,7 @@ decision = "allow"
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let inserted_id = db::insert(&conn, &mem).unwrap();
         // Write a real-length embedding (384 dims of f32).

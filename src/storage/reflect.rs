@@ -521,6 +521,7 @@ pub fn reflect_with_hooks(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // Atomic boundary: insert the reflection row + N `reflects_on`

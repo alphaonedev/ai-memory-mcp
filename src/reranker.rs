@@ -1888,6 +1888,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -2571,6 +2572,7 @@ mod tests {
                     confidence_signals: None,
                     confidence_decayed_at: None,
                     version: 1,
+                    lifecycle_state: crate::models::LifecycleState::Open,
                 },
                 0.6,
             ),
@@ -2602,6 +2604,7 @@ mod tests {
                     confidence_signals: None,
                     confidence_decayed_at: None,
                     version: 1,
+                    lifecycle_state: crate::models::LifecycleState::Open,
                 },
                 0.4,
             ),
@@ -2957,6 +2960,7 @@ mod mock_tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 63).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 64).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -37,6 +37,11 @@ pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
 /// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
 /// #1558 wave 4).
 const PRAGMA_TABLE_INFO_MEMORIES: &str = "PRAGMA table_info(memories)";
+
+/// Column-existence probe for the `archived_memories` table — one
+/// spelling shared by the v49 / v63 / v64 archive-mirror migration
+/// arms (pm-v3.1 hardcoded-literal gate).
+const PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES: &str = "PRAGMA table_info(archived_memories)";
 
 /// Tracing target for the sqlite migration ladder (the
 /// `store::postgres` `TRACE_TARGET` precedent — one named const, no
@@ -149,7 +154,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- CONFLICT envelope when the stored value has drifted from the
     -- caller's expected. Legacy rows land at `version = 1` via the
     -- SQL DEFAULT clause; subsequent updates bump monotonically.
-    version               BIGINT NOT NULL DEFAULT 1
+    version               BIGINT NOT NULL DEFAULT 1,
+    -- v0.8.0 Pillar 2 (#1709, schema v64) — typed-cognition lifecycle
+    -- state. `open` for every legacy row (SQL DEFAULT) and every fresh
+    -- store that omits the field. Transitions
+    -- (open → active → blocked/done/abandoned) are enforced at the
+    -- write boundary by `models::LifecycleState::can_transition_to`,
+    -- not a SQL CHECK, so a future state needs no migration. Mirrors
+    -- `models::Memory::lifecycle_state`.
+    lifecycle_state       TEXT NOT NULL DEFAULT 'open'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -621,7 +634,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 63;
+const CURRENT_SCHEMA_VERSION: i64 = 64;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2302,7 +2315,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // the v4 arm on the next replay, or by the operator's
             // baseline schema if they're using SCHEMA directly.
             let existing: std::collections::HashSet<String> = conn
-                .prepare("PRAGMA table_info(archived_memories)")?
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
                 .query_map([], |r| r.get::<_, String>(1))?
                 .collect::<rusqlite::Result<_>>()?;
             if existing.is_empty() {
@@ -2506,7 +2519,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // ladders (fresh v0 replay or any v4+ deployment) always
             // have the table.
             let has_archive_table: bool = conn
-                .prepare("PRAGMA table_info(archived_memories)")?
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
                 .query_map([], |r| r.get::<_, String>(1))?
                 .next()
                 .is_some();
@@ -2672,6 +2685,45 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                          DROP TRIGGER IF EXISTS memory_links_ck_relation_upd;",
                     )?;
                 }
+            }
+        }
+
+        if version < 64 {
+            // v0.8.0 Pillar 2 (#1709) — typed-cognition `lifecycle_state`
+            // column on `memories` (and the `archived_memories` mirror so
+            // archive → restore is lossless for the full v0.8.0 shape).
+            // Additive `TEXT NOT NULL DEFAULT 'open'`; SQLite has no
+            // `ADD COLUMN IF NOT EXISTS`, so each ALTER is gated by a
+            // column-existence probe (the reflection_depth / memory_kind
+            // precedent) — fully idempotent + replay-safe.
+            let has_lifecycle_state = conn
+                .prepare("SELECT lifecycle_state FROM memories LIMIT 0")
+                .is_ok();
+            if !has_lifecycle_state {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+                    [],
+                )?;
+            }
+            // archived_memories mirror — nullable so already-archived
+            // legacy rows stay valid (the v49 lossless-archive precedent).
+            // Defensive: skip when the table doesn't exist (test fixtures
+            // that stamp a version past v4 without applying the v4 CREATE).
+            let archived_cols: std::collections::HashSet<String> = conn
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if archived_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v64: archived_memories table does not exist (test fixture or \
+                     deployment-without-archive); skipping lifecycle_state mirror"
+                );
+            } else if !archived_cols.contains(field_names::LIFECYCLE_STATE) {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN lifecycle_state TEXT",
+                    [],
+                )?;
             }
         }
 

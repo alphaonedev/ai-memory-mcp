@@ -7,7 +7,7 @@ use crate::embeddings::Embed;
 use crate::hnsw::VectorIndex;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
-use crate::models::{EditSource, Tier};
+use crate::models::{EditSource, LifecycleState, Tier};
 use crate::storage::VersionConflict;
 use crate::{db, validate};
 use schemars::JsonSchema;
@@ -70,6 +70,12 @@ pub struct UpdateRequest {
     #[schemars(description = "#906 update source_uri.")]
     #[serde(default)]
     pub source_uri: Option<String>,
+
+    #[schemars(
+        description = "#1709 Pillar-2 lifecycle transition target (open|active|blocked|done|abandoned). Illegal transitions are rejected; terminals go nowhere."
+    )]
+    #[serde(default)]
+    pub lifecycle_state: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_update`.
@@ -160,6 +166,13 @@ pub(super) fn handle_update(
     // mutation with a typed VersionConflict envelope if the stored
     // row's `version` no longer matches.
     let expected_version = params["expected_version"].as_i64();
+    // v0.8.0 Pillar 2 (#1709) — optional lifecycle transition target.
+    // An explicit, non-parseable value is REJECTED here (naming the valid
+    // set); the legality of a parseable transition (current → requested)
+    // is enforced after the in-place update lands (below).
+    let lifecycle_state_req = params["lifecycle_state"].as_str();
+    validate::validate_lifecycle_state(lifecycle_state_req).map_err(|e| e.to_string())?;
+    let requested_lifecycle = lifecycle_state_req.and_then(LifecycleState::from_str);
     // #1600 — resolve the caller agent id ONCE, up front: it feeds
     // both the omitted-`edit_source` default below and the K9 /
     // governance write gate further down.
@@ -383,6 +396,37 @@ pub(super) fn handle_update(
         return Err(crate::errors::msg::MEMORY_NOT_FOUND.into());
     }
 
+    // v0.8.0 Pillar 2 (#1709) — lifecycle transition enforcement. When the
+    // caller supplies a `lifecycle_state` that DIFFERS from the stored
+    // value, enforce `current.can_transition_to(requested)` (the typed
+    // state machine in `models::LifecycleState`). An illegal transition is
+    // rejected with a clear error; a legal one is persisted (and bumps the
+    // Gap-1 `version`). A request equal to the stored state is a no-op (no
+    // self-loop, no error). This is the consumer that makes the column
+    // load-bearing rather than inert.
+    if let Some(requested) = requested_lifecycle {
+        let current = db::get(conn, &resolved_id)
+            .map_err(|e| e.to_string())?
+            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?
+            .lifecycle_state;
+        if requested != current {
+            if !current.can_transition_to(requested) {
+                return Err(format!(
+                    "illegal lifecycle transition '{}' -> '{}' (legal: {})",
+                    current.as_str(),
+                    requested.as_str(),
+                    LifecycleState::all()
+                        .iter()
+                        .filter(|s| current.can_transition_to(**s))
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                ));
+            }
+            db::set_lifecycle_state(conn, &resolved_id, requested).map_err(|e| e.to_string())?;
+        }
+    }
+
     // Regenerate embedding when title or content changed
     if content_changed && let Some(emb) = embedder {
         let mem = db::get(conn, &resolved_id).map_err(|e| e.to_string())?;
@@ -475,6 +519,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1071,5 +1116,149 @@ mod tests {
         )
         .expect("ungoverned update should pass the gate");
         assert_eq!(out["updated"].as_bool(), Some(true));
+    }
+
+    // v0.8.0 Pillar 2 (#1709) — lifecycle transition enforcement on the
+    // `memory_update` path. A legal advance persists; an illegal one is
+    // rejected with a typed error; a no-op (same state) succeeds silently.
+
+    #[test]
+    fn lifecycle_legal_open_to_active_to_done_persists() {
+        let conn = fresh_conn();
+        let mem = make_mem("lc-legal");
+        let id = db::insert(&conn, &mem).expect("insert");
+        // Fresh row is `open`.
+        let stored = db::get(&conn, &id).unwrap().unwrap();
+        assert_eq!(stored.lifecycle_state, LifecycleState::Open);
+        // open -> active (legal).
+        let out = handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "active"}),
+            None,
+            None,
+            None,
+        )
+        .expect("open->active is legal");
+        assert_eq!(out["updated"].as_bool(), Some(true));
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Active
+        );
+        // active -> done (legal).
+        handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "done"}),
+            None,
+            None,
+            None,
+        )
+        .expect("active->done is legal");
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Done
+        );
+    }
+
+    #[test]
+    fn lifecycle_illegal_open_to_done_is_rejected() {
+        let conn = fresh_conn();
+        let mem = make_mem("lc-skip");
+        let id = db::insert(&conn, &mem).expect("insert");
+        let err = handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "done"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("illegal lifecycle transition")
+                && err.contains("open")
+                && err.contains("done"),
+            "open->done must be rejected; got: {err}"
+        );
+        // Stored state is unchanged.
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Open
+        );
+    }
+
+    #[test]
+    fn lifecycle_illegal_terminal_done_to_active_is_rejected() {
+        let conn = fresh_conn();
+        let mem = make_mem("lc-terminal");
+        let id = db::insert(&conn, &mem).expect("insert");
+        // Drive to terminal `done` via the legal path.
+        handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "active"}),
+            None,
+            None,
+            None,
+        )
+        .expect("open->active");
+        handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "done"}),
+            None,
+            None,
+            None,
+        )
+        .expect("active->done");
+        // done -> active (illegal: terminals go nowhere).
+        let err = handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "active"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("illegal lifecycle transition"),
+            "done->active must be rejected; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_unknown_value_is_rejected() {
+        let conn = fresh_conn();
+        let mem = make_mem("lc-bogus");
+        let id = db::insert(&conn, &mem).expect("insert");
+        let err = handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "frobnicated"}),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("invalid lifecycle_state"),
+            "unknown lifecycle_state must be rejected; got: {err}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_same_state_is_noop_not_error() {
+        let conn = fresh_conn();
+        let mem = make_mem("lc-noop");
+        let id = db::insert(&conn, &mem).expect("insert");
+        // open -> open is a no-op (no self-loop, but also no error).
+        let out = handle_update(
+            &conn,
+            &json!({"id": &id, "lifecycle_state": "open"}),
+            None,
+            None,
+            None,
+        )
+        .expect("open->open must be a silent no-op");
+        assert_eq!(out["updated"].as_bool(), Some(true));
+        assert_eq!(
+            db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
+            LifecycleState::Open
+        );
     }
 }

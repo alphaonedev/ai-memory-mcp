@@ -614,6 +614,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -647,6 +648,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -680,6 +682,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -713,6 +716,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut cfg = CuratorConfig {
             include_namespaces: vec!["other".to_string()],
@@ -752,6 +756,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let cfg = CuratorConfig {
             exclude_namespaces: vec!["noisy".to_string()],
@@ -812,6 +817,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1035,6 +1041,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap();
         }
@@ -1323,6 +1330,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1690,6 +1698,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let m_b = Memory {
             id: "smart-b".to_string(),
@@ -1954,6 +1963,7 @@ fn apply_rollback_handles_storage_error() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // Insert the memory so it exists
@@ -2014,6 +2024,7 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     let mem2 = Memory {
@@ -2043,6 +2054,7 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     db::insert(&conn, &mem1).unwrap();
