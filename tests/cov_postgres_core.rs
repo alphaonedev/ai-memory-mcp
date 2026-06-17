@@ -306,10 +306,15 @@ async fn list_by_namespace_prefix_groups_children() {
     // Bounded read-retry: under `--test-threads=2` against a shared
     // persistent DB the sqlx pool can momentarily lag a just-committed
     // write; the uuid-unique root means only these two children can ever
-    // match, so retry until both appear (or give up after a few tries
-    // and let the assertion fail loudly).
+    // match, so retry until both appear (or give up after the budget
+    // and let the assertion fail loudly). The budget is generous (~3s)
+    // because under `cargo llvm-cov` instrumentation every statement
+    // runs ~3-5x slower and the two concurrent test threads contend on
+    // the shared `ai:cov4` `agent_quotas` row, so the prior 5x100ms
+    // (500ms) budget under-provisioned the visibility window and the
+    // gate flaked intermittently (only on the alpha-ordered-first row).
     let mut listed = Vec::new();
-    for _ in 0..5 {
+    for _ in 0..20 {
         listed = store
             .list_by_namespace_prefix(&ctx, &root, 50)
             .await
@@ -317,7 +322,7 @@ async fn list_by_namespace_prefix_groups_children() {
         if listed.iter().any(|m| m.id == id_a) && listed.iter().any(|m| m.id == id_b) {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
     assert!(
         listed.iter().any(|m| m.id == id_a),
