@@ -145,6 +145,7 @@ fn seed_parent(conn: &rusqlite::Connection, namespace: &str) -> Result<(String, 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     };
     let id = db::insert(conn, &parent).context("insert long parent")?;
     Ok((id, body_len))
@@ -179,6 +180,7 @@ fn observe_recall(
         None,
         /* include_archived = */ false,
         /* source_uri_prefix = */ None,
+        /* caller = */ Some("ai:cookbook"),
     )
     .context("recall default")?;
     let recall_ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
@@ -203,6 +205,7 @@ fn observe_recall(
         None,
         /* include_archived = */ true,
         /* source_uri_prefix = */ None,
+        /* caller = */ Some("ai:cookbook"),
     )
     .context("recall include_archived")?;
     let parent_visible_with_flag = rows_all.iter().any(|(m, _)| m.id == parent_id);
