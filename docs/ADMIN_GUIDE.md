@@ -1023,8 +1023,8 @@ registration itself landed earlier as Task 1.3.
 1. Explicit caller value (`--agent-id`, MCP `agent_id` tool param, or
    `metadata.agent_id` embedded in an MCP store request)
 2. `AI_MEMORY_AGENT_ID` environment variable
-3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<hostname>:pid-<pid>`
-4. `host:<hostname>:pid-<pid>-<uuid8>` (stable for the process's lifetime)
+3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<hostname>` (durable, pid-free since #1720)
+4. `host:<hostname>` (durable host-scoped default, pid-free since #1720)
 5. `anonymous:pid-<pid>-<uuid8>` (only when hostname is unavailable)
 
 **HTTP daemon (request-scoped, no process-level default):**
@@ -1044,11 +1044,14 @@ through a **separate, narrower** ladder:
 1. `AI_MEMORY_AGENT_ID` environment variable (when set + shape-valid)
 2. `None` — trust-all, single-tenant read posture
 
-The pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo identity is
-**deliberately NOT** used for the read-path visibility caller: it embeds
-the live PID, so it can never equal the `metadata.agent_id` an *earlier*
-process wrote, which would make every prior-session private row invisible
-to its own owner. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
+The synthesized `ai:<client>@<hostname>` / `host:<hostname>` clientInfo /
+host identities are **deliberately NOT** used for the read-path visibility
+caller: historically (pre-#1720 B1) they embedded the live PID, so they
+could never equal the `metadata.agent_id` an *earlier* process wrote, which
+would make every prior-session private row invisible to its own owner.
+#1720 B1 makes those *write*-side stamps durable + pid-free, but this read
+ladder still resolves the caller from `AI_MEMORY_AGENT_ID` only — durable
+stamps make a future enforced-read opt-in safe, they do not flip filtering on. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
 cross-agent `scope=private` rows (rows owned by a different agent and not
 shared/targeted at the caller) before they reach the wire; collective and
 caller-owned rows always pass. When it is unset, the read path keeps the
@@ -1108,9 +1111,9 @@ These are written by the server; treat as read-only in queries:
 
 ### Operational warnings
 
-- **Default identities leak infrastructure.** When no explicit `agent_id` is
-  set, memories are stamped `host:<hostname>:pid-<pid>-<uuid8>`, exposing the
-  host's name and the running PID. For multi-tenant databases or any scenario
+- **Default identities expose the hostname.** When no explicit `agent_id` is
+  set, memories are stamped `host:<hostname>` (durable, pid-free since #1720),
+  exposing the host's name. For multi-tenant databases or any scenario
   where the DB is shared outside its origin host, require callers to set
   `AI_MEMORY_AGENT_ID` or `--agent-id` explicitly. See [#198] for tracked work
   on a config-level opt-out.

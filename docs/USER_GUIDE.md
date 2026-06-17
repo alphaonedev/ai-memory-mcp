@@ -1315,8 +1315,8 @@ The identity that ends up in `metadata.agent_id` is resolved in order:
 1. The explicit value you passed (flag, env var, MCP param, or HTTP body field)
 2. `AI_MEMORY_AGENT_ID` environment variable
 3. (MCP server only) the MCP client's `initialize.clientInfo.name` →
-   `ai:<client>@<hostname>:pid-<pid>`
-4. `host:<hostname>:pid-<pid>-<uuid8>` — a collision-free host-qualified default
+   `ai:<client>@<hostname>` (durable, pid-free since #1720)
+4. `host:<hostname>` — a durable host-qualified default (pid-free since #1720)
 5. `anonymous:pid-<pid>-<uuid8>` — last-resort fallback if hostname lookup fails
 
 For the **HTTP API**, the precedence within a single request is:
@@ -1398,11 +1398,12 @@ trust boundary, not a per-write agent signature) and this permissive default
 posture — both tracked for v0.8 hardening under
 [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464).
 
-### Default leaks hostname + PID
+### Default exposes the hostname
 
-The auto-generated `host:<hostname>:pid-<pid>-<uuid8>` default exposes your
-hostname and process id. When exporting / syncing / sharing a DB externally,
-pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that leakage. Tracking issue
+The auto-generated `host:<hostname>` default exposes your hostname (it is
+durable + pid-free since #1720; only the `anonymous:pid-…` fallback still
+carries a process id). When exporting / syncing / sharing a DB externally,
+pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that exposure. Tracking issue
 #198 covers an opt-out config flag.
 
 ## Zero Token Cost

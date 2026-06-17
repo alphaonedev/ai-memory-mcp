@@ -80,7 +80,7 @@ Three substrate behaviors give operators a defensible privacy posture without ch
 
 **Memory content is never in spans.** This is structural, not policy: the `tracing::info!` call sites never receive `content`, `title`, or `metadata` payloads. Adding a span macro that violated this would fail code review against [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) §Hard Prohibitions. Operators can audit this themselves: `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
 
-**Agent-id resolution is local.** The precedence ladder (CLI flag > env > MCP `clientInfo` > `host:<hostname>:pid-…`) is resolved entirely in-process. There is no central agent registry to consult. If the resolved id contains a hostname or PID you do not want surfaced (the default fallback `host:<hostname>:pid-…` does both), set `AI_MEMORY_AGENT_ID` to an opaque value. Tracking history: issue #198.
+**Agent-id resolution is local.** The precedence ladder (CLI flag > env > MCP `clientInfo` > `host:<hostname>`) is resolved entirely in-process. There is no central agent registry to consult. If the resolved id contains a hostname you do not want surfaced (the default fallback `host:<hostname>` is durable + pid-free since #1720, so it exposes only the hostname; only the `AI_MEMORY_ANONYMIZE=1` / hostname-unavailable `anonymous:pid-…` fallback still carries a PID), set `AI_MEMORY_AGENT_ID` to an opaque value. Tracking history: issue #198.
 
 ---
 

@@ -894,8 +894,8 @@ Every memory stamps `metadata.agent_id`. Resolution order:
 
 1. Explicit `--agent-id` CLI flag.
 2. `AI_MEMORY_AGENT_ID` env var.
-3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<host>:pid-<pid>`.
-4. `host:<hostname>:pid-<pid>-<uuid8>` (per-process stable).
+3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<host>` (durable, pid-free since #1720).
+4. `host:<hostname>` (durable host-scoped default, pid-free since #1720).
 5. `anonymous:pid-<pid>-<uuid8>` (no hostname).
 
 Validation: `^[A-Za-z0-9_\-:@./]{1,128}$`. Once stored, preserved
@@ -903,7 +903,7 @@ across update / upsert / import / sync / consolidate.
 
 For production deployments, always set `--agent-id` or
 `AI_MEMORY_AGENT_ID` to an opaque identity. The default fallback
-leaks hostname + PID.
+exposes the hostname (the `host:<hostname>` form is durable + pid-free since #1720).
 
 The ladder above is the **write-path** identity stamped into
 `metadata.agent_id`. The MCP read tools that enforce per-row
