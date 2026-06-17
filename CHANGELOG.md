@@ -193,6 +193,35 @@ lifecycle surface adds only permissive optional fields to the existing
   candle/mistralrs GPU backend remains v0.8.x-deferred per ROADMAP §11.4.C (the
   `src/inference/mod.rs::GpuBackend` phase labels are corrected here to say so —
   #1677). **No schema change. No MCP tool-count change.**
+- **#1722 — coordination-substrate `signed_events` audit observability (full Pillar-1 coverage).**
+  Every coordination state-mutation (signal send/ack, action create/transition/add_edge, lease
+  acquire/renew/release, checkpoint create/resolve, routine create/freeze/run) appends a
+  tamper-evident `coordination.<op>` row to the append-only `signed_events` V-4 chain through one
+  shared best-effort writer (`crate::coordination_audit::emit`, 13 event-type slugs SSOT). Emitted
+  AFTER the op commits (append failure WARN-logged, never fails the op); payload hash commits to
+  the op's identity; daemon-signed when an audit key is installed. Per-handler actor attribution
+  (success-arm only). Commits a6f94854, 934989ca.
+- **#1670 — `SqliteStore::capabilities()` advertises `ATOMIC_MULTI_WRITE`.** Wire-honesty fix
+  (#302 item 6 / #1052 family): the bit is genuinely held — `reflect` / `consolidate` / bulk-insert
+  run as a single `BEGIN IMMEDIATE … COMMIT` atom with ROLLBACK on mid-failure. `TRANSACTIONS`
+  stays withheld (the SAL adapter exposes no caller-facing `begin_transaction` handle). At parity
+  with `PostgresStore` on `ATOMIC_MULTI_WRITE`. Capability-bit↔runtime cross-check test. Commit 14cdd6ce.
+
+### Fixed
+
+- **#1655 — path-form `GET /api/v1/namespaces/{ns}/standard` works on postgres (was HTTP 501).**
+  The path-form handler used the sqlite-only `State<Db>` extractor + a raw rusqlite call, so the
+  postgres route-gate 501'd it even though the SAL `get_namespace_standard` was implemented. Now
+  delegates to the SAL-backed query-string handler (both backends, same response shape) + added to
+  the postgres-gate allowlist. Commit 2a1c39e2.
+- **#1713 — flaky MCP-subprocess test deadlock.** ~24 integration tests collected a spawned
+  `ai-memory mcp` child with raw unbounded `child.wait_with_output()`; under parallel load a wedged
+  child hung the whole integration binary (a 1728s hang). Routed every raw MCP spawn through the
+  existing 60s-deadline `drive_mcp_bounded` driver (kill-and-panic-on-expiry) — a silent hang
+  becomes a fast, loud failure. Commit 87c30241.
+- **#1721 — test scratch DBs moved off `/tmp` → gitignored `.local-runs/`.** Completed the
+  `std::env::temp_dir()` → project-local sweep (CLAUDE.md no-`/tmp` hard rule): 73 sites in
+  `tests/integration.rs` + ~9 across other test files, behavior-neutral. Commit 522621e8.
 
 ## [0.7.1] — 2026-06-15
 
