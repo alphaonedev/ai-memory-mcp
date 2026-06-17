@@ -117,6 +117,52 @@ impl GovernanceRefusal {
     }
 }
 
+/// #1720 C — build the per-namespace `required_scope` refusal for a
+/// `Store` when the write's effective scope does not match the policy's
+/// pinned scope. Refuse-only: this NEVER mutates the write; it only
+/// produces the typed refusal (or `None` when the scope satisfies the
+/// requirement). Shared by the sqlite (`storage::enforce_governance`) and
+/// postgres (`PostgresStore::enforce_governance_action`) Store gates so
+/// the fail-closed semantics + message cannot drift between adapters.
+///
+/// The effective scope is read from `payload["metadata"]["scope"]`
+/// (the Store call sites pass the full serialized `Memory` as the
+/// governance payload); an absent/null/unparseable value defaults to
+/// [`crate::models::MemoryScope::Private`] — matching the query-layer
+/// convention for unmarked rows.
+#[must_use]
+pub fn required_scope_refusal(
+    required: crate::models::MemoryScope,
+    payload: &serde_json::Value,
+    action: GovernedAction,
+    denied_level: GovernanceLevel,
+    agent_id: &str,
+    namespace: &str,
+) -> Option<GovernanceRefusal> {
+    let effective = payload
+        .get("metadata")
+        .and_then(|m| m.get("scope"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::models::MemoryScope::from_str)
+        .unwrap_or(crate::models::MemoryScope::Private);
+    if effective == required {
+        return None;
+    }
+    Some(
+        GovernanceRefusal::new(
+            action,
+            denied_level,
+            agent_id,
+            format!(
+                "namespace requires scope '{}' but write declared scope '{}'",
+                required.as_str(),
+                effective.as_str()
+            ),
+        )
+        .with_namespace(namespace),
+    )
+}
+
 impl std::fmt::Display for GovernanceRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Byte-identical to pre-#963 `Deny(String)` Display: routes
@@ -220,6 +266,73 @@ mod tests {
         let json = serde_json::to_string(&r).expect("ser");
         assert!(!json.contains("namespace"));
         assert!(!json.contains("owner"));
+    }
+
+    #[test]
+    fn required_scope_refusal_none_when_scope_matches() {
+        use crate::models::MemoryScope;
+        let payload = serde_json::json!({ "metadata": { "scope": "private" } });
+        let r = required_scope_refusal(
+            MemoryScope::Private,
+            &payload,
+            GovernedAction::Store,
+            GovernanceLevel::Any,
+            "ai:bob",
+            "team/prod",
+        );
+        assert!(r.is_none(), "matching scope must not refuse");
+    }
+
+    #[test]
+    fn required_scope_refusal_absent_scope_defaults_private() {
+        use crate::models::MemoryScope;
+        // No scope key ⇒ defaults to private ⇒ matches a private requirement.
+        let payload = serde_json::json!({ "metadata": {} });
+        assert!(
+            required_scope_refusal(
+                MemoryScope::Private,
+                &payload,
+                GovernedAction::Store,
+                GovernanceLevel::Any,
+                "ai:bob",
+                "team/prod",
+            )
+            .is_none()
+        );
+        // …but a collective requirement is unsatisfied by the private default.
+        let refusal = required_scope_refusal(
+            MemoryScope::Collective,
+            &payload,
+            GovernedAction::Store,
+            GovernanceLevel::Any,
+            "ai:bob",
+            "team/prod",
+        )
+        .expect("absent-scope (private) must refuse a collective requirement");
+        assert!(refusal.reason.contains("requires scope 'collective'"));
+        assert!(refusal.reason.contains("private"));
+        assert_eq!(refusal.namespace.as_deref(), Some("team/prod"));
+    }
+
+    #[test]
+    fn required_scope_refusal_refuses_mismatch() {
+        use crate::models::MemoryScope;
+        let payload = serde_json::json!({ "metadata": { "scope": "collective" } });
+        let refusal = required_scope_refusal(
+            MemoryScope::Private,
+            &payload,
+            GovernedAction::Store,
+            GovernanceLevel::Owner,
+            "ai:bob",
+            "team/prod",
+        )
+        .expect("scope mismatch must refuse");
+        assert_eq!(refusal.denied_level, GovernanceLevel::Owner);
+        assert_eq!(refusal.action, GovernedAction::Store);
+        assert!(
+            refusal.reason.contains("requires scope 'private'")
+                && refusal.reason.contains("collective")
+        );
     }
 
     #[test]

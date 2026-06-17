@@ -13598,6 +13598,7 @@ mod tests {
                             approver: ApproverType::Human,
                             inherit: false,
                             max_reflection_depth: None,
+                            required_scope: None,
                         },
                         ..Default::default()
                     }
@@ -13668,6 +13669,7 @@ mod tests {
                             approver: ApproverType::Agent("not-me".to_string()),
                             inherit: false,
                             max_reflection_depth: None,
+                            required_scope: None,
                         },
                         ..Default::default()
                     }

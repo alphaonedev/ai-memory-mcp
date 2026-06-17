@@ -14742,7 +14742,7 @@ impl MemoryStore for PostgresStore {
             super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
             super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
         };
-        let decision = match level {
+        let mut decision = match level {
             GovernanceLevel::Any => GovernanceDecision::Allow,
             GovernanceLevel::Registered => {
                 if registered_agent_check {
@@ -14795,6 +14795,27 @@ impl MemoryStore for PostgresStore {
                 }
             }
         };
+
+        // #1720 C — per-namespace `required_scope` (refuse-only, fail-closed).
+        // Mirrors the sqlite `enforce_governance` Store path via the shared
+        // `required_scope_refusal` helper so the semantics + message cannot
+        // drift between adapters. Only fires when the write-level decision was
+        // `Allow`; computed into `decision` BEFORE the Advisory/Enforce branch
+        // so advisory logs-and-allows and enforce blocks.
+        if matches!(action, super::GovernedAction::Store)
+            && matches!(decision, GovernanceDecision::Allow)
+            && let Some(required) = policy.core.required_scope
+            && let Some(refusal) = crate::governance::required_scope_refusal(
+                required,
+                payload,
+                model_action,
+                policy.core.write.clone(),
+                agent_id,
+                namespace,
+            )
+        {
+            decision = GovernanceDecision::Deny(refusal);
+        }
 
         if mode == PermissionsMode::Advisory {
             // Drop the tx (no writes); advisory mode is read-only.

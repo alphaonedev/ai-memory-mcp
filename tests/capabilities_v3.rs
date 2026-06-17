@@ -1042,6 +1042,7 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -1117,6 +1118,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
             approver: ApproverType::Agent("maintainer".to_string()),
             inherit: false,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -1128,6 +1130,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
             approver: ApproverType::Consensus(3),
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };

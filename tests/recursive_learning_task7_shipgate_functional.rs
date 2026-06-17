@@ -450,6 +450,7 @@ fn cap_zero_disables_every_reflection_with_audit_row() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(0),
+            required_scope: None,
         },
         ..Default::default()
     };

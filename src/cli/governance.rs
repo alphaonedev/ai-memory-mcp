@@ -274,6 +274,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -315,6 +316,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -361,6 +363,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -406,6 +409,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -448,6 +452,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };

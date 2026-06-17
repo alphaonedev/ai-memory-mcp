@@ -96,6 +96,7 @@ fn effective_max_reflection_depth_explicit_override_returns_value() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(7),
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -119,6 +120,7 @@ fn effective_max_reflection_depth_some_zero_disables_reflection() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(0),
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -138,6 +140,7 @@ fn effective_max_reflection_depth_some_one_returns_one() {
     let p = GovernancePolicy {
         core: CorePolicy {
             max_reflection_depth: Some(1),
+            required_scope: None,
             ..CorePolicy::default()
         },
         ..GovernancePolicy::default()
@@ -155,6 +158,7 @@ fn effective_max_reflection_depth_high_override_returns_value() {
     let p = GovernancePolicy {
         core: CorePolicy {
             max_reflection_depth: Some(255),
+            required_scope: None,
             ..CorePolicy::default()
         },
         ..GovernancePolicy::default()
@@ -271,6 +275,7 @@ fn serialize_policy_with_explicit_field_writes_key_on_the_wire() {
     let p = GovernancePolicy {
         core: CorePolicy {
             max_reflection_depth: Some(0),
+            required_scope: None,
             ..CorePolicy::default()
         },
         ..GovernancePolicy::default()
@@ -297,6 +302,7 @@ fn full_roundtrip_with_explicit_field() {
             approver: ApproverType::Agent("maintainer".to_string()),
             inherit: true,
             max_reflection_depth: Some(4),
+            required_scope: None,
         },
         ..Default::default()
     };

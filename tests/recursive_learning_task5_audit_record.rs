@@ -450,6 +450,7 @@ fn cap_zero_disable_path_still_emits_audit_row() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(0),
+            required_scope: None,
         },
         ..Default::default()
     };

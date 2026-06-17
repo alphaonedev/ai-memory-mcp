@@ -207,6 +207,7 @@ fn opt_in_policy(threshold: u32, max_atom_tokens: u32) -> GovernancePolicy {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         atomisation: AtomisationPolicy {
             auto_atomise: Some(true),
@@ -228,6 +229,7 @@ fn opt_out_policy() -> GovernancePolicy {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         atomisation: AtomisationPolicy {
             auto_atomise: Some(false),

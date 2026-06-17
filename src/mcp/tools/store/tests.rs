@@ -1103,6 +1103,7 @@ fn install_legacy_classifier_policy(conn: &rusqlite::Connection, ns: &str) {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         synthesis: SynthesisPolicy {
             legacy_per_pair_classifier: Some(true),
@@ -1219,6 +1220,163 @@ fn governance_pending_returns_pending_envelope_for_store() {
     assert_eq!(out["status"].as_str(), Some("pending"));
     assert_eq!(out["action"].as_str(), Some("store"));
     assert!(out["pending_id"].as_str().is_some());
+    crate::config::clear_permissions_mode_override_for_test();
+}
+
+// ---- #1720 C: required_scope (refuse-only) at the sqlite gate -----------
+
+/// Install a namespace standard whose governance pins `required_scope`
+/// while leaving the write level at `Any` — so the write-level decision
+/// is `Allow` and the scope mismatch is the sole refusal trigger.
+fn install_required_scope_policy(
+    conn: &rusqlite::Connection,
+    ns: &str,
+    required_scope: crate::models::MemoryScope,
+) {
+    use crate::models::{
+        ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy, default_metadata,
+    };
+    let policy = GovernancePolicy {
+        core: CorePolicy {
+            write: GovernanceLevel::Any,
+            promote: GovernanceLevel::Any,
+            delete: GovernanceLevel::Any,
+            approver: ApproverType::Human,
+            inherit: true,
+            required_scope: Some(required_scope),
+            ..CorePolicy::default()
+        },
+        ..Default::default()
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut metadata = default_metadata();
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "agent_id".to_string(),
+            serde_json::Value::String("ai:alice".to_string()),
+        );
+        obj.insert(
+            "governance".to_string(),
+            serde_json::to_value(&policy).unwrap(),
+        );
+    }
+    let standard = crate::models::Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: format!("_standards-{ns}"),
+        title: format!("scope-std-{ns}"),
+        content: "policy".to_string(),
+        tags: vec![],
+        priority: 9,
+        confidence: 1.0,
+        source: "test".to_string(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now,
+        last_accessed_at: None,
+        expires_at: None,
+        metadata,
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let sid = db::insert(conn, &standard).expect("insert standard");
+    db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");
+}
+
+/// Drive the sqlite governance gate directly for a `Store` with the given
+/// `metadata.scope` (or none). Returns the gate decision under enforce mode.
+fn enforce_store_with_scope(
+    conn: &rusqlite::Connection,
+    ns: &str,
+    scope: Option<&str>,
+) -> crate::models::GovernanceDecision {
+    let metadata = match scope {
+        Some(s) => json!({ "scope": s }),
+        None => json!({}),
+    };
+    let payload = json!({ "metadata": metadata });
+    db::enforce_governance(
+        conn,
+        crate::models::GovernedAction::Store,
+        ns,
+        "ai:bob",
+        None,
+        None,
+        &payload,
+    )
+    .expect("gate runs")
+}
+
+#[test]
+fn required_scope_refuses_mismatched_store() {
+    let _gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    let conn = fresh_conn();
+    let ns = "req-scope-mismatch";
+    install_required_scope_policy(&conn, ns, crate::models::MemoryScope::Private);
+
+    // Write declares scope=collective into a private-required namespace.
+    let decision = enforce_store_with_scope(&conn, ns, Some("collective"));
+    match decision {
+        crate::models::GovernanceDecision::Deny(refusal) => {
+            assert!(
+                refusal.reason.contains("requires scope 'private'")
+                    && refusal.reason.contains("collective"),
+                "unexpected refusal reason: {}",
+                refusal.reason
+            );
+        }
+        other => panic!("expected Deny for scope mismatch, got {other:?}"),
+    }
+    crate::config::clear_permissions_mode_override_for_test();
+}
+
+#[test]
+fn required_scope_allows_matching_store() {
+    let _gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    let conn = fresh_conn();
+    let ns = "req-scope-match";
+    install_required_scope_policy(&conn, ns, crate::models::MemoryScope::Private);
+
+    let decision = enforce_store_with_scope(&conn, ns, Some("private"));
+    assert!(
+        matches!(decision, crate::models::GovernanceDecision::Allow),
+        "matching scope must be allowed, got {decision:?}"
+    );
+    crate::config::clear_permissions_mode_override_for_test();
+}
+
+#[test]
+fn required_scope_treats_absent_scope_as_private() {
+    let _gate = crate::config::lock_permissions_mode_for_test();
+    crate::config::override_active_permissions_mode_for_test(
+        crate::config::PermissionsMode::Enforce,
+    );
+    let conn = fresh_conn();
+    let ns = "req-scope-absent";
+    install_required_scope_policy(&conn, ns, crate::models::MemoryScope::Private);
+
+    // No scope key in metadata ⇒ defaults to private ⇒ matches the requirement.
+    let decision = enforce_store_with_scope(&conn, ns, None);
+    assert!(
+        matches!(decision, crate::models::GovernanceDecision::Allow),
+        "absent scope must default to private and be allowed, got {decision:?}"
+    );
     crate::config::clear_permissions_mode_override_for_test();
 }
 

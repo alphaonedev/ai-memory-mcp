@@ -10473,7 +10473,7 @@ pub fn enforce_governance(
         None
     };
 
-    let decision = evaluate_level(
+    let mut decision = evaluate_level(
         conn,
         action,
         namespace,
@@ -10482,6 +10482,24 @@ pub fn enforce_governance(
         memory_owner,
         ns_owner.as_deref(),
     );
+
+    // #1720 C — per-namespace `required_scope` (refuse-only, fail-closed;
+    // see `governance::required_scope_refusal`). Only overrides an `Allow`,
+    // BEFORE the Advisory/Enforce branch so both modes handle it uniformly.
+    if matches!(action, GovernedAction::Store)
+        && matches!(decision, GovernanceDecision::Allow)
+        && let Some(required) = policy.core.required_scope
+        && let Some(refusal) = crate::governance::required_scope_refusal(
+            required,
+            payload,
+            action,
+            policy.core.write.clone(),
+            agent_id,
+            namespace,
+        )
+    {
+        decision = GovernanceDecision::Deny(refusal);
+    }
 
     // K3 — `Advisory` logs the would-be outcome but does not block or
     // queue a pending row. The capabilities surface continues to
@@ -16532,6 +16550,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -16676,6 +16695,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: false,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };

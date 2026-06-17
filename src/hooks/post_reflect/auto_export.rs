@@ -298,6 +298,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             export: ExportPolicy {
                 auto_export_reflections_to_filesystem: Some(true),

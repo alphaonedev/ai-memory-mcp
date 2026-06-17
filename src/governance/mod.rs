@@ -98,7 +98,7 @@ pub mod wire_check;
 // `GovernanceDecision::Deny` lands in the follow-up commit per the
 // per-issue end-to-end protocol (see issue #963 body).
 pub mod refusal;
-pub use refusal::GovernanceRefusal;
+pub use refusal::{GovernanceRefusal, required_scope_refusal};
 
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
