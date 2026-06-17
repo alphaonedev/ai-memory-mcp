@@ -349,6 +349,7 @@ fn has_citations_recall_filter_excludes_empty_provenance() {
         None,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("recall");
     // Substrate returns both; the post-filter restricts.
@@ -396,6 +397,7 @@ fn source_uri_prefix_recall_filter_restricts_to_matching_uri() {
         None,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("recall");
     assert_eq!(results.len(), 3, "substrate returns all three rows");
@@ -581,6 +583,7 @@ fn recall_with_source_uri_prefix_uses_index() {
         None,
         false,
         Some("uri:https://"),
+        None, // #1720 caller
     )
     .expect("recall with prefix");
     // Every returned row must carry a source_uri starting with the

@@ -291,6 +291,9 @@ fn a2a_2_multi_agent_private_visibility_isolation() {
             None,
             Some(ns),
             false,
+            // #1720 — owner-keyed private: caller is the owner's
+            // agent_id (`label` == "ai:alice"...), DISTINCT from `ns`.
+            Some(label),
         )
         .expect("search own ns");
         let own_priv = own_view
@@ -319,6 +322,9 @@ fn a2a_2_multi_agent_private_visibility_isolation() {
                 None,
                 Some(ns),
                 false,
+                // #1720 — alice (caller `label`) peeking another ns:
+                // owner-keyed private => alice owns none of bob's rows.
+                Some(label),
             )
             .expect("cross search");
             let leaked = cross
@@ -346,6 +352,7 @@ fn a2a_2_multi_agent_private_visibility_isolation() {
             None,
             Some(ns),
             false,
+            Some(label), // #1720 — collective visible regardless of caller
         )
         .expect("search shared");
         let collective_count = shared
@@ -423,6 +430,9 @@ fn a2a_3_scoped_recall_collective_visible_private_isolated() {
         None,
         Some(bob_ns),
         false,
+        // #1720 — owner-keyed: bob (caller ai:bob) owns none of alice's
+        // private rows, so they are excluded.
+        Some("ai:bob"),
     )
     .expect("bob search");
 
@@ -460,6 +470,9 @@ fn a2a_3_scoped_recall_collective_visible_private_isolated() {
         None,
         Some(alice_ns),
         false,
+        // #1720 — owner-keyed: alice (caller ai:alice) owns her private
+        // rows, so she sees all 5.
+        Some("ai:alice"),
     )
     .expect("alice search");
     assert_eq!(alice_view.len(), 5, "alice sees all 5 of her own rows");

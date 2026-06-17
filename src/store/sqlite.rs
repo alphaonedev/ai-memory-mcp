@@ -271,6 +271,13 @@ impl MemoryStore for SqliteStore {
         // SAL-level contract so adapters with FTS paths that lack the
         // generated column (or where the column trails the metadata
         // update by a transaction window) still fail-closed.
+        // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller; mirror
+        // the #910 post-filter principal (`effective_principal`).
+        let vis_caller = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
         let rows = db::search(
             &conn,
             query,
@@ -284,6 +291,7 @@ impl MemoryStore for SqliteStore {
             filter.agent_id.as_deref(),
             ctx.as_agent.as_deref(),
             false,
+            vis_caller,
         )
         .map_err(box_err)?;
         // #910 SAL-level scope=private gate — see trait docstring +
@@ -513,6 +521,16 @@ impl MemoryStore for SqliteStore {
         let until = filter.until.map(|d| d.to_rfc3339());
         let limit = if filter.limit == 0 { 10 } else { filter.limit };
         let scoring = crate::config::ResolvedScoring::default();
+        // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller
+        // for the SQL `visibility_clause` private arm. Use the same
+        // resolved principal the #910 post-filter below applies
+        // (`effective_principal` = `as_agent` when set, else `agent_id`)
+        // so the SQL gate and the Rust post-filter agree.
+        let vis_caller = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
         let results = if let Some(qe) = query_embedding {
             db::recall_hybrid(
                 &conn,
@@ -536,6 +554,7 @@ impl MemoryStore for SqliteStore {
                 // the URI prefix via the dedicated argument on the
                 // direct db::recall call.
                 None,
+                vis_caller,
             )
             .map_err(box_err)?
             .0
@@ -554,6 +573,7 @@ impl MemoryStore for SqliteStore {
                 None,
                 false,
                 None,
+                vis_caller,
             )
             .map_err(box_err)?
             .0

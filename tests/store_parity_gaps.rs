@@ -217,7 +217,7 @@ fn verify_gap_2_source_uri_sqlite() {
     )
     .expect("seed third source_uri row");
 
-    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None, None)
+    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None, None, None)
         .expect("list_by_source_uri");
     assert_eq!(hits.len(), 2, "two memories under uri:fixture/a");
     for m in &hits {
@@ -368,7 +368,7 @@ fn verify_gap_6_search_source_uri_sqlite() {
 
     // Without the source_uri filter we get both matches.
     let all = db::search_with_source_uri(
-        &conn, "matching", None, None, 10, None, None, None, None, None, None, false, None,
+        &conn, "matching", None, None, 10, None, None, None, None, None, None, false, None, None,
     )
     .expect("search all");
     assert!(all.len() >= 2, "FTS returns at least the two seeded rows");
@@ -388,6 +388,7 @@ fn verify_gap_6_search_source_uri_sqlite() {
         None,
         false,
         Some("uri:doc/a"),
+        None, // #1720 caller
     )
     .expect("search scoped");
     assert_eq!(scoped.len(), 1, "source_uri filter narrows to one match");

@@ -122,9 +122,15 @@ pub(super) fn handle_search(
             // #975 — propagate the caller's `as_agent` to the reciprocal
             // source-uri endpoint so the MCP source_uri-only path
             // respects the same scope=private gate as `search_with_source_uri`.
-            let results =
-                db::list_by_source_uri(conn, uri, namespace, Some(limit.min(200)), as_agent)
-                    .map_err(|e| e.to_string())?;
+            let results = db::list_by_source_uri(
+                conn,
+                uri,
+                namespace,
+                Some(limit.min(200)),
+                as_agent,
+                caller,
+            )
+            .map_err(|e| e.to_string())?;
             let results = filter_visible(results, caller);
             return Ok(json!({"results": results, "count": results.len()}));
         }
@@ -145,6 +151,7 @@ pub(super) fn handle_search(
         as_agent,
         include_archived,
         source_uri,
+        caller,
     )
     .map_err(|e| e.to_string())?;
     let results = filter_visible(results, caller);
