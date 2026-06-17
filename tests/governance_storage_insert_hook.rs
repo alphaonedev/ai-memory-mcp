@@ -60,6 +60,18 @@ use ai_memory::storage::{self, GovernanceRefusal};
 mod common;
 use common::{free_port, fresh_conn};
 
+/// #1721 — project-local scratch DB path (no files under /tmp; CLAUDE.md
+/// hard rule). One fresh uuid-named DB per call under the gitignored
+/// `.local-runs/` tree.
+fn scratch_db(infix: &str) -> std::path::PathBuf {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("governance-storage-insert-hook");
+    std::fs::create_dir_all(&root).ok();
+    root.join(format!("{infix}-{}.db", uuid::Uuid::new_v4()))
+}
+
 // ---------------------------------------------------------------------------
 // Process-wide hook dispatcher (OnceLock workaround)
 // ---------------------------------------------------------------------------
@@ -280,11 +292,8 @@ fn hook_gates_all_three_insert_paths() {
 
 #[test]
 fn cli_one_shot_does_not_install_hook() {
-    // Use TMPDIR-honoring temp dir (project hard rule: no /tmp writes
-    // by name; std::env::temp_dir() honors the export TMPDIR set at
-    // session bootstrap, which lands under .local-runs/tmp).
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-l16e-cli-{}.db", uuid::Uuid::new_v4()));
+    // Project-local scratch DB (no /tmp writes — CLAUDE.md hard rule).
+    let db_path = scratch_db("ai-memory-l16e-cli");
     let bin = env!("CARGO_BIN_EXE_ai-memory");
 
     // Seed a refuse rule into the DB BEFORE the CLI runs. We open
@@ -478,8 +487,7 @@ fn refusal_maps_to_http_403() {
     use base64::Engine;
     use ed25519_dalek::{Signer, SigningKey};
     use rand_core::OsRng;
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-l16e-http-{}.db", uuid::Uuid::new_v4()));
+    let db_path = scratch_db("ai-memory-l16e-http");
     let bin = env!("CARGO_BIN_EXE_ai-memory");
 
     // Generate a one-off operator keypair scoped to this test. The

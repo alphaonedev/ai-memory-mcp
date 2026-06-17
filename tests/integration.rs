@@ -236,19 +236,22 @@ fn wait_child_bounded(
 /// #1713 — project-local scratch DB root (no files under /tmp; CLAUDE.md
 /// hard rule). One fresh uuid-named DB per call under the gitignored
 /// `.local-runs/` tree.
-fn integration_scratch_db(infix: &str) -> std::path::PathBuf {
+fn integration_scratch_root() -> std::path::PathBuf {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(".local-runs")
         .join("integration");
     std::fs::create_dir_all(&root).ok();
-    root.join(format!("ai-memory-{infix}-{}.db", uuid::Uuid::new_v4()))
+    root
+}
+
+fn integration_scratch_db(infix: &str) -> std::path::PathBuf {
+    integration_scratch_root().join(format!("ai-memory-{infix}-{}.db", uuid::Uuid::new_v4()))
 }
 
 #[test]
 fn test_cli_store_and_recall() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-cli-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("cli-test");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store
@@ -369,8 +372,7 @@ fn test_cli_store_and_recall() {
 #[test]
 fn test_deduplication() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-dedup-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("dedup-test");
 
     // Store same title+namespace twice
     for content in ["first version", "second version"] {
@@ -412,8 +414,7 @@ fn test_deduplication() {
 #[test]
 fn test_gc_removes_expired() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-gc-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("gc-test");
 
     // Store a short-term memory (6h TTL) — we can't easily test real expiry,
     // but we can verify gc runs without error
@@ -450,8 +451,7 @@ fn test_gc_removes_expired() {
 fn test_content_size_limit() {
     use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-size-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("size-test");
 
     let huge_content = "x".repeat(70_000);
     // Pipe huge content via stdin (-c -) to avoid Windows' ~8191-char argv
@@ -487,9 +487,8 @@ fn test_content_size_limit() {
 #[test]
 fn test_import_export_roundtrip() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db1 = dir.join(format!("ai-memory-export-{}.db", uuid::Uuid::new_v4()));
-    let db2 = dir.join(format!("ai-memory-import-{}.db", uuid::Uuid::new_v4()));
+    let db1 = integration_scratch_db("export");
+    let db2 = integration_scratch_db("import");
 
     // Store in db1
     let output = cmd(binary)
@@ -556,8 +555,7 @@ fn test_import_export_roundtrip() {
 #[test]
 fn test_reject_empty_title() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-title-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-title");
 
     let output = cmd(binary)
         .args([
@@ -579,8 +577,7 @@ fn test_reject_empty_title() {
 #[test]
 fn test_reject_bad_source() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-source-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-source");
 
     let output = cmd(binary)
         .args([
@@ -604,8 +601,7 @@ fn test_reject_bad_source() {
 #[test]
 fn test_reject_bad_namespace() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-ns-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-ns");
 
     let output = cmd(binary)
         .args([
@@ -633,8 +629,7 @@ fn test_reject_bad_namespace() {
 fn test_reject_oversized_content() {
     use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-size-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-size");
 
     let huge = "x".repeat(70_000);
     // Pipe via stdin (-c -) for Windows argv-length compatibility.
@@ -669,8 +664,7 @@ fn test_reject_oversized_content() {
 #[test]
 fn test_reject_bad_priority() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-prio-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-prio");
 
     let output = cmd(binary)
         .args([
@@ -710,8 +704,7 @@ fn test_reject_bad_priority() {
 #[test]
 fn test_reject_bad_confidence() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-conf-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-conf");
 
     let output = cmd(binary)
         .args([
@@ -753,8 +746,7 @@ fn test_reject_bad_confidence() {
 #[test]
 fn test_recall_priority_order() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-order-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("order");
 
     for (title, priority) in [
         ("alpha recall test", "2"),
@@ -819,8 +811,7 @@ fn test_recall_priority_order() {
 #[test]
 fn test_ttl_assignment() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ttl-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ttl");
 
     // Store short-term
     let output = cmd(binary)
@@ -905,11 +896,7 @@ fn test_ttl_assignment() {
 #[test]
 fn test_auto_promotion() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-promote-auto-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("promote-auto");
 
     // Store a mid-term memory
     let output = cmd(binary)
@@ -974,8 +961,7 @@ fn test_auto_promotion() {
 #[test]
 fn test_forget_by_pattern() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-forget-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("forget");
 
     // Store 3 memories, 2 with "ephemeral" in content
     for (title, content) in [
@@ -1050,8 +1036,7 @@ fn test_forget_by_pattern() {
 #[test]
 fn test_namespace_isolation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-nsiso-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("nsiso");
 
     // Store in ns-a
     let output = cmd(binary)
@@ -1122,8 +1107,7 @@ fn test_namespace_isolation() {
 #[test]
 fn test_link_creation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-link-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("link");
 
     // Store two memories
     let output = cmd(binary)
@@ -1202,8 +1186,7 @@ fn test_link_creation() {
 #[test]
 fn test_consolidation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-consol-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("consol");
 
     let mut ids = Vec::new();
     for (title, content) in [
@@ -1293,8 +1276,7 @@ fn test_consolidation() {
 #[test]
 fn test_promote_command() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-promote-cmd-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("promote-cmd");
 
     let output = cmd(binary)
         .args([
@@ -1341,8 +1323,7 @@ fn test_promote_command() {
 #[test]
 fn test_namespaces_command() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-cmd-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-cmd");
 
     // Store in two namespaces
     for (ns, title) in [("ns-alpha", "alpha mem"), ("ns-beta", "beta mem")] {
@@ -1387,8 +1368,7 @@ fn test_namespaces_command() {
 #[test]
 fn test_unicode_handling() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-unicode-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("unicode");
 
     let output = cmd(binary)
         .args([
@@ -1436,8 +1416,7 @@ fn test_unicode_handling() {
 #[test]
 fn test_boundary_priority_min() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-pmin-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-pmin");
 
     let output = cmd(binary)
         .args([
@@ -1462,8 +1441,7 @@ fn test_boundary_priority_min() {
 #[test]
 fn test_boundary_priority_max() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-pmax-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-pmax");
 
     let output = cmd(binary)
         .args([
@@ -1488,8 +1466,7 @@ fn test_boundary_priority_max() {
 #[test]
 fn test_boundary_confidence_zero() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-c0-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-c0");
 
     let output = cmd(binary)
         .args([
@@ -1514,8 +1491,7 @@ fn test_boundary_confidence_zero() {
 #[test]
 fn test_boundary_confidence_one() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-c1-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-c1");
 
     let output = cmd(binary)
         .args([
@@ -1540,8 +1516,7 @@ fn test_boundary_confidence_one() {
 #[test]
 fn test_boundary_max_title_length() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-tlen-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-tlen");
 
     let long_title = "a".repeat(512);
     let output = cmd(binary)
@@ -1567,8 +1542,7 @@ fn test_boundary_max_title_length() {
 #[test]
 fn test_export_includes_links() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-explink-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("explink");
 
     // Store two memories
     let output = cmd(binary)
@@ -1643,9 +1617,8 @@ fn test_export_includes_links() {
 #[test]
 fn test_import_roundtrip_count_match() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db1 = dir.join(format!("ai-memory-irt-src-{}.db", uuid::Uuid::new_v4()));
-    let db2 = dir.join(format!("ai-memory-irt-dst-{}.db", uuid::Uuid::new_v4()));
+    let db1 = integration_scratch_db("irt-src");
+    let db2 = integration_scratch_db("irt-dst");
 
     // Store 3 memories in db1
     for i in 0..3 {
@@ -1716,8 +1689,7 @@ fn test_import_roundtrip_count_match() {
 #[test]
 fn test_update_via_cli() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-update-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("update");
 
     let output = cmd(binary)
         .args([
@@ -1772,8 +1744,7 @@ fn test_update_via_cli() {
 #[test]
 fn test_stats_accuracy() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-statsacc-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("statsacc");
 
     let count = 5;
     for i in 0..count {
@@ -1815,8 +1786,7 @@ fn test_stats_accuracy() {
 #[test]
 fn test_gc_preserves_long_term() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-gckeep-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("gckeep");
 
     // Store short-term and long-term
     let output = cmd(binary)
@@ -1884,8 +1854,7 @@ fn test_gc_preserves_long_term() {
 #[test]
 fn test_search_with_since_future() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-since-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("since");
 
     let output = cmd(binary)
         .args([
@@ -1934,8 +1903,7 @@ fn test_search_with_since_future() {
 #[test]
 fn test_health_endpoint() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-health-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("health");
 
     // Find a free port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2404,8 +2372,7 @@ fn test_mcp_recall_default_toon() {
 
 #[test]
 fn test_cli_validate_id_rejects_invalid() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-validate-id-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("validate-id");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // delete with empty/whitespace ID
@@ -2440,11 +2407,7 @@ fn test_cli_validate_id_rejects_invalid() {
 
 #[test]
 fn test_tier_downgrade_rejected() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-tier-downgrade-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("tier-downgrade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a long-term memory
@@ -2498,11 +2461,7 @@ fn test_tier_downgrade_rejected() {
 
 #[test]
 fn test_tier_upgrade_allowed() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-tier-upgrade-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("tier-upgrade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a short-term memory
@@ -2545,8 +2504,7 @@ fn test_tier_upgrade_allowed() {
 
 #[test]
 fn test_duplicate_title_no_self_contradiction() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-selfref-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("selfref");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a memory
@@ -2598,8 +2556,7 @@ fn test_duplicate_title_no_self_contradiction() {
 
 #[test]
 fn test_promote_clears_expires_at() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-promote-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("promote");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a short-term memory (has expires_at)
@@ -3209,8 +3166,7 @@ fn test_mcp_dedup_replaces_metadata() {
 
 #[test]
 fn test_cli_prefix_id_resolution() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-prefix-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("prefix-test");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a memory
@@ -3313,7 +3269,7 @@ fn test_cli_prefix_id_resolution() {
 
 /// Helper: fresh DB path for each test.
 fn fresh_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-agentid-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("agentid")
 }
 
 /// Helper: extract `metadata.agent_id` from a stored-memory JSON payload.
@@ -3758,7 +3714,8 @@ fn test_mcp_update_preserves_agent_id() {
 fn test_import_restamps_agent_id_by_default() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let forge_path = std::env::temp_dir().join(format!("forge-{}.json", uuid::Uuid::new_v4()));
+    let forge_path =
+        integration_scratch_root().join(format!("forge-{}.json", uuid::Uuid::new_v4()));
 
     let forged = serde_json::json!({
         "memories": [{
@@ -3823,7 +3780,8 @@ fn test_import_restamps_agent_id_by_default() {
 fn test_import_trust_source_preserves_agent_id() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let forge_path = std::env::temp_dir().join(format!("backup-{}.json", uuid::Uuid::new_v4()));
+    let forge_path =
+        integration_scratch_root().join(format!("backup-{}.json", uuid::Uuid::new_v4()));
 
     let backup = serde_json::json!({
         "memories": [{
@@ -4031,7 +3989,7 @@ fn test_mine_stamps_caller_agent_id() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Minimal Claude conversations.json the miner can parse.
-    let mine_dir = std::env::temp_dir().join(format!("mine-{}", uuid::Uuid::new_v4()));
+    let mine_dir = integration_scratch_root().join(format!("mine-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&mine_dir).unwrap();
     // Claude's format is JSONL (one conversation object per line, no outer array).
     let conv_path = mine_dir.join("conversations.jsonl");
@@ -4268,7 +4226,7 @@ fn test_agentid_visible_in_toon_and_json() {
 // ---------------------------------------------------------------------------
 
 fn fresh_agent_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-agentreg-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("agentreg")
 }
 
 fn register_via_cli(
@@ -4568,7 +4526,7 @@ fn test_mcp_agent_register_and_list() {
 // ---------------------------------------------------------------------------
 
 fn fresh_followup_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-followup-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("followup")
 }
 
 #[test]
@@ -4836,7 +4794,7 @@ fn test_199_toon_compact_surfaces_agent_id() {
 // ---------------------------------------------------------------------------
 
 fn fresh_scope_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-scope-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("scope")
 }
 
 /// Seed a memory with an explicit scope + namespace.
@@ -5189,7 +5147,7 @@ fn test_scope_invalid_as_agent_rejected() {
 // ---------------------------------------------------------------------------
 
 fn fresh_inherit_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("inherit")
 }
 
 /// Seed a standard memory in a namespace, then `set_standard` it.
@@ -5548,7 +5506,7 @@ fn test_inherit_default_omits_chain() {
 // ---------------------------------------------------------------------------
 
 fn fresh_vpromote_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-vpromote-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("vpromote")
 }
 
 fn seed_memory_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
@@ -5776,7 +5734,7 @@ fn test_vpromote_flat_namespace_cannot_promote() {
 // ---------------------------------------------------------------------------
 
 fn fresh_gov_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-gov-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("gov")
 }
 
 fn store_std_mem(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
@@ -6078,7 +6036,7 @@ fn test_governance_legacy_memory_defaults_not_mutated() {
 // ---------------------------------------------------------------------------
 
 fn fresh_enforce_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-enforce-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("enforce")
 }
 
 /// Set a governance policy on a namespace. Seeds the standard memory under
@@ -6708,7 +6666,7 @@ fn test_enforce_mcp_pending_tools() {
 // ---------------------------------------------------------------------------
 
 fn fresh_approver_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-approver-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("approver")
 }
 
 fn queue_store(
@@ -7264,7 +7222,7 @@ fn test_visibility_wildcard_underscore_smuggling_blocked() {
 // ---------------------------------------------------------------------------
 
 fn fresh_budget_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-budget-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("budget")
 }
 
 fn store_sized(binary: &str, db_path: &std::path::Path, title: &str, content: &str, priority: i32) {
@@ -7570,7 +7528,7 @@ fn test_budget_mcp_tool_schema_and_response() {
 // ---------------------------------------------------------------------------
 
 fn fresh_hier_recall_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-hier-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("hier")
 }
 
 fn store_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) {
@@ -7891,7 +7849,7 @@ fn test_cli_sync_dry_run_writes_nothing() {
     // v0.6.0 GA Phase 3 foundation: --dry-run must classify new/update/noop
     // and NOT mutate either side of the sync. Uses today's timestamp-aware
     // merge semantics; the richer CRDT-lite preview lands with Task 3a.1.
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let local_db = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
     let remote_db = dir.join(format!("ai-memory-sync-remote-{}.db", uuid::Uuid::new_v4()));
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -8045,7 +8003,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // 4. Within a few cycles (interval=1s), db_A should contain a copy of
     //    the memory. This is the cross-machine / no-cloud knowledge mesh.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db_a = dir.join(format!("ai-memory-mesh-a-{}.db", uuid::Uuid::new_v4()));
     let db_b = dir.join(format!("ai-memory-mesh-b-{}.db", uuid::Uuid::new_v4()));
 
@@ -8212,7 +8170,7 @@ fn test_serve_native_tls_health_probe() {
     // Layer 1 — `ai-memory serve --tls-cert ... --tls-key ...` must serve
     // the health endpoint over HTTPS (self-signed cert, --insecure probe).
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db = dir.join(format!("ai-memory-tls-{}.db", uuid::Uuid::new_v4()));
     let Some((cert_path, key_path)) = gen_self_signed_cert(&dir) else {
         eprintln!("skipping: openssl not available on PATH");
@@ -8342,7 +8300,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // must succeed. A second daemon presenting an unknown cert must be
     // rejected at the TLS handshake.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db_a = dir.join(format!("ai-memory-mtls-a-{}.db", uuid::Uuid::new_v4()));
     let db_b = dir.join(format!("ai-memory-mtls-b-{}.db", uuid::Uuid::new_v4()));
 
@@ -8546,11 +8504,7 @@ fn test_child_guard_kills_daemon_on_assert_panic() {
     // it in a ChildGuard, force a panic, catch the unwind, then verify
     // via `kill -0` that the spawned PID is gone.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-childguard-regression-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("childguard-regression");
     let port = free_port();
 
     // The PID is captured before the panic so the post-unwind block
@@ -8612,8 +8566,7 @@ fn test_serve_rejects_half_tls_config() {
     // Layer 1 — clap's `requires = "tls_key"` must reject `--tls-cert`
     // without `--tls-key` at arg-parse time.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!("ai-memory-tls-half-{}.db", uuid::Uuid::new_v4()));
+    let db = integration_scratch_db("tls-half");
     let out = cmd(bin)
         .args([
             "--db",
@@ -8727,7 +8680,7 @@ fn curl_post(
     // Spill body to a temp file to avoid Windows CreateProcess argv overflow
     // (ERROR_FILENAME_EXCED_RANGE / OS error 206) on bulk POSTs >~32 KB.
     let payload_path =
-        std::env::temp_dir().join(format!("ai-memory-curl-{}.json", uuid::Uuid::new_v4()));
+        integration_scratch_root().join(format!("ai-memory-curl-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
@@ -9066,8 +9019,7 @@ struct DaemonGuard {
 impl DaemonGuard {
     fn spawn() -> Self {
         let bin = env!("CARGO_BIN_EXE_ai-memory");
-        let dir = std::env::temp_dir();
-        let db = dir.join(format!("ai-memory-http-parity-{}.db", uuid::Uuid::new_v4()));
+        let db = integration_scratch_db("http-parity");
         let port = free_port();
         // `cmd()` already injects `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`
         // and `AI_MEMORY_FED_SYNC_TRUST_PEER=1` so the legacy posture
@@ -9534,11 +9486,7 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     for attempt in 1..=3u8 {
-        let dir = std::env::temp_dir();
-        let db = dir.join(format!(
-            "ai-memory-http-parity-leader-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let db = integration_scratch_db("http-parity-leader");
         let port = free_port();
         let mut args: Vec<String> = vec![
             "--db".into(),
@@ -10575,8 +10523,7 @@ fn http_namespace_standard_meta_fans_out() {
 
 #[test]
 fn test_curator_autonomy_end_to_end_cycle() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-curator-e2e-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("curator-e2e");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Seed the database with intentionally-tagable memories
@@ -11029,11 +10976,7 @@ fn spawn_leader_with_timeout(
     timeout_ms: u64,
 ) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-http-parity-leader-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("http-parity-leader");
     let port = free_port();
     let mut args: Vec<String> = vec![
         "--db".into(),
@@ -11080,8 +11023,8 @@ fn curl_put(
         args.push("-H".into());
         args.push(format!("x-agent-id: {id}"));
     }
-    let payload_path =
-        std::env::temp_dir().join(format!("ai-memory-curl-put-{}.json", uuid::Uuid::new_v4()));
+    let payload_path = integration_scratch_root()
+        .join(format!("ai-memory-curl-put-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
@@ -12036,8 +11979,7 @@ fn test_cli_smoke_subcommand_help() {
 #[test]
 #[allow(clippy::too_many_lines)] // CLI smoke matrix exercises 30+ subcommands sequentially
 fn test_cli_smoke_canonical_paths() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-cli-smoke-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("cli-smoke");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Tier 2: canonical happy-path invocations
@@ -12200,7 +12142,8 @@ fn test_cli_smoke_canonical_paths() {
     assert!(pending_output.status.success(), "pending list failed");
 
     // 18. backup: backup the database
-    let backup_dir = dir.join(format!("ai-memory-backup-{}", uuid::Uuid::new_v4()));
+    let backup_dir =
+        integration_scratch_root().join(format!("ai-memory-backup-{}", uuid::Uuid::new_v4()));
     let backup_output = cmd_output_or_panic(
         binary,
         &[
@@ -12623,8 +12566,7 @@ const FAILURE_CASES: &[FailureCase] = &[
 #[test]
 fn test_cli_failure_matrix() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-failure-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("failure");
     let db_str = db_path.to_str().unwrap();
 
     // Test each failure case
@@ -12756,8 +12698,7 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
     // the production HTTP path of main.rs::serve (lines 1326-1338 of
     // v0.6.3). The shared `build_router` keeps the route table identical
     // to the production daemon.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!("ai-memory-serve-test-{}.db", uuid::Uuid::new_v4()));
+    let db = integration_scratch_db("serve-test");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -12835,9 +12776,8 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
     // Drives a real peer (an in-process serve_http_with_shutdown) so the
     // pull/push round-trips exercise the production handlers + db sync
     // state code paths.
-    let dir = std::env::temp_dir();
-    let db_peer = dir.join(format!("ai-memory-sync-peer-{}.db", uuid::Uuid::new_v4()));
-    let db_local = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
+    let db_peer = integration_scratch_db("sync-peer");
+    let db_local = integration_scratch_db("sync-local");
 
     // Initialise the local DB so the sync_cycle's `db::open` calls find a
     // valid file. The schema is created on first open.
@@ -12927,11 +12867,7 @@ async fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
     // run_daemon's interval is clamped to 60s minimum, but its shutdown
     // poll fires every 500ms, so we observe clean termination within
     // ~500ms regardless.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-curator-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("curator-test");
     {
         let _ = ai_memory::db::open(&db).unwrap();
     }
@@ -12996,11 +12932,7 @@ async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() 
     // that does nontrivial async work (a tokio sleep + observable side
     // effect via an AtomicBool) before resolving, and confirm the helper
     // runs the future and returns gracefully.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-serve-future-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("serve-future-test");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -13086,15 +13018,8 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
     // We pass a custom client (non-default timeout, distinct user-agent)
     // and confirm at least one cycle runs against an in-process peer
     // and shutdown is honored.
-    let dir = std::env::temp_dir();
-    let db_peer = dir.join(format!(
-        "ai-memory-sync-client-peer-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let db_local = dir.join(format!(
-        "ai-memory-sync-client-local-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_peer = integration_scratch_db("sync-client-peer");
+    let db_local = integration_scratch_db("sync-client-local");
     {
         let _ = ai_memory::db::open(&db_local).unwrap();
     }
@@ -13205,11 +13130,7 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     // var once per binary so the resolver lands on `CompiledDefault`
     // and the no-construct short-circuit (lines 4121-4127) fires.
     common::ensure_no_config_env();
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-curator-prim-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("curator-prim-test");
     {
         let _ = ai_memory::db::open(&db).unwrap();
     }
