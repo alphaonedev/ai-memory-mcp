@@ -419,6 +419,10 @@ pub(crate) mod connection;
 // invoke `migrate_v34_backfill_chain` directly to exercise the
 // idempotent-replay property without going through a full daemon
 // boot cycle.
+// #1720 B3 — boot owner-lockout probe (read-only COUNT over the indexed
+// visibility generated columns). Lives in its own submodule to keep this
+// already-large module under the qual_10 size ceiling.
+pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
 pub(crate) mod reflect;
@@ -437,6 +441,7 @@ pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
 // `ai_memory::storage::current_schema_version_for_tests()` or the
 // existing `ai_memory::db::current_schema_version_for_tests()` shim
 // (via `pub use storage as db;` in `src/lib.rs`).
+pub use lockout::count_private_rows_hidden_from;
 pub use migrations::current_schema_version_for_tests;
 // Pre-migration safety-snapshot infix accessor — lets coverage tests
 // locate / name-assert the snapshot file without restamping the literal.
