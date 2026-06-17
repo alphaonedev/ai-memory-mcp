@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 65).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 66).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -634,7 +634,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 65;
+const CURRENT_SCHEMA_VERSION: i64 = 66;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1145,6 +1145,15 @@ const MIGRATION_V63_SQLITE: &str =
 // is unaffected (its #902 signature CHECK survived the in-place swap).
 const MIGRATION_V65_SQLITE: &str =
     include_str!("../../migrations/sqlite/0054_v65_restore_memory_links_signature_triggers.sql");
+
+// v0.8.0 §22 PE-5 (#697) — extend the governance_rules.severity CHECK
+// (refuse/warn/log → +escalate) for the Decision::Escalate verdict
+// primitive. Full-table rebuild (SQLite cannot ALTER a CHECK in
+// place); preserves all signed-rule rows + columns and recreates both
+// indexes. Postgres ships no governance_rules table, so its v66 arm is
+// a version-stamp no-op.
+const MIGRATION_V66_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0055_v66_governance_rules_escalate_severity.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2747,6 +2756,37 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V65_SQLITE)?;
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v66 = v0.8.0 §22 PE-5 (#697) — extend the
+            // governance_rules.severity CHECK (refuse/warn/log →
+            // +escalate) for the Decision::Escalate verdict primitive.
+            // Full-table rebuild (SQLite cannot ALTER a CHECK in
+            // place): create governance_rules_new with the widened
+            // CHECK + the same 11-column set, INSERT..SELECT every row
+            // explicitly (preserving the signed-rule signature +
+            // attest_level columns), DROP the old table, RENAME, then
+            // recreate BOTH indexes (idx_governance_rules_kind_enabled
+            // + idx_governance_rules_namespace). governance_rules has
+            // no triggers. Postgres ships no governance_rules table so
+            // its v66 arm is a version-stamp no-op.
+            //
+            // Guarded on table existence: `governance_rules` is
+            // migration-only (NOT in the bootstrap SCHEMA const), so a
+            // DB stamped past v30 that never actually ran the v30
+            // CREATE (e.g. a test seeded from SCHEMA then version-
+            // stamped, or a legacy snapshot) has no table to rebuild.
+            // The v30 arm creates it for every real upgrade / fresh-DB
+            // path before this arm runs; if it is genuinely absent the
+            // rebuild is correctly a no-op (no rows, hence no
+            // `escalate` value, to admit).
+            let has_governance_rules = conn
+                .prepare("SELECT 1 FROM governance_rules LIMIT 0")
+                .is_ok();
+            if has_governance_rules {
+                conn.execute_batch(MIGRATION_V66_SQLITE)?;
+            }
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -3097,6 +3137,163 @@ mod tests {
             rel_index_present,
             "v63 rebuild must recreate idx_links_relation"
         );
+    }
+
+    #[test]
+    fn v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity() {
+        // §22 PE-5 (#697) — the load-bearing risk: the v66 full-table
+        // rebuild of `governance_rules` must preserve every
+        // pre-existing row + every column (including the OPERATOR-SIGNED
+        // signature + attest_level data — a dropped signed-rule row or
+        // column is a security regression), recreate BOTH indexes, AND
+        // begin accepting the new `escalate` severity. We build a
+        // pre-v66 (3-value severity CHECK) governance_rules table with
+        // its two indexes, seed a signed rule, stamp the DB at v65, run
+        // the migrate ladder, and assert:
+        //   (a) the seeded row survives the rebuild verbatim (all
+        //       columns, incl. signature + attest_level),
+        //   (b) the pre-v66 CHECK would have REJECTED 'escalate',
+        //   (c) post-v66 an 'escalate' row inserts cleanly,
+        //   (d) both indexes were recreated.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+
+        // The pre-v66 governance_rules shape (3-value severity CHECK).
+        conn.execute_batch(
+            "CREATE TABLE governance_rules (
+                 id            TEXT PRIMARY KEY,
+                 kind          TEXT NOT NULL,
+                 matcher       TEXT NOT NULL,
+                 severity      TEXT NOT NULL CHECK (severity IN ('refuse', 'warn', 'log')),
+                 reason        TEXT NOT NULL,
+                 namespace     TEXT NOT NULL DEFAULT '_global',
+                 created_by    TEXT NOT NULL,
+                 created_at    INTEGER NOT NULL,
+                 enabled       INTEGER NOT NULL DEFAULT 1,
+                 signature     BLOB,
+                 attest_level  TEXT NOT NULL DEFAULT 'unsigned'
+             );
+             CREATE INDEX idx_governance_rules_kind_enabled
+                 ON governance_rules (kind, enabled);
+             CREATE INDEX idx_governance_rules_namespace
+                 ON governance_rules (namespace);",
+        )
+        .expect("recreate pre-v66 governance_rules");
+
+        // (b) pre-v66 the CHECK must REJECT 'escalate'.
+        let pre_escalate = conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, created_by, created_at) \
+             VALUES ('E0', 'bash', '{}', 'escalate', 'x', 'test', 0)",
+            [],
+        );
+        assert!(
+            pre_escalate.is_err(),
+            "pre-v66 CHECK must reject the 'escalate' severity"
+        );
+
+        // Seed a signed operator rule (refuse severity + a 64-byte
+        // signature + operator_signed attest_level) to prove the
+        // rebuild preserves signed-rule security columns.
+        let sig = vec![0xABu8; 64];
+        conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, namespace, created_by, created_at, \
+              enabled, signature, attest_level) \
+             VALUES ('R001', 'filesystem_write', '{\"glob\":\"/tmp/**\"}', 'refuse', \
+                     'no /tmp', 'secure', 'operator', 42, 1, ?1, 'operator_signed')",
+            params![sig],
+        )
+        .expect("seed signed pre-v66 rule");
+
+        // Stamp at v65 so the migrate ladder runs the v66 arm.
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (65)", [])
+            .expect("stamp v65");
+
+        super::migrate(&conn).expect("migrate to v66 succeeds");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) the signed row survived verbatim — every column intact.
+        let (kind, matcher, severity, reason, namespace, created_by, created_at, enabled, attest): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT kind, matcher, severity, reason, namespace, created_by, created_at, \
+                        enabled, attest_level FROM governance_rules WHERE id = 'R001'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .expect("signed rule must survive the v66 rebuild");
+        assert_eq!(kind, "filesystem_write");
+        assert_eq!(matcher, "{\"glob\":\"/tmp/**\"}");
+        assert_eq!(severity, "refuse");
+        assert_eq!(reason, "no /tmp");
+        assert_eq!(namespace, "secure");
+        assert_eq!(created_by, "operator");
+        assert_eq!(created_at, 42);
+        assert_eq!(enabled, 1);
+        assert_eq!(attest, "operator_signed");
+
+        // The signature BLOB survived byte-for-byte.
+        let surviving_sig: Vec<u8> = conn
+            .query_row(
+                "SELECT signature FROM governance_rules WHERE id = 'R001'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("signature column must survive");
+        assert_eq!(
+            surviving_sig, sig,
+            "signed-rule signature must be preserved"
+        );
+
+        // (c) post-v66 an 'escalate' row inserts cleanly.
+        conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, created_by, created_at) \
+             VALUES ('E001', 'bash', '{\"command_substring\":\"sudo\"}', 'escalate', \
+                     'human review', 'operator', 7)",
+            [],
+        )
+        .expect("'escalate' severity must insert cleanly post-v66");
+
+        // (d) both indexes were recreated by the rebuild.
+        for idx in [
+            "idx_governance_rules_kind_enabled",
+            "idx_governance_rules_namespace",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'index' AND name = ?1)",
+                    params![idx],
+                    |r| r.get(0),
+                )
+                .expect("probe index");
+            assert!(present, "v66 rebuild must recreate {idx}");
+        }
     }
 
     #[test]
