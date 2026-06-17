@@ -3333,16 +3333,30 @@ fn test_agentid_default_is_nhi_prefixed() {
     assert!(output.status.success());
     let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let id = agent_id_of(&stored);
-    // One of: host:<sanitized-hostname>:pid-<pid>-<uuid8>
-    //      or anonymous:pid-<pid>-<uuid8>
+    // v0.8.0 #1720 B1 — the default CLI stamp is one of:
+    //   host:<sanitized-hostname>            (DURABLE, pid-free)
+    //   anonymous:pid-<pid>-<uuid8>          (ephemeral fallback when
+    //                                         the hostname is unavailable)
+    // The host form is now PID-FREE + durable: a pid suffix would change
+    // every process restart and orphan scope=private rows owned by the
+    // old id once enforced-read multi-agent mode is opted into (the
+    // owner-lockout trap B1/B2/B3 close). Only the anonymous fallback
+    // keeps the ephemeral pid discriminator.
     assert!(
         id.starts_with("host:") || id.starts_with("anonymous:"),
         "expected NHI-prefixed default, got: {id}"
     );
-    assert!(
-        id.contains(":pid-"),
-        "expected pid discriminator, got: {id}"
-    );
+    if let Some(host) = id.strip_prefix("host:") {
+        assert!(
+            !host.contains("pid-"),
+            "durable host stamp must be pid-free (#1720 B1), got: {id}"
+        );
+    } else {
+        assert!(
+            id.starts_with("anonymous:pid-"),
+            "anonymous fallback keeps the ephemeral pid discriminator, got: {id}"
+        );
+    }
     let _ = std::fs::remove_file(&db_path);
 }
 
@@ -4860,30 +4874,128 @@ fn recall_as_agent(
         .collect()
 }
 
+/// v0.8.0 #1720 A2-A6: seed a private/typed-scope memory with an
+/// EXPLICIT owner (`metadata.agent_id`). Owner-keyed `scope=private`
+/// visibility (the security fix in 15e0504f) means the owner id — not
+/// the namespace — decides who can read the row, so the scope tests
+/// must control the owner per-row.
+fn seed_owned(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    scope: &str,
+    owner: &str,
+) {
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            owner,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "content",
+            "-t",
+            "long",
+            "--scope",
+            scope,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed failed for {title}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// v0.8.0 #1720 A3: recall as a concrete OWNER. The read-path
+/// visibility caller is resolved from `AI_MEMORY_AGENT_ID`
+/// (`identity::resolve_read_visibility_caller`), DISTINCT from the
+/// `--as-agent` namespace (which only drives the team/unit/org subtree
+/// arms). `--as-agent` is still passed so visibility filtering is
+/// engaged (an unset `as_agent` disables filtering entirely); the owner
+/// id is what gates the `scope=private` arm.
+fn recall_as_owner(
+    binary: &str,
+    db_path: &std::path::Path,
+    as_agent: &str,
+    context: &str,
+    owner: &str,
+) -> Vec<String> {
+    let out = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", owner)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "recall",
+            context,
+            "--as-agent",
+            as_agent,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect()
+}
+
 #[test]
-fn test_scope_private_visible_only_in_exact_namespace() {
+fn test_scope_private_visible_only_to_owner() {
+    // v0.8.0 #1720 A2-A6: scope=private is OWNER-keyed, not
+    // namespace-keyed. The owner sees their own private rows; a
+    // different owner sees none — regardless of namespace co-residency.
+    // (Pre-#1720 a same-namespace `--as-agent` principal could read
+    // another agent's private rows — the cross-tenant leak 15e0504f
+    // closed. This test previously asserted that leaking behavior.)
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(
+    // agent-1 owns priv-self; agent-2 owns priv-other (same subtree).
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-1",
         "priv-self",
         "private",
+        "agent-1",
     );
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-2",
-        "priv-sibling",
+        "priv-other",
         "private",
+        "agent-2",
     );
-    seed_scoped(bin, &db, "alphaone/eng/platform", "priv-parent", "private");
 
-    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "priv");
-    assert!(titles.contains(&"priv-self".to_string()));
-    assert!(!titles.contains(&"priv-sibling".to_string()));
-    assert!(!titles.contains(&"priv-parent".to_string()));
+    // The owner (agent-1) sees its own private row, not agent-2's —
+    // even though both live under the same namespace subtree.
+    let titles = recall_as_owner(bin, &db, "alphaone/eng/platform/agent-1", "priv", "agent-1");
+    assert!(
+        titles.contains(&"priv-self".to_string()),
+        "owner must see its own private row; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"priv-other".to_string()),
+        "a different owner's private row must stay hidden; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
@@ -4965,13 +5077,19 @@ fn test_scope_collective_always_visible() {
 
 #[test]
 fn test_scope_missing_treated_as_private() {
+    // A row stored WITHOUT an explicit scope defaults to private, so it
+    // is governed by the #1720 owner-keyed gate: visible to its owner,
+    // hidden from a different owner.
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    // seed WITHOUT scope (legacy-style)
+    // seed WITHOUT --scope (legacy-style) but WITH explicit owners.
     cmd(bin)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args([
             "--db",
             db.to_str().unwrap(),
+            "--agent-id",
+            "agent-1",
             "store",
             "-n",
             "alphaone/eng/platform/agent-1",
@@ -4985,14 +5103,17 @@ fn test_scope_missing_treated_as_private() {
         .output()
         .unwrap();
     cmd(bin)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args([
             "--db",
             db.to_str().unwrap(),
+            "--agent-id",
+            "agent-2",
             "store",
             "-n",
             "alphaone/eng/platform/agent-2",
             "-T",
-            "legacy-at-sibling",
+            "legacy-at-other",
             "-c",
             "legacy",
             "-t",
@@ -5001,9 +5122,22 @@ fn test_scope_missing_treated_as_private() {
         .output()
         .unwrap();
 
-    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "legacy");
-    assert!(titles.contains(&"legacy-at-self".to_string()));
-    assert!(!titles.contains(&"legacy-at-sibling".to_string()));
+    // Owner agent-1 sees its own scopeless (→private) row, not agent-2's.
+    let titles = recall_as_owner(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-1",
+        "legacy",
+        "agent-1",
+    );
+    assert!(
+        titles.contains(&"legacy-at-self".to_string()),
+        "owner sees its own scopeless(→private) row; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"legacy-at-other".to_string()),
+        "scopeless row defaults to private → hidden from a different owner; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
@@ -5035,25 +5169,33 @@ fn test_scope_no_as_agent_returns_all() {
 }
 
 #[test]
-fn test_scope_search_respects_as_agent() {
+fn test_scope_search_respects_owner() {
+    // The FTS `search` read path applies the same #1720 owner-keyed
+    // scope=private gate as recall: the owner finds its own private
+    // rows; a different owner's private rows stay out of the results.
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-1",
         "search-my",
         "private",
+        "agent-1",
     );
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-2",
         "search-neighbor",
         "private",
+        "agent-2",
     );
 
+    // Authenticate as owner agent-1 via AI_MEMORY_AGENT_ID (the read-path
+    // visibility caller); --as-agent engages filtering.
     let out = cmd(bin)
+        .env("AI_MEMORY_AGENT_ID", "agent-1")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -5073,25 +5215,45 @@ fn test_scope_search_respects_as_agent() {
         .iter()
         .filter_map(|m| m["title"].as_str().map(str::to_string))
         .collect();
-    assert!(titles.contains(&"search-my".to_string()));
-    assert!(!titles.contains(&"search-neighbor".to_string()));
+    assert!(
+        titles.contains(&"search-my".to_string()),
+        "owner finds its own private row in search; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"search-neighbor".to_string()),
+        "a different owner's private row must not surface in search; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
 #[test]
-fn test_scope_flat_namespace_only_sees_exact_match_plus_collective() {
+fn test_scope_flat_namespace_owner_sees_own_private_plus_collective() {
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(bin, &db, "global", "flat-private", "private");
-    seed_scoped(bin, &db, "other", "flat-elsewhere", "private");
-    seed_scoped(bin, &db, "global", "flat-team-at-self", "team");
-    seed_scoped(bin, &db, "shared", "flat-collective", "collective");
+    // agent-1 owns flat-private; agent-2 owns flat-elsewhere. Team +
+    // collective rows' owner is irrelevant (those arms are not
+    // owner-keyed).
+    seed_owned(bin, &db, "global", "flat-private", "private", "agent-1");
+    seed_owned(bin, &db, "other", "flat-elsewhere", "private", "agent-2");
+    seed_owned(bin, &db, "global", "flat-team-at-self", "team", "agent-1");
+    seed_owned(
+        bin,
+        &db,
+        "shared",
+        "flat-collective",
+        "collective",
+        "agent-1",
+    );
 
-    let titles = recall_as_agent(bin, &db, "global", "flat");
+    let titles = recall_as_owner(bin, &db, "global", "flat", "agent-1");
+    // Owner sees its own private row (#1720 owner-keyed)...
     assert!(titles.contains(&"flat-private".to_string()));
+    // ...but not a different owner's private row.
     assert!(!titles.contains(&"flat-elsewhere".to_string()));
+    // Collective is always visible.
     assert!(titles.contains(&"flat-collective".to_string()));
     // Flat agent has no parent; team-scope with no team_prefix → invisible
+    // (team arm stays namespace-keyed, unaffected by #1720).
     assert!(!titles.contains(&"flat-team-at-self".to_string()));
     let _ = std::fs::remove_file(&db);
 }
