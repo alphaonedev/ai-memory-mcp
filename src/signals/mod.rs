@@ -24,13 +24,12 @@ use crate::models::{Signal, SignalType};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-/// #1714 — `signed_events` audit-chain event type for an outbound
-/// coordination signal send. Emitting this row gives the Pillar-1
-/// coordination substrate a tamper-evident, `verify_audit_trail`-walkable
-/// observability record on the same append-only chain the governance gate
-/// uses — the interim observability mechanism for coordination ops until
-/// the hook-executor pipeline is wired end-to-end (the broader #1714 lane).
-pub const SIGNAL_SEND_EVENT_TYPE: &str = "coordination.signal_send";
+/// #1714 / #1722 — `signed_events` audit-chain event type for an outbound
+/// coordination signal send. Back-compat re-export of the SSOT
+/// [`crate::coordination_audit::SIGNAL_SEND`] (the slug moved into the
+/// shared coordination-audit module in #1722); existing call sites that
+/// reference `crate::signals::SIGNAL_SEND_EVENT_TYPE` keep compiling.
+pub use crate::coordination_audit::SIGNAL_SEND as SIGNAL_SEND_EVENT_TYPE;
 
 /// SHA-256 over the signal body's canonical JSON string's UTF-8 bytes. This is
 /// the bounded payload the signature commits to (the same bound the persona /

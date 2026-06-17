@@ -69,6 +69,18 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
     };
 
     let id = crate::actions::create(conn, &action).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the
+    // create, attributed to the action's owning agent (`agent_id`, "" when
+    // unowned). Identity = action id / kind / "create".
+    let actor = action.agent_id.as_deref().unwrap_or_default();
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::ACTION_CREATE,
+        actor,
+        &[&id, &action.kind, "create"],
+    );
+
     Ok(json!({
         (param_names::ID): id,
         "action": serde_json::to_value(&action).map_err(|e| e.to_string())?,
@@ -135,9 +147,22 @@ pub fn handle_action_transition(
         crate::actions::TransitionOutcome::Illegal { from, to } => {
             Err(crate::actions::illegal_transition_detail(from, to))
         }
-        crate::actions::TransitionOutcome::Updated(a) => Ok(json!({
-            "action": serde_json::to_value(&a).map_err(|e| e.to_string())?,
-        })),
+        crate::actions::TransitionOutcome::Updated(a) => {
+            // #1722 — coordination observability: best-effort audit row for
+            // the transition, attributed to the claiming agent (`claimed_by`,
+            // "" when none was supplied). Identity = action id / target state
+            // / claimer.
+            let actor = claimed_by.as_deref().unwrap_or_default();
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::ACTION_TRANSITION,
+                actor,
+                &[id, to_name, actor],
+            );
+            Ok(json!({
+                "action": serde_json::to_value(&a).map_err(|e| e.to_string())?,
+            }))
+        }
     }
 }
 
@@ -200,6 +225,18 @@ pub fn handle_action_add_edge(
     let now = chrono::Utc::now().timestamp();
     crate::actions::add_edge(conn, from_action, to_action, edge_type, now)
         .map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the edge
+    // insert. The add-edge handler carries NO actor/principal field, so the
+    // row records the event + payload hash with an empty actor; identity =
+    // from_action / to_action / edge_type so the specific edge is committed.
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::ACTION_ADD_EDGE,
+        "",
+        &[from_action, to_action, edge_type_name],
+    );
+
     Ok(json!({ "ok": true }))
 }
 
@@ -306,9 +343,20 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
         crate::actions::LeaseAcquire::Conflict => Err(format!(
             "lease conflict: {action_id} held by another holder"
         )),
-        crate::actions::LeaseAcquire::Acquired(l) => Ok(json!({
-            "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
-        })),
+        crate::actions::LeaseAcquire::Acquired(l) => {
+            // #1722 — coordination observability: best-effort audit row for the
+            // acquire, attributed to the lease `holder`. Identity = action id /
+            // holder.
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::LEASE_ACQUIRE,
+                holder,
+                &[action_id, holder],
+            );
+            Ok(json!({
+                "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
+            }))
+        }
     }
 }
 
@@ -339,9 +387,20 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
         .map_err(|e| e.to_string())?
     {
         None => Err(format!("no lease held by {holder} on {action_id}")),
-        Some(l) => Ok(json!({
-            "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
-        })),
+        Some(l) => {
+            // #1722 — coordination observability: best-effort audit row for the
+            // renew, attributed to the lease `holder`. Identity = action id /
+            // holder.
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::LEASE_RENEW,
+                holder,
+                &[action_id, holder],
+            );
+            Ok(json!({
+                "lease": serde_json::to_value(&l).map_err(|e| e.to_string())?,
+            }))
+        }
     }
 }
 
@@ -362,6 +421,20 @@ pub fn handle_lease_release(conn: &rusqlite::Connection, params: &Value) -> Resu
         .unwrap_or_default();
     let released =
         crate::actions::lease_release(conn, action_id, holder).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the
+    // release, attributed to the lease `holder`. Only emit when a row was
+    // actually removed (a no-op release by a non-owner writes nothing).
+    // Identity = action id / holder.
+    if released {
+        crate::coordination_audit::emit(
+            conn,
+            crate::coordination_audit::LEASE_RELEASE,
+            holder,
+            &[action_id, holder],
+        );
+    }
+
     Ok(json!({ "released": released }))
 }
 
@@ -1175,5 +1248,78 @@ mod handler_tests {
         // An empty namespace yields a null next action.
         let empty = handle_action_next(&conn, &json!({ "namespace": "_empty" })).expect("next ok");
         assert!(empty["action"].is_null());
+    }
+
+    /// #1722 — a legal action transition appends one
+    /// `coordination.action_transition` audit row attributed to the claiming
+    /// agent; the append-only chain stays intact.
+    #[test]
+    fn transition_emits_signed_events_audit_row_1722() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        handle_action_transition(
+            &conn,
+            &json!({ "id": id, "to": "claimed", "claimed_by": "holder-1" }),
+        )
+        .expect("transition ok");
+
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::ACTION_TRANSITION],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "one coordination.action_transition row");
+        assert_eq!(agent, "holder-1", "row attributed to the claiming agent");
+
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
+    }
+
+    /// #1722 — a lease acquire appends one `coordination.lease_acquire` audit
+    /// row attributed to the holder; the append-only chain stays intact.
+    #[test]
+    fn lease_acquire_emits_signed_events_audit_row_1722() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        handle_lease_acquire(
+            &conn,
+            &json!({ "action_id": id, "holder": "holder-a", "ttl_secs": 120 }),
+        )
+        .expect("acquire ok");
+
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::LEASE_ACQUIRE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "one coordination.lease_acquire row");
+        assert_eq!(agent, "holder-a", "row attributed to the lease holder");
+
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 }

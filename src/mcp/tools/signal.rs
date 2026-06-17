@@ -98,54 +98,32 @@ pub fn handle_signal_send(
 
     crate::signals::insert(conn, &signal).map_err(|e| e.to_string())?;
 
-    // #1714 — coordination observability: append a tamper-evident
+    // #1714 / #1722 — coordination observability: append a tamper-evident
     // `signed_events` row for the send so the Pillar-1 substrate has an
-    // audit trail on the same chain the governance gate uses. Best-effort:
-    // the signal already committed, so an audit-append failure (e.g. a rare
-    // chain-sequence race) is logged loudly rather than failing the send.
-    emit_signal_send_audit(conn, &signal);
+    // audit trail on the same chain the governance gate uses. Best-effort
+    // via the shared `coordination_audit::emit` writer: the signal already
+    // committed, so an append failure is logged loudly, never propagated.
+    // The payload hash commits to the signal's identity (id / sender /
+    // recipient / subject / type) so the chain row is bounded regardless of
+    // body size and an auditor can correlate it to the stored signal.
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::SIGNAL_SEND,
+        &signal.from_agent,
+        &[
+            &signal.id,
+            &signal.from_agent,
+            signal.to_agent.as_deref().unwrap_or(""),
+            &signal.subject,
+            signal.signal_type.as_str(),
+        ],
+    );
 
     Ok(json!({
         (param_names::ID): signal.id,
         "attest_level": attest_level,
         "signal": serde_json::to_value(&signal).map_err(|e| e.to_string())?,
     }))
-}
-
-/// #1714 — emit the `coordination.signal_send` audit row. The payload hash
-/// commits to the signal's identity (id / sender / recipient / subject /
-/// type), so the chain row is bounded regardless of body size and lets an
-/// auditor correlate it to the stored signal. Daemon-signed when an audit
-/// signing key is installed (else `unsigned`), exactly like every other
-/// production audit-row writer. Failures are logged, never propagated.
-fn emit_signal_send_audit(conn: &rusqlite::Connection, signal: &crate::models::Signal) {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(signal.id.as_bytes());
-    hasher.update([0x1F]);
-    hasher.update(signal.from_agent.as_bytes());
-    hasher.update([0x1F]);
-    hasher.update(signal.to_agent.as_deref().unwrap_or("").as_bytes());
-    hasher.update([0x1F]);
-    hasher.update(signal.subject.as_bytes());
-    hasher.update([0x1F]);
-    hasher.update(signal.signal_type.as_str().as_bytes());
-    let payload_hash = hasher.finalize().to_vec();
-    let event = crate::signed_events::SignedEvent::with_daemon_signature(
-        payload_hash,
-        signal.from_agent.clone(),
-        crate::signals::SIGNAL_SEND_EVENT_TYPE.to_string(),
-        chrono::Utc::now().to_rfc3339(),
-    );
-    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
-        tracing::warn!(
-            target: "ai_memory::coordination",
-            signal_id = %signal.id,
-            from_agent = %signal.from_agent,
-            error = %e,
-            "coordination.signal_send audit append failed (signal already committed)"
-        );
-    }
 }
 
 /// MCP handler for `memory_signal_read`. Fetches a signal by id, stamps
@@ -236,6 +214,27 @@ pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<
         .unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let acknowledged = crate::signals::mark_acked(conn, id, now).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: append a `coordination.signal_ack`
+    // audit row ONLY when this call actually flipped the ack (a no-op re-ack
+    // must not write a row). The ack handler has no actor param, so resolve
+    // the principal by loading the signal: the recipient (`to_agent`) is who
+    // acks; fall back to "" for a broadcast (None) or an absent signal.
+    // Best-effort: the ack already committed.
+    if acknowledged {
+        let actor = crate::signals::get(conn, id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.to_agent)
+            .unwrap_or_default();
+        crate::coordination_audit::emit(
+            conn,
+            crate::coordination_audit::SIGNAL_ACK,
+            &actor,
+            &[id, &actor, "ack"],
+        );
+    }
+
     Ok(json!({ "acknowledged": acknowledged }))
 }
 
@@ -630,7 +629,7 @@ mod handler_tests {
             .query_row(
                 "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
                  WHERE event_type = ?1",
-                rusqlite::params![crate::signals::SIGNAL_SEND_EVENT_TYPE],
+                rusqlite::params![crate::coordination_audit::SIGNAL_SEND],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("query audit row");
@@ -641,5 +640,60 @@ mod handler_tests {
         let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
         assert!(report.total_events >= 1);
+    }
+
+    /// #1722 — a signal ack that actually flips `acknowledged` appends one
+    /// `coordination.signal_ack` audit row attributed to the recipient
+    /// (`to_agent`), and a no-op re-ack appends NO further row. The
+    /// append-only chain stays intact across both.
+    #[test]
+    fn ack_emits_signed_events_audit_row_1722() {
+        let conn = fresh();
+        let sent = handle_signal_send(
+            &conn,
+            &json!({
+                "namespace": "_sig",
+                "from_agent": "ai:alice",
+                "to_agent": "ai:bob",
+                "subject": "coordinate",
+            }),
+            None,
+        )
+        .expect("send ok");
+        let id = sent[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        // First ack flips it → exactly one signal_ack row, attributed to the
+        // recipient (the agent that acks).
+        let acked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        assert_eq!(acked["acknowledged"].as_bool(), Some(true));
+
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::SIGNAL_ACK],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "expected one coordination.signal_ack audit row");
+        assert_eq!(agent, "ai:bob", "ack row attributed to the recipient");
+
+        // A no-op re-ack writes NO further signal_ack row.
+        let reacked = handle_signal_ack(&conn, &json!({ "id": id })).expect("ack ok");
+        assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
+        let count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::SIGNAL_ACK],
+                |r| r.get(0),
+            )
+            .expect("query audit row");
+        assert_eq!(count2, 1, "a no-op re-ack must not write another audit row");
+
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 }

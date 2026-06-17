@@ -489,6 +489,12 @@ pub mod color;
 /// caller-provided `confidence` field.
 pub mod confidence;
 pub mod config;
+/// v0.8.0 Pillar 1 (#1722) — coordination-substrate `signed_events`
+/// observability. The single shared writer that appends a
+/// tamper-evident `coordination.<op>` audit row to the append-only chain
+/// after every coordination state-mutation (signal / action / lease /
+/// checkpoint / routine).
+pub mod coordination_audit;
 pub mod curator;
 pub mod daemon_runtime;
 // v0.7.0 L0.5-3 — module renamed from `db` → `storage` as part of
