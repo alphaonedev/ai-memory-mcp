@@ -2999,6 +2999,16 @@ pub fn run_mcp_server(
 
     let mut conn = db::open(db_path)?;
 
+    // #1720 B3 — boot-time operator self-lockout guard. When the operator
+    // has set AI_MEMORY_AGENT_ID (read-path ownership filtering scopes
+    // private rows to that caller), warn — or, under
+    // AI_MEMORY_REQUIRE_OWNED_ROWS, refuse to boot — if pre-existing
+    // private rows are owned by a different / pid-suffixed / unowned id,
+    // naming `ai-memory reown` as the fix. No-op when the env id is unset
+    // (single-operator trust-all default). The `?` makes the refuse posture
+    // abort MCP startup before the stdio loop opens.
+    crate::identity::enforce_owner_lockout_guard(&conn)?;
+
     // #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
     // agent-action gate on the MCP write surface. Pre-#1583 the hook
     // was installed ONLY by the HTTP daemon (`bootstrap_serve`), so an

@@ -287,6 +287,85 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
     Some(v)
 }
 
+/// #1720 B3 — env flag that turns a detected boot-time owner-lockout into a
+/// hard REFUSAL instead of a WARN. Truthy (`1`/`true`/`yes`/`on`) makes
+/// [`enforce_owner_lockout_guard`] return an error (aborting MCP boot) when
+/// `AI_MEMORY_AGENT_ID` is set but pre-existing private rows are owned by a
+/// different / pid-suffixed / unowned id. Default (unset) = WARN-only.
+pub const ENV_REQUIRE_OWNED_ROWS: &str = "AI_MEMORY_REQUIRE_OWNED_ROWS";
+
+/// Returns true when [`ENV_REQUIRE_OWNED_ROWS`] is truthy.
+#[must_use]
+pub fn require_owned_rows_enabled() -> bool {
+    let Ok(v) = std::env::var(ENV_REQUIRE_OWNED_ROWS) else {
+        return false;
+    };
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// #1720 B3 — boot-time operator self-lockout guard.
+///
+/// The lockout trap: an operator sets `AI_MEMORY_AGENT_ID` (so read-path
+/// ownership filtering scopes private rows to that caller) on a database
+/// whose pre-existing `scope=private` rows were stamped with a DIFFERENT id
+/// — e.g. a legacy pid-suffixed owner from before #1720 B1, or another
+/// agent's id, or no owner at all. Under enforcement those rows are
+/// invisible to the new caller: the operator is locked out of their own
+/// memories without any signal.
+///
+/// This guard runs once at MCP boot (the primary interactive NHI surface,
+/// and the only one that honors `AI_MEMORY_AGENT_ID` for reads — the HTTP
+/// daemon is multi-tenant and ignores the env id). When the env caller is
+/// unset it is a no-op (trust-all; no lockout is possible). Otherwise it
+/// runs a single indexed COUNT
+/// ([`crate::storage::count_private_rows_hidden_from`]); a non-zero result
+/// emits a loud stderr WARN naming `ai-memory reown` as the fix. If
+/// [`require_owned_rows_enabled`] is set, the same condition is a hard
+/// refusal (returns `Err`) so a strict operator cannot silently boot into a
+/// locked-out state.
+///
+/// Filtering itself is NOT changed here — this is purely an advisory probe
+/// over the rows the existing predicate would hide.
+///
+/// # Errors
+///
+/// Returns an error only when a lockout is detected AND
+/// [`require_owned_rows_enabled`] is true (refuse-on-lockout posture), or
+/// when the underlying COUNT query fails.
+pub fn enforce_owner_lockout_guard(conn: &rusqlite::Connection) -> Result<()> {
+    let Some(caller) = resolve_read_visibility_caller() else {
+        return Ok(());
+    };
+    let (hidden, sample) = crate::storage::count_private_rows_hidden_from(conn, &caller)?;
+    if hidden == 0 {
+        return Ok(());
+    }
+    let owned_by = sample.map_or_else(
+        || "(unowned rows)".to_string(),
+        |s| format!("e.g. owned by `{s}`"),
+    );
+    let detail = format!(
+        "AI_MEMORY_AGENT_ID is set to `{caller}`, but {hidden} private \
+         row(s) in this database are NOT owned by it ({owned_by}). With \
+         read-path ownership filtering those rows are HIDDEN from `{caller}` \
+         — the operator self-lockout trap (#1720). Re-own them first:\n    \
+         ai-memory reown --namespace <ns> --to {caller}\n  \
+         (add --claim-unowned to also take rows with no owner; --dry-run to \
+         preview)."
+    );
+    if require_owned_rows_enabled() {
+        anyhow::bail!(
+            "ai-memory: refusing to start ({} set) — {detail}",
+            ENV_REQUIRE_OWNED_ROWS
+        );
+    }
+    eprintln!("ai-memory: WARN (#1720 B3 owner-lockout) — {detail}");
+    Ok(())
+}
+
 /// Resolve `agent_id` for a single HTTP request.
 ///
 /// `body` is the (optional) `agent_id` field from `CreateMemory`;
@@ -593,6 +672,96 @@ mod tests {
         assert_eq!(resolve_read_visibility_caller(), None);
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    // --- #1720 B3 — boot owner-lockout guard -----------------------------
+
+    #[test]
+    fn require_owned_rows_flag_parses() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        assert!(!require_owned_rows_enabled());
+        for truthy in ["1", "true", "YES", "On"] {
+            unsafe {
+                std::env::set_var(ENV_REQUIRE_OWNED_ROWS, truthy);
+            }
+            assert!(require_owned_rows_enabled(), "{truthy} should be truthy");
+        }
+        unsafe {
+            std::env::set_var(ENV_REQUIRE_OWNED_ROWS, "0");
+        }
+        assert!(!require_owned_rows_enabled());
+        unsafe {
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+    }
+
+    /// Insert one `scope=private` row owned by `owner` into a fresh
+    /// in-memory DB (migrations applied by `storage::open`). The VIRTUAL
+    /// generated columns project the metadata at query time, so a raw
+    /// INSERT carrying a metadata JSON is sufficient.
+    fn db_with_private_row(owner: &str) -> rusqlite::Connection {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+                 (id, tier, namespace, title, content, created_at, updated_at, metadata) \
+             VALUES ('r1','long','ns','t','c','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z', \
+                 json_object('agent_id', ?1, 'scope', 'private'))",
+            [owner],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn lockout_guard_noop_when_env_unset() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        // A row exists that WOULD be hidden, but with no env caller the guard
+        // never queries — single-operator trust-all default.
+        let conn = db_with_private_row("host:laptop:pid-9");
+        assert!(enforce_owner_lockout_guard(&conn).is_ok());
+    }
+
+    #[test]
+    fn lockout_guard_warns_then_refuses_b3() {
+        let _g = env_var_lock();
+        let conn = db_with_private_row("host:laptop:pid-9");
+        // Caller `bob` does not own the private row.
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "bob");
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        // WARN-only posture: returns Ok (the warning goes to stderr).
+        assert!(
+            enforce_owner_lockout_guard(&conn).is_ok(),
+            "default posture must WARN, not refuse"
+        );
+        // Refuse posture: hard error naming reown.
+        unsafe {
+            std::env::set_var(ENV_REQUIRE_OWNED_ROWS, "1");
+        }
+        let err = enforce_owner_lockout_guard(&conn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("reown"), "error must name the fix; got: {msg}");
+        assert!(msg.contains("host:laptop:pid-9"), "got: {msg}");
+        // A caller that DOES own the row clears the guard even under refuse.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "host:laptop:pid-9");
+        }
+        assert!(enforce_owner_lockout_guard(&conn).is_ok());
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
         }
     }
 
