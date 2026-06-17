@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 64).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 65).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -634,7 +634,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 64;
+const CURRENT_SCHEMA_VERSION: i64 = 65;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1136,6 +1136,15 @@ const MIGRATION_V62_SQLITE: &str = include_str!("../../migrations/sqlite/0052_v6
 // rebuild dance exactly; the only delta is the extended CHECK clause.
 const MIGRATION_V63_SQLITE: &str =
     include_str!("../../migrations/sqlite/0053_v63_memory_links_typed_cognition_relations.sql");
+
+// v0.8.0 #1709 — RESTORE the memory_links (attest_level, signature)
+// atomicity triggers that the v63 (0053) memory_links full-table-rebuild
+// silently dropped (a SQLite `DROP TABLE` drops all attached triggers;
+// the v63 recreation block restored relation + attest_level but missed
+// the 0037 signature pair). Idempotent DROP IF EXISTS + CREATE; postgres
+// is unaffected (its #902 signature CHECK survived the in-place swap).
+const MIGRATION_V65_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0054_v65_restore_memory_links_signature_triggers.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2725,6 +2734,17 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+
+        if version < 65 {
+            // v0.8.0 #1709 — restore the memory_links (attest_level,
+            // signature) atomicity triggers dropped by the v63 (0053)
+            // full-table-rebuild. Idempotent (DROP IF EXISTS + CREATE);
+            // bodies byte-identical to migration 0037. Closes the
+            // #810/#813 phantom-signed regression. Postgres unaffected —
+            // its #902 signature CHECK survived the in-place relation swap,
+            // so the postgres v65 arm is a version-stamp no-op.
+            conn.execute_batch(MIGRATION_V65_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
