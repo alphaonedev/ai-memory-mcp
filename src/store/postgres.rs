@@ -12822,6 +12822,69 @@ impl MemoryStore for PostgresStore {
         Ok(usize::try_from(n).unwrap_or(0))
     }
 
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_id: &str,
+        claim_unowned: bool,
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        // v0.8.0 #1709/#1720 WS-B B2 — postgres twin of
+        // `crate::storage::reown`. `metadata` is JSONB; `jsonb_set` on
+        // the single `{agent_id}` path preserves every other key, and
+        // the `agent_id_idx` STORED generated column re-projects the new
+        // owner automatically. `to_id` is validated identically so a
+        // malformed owner can never be written on either backend.
+        crate::validate::validate_agent_id(to_id).map_err(|e| StoreError::InvalidInput {
+            detail: format!("reown: invalid --to agent_id: {e}"),
+        })?;
+
+        // Default: rows already carrying an `agent_id` (the JSONB `?`
+        // key-exists operator + a non-empty text projection).
+        // `--claim-unowned`: every row in the namespace.
+        let owner_filter = if claim_unowned {
+            ""
+        } else {
+            " AND metadata ? 'agent_id' AND COALESCE(metadata ->> 'agent_id', '') != ''"
+        };
+
+        let matched: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM memories WHERE namespace = $1{owner_filter}"
+        ))
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("reown count", e))?;
+        let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+
+        if dry_run {
+            return Ok(crate::storage::ReownReport {
+                matched,
+                rewritten: 0,
+                dry_run: true,
+            });
+        }
+
+        let result = sqlx::query(&format!(
+            "UPDATE memories \
+             SET metadata = jsonb_set(metadata, '{{agent_id}}', to_jsonb($2::text)) \
+             WHERE namespace = $1{owner_filter}"
+        ))
+        .bind(namespace)
+        .bind(to_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("reown update", e))?;
+        let rewritten = usize::try_from(result.rows_affected()).unwrap_or(usize::MAX);
+
+        Ok(crate::storage::ReownReport {
+            matched,
+            rewritten,
+            dry_run: false,
+        })
+    }
+
     async fn action_create(
         &self,
         _ctx: &CallerContext,

@@ -717,6 +717,40 @@ pub trait MemoryStore: Send + Sync {
         Ok(written)
     }
 
+    /// v0.8.0 #1709/#1720 WS-B B2 — rewrite `metadata.agent_id` (the
+    /// NHI ownership stamp) on the memories in EXACTLY `namespace` to
+    /// `to_id`, so an operator can establish durable ownership over a
+    /// namespace BEFORE enabling `scope=private` visibility filtering
+    /// (avoiding a self-lockout from legacy / foreign-owned rows).
+    ///
+    /// Default rewrites every OWNED row (any present `agent_id`);
+    /// `claim_unowned` additionally covers rows with a NULL/empty
+    /// `agent_id`. `dry_run` counts the matched rows and writes nothing.
+    /// Only the single `agent_id` metadata key is rewritten — every
+    /// other key is preserved and the `agent_id_idx` generated column
+    /// re-projects the new owner (no schema change). `to_id` is
+    /// validated; a malformed owner is rejected before any write.
+    ///
+    /// Mirrors [`crate::storage::reown`] on the SQLite path. Default
+    /// returns `UnsupportedCapability` so an in-memory/test adapter
+    /// round-trips cleanly.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default.
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _to_id: &str,
+        _claim_unowned: bool,
+        _dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REOWN".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`

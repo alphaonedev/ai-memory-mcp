@@ -61,6 +61,11 @@ pub mod namespace;
 pub mod offload;
 pub mod promote;
 pub mod recall;
+/// v0.8.0 #1709/#1720 WS-B B2 — `ai-memory reown` subcommand. Rewrite
+/// the `metadata.agent_id` ownership stamp on a namespace's memories
+/// BEFORE enabling `scope=private` visibility filtering (avoids
+/// operator self-lockout). Additive admin tool; no MCP/HTTP surface.
+pub mod reown;
 /// v0.7.0 (issue #691) — `ai-memory rules` subcommand. CRUD for the
 /// substrate-level agent-action rules engine. Mutation verbs (add /
 /// enable / disable / remove) require the operator keypair on disk.

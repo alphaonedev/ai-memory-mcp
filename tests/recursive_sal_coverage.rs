@@ -869,6 +869,44 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     merged_tags.sort();
     assert_eq!(merged_tags, vec!["a", "b"], "tags union (both survive)");
     assert_eq!(merged.priority, 5, "priority is max(3, 5)");
+
+    // v0.8.0 #1709/#1720 WS-B B2 — reown both-adapter roundtrip. Seed a
+    // dedicated owned row, dry-run (count, no write), then live re-own
+    // it to a fresh owner; the matched/rewritten counts must agree and
+    // the new owner must stick.
+    let reown_ns = format!("{TEST_NS}_reown");
+    let reown_row = base_memory(
+        &format!("sal-reown-{}", uuid_like()),
+        &reown_ns,
+        "sal-reown-row",
+    );
+    let reown_id = store
+        .store(&ctx, &reown_row)
+        .await
+        .expect("store reown row");
+
+    let dry = store
+        .reown(&ctx, &reown_ns, "reown-new-owner", false, true)
+        .await
+        .expect("reown dry-run");
+    assert_eq!(dry.matched, 1, "dry-run matches the one seeded row");
+    assert_eq!(dry.rewritten, 0, "dry-run writes nothing");
+    assert!(dry.dry_run);
+
+    let live = store
+        .reown(&ctx, &reown_ns, "reown-new-owner", false, false)
+        .await
+        .expect("reown live");
+    assert_eq!(live.matched, 1);
+    assert_eq!(live.rewritten, 1, "live run rewrites the owned row");
+    assert!(!live.dry_run);
+
+    let reowned = store.get(&ctx, &reown_id).await.expect("get reowned row");
+    assert_eq!(
+        reowned.metadata.get("agent_id").and_then(|v| v.as_str()),
+        Some("reown-new-owner"),
+        "the new owner stamp stuck via the SAL trait on this adapter"
+    );
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

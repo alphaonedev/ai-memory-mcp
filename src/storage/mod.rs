@@ -8401,6 +8401,110 @@ pub fn set_embeddings_batch_reembed(
     Ok(rows_updated)
 }
 
+/// v0.8.0 #1709/#1720 WS-B B2 — outcome of a [`reown`] sweep.
+///
+/// `matched` is the number of rows the namespace + ownership filter
+/// selected; `rewritten` is the number actually written (`0` under a
+/// dry-run, otherwise `== matched` because the `UPDATE` and the
+/// `COUNT` share the same `WHERE`). `dry_run` echoes the requested
+/// mode so the CLI / JSON envelope can render the right verb without
+/// re-deriving it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReownReport {
+    /// Rows selected by the namespace + ownership filter.
+    pub matched: usize,
+    /// Rows whose `metadata.agent_id` was rewritten (0 on dry-run).
+    pub rewritten: usize,
+    /// Whether this was a dry-run (count only, no write).
+    pub dry_run: bool,
+}
+
+/// v0.8.0 #1709/#1720 WS-B B2 — rewrite `metadata.agent_id` (the NHI
+/// ownership stamp) on the memories in **exactly** `namespace` to
+/// `to_id`, establishing durable ownership BEFORE an operator turns on
+/// `scope=private` visibility filtering (so a namespace can be claimed
+/// without the operator locking themselves out of legacy rows).
+///
+/// Semantics (least-surprising; documented in the CLI `--help`):
+/// - Target rows are the EXACT-namespace match (`namespace = ?ns`), not
+///   the namespace subtree — predictable + safe for an admin migration.
+/// - Default: rewrite every row whose `metadata.agent_id` is present
+///   (any current owner) to `to_id` — the operator is explicitly
+///   claiming the whole namespace. Rows with an absent/empty
+///   `agent_id` (legacy / unowned) are LEFT UNTOUCHED.
+/// - `claim_unowned`: ADDITIONALLY rewrite rows with NULL/empty
+///   `agent_id`, so the `empty_owner_blocks_named_caller` legacy class
+///   gets a durable owner too.
+/// - `dry_run`: COUNT the matched rows, write NOTHING, return
+///   `rewritten = 0`.
+///
+/// Only `metadata.agent_id` is touched (`json_set` of the single key) —
+/// every other metadata key is preserved, and the `agent_id_idx`
+/// generated column re-projects the new owner automatically (no schema
+/// change, no FTS sync — FTS tracks `(title, content, tags)` only).
+/// `to_id` is validated via [`crate::validate::validate_agent_id`] so a
+/// malformed owner can never be written.
+///
+/// Idempotent: a second run rewrites the same rows to the same id with
+/// no error (the metadata is byte-identical after the first pass).
+///
+/// # Errors
+///
+/// - `to_id` fails [`crate::validate::validate_agent_id`].
+/// - the underlying `COUNT` / `UPDATE` fails.
+pub fn reown(
+    conn: &Connection,
+    namespace: &str,
+    to_id: &str,
+    claim_unowned: bool,
+    dry_run: bool,
+) -> Result<ReownReport> {
+    crate::validate::validate_agent_id(to_id)
+        .map_err(|e| anyhow::anyhow!("reown: invalid --to agent_id: {e}"))?;
+
+    // Ownership predicate. Default: rows that already carry an
+    // `agent_id` (any owner). `--claim-unowned`: ALSO rows with a
+    // NULL/empty `agent_id` — i.e. every row in the namespace.
+    let owner_filter = if claim_unowned {
+        ""
+    } else {
+        " AND json_extract(metadata, '$.agent_id') IS NOT NULL \
+          AND json_extract(metadata, '$.agent_id') != ''"
+    };
+
+    let matched: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM memories WHERE namespace = ?1{owner_filter}"),
+        params![namespace],
+        |row| row.get(0),
+    )?;
+    let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+
+    if dry_run {
+        return Ok(ReownReport {
+            matched,
+            rewritten: 0,
+            dry_run: true,
+        });
+    }
+
+    // `json_set` rewrites ONLY `$.agent_id`, preserving the rest of the
+    // metadata object; the `agent_id_idx` generated column auto-updates.
+    let rewritten = conn.execute(
+        &format!(
+            "UPDATE memories \
+             SET metadata = json_set(metadata, '$.agent_id', ?2) \
+             WHERE namespace = ?1{owner_filter}"
+        ),
+        params![namespace, to_id],
+    )?;
+
+    Ok(ReownReport {
+        matched,
+        rewritten,
+        dry_run: false,
+    })
+}
+
 /// #1598 — `(total_rows, rows_with_embeddings)` for the reembed
 /// dry-run plan, optionally namespace-filtered. `COUNT(embedding)`
 /// counts non-NULL values, so the missing count is the difference.
@@ -13855,6 +13959,171 @@ mod tests {
         .unwrap();
         assert_eq!(n, 0);
         assert_eq!(set_embeddings_batch_reembed(&mut conn, &[]).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 #1709/#1720 WS-B B2 — `reown` (rewrite metadata.agent_id).
+    // -----------------------------------------------------------------
+
+    /// Insert a row with explicit metadata so the reown tests can seed
+    /// owned / unowned / multi-key shapes.
+    fn insert_with_meta(
+        conn: &Connection,
+        title: &str,
+        ns: &str,
+        meta: serde_json::Value,
+    ) -> String {
+        let mut m = make_memory(title, ns, Tier::Long, 5);
+        m.metadata = meta;
+        insert(conn, &m).unwrap()
+    }
+
+    fn agent_id_of(conn: &Connection, id: &str) -> Option<String> {
+        get(conn, id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// Default reown rewrites every OWNED row's agent_id to `--to`,
+    /// preserves the other metadata keys, leaves unowned rows + other
+    /// namespaces untouched, and the `agent_id_idx` reflects the owner.
+    #[test]
+    fn reown_rewrites_owned_rows_preserving_other_keys_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice", "scope": "private", "k": "v"}),
+        );
+        let other_ns = insert_with_meta(
+            &conn,
+            "elsewhere",
+            "other-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+
+        let report = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.rewritten, 1);
+        assert!(!report.dry_run);
+
+        // Owner rewritten; sibling metadata keys preserved.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+        let meta = get(&conn, &owned).unwrap().unwrap().metadata;
+        assert_eq!(meta.get("scope").and_then(|v| v.as_str()), Some("private"));
+        assert_eq!(meta.get("k").and_then(|v| v.as_str()), Some("v"));
+
+        // Generated agent_id_idx re-projects the new owner.
+        let idx: Option<String> = conn
+            .query_row(
+                "SELECT agent_id_idx FROM memories WHERE id = ?1",
+                params![owned],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx.as_deref(), Some("bob"));
+
+        // Other namespace untouched.
+        assert_eq!(agent_id_of(&conn, &other_ns).as_deref(), Some("alice"));
+    }
+
+    /// dry-run COUNTS matched rows but writes NOTHING.
+    #[test]
+    fn reown_dry_run_counts_but_does_not_write_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.rewritten, 0);
+        assert!(report.dry_run);
+        // No write happened.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
+    }
+
+    /// `--claim-unowned` covers empty/missing-agent_id rows; the default
+    /// leaves them untouched.
+    #[test]
+    fn reown_claim_unowned_covers_empty_and_missing_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let empty = insert_with_meta(
+            &conn,
+            "empty",
+            "claim-ns",
+            serde_json::json!({"agent_id": ""}),
+        );
+        let missing = insert_with_meta(
+            &conn,
+            "missing",
+            "claim-ns",
+            serde_json::json!({"scope": "private"}),
+        );
+
+        // Default leaves the unowned rows alone (matches only `owned`).
+        let default_report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        assert_eq!(default_report.matched, 1);
+
+        // claim_unowned covers all three.
+        let report = reown(&conn, "claim-ns", "bob", true, false).unwrap();
+        assert_eq!(report.matched, 3);
+        assert_eq!(report.rewritten, 3);
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+        assert_eq!(agent_id_of(&conn, &empty).as_deref(), Some("bob"));
+        assert_eq!(agent_id_of(&conn, &missing).as_deref(), Some("bob"));
+        // The previously-missing row had its other keys preserved.
+        let meta = get(&conn, &missing).unwrap().unwrap().metadata;
+        assert_eq!(meta.get("scope").and_then(|v| v.as_str()), Some("private"));
+    }
+
+    /// Running reown twice is idempotent (second run rewrites the same
+    /// rows to the same id, no error, same count).
+    #[test]
+    fn reown_is_idempotent_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let first = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        let second = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        assert_eq!(first.rewritten, 1);
+        assert_eq!(second.matched, 1);
+        assert_eq!(second.rewritten, 1);
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+    }
+
+    /// A malformed `--to` agent_id is rejected before any write.
+    #[test]
+    fn reown_rejects_invalid_to_id_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        // Whitespace / control chars are rejected by validate_agent_id.
+        let err = reown(&conn, "claim-ns", "bad id\n", false, false).unwrap_err();
+        assert!(format!("{err}").contains("agent_id"), "got: {err}");
+        // No write happened.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
     }
 
     /// #1598 — dry-run coverage counts, with and without the namespace
