@@ -273,10 +273,25 @@ impl MemoryStore for SqliteStore {
         // update by a transaction window) still fail-closed.
         // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller; mirror
         // the #910 post-filter principal (`effective_principal`).
-        let vis_caller = if ctx.bypass_visibility {
-            None
+        // v0.8.0 #1720 A7 — on a BYPASS read (admin/migrate/federation
+        // catchup/GC) we BOTH pass `vis_caller=None` AND drop `as_agent`.
+        // The A2 owner-keyed `visibility_clause` only trust-alls via the
+        // `?private_ph IS NULL` sentinel, and `private_ph` is bound from
+        // `compute_visibility_prefixes(as_agent)` — so a bypass ctx that
+        // carries `as_agent=Some(..)` would bind a NON-null `private_ph`,
+        // the sentinel would NOT fire, and the owner-keyed private arm
+        // would be false (caller is NULL) — excluding every private row
+        // from an admin who is supposed to read everything. Forcing
+        // `as_agent=None` on bypass fires the sentinel → trust-all,
+        // matching the postgres adapter, whose recall/search/recall_hybrid
+        // bind `caller=NULL` on bypass and trust-all via `$N::text IS NULL`
+        // REGARDLESS of `as_agent`. `as_agent` ONLY feeds visibility
+        // scoping; `filter.namespace` scopes the query independently
+        // (separate `db::search` argument), so dropping it here is safe.
+        let (vis_caller, vis_as_agent) = if ctx.bypass_visibility {
+            (None, None)
         } else {
-            Some(ctx.effective_principal())
+            (Some(ctx.effective_principal()), ctx.as_agent.as_deref())
         };
         let rows = db::search(
             &conn,
@@ -289,7 +304,7 @@ impl MemoryStore for SqliteStore {
             until.as_deref(),
             tags_first,
             filter.agent_id.as_deref(),
-            ctx.as_agent.as_deref(),
+            vis_as_agent,
             false,
             vis_caller,
         )
@@ -526,10 +541,20 @@ impl MemoryStore for SqliteStore {
         // resolved principal the #910 post-filter below applies
         // (`effective_principal` = `as_agent` when set, else `agent_id`)
         // so the SQL gate and the Rust post-filter agree.
-        let vis_caller = if ctx.bypass_visibility {
-            None
+        // v0.8.0 #1720 A7 — on a BYPASS read also drop `as_agent` so the
+        // `?private_ph IS NULL` sentinel in `visibility_clause` fires and
+        // trust-alls (admin sees every private row). See the matching
+        // comment in `search()` above for the full rationale; without
+        // this a bypass ctx carrying `as_agent=Some(..)` binds a non-null
+        // `private_ph`, the sentinel never fires, and the owner-keyed
+        // private arm excludes every private row from the admin. Matches
+        // postgres recall/recall_hybrid (caller=NULL on bypass → trust-all
+        // regardless of as_agent). `filter.namespace` still scopes the
+        // query independently of `as_agent`.
+        let (vis_caller, vis_as_agent) = if ctx.bypass_visibility {
+            (None, None)
         } else {
-            Some(ctx.effective_principal())
+            (Some(ctx.effective_principal()), ctx.as_agent.as_deref())
         };
         let results = if let Some(qe) = query_embedding {
             db::recall_hybrid(
@@ -544,7 +569,7 @@ impl MemoryStore for SqliteStore {
                 None, // vector_index threaded by the caller from AppState
                 crate::SECS_PER_HOUR,
                 crate::SECS_PER_DAY,
-                ctx.as_agent.as_deref(),
+                vis_as_agent,
                 None,
                 &scoring,
                 false,
@@ -569,7 +594,7 @@ impl MemoryStore for SqliteStore {
                 until.as_deref(),
                 crate::SECS_PER_HOUR,
                 crate::SECS_PER_DAY,
-                ctx.as_agent.as_deref(),
+                vis_as_agent,
                 None,
                 false,
                 None,

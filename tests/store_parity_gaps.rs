@@ -1080,4 +1080,147 @@ mod postgres_side {
              after run_gc commits — get() must return Err(NotFound); got {live:?}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 #1709/#1720 Workstream-A (unit A7) — postgres twin of the
+    // sqlite cross-tenant `scope=private` leak regression
+    // (`tests/visibility_private_leak_1720.rs`) + the bypass-correctness
+    // contract (`tests/sqlite_admin_bypass_visibility_a7_1720.rs`).
+    //
+    // The postgres recall/search/recall_hybrid read paths are ALREADY
+    // owner-keyed at HEAD with the `target_agent_id` carve-out and a
+    // NULL-caller trust-all bypass (src/store/postgres.rs ~10577 / 10771
+    // / 11627):
+    //
+    //   $N::text IS NULL
+    //   OR COALESCE(metadata->>'scope','private') <> 'private'
+    //   OR metadata->>'agent_id' = $N
+    //   OR metadata->>'target_agent_id' = $N
+    //
+    // with `caller = if ctx.bypass_visibility { None } else { Some(..) }`.
+    // So pg has NO leak — A7 is parity verification, not a pg fix. This
+    // test pins the adapter-agnostic contract on the POSTGRES side:
+    //
+    //   * non-admin (no bypass) + as_agent=NS  → MUST NOT see alice's
+    //     private row (owner-keyed; the closed leak),
+    //   * owner alice                          → MUST see her own row,
+    //   * target_agent_id carve-out (inbox)    → recipient sees it,
+    //   * admin bypass (as_agent=Some)         → trust-all, sees private
+    //     (the same contract A7 just restored on sqlite).
+    //
+    // Gated on `AI_MEMORY_TEST_POSTGRES_URL` via `live_pg()` (skip-with-
+    // eprintln when unset, like every sibling pg-parity test) so it
+    // compiles + documents the contract here and runs in CI-with-pg.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_parity_private_leak_and_bypass_a7_1720() {
+        const NS: &str = "fortitude/X";
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+        const NEEDLE: &str = "needle-a7";
+
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+
+        // Seed alice's scope=private row + a target_agent_id inbox row
+        // (carve-out: alice owns it, bob is the recipient). Use a bypass
+        // ctx to seed so the SAL store path applies no visibility filter
+        // to the writes; the rows carry explicit owner/scope metadata.
+        let seed_ctx = ai_memory::store::CallerContext::for_admin("parity-test-a7");
+        let mut priv_mem = sample_memory("pg-a7-alice-priv");
+        priv_mem.namespace = NS.to_string();
+        priv_mem.content = format!("{NEEDLE} alice private");
+        priv_mem.metadata = serde_json::json!({"agent_id": ALICE, "scope": "private"});
+        let mut inbox_mem = sample_memory("pg-a7-inbox");
+        inbox_mem.namespace = NS.to_string();
+        inbox_mem.content = format!("{NEEDLE} alice inbox for bob");
+        inbox_mem.metadata =
+            serde_json::json!({"agent_id": ALICE, "scope": "private", "target_agent_id": BOB});
+        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &priv_mem).await;
+        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &inbox_mem).await;
+
+        let filter = ai_memory::store::Filter {
+            namespace: Some(NS.to_string()),
+            limit: 100,
+            ..ai_memory::store::Filter::default()
+        };
+
+        let has = |rows: &[Memory], id: &str| rows.iter().any(|m| m.id == id);
+        let has_scored = |rows: &[(Memory, f64)], id: &str| rows.iter().any(|(m, _)| m.id == id);
+
+        // --- bob (non-admin, no bypass) impersonating the namespace ---
+        let mut bob_ctx = ai_memory::store::CallerContext::for_agent(BOB);
+        bob_ctx.as_agent = Some(NS.to_string());
+        assert!(!bob_ctx.bypass_visibility, "non-admin ctx never bypasses");
+
+        let bob_search = ai_memory::store::MemoryStore::search(&pg, &bob_ctx, NEEDLE, &filter)
+            .await
+            .expect("bob search");
+        assert!(
+            !has(&bob_search, "pg-a7-alice-priv"),
+            "#1720 pg LEAK: bob (non-admin) MUST NOT see alice's private row via search; got={:?}",
+            bob_search.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        // Inbox carve-out: bob IS the target_agent_id, so bob DOES see it.
+        assert!(
+            has(&bob_search, "pg-a7-inbox"),
+            "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox row via search"
+        );
+
+        let bob_recall =
+            ai_memory::store::MemoryStore::recall_hybrid(&pg, &bob_ctx, NEEDLE, None, &filter)
+                .await
+                .expect("bob recall_hybrid");
+        assert!(
+            !has_scored(&bob_recall, "pg-a7-alice-priv"),
+            "#1720 pg LEAK: bob MUST NOT see alice's private row via recall_hybrid; got={:?}",
+            bob_recall.iter().map(|(m, _)| &m.id).collect::<Vec<_>>()
+        );
+        assert!(
+            has_scored(&bob_recall, "pg-a7-inbox"),
+            "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox via recall_hybrid"
+        );
+
+        // --- alice (owner) sees her own private row ---
+        let mut alice_ctx = ai_memory::store::CallerContext::for_agent(ALICE);
+        alice_ctx.as_agent = Some(NS.to_string());
+        let alice_search = ai_memory::store::MemoryStore::search(&pg, &alice_ctx, NEEDLE, &filter)
+            .await
+            .expect("alice search");
+        assert!(
+            has(&alice_search, "pg-a7-alice-priv"),
+            "#1720 pg: owner alice MUST see her own private row via search"
+        );
+
+        // --- admin bypass = trust-all, sees private REGARDLESS of as_agent
+        //     (the same contract A7 restored on sqlite). Pin BOTH as_agent
+        //     shapes so the postgres NULL-caller trust-all is unambiguous.
+        for with_as_agent in [false, true] {
+            let mut admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-a7-admin");
+            assert!(admin_ctx.bypass_visibility, "for_admin sets bypass");
+            if with_as_agent {
+                admin_ctx.as_agent = Some(NS.to_string());
+            }
+            let admin_search =
+                ai_memory::store::MemoryStore::search(&pg, &admin_ctx, NEEDLE, &filter)
+                    .await
+                    .expect("admin search");
+            assert!(
+                has(&admin_search, "pg-a7-alice-priv"),
+                "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
+                 alice's private row via search — parity with sqlite + the pg NULL-caller bypass"
+            );
+            let admin_recall = ai_memory::store::MemoryStore::recall_hybrid(
+                &pg, &admin_ctx, NEEDLE, None, &filter,
+            )
+            .await
+            .expect("admin recall_hybrid");
+            assert!(
+                has_scored(&admin_recall, "pg-a7-alice-priv"),
+                "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
+                 alice's private row via recall_hybrid"
+            );
+        }
+    }
 }
