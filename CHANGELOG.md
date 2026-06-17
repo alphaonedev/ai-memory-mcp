@@ -18,6 +18,29 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **Pillar-2.5 compaction — size-GC (corpus byte-cap eviction)**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)). The
+  curator now evicts under byte pressure: when a namespace's live corpus
+  (`SUM(length(title)+length(content)+length(metadata))` over its
+  non-archived rows — the same byte metric the K8 write quota uses) exceeds
+  a configured cap, the lowest-value memories are evicted (archived-before-
+  deleted, so **restorable**) one at a time until the corpus is back under
+  cap. Eviction order is a pure, deterministic SQL ranking — least-durable
+  tier first (`short` → `mid` → `long`), then `priority` / `access_count` /
+  `last_accessed_at` ascending — so a high-priority, frequently-accessed,
+  long-tier row is evicted last, only if still over cap. **No LLM on the
+  eviction path.** Surface: the `crate::storage::size_gc` free-fn, the
+  `MemoryStore::size_gc` SAL trait method on BOTH the sqlite (delegate) and
+  postgres (sqlx-native, per-victim transactional archive+delete mirroring
+  `run_gc`'s #1026 atomicity) adapters, the new `CompactionConfig.max_corpus_bytes`
+  config knob (`Option<i64>`, default `None` = disabled, opt-in via
+  `[curator.compaction]`), and the curator `run_once` wiring (gated on
+  `compaction.max_corpus_bytes.is_some()` && `!dry_run`; best-effort
+  per-namespace, errors land in `report.errors`) with the new
+  `CuratorReport.memories_evicted_size_gc` counter. **No schema change**
+  (reuses the existing `memories` / `archived_memories` columns + the
+  archive-before-delete path) and **no MCP tool-count change**. Victims
+  carry `archive_reason = 'size_gc'`, distinct from TTL-GC's `'ttl_expired'`.
 - **Pillar-1 coordination substrate** — typed actions with a state machine +
   typed DAG edges + single-holder heartbeat leases + an hourly lease-sweeper
   (`crate::actions`, `MemoryStore::{action_*,lease_*}`, 8 MCP tools); signed

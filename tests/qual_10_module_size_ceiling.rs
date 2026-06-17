@@ -153,7 +153,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (archive-listing full v49 projection), #1631 (insert_if_newer
     // version column). Measured 17_521 + 129 headroom; every addition
     // is a closed audit finding with its own regression test.
-    ("src/storage/mod.rs", 17_650),
+    //
+    // 2026-06-16 — bumped 17_650 → 17_950 by the v0.8.0 Pillar-2.5
+    // (#1709) size-GC unit: the net-new `size_gc` free-fn (corpus
+    // byte-cap eviction) + its `namespace_corpus_bytes` helper + the
+    // two hoisted SQL consts, plus the 8-test in-file `mod tests` block
+    // (over-cap / eviction-order / under-cap-noop / restorable-archive /
+    // hard-delete / disabled-cap / namespace-scoped / cap-exactly-at-
+    // corpus). Measured 17_900 + 50 headroom; pure additive feature +
+    // its deterministic SQL-ranking regression coverage, no LLM on the
+    // eviction path, far under the 1.5x cap.
+    ("src/storage/mod.rs", 17_950),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -378,7 +388,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // typed-cognition migration: the `migrate_v63` method (the
     // memory_links.relation CHECK-extend) + its dispatch arm + the two
     // literal-version stamps on v61/v62. Measured 19_540 + ~100 headroom.
-    ("src/store/postgres.rs", 19_640),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2.5 size-GC SAL surface) — bumped
+    // 19_640 → 19_820: the sqlx-native `PostgresStore::size_gc` method
+    // (corpus byte-cap eviction — the SUM-bytes select + the
+    // lowest-value-first per-victim archive-INSERT/DELETE loop, mirroring
+    // run_gc's #1026 per-victim transactional atomicity). Measured 19_760
+    // + 60 headroom; new SAL surface so postgres-backed curators evict
+    // under byte pressure too, no LLM on the eviction path. The 19k-LOC
+    // module split remains the highest-priority manageability target.
+    ("src/store/postgres.rs", 19_820),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

@@ -1164,6 +1164,16 @@ impl MemoryStore for SqliteStore {
         db::gc(&conn, archive).map_err(box_err)
     }
 
+    async fn size_gc(
+        &self,
+        namespace: &str,
+        max_corpus_bytes: i64,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::size_gc(&conn, namespace, max_corpus_bytes, archive).map_err(box_err)
+    }
+
     async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         let conn = self.state.lock().await;
         db::restore_archived(&conn, id).map_err(box_err)

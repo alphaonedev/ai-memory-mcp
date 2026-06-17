@@ -13516,6 +13516,126 @@ impl MemoryStore for PostgresStore {
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }
 
+    async fn size_gc(
+        &self,
+        namespace: &str,
+        max_corpus_bytes: i64,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        // v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction, the
+        // postgres twin of `crate::storage::size_gc`. Same metric
+        // (`SUM(length(title)+length(content)+length(metadata))` over the
+        // live rows in `namespace`), same lowest-value-first eviction
+        // order, same archive-before-delete restorability. Deterministic +
+        // LLM-free. A non-positive cap is a no-op.
+        if max_corpus_bytes <= 0 {
+            return Ok(0);
+        }
+
+        let mut corpus: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(\
+                 length(title) + length(content) + length(metadata::text)), 0)::bigint \
+             FROM memories WHERE namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("size_gc corpus sum", e))?;
+
+        if corpus <= max_corpus_bytes {
+            return Ok(0);
+        }
+
+        let mut evicted = 0usize;
+        while corpus > max_corpus_bytes {
+            // Lowest-value victim: least-durable tier first, then lowest
+            // priority / access_count / last_accessed_at. NULLS FIRST on
+            // last_accessed_at so never-accessed rows evict first.
+            let victim: Option<(String, i64)> = sqlx::query_as(
+                "SELECT id, \
+                     (length(title) + length(content) + length(metadata::text))::bigint \
+                 FROM memories WHERE namespace = $1 \
+                 ORDER BY CASE tier \
+                     WHEN 'short' THEN 0 WHEN 'mid' THEN 1 WHEN 'long' THEN 2 ELSE 3 END ASC, \
+                 priority ASC, access_count ASC, last_accessed_at ASC NULLS FIRST \
+                 LIMIT 1",
+            )
+            .bind(namespace)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("size_gc next victim", e))?;
+
+            let Some((id, row_bytes)) = victim else {
+                break;
+            };
+
+            // One transaction per victim: archive-INSERT + live-DELETE, the
+            // same atomicity contract `run_gc` holds per-#1026 so a crash
+            // mid-flow never leaves a row in both tables.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("size_gc begin tx", e))?;
+
+            if archive {
+                sqlx::query(
+                    "INSERT INTO archived_memories (
+                        id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, archived_at, archive_reason, metadata,
+                        embedding, embedding_dim, original_tier, original_expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state
+                    )
+                    SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                           source, access_count, created_at, updated_at, last_accessed_at,
+                           expires_at, now(), 'size_gc', metadata,
+                           embedding, embedding_dim, tier, expires_at,
+                           reflection_depth, atomised_into, atom_of, memory_kind,
+                           entity_id, persona_version, citations, source_uri, source_span,
+                           confidence_source, confidence_signals, confidence_decayed_at,
+                           mentioned_entity_id, version, lifecycle_state
+                    FROM memories
+                    WHERE id = $1
+                    ON CONFLICT (id) DO UPDATE SET
+                        archived_at = EXCLUDED.archived_at,
+                        archive_reason = EXCLUDED.archive_reason",
+                )
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("size_gc archive copy", e))?;
+            }
+
+            sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("size_gc delete victim", e))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("size_gc commit", e))?;
+
+            evicted += 1;
+            corpus -= row_bytes;
+        }
+
+        // Best-effort cleanup of namespace_meta dangling references, same
+        // shape as run_gc's trailing sweep.
+        let _ = sqlx::query(
+            "DELETE FROM namespace_meta \
+             WHERE standard_id NOT IN (SELECT id FROM memories)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(evicted)
+    }
+
     async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
         let mut tx = self
             .pool
