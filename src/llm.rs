@@ -21,7 +21,7 @@
 //!     - alias values that pre-fill `AI_MEMORY_LLM_BASE_URL` for known vendors:
 //!       `xai`, `openai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`,
 //!       `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
-//!       `fireworks`, `lmstudio`
+//!       `fireworks`, `lmstudio`, `vllm`
 //! - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-backend URL.
 //! - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for OpenAI-compatible
 //!   backends. Some aliases also accept per-vendor env vars as a
@@ -189,6 +189,28 @@ where
 /// the codebase.
 pub const BACKEND_OLLAMA: &str = "ollama";
 
+/// v0.8.0 #1709 §11.4.C — canonical wire value for the dedicated vLLM
+/// backend alias. vLLM serves an OpenAI-compatible API (`POST
+/// /v1/chat/completions`, `POST /v1/embeddings`) on its default
+/// `--port 8000` mount, so a `vllm` alias is sugar over
+/// `openai-compatible` that pre-fills the base URL to
+/// `http://localhost:8000/v1` (mirroring how `lmstudio` pre-fills
+/// `http://localhost:1234/v1`). Keyless by default like `lmstudio` — a
+/// Bearer token can still be supplied via `AI_MEMORY_LLM_API_KEY` for a
+/// secured deployment. Centralised here for the same heterogeneous-NHI
+/// vendor-literal discipline as [`BACKEND_OLLAMA`] (#1067 / pm-v3.1);
+/// every site references this const, never the bare `"vllm"` literal.
+pub const BACKEND_VLLM: &str = "vllm";
+
+/// Placeholder model identifier for single-model OpenAI-compatible
+/// servers (LMStudio, vLLM) that serve whatever single model the
+/// process was launched with and ignore the request's `model` field.
+/// Centralised so the `lmstudio` + `vllm` default-model arms — in both
+/// [`LlmProvider::from_env`] (here) and
+/// `crate::config::default_model_for_alias` — share one definition
+/// (pm-v3.1 no-scattered-literal discipline / hardcoded-literal gate).
+pub const LOCAL_SERVER_MODEL_PLACEHOLDER: &str = "local-model";
+
 /// #1598 — OpenAI-compatible embeddings endpoint path suffix, appended
 /// to the resolved base URL (e.g. `https://openrouter.ai/api/v1`).
 /// Single source for the embed wire path across the client's two embed
@@ -219,6 +241,9 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
         "lmstudio" => Some("http://localhost:1234/v1"),
+        // v0.8.0 #1709 §11.4.C — vLLM's OpenAI-compatible server
+        // defaults to `--port 8000` with the `/v1` OpenAI route mount.
+        BACKEND_VLLM => Some("http://localhost:8000/v1"),
         _ => None,
     }
 }
@@ -250,6 +275,12 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
         "cerebras" => &["CEREBRAS_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "fireworks" => &["FIREWORKS_API_KEY"],
+        // v0.8.0 #1709 §11.4.C — vLLM is keyless by default (same as
+        // `lmstudio`, which also resolves via the `_ => &[]` fallthrough);
+        // a token can still be supplied via `AI_MEMORY_LLM_API_KEY` for a
+        // secured deployment. The explicit arm pins the contract so the
+        // `alias_api_key_env_vars_per_alias_pins_1067` test asserts it.
+        BACKEND_VLLM => &[],
         _ => &[],
     }
 }
@@ -615,7 +646,8 @@ impl OllamaClient {
     /// - `AI_MEMORY_LLM_BACKEND` — `ollama` (default) | `openai-compatible`
     ///   | one of the per-vendor aliases (`xai`, `openai`, `anthropic`,
     ///   `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`,
-    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
+    ///   `vllm`).
     /// - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-alias URL.
     /// - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for the
     ///   OpenAI-compatible path. Per-alias fallback env vars are also
@@ -660,7 +692,11 @@ impl OllamaClient {
                 "cerebras" => "llama-3.3-70b".to_string(),
                 "openrouter" => "openai/gpt-5".to_string(),
                 "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
-                "lmstudio" => "local-model".to_string(),
+                // v0.8.0 #1709 §11.4.C — vLLM, like LMStudio, serves
+                // whatever single model the server was launched with, so
+                // the shared placeholder is the sane default when the
+                // operator does not set `AI_MEMORY_LLM_MODEL`.
+                "lmstudio" | BACKEND_VLLM => LOCAL_SERVER_MODEL_PLACEHOLDER.to_string(),
                 _ => "gemma3:4b".to_string(),
             });
 
@@ -702,7 +738,7 @@ impl OllamaClient {
                          backend alias. Valid values: ollama, openai-compatible, \
                          openai, xai, anthropic, gemini, deepseek, kimi, qwen, \
                          mistral, groq, together, cerebras, openrouter, \
-                         fireworks, lmstudio"
+                         fireworks, lmstudio, vllm"
                     ));
                 };
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
@@ -2095,10 +2131,11 @@ mod tests {
     }
 
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
-    /// every vendor alias the v0.7.0 LLM client advertises and asserts
-    /// `default_base_url_for_alias` returns the documented host.
+    /// every vendor alias the LLM client advertises and asserts
+    /// `default_base_url_for_alias` returns the documented host. v0.8.0
+    /// #1709 §11.4.C added the 16th alias (`vllm`).
     #[test]
-    fn default_base_url_for_alias_covers_all_15_aliases_1067() {
+    fn default_base_url_for_alias_covers_all_16_aliases_1067() {
         let cases: &[(&str, Option<&str>)] = &[
             ("openai", Some("https://api.openai.com/v1")),
             ("xai", Some("https://api.x.ai/v1")),
@@ -2125,6 +2162,7 @@ mod tests {
             ("openrouter", Some("https://openrouter.ai/api/v1")),
             ("fireworks", Some("https://api.fireworks.ai/inference/v1")),
             ("lmstudio", Some("http://localhost:1234/v1")),
+            (BACKEND_VLLM, Some("http://localhost:8000/v1")),
             ("openai-compatible", None),
             ("totally-unknown-vendor", None),
         ];
@@ -2158,6 +2196,7 @@ mod tests {
             ("fireworks", &["FIREWORKS_API_KEY"]),
             (BACKEND_OLLAMA, &[]),
             ("lmstudio", &[]),
+            (BACKEND_VLLM, &[]),
             ("openai-compatible", &[]),
             ("totally-unknown-vendor", &[]),
         ];

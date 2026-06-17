@@ -96,6 +96,27 @@ lifecycle surface adds only permissive optional fields to the existing
   untouched, no read-path DB round-trip is added, no LLM runs on the read path,
   and the recall determinism invariant (`tests/bias_displacement_invariants_2_6.rs`,
   id-ranking byte-equality) holds.
+- **§11.4.C — vLLM first-class backend alias**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709); reconciles
+  doc-drift defect [#1677](https://github.com/alphaonedev/ai-memory-mcp/issues/1677)).
+  `AI_MEMORY_LLM_BACKEND=vllm` (and the embeddings sibling
+  `AI_MEMORY_EMBED_BACKEND=vllm`) are now a dedicated alias that pre-fills the
+  OpenAI-compatible base URL to `http://localhost:8000/v1` (vLLM's default
+  `--port 8000` + `/v1` route mount), instead of requiring the generic
+  `openai-compatible` backend plus an explicit `AI_MEMORY_LLM_BASE_URL`.
+  Keyless by default like `lmstudio` — a Bearer token may still be supplied via
+  `AI_MEMORY_LLM_API_KEY` for a secured deployment. Anchors:
+  `src/llm.rs::BACKEND_VLLM` (the 16th vendor alias), the
+  `src/llm.rs::default_base_url_for_alias` + `src/llm.rs::alias_api_key_env_vars`
+  arms, the `doctor` "Valid values:" enumeration, and the embed surface for free
+  via `src/config.rs::resolve_embeddings` → `is_api_embed_backend` (everything
+  but `ollama`) → the shared `default_base_url_for_alias`. Pins:
+  `default_base_url_for_alias_covers_all_16_aliases_1067`,
+  `alias_api_key_env_vars_per_alias_pins_1067`,
+  `resolve_embeddings_1709_vllm_alias_default_base_url`. The in-process
+  candle/mistralrs GPU backend remains v0.8.x-deferred per ROADMAP §11.4.C (the
+  `src/inference/mod.rs::GpuBackend` phase labels are corrected here to say so —
+  #1677). **No schema change. No MCP tool-count change.**
 
 ## [0.7.1] — 2026-06-15
 
