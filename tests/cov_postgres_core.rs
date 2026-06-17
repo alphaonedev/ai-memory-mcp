@@ -78,6 +78,7 @@ fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     }
 }
 

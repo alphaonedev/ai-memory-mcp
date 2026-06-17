@@ -175,6 +175,13 @@ CREATE TABLE IF NOT EXISTS memories (
     -- Fresh schemas carry this inline; existing schemas pick it up via
     -- migrate_v42().
     version               BIGINT NOT NULL DEFAULT 1,
+    -- v0.8.0 Pillar 2 (schema v64, #1709) — typed-cognition lifecycle
+    -- state. `open` for every legacy row (DEFAULT) and every fresh store
+    -- that omits the field; transitions are enforced at the write
+    -- boundary by `models::LifecycleState::can_transition_to`, not a SQL
+    -- CHECK. Fresh schemas carry it inline; existing schemas pick it up
+    -- via migrate_v64().
+    lifecycle_state       TEXT NOT NULL DEFAULT 'open',
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -412,7 +419,10 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     confidence_signals    TEXT,
     confidence_decayed_at TEXT,
     mentioned_entity_id   TEXT,
-    version               BIGINT
+    version               BIGINT,
+    -- v0.8.0 Pillar 2 (schema v64, #1709) — lifecycle_state mirror so
+    -- archive → restore is lossless. Nullable on legacy archived rows.
+    lifecycle_state       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

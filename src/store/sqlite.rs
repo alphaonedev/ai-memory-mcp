@@ -1739,6 +1739,7 @@ impl MemoryStore for SqliteStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
@@ -1943,6 +1944,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

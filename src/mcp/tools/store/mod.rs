@@ -110,6 +110,12 @@ pub struct StoreRequest {
     #[serde(default)]
     pub kind: Option<String>,
 
+    #[schemars(
+        description = "#1709 Pillar-2 initial lifecycle state (open|active|blocked|done|abandoned). Default open."
+    )]
+    #[serde(default)]
+    pub lifecycle_state: Option<String>,
+
     #[serde(default)]
     #[schemars(description = "#519 bypass proactive contradiction detection.")]
     pub force: Option<bool>,

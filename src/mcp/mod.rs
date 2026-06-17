@@ -5509,6 +5509,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -5596,6 +5597,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -5650,6 +5652,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5707,6 +5710,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5821,6 +5825,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             source_ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5990,6 +5995,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             source_ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -6701,6 +6707,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
         db::set_namespace_standard(&conn, "m9-parent", &std_id, None).unwrap();
@@ -6732,6 +6739,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(&conn, "repo/team/sub", &child_id, None).unwrap();
@@ -6806,6 +6814,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let parent_id = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "m9-explicit-parent", &parent_id, None).unwrap();
@@ -6837,6 +6846,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(
@@ -6905,6 +6915,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(conn, &mem).unwrap();
         db::set_namespace_standard(conn, namespace, &id, None).unwrap();
@@ -7198,6 +7209,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7328,6 +7340,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7551,6 +7564,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
 
@@ -7667,6 +7681,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8022,6 +8037,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8065,6 +8081,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8147,6 +8164,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8194,6 +8212,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8236,6 +8255,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -8530,6 +8550,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let pid = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "w12-explicit-grand", &pid, None).unwrap();
@@ -8638,6 +8659,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_promote", json!({"id": id}));
@@ -8780,6 +8802,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8836,6 +8859,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8889,6 +8913,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -8935,6 +8960,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8990,6 +9016,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -9038,6 +9065,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -9098,6 +9126,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let uri = "doc:test-uplift/abc#section-1";
         db::insert(&conn, &mk("kg-uplift", "a", Some(uri))).unwrap();
@@ -9182,6 +9211,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -9609,6 +9639,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -9671,6 +9702,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_update", json!({"id": id, "expires_at": ""}));
@@ -9713,6 +9745,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -9763,6 +9796,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -10176,6 +10210,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -10221,6 +10256,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(conn, &standard).unwrap();
         db::set_namespace_standard(conn, namespace, &std_id, None).unwrap();
@@ -10937,6 +10973,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11095,6 +11132,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&conn, &mk("a")).unwrap();
         let b = db::insert(&conn, &mk("b")).unwrap();
@@ -11203,6 +11241,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -11404,6 +11443,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11460,6 +11500,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11528,6 +11569,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11609,6 +11651,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11701,6 +11744,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11794,6 +11838,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11905,6 +11950,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -11949,6 +11995,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -12060,6 +12107,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -13231,6 +13279,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &stale).unwrap();
         let resp = crate::mcp::handle_load_family(
@@ -13554,6 +13603,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -13623,6 +13673,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -14250,6 +14301,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": false}));
@@ -14293,6 +14345,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": true}));
@@ -14474,6 +14527,7 @@ mod backfill_resilience_1595_tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }

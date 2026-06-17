@@ -656,6 +656,7 @@ fn ga2_memory(id: &str) -> ai_memory::models::Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     }
 }
 

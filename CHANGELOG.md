@@ -7,11 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.8.0 (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-In progress on `release/v0.8.0`. Schema advances v57 → **v63** (additive: actions /
+In progress on `release/v0.8.0`. Schema advances v57 → **v64** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
 routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
-6 → 9 relations at v63). Surface grows to **93 MCP tools** at `--profile full` and
-**27 hook lifecycle events**.
+6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
+v64). Surface grows to **93 MCP tools** at `--profile full` and
+**27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
+lifecycle surface adds only permissive optional fields to the existing
+`memory_store` / `memory_update` request structs).
 
 ### Added
 
@@ -31,6 +34,26 @@ routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
   wired into a typed plan graph. Schema v63 on both adapters (sqlite
   full-table-rebuild migration `0053`, postgres `migrate_v63` CHECK-extend);
   `MemoryLinkRelation` + `validate::VALID_RELATIONS` carry the matching set.
+- **Pillar-2 promote-as-typed-state-machine** — a first-class
+  `memories.lifecycle_state` column (schema v64, additive
+  `TEXT NOT NULL DEFAULT 'open'` on both adapters; the `archived_memories`
+  mirror keeps archive → restore lossless) that makes the already-shipped
+  Goal/Plan/Step `MemoryKind`s load-bearing. The `models::LifecycleState`
+  enum (`open` → `active` → `blocked`/`done`/`abandoned`; `done`/`abandoned`
+  terminal) provides a proven transition machine
+  (`LifecycleState::can_transition_to`, mirroring `ActionState`). The
+  `Memory` struct grows to **27 fields** (the 27th is `lifecycle_state`,
+  `#[serde(default)]` → `Open` for legacy rows). The column is load-bearing,
+  not inert: `memory_store` accepts an optional initial `lifecycle_state`
+  (validated), and `memory_update` accepts a `lifecycle_state` transition
+  target whose legality is enforced against the stored state
+  (`current.can_transition_to(new)`) — an illegal transition (e.g. `open` →
+  `done`, or any move out of a terminal) is rejected with a typed validation
+  error; a legal one persists and bumps the optimistic-concurrency `version`.
+  No new MCP tool and no tool-count change (the additions are permissive
+  optional fields on the existing store / update request structs). Schema
+  v64 on both adapters (sqlite probe-then-add ALTER, postgres `migrate_v64`
+  stamping the literal 64 for crash-safety).
 - **§2.5 attested — read-time attested-provenance surfacing**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709), reframed
   from #1715). `memory_recall` now composes provenance at read from already-merged

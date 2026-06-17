@@ -554,6 +554,15 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // value a pre-v45 row would land at the moment the ALTER
         // fires in the migrate ladder).
         version: row.get::<_, i64>("version").unwrap_or(1),
+        // v0.8.0 Pillar 2 (#1709) — schema v64 column. Falls back to
+        // `Open` on pre-v64 rows (column absent) and on any unrecognised
+        // value from a future schema (forward-compat), matching the SQL
+        // `DEFAULT 'open'`.
+        lifecycle_state: row
+            .get::<_, String>(field_names::LIFECYCLE_STATE)
+            .ok()
+            .and_then(|s| crate::models::LifecycleState::from_str(&s))
+            .unwrap_or_default(),
     })
 }
 
@@ -658,8 +667,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = excluded.content,
             tags = excluded.tags,
@@ -730,6 +739,13 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- blank out the indexed column) while letting a fresh
             -- extraction populate previously-NULL rows.
             mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
+            -- a plain re-store: the stored value wins so a re-store of an
+            -- already-`active`/`done` row does NOT reset it to the incoming
+            -- (typically `open`) initial state. Lifecycle ADVANCES go
+            -- through the typed `memory_update` transition gate, never a
+            -- silent upsert.
+            lifecycle_state = memories.lifecycle_state,
             -- #1632 — upsert-merge IS a mutation (content/tags/priority
             -- can change), so the Gap-1 optimistic-concurrency counter
             -- bumps here exactly like db::update. Pre-#1632 a re-store
@@ -768,6 +784,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             confidence_signals_json,
             mem.confidence_decayed_at,
             mentioned_entity_id,
+            mem.lifecycle_state.as_str(),
         ],
         |r| r.get(0),
     )?;
@@ -1029,8 +1046,8 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
                  RETURNING id",
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
@@ -1040,7 +1057,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
-                    mentioned_entity_id,
+                    mentioned_entity_id, mem.lifecycle_state.as_str(),
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -1336,6 +1353,34 @@ impl std::fmt::Display for VersionConflict {
 }
 
 impl std::error::Error for VersionConflict {}
+
+/// v0.8.0 Pillar 2 (#1709) — persist a validated lifecycle-state
+/// transition on a single memory. The transition legality
+/// ([`crate::models::LifecycleState::can_transition_to`]) is enforced by
+/// the caller (the MCP `memory_update` path) BEFORE this write; this
+/// helper is the pure persistence primitive (UPDATE one column). Bumps
+/// the Gap-1 `version` counter because a lifecycle advance IS a mutation
+/// observable to optimistic-concurrency callers.
+///
+/// Returns `true` when a row was updated, `false` when `id` did not match
+/// a live row.
+///
+/// # Errors
+///
+/// Propagates rusqlite errors from the UPDATE.
+pub fn set_lifecycle_state(
+    conn: &Connection,
+    id: &str,
+    state: crate::models::LifecycleState,
+) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+         WHERE id = ?3",
+        params![state.as_str(), now, id],
+    )?;
+    Ok(n > 0)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn update(
@@ -1834,7 +1879,7 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -1842,7 +1887,7 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -1914,7 +1959,7 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -1922,7 +1967,7 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -2040,7 +2085,7 @@ pub fn forget(
                   reflection_depth, atomised_into, atom_of, memory_kind,
                   entity_id, persona_version, citations, source_uri, source_span,
                   confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version)
+                  mentioned_entity_id, version, lifecycle_state)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?4, 'forget', metadata,
@@ -2048,7 +2093,7 @@ pub fn forget(
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version
+                        mentioned_entity_id, version, lifecycle_state
                  FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
@@ -2072,7 +2117,7 @@ pub fn forget(
                   reflection_depth, atomised_into, atom_of, memory_kind,
                   entity_id, persona_version, citations, source_uri, source_span,
                   confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version)
+                  mentioned_entity_id, version, lifecycle_state)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?3, 'forget', metadata,
@@ -2080,7 +2125,7 @@ pub fn forget(
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version
+                        mentioned_entity_id, version, lifecycle_state
                  FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                 params![namespace, tier_str, now],
             )?;
@@ -3126,6 +3171,7 @@ pub fn promote_to_namespace(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
@@ -4255,6 +4301,7 @@ pub fn consolidate(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write(&candidate)?;
 
@@ -5521,6 +5568,7 @@ pub fn entity_register(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = insert(conn, &mem).context("insert entity memory")?;
         (id, true)
@@ -6408,6 +6456,7 @@ pub fn register_agent(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     insert(conn, &mem)
@@ -6716,7 +6765,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version)
+                      mentioned_entity_id, version, lifecycle_state)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -6724,7 +6773,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version
+                            mentioned_entity_id, version, lifecycle_state
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -6957,7 +7006,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -6972,7 +7021,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     COALESCE(confidence_source, 'caller_provided'),
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1)
+                    COALESCE(version, 1),
+                    COALESCE(lifecycle_state, 'open')
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
@@ -7082,7 +7132,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -7097,7 +7147,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     COALESCE(confidence_source, 'caller_provided'),
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1)
+                    COALESCE(version, 1),
+                    COALESCE(lifecycle_state, 'open')
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
@@ -7347,8 +7398,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
@@ -7440,7 +7491,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             -- MAX(local, remote) so an out-of-order peer push can't
             -- roll the Gap-1 optimistic-concurrency counter backwards.
             -- Matches the pg `apply_remote_memory` GREATEST arm.
-            version = MAX(memories.version, excluded.version)
+            version = MAX(memories.version, excluded.version),
+            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
+            -- federation merge: the timestamp winner's state is adopted so
+            -- a peer that advanced a Goal open→done replicates that state;
+            -- a stale peer push (loses the tiebreak) preserves the local
+            -- lifecycle. Transition legality is enforced at the originating
+            -- update site, so the replicated value is already-validated.
+            lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
+                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END
          RETURNING id",
     )?;
     let actual_id: String = newer_wins_stmt.query_row(
@@ -7472,6 +7532,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.confidence_decayed_at,
             mentioned_entity_id,
             mem.version,
+            mem.lifecycle_state.as_str(),
         ],
         |r| r.get(0),
     )?;
@@ -11551,6 +11612,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -15192,6 +15254,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -15334,6 +15397,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -17034,6 +17098,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let ref_mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
@@ -17062,6 +17127,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
 
         insert(&conn, &obs).unwrap();
@@ -17131,6 +17197,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id)
@@ -17180,6 +17247,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         insert(&conn, &mem_reflection).unwrap();
 
@@ -17211,6 +17279,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         insert(&conn, &mem_obs).unwrap();
 

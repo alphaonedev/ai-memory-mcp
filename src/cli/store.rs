@@ -255,6 +255,7 @@ pub fn run(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // #626 Layer-3 (Task 1.3 / C5) — agent attestation gate. When

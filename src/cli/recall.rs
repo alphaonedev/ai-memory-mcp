@@ -867,6 +867,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             crate::db::insert(&conn, &mem).unwrap();
         }
@@ -1305,6 +1306,7 @@ limit = 25
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         if let Some(obj) = mem.metadata.as_object_mut() {
             obj.insert("agent_id".to_string(), serde_json::json!("t"));

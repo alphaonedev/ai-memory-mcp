@@ -461,6 +461,7 @@ impl<'a> ReflectionPass<'a> {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         })
     }
 
@@ -1019,6 +1020,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1289,6 +1291,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             crate::db::insert(conn, &mem).unwrap()
         }
@@ -1599,6 +1602,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             let id = crate::db::insert(&conn, &m).unwrap();
             let err = pass.verify(id).await.unwrap_err().to_string();
@@ -1737,6 +1741,7 @@ mod tests {
                     confidence_signals: None,
                     confidence_decayed_at: None,
                     version: 1,
+                    lifecycle_state: crate::models::LifecycleState::Open,
                 };
                 crate::db::insert(&conn, &m).unwrap();
             }

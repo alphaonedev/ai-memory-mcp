@@ -751,6 +751,7 @@ async fn create_memory_postgres(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
@@ -1174,6 +1175,7 @@ pub async fn create_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // #626 Layer-3 (C7) — agent-attestation gate on the HTTP store path.

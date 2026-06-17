@@ -951,6 +951,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).expect("db::insert")
     }
@@ -1000,6 +1001,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -1076,6 +1078,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             let m2 = crate::models::Memory {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1104,6 +1107,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             t1 = db::insert(&conn, &m1).unwrap();
             t2 = db::insert(&conn, &m2).unwrap();
@@ -1178,6 +1182,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             target = db::insert(&conn, &mem).unwrap();
         }
@@ -1222,6 +1227,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             entry_id = db::insert(&conn, &mem).unwrap();
         }

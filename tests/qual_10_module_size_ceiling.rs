@@ -185,7 +185,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // routine surface: the `#[path] mod routine;` decl, `use routine::{…}`
     // import, 5 `memory_routine_*` dispatch wrappers, and 5 dispatch-table
     // arms, landing the file at 14_664. 14_720 = 14_664 + ~56 headroom.
-    ("src/mcp/mod.rs", 14_720),
+    // 2026-06-16 — bumped 14_720 → 14_760 by the v0.8.0 #1709 Pillar-2
+    // lifecycle-state-machine unit: the optional `lifecycle_state` field
+    // threading through the memory_store / memory_update dispatch +
+    // transition-enforcement plumbing, landing the file at 14_734.
+    // 14_760 = 14_734 + ~26 headroom.
+    ("src/mcp/mod.rs", 14_760),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -548,7 +553,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // row-preservation regression test pushed the file to 4_069. Growth
     // justified: one schema bump + its load-bearing rebuild coverage.
     // 4_120 = 4_069 + 51 headroom.
-    ("src/storage/migrations.rs", 4_120),
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2) — bumped 4_120 → 4_160: the v64
+    // lifecycle-state-machine unit added the v64 ladder arm (memories +
+    // archived_memories `lifecycle_state` column probe-then-add) and the
+    // `PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES` named const (pm-v3.1 literal
+    // gate), landing the file at 4_121. 4_160 = 4_121 + ~39 headroom.
+    ("src/storage/migrations.rs", 4_160),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

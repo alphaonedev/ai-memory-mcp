@@ -158,7 +158,7 @@ Codex, Grok, Gemini, Llama Stack. See `docs/USER_GUIDE.md`.
 
 ## Memory
 
-The core data unit. **A 26-field record at v0.7.0** (was 15 at v0.6.x) —
+The core data unit. **A 27-field record at v0.8.0** (26 at v0.7.0, was 15 at v0.6.x; the 27th field is `lifecycle_state`, the v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64) —
 adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind`
 (Batman Form-6 vocabulary), `entity_id`/`persona_version` (QW-2 persona
 artefact), `citations`/`source_uri`/`source_span` (Form-4 fact

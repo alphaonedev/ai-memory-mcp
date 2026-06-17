@@ -156,6 +156,7 @@ fn sample_memory(id: &str, namespace: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     }
 }
 

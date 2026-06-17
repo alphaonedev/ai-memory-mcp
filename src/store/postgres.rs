@@ -504,7 +504,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 63;
+const CURRENT_SCHEMA_VERSION: i32 = 64;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1317,8 +1317,11 @@ impl PostgresStore {
         if current_version < 62 {
             self.migrate_v62().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 63 {
             self.migrate_v63().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v64().await?;
         }
 
         Ok(())
@@ -2946,6 +2949,48 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v64 — v0.8.0 Pillar 2 (#1709) typed-cognition `lifecycle_state`
+    /// column on `memories` (+ the `archived_memories` mirror so
+    /// archive → restore is lossless). Additive
+    /// `TEXT NOT NULL DEFAULT 'open'`; Postgres `ADD COLUMN IF NOT EXISTS`
+    /// keeps the migration idempotent / replay-safe.
+    async fn migrate_v64(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v64 tx", e))?;
+
+        for stmt in [
+            "ALTER TABLE memories \
+             ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+            "ALTER TABLE archived_memories \
+             ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v64 add lifecycle_state column", e))?;
+        }
+
+        // Literal arm version (crash-safety) — the postgres v57..v63 arms
+        // stamp their own literal so a crash mid-ladder records the exact
+        // applied tip; v64 keeps the invariant (record the LITERAL 64, NOT
+        // CURRENT_SCHEMA_VERSION).
+        record_schema_version(&mut tx, 64).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v64 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v64 applied (#1709 Pillar 2: memories.lifecycle_state \
+             + archived_memories mirror)"
+        );
+        Ok(())
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // v0.7.0 Provenance Gap parity — postgres SAL methods (issue #894).
     //
@@ -3443,6 +3488,7 @@ impl PostgresStore {
             confidence_signals: existing.confidence_signals.clone(),
             confidence_decayed_at: existing.confidence_decayed_at.clone(),
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -3457,7 +3503,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version)
+                 mentioned_entity_id, version, lifecycle_state)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -3465,7 +3511,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state
              FROM memories WHERE id = $1
              ON CONFLICT (id) DO NOTHING",
         )
@@ -6883,6 +6929,14 @@ impl PostgresStore {
             version: row
                 .try_get::<i64, _>("version")
                 .unwrap_or_else(|_| crate::models::default_memory_version()),
+            // v0.8.0 Pillar 2 (#1709) — read the v64 column. Pre-v64 rows /
+            // backups missing the column fall back to `Open` (SQL DEFAULT)
+            // and any unrecognised future value reads as `Open`.
+            lifecycle_state: row
+                .try_get::<String, _>(field_names::LIFECYCLE_STATE)
+                .ok()
+                .and_then(|s| crate::models::LifecycleState::from_str(&s))
+                .unwrap_or_default(),
         })
     }
 
@@ -7157,6 +7211,7 @@ impl PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         if let Err(e) = consult_governance_pre_write_pg(&candidate) {
             // Map `StoreError::PermissionDenied` (the canonical refusal
@@ -7922,7 +7977,8 @@ impl PostgresStore {
                     COALESCE(confidence_source, 'caller_provided') AS confidence_source,
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1) AS version
+                    COALESCE(version, 1) AS version,
+                    COALESCE(lifecycle_state, 'open') AS lifecycle_state
              FROM archived_memories WHERE id = $1",
         )
         .bind(id)
@@ -9175,12 +9231,12 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26)
+                      $26, $27)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -9248,6 +9304,12 @@ impl MemoryStore for PostgresStore {
                 -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
                 -- at `src/storage/mod.rs:689`).
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — sqlite parity: lifecycle_state
+                -- is preserved across a plain re-store (the stored value
+                -- wins) so a re-store does not reset an advanced
+                -- active/done state to the incoming open. Lifecycle
+                -- advances go through the typed `memory_update` gate.
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
                 -- optimistic-concurrency counter bumps exactly like
                 -- db::update (sqlite landed in 27b45dc2).
@@ -9280,6 +9342,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.entity_id.as_deref())
         .bind(memory.persona_version)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -9372,7 +9435,7 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) ",
         );
 
@@ -9470,7 +9533,9 @@ impl MemoryStore for PostgresStore {
                 // #1608 — QW-2 persona-artifact parity with `store()`.
                 .push_bind(memory.entity_id.clone())
                 .push_bind(memory.persona_version)
-                .push_bind(mentioned_entity_id);
+                .push_bind(mentioned_entity_id)
+                // v0.8.0 Pillar 2 (#1709) — lifecycle_state parity with `store()`.
+                .push_bind(memory.lifecycle_state.as_str().to_string());
         });
         if let Some(e) = push_err {
             return Err(e);
@@ -9521,6 +9586,9 @@ impl MemoryStore for PostgresStore {
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
+                -- re-store (sqlite parity).
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id, title, namespace",
@@ -9909,12 +9977,12 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, embedding,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
-                      $27)
+                      $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -9966,6 +10034,10 @@ impl MemoryStore for PostgresStore {
                 -- #1383 — preserve a previously-extracted attribution
                 -- if EXCLUDED is NULL (sqlite parity).
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
+                -- re-store (sqlite parity); advances go through the typed
+                -- update gate.
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id",
@@ -9997,6 +10069,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.persona_version)
         .bind(emb_pgvec)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -10924,11 +10997,11 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27
+                $27, $28
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -11058,6 +11131,18 @@ impl MemoryStore for PostgresStore {
                              AND EXCLUDED.id > memories.id)
                         THEN COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
                     ELSE memories.mentioned_entity_id
+                END,
+                -- v0.8.0 Pillar 2 (#1709) — newer-wins on lifecycle_state
+                -- (sqlite insert_if_newer parity): a peer that advanced a
+                -- Goal open→done replicates that state; a stale push keeps
+                -- the local lifecycle. Transition legality was enforced at
+                -- the originating update site.
+                lifecycle_state = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
+                        THEN EXCLUDED.lifecycle_state
+                    ELSE memories.lifecycle_state
                 END
             RETURNING id",
         )
@@ -11088,6 +11173,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.persona_version)
         .bind(memory.version)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -11804,6 +11890,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -12176,6 +12263,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -13484,7 +13572,7 @@ impl MemoryStore for PostgresStore {
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version
+                mentioned_entity_id, version, lifecycle_state
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -13500,7 +13588,8 @@ impl MemoryStore for PostgresStore {
                    COALESCE(confidence_source, 'caller_provided'),
                    confidence_signals, confidence_decayed_at,
                    mentioned_entity_id,
-                   COALESCE(version, 1)
+                   COALESCE(version, 1),
+                   COALESCE(lifecycle_state, 'open')
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
@@ -13743,6 +13832,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         self.store(ctx, &mem).await
     }
@@ -15559,6 +15649,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let written_id = self.store(ctx, &mem).await?;
         let created = prior.is_none();
@@ -17292,6 +17383,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
