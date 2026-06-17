@@ -13921,6 +13921,55 @@ mod tests {
         assert_eq!(got.priority, 5);
     }
 
+    /// CORRECTNESS BOUNDARY (#1709 Pillar-3): an inbound with a BRAND-NEW
+    /// id that collides on `(title, namespace)` with an existing
+    /// DIFFERENT-id row must NOT field-merge across the two distinct
+    /// memories. `merge_inbound` keys the #224 field-merge on `id`; a new
+    /// id misses `get(id)` and falls through to `insert_if_newer`, whose
+    /// `(title, namespace)` LWW upsert dedups onto the existing row. If a
+    /// future refactor keyed the merge on `(title, namespace)` instead of
+    /// `id`, two genuinely-distinct federated memories would silently
+    /// union their tags/metadata — corruption. This pins the boundary.
+    #[test]
+    fn merge_inbound_new_id_title_ns_collision_dedups_not_field_merges() {
+        let conn = test_db();
+        let mut local = make_memory("collide-title", "test", Tier::Mid, 3);
+        local.tags = vec!["a".to_string()];
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id_a = insert(&conn, &local).unwrap();
+
+        // Inbound: a BRAND-NEW id, same (title, namespace), NEWER, with a
+        // disjoint tag. Must NOT produce the {a,b} union (that would be a
+        // cross-id field-merge); insert_if_newer LWW-replaces instead.
+        let mut inbound = make_memory("collide-title", "test", Tier::Mid, 9);
+        let id_b = uuid::Uuid::new_v4().to_string();
+        inbound.id = id_b.clone();
+        inbound.tags = vec!["b".to_string()];
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        let result_id = merge_inbound(&conn, &inbound).unwrap();
+
+        // Deduped onto the existing row (kept its id); the new id never
+        // became a separate row.
+        assert_eq!(
+            result_id, id_a,
+            "a (title,namespace) collision must dedup onto the existing row id, not mint the inbound id"
+        );
+        assert!(
+            get(&conn, &id_b).unwrap().is_none(),
+            "the brand-new inbound id must NOT exist as a separate row"
+        );
+        // The surviving row took the newer inbound's tags by LWW — NOT the
+        // {a,b} cross-id union that same-id merge_inbound would produce.
+        let got = get(&conn, &id_a).unwrap().unwrap();
+        assert_eq!(
+            got.tags,
+            vec!["b".to_string()],
+            "distinct-id collision is LWW-dedup (tags replaced), NOT a field-merge union; got {:?}",
+            got.tags
+        );
+    }
+
     /// The merged row is fully consistent after the atomic read-merge-write
     /// (every column reflects the #224 resolution, not a partial write).
     #[test]
