@@ -4,7 +4,7 @@
 
 `ai-memory` is an AI-agnostic memory management system built as a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 93 advertised entries at `--profile full` (92 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
+1. **MCP tool server** -- stdio JSON-RPC server exposing 100 advertised entries at `--profile full` (99 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
 3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 89 route registrations / 75 unique URL paths at v0.7.0 (completely AI-agnostic)
 
@@ -17,7 +17,7 @@ main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now li
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (27 fields at v0.8.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
-storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 61)
+storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 67)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs incl. the tool_names const module), per-tool handlers under tools/, JSON-RPC wire-constant SSOT (mcp/jsonrpc.rs, #1558 batch 3 — version tag, reserved error codes, method names), tool-call param-name SSOT (mcp/param_names.rs), notification handling
 identity/          -- NHI identity: keypair storage (keypair.rs — DAEMON_KEYPAIR_LABEL), reserved-principal sentinel SSOT (sentinels.rs, #1558 batch 2 — DAEMON_PRINCIPAL, ANONYMOUS_INVALID, …; validate::RESERVED_AGENT_IDS is built from these), attestation (attest.rs), signing/verification (sign.rs/verify.rs), replay protection (replay.rs)
@@ -85,9 +85,9 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 
 ### `src/mcp/`
 
-The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.8.0 the registry exposes 93 advertised entries at `--profile full`** (92 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
+The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.8.0 the registry exposes 100 advertised entries at `--profile full`** (99 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
 
-The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (93 canonical tool-name consts at v0.8.0 — extracted per #1187 / Wave-1 PR1, then grown through the v0.7.x/v0.8.0 tool additions incl. `memory_capture_turn` and the #1709 coordination tools; `tool_names::ALL.len()` is pinned against `Profile::full().expected_tool_count()`); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop; `src/mcp/jsonrpc.rs` is the JSON-RPC wire-constant SSOT (#1558 batch 3) and `src/mcp/param_names.rs` the tool-call param-name SSOT.
+The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (100 canonical tool-name consts at v0.8.0 — extracted per #1187 / Wave-1 PR1, then grown through the v0.7.x/v0.8.0 tool additions incl. `memory_capture_turn` and the #1709 coordination tools; `tool_names::ALL.len()` is pinned against `Profile::full().expected_tool_count()`); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop; `src/mcp/jsonrpc.rs` is the JSON-RPC wire-constant SSOT (#1558 batch 3) and `src/mcp/param_names.rs` the tool-call param-name SSOT.
 
 Post-v0.7.0 #987 (D1.6) the source-of-truth lives in `registered_tools()` — a single `Vec<RegisteredTool>` with one entry per `McpTool` impl. `tool_definitions()` is now a thin four-line view that iterates the vec and projects each row to the wire shape (`name`/`description`/`docs`/`inputSchema`). The hand-coded `json!({...})` macro that previously held every tool's schema verbatim is GONE.
 
@@ -419,7 +419,7 @@ The `config.rs` module defines 4 feature tiers that gate functionality:
 | `smart` | Yes | Yes | Adds LLM-backed expansion / auto-tag / contradiction detection |
 | `autonomous` | Yes | Yes | Adds cross-encoder reranking + autonomous behaviors |
 
-The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 74 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
+The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 100 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 

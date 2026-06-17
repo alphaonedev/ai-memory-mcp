@@ -14,7 +14,7 @@ routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
 v64; the `memory_links` signature-trigger restore at v65; the
 `governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
 for the §22 PE-5 `Decision::Escalate` verdict at v66; the
-`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **93 MCP tools** at `--profile full` and
+`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **100 MCP tools** at `--profile full` and
 **27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).
