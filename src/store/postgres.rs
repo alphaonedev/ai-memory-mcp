@@ -508,7 +508,19 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 66;
+// v67 = #1720 A1 (v0.8.0 Workstream-A) — index `metadata.target_agent_id`
+//       for the A2 owner-keyed `private` visibility clause
+//       (`agent_id_idx = ?caller OR target_agent_id_idx = ?caller`).
+//       STORED generated column `target_agent_id_idx TEXT GENERATED
+//       ALWAYS AS (metadata ->> 'target_agent_id') STORED` +
+//       `idx_memories_target_agent_id`, mirroring the `agent_id_idx`
+//       precedent (postgres_schema.sql:93) with the key swapped. Postgres
+//       has no VIRTUAL generated columns, so this is STORED where the
+//       SQLite twin is VIRTUAL (the scope_idx / agent_id_idx convention);
+//       both adapters carry the column + index. Pure additive ADD COLUMN
+//       IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — idempotent +
+//       replay-safe. CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 67;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1330,8 +1342,11 @@ impl PostgresStore {
         if current_version < 65 {
             self.migrate_v65().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 66 {
             self.migrate_v66().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v67().await?;
         }
 
         Ok(())
@@ -3061,6 +3076,59 @@ impl PostgresStore {
             "schema migration v66 applied (#697 §22 PE-5: governance_rules.severity \
              escalate CHECK is sqlite-only; postgres ships no governance_rules table — \
              version-stamp no-op)"
+        );
+        Ok(())
+    }
+
+    /// v67 — #1720 A1 (v0.8.0 Workstream-A): index
+    /// `metadata.target_agent_id` for the A2 owner-keyed `private`
+    /// visibility clause (`agent_id_idx = ?caller OR
+    /// target_agent_id_idx = ?caller`). The postgres twin of the sqlite
+    /// v67 arm; mirrors the `agent_id_idx` generated-column precedent
+    /// (`metadata ->> 'agent_id'`, postgres_schema.sql:93) swapping the
+    /// key to `target_agent_id`. Postgres has no VIRTUAL generated
+    /// columns, so this is a STORED generated column (the
+    /// scope_idx / agent_id_idx convention). Pure additive
+    /// `ADD COLUMN IF NOT EXISTS` (Postgres 14+) + `CREATE INDEX IF NOT
+    /// EXISTS` — idempotent + replay-safe (fresh schemas carry both
+    /// inline in postgres_schema.sql). This unit ONLY adds the column +
+    /// index; the visibility-predicate change itself is A2 (separate).
+    /// Stamps the LITERAL 67 (crash-safety: a crash mid-ladder records
+    /// the exact applied tip, NOT `CURRENT_SCHEMA_VERSION`).
+    async fn migrate_v67(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v67 tx", e))?;
+
+        sqlx::query(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS target_agent_id_idx \
+             TEXT GENERATED ALWAYS AS (metadata ->> 'target_agent_id') STORED",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v67 add memories.target_agent_id_idx", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
+             ON memories (target_agent_id_idx)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v67 create idx_memories_target_agent_id", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 67).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v67 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v67 applied (#1720 A1: memories.target_agent_id_idx \
+             STORED generated column + idx_memories_target_agent_id)"
         );
         Ok(())
     }
