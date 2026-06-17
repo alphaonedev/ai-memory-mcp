@@ -672,6 +672,168 @@ pub fn verify_chain(
     })
 }
 
+/// Operator-facing end-to-end report over the append-only
+/// `signed_events` V-4 cross-row hash chain.
+///
+/// # v0.8.0 §22 Policy-Engine PE-8 (#697 / EPIC #1709)
+///
+/// Backs the `ai-memory verify-audit-trail` CLI. Distinct from the
+/// lower-level [`ChainVerificationReport`] in two ways the operator
+/// surface needs:
+///
+/// 1. An explicit `sequence_gaps` list — every contiguity hole as a
+///    `(from, to)` inclusive missing range — rather than only the
+///    FIRST break sequence that [`verify_chain`] records. A pruned /
+///    partially-restored chain can have several holes; operators want
+///    the whole inventory, not just the first.
+/// 2. A `since` window scoped by RFC3339 `timestamp` (the column an
+///    auditor actually has), while still verifying the cross-row hash
+///    links ACROSS the window boundary so the first in-window row is
+///    never falsely flagged as a break merely because its `prev_hash`
+///    points at an out-of-window predecessor.
+///
+/// `chain_intact` mirrors [`ChainVerificationReport::chain_holds`]
+/// (no `prev_hash`/sequence break inside the window). An empty chain
+/// (`total_events == 0`) is trivially intact with no gaps.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditTrailReport {
+    /// Rows walked inside the `since` window (the whole table when
+    /// `since` is `None`).
+    pub total_events: usize,
+    /// `true` when the cross-row hash chain held end-to-end across the
+    /// window (no `prev_hash` mismatch, no sequence-contiguity break).
+    pub chain_intact: bool,
+    /// `Some(seq)` of the FIRST row whose chain link failed (its
+    /// `prev_hash` no longer matches the recomputed canonical digest
+    /// of its predecessor, OR its `sequence` is not `prior + 1`).
+    /// Mirrors [`ChainVerificationReport::chain_break`].
+    pub first_break_sequence: Option<i64>,
+    /// Every monotonic-sequence hole inside the window as an inclusive
+    /// `(from, to)` MISSING range. `[(4, 6)]` means sequences 4, 5, 6
+    /// are absent (the row at 3 is followed directly by the row at 7).
+    pub sequence_gaps: Vec<(i64, i64)>,
+    /// Highest `sequence` present in the ENTIRE table (chain head),
+    /// independent of the `since` window. `0` for an empty table.
+    pub head_sequence: i64,
+    /// Echoes the caller's RFC3339 `since` filter (or `None` for a
+    /// full-table verification).
+    pub since: Option<String>,
+}
+
+impl AuditTrailReport {
+    /// `true` when the chain held AND no sequence gaps were found —
+    /// the all-clear an operator (or CI exit-code 0) wants. A chain
+    /// break OR a gap makes this `false`.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.chain_intact && self.sequence_gaps.is_empty()
+    }
+}
+
+/// Verify the append-only `signed_events` V-4 cross-row hash chain
+/// end-to-end and surface any gaps for operator review.
+///
+/// # v0.8.0 §22 Policy-Engine PE-8 (#697 / EPIC #1709)
+///
+/// Reuses [`verify_chain`] verbatim for the cross-row hash-chain +
+/// sequence-contiguity integrity — no chain crypto is reimplemented
+/// here. The added value over the raw verifier is the operator-facing
+/// [`AuditTrailReport`]: a full `sequence_gaps` inventory and an
+/// RFC3339-`timestamp` window.
+///
+/// ## `since` boundary handling
+///
+/// `verify_chain` is sequence-scoped, not timestamp-scoped. When
+/// `since` is `Some(ts)` we resolve `ts` to a sequence FLOOR — the
+/// max `sequence` of any row whose `timestamp < ts` — and pass that
+/// floor to `verify_chain` as `since_sequence`. `verify_chain`
+/// already recomputes the predecessor row's canonical hash from the
+/// row AT the floor, so the first in-window row's `prev_hash` is
+/// checked against its real (out-of-window) predecessor: a `--since`
+/// view never falsely reports the window edge as a break. Rows whose
+/// `timestamp >= ts` are the verified window; the gap scan runs over
+/// that same `sequence > floor` window.
+///
+/// An empty chain (or an empty window) is trivially intact with a
+/// `total_events` of 0 and no gaps.
+///
+/// # Errors
+///
+/// Returns the underlying `rusqlite` error if any of the head /
+/// floor / gap-scan queries fail, or the `verify_chain` error.
+pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<AuditTrailReport> {
+    // Chain head — highest sequence in the WHOLE table (independent of
+    // the window). `MAX(sequence)` is NULL on an empty table → 0.
+    let head_sequence: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM signed_events WHERE sequence IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .context("verify_audit_trail: read chain head sequence")?;
+
+    // Resolve the RFC3339 `since` timestamp to a sequence FLOOR: the
+    // max sequence of any row strictly BEFORE the window. `verify_chain`
+    // walks `sequence > floor` and re-derives the predecessor hash from
+    // the row at `floor`, so the boundary link is checked, not assumed.
+    let floor: i64 = match since {
+        Some(ts) => conn
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM signed_events \
+                 WHERE sequence IS NOT NULL AND timestamp < ?1",
+                params![ts],
+                |row| row.get(0),
+            )
+            .context("verify_audit_trail: resolve since-timestamp to sequence floor")?,
+        None => 0,
+    };
+
+    let since_sequence = if floor > 0 { Some(floor) } else { None };
+
+    // Reuse the canonical chain verifier — no reimplemented crypto.
+    let report = verify_chain(conn, since_sequence).context("verify_audit_trail: verify_chain")?;
+
+    // Independent monotonic-sequence gap scan over the SAME window.
+    // `verify_chain` records only the FIRST break sequence; operators
+    // want every hole. Walk the present sequences in order and emit an
+    // inclusive (from, to) missing range for each discontinuity.
+    let mut stmt = conn
+        .prepare(
+            "SELECT sequence FROM signed_events \
+             WHERE sequence IS NOT NULL AND sequence > ?1 \
+             ORDER BY sequence ASC",
+        )
+        .context("verify_audit_trail: prepare gap scan")?;
+    let mut rows = stmt
+        .query(params![floor])
+        .context("verify_audit_trail: gap-scan query")?;
+
+    let mut sequence_gaps: Vec<(i64, i64)> = Vec::new();
+    // The first in-window row is expected at `floor + 1`.
+    let mut expected = floor + 1;
+    while let Some(row) = rows.next().context("verify_audit_trail: gap-scan next")? {
+        let seq: i64 = row
+            .get(0)
+            .context("verify_audit_trail: gap-scan sequence")?;
+        if seq > expected {
+            // Sequences [expected, seq - 1] are missing.
+            sequence_gaps.push((expected, seq - 1));
+        }
+        // Realign past this row (handles duplicate / non-monotonic
+        // sequences gracefully without spurious negative ranges).
+        expected = seq + 1;
+    }
+
+    Ok(AuditTrailReport {
+        total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
+        chain_intact: report.chain_holds(),
+        first_break_sequence: report.chain_break,
+        sequence_gaps,
+        head_sequence,
+        since: since.map(ToString::to_string),
+    })
+}
+
 /// SHA-256 helper. Centralised so every audit-row producer commits
 /// to the same digest; a future hash-agility migration changes one
 /// line here, not every call site.

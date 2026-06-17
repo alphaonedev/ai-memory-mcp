@@ -329,20 +329,24 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 75;
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 82
+/// COMPILE under the default build. The source file declares 83
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 80.
+/// "sal")]`-gated and excluded from default builds, leaving 81.
 /// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
 /// surface, bumping 78 → 79; #1598 added `Reembed` for the
-/// `ai-memory reembed` vector-space migration, bumping 79 → 80.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 80;
+/// `ai-memory reembed` vector-space migration, bumping 79 → 80;
+/// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail` for
+/// the `ai-memory verify-audit-trail` CLI, bumping 80 → 81.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 81;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
 /// awk-canonical source-file count: every variant declared in the
 /// enum body (including `Migrate` + `SchemaInit`). v0.7.0 #1443 added
-/// `Expand`, bumping 80 → 81; #1598 added `Reembed`, bumping 81 → 82.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 82;
+/// `Expand`, bumping 80 → 81; #1598 added `Reembed`, bumping 81 → 82;
+/// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail`,
+/// bumping 82 → 83.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 83;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification

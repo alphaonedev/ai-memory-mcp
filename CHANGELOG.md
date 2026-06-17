@@ -18,6 +18,19 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **§22 Policy-Engine V08-PE-8 — `ai-memory verify-audit-trail` CLI**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
+  epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).
+  New CLI `ai-memory verify-audit-trail [--since <ts>] [--json]` walks the
+  append-only `signed_events` V-4 cross-row hash chain end-to-end (reusing
+  `signed_events::verify_chain` — no reimplemented crypto), inventories any
+  monotonic-`sequence` gaps, and reports an `AuditTrailReport`
+  (`total_events` / `chain_intact` / `first_break_sequence` /
+  `sequence_gaps` / `head_sequence`). `--since` is timestamp-scoped and
+  boundary-correct (the first in-window row's `prev_hash` is checked
+  against its real out-of-window predecessor, never a false break). Exits
+  non-zero on any break or gap (CI-scriptable). §2.5 attested / §2.3
+  stoppable. CLI subcommand count 80→81 (82→83 sal).
 - **Pillar-2.5 compaction — size-GC (corpus byte-cap eviction)**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)). The
   curator now evicts under byte pressure: when a namespace's live corpus
