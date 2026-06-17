@@ -233,6 +233,18 @@ fn wait_child_bounded(
     }
 }
 
+/// #1713 — project-local scratch DB root (no files under /tmp; CLAUDE.md
+/// hard rule). One fresh uuid-named DB per call under the gitignored
+/// `.local-runs/` tree.
+fn integration_scratch_db(infix: &str) -> std::path::PathBuf {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("integration");
+    std::fs::create_dir_all(&root).ok();
+    root.join(format!("ai-memory-{infix}-{}.db", uuid::Uuid::new_v4()))
+}
+
 #[test]
 fn test_cli_store_and_recall() {
     let dir = std::env::temp_dir();
@@ -1975,34 +1987,21 @@ fn test_health_endpoint() {
 #[test]
 fn test_mcp_initialize() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-init-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-init");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_initialize",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2019,34 +2018,21 @@ fn test_mcp_initialize() {
 #[test]
 fn test_mcp_tools_list() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-tools-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-tools");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_tools_list",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2111,26 +2097,24 @@ fn test_mcp_tools_list() {
 #[test]
 fn test_mcp_store_and_recall() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-store-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-store");
 
     // Send store then recall in sequence
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"MCP test memory","content":"This was stored via MCP protocol","tier":"long","priority":8}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"MCP test"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"MCP test memory","content":"This was stored via MCP protocol","tier":"long","priority":8}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"MCP test"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_and_recall",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -2162,34 +2146,21 @@ fn test_mcp_store_and_recall() {
 #[test]
 fn test_mcp_invalid_jsonrpc_version() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-ver-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-ver");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"1.0","id":1,"method":"initialize","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_invalid_jsonrpc_version",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2206,24 +2177,22 @@ fn test_mcp_invalid_jsonrpc_version() {
 #[test]
 fn test_mcp_unknown_tool() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-unk-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-unk");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"nonexistent_tool","arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_unknown_tool",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2252,24 +2221,22 @@ fn test_mcp_unknown_tool() {
 #[test]
 fn test_mcp_missing_tool_name() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-noname-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-noname");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_missing_tool_name",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2286,24 +2253,22 @@ fn test_mcp_missing_tool_name() {
 #[test]
 fn test_mcp_stats() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-stats-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-stats");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_stats","arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_stats","arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_stats",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2318,34 +2283,21 @@ fn test_mcp_stats() {
 #[test]
 fn test_mcp_prompts_list() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-prompts-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-prompts");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_prompts_list",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2363,27 +2315,23 @@ fn test_mcp_prompts_list() {
 #[test]
 fn test_mcp_prompts_get_recall_first() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-prompt-get-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-prompt-get");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{{"name":"recall-first"}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"recall-first"}}"#
+            .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_prompts_get_recall_first",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2411,28 +2359,23 @@ fn test_mcp_prompts_get_recall_first() {
 #[test]
 fn test_mcp_recall_default_toon() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-toon-def-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-toon-def");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"TOON default test","content":"Testing.","tier":"long","namespace":"test"}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"TOON test","namespace":"test"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"TOON default test","content":"Testing.","tier":"long","namespace":"test"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"TOON test","namespace":"test"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_recall_default_toon",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2727,11 +2670,7 @@ fn test_version_flag_matches_cargo_pkg_version() {
 #[test]
 #[allow(clippy::too_many_lines)] // sequential CLI scenario, splitting hurts readability
 fn test_namespace_auto_detect_parent() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-ns-autoparent-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("ns-autoparent");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store parent namespace standard
@@ -2785,35 +2724,24 @@ fn test_namespace_auto_detect_parent() {
     let child_set = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_namespace_set_standard","arguments":{{"namespace":"myproject-tests","id":"{child_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         parent_set,
         child_set,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"myproject-tests","format":"json"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"myproject-tests","format":"json"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_namespace_auto_detect_parent",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2854,8 +2782,7 @@ fn test_namespace_auto_detect_parent() {
 
 #[test]
 fn test_mcp_namespace_standard_auto_prepend() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-auto-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-auto");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a standard memory
@@ -2904,34 +2831,23 @@ fn test_mcp_namespace_standard_auto_prepend() {
     let set_standard = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_namespace_set_standard","arguments":{{"namespace":"test-ns","id":"{std_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         set_standard,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"test-ns","format":"json"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"test-ns","format":"json"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_namespace_standard_auto_prepend",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2974,8 +2890,7 @@ fn test_mcp_namespace_standard_auto_prepend() {
 
 #[test]
 fn test_namespace_standard_cascade_on_delete() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-cascade-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-cascade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store and set as standard
@@ -3007,35 +2922,24 @@ fn test_namespace_standard_cascade_on_delete() {
     let delete_mem = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_delete","arguments":{{"id":"{std_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         set_standard,
         delete_mem,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_namespace_get_standard","arguments":{"namespace":"cascade-ns"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_namespace_get_standard","arguments":{"namespace":"cascade-ns"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_namespace_standard_cascade_on_delete",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -3062,26 +2966,24 @@ fn test_namespace_standard_cascade_on_delete() {
 #[test]
 fn test_mcp_store_with_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-meta-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-meta");
 
     // Store with metadata, then recall in JSON format to verify it persists
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Metadata MCP test","content":"Testing metadata via MCP","tier":"long","metadata":{{"agent_id":"claude-test","session":42}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Metadata MCP test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Metadata MCP test","content":"Testing metadata via MCP","tier":"long","metadata":{"agent_id":"claude-test","session":42}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Metadata MCP test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_with_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3110,29 +3012,24 @@ fn test_mcp_store_with_metadata() {
 #[test]
 fn test_mcp_update_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-upd-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-upd");
 
     // Store with initial metadata
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Update meta test","content":"Initial content","tier":"long","metadata":{{"version":1}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Update meta test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Update meta test","content":"Initial content","tier":"long","metadata":{"version":1}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Update meta test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_update_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3145,22 +3042,25 @@ fn test_mcp_update_metadata() {
     let id = store_data["id"].as_str().unwrap();
 
     // Update metadata via a second MCP session, then get to verify
-    let output2 = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"version":2,"updated":true}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{id}"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests2 = vec![
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"version":2,"updated":true}}}}}}}}"#
+        ),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{id}"}}}}}}"#
+        ),
+    ];
+    let output2 = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests2,
+        "test_mcp_update_metadata",
+    );
 
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let lines2: Vec<&str> = stdout2.trim().lines().collect();
@@ -3187,38 +3087,33 @@ fn test_mcp_update_metadata() {
 #[test]
 fn test_mcp_store_invalid_metadata_defaults_to_empty() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-inv-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-inv");
 
     // Store with metadata as array (invalid — should default to {})
     // Then store with metadata as string (invalid — should default to {})
     // Then store with metadata as null (invalid — should default to {})
     // Verify all three have empty metadata
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                // metadata as array
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Array meta","content":"test","tier":"long","metadata":[1,2,3]}}}}}}"#).ok();
-                // metadata as string
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"String meta","content":"test","tier":"long","metadata":"not an object"}}}}}}"#).ok();
-                // metadata as null
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Null meta","content":"test","tier":"long","metadata":null}}}}}}"#).ok();
-                // Recall all to verify
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_list","arguments":{{"format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        // metadata as array
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Array meta","content":"test","tier":"long","metadata":[1,2,3]}}}"#.to_string(),
+        // metadata as string
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"String meta","content":"test","tier":"long","metadata":"not an object"}}}"#.to_string(),
+        // metadata as null
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Null meta","content":"test","tier":"long","metadata":null}}}"#.to_string(),
+        // Recall all to verify
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_invalid_metadata_defaults_to_empty",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3271,31 +3166,26 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
 #[test]
 fn test_mcp_dedup_replaces_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-dup-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-dup");
 
     // Store with metadata v1, then store same title+namespace with metadata v2
     // The MCP dedup path goes through db::update, not db::insert upsert
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Dedup meta test","content":"first","tier":"long","namespace":"test","metadata":{{"version":1}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Dedup meta test","content":"second","tier":"long","namespace":"test","metadata":{{"version":2,"extra":"added"}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Dedup meta test","namespace":"test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Dedup meta test","content":"first","tier":"long","namespace":"test","metadata":{"version":1}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Dedup meta test","content":"second","tier":"long","namespace":"test","metadata":{"version":2,"extra":"added"}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Dedup meta test","namespace":"test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_dedup_replaces_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3821,8 +3711,9 @@ fn test_mcp_update_preserves_agent_id() {
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"agent_id":"attacker","side_field":"ok"}}}}}}}}"#,
     );
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req2];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -3830,21 +3721,10 @@ fn test_mcp_update_preserves_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req2}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_update_preserves_agent_id",
+    );
 
     // 3. Parse the MCP response and assert provenance held.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4263,8 +4143,9 @@ fn test_agentid_visible_in_recall_response() {
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"DistinctiveRecallToken","format":"json"}}}"#;
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req2.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4272,21 +4153,10 @@ fn test_agentid_visible_in_recall_response() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req2}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_agentid_visible_in_recall_response",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let last_line = stdout.trim().lines().last().unwrap();
@@ -4348,8 +4218,9 @@ fn test_agentid_visible_in_toon_and_json() {
     let req_toon = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"toon"}}}"#;
     let req_json = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"json"}}}"#;
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req_toon.to_string(), req_json.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4357,22 +4228,10 @@ fn test_agentid_visible_in_toon_and_json() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req_toon}").ok();
-                writeln!(stdin, "{req_json}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_agentid_visible_in_toon_and_json",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -4641,33 +4500,13 @@ fn test_agents_list_uses_reserved_namespace() {
 
 #[test]
 fn test_mcp_agent_register_and_list() {
-    use std::io::Write;
     let db_path = fresh_agent_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let stdin = child.stdin.as_mut().unwrap();
     let init = serde_json::json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{"clientInfo":{"name":"test-suite","version":"1.0"}}
     });
-    writeln!(stdin, "{init}").unwrap();
-
     let reg = serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
         "params":{
@@ -4679,17 +4518,25 @@ fn test_mcp_agent_register_and_list() {
             }
         }
     });
-    writeln!(stdin, "{reg}").unwrap();
-
     let list = serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
         "params":{"name":"memory_agent_list","arguments":{}}
     });
-    writeln!(stdin, "{list}").unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
+    let requests = vec![init.to_string(), reg.to_string(), list.to_string()];
 
-    let output = child.wait_with_output().unwrap();
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_mcp_agent_register_and_list",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
@@ -4754,13 +4601,25 @@ fn test_196_cli_store_echoes_agent_id() {
 
 #[test]
 fn test_196_mcp_store_echoes_resolved_agent_id() {
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .env_remove("AI_MEMORY_AGENT_ID")
-        .args([
+    let requests = vec![
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"clientInfo":{"name":"echo-test","version":"1"}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{
+                "title":"echo-mcp","content":"hi","agent_id":"mcp-echo"
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).env_remove("AI_MEMORY_AGENT_ID").args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4768,36 +4627,10 @@ fn test_196_mcp_store_echoes_resolved_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{"clientInfo":{"name":"echo-test","version":"1"}}
-        })
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_store","arguments":{
-                "title":"echo-mcp","content":"hi","agent_id":"mcp-echo"
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_196_mcp_store_echoes_resolved_agent_id",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -4860,12 +4693,19 @@ fn test_197_cli_search_rejects_invalid_agent_id_filter() {
 
 #[test]
 fn test_197_mcp_list_rejects_invalid_agent_id_filter() {
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{"agent_id":"alice bob"}}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4873,31 +4713,10 @@ fn test_197_mcp_list_rejects_invalid_agent_id_filter() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_list","arguments":{"agent_id":"alice bob"}}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_197_mcp_list_rejects_invalid_agent_id_filter",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -4949,7 +4768,6 @@ fn test_198_anonymize_env_skips_host_fallback() {
 fn test_199_toon_compact_surfaces_agent_id() {
     // Build a minimal response object and render via the library's TOON path
     // by exercising `memory_list` through the MCP surface with format=toon_compact.
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
@@ -4973,8 +4791,18 @@ fn test_199_toon_compact_surfaces_agent_id() {
         .unwrap();
     assert!(seed.status.success());
 
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{
+                "namespace":"toon-ns","format":"toon_compact"
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4982,33 +4810,10 @@ fn test_199_toon_compact_surfaces_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_list","arguments":{
-                "namespace":"toon-ns","format":"toon_compact"
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_199_toon_compact_surfaces_agent_id",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5395,8 +5200,6 @@ fn seed_standard(
     title: &str,
     content: &str,
 ) -> String {
-    use std::io::Write;
-
     let out = cmd(binary)
         .args([
             "--db",
@@ -5423,31 +5226,8 @@ fn seed_standard(
     let id = v["id"].as_str().unwrap().to_string();
 
     // Set via MCP (CLI doesn't expose set_namespace_standard)
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_set_standard","arguments":{
@@ -5455,11 +5235,21 @@ fn seed_standard(
                 "id": id,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let _ = child.wait_with_output();
+        .to_string(),
+    ];
+    let _ = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "seed_standard",
+    );
     id
 }
 
@@ -5469,32 +5259,8 @@ fn get_standard_inherit(
     db_path: &std::path::Path,
     namespace: &str,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_get_standard","arguments":{
@@ -5502,11 +5268,21 @@ fn get_standard_inherit(
                 "inherit": true,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "get_standard_inherit",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5602,8 +5378,6 @@ fn test_inherit_preserves_3_level_flat_behavior() {
 
 #[test]
 fn test_inherit_recall_auto_prepends_chain() {
-    use std::io::Write;
-
     // session_start / recall should already inject the chain when namespace is set.
     let db = fresh_inherit_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -5631,31 +5405,8 @@ fn test_inherit_recall_auto_prepends_chain() {
         .unwrap();
 
     // Invoke recall via MCP and look for standards[]
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_recall","arguments":{
@@ -5664,11 +5415,21 @@ fn test_inherit_recall_auto_prepends_chain() {
                 "format": "json"
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
+            "--db",
+            db.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_inherit_recall_auto_prepends_chain",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5738,8 +5499,6 @@ fn test_inherit_deep_namespace_8_levels() {
 
 #[test]
 fn test_inherit_default_omits_chain() {
-    use std::io::Write;
-
     // Without inherit=true, the old single-namespace response shape is used.
     let db = fresh_inherit_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -5747,8 +5506,18 @@ fn test_inherit_default_omits_chain() {
     seed_standard(bin, &db, "alphaone", "org-only", "org");
 
     // get_standard with inherit=false (default) must return single-object shape
-    let mut child = cmd(bin)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": "alphaone",
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "mcp",
@@ -5756,33 +5525,10 @@ fn test_inherit_default_omits_chain() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_namespace_get_standard","arguments":{
-                "namespace": "alphaone",
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_inherit_default_omits_chain",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -6062,9 +5808,16 @@ fn mcp_call(
     name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -6072,31 +5825,10 @@ fn mcp_call(
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name": name, "arguments": args}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_call",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -6177,9 +5909,16 @@ fn mcp_call_raw(
     name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -6187,31 +5926,10 @@ fn mcp_call_raw(
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name": name, "arguments": args}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_call_raw",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     serde_json::from_str(lines[1]).unwrap()
@@ -7754,42 +7472,13 @@ fn test_budget_touch_only_surviving() {
 
 #[test]
 fn test_budget_mcp_tool_schema_and_response() {
-    use std::io::Write;
     let db = fresh_budget_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     store_sized(bin, &db, "mcp-target", "mcp budget test content", 5);
 
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
             "params":{"name":"memory_recall","arguments":{
@@ -7798,11 +7487,21 @@ fn test_budget_mcp_tool_schema_and_response() {
                 "format":"json"
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
+            "--db",
+            db.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_budget_mcp_tool_schema_and_response",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
 
