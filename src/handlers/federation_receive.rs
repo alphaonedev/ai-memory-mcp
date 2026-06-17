@@ -87,9 +87,15 @@ fn attestation_refusal_response(err: &AttestError) -> Response {
 // ---------------------------------------------------------------------------
 // Phase 3 foundation (issue #224) — HTTP sync endpoints.
 //
-// These ship in v0.6.0 GA as SKELETONS running today's timestamp-aware merge
-// (`db::insert_if_newer`). Field-level CRDT-lite merge rules, streaming,
-// resume-on-interrupt, and per-peer auth tokens are v0.8.0 targets.
+// These shipped in v0.6.0 GA as SKELETONS running a timestamp-aware merge
+// (`db::insert_if_newer`). v0.8.0 Pillar-3 (#1709) WIRED the #224
+// field-level CRDT-lite merge: the reconciliation site below now routes
+// through `db::merge_inbound`, which field-merges a divergent same-`id`
+// inbound row via `crate::models::merge_memory` (tags union, max-merge on
+// the counters, metadata deep-merge, agent_id/governance immutable-to-
+// local) and falls through to `insert_if_newer` for fresh / dedup rows.
+// Streaming, resume-on-interrupt, and per-peer auth tokens remain v0.8.0+
+// targets.
 // ---------------------------------------------------------------------------
 
 /// v0.7.0 S6-LOW2 — log a warning when the sender's claimed wall-clock
@@ -275,8 +281,11 @@ pub struct SyncPushBody {
     /// never enforced.
     #[serde(default)]
     pub sender_wall_clock: Option<String>,
-    /// Memories the sender is offering. Applied via the existing
-    /// timestamp-aware merge (`insert_if_newer`).
+    /// Memories the sender is offering. Applied via the v0.8.0 Pillar-3
+    /// (#1709 / #224) field-level CRDT-lite merge (`db::merge_inbound`):
+    /// a divergent same-`id` inbound row is field-merged via
+    /// `crate::models::merge_memory`; fresh / `(title, namespace)`-dedup
+    /// rows fall through to the timestamp-aware `insert_if_newer` LWW path.
     pub memories: Vec<Memory>,
     /// #1566 / #1579 B1 — source-side embedding vectors for the rows
     /// in `memories` (embed-once-replicate-vector). Inside the
@@ -704,7 +713,8 @@ pub async fn sync_push(
         // on the HTTP POST store path but federation receive was a
         // back-door bypass: an mTLS peer could push N memories per
         // second past the local `agent_quotas.max_memories_per_day`
-        // ceiling because `insert_if_newer` is the substrate-level
+        // ceiling because `merge_inbound` (the #1709/#224 reconciliation
+        // writer wrapping `insert_if_newer`) is the substrate-level
         // upsert and doesn't consult quotas. Charge each accepted
         // memory against the original author's quota row so the cap
         // is a true cluster-wide budget. On refusal: emit a signed
@@ -797,7 +807,7 @@ pub async fn sync_push(
         // (which re-exports `crate::storage` from `src/lib.rs:52`) so
         // every sqlite-direct call in this branch reads as a single
         // module surface — keeps the alias hygiene that the rest of
-        // this file already follows (`db::insert_if_newer`,
+        // this file already follows (`db::merge_inbound`,
         // `db::archive_memory`, etc.).
         let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
             .unwrap_or_else(crate::models::GovernancePolicy::default)
@@ -807,7 +817,7 @@ pub async fn sync_push(
             &body.sender_agent_id,
             cap_for_namespace,
         );
-        match db::insert_if_newer(&lock.0, &to_insert) {
+        match db::merge_inbound(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
                 // #1566 / #1579 B1 — store a dim-matching shipped
@@ -864,7 +874,7 @@ pub async fn sync_push(
                         bytes: bytes_estimate,
                     },
                 );
-                tracing::warn!("sync_push: insert_if_newer failed for {}: {e}", mem.id);
+                tracing::warn!("sync_push: merge_inbound failed for {}: {e}", mem.id);
                 skipped += 1;
             }
         }

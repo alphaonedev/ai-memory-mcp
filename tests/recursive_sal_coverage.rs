@@ -835,6 +835,40 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
     assert_eq!(completed_run.state, RoutineRunState::Completed);
     assert_eq!(completed_run.finished_at, Some(1_700_005_200));
     assert_eq!(completed_run.created_action_ids, serde_json::json!(["a1"]));
+
+    // #1709 Pillar-3 (#224) — merge_inbound field-merges a divergent
+    // same-`id` inbound row through the SAL trait on BOTH adapters. The
+    // merge_memory reconciler is the SAME shared Rust fn on each adapter
+    // (only the read/write SQL differs), so this asserts the wired #224
+    // CRDT-lite behaviour end-to-end: insert id X (tags=[a], prio=3),
+    // then merge_inbound id X (tags=[b], prio=5, NEWER) → tags union
+    // {a,b}, priority max=5.
+    let mi_id = format!("sal-cov-merge-{}", uuid_like());
+    let mut mi_local = base_memory(&mi_id, TEST_NS, "sal-cov-merge");
+    mi_local.tags = vec!["a".to_string()];
+    mi_local.priority = 3;
+    mi_local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+    let stored_id = store
+        .merge_inbound(&ctx, &mi_local)
+        .await
+        .expect("merge_inbound fresh-insert ok");
+    assert_eq!(stored_id, mi_id, "fresh merge_inbound returns the row id");
+
+    let mut mi_inbound = mi_local.clone();
+    mi_inbound.tags = vec!["b".to_string()];
+    mi_inbound.priority = 5;
+    mi_inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+    let merged_id = store
+        .merge_inbound(&ctx, &mi_inbound)
+        .await
+        .expect("merge_inbound divergent same-id ok");
+    assert_eq!(merged_id, mi_id, "merge returns the existing row id");
+
+    let merged = store.get(&ctx, &mi_id).await.expect("get merged row ok");
+    let mut merged_tags = merged.tags.clone();
+    merged_tags.sort();
+    assert_eq!(merged_tags, vec!["a", "b"], "tags union (both survive)");
+    assert_eq!(merged.priority, 5, "priority is max(3, 5)");
 }
 
 // A tiny unique-id source that does not pull in `Math.random`-equivalent

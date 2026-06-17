@@ -173,7 +173,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // regression test. Pure deterministic clock reconciliation, no
     // schema change, no I/O beyond the existing per-peer upsert.
     // Measured 17_959 + 31 headroom; far under the 1.5x cap.
-    ("src/storage/mod.rs", 17_990),
+    // 2026-06-16 (#1709 / #224 Pillar-3 unit 3 — wire merge_memory into
+    // the federation conflict path) — net-new `merge_inbound` free-fn
+    // (atomic read-by-id → `crate::models::merge_memory` → full-row write,
+    // else `insert_if_newer` fall-through) + the `overwrite_full_row_by_id`
+    // full-row writer + four in-module `merge_inbound_*` regression tests.
+    // No schema change; pure reuse of the existing merge primitive + a
+    // full-row UPDATE. Measured 18_288; bump 17_990 → 18_340 in lockstep.
+    ("src/storage/mod.rs", 18_340),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -406,7 +413,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + 60 headroom; new SAL surface so postgres-backed curators evict
     // under byte pressure too, no LLM on the eviction path. The 19k-LOC
     // module split remains the highest-priority manageability target.
-    ("src/store/postgres.rs", 19_820),
+    // 2026-06-16 (v0.8.0 #1709 / #224 Pillar-3 unit 3 — federation
+    // conflict-path field-merge) — bumped 19_820 → 19_960: the sqlx-native
+    // `PostgresStore::merge_inbound` method (read-by-id → the SHARED Rust
+    // `crate::models::merge_memory` reconciler → full-row UPDATE in a tx,
+    // else `apply_remote_memory` fall-through) + the hoisted
+    // `SQL_SELECT_MEMORY_ROW_BY_ID` const (pm-v3.1 literal de-dup). No
+    // per-adapter merge SQL — the merge is the same pure Rust fn the sqlite
+    // path uses. Measured 19_926 + ~34 headroom. The 19k-LOC module split
+    // remains the highest-priority manageability target.
+    ("src/store/postgres.rs", 19_960),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
