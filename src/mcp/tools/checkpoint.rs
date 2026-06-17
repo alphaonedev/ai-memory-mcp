@@ -80,6 +80,17 @@ pub fn handle_checkpoint_create(
     };
 
     crate::checkpoints::insert(conn, &cp).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the
+    // create, attributed to the creating agent (`created_by`, "" when
+    // unspecified). Identity = checkpoint id / creator / "create".
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::CHECKPOINT_CREATE,
+        &cp.created_by,
+        &[&cp.id, &cp.created_by, "create"],
+    );
+
     Ok(json!({
         (param_names::ID): cp.id,
         (RESP_CHECKPOINT): serde_json::to_value(&cp).map_err(|e| e.to_string())?,
@@ -140,6 +151,15 @@ pub fn handle_checkpoint_resolve(
     match resolved {
         None => Err(format!("checkpoint not found: {id}")),
         Some(cp) => {
+            // #1722 — coordination observability: best-effort audit row for the
+            // resolution, attributed to the resolving agent (`resolved_by`).
+            // Identity = checkpoint id / resolver / target state.
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::CHECKPOINT_RESOLVE,
+                resolved_by,
+                &[id, resolved_by, state.as_str()],
+            );
             let attest_level = if cp.signature.is_empty() {
                 crate::models::AttestLevel::Unsigned.as_str()
             } else {
@@ -550,6 +570,44 @@ mod handler_tests {
         )
         .expect_err("missing id must error");
         assert!(err.contains("not found"), "error reports absence: {err}");
+    }
+
+    /// #1722 — resolving a checkpoint appends one
+    /// `coordination.checkpoint_resolve` audit row attributed to the
+    /// resolving agent; the append-only chain stays intact.
+    #[test]
+    fn resolve_emits_signed_events_audit_row_1722() {
+        let conn = fresh();
+        let created = handle_checkpoint_create(
+            &conn,
+            &json!({ "namespace": "_cp", "title": "t", "created_by": "agent-a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        handle_checkpoint_resolve(
+            &conn,
+            &json!({ "id": id, "state": "resolved", "resolved_by": "agent-b" }),
+            None,
+        )
+        .expect("resolve ok");
+
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::CHECKPOINT_RESOLVE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "one coordination.checkpoint_resolve row");
+        assert_eq!(agent, "agent-b", "row attributed to the resolver");
+
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 
     #[test]

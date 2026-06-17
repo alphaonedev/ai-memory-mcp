@@ -91,6 +91,17 @@ pub fn handle_routine_create(conn: &rusqlite::Connection, params: &Value) -> Res
     };
 
     crate::routines::routine_insert(conn, &r).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the
+    // create, attributed to the creating agent (`created_by`, "" when
+    // unspecified). Identity = routine id / name / "create".
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::ROUTINE_CREATE,
+        &r.created_by,
+        &[&r.id, &r.name, "create"],
+    );
+
     Ok(json!({
         (param_names::ID): r.id,
         (RESP_ROUTINE): serde_json::to_value(&r).map_err(|e| e.to_string())?,
@@ -123,6 +134,15 @@ pub fn handle_routine_freeze(
     match frozen {
         None => Err(format!("routine not found: {id}")),
         Some(r) => {
+            // #1722 — coordination observability: best-effort audit row for the
+            // freeze, attributed to the routine's creating agent
+            // (`created_by`). Identity = routine id / creator / "freeze".
+            crate::coordination_audit::emit(
+                conn,
+                crate::coordination_audit::ROUTINE_FREEZE,
+                &r.created_by,
+                &[&r.id, &r.created_by, "freeze"],
+            );
             let attest_level = if r.signature.is_empty() {
                 AttestLevel::Unsigned.as_str()
             } else {
@@ -342,6 +362,18 @@ pub fn handle_routine_run(conn: &rusqlite::Connection, params: &Value) -> Result
         metadata: json!({}),
     };
     let run_id = crate::routines::run_insert(conn, &run).map_err(|e| e.to_string())?;
+
+    // #1722 — coordination observability: best-effort audit row for the run,
+    // attributed to the routine's owning agent (`created_by`, "" when
+    // unspecified) since the run materialises actions under that principal.
+    // Identity = routine id / run id / "run". Emitted once the run row is
+    // recorded (it persists in both the failed and completed paths below).
+    crate::coordination_audit::emit(
+        conn,
+        crate::coordination_audit::ROUTINE_RUN,
+        &routine.created_by,
+        &[routine_id, &run_id, "run"],
+    );
 
     // (3) Materialise the template — a SINGLE match folds the success /
     // failure paths so the failed run is always recorded, never lost.
@@ -750,6 +782,49 @@ mod handler_tests {
         let arr = listed["routines"].as_array().expect("routines array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["id"].as_str(), Some(routine_id.as_str()));
+    }
+
+    /// #1722 — running a frozen routine appends one `coordination.routine_run`
+    /// audit row attributed to the routine's owning agent; the append-only
+    /// chain stays intact.
+    #[test]
+    fn run_emits_signed_events_audit_row_1722() {
+        let conn = fresh();
+        let created = handle_routine_create(
+            &conn,
+            &json!({
+                "namespace": "_rt",
+                "name": "deploy",
+                "template": {"actions": [{"kind": "task.do", "title": "{{what}}"}]},
+                "created_by": "agent-a",
+            }),
+        )
+        .expect("create ok");
+        let routine_id = created[param_names::ID]
+            .as_str()
+            .expect("id present")
+            .to_string();
+        handle_routine_freeze(&conn, &json!({ "id": routine_id }), None).expect("freeze ok");
+
+        handle_routine_run(
+            &conn,
+            &json!({ "routine_id": routine_id, "arguments": {"what": "ship it"} }),
+        )
+        .expect("run ok");
+
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::coordination_audit::ROUTINE_RUN],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "one coordination.routine_run row");
+        assert_eq!(agent, "agent-a", "row attributed to the routine owner");
+
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
     }
 
     #[test]
