@@ -97,11 +97,55 @@ pub fn handle_signal_send(
     };
 
     crate::signals::insert(conn, &signal).map_err(|e| e.to_string())?;
+
+    // #1714 — coordination observability: append a tamper-evident
+    // `signed_events` row for the send so the Pillar-1 substrate has an
+    // audit trail on the same chain the governance gate uses. Best-effort:
+    // the signal already committed, so an audit-append failure (e.g. a rare
+    // chain-sequence race) is logged loudly rather than failing the send.
+    emit_signal_send_audit(conn, &signal);
+
     Ok(json!({
         (param_names::ID): signal.id,
         "attest_level": attest_level,
         "signal": serde_json::to_value(&signal).map_err(|e| e.to_string())?,
     }))
+}
+
+/// #1714 — emit the `coordination.signal_send` audit row. The payload hash
+/// commits to the signal's identity (id / sender / recipient / subject /
+/// type), so the chain row is bounded regardless of body size and lets an
+/// auditor correlate it to the stored signal. Daemon-signed when an audit
+/// signing key is installed (else `unsigned`), exactly like every other
+/// production audit-row writer. Failures are logged, never propagated.
+fn emit_signal_send_audit(conn: &rusqlite::Connection, signal: &crate::models::Signal) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(signal.id.as_bytes());
+    hasher.update([0x1F]);
+    hasher.update(signal.from_agent.as_bytes());
+    hasher.update([0x1F]);
+    hasher.update(signal.to_agent.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0x1F]);
+    hasher.update(signal.subject.as_bytes());
+    hasher.update([0x1F]);
+    hasher.update(signal.signal_type.as_str().as_bytes());
+    let payload_hash = hasher.finalize().to_vec();
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        payload_hash,
+        signal.from_agent.clone(),
+        crate::signals::SIGNAL_SEND_EVENT_TYPE.to_string(),
+        chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+        tracing::warn!(
+            target: "ai_memory::coordination",
+            signal_id = %signal.id,
+            from_agent = %signal.from_agent,
+            error = %e,
+            "coordination.signal_send audit append failed (signal already committed)"
+        );
+    }
 }
 
 /// MCP handler for `memory_signal_read`. Fetches a signal by id, stamps
@@ -559,5 +603,43 @@ mod handler_tests {
         // Broadcast (no to_agent) round-trips with a null recipient.
         assert!(sent["signal"]["to_agent"].is_null());
         assert!(sent["signal"]["created_at"].as_i64().expect("created_at") > 0);
+    }
+
+    /// #1714 — a signal send appends a `coordination.signal_send` audit row
+    /// to the `signed_events` chain (attributed to the sender), and the
+    /// append-only chain still verifies after it. This is the coordination
+    /// substrate's first tamper-evident observability record.
+    #[test]
+    fn send_emits_signed_events_audit_row_1714() {
+        let conn = fresh();
+        let sent = handle_signal_send(
+            &conn,
+            &json!({
+                "namespace": "_sig",
+                "from_agent": "ai:alice",
+                "to_agent": "ai:bob",
+                "subject": "coordinate",
+            }),
+            None,
+        )
+        .expect("send ok");
+        assert!(sent[param_names::ID].as_str().is_some());
+
+        // Exactly one coordination.signal_send row, attributed to the sender.
+        let (count, agent): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(agent_id), '') FROM signed_events \
+                 WHERE event_type = ?1",
+                rusqlite::params![crate::signals::SIGNAL_SEND_EVENT_TYPE],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("query audit row");
+        assert_eq!(count, 1, "expected one coordination.signal_send audit row");
+        assert_eq!(agent, "ai:alice", "audit row attributed to the sender");
+
+        // The append-only chain verifies over the new row.
+        let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
+        assert!(report.chain_intact, "chain must verify; report={report:?}");
+        assert!(report.total_events >= 1);
     }
 }
