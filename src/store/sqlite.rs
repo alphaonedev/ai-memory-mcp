@@ -856,6 +856,18 @@ impl MemoryStore for SqliteStore {
         crate::observations::gc::prune_before(&conn, &cutoff).map_err(box_err)
     }
 
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_id: &str,
+        claim_unowned: bool,
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        let conn = self.state.lock().await;
+        crate::storage::reown(&conn, namespace, to_id, claim_unowned, dry_run).map_err(box_err)
+    }
+
     async fn action_create(
         &self,
         _ctx: &CallerContext,

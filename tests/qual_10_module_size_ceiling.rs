@@ -187,7 +187,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `visibility_private_owner_keyed_matrix_1720` anti-re-drift test and
     // the owner-keyed rewrite of `is_visible_scope_matrix_covers_every_arm`.
     // No schema change. Measured 18_691; bump 18_340 → 18_700 in lockstep.
-    ("src/storage/mod.rs", 18_700),
+    // 2026-06-17 (#1709/#1720 WS-B B2, security lane) — the `reown`
+    // free-fn + `ReownReport` struct (rewrite metadata.agent_id ownership
+    // stamp on a namespace before scope=private filtering) and its 5
+    // in-module storage tests. No schema change. Measured 18_960; bump
+    // 18_700 → 18_985 in lockstep (18_960 + 25 headroom).
+    ("src/storage/mod.rs", 18_985),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -433,7 +438,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // STORED-generated target_agent_id_idx column + index arm, its dispatch
     // wiring, and the v67 doc-comment landed the file at 20_027.
     // 20_050 = 20_027 + 23 headroom.
-    ("src/store/postgres.rs", 20_050),
+    // 2026-06-17 (#1709/#1720 WS-B B2, security lane) — the sqlx-native
+    // `reown` adapter method (jsonb_set single-key rewrite of
+    // metadata.agent_id + matched/dry_run count, mirroring the sqlite
+    // free-fn) landed the file at 20_090. Bump 20_050 → 20_115 in
+    // lockstep (20_090 + 25 headroom).
+    ("src/store/postgres.rs", 20_115),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

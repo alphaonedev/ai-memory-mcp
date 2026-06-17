@@ -480,6 +480,19 @@ pub enum Command {
     /// embedder via the same `AppConfig::resolve_embeddings()` +
     /// `Embedder::from_resolved` path as daemon/MCP boot.
     Reembed(crate::cli::commands::reembed::ReembedArgs),
+    /// v0.8.0 #1709/#1720 WS-B B2 — `ai-memory reown` subcommand.
+    /// Rewrite the `metadata.agent_id` ownership stamp on the memories
+    /// in EXACTLY `--namespace` to `--to`, so an operator can establish
+    /// durable ownership over a namespace BEFORE enabling `scope=private`
+    /// visibility filtering (avoiding a self-lockout from legacy /
+    /// foreign-owned rows). Default rewrites every owned row;
+    /// `--claim-unowned` also covers absent/empty-`agent_id` rows;
+    /// `--dry-run` counts without writing. Only the single `agent_id`
+    /// metadata key is rewritten (the `agent_id_idx` generated column
+    /// re-projects the new owner); `--to` is validated. Additive admin
+    /// tool — no schema change, no visibility-behaviour change, no
+    /// MCP/HTTP surface (like `reembed`).
+    Reown(crate::cli::reown::ReownArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
     /// Reconstruct the conversation transcript chain that produced a
     /// memory. CLI parity for `memory_replay`.
@@ -1722,6 +1735,18 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // Non-zero exit codes map configuration outcomes
             // (no-embedder / init-failed) like `ai-memory expand`.
             match cli::commands::reembed::cmd_reembed(&db_path, &a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Reown(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
+            match cli::reown::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
