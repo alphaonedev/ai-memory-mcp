@@ -1219,6 +1219,21 @@ pub async fn sync_push(
         tracing::warn!("sync_push: sync_state_observe failed: {e}");
     }
 
+    // v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite merge: fold
+    // the sender's full vector clock into the receiver's persisted
+    // sync-state (pointwise max). Additive over the per-peer `observe`
+    // above — `observe` advances only what THIS push told us about the
+    // sender, whereas the merge enriches the receiver clock with every
+    // peer the sender has transitively observed, so the receiver's clock
+    // reflects all known peer timestamps (the reconciliation foundation
+    // for redundant-push short-circuiting). Monotonic: an older incoming
+    // timestamp never regresses a newer stored entry. Skipped in dry-run.
+    if !body.dry_run
+        && let Err(e) = db::sync_state_merge(&lock.0, &local_agent_id, &body.sender_clock)
+    {
+        tracing::warn!("sync_push: sync_state_merge failed: {e}");
+    }
+
     // #1566 / #1579 B1 — the pre-#1566 synchronous embed loop lived
     // here (one `emb.embed()` per applied row, ~1s/row via ollama,
     // WHILE HOLDING the DB lock and inside the sender's quorum-ack

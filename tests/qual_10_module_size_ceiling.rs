@@ -163,7 +163,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // corpus). Measured 17_900 + 50 headroom; pure additive feature +
     // its deterministic SQL-ranking regression coverage, no LLM on the
     // eviction path, far under the 1.5x cap.
-    ("src/storage/mod.rs", 17_950),
+    //
+    // 2026-06-16 — bumped 17_950 → 17_990 by the v0.8.0 Pillar-3
+    // (#1709 / #224 Task 3a.1) CRDT-lite merge unit: the net-new
+    // `sync_state_merge` free-fn (folds an incoming peer VectorClock
+    // into the persisted sync-state via pointwise-max, looping the
+    // existing monotonic `sync_state_observe` upsert) + its in-module
+    // `sync_state_merge_applies_pointwise_max_and_never_regresses`
+    // regression test. Pure deterministic clock reconciliation, no
+    // schema change, no I/O beyond the existing per-peer upsert.
+    // Measured 17_959 + 31 headroom; far under the 1.5x cap.
+    ("src/storage/mod.rs", 17_990),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
