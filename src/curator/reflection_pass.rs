@@ -105,6 +105,22 @@ async fn store_get_opt(
 /// (the legacy `db::*` free functions applied no SAL visibility filter).
 /// `agent_id` carries the curator's resolved signing identity so audit
 /// trails attribute the sweep correctly.
+///
+/// # #1720 D1 — curator read posture (decided)
+///
+/// The curator KEEPS `bypass_visibility=true` (`for_admin`) for its read
+/// pass. Under the substrate's default Op-0 posture (single-operator,
+/// trust-all reads — see `crate::identity` "Op-0 posture"), the rows the
+/// curator reads across namespaces are the operator's own; reading them
+/// to synthesise reflections is the intended maintenance behaviour, not a
+/// cross-tenant read. The cross-tenant concern only arises under an
+/// explicitly enabled enforced-multi-agent deployment, which is opt-in and
+/// out of scope for this sweep; a per-namespace exclusion / non-bypass
+/// pass for that mode is a follow-on hardening, not a fix needed today.
+/// The load-bearing #1720 curator fix is D2 (below): the sweep's OUTPUT is
+/// stamped with an explicit `collective` scope so a curator-written
+/// reflection is never an accidental `private` row that leaks under
+/// trust-all and goes operator-invisible under enforcement.
 #[cfg(feature = "sal")]
 fn curator_caller_context(agent_id: &str) -> CallerContext {
     CallerContext::for_admin(agent_id)
@@ -449,7 +465,22 @@ impl<'a> ReflectionPass<'a> {
             updated_at: now,
             last_accessed_at: None,
             expires_at: None,
-            metadata: serde_json::json!({}),
+            // #1720 D2 — stamp an EXPLICIT, intended scope on every
+            // curator-written reflection. Without this the metadata is
+            // empty, so `scope_idx` defaults to `private` and the row is
+            // owned by the curator (`ai:curator` / keypair id): visible to
+            // everyone TODAY under trust-all reads, but operator-INVISIBLE
+            // the moment read-path ownership filtering is enabled — the
+            // accidental-private trap #1720 closes. A reflection is a
+            // shared, attributable substrate-maintenance artifact, so it is
+            // stamped `collective`: intentionally visible to every caller
+            // in the deployment (preserving today's behaviour) AND
+            // operator-visible under enforcement. The owner stays the
+            // curator for attribution (the substrate `reflect` path stamps
+            // `metadata.agent_id` from `ReflectInput::agent_id`).
+            metadata: serde_json::json!({
+                "scope": crate::models::MemoryScope::Collective.as_str(),
+            }),
             reflection_depth: 0,
             memory_kind: MemoryKind::Reflection,
             entity_id: None,
@@ -1532,6 +1563,21 @@ mod tests {
                 .expect("expected one reflection");
             // verify() should succeed on it.
             pass.verify(refl.id.clone()).await.unwrap();
+            // #1720 D2 — the persisted reflection carries an EXPLICIT
+            // `collective` scope (not the accidental default-private that
+            // would be operator-invisible under enforcement), and stays
+            // attributed to the curator via metadata.agent_id.
+            assert_eq!(
+                refl.metadata.get("scope").and_then(|v| v.as_str()),
+                Some(crate::models::MemoryScope::Collective.as_str()),
+                "curator reflection must be stamped collective (#1720 D2); got {:?}",
+                refl.metadata.get("scope")
+            );
+            assert_eq!(
+                refl.metadata.get("agent_id").and_then(|v| v.as_str()),
+                Some(crate::identity::sentinels::AI_CURATOR),
+                "curator reflection must stay attributed to the curator"
+            );
         }
 
         #[tokio::test]
