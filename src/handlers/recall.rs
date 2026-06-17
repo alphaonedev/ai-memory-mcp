@@ -630,6 +630,21 @@ async fn recall_response(
         None
     };
 
+    // #1710 — populate the recall_observations ledger on the sqlite
+    // HTTP recall branch too (the postgres branch already does via the
+    // SAL trait, #1705; the MCP path does via the free-fn). Closes the
+    // §2.5 audit-parity gap: a sqlite-backed daemon answering recall
+    // over HTTP never logged the recall. The recall_id is echoed in the
+    // response so a caller can cite it on a later memory_store / link.
+    //
+    // DEADLOCK GUARD: routing this through `app.store.record_recall_observation`
+    // would re-acquire `self.state.lock()` WHILE the recall DB lock below
+    // is held → deadlock. We instead call the FREE-FN
+    // `crate::observations::record_recall_with_identity(&lock.0, ...)`
+    // directly on the ALREADY-HELD connection (mirroring the MCP path),
+    // so no second lock is ever taken. Recorded INSIDE the lock block,
+    // before the guard drops at the end of the block.
+    let recall_id = uuid::Uuid::new_v4().to_string();
     // Stage (b) — DB lock for the FTS5 query + get_many for the
     // pre-computed HNSW hits + touch ops. Scoped tightly so the
     // guard drops as soon as `recall_hybrid_precomputed_hnsw` /
@@ -700,6 +715,40 @@ async fn recall_response(
             );
             (r, "keyword")
         };
+        // #1710 — record the recalled set into the ledger WHILE the DB
+        // lock is still held (the `&lock.0` connection is in scope here;
+        // the guard drops at the end of this block). NON-FATAL: a ledger
+        // error logs at warn and never blocks / reshapes the recall
+        // response. Records the RECALLED set (pre-post-filter), exactly
+        // as the MCP path records its candidates — the heavy
+        // post-processing (form4 / rerank / kinds) stays OUTSIDE the lock
+        // below. Identity stamping (`agent_id` + `namespace`) mirrors the
+        // postgres branch: `as_agent.or(caller_principal)` for the agent,
+        // the in-scope `namespace` param for the namespace.
+        if let Ok((rows, _)) = result.as_ref()
+            && crate::observations::table_exists(&lock.0)
+        {
+            #[allow(clippy::cast_possible_wrap)]
+            let candidates: Vec<crate::observations::Candidate<'_>> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (m, s))| crate::observations::Candidate {
+                    memory_id: m.id.as_str(),
+                    retriever: mode,
+                    rank: (i + 1) as i64,
+                    score: *s,
+                })
+                .collect();
+            if let Err(e) = crate::observations::record_recall_with_identity(
+                &lock.0,
+                &recall_id,
+                &candidates,
+                as_agent.or(caller_principal),
+                namespace,
+            ) {
+                tracing::warn!("recall (sqlite-http): record_recall failed (non-fatal): {e}");
+            }
+        }
         (result, mode)
         // `lock` drops here — every line below this block runs
         // WITHOUT the DB mutex held. short_extend / mid_extend are
@@ -801,6 +850,9 @@ async fn recall_response(
             let mut resp = json!({
                 "memories": scored,
                 "count": scored.len(),
+                // #1710 — echo the recall_id for postgres-parity (line
+                // ~553) so a caller can cite it on a later store / link.
+                "recall_id": recall_id,
                 (field_names::TOKENS_USED): outcome.tokens_used,
                 "mode": mode,
             });
