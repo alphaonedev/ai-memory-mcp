@@ -38,7 +38,7 @@ fn fresh_conn() -> rusqlite::Connection {
              id TEXT PRIMARY KEY,
              kind TEXT NOT NULL,
              matcher TEXT NOT NULL,
-             severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log')),
+             severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log','escalate')),
              reason TEXT NOT NULL,
              namespace TEXT NOT NULL DEFAULT '_global',
              created_by TEXT NOT NULL,
@@ -304,4 +304,48 @@ fn refusal_path_still_emits_signed_event() {
         )
         .unwrap();
     assert_eq!(agent_id, "agent:t");
+}
+
+#[test]
+fn escalate_verdict_lands_in_signed_events_chain_and_verifies_pe5_pe8_1709() {
+    // §22 PE-5 + PE-8 end-to-end (#1709): an `escalate`-severity rule
+    // yields a `Decision::Escalate` (the fail-closed human-escalation
+    // verdict) that is chain-logged to `signed_events` exactly like a
+    // refusal — validating PE-5's "chain-logged" claim for the blocking
+    // escalation verdict — and the PE-8 `verify_audit_trail` verifier
+    // reports the `governance.check` chain intact over that event. Ties
+    // the two §22 units together over a real escalation, so a future
+    // change that drops the escalate audit row (or breaks the chain)
+    // trips here.
+    let (signing, _env_guard) = install_test_operator_key();
+    let conn = fresh_conn();
+    add_rule(
+        &conn,
+        &signing,
+        "R-esc-1709",
+        "filesystem_write",
+        r#"{"glob":"/tmp/**"}"#,
+        "escalate",
+    );
+    let action = AgentAction::FilesystemWrite {
+        path: "/tmp/escalate-me".into(),
+        byte_estimate: None,
+    };
+    let decision = check_agent_action(&conn, "agent:esc", &action).unwrap();
+    assert!(
+        matches!(decision, Decision::Escalate { .. }),
+        "escalate-severity rule must yield Decision::Escalate; got {decision:?}"
+    );
+    // PE-5: the escalation is chain-logged (one governance.check row).
+    assert_eq!(count_audit_rows(&conn), 1);
+    // PE-8: verify_audit_trail confirms the chain is intact + counts it.
+    let report = ai_memory::signed_events::verify_audit_trail(&conn, None).unwrap();
+    assert!(
+        report.chain_intact,
+        "governance.check chain must verify after an escalate verdict; report={report:?}"
+    );
+    assert!(
+        report.total_events >= 1,
+        "the escalate governance.check event must be counted; report={report:?}"
+    );
 }

@@ -7638,7 +7638,7 @@ decision = "allow"
                  id TEXT PRIMARY KEY,
                  kind TEXT NOT NULL,
                  matcher TEXT NOT NULL,
-                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log')),
+                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log','escalate')),
                  reason TEXT NOT NULL,
                  namespace TEXT NOT NULL DEFAULT '_global',
                  created_by TEXT NOT NULL,
