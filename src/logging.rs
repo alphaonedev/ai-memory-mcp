@@ -53,6 +53,20 @@ pub const DEFAULT_LOG_DIRECTIVE: &str = "ai_memory=info";
 /// # Errors
 /// - The configured log directory cannot be created.
 /// - The rolling file appender cannot be constructed.
+/// Build the `EnvFilter` for `level`, falling back to `info` on a
+/// malformed directive. PURE — no global subscriber install, no I/O —
+/// so the level-parse fallback can be asserted deterministically
+/// without going through the fragile process-global install path that
+/// made the #1711 `init_file_logging_*` fallback tests flaky under
+/// parallel `cargo test` (the install path was incidental to what
+/// those tests actually verify: that a garbage directive degrades to
+/// `info` instead of erroring).
+pub(crate) fn level_filter_or_info_fallback(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_new(level).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::try_new("info").expect("info is a valid filter")
+    })
+}
+
 pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     if !cfg.enabled.unwrap_or(false) {
         return Ok(None);
@@ -71,9 +85,7 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     // subscriber can drain it. `try_init` so multiple test runs
     // (each spinning a fresh subscriber) don't poison the global.
     let level = cfg.level.as_deref().unwrap_or("info");
-    let filter = tracing_subscriber::EnvFilter::try_new(level).unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::try_new("info").expect("info is a valid filter")
-    });
+    let filter = level_filter_or_info_fallback(level);
     let structured = cfg.structured.unwrap_or(false);
     let res = if structured {
         tracing_subscriber::fmt()
@@ -369,43 +381,43 @@ mod tests {
 
     #[test]
     fn init_file_logging_accepts_invalid_level_falling_back_to_info() {
-        let _g = subscriber_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = LoggingConfig {
-            enabled: Some(true),
-            path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
-            // Garbage directive — exercises the EnvFilter fallback branch.
-            // The string contains an `@` which tracing-subscriber 0.3
-            // recognises as a span constraint operator with invalid
-            // syntax, forcing try_new to return Err.
-            level: Some("@invalid@directive@".to_string()),
-            ..Default::default()
-        };
-        // Must not panic; fallback path swaps in `info`.
-        let guard = init_file_logging(&cfg).unwrap();
-        assert!(guard.is_some());
+        // #1711 — assert the level-parse FALLBACK directly via the pure
+        // helper. The garbage directive (`@` is a span-constraint
+        // operator with invalid syntax → `try_new` Err) must degrade to
+        // the `info` filter. This is decoupled from the process-global
+        // subscriber install path: `init_file_logging` always returns
+        // `Ok(Some(guard))` whether or not the fallback fires (the
+        // `try_init` Err is swallowed), so the old install-based test
+        // never actually verified the fallback AND flaked under parallel
+        // exec on the incidental dir/install machinery (#1711). This
+        // assertion is deterministic and stronger.
+        let garbage = level_filter_or_info_fallback("@invalid@directive@");
+        let info = level_filter_or_info_fallback("info");
+        assert_eq!(
+            garbage.to_string(),
+            info.to_string(),
+            "a malformed directive must fall back to the `info` filter"
+        );
+        // Not vacuous: a valid, distinct level must NOT collapse to info.
+        assert_ne!(
+            level_filter_or_info_fallback("debug").to_string(),
+            info.to_string(),
+            "a valid `debug` level must not equal the info fallback"
+        );
     }
 
     #[test]
     fn init_file_logging_fallback_filter_on_malformed_directive() {
-        // Lines 63-65: EnvFilter::try_new(level) Err arm => fall back
-        // to "info" filter. Use a directive containing an invalid
-        // level spec (lowercase `bogus` is rejected as a level when
-        // the directive has the `<target>=<level>` shape).
-        let _g = subscriber_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = LoggingConfig {
-            enabled: Some(true),
-            path: Some(tmp.path().to_string_lossy().into_owned()),
-            rotation: Some("never".to_string()),
-            // A `target=level` shape with garbage level forces the
-            // Err arm of EnvFilter::try_new in tracing-subscriber 0.3.
-            level: Some("my_target=not_a_level".to_string()),
-            ..Default::default()
-        };
-        let guard = init_file_logging(&cfg).unwrap();
-        assert!(guard.is_some());
+        // #1711 (sibling) — the `<target>=<level>` shape with a garbage
+        // level also takes the `EnvFilter::try_new` Err arm and falls
+        // back to `info`. Pure-helper assertion (see the sibling test
+        // for why this is decoupled from the install path).
+        let garbage = level_filter_or_info_fallback("my_target=not_a_level");
+        assert_eq!(
+            garbage.to_string(),
+            level_filter_or_info_fallback("info").to_string(),
+            "a malformed `target=level` directive must fall back to info"
+        );
     }
 
     #[test]
