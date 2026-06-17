@@ -328,8 +328,13 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- closed set with `derives_from` for atomisation provenance edges
     -- and re-pinned the constraint under the `_wt1a` suffix so the
     -- 0017 migration can detect the upgraded form via pg_constraint.
+    -- v0.8.0 Pillar-2 (schema v63 both adapters, #1709) extended the
+    -- closed set with the Goal/Plan/Step typed-cognition wiring
+    -- relations `decomposes_into` / `depends_on` / `advances` (kept
+    -- under the same `_wt1a` constraint name; `migrate_v63` re-adds it
+    -- on upgrade).
     CONSTRAINT memory_links_relation_check_wt1a
-        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
+        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
 
 CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links (source_id);
