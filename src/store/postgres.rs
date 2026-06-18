@@ -3475,7 +3475,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -3483,7 +3483,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -3779,7 +3779,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -3787,7 +3787,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = $1
              ON CONFLICT (id) DO NOTHING",
         )
@@ -12471,7 +12471,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -12480,7 +12480,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -13937,7 +13937,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -13946,7 +13946,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 ON CONFLICT (id) DO UPDATE SET
@@ -14053,7 +14053,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -14062,7 +14062,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                     FROM memories
                     WHERE id = $1
                     ON CONFLICT (id) DO UPDATE SET
@@ -14157,7 +14157,7 @@ impl MemoryStore for PostgresStore {
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -14174,7 +14174,8 @@ impl MemoryStore for PostgresStore {
                    confidence_signals, confidence_decayed_at,
                    mentioned_entity_id,
                    COALESCE(version, 1),
-                   COALESCE(lifecycle_state, 'open')
+                   COALESCE(lifecycle_state, 'open'),
+                   encrypted_envelope
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
@@ -14310,7 +14311,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -14319,7 +14320,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories WHERE id = $3
                 ON CONFLICT (id) DO UPDATE SET
                     archived_at = EXCLUDED.archived_at,

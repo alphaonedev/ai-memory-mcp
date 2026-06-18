@@ -984,6 +984,79 @@ mod postgres_side {
         assert_eq!(nonc, 0, "metadata/priority-only edit archives nothing");
     }
 
+    /// #228 / #1728 Commit A-carry — postgres twin of
+    /// `sqlite_archive_restore_carries_encrypted_envelope_1728`. The pg
+    /// archive → restore SQL copy paths must carry the
+    /// `encrypted_envelope` BYTEA column, so archiving an encrypted
+    /// memory preserves the ciphertext and restoring round-trips it.
+    /// Drives `archive_by_ids` (archive INSERT-SELECT carry) +
+    /// `archive_restore` (restore INSERT-SELECT carry) through
+    /// `PostgresStore` against a known envelope written via raw sqlx.
+    /// Without the carry the INSERT-SELECT would drop the column
+    /// (DEFAULT NULL) and the ciphertext would be unrecoverable.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_archive_restore_carries_encrypted_envelope_1728() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        // Sqlite reference pins the contract shape.
+        super::sqlite_archive_restore_carries_encrypted_envelope_1728();
+
+        // The fixture carries no metadata.agent_id, so drive the
+        // archive/restore paths via the admin/bypass context.
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-1728");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = sample_memory(&format!("pg-1728-env-{run}"));
+        let _ = MemoryStore::store(&pg, &admin_ctx, &mem).await;
+
+        // Stamp a known ciphertext envelope onto the live row.
+        let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
+        sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+            .bind(&envelope)
+            .bind(&mem.id)
+            .execute(pg.pool())
+            .await
+            .expect("set envelope on live row");
+
+        // Archive: the INSERT-SELECT must carry the envelope into
+        // archived_memories.
+        let moved = pg
+            .archive_by_ids(&admin_ctx, std::slice::from_ref(&mem.id), Some("manual"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1, "one row archived");
+        let arch_env: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_envelope FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("archived row carries envelope");
+        assert_eq!(
+            arch_env, envelope,
+            "archive carries the ciphertext envelope"
+        );
+
+        // Restore: the INSERT-SELECT must round-trip the envelope back
+        // onto the live memories row.
+        let restored = pg
+            .archive_restore(&admin_ctx, &mem.id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore reports success");
+        let live_env: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("restored row carries envelope");
+        assert_eq!(
+            live_env, envelope,
+            "restore round-trips the ciphertext envelope"
+        );
+    }
+
     /// Gap 2 (#885) — postgres twin of `verify_gap_2_source_uri_sqlite`.
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
