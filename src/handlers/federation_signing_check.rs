@@ -32,7 +32,8 @@ use crate::federation::signing as fed_signing;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::federation_receive::{
-    SyncPushBody, attribute_agent_for_quota, check_sender_clock_skew, next_utc_midnight,
+    SyncPushBody, check_sender_clock_skew, extract_peer_id, next_utc_midnight,
+    resolve_inbound_attribution,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -41,7 +42,7 @@ use crate::validate;
 #[allow(clippy::too_many_lines)]
 pub(super) async fn sync_push_via_store(
     app: AppState,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: SyncPushBody,
 ) -> Response {
     if let Err(e) = validate::validate_agent_id(&body.sender_agent_id) {
@@ -98,6 +99,14 @@ pub(super) async fn sync_push_via_store(
     // (parity with the sqlite path).
     check_sender_clock_skew(&body.sender_agent_id, &body);
 
+    // #1464 (v0.8.0, P0) — per-memory authorship gate inputs (parity with
+    // the sqlite path). The outer `sync_push` already verified the body
+    // signature (#791) + sender↔x-peer-id attestation (#238) before
+    // dispatching here, so the peer-id + allowlist are the authority for
+    // gating each row's claimed `metadata.agent_id`.
+    let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+    let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
+
     // #1566 / #1579 B1 — embed-once-replicate-vector + ack-after-commit
     // (sqlite-twin parity; see `federation_receive::sync_push`). The
     // pre-#1566 shape re-embedded EVERY applied row synchronously
@@ -143,10 +152,32 @@ pub(super) async fn sync_push_via_store(
         // the postgres path consults the same `app.db` connection the
         // sqlite path uses. F7 closure (#639) — federation receive
         // never bypasses the cap that the equivalent HTTP POST sees.
-        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
-        let bytes_estimate =
-            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
-                .unwrap_or(i64::MAX);
+        // #1464 (v0.8.0, P0) — build the row first, then gate its quota +
+        // ownership attribution (sqlite-twin parity). `resolve_governance_policy`
+        // is async on the store, so resolve it before taking the quota lock.
+        let local_cap = app
+            .store
+            .resolve_governance_policy(&mem.namespace)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            local_cap,
+        );
+        let attribute_agent = resolve_inbound_attribution(
+            &mut to_insert,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
+        let bytes_estimate = i64::try_from(
+            to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
+        )
+        .unwrap_or(i64::MAX);
         {
             let conn = app.db.lock().await;
             // v0.7.0 #1156 — charge against the per-namespace
@@ -208,33 +239,11 @@ pub(super) async fn sync_push_via_store(
                 }
             }
         }
-        // v0.7.0 L2-2 — reflection origin stamping (postgres parity).
-        //
-        // #961 (SAL boundary cleanup, 2026-05-21): pre-fix this branch
-        // used `GovernancePolicy::default().effective_max_reflection_depth()`
-        // because `resolve_governance_policy` was thought to be
-        // sqlite-only. As of Wave-3 the SAL trait method is wired on
-        // both `SqliteStore` (`src/store/sqlite.rs::687`) and
-        // `PostgresStore` (`src/store/postgres.rs::8795`), so we now
-        // honour operator-set per-namespace caps on inbound federation
-        // pushes the same way sqlite does in
-        // `federation_receive.rs::sync_push`. Best-effort: a backend
-        // error (`Err(_)`) or absent policy (`Ok(None)`) falls back to
-        // the compiled-in default so a transient backend hiccup doesn't
-        // refuse legitimate reflection-bearing pushes.
-        let local_cap = app
-            .store
-            .resolve_governance_policy(&mem.namespace)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
-        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
-            mem,
-            &body.sender_agent_id,
-            local_cap,
-        );
+        // (`local_cap`, `to_insert` + the #1464 attribution gate were
+        // resolved above the quota gate — honouring operator-set
+        // per-namespace reflection caps via the SAL `resolve_governance_policy`
+        // (both backends) and applying any per-memory re-attribution — so
+        // the exact persisted row is stored here.)
         match app.store.apply_remote_memory(&ctx, &to_insert).await {
             Ok(applied_id) => {
                 applied += 1;
