@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────
+# ai-memory — PgBouncer pooler smoke stack (v0.8.0 Pillar-4 4.B, #1736).
+#
+# Demonstrates the production wiring: clients (ai-memory) connect to the
+# pooler on 6432; the pooler fans them into the real postgres+AGE backend on
+# 5432 in transaction mode. Used by ./smoke-test.sh to prove an AGE cypher
+# transaction survives transaction-mode multiplexing.
+#
+# NOTE on the postgres image: this smoke stack uses the upstream apache/age
+# image (postgres + AGE) because validating the POOLER only needs the AGE
+# cypher path. A PRODUCTION module backbone also needs pgvector for ai-memory's
+# `sal-postgres` adapter — build that from infra/lan-parity-test/
+# Dockerfile.pg-age-vector and swap the `postgres.image` below for it.
+# ─────────────────────────────────────────────────────────────────────────
+
+name: ai-memory-pgbouncer-smoke
+
+services:
+  postgres:
+    image: apache/age:PG16_latest
+    container_name: ai-memory-pgbouncer-postgres
+    environment:
+      POSTGRES_USER: ai_memory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ai_memory_smoke}
+      POSTGRES_DB: ai_memory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_memory -d ai_memory"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Apply the role-default timeouts that PgBouncer's DISCARD ALL would
+    # otherwise strip from the per-session GUCs.
+    volumes:
+      - ./role-defaults.sql:/docker-entrypoint-initdb.d/10-role-defaults.sql:ro
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.23.1-p2
+    container_name: ai-memory-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "6432:6432"
+    # The smoke test renders userlist.txt from POSTGRES_PASSWORD (see
+    # smoke-test.sh) so the committed placeholder never needs a real secret.
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./.userlist.generated.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U ai_memory -d ai_memory || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20

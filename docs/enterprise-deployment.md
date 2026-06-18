@@ -593,6 +593,12 @@ ceiling (§10.2). PgBouncer is the middleman that decouples the two.
 
 #### 5.6.3 Minimal `pgbouncer.ini`
 
+> **Copy-deployable templates (v0.8.0 Pillar-4 4.B, #1736):**
+> [`infra/pgbouncer/`](../infra/pgbouncer/) materializes this section into
+> runnable artifacts — `pgbouncer.ini`, `userlist.txt`, `role-defaults.sql`,
+> a `docker-compose.yml`, and a `smoke-test.sh` that proves an AGE cypher
+> transaction + the role-default timeouts survive transaction-mode pooling.
+
 `transaction` pooling mode is **REQUIRED** (rationale in §5.6.4):
 
 ```ini
