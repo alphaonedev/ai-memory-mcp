@@ -316,7 +316,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            120,
+            121,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
