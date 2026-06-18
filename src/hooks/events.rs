@@ -728,6 +728,53 @@ impl From<&crate::transcripts::Transcript> for Transcript {
 }
 
 // ---------------------------------------------------------------------------
+// Signal payloads (v0.8.0 Pillar-1 #1709 / #1729)
+// ---------------------------------------------------------------------------
+
+/// Writable delta for [`HookEvent::PreSignalSend`]. Carries the
+/// rewritable fields of an in-flight coordination signal so a
+/// `pre_signal_send` hook can inspect it and, via
+/// `HookDecision::Modify`, rewrite any of them before the signal is
+/// signed + persisted to the append-only signal log.
+///
+/// `from_agent` and `id` are intentionally absent — rewriting the
+/// sender identity would silently change the signal's audit
+/// provenance (and invalidate the Ed25519 signature binding), which
+/// is the wrong shape for a hook contract. Mirrors the
+/// `source_ids`/`agent_id` omission on [`ReflectDelta`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalDelta {
+    pub namespace: String,
+    /// Recipient agent; `None` = namespace broadcast.
+    pub to_agent: Option<String>,
+    pub subject: String,
+    /// JSON-typed payload.
+    pub body: Value,
+    pub signal_type: crate::models::SignalType,
+    pub in_reply_to: Option<String>,
+    pub correlation_id: Option<String>,
+    /// JSON array of related signal/memory ids.
+    pub reference_ids: Value,
+}
+
+/// Read-only payload for [`HookEvent::PostSignalAck`]. A snapshot of
+/// the signal at acknowledgement time — enough for an observability
+/// hook to log / page / correlate without re-querying. **Notify-class**:
+/// the `post_signal_ack` hook's return value is ignored (the ack has
+/// already committed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalAck {
+    pub id: String,
+    pub namespace: String,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub subject: String,
+    pub signal_type: crate::models::SignalType,
+    /// Epoch seconds the ack was stamped.
+    pub acknowledged_at: i64,
+}
+
+// ---------------------------------------------------------------------------
 // Tests — JSON round-trip per representative variant
 // ---------------------------------------------------------------------------
 //
@@ -1147,5 +1194,41 @@ mod tests {
         assert_eq!(back.compressed_size, 42);
         assert_eq!(back.original_size, 256);
         assert!(back.expires_at.is_none());
+    }
+
+    #[test]
+    fn signal_payloads_round_trip() {
+        // v0.8.0 Pillar-1 #1729 — SignalDelta (pre) + SignalAck (post) wire shapes.
+        let delta = SignalDelta {
+            namespace: "_sig".into(),
+            to_agent: Some("agent-to".into()),
+            subject: "subj".into(),
+            body: serde_json::json!({"k": "v"}),
+            signal_type: crate::models::SignalType::Request,
+            in_reply_to: None,
+            correlation_id: Some("corr-1".into()),
+            reference_ids: serde_json::json!(["m-1"]),
+        };
+        let v = serde_json::to_value(&delta).expect("encode delta");
+        assert_eq!(v["signal_type"], serde_json::json!("request"));
+        let back: SignalDelta = serde_json::from_value(v).expect("decode delta");
+        assert_eq!(back.subject, "subj");
+        assert_eq!(back.to_agent.as_deref(), Some("agent-to"));
+        assert_eq!(back.signal_type, crate::models::SignalType::Request);
+
+        let ack = SignalAck {
+            id: "s-1".into(),
+            namespace: "_sig".into(),
+            from_agent: "agent-from".into(),
+            to_agent: None,
+            subject: "subj".into(),
+            signal_type: crate::models::SignalType::Notify,
+            acknowledged_at: 1_700_000_000,
+        };
+        let av = serde_json::to_value(&ack).expect("encode ack");
+        let ackback: SignalAck = serde_json::from_value(av).expect("decode ack");
+        assert_eq!(ackback.id, "s-1");
+        assert!(ackback.to_agent.is_none());
+        assert_eq!(ackback.acknowledged_at, 1_700_000_000);
     }
 }

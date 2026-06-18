@@ -121,9 +121,30 @@ lifecycle surface adds only permissive optional fields to the existing
   typed DAG edges + single-holder heartbeat leases + an hourly lease-sweeper
   (`crate::actions`, `MemoryStore::{action_*,lease_*}`, 8 MCP tools); signed
   signals (`crate::signals`, Ed25519 over canonical content, 5 MCP tools +
-  `pre_signal_send`/`post_signal_ack` hook events); attested checkpoints
+  `pre_signal_send`/`post_signal_ack` hook events — now load-bearing, see
+  below); attested checkpoints
   (`crate::checkpoints`, Ed25519-attested resolution = separation-of-duties,
   4 MCP tools). All on both the sqlite and postgres SAL adapters.
+- **Pillar-1 signal coordination hooks wired** ([#1729](https://github.com/alphaonedev/ai-memory-mcp/issues/1729), the last
+  Pillar-1 residual). `HookEvent::PreSignalSend` / `PostSignalAck` shipped at
+  v0.8.0-dev declared + classified but had **zero fire sites**, the
+  `SignalDelta`/`SignalAck` payloads were undefined, and the signal handlers
+  never invoked any hook. Now: `SignalDelta` (writable; `from_agent`/`id`
+  provenance-immutable) + `SignalAck` (read-only) are defined
+  (`src/hooks/events.rs`); `handle_signal_send_with_hooks` fires `PreSignalSend`
+  **before signing** (so a `Modify` rewrite is reflected in the
+  Ed25519-signed bytes) honoring `Allow`/`Modify`/`Deny`/`AskUser`
+  (`AskUser` is fail-closed on the sync MCP path); `handle_signal_ack_with_hooks`
+  fires `PostSignalAck` (notify-only) after the ack stamp commits. Wired via an
+  in-substrate sync-callback bundle `SignalHooks` (mirroring the `ReflectHooks`
+  precedent — the handlers are synchronous and run on the MCP stdio loop's
+  `spawn_blocking` thread with no tokio runtime, so the async wire-level
+  `HookChain` cannot be `.await`-ed there; the daemon-side chain bridge is the
+  separate [#1714](https://github.com/alphaonedev/ai-memory-mcp/issues/1714) gap). Thin `handle_signal_send`/`handle_signal_ack`
+  shims preserve the pre-#1729 signatures (zero caller churn). MCP-only surface
+  (no HTTP/CLI signal route). Tests pin Deny-refuses-insert, Modify-rewrites-
+  and-persists, AskUser-fail-closed, and post-fires-once (no re-fire on a no-op
+  re-ack).
 - **Pillar-2 typed-cognition link relations** — the closed
   `memory_links.relation` CHECK taxonomy extends 6 → 9 with `decomposes_into`
   (parent → child structural: a Goal decomposes_into Plans, a Plan
