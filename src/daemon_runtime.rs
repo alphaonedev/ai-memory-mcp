@@ -5442,6 +5442,41 @@ mod tests {
         );
     }
 
+    /// #1455 — exercise the env-reading wrapper `governance_consultation_unavailable`
+    /// itself (it resolves `governance_fail_open_on_error()` and delegates to
+    /// the pure `_inner`). The fail-open/fail-closed SEMANTICS are pinned by
+    /// the `_inner` test above and the env-parse test below; this pins the
+    /// wrapper's delegation path. The verdict depends on the ambient
+    /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR`, so accept either arm (no env
+    /// mutation here → no cross-test env race).
+    #[test]
+    fn governance_consultation_unavailable_wrapper_delegates_1455() {
+        use crate::governance::agent_action::AgentAction;
+        use crate::governance::deferred_audit::DeferredAuditQueue;
+
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".to_string(),
+            payload: serde_json::json!({ "namespace": "ns", "tier": "long" }),
+        };
+        let path = Path::new("/nonexistent/rules.db");
+        match governance_consultation_unavailable(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "wrap-surface",
+        ) {
+            // fail-open override (operator opted in) → permissive ALLOW.
+            Ok(()) => {}
+            // secure default → fail CLOSED, naming the cause.
+            Err(reason) => assert!(
+                reason.contains("consultation_unavailable"),
+                "fail-closed reason must name the cause: {reason}"
+            ),
+        }
+    }
+
     /// #1455 — the env-reading wrapper honours the documented
     /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` truthy values and
     /// defaults to `false` (fail-closed) when unset.
