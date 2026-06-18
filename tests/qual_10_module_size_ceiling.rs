@@ -202,7 +202,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // appending `encrypted_envelope` to the archive/restore INSERT-SELECT
     // column lists (the restore SELECT adds it on its own line ×2) landed
     // the file at 19_091. 19_110 = 19_091 + 19 headroom.
-    ("src/storage/mod.rs", 19_110),
+    // 2026-06-18 (#228 / #1728 Commit B-wiring) — bumped 19_110 → 19_280:
+    // the at-rest content encryption WIRING (seal_content/open_content
+    // threading through `insert` / `insert_with_conflict` / `insert_if_newer`
+    // / `update_with_expected_version` / `row_to_memory` + commented
+    // `encrypted_envelope` columns on the recall/search/list/by-source-uri
+    // SELECTs) landed the file at 19_256. 19_280 = 19_256 + 24 headroom.
+    ("src/storage/mod.rs", 19_280),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -466,7 +472,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // encrypted_envelope BYTEA — postgres parity for the sqlite-only #228
     // primitive + the archive carry) + its dispatch wiring landed the
     // file at 20_246. 20_260 = 20_246 + 14 headroom.
-    ("src/store/postgres.rs", 20_260),
+    // 2026-06-18 (#228 / #1728 Commit B-wiring) — bumped 20_260 → 20_380:
+    // the at-rest content encryption WIRING (seal_content threading through
+    // `PostgresStore::store` + `update_with_expected_version_once`, the
+    // encrypted_envelope INSERT column/bind + ON CONFLICT clause, and the
+    // fail-closed decrypt branch in the pg `row_to_memory` mapper) landed
+    // the file at 20_358. 20_380 = 20_358 + 22 headroom. The
+    // postgres/{mod,kg,...}.rs split remains the tracked target (#650).
+    ("src/store/postgres.rs", 20_380),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
