@@ -1,0 +1,2 @@
+# 4.B smoke-test renders this from POSTGRES_PASSWORD at runtime — never commit
+.userlist.generated.txt
