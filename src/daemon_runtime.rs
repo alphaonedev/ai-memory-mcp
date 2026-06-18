@@ -853,6 +853,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             max_storage_bytes: limits.max_storage_bytes,
             max_links_per_day: limits.max_links_per_day,
         });
+        // #1733 (Pillar-4 4.A) — seed the process-wide HTTP admission-control
+        // in-flight cap from the resolved `[limits]` config (env
+        // `AI_MEMORY_MAX_INFLIGHT_REQUESTS` > `[limits].max_inflight_requests`
+        // > compiled default `0` = disabled). `build_router_with_timeout`
+        // reads it at router-build time. Idempotent; harmless on the mcp/CLI
+        // paths that never build the HTTP router.
+        crate::set_max_inflight_requests(limits.max_inflight_requests);
     }
     // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
     // the resolved `[storage]` config (env `AI_MEMORY_DB_MMAP_SIZE` >

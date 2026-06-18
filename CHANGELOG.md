@@ -21,6 +21,24 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1733 (Pillar-4 4.A) — HTTP admission control (in-flight-request load-shedding).**
+  The axum daemon can now bound concurrent in-flight requests: when
+  `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or `[limits].max_inflight_requests`) is a positive
+  `n`, the daemon admits at most `n` concurrent requests and sheds the rest with a typed
+  `503` (`{"error":"server_overloaded","code":"OVERLOADED","max_inflight":n}` +
+  `Retry-After: 1`) instead of degrading or OOMing under a thundering herd. Implemented as a
+  custom `Arc<Semaphore>` + `try_acquire_owned` middleware (mirrors the existing 504-timeout
+  layer; no new tower features), applied OUTERMOST so rejection precedes the timeout future /
+  body decode / handler work, with the permit RAII-released on every exit path. `/health`,
+  `/metrics`, `/api/v1/metrics` are EXEMPT so liveness/readiness probes + Prometheus scrapes
+  survive overload (an unexempted cap would let the orchestrator kill an overloaded node,
+  amplifying the outage). **Opt-in** — unset / `0` / garbage leaves the layer uncomposed
+  (concurrency behaviour byte-identical to before). Shed events increment the
+  `ai_memory_admission_shed_total` Prometheus counter + a sampled WARN. Resolver ladder
+  `env > [limits] > compiled default 0`; seeded at boot via `crate::set_max_inflight_requests`.
+  Mechanism + posture resolved by the mandatory 5-agent crossroads vote (memory 4d3ea1c5).
+  Behavioural tests (`src/lib.rs::admission_control_1733_tests`: over-cap shed + typed-503
+  wire shape, `/health` exempt, cap=0 disabled) + precedence pin (`tests/config_precedence.rs`).
 - **#1720 A — owner-keyed `scope=private` visibility (cross-tenant leak closed, both adapters).**
   The three divergent `scope=private` read predicates (recall / search / list) are collapsed
   onto ONE owner-keyed canonical check: a private row is visible to a caller iff

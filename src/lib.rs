@@ -701,6 +701,43 @@ pub mod store;
 /// constructs inline so the production binary and the test harness
 /// share a single route map.
 ///
+/// #1733 (Pillar-4 4.A) — process-wide HTTP admission-control concurrency
+/// cap, seeded once at daemon boot from the resolved `[limits]`
+/// configuration (`AI_MEMORY_MAX_INFLIGHT_REQUESTS` > `[limits]` >
+/// compiled default). `0` = disabled. Read by [`build_router_with_timeout`]
+/// at router-build time to decide whether to compose the inflight layer.
+///
+/// This mirrors the existing process-wide seeded-knob precedent
+/// (`crate::reranker::set_rerank_max_seq`, `crate::storage::set_db_mmap_size`,
+/// `crate::quotas::set_quota_defaults`): the cap is needed deep in
+/// `build_router_with_timeout` where no `AppConfig` is threaded, and the
+/// daemon has many serve entry points (TLS, plaintext, test-shutdown), so a
+/// seeded global is lower-churn and more uniform than threading a parameter
+/// through every path. Backed by an `AtomicUsize` (not a `OnceLock`) so the
+/// per-binary integration tests can set it before building a router.
+static MAX_INFLIGHT_REQUESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(config::DEFAULT_MAX_INFLIGHT_REQUESTS);
+
+/// Seed the process-wide HTTP admission-control in-flight cap (#1733).
+/// Called once at daemon boot from the resolved `[limits]` config. `0`
+/// disables admission control (no layer composed).
+pub fn set_max_inflight_requests(cap: usize) {
+    MAX_INFLIGHT_REQUESTS.store(cap, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide HTTP admission-control in-flight cap (#1733).
+/// `0` means disabled. Consumed by [`build_router_with_timeout`].
+#[must_use]
+pub fn max_inflight_requests() -> usize {
+    MAX_INFLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #1733 (Pillar-4 4.A) — sample rate for the admission-shed `WARN` log.
+/// The Prometheus `ai_memory_admission_shed_total` counter records every
+/// shed; the log line is sampled (1st, then every Nth) so sustained
+/// overload cannot flood the log while still leaving periodic breadcrumbs.
+const ADMISSION_WARN_SAMPLE: u64 = 256;
+
 /// DOC-5 (med/low review batch) — promoted from the pre-existing `//`
 /// banner so the doc-comment attaches to the symbol (cargo-doc + IDE
 /// surfaces) and is symmetric with the sibling
@@ -769,7 +806,7 @@ pub fn build_router_with_timeout(
         },
     );
 
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(handlers::routes::HEALTH, get(handlers::health))
         // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
         // (the community convention) and /api/v1/metrics (consistent with
@@ -1113,7 +1150,87 @@ pub fn build_router_with_timeout(
         // window. Default 60 s; configurable via
         // `AppConfig::request_timeout_secs`.
         .layer(timeout_layer)
-        .with_state(app_state)
+        .with_state(app_state);
+
+    // #1733 (Pillar-4 4.A) — HTTP admission control, applied OUTERMOST
+    // (after `.with_state`, so it is the very first layer a request hits).
+    // Reads the process-wide cap seeded at boot; `0` = disabled (no layer
+    // composed, byte-identical to a build without admission control).
+    compose_admission_control(router, max_inflight_requests())
+}
+
+/// #1733 (Pillar-4 4.A) — wrap `router` with the HTTP admission-control
+/// layer when `cap > 0`; otherwise return it unchanged.
+///
+/// When enabled, the daemon admits at most `cap` concurrent in-flight
+/// requests and sheds the rest with a typed `503` (`{"error":
+/// "server_overloaded", "code": "OVERLOADED", "max_inflight": cap}` +
+/// `Retry-After: 1`). The layer is applied OUTERMOST so rejection happens
+/// before the timeout future / body decode / handler work is allocated.
+/// The liveness/readiness (`/health`) + Prometheus-scrape (`/metrics`,
+/// `/api/v1/metrics`) endpoints are EXEMPT so an overloaded node's health
+/// checks survive — otherwise the orchestrator's probe gets shed, the node
+/// is killed, and graceful load-shedding becomes a crash-loop. The owned
+/// semaphore permit is held across `next.run(req)` and released by RAII on
+/// every exit path (normal return, handler panic, client disconnect, or the
+/// inner timeout firing). Mechanism + posture resolved by the mandatory
+/// 5-agent crossroads vote (memory 4d3ea1c5).
+///
+/// Extracted as a named fn (rather than inlined in
+/// [`build_router_with_timeout`]) so the behavioural test can drive the
+/// real layer against a controllable blocking handler.
+fn compose_admission_control(router: axum::Router, cap: usize) -> axum::Router {
+    if cap == 0 {
+        return router;
+    }
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+    let warn_sampler = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let semaphore = std::sync::Arc::clone(&semaphore);
+            let warn_sampler = std::sync::Arc::clone(&warn_sampler);
+            async move {
+                use axum::response::IntoResponse;
+                // Liveness/readiness + metrics scrape bypass the cap so an
+                // overloaded node still answers its orchestrator + scraper.
+                let path = req.uri().path();
+                if path == handlers::routes::HEALTH
+                    || path == handlers::routes::METRICS
+                    || path == handlers::routes::METRICS_BARE
+                {
+                    return next.run(req).await;
+                }
+                match semaphore.try_acquire_owned() {
+                    // `_permit` is held for the whole downstream call and
+                    // RAII-released the instant `next.run(req)` resolves
+                    // (including the timeout-fires and panic-unwind paths).
+                    Ok(_permit) => next.run(req).await,
+                    Err(_) => {
+                        crate::metrics::registry().admission_shed_total.inc();
+                        let n = warn_sampler
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n % ADMISSION_WARN_SAMPLE == 0 {
+                            tracing::warn!(
+                                max_inflight = cap,
+                                "admission control: in-flight request cap reached \
+                                 — shedding request with 503 (log sampled 1/{ADMISSION_WARN_SAMPLE})"
+                            );
+                        }
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("Retry-After", "1")],
+                            axum::Json(serde_json::json!({
+                                "error": "server_overloaded",
+                                "code": "OVERLOADED",
+                                "max_inflight": cap,
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        },
+    ))
 }
 
 /// v0.7.0 Wave-3 Continuation — adapter that picks up the appropriate
@@ -1136,6 +1253,156 @@ async fn postgres_route_gate_layer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// #1733 (Pillar-4 4.A) — HTTP admission-control tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_control_1733_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt as _;
+
+    // Two counting semaphores used as ordering gates. `Semaphore` (unlike
+    // `Notify`) accumulates permits reliably regardless of waiter timing, so
+    // the handshake is race-free even with multiple concurrent requests:
+    //   - `entered`: handler `add_permits(1)` once it holds the admission
+    //     permit; test `acquire().forget()` to await a confirmed in-flight.
+    //   - `release`: handler `acquire().forget()` to park; test
+    //     `add_permits(n)` to let parked handlers complete.
+    type Gate = (Arc<Semaphore>, Arc<Semaphore>);
+
+    /// A router whose `/slow` handler signals `entered` once it holds the
+    /// admission permit, then parks on `release` — giving the test a
+    /// deterministic in-flight request (no sleeps/timing races). `/health`
+    /// mirrors the production exempt path. Wrapped with the real
+    /// `compose_admission_control` layer at `cap`.
+    fn admission_router(cap: usize, entered: Arc<Semaphore>, release: Arc<Semaphore>) -> Router {
+        async fn slow(State((entered, release)): State<Gate>) -> StatusCode {
+            entered.add_permits(1);
+            release
+                .acquire()
+                .await
+                .expect("release sem closed")
+                .forget();
+            StatusCode::OK
+        }
+        async fn health() -> StatusCode {
+            StatusCode::OK
+        }
+        let inner = Router::new()
+            .route("/slow", get(slow))
+            .route(crate::handlers::routes::HEALTH, get(health))
+            .with_state((entered, release));
+        super::compose_admission_control(inner, cap)
+    }
+
+    fn get_req(path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    async fn await_entered(entered: &Arc<Semaphore>) {
+        entered
+            .acquire()
+            .await
+            .expect("entered sem closed")
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn second_request_over_cap_is_shed_with_typed_503() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let app = admission_router(1, entered.clone(), release.clone());
+
+        // Request 1 acquires the only permit and parks inside the handler.
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // permit is now held
+
+        // Request 2 must be shed: 503 + Retry-After + the typed envelope.
+        let resp2 = app.clone().oneshot(get_req("/slow")).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp2.headers().get("Retry-After").unwrap(),
+            "1",
+            "shed response must carry Retry-After",
+        );
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "server_overloaded");
+        assert_eq!(v["code"], "OVERLOADED");
+        assert_eq!(v["max_inflight"], 1);
+
+        // Release request 1; it completes normally and frees the permit.
+        release.add_permits(1);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_is_exempt_even_when_cap_is_saturated() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let app = admission_router(1, entered.clone(), release.clone());
+
+        // Saturate the cap with a parked /slow request.
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await;
+
+        // /health bypasses the (saturated) cap so liveness probes survive.
+        let health = app
+            .clone()
+            .oneshot(get_req(crate::handlers::routes::HEALTH))
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "/health must be exempt from admission control",
+        );
+
+        release.add_permits(1);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cap_zero_disables_admission_control() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        // cap == 0 → layer not composed; a parked request does NOT block a
+        // second one with a 503 (the second also enters the handler).
+        let app = admission_router(0, entered.clone(), release.clone());
+
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // request 1 in the handler
+
+        // Request 2 also reaches the handler (no shed); prove it by observing
+        // a second `entered` signal rather than a 503.
+        let app2 = app.clone();
+        let h2 = tokio::spawn(async move { app2.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // request 2 ALSO entered → not shed
+
+        release.add_permits(2);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(h2.await.unwrap().status(), StatusCode::OK);
+    }
 }
 
 // ---------------------------------------------------------------------------

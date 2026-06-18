@@ -3613,6 +3613,12 @@ pub struct LimitsSection {
     /// Maximum items returned in a single list response / accepted in a
     /// single bulk or federation-sync request.
     pub max_page_size: Option<usize>,
+
+    /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
+    /// cap. When `Some(n)` with `n > 0`, the daemon admits at most `n`
+    /// concurrent in-flight requests and sheds the rest with a typed
+    /// `503`. `None` / `Some(0)` leaves admission control disabled.
+    pub max_inflight_requests: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4038,6 +4044,9 @@ pub struct ResolvedLimits {
     pub max_links_per_day: i64,
     /// Maximum items per list response / bulk-or-sync request.
     pub max_page_size: usize,
+    /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
+    /// cap. `0` means disabled (no inflight layer composed).
+    pub max_inflight_requests: usize,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -4050,6 +4059,16 @@ pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
 pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
 /// Env override for `[limits].max_page_size`.
 pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
+/// #1733 (Pillar-4 4.A) — env override for `[limits].max_inflight_requests`,
+/// the global HTTP admission-control concurrency cap.
+pub const ENV_MAX_INFLIGHT_REQUESTS: &str = "AI_MEMORY_MAX_INFLIGHT_REQUESTS";
+/// #1733 (Pillar-4 4.A) — compiled default for the HTTP admission-control
+/// in-flight-request cap. `0` means **disabled** (the layer is not composed
+/// at all, so the daemon's concurrency behaviour is byte-identical to a
+/// build without admission control). Admission control is strictly opt-in:
+/// operators set `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or
+/// `[limits].max_inflight_requests`) to a positive cap to enable load-shedding.
+pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 0;
 
 /// #1579 B7 — env override for the sqlite `PRAGMA mmap_size`
 /// (`[storage].db_mmap_size_bytes`), in whole bytes. `0` disables
@@ -6992,16 +7011,28 @@ impl AppConfig {
             .or(page_cfg)
             .unwrap_or(crate::handlers::MAX_BULK_SIZE);
 
+        // #1733 (Pillar-4 4.A) — admission-control cap. `env_pos_usize`
+        // filters `> 0`, so a `0` / negative / garbage env or config value
+        // falls through to the compiled default (`0` = disabled), keeping
+        // admission control strictly opt-in.
+        let inflight_env = env_pos_usize(ENV_MAX_INFLIGHT_REQUESTS);
+        let inflight_cfg = cfg.and_then(|l| l.max_inflight_requests).filter(|n| *n > 0);
+        let max_inflight_requests = inflight_env
+            .or(inflight_cfg)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
+
         let source = if mem_env.is_some()
             || bytes_env.is_some()
             || links_env.is_some()
             || page_env.is_some()
+            || inflight_env.is_some()
         {
             ConfigSource::Env
         } else if mem_cfg.is_some()
             || bytes_cfg.is_some()
             || links_cfg.is_some()
             || page_cfg.is_some()
+            || inflight_cfg.is_some()
         {
             ConfigSource::Config
         } else {
@@ -7013,6 +7044,7 @@ impl AppConfig {
             max_storage_bytes,
             max_links_per_day,
             max_page_size,
+            max_inflight_requests,
             source,
         }
     }
@@ -9050,6 +9082,7 @@ legacy_scoring = false
             ENV_MAX_STORAGE_BYTES,
             ENV_MAX_LINKS_PER_DAY,
             ENV_MAX_PAGE_SIZE,
+            ENV_MAX_INFLIGHT_REQUESTS,
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -9089,12 +9122,14 @@ legacy_scoring = false
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            max_inflight_requests: Some(64),
         });
         let r = cfg.resolve_limits();
         assert_eq!(r.max_memories_per_day, 5_000_000);
         assert_eq!(r.max_storage_bytes, 9_000_000_000);
         assert_eq!(r.max_links_per_day, 4_000_000);
         assert_eq!(r.max_page_size, 250_000);
+        assert_eq!(r.max_inflight_requests, 64);
         assert_eq!(r.source, ConfigSource::Config);
     }
 
@@ -9112,6 +9147,7 @@ legacy_scoring = false
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            max_inflight_requests: Some(64),
         });
         let r = cfg.resolve_limits();
         // env wins for the two it sets …
