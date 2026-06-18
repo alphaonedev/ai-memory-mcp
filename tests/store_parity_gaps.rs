@@ -605,6 +605,61 @@ fn sqlite_parity_gap_1725_in_place_archive() {
     verify_gap_1725_in_place_archive_sqlite();
 }
 
+/// #1725 regression — `update_with_expected_version` must work when the
+/// CALLER already holds a transaction. The synthesis merge path
+/// (`src/mcp/tools/store/synthesis.rs`) wraps candidate updates +
+/// provenance rows in one `BEGIN IMMEDIATE`; the #1725 archive-before-
+/// update wrap must NOT open a nested `BEGIN` (sqlite errors "cannot
+/// start a transaction within a transaction"). `is_autocommit()` gates
+/// the inner tx so the archive + UPDATE run inside the caller's tx.
+#[test]
+fn sqlite_update_inside_caller_transaction_does_not_nest_1725() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1725-tx", "test", "tx title", "content-v1");
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("open the caller's outer transaction");
+    let (ok, changed) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v2"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("in-place update inside an open tx must NOT nest-error");
+    assert!(ok && changed, "update applied with content_changed");
+    conn.execute_batch("COMMIT")
+        .expect("commit the caller's tx");
+
+    // The live row carries the new content and the in_place_edit snapshot
+    // of the prior content was archived inside (and committed with) the
+    // caller's transaction.
+    let live: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("live row");
+    assert_eq!(live, "content-v2");
+    let archived: String = conn
+        .query_row(
+            "SELECT content FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("in_place_edit archive committed with the caller tx");
+    assert_eq!(archived, "content-v1");
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // v0.7.0 #1117 — sqlite-side parity pin for the SAL trait `update`
 // version bump (#1024). Postgres parity pin lives in `postgres_side`
