@@ -3361,6 +3361,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_v07_v08_capability_methods_report_documented_defaults() {
+        // #1709 SHIP-HARDEN — pin the SAL default bodies for the v0.7.x +
+        // v0.8.0 capability methods a minimal in-memory adapter does not
+        // implement: unsupported reads/writes surface `UnsupportedCapability`,
+        // while the recall-ledger writes are permissive no-ops (`Ok(0)` /
+        // `Ok(None)`) so a non-ledger adapter round-trips cleanly.
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+
+        // Unsupported-capability read/write defaults.
+        assert!(matches!(
+            s.get_links_for_anchor("anchor").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.get_reflection_origin("rid").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_recall_observations(None, None, None, None, 10)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.revoke_agent_pubkey(&ctx, "agent").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.lease_sweep_expired(0).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+
+        // Permissive defaults.
+        assert_eq!(s.agent_pubkey("agent").await.expect("agent_pubkey"), None);
+        assert_eq!(
+            s.record_recall_observation("rid", &[], None, None)
+                .await
+                .expect("record_recall_observation default"),
+            0
+        );
+        assert_eq!(
+            s.mark_recall_consumed("rid", &[], "alice", None)
+                .await
+                .expect("mark_recall_consumed default"),
+            0
+        );
+        assert_eq!(
+            s.recall_observation_gc(7)
+                .await
+                .expect("recall_observation_gc default"),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn default_apply_remote_link_forwards_to_link() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
