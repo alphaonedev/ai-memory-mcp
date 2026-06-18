@@ -298,13 +298,21 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // addition / removal of a route surface requires bumping this
 // constant in lockstep with the test failing.
 //
-// The 90th `.route(` at the bottom of `build_router_with_timeout` is
-// the `/slow` slowloris-test route gated by `#[cfg(test)]` — that is
-// counted by `EXPECTED_TEST_ROUTES_COUNT` below.
+// The `/slow` slowloris-test route in `h7_timeout_tests` is gated by
+// `#[cfg(test)]` — that, plus the `/slow` + `/health` routes in the
+// `admission_control_1733_tests` helper router (#1733 Pillar-4 4.A), are
+// counted by `EXPECTED_TEST_ROUTES_COUNT` below. The ARCH-14 scan counts
+// `.route(` lines from the FIRST `#[cfg(test)] mod` after
+// `build_router_with_timeout` to EOF, so every inline test-router route
+// contributes regardless of which test module declares it.
 // ---------------------------------------------------------------------------
 
 pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 89;
-pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
+// 2026-06-18 (#1733 Pillar-4 4.A) — bumped 1 → 3: the
+// `admission_control_1733_tests` helper router adds a `/slow` (blocking
+// handler for the concurrency test) + a `/health` (exemption assertion)
+// test-only route alongside the pre-existing `h7_timeout_tests` `/slow`.
+pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 
 /// Number of distinct URL paths (multi-line-aware) registered by the
 /// production router. Derived via
