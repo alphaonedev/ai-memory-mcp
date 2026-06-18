@@ -603,7 +603,7 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
 /// write fails with `ENOENT`. For a plain (slash-free) `agent_id` the
 /// file parent IS `dir`, so this is behaviourally identical to the old
 /// `create_dir_all(dir)`.
-fn ensure_parent(path: &Path) -> Result<()> {
+pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating key directory {}", parent.display()))?;
@@ -619,7 +619,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
 //           with write permission. Triggering EACCES / ENOSPC / EIO
 //           in unit tests requires kernel-level fault injection.
 #[cfg(unix)]
-fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     // Best-effort remove first so a previous, possibly stricter mode
     // on the same name doesn't block an `open` with `create_new`.
@@ -636,7 +636,7 @@ fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Windows/non-Unix: mode bits don't apply. The file inherits the
     // parent directory ACL. Hardware-backed key storage on Windows is
     // out of OSS scope — see the AgenticMem commercial layer.
