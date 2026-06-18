@@ -360,6 +360,14 @@ impl DeferredAuditJournal {
     /// Open (creating if absent) the journal at `path`, tightening to
     /// mode 0600 on unix.
     ///
+    /// Opened `read + write` (NOT append-mode): on Windows an append-only
+    /// handle grants `FILE_APPEND_DATA` but not the general write access
+    /// `set_len`/`SetEndOfFile` (used by [`Self::truncate`]) requires, so
+    /// truncate would fail with `os error 5`. [`Self::append`] seeks to
+    /// end before each write — single-process daemon writes serialized by
+    /// the `Mutex` make this equivalent to append without the Windows
+    /// truncate hazard.
+    ///
     /// # Errors
     /// Propagates the open / chmod IO error.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
@@ -367,7 +375,7 @@ impl DeferredAuditJournal {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
-            .append(true)
+            .write(true)
             .open(&path)
             .with_context(|| format!("open deferred-audit journal {}", path.display()))?;
         #[cfg(unix)]
@@ -399,6 +407,11 @@ impl DeferredAuditJournal {
         frame.extend_from_slice(&payload);
         frame.extend_from_slice(&hash);
         let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
+        // Seek to end before writing — the handle is read+write (not
+        // append-mode, for Windows truncate compatibility), and the Mutex
+        // serializes all writers in this single-process daemon.
+        f.seek(SeekFrom::End(0))
+            .context("journal append: seek-to-end")?;
         f.write_all(&frame).context("journal append: write_all")?;
         f.sync_all().context("journal append: fsync")?;
         Ok(())
