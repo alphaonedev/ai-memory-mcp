@@ -303,6 +303,7 @@ mod arch_9_slug_tests {
                 capability: "c".into(),
             },
             StoreError::IntegrityFailed { detail: "d".into() },
+            StoreError::InvalidTransition { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -314,6 +315,7 @@ mod arch_9_slug_tests {
             CONFLICT,
             STORE_UNSUPPORTED_CAPABILITY,
             STORE_OPERATION_FAILED,
+            CONFLICT,
             DATABASE_ERROR,
         ];
         for (got, want) in variants.iter().zip(expected.iter()) {

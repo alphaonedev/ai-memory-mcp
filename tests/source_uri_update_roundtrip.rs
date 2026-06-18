@@ -209,6 +209,7 @@ fn invalid_source_uri_rejected_by_validator() {
         metadata: None,
         source_uri: Some("no-scheme-here".to_string()),
         agent_id: None,
+        lifecycle_state: None,
     };
     let via_update = validate::validate_update(&bad_update);
     assert!(

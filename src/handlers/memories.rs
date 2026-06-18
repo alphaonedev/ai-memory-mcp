@@ -264,6 +264,14 @@ pub async fn update_memory(
             // db::update_with_expected_version) so this was a
             // postgres-only data drop.
             expires_at: body.expires_at.clone(),
+            // v0.8.0 Pillar 2 (#1726) — thread the lifecycle transition
+            // target so the postgres trait `update` enforces
+            // `can_transition_to` (illegal edge → 409 via
+            // `StoreError::InvalidTransition`). Already validated above.
+            lifecycle_state: body
+                .lifecycle_state
+                .as_deref()
+                .and_then(crate::models::LifecycleState::from_str),
         };
         // v0.7.0 ship-hardening (2026-05-19): resolve caller from
         // X-Agent-Id header so update() can authorize against the
@@ -486,6 +494,32 @@ pub async fn update_memory(
         if_match_version,
     ) {
         Ok((true, _)) => {
+            // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle
+            // transition through the self-validating storage primitive. An
+            // illegal edge surfaces as a typed `InvalidTransition` → 409
+            // CONFLICT (byte-parity error detail with the postgres branch's
+            // `StoreError::InvalidTransition`); a request equal to the stored
+            // state is an idempotent no-op. `body.lifecycle_state` was already
+            // shape-validated by `validate_update` above.
+            if let Some(target) = body
+                .lifecycle_state
+                .as_deref()
+                .and_then(crate::models::LifecycleState::from_str)
+                && let Err(e) = db::set_lifecycle_state(&lock.0, &resolved_id, target)
+            {
+                if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "conflict",
+                            "id": resolved_id,
+                            "error": it.to_string(),
+                        })),
+                    )
+                        .into_response();
+                }
+                return crate::handlers::errors::handler_error_500(&e);
+            }
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
             // Issue #219: regenerate the embedding when the searchable text
             // (title/content) changed. Without this, the semantic index keeps

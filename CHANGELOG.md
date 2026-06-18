@@ -144,15 +144,21 @@ lifecycle surface adds only permissive optional fields to the existing
   `Memory` struct grows to **27 fields** (the 27th is `lifecycle_state`,
   `#[serde(default)]` → `Open` for legacy rows). The column is load-bearing,
   not inert: `memory_store` accepts an optional initial `lifecycle_state`
-  (validated), and `memory_update` accepts a `lifecycle_state` transition
-  target whose legality is enforced against the stored state
-  (`current.can_transition_to(new)`) — an illegal transition (e.g. `open` →
-  `done`, or any move out of a terminal) is rejected with a typed validation
-  error; a legal one persists and bumps the optimistic-concurrency `version`.
-  No new MCP tool and no tool-count change (the additions are permissive
-  optional fields on the existing store / update request structs). Schema
-  v64 on both adapters (sqlite probe-then-add ALTER, postgres `migrate_v64`
-  stamping the literal 64 for crash-safety).
+  (validated), and a `lifecycle_state` transition target is enforced against
+  the stored state (`current.can_transition_to(new)`) across **all three
+  surfaces** — MCP `memory_update`, HTTP `PUT /api/v1/memories/{id}`, and the
+  SAL `MemoryStore::update` path (via `UpdatePatch.lifecycle_state`) — on
+  **both backends**. The gate is centralised in the storage primitive
+  (#1726): sqlite `storage::set_lifecycle_state` and its postgres twin
+  `PostgresStore::apply_lifecycle_patch` SELECT the current state and reject
+  an illegal edge (e.g. `open → done`, or any move out of a terminal) with a
+  typed `InvalidTransition` → HTTP **409 CONFLICT** (byte-parity error detail
+  on both adapters); a legal edge persists and bumps the optimistic-
+  concurrency `version`, and a request equal to the stored state is an
+  idempotent no-op. No new MCP tool and no tool-count change (the additions
+  are permissive optional fields on the existing store / update request
+  structs). Schema v64 on both adapters (sqlite probe-then-add ALTER,
+  postgres `migrate_v64` stamping the literal 64 for crash-safety).
 - **§2.5 attested — read-time attested-provenance surfacing**
   ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709), reframed
   from #1715). `memory_recall` now composes provenance at read from already-merged

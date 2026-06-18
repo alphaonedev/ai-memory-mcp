@@ -1266,6 +1266,16 @@ pub struct UpdateMemory {
     /// cross-tenant write hijack with forged provenance.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// v0.8.0 Pillar 2 (#1726) — opt-in lifecycle transition target
+    /// (`open` / `active` / `blocked` / `done` / `abandoned`). `None` leaves
+    /// the stored `lifecycle_state` untouched; a supplied value is validated
+    /// (`validate_lifecycle_state`) and the transition legality is enforced
+    /// against the stored state (`LifecycleState::can_transition_to`) in the
+    /// update path — an illegal edge returns HTTP 409, a legal one persists
+    /// and bumps the optimistic-concurrency `version`. A request equal to the
+    /// stored state is an idempotent no-op.
+    #[serde(default)]
+    pub lifecycle_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

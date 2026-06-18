@@ -646,6 +646,98 @@ async fn http_update_memory_uses_appstate() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn http_update_memory_enforces_lifecycle_transition_1726() {
+    // #1726 — PUT /api/v1/memories/{id} with a `lifecycle_state` target must
+    // enforce the transition machine. Legal `open → active` → 200 + persists;
+    // illegal `open → done` (skips active) → 409 CONFLICT + row untouched.
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let mk = |title: &str| Memory {
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-lc-1726".into(),
+        title: title.into(),
+        content: "lifecycle http fixture".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({}),
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Goal,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let (legal_id, illegal_id) = {
+        let lock = state.lock().await;
+        (
+            db::insert(&lock.0, &mk("lc-legal")).unwrap(),
+            db::insert(&lock.0, &mk("lc-illegal")).unwrap(),
+        )
+    };
+
+    let app = Router::new()
+        .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+        .with_state(test_app_state(state.clone()));
+
+    let put = |id: &str, target: &str| {
+        let body = serde_json::json!({ "lifecycle_state": target });
+        axum::http::Request::builder()
+            .uri(format!("/api/v1/memories/{id}"))
+            .method("PUT")
+            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+
+    // Legal: open -> active.
+    let resp = app.clone().oneshot(put(&legal_id, "active")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "open->active must be 200");
+    {
+        let lock = state.lock().await;
+        assert_eq!(
+            db::get(&lock.0, &legal_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            crate::models::LifecycleState::Active,
+        );
+    }
+
+    // Illegal: open -> done.
+    let resp = app.oneshot(put(&illegal_id, "done")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "open->done must be 409 CONFLICT"
+    );
+    {
+        let lock = state.lock().await;
+        assert_eq!(
+            db::get(&lock.0, &illegal_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            crate::models::LifecycleState::Open,
+            "a rejected transition must leave the row untouched"
+        );
+    }
+}
+
 // --- Phase 3 foundation HTTP sync tests (issue #224) ---
 
 #[tokio::test]
