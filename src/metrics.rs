@@ -245,6 +245,16 @@ pub struct Metrics {
     /// silently failing (bad CA reachability, key-load fault) even
     /// though the worker thread is still alive.
     pub federation_renewal_lag_seconds: IntGauge,
+
+    /// #1733 (Pillar-4 4.A) — monotonic counter of HTTP requests shed by
+    /// the admission-control layer because the in-flight-request cap
+    /// (`AI_MEMORY_MAX_INFLIGHT_REQUESTS`) was already saturated. Each
+    /// increment pairs with a sampled `tracing::warn!`. Non-zero means
+    /// the daemon is actively load-shedding — operators alert on a
+    /// sustained increment rate to size the cap (or the fleet) up. Zero
+    /// on every deployment that has not opted into admission control
+    /// (the cap defaults to disabled).
+    pub admission_shed_total: IntCounter,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -569,6 +579,18 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_renewal_lag_seconds.clone()))?;
 
+        let admission_shed_total = IntCounter::new(
+            "ai_memory_admission_shed_total",
+            "Monotonic counter of HTTP requests shed by the admission-control \
+             layer because the in-flight-request cap \
+             (AI_MEMORY_MAX_INFLIGHT_REQUESTS) was already saturated. Non-zero \
+             means the daemon is load-shedding with a typed 503; operators \
+             alert on a sustained increment rate to size the cap or the fleet \
+             up. Always zero on deployments that have not opted into admission \
+             control (the cap defaults to disabled).",
+        )?;
+        registry.register(Box::new(admission_shed_total.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -598,6 +620,7 @@ impl Metrics {
             federation_inbound_cred_total,
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
+            admission_shed_total,
         })
     }
 }

@@ -345,12 +345,14 @@ fn test_limits_env_overrides_config_and_default() {
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            // #1733 (Pillar-4 4.A) — admission-control inflight cap.
+            max_inflight_requests: Some(64),
         }),
         ..AppConfig::default()
     };
 
     // ---- Branch A: env unset → config wins over compiled default ----
-    // All four guards must share ONE `ENV_LOCK` acquisition; stacking
+    // All guards must share ONE `ENV_LOCK` acquisition; stacking
     // single-key `EnvVarGuard`s on one thread self-deadlocks the
     // non-reentrant lock (see `MultiEnvVarGuard` docs).
     let guard_a = MultiEnvVarGuard::apply(&[
@@ -358,17 +360,23 @@ fn test_limits_env_overrides_config_and_default() {
         ("AI_MEMORY_MAX_STORAGE_BYTES", None),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
         ("AI_MEMORY_MAX_PAGE_SIZE", None),
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", None),
     ]);
     let r_cfg = cfg.resolve_limits();
     assert_eq!(r_cfg.max_memories_per_day, 5_000_000);
     assert_eq!(r_cfg.max_page_size, 250_000);
+    assert_eq!(
+        r_cfg.max_inflight_requests, 64,
+        "[limits].max_inflight_requests config MUST beat the compiled default",
+    );
     drop(guard_a);
 
-    // ---- Branch B: env overrides the two it sets; config fills the
+    // ---- Branch B: env overrides the ones it sets; config fills the
     //               rest; the resolved source becomes Env ----
     let _guard_b = MultiEnvVarGuard::apply(&[
         ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("7000000")),
         ("AI_MEMORY_MAX_PAGE_SIZE", Some("1000000")),
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", Some("128")),
         ("AI_MEMORY_MAX_STORAGE_BYTES", None),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
     ]);
@@ -380,6 +388,10 @@ fn test_limits_env_overrides_config_and_default() {
     assert_eq!(
         r_env.max_page_size, 1_000_000,
         "AI_MEMORY_MAX_PAGE_SIZE env MUST beat [limits] config",
+    );
+    assert_eq!(
+        r_env.max_inflight_requests, 128,
+        "AI_MEMORY_MAX_INFLIGHT_REQUESTS env MUST beat [limits] config",
     );
     assert_eq!(
         r_env.max_storage_bytes, 9_000_000_000,
@@ -395,12 +407,16 @@ fn test_limits_env_overrides_config_and_default() {
 fn test_limits_garbage_env_falls_through_to_default() {
     let cfg = AppConfig::default();
 
-    // One lock acquisition for all three mutations (see `MultiEnvVarGuard`).
+    // One lock acquisition for all mutations (see `MultiEnvVarGuard`).
     let _guard = MultiEnvVarGuard::apply(&[
         ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("0")),
         ("AI_MEMORY_MAX_PAGE_SIZE", Some("-9")),
         ("AI_MEMORY_MAX_STORAGE_BYTES", Some("lots")),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
+        // #1733 — garbage inflight env must fall through to the compiled
+        // default (`0` = admission control DISABLED), never panic or enable
+        // a bogus cap.
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", Some("nope")),
     ]);
 
     let r = cfg.resolve_limits();
@@ -416,6 +432,11 @@ fn test_limits_garbage_env_falls_through_to_default() {
         "non-positive page-size env must be ignored"
     );
     assert!(r.max_storage_bytes > 0, "unparseable env must be ignored");
+    assert_eq!(
+        r.max_inflight_requests,
+        ai_memory::config::DEFAULT_MAX_INFLIGHT_REQUESTS,
+        "garbage inflight env must fall through to the disabled default",
+    );
 }
 
 // ---------------------------------------------------------------------------

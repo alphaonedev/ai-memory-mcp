@@ -546,7 +546,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `default_model_for_alias` referencing the shared
     // `LOCAL_SERVER_MODEL_PLACEHOLDER` const (hoisted to keep the
     // `local-model` literal under the hardcoded-literal-gate ratchet).
-    ("src/config.rs", 10_400),
+    // 2026-06-18 (v0.8.0 #1733 Pillar-4 4.A) — bumped 10_400 → 10_460: the
+    // admission-control env/const (`ENV_MAX_INFLIGHT_REQUESTS`,
+    // `DEFAULT_MAX_INFLIGHT_REQUESTS`), the `LimitsSection` +
+    // `ResolvedLimits` `max_inflight_requests` fields, the `resolve_limits`
+    // arm, and the lockstep test-fixture updates.
+    ("src/config.rs", 10_460),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -640,7 +645,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // L1-6 governance pre-write hook sites (storage pre-write +
     // wire_check) each gained a `Decision::Escalate` block-and-chain-log
     // arm (the compiler-forced exhaustive-match arm).
-    ("src/daemon_runtime.rs", 8_700),
+    // 2026-06-18 (v0.8.0 #1733 Pillar-4 4.A) — bumped 8_700 → 8_760: the
+    // boot-time `set_max_inflight_requests` seeding block next to the
+    // existing `set_quota_defaults` seed (admission-control cap resolved
+    // from `[limits]`).
+    ("src/daemon_runtime.rs", 8_760),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
