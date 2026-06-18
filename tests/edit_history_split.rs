@@ -7,14 +7,20 @@
 //! regression pin.
 //!
 //! * `EditSource::Human` (default) — in-place mutation, content
-//!   overwritten, version bumped, no archive created.
+//!   overwritten, version bumped, SAME memory_id. Since #1725 (v0.8.0)
+//!   this path is also lossless: the prior content is snapshotted into
+//!   `archived_memories` with `archive_reason='in_place_edit'` BEFORE
+//!   the in-place UPDATE (no fork — the live row keeps its id), so a
+//!   human edit still mutates in place but no longer destroys the
+//!   immediately-prior content.
 //! * `EditSource::Llm` / `EditSource::Hook` — append-and-archive:
 //!   a NEW memory row is minted carrying the patched content; the
 //!   OLD row is archived with `archive_reason='superseded'` so
 //!   `memory_archive_list` can rewind to read the pre-edit body.
 //!
 //! Mirrors mem9's pattern: human-typed corrections mutate in place
-//! (rewinding is rare); programmatic LLM rewrites preserve the
+//! (and, since #1725, retain the immediately-prior content under the
+//! same id); programmatic LLM rewrites fork a NEW row and preserve the
 //! prior content so "what did we believe before?" stays answerable.
 
 use ai_memory::db;
@@ -70,7 +76,29 @@ fn human_edit_path_mutates_in_place_and_bumps_version() {
     assert_eq!(stored.content, "v2 body — human typed");
     assert_eq!(stored.version, 2, "in-place update bumps version");
     let after = count_archived(&conn);
-    assert_eq!(before, after, "human edit must NOT create an archived row");
+    // #1725 (v0.8.0) — the DEFAULT in-place update path is now lossless:
+    // a content edit snapshots the prior content into archived_memories
+    // (SAME memory_id, archive_reason='in_place_edit', NO fork) BEFORE
+    // the in-place UPDATE. This supersedes the pre-#1725 "human edit must
+    // NOT archive" contract; the in-place + version-bump semantics
+    // (same id, version 1→2) are unchanged.
+    assert_eq!(
+        after,
+        before + 1,
+        "#1725: a human content edit archives the prior content in place"
+    );
+    let (reason, archived_body): (String, String) = conn
+        .query_row(
+            "SELECT archive_reason, content FROM archived_memories WHERE id = ?1",
+            params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("in_place_edit archive row present");
+    assert_eq!(reason, "in_place_edit");
+    assert_eq!(
+        archived_body, "v1 body",
+        "#1725: archive holds the PRIOR content under the SAME id (no fork)"
+    );
 }
 
 #[test]
@@ -486,6 +514,12 @@ fn append_and_archive_honors_expected_version_gate() {
         None,
     )
     .expect("bump");
+    // #1725 — the in-place update above is now lossless: it archived the
+    // prior "v1 body" under archive_reason='in_place_edit'. Capture the
+    // post-update archive count so the assertion below pins that the
+    // REFUSED supersede gate adds NOTHING further (rather than assuming a
+    // pristine zero-archive baseline that pre-#1725 held).
+    let archived_after_inplace = count_archived(&conn);
     let err = db::update_with_archive_on_supersede(
         &conn,
         &id,
@@ -508,6 +542,8 @@ fn append_and_archive_honors_expected_version_gate() {
         .expect("typed VersionConflict on the supersede gate");
     assert_eq!(vc.expected, 1);
     assert_eq!(vc.current, 2);
-    // No archive was created — the gate refused before the move.
-    assert_eq!(count_archived(&conn), 0);
+    // The refused supersede gate created NO archive — it refused before
+    // the move. The only archive present is the #1725 in_place_edit
+    // snapshot from the human update above (count unchanged here).
+    assert_eq!(count_archived(&conn), archived_after_inplace);
 }
