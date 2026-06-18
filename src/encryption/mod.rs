@@ -503,6 +503,63 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
     )
 }
 
+/// #228 Commit B — seal a memory's plaintext content for at-rest storage.
+///
+/// Returns `Some((envelope_bytes, placeholder))` when at-rest encryption
+/// is enabled AND `content` is non-empty; `None` otherwise (the caller
+/// stores `content` verbatim and leaves `encrypted_envelope` NULL — the
+/// byte-identical default path). Content-only: title / tags / metadata
+/// stay plaintext and are NOT routed through here.
+///
+/// The returned `placeholder` is the empty string — the `content` column
+/// holds it while the ciphertext lives in `encrypted_envelope`. Reads
+/// recover the plaintext via [`open_content`], gated on envelope
+/// presence (never on [`encryption_enabled`]) so rows written while
+/// encryption was on remain readable after the flag is toggled off.
+///
+/// Fail-closed: keypair-resolution errors propagate, and an enabled gate
+/// over a memory with no `agent_id` to key encryption to is refused
+/// rather than silently storing plaintext.
+///
+/// # Errors
+/// * Returns `Err` when encryption is enabled, `content` is non-empty,
+///   but `agent_id` is empty — there is no recipient key to seal to.
+/// * Returns `Err` when the per-agent keypair cannot be
+///   resolved/persisted, or when the AEAD encrypt call fails.
+pub(crate) fn seal_content(content: &str, agent_id: &str) -> Result<Option<(Vec<u8>, String)>> {
+    if !encryption_enabled(None) || content.is_empty() {
+        return Ok(None);
+    }
+    if agent_id.is_empty() {
+        return Err(anyhow!(
+            "at-rest encryption enabled but memory has no agent_id to key encryption to (fail-closed)"
+        ));
+    }
+    let kp = get_or_create_keypair(agent_id)?;
+    let env = encrypt(content, &kp.public)?;
+    Ok(Some((env.to_bytes(), String::new())))
+}
+
+/// #228 Commit B — decrypt an at-rest envelope back to plaintext content.
+///
+/// Gated by the CALLER on envelope PRESENCE (a non-NULL
+/// `encrypted_envelope` BLOB / BYTEA), NOT on [`encryption_enabled`], so
+/// rows written while encryption was on stay readable after the flag is
+/// toggled off. The plaintext `content` column then carries the empty
+/// placeholder; the recovered value here is the source of truth.
+///
+/// # Errors
+/// * Returns `Err` when the envelope bytes don't parse (truncated /
+///   unknown version), or when AEAD authentication / decryption fails
+///   (tampered ciphertext, wrong recipient key, missing keypair). The
+///   caller maps this to a fail-closed read error — never substitutes
+///   the placeholder for the plaintext.
+pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<String> {
+    let env = Envelope::from_bytes(envelope_bytes)?;
+    let kp = get_or_create_keypair(agent_id)?;
+    decrypt(&env, &kp.secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +767,48 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
         }
+    }
+
+    // --- #228 Commit B — seal_content / open_content helpers ---
+
+    #[test]
+    fn seal_content_returns_none_when_encryption_disabled() {
+        // #228 Commit B — the default (encryption-off) path: seal_content
+        // is a no-op so the caller stores content verbatim with a NULL
+        // envelope (byte-identical to pre-wiring behaviour). This test is
+        // hermetic — it never sets the env var, relying on the default
+        // disabled gate. (The env-mutating `encryption_enabled_*` test
+        // restores the var, but to avoid cross-test ordering coupling we
+        // assert disabled-by-default explicitly when the var is unset.)
+        if encryption_enabled(None) {
+            // Another test left the var set in this process; skip rather
+            // than assert a false negative. The env-guarded integration
+            // suite (tests/encryption_at_rest.rs) covers the enabled path.
+            return;
+        }
+        let sealed = seal_content("plaintext content", "agent-seal-off").expect("seal");
+        assert!(
+            sealed.is_none(),
+            "encryption disabled => seal_content must return None (verbatim store)"
+        );
+    }
+
+    #[test]
+    fn open_content_round_trips_via_process_test_key() {
+        // #228 Commit B — open_content recovers the plaintext from an
+        // envelope sealed to the agent's per-process test keypair.
+        // open_content resolves the agent key through
+        // `get_or_create_keypair`, which in cfg(test) reads the
+        // process-wide ephemeral test key dir. To stay hermetic we:
+        //   1. populate the cache for the agent (first call mints+caches),
+        //   2. build the envelope with THAT keypair's public key,
+        //   3. assert open_content(bytes, agent) recovers the plaintext.
+        let agent = "open-content-roundtrip-agent";
+        let kp = get_or_create_keypair(agent).expect("seed keypair");
+        let plaintext = "round-trip via open_content — #228 Commit B";
+        let env = encrypt(plaintext, &kp.public).expect("encrypt");
+        let bytes = env.to_bytes();
+        let recovered = open_content(&bytes, agent).expect("open_content");
+        assert_eq!(recovered, plaintext);
     }
 }

@@ -535,7 +535,7 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
                 }
             },
         );
-    Ok(Memory {
+    let mut memory = Memory {
         id: row_id,
         tier,
         namespace: row.get("namespace")?,
@@ -611,7 +611,43 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             .ok()
             .and_then(|s| crate::models::LifecycleState::from_str(&s))
             .unwrap_or_default(),
-    })
+    };
+
+    // #228 Commit B — at-rest content decryption. The decrypt branch is
+    // gated on envelope PRESENCE (a non-NULL `encrypted_envelope`), NOT on
+    // `encryption_enabled`, so rows written while encryption was on remain
+    // readable after the flag is toggled off. When the column is NULL
+    // (every legacy row + every row written under encryption-off) this is
+    // a no-op — `memory.content` keeps the plaintext read above, so the
+    // default path stays byte-identical. `.unwrap_or(None)` tolerates the
+    // column being absent on a pre-v44 backup (the migrate ladder may not
+    // have reached this DB yet); an absent column reads as NULL.
+    let enc: Option<Vec<u8>> = row
+        .get::<_, Option<Vec<u8>>>(field_names::ENCRYPTED_ENVELOPE)
+        .unwrap_or(None);
+    if let Some(bytes) = enc {
+        let agent_id = memory
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match crate::encryption::open_content(&bytes, agent_id) {
+            Ok(plaintext) => memory.content = plaintext,
+            Err(e) => {
+                // FAIL-CLOSED: a row with a non-NULL envelope MUST decrypt
+                // or the read errors. Never return the empty placeholder as
+                // if it were the plaintext content — that would silently
+                // surface an empty memory and mask key loss / corruption.
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("decrypt failed: {e}"))),
+                ));
+            }
+        }
+    }
+
+    Ok(memory)
 }
 
 /// v0.7.0 polish PERF-8 (issue #781) — extract the canonical
@@ -710,15 +746,38 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // `[entity:X]` title-marker fallback) on reflection rows. See
     // `extract_mentioned_entity_id` for the resolution order.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #228 Commit B — at-rest content encryption. When enabled, seal the
+    // plaintext content to the per-agent X25519 key; the `content` column
+    // then carries the empty placeholder and the ciphertext envelope lands
+    // in `encrypted_envelope`. When disabled (default) `sealed` is None and
+    // the content column holds the plaintext verbatim with a NULL envelope
+    // — byte-identical to pre-wiring behaviour. agent_id is the NHI
+    // provenance marker from metadata (fail-closed under an enabled gate
+    // when absent). Content-only: title / tags / metadata stay plaintext.
+    let agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+    let content_to_store = sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = excluded.content,
+            -- #228 Commit B — content + envelope move together on upsert so
+            -- a re-store under encryption replaces both the placeholder and
+            -- the ciphertext (and a re-store under encryption-off writes the
+            -- plaintext + NULL envelope, clearing any stale ciphertext).
+            encrypted_envelope = excluded.encrypted_envelope,
             tags = excluded.tags,
             priority = MAX(memories.priority, excluded.priority),
             confidence = MAX(memories.confidence, excluded.confidence),
@@ -810,7 +869,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.tier.as_str(),
             mem.namespace,
             mem.title,
-            mem.content,
+            content_to_store,
             tags_json,
             mem.priority,
             mem.confidence,
@@ -833,6 +892,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.confidence_decayed_at,
             mentioned_entity_id,
             mem.lifecycle_state.as_str(),
+            encrypted_envelope,
         ],
         |r| r.get(0),
     )?;
@@ -1084,6 +1144,21 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // first-write happy path; otherwise the auto-persona matcher
             // would miss every reflection minted via reflect.
             let mentioned_entity_id = extract_mentioned_entity_id(mem);
+            // #228 Commit B — at-rest content encryption on the
+            // ConflictMode::Error first-write path (used by db::reflect).
+            // Mirrors `insert`: seal content to the per-agent key when
+            // enabled, store the placeholder + envelope; None (default)
+            // stores plaintext verbatim with a NULL envelope.
+            let agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+            let content_to_store = sealed
+                .as_ref()
+                .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+            let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
             // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
             // This INSERT path was added by the fix-campaign R1-M3
             // (ConflictMode::Error refuses duplicates) and originally
@@ -1094,18 +1169,18 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
                  RETURNING id",
                 params![
-                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
+                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
                     mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
-                    mentioned_entity_id, mem.lifecycle_state.as_str(),
+                    mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -1199,10 +1274,14 @@ pub fn get_by_prefix(conn: &Connection, prefix: &str) -> Result<Option<Memory>> 
     let escaped = prefix.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("{escaped}%");
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE id LIKE ?1 ESCAPE '\\'")?;
+    // #228 Commit B — collect with `?` (not `.filter_map(Result::ok)`) so a
+    // row whose `encrypted_envelope` fails to decrypt surfaces the
+    // fail-closed FromSqlConversionFailure from `row_to_memory` instead of
+    // being silently dropped from the match set (which would mask key loss
+    // / corruption AND could flip an ambiguous prefix to a false single hit).
     let rows: Vec<Memory> = stmt
         .query_map(params![pattern], row_to_memory)?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     match rows.len() {
         0 => Ok(None),
         1 => Ok(Some(rows.into_iter().next().expect("len checked"))),
@@ -1557,6 +1636,28 @@ pub fn update_with_expected_version(
     let metadata_json = serde_json::to_string(metadata)?;
     let now = Utc::now().to_rfc3339();
 
+    // #228 Commit B — at-rest content encryption on the in-place update
+    // path. Seal the effective NEW content (post-merge) to the per-agent
+    // key when enabled; the `content` column then holds the placeholder
+    // and `encrypted_envelope` the ciphertext. When disabled (default),
+    // `sealed` is None so we write the plaintext verbatim and set the
+    // envelope to NULL (clearing any stale ciphertext under encryption-off
+    // — byte-identical to the pre-wiring path where the column was always
+    // NULL). agent_id is the resolved metadata NHI marker (the patch's
+    // metadata if supplied, else the existing row's), matching the seal
+    // key that `insert` used for this row. Both columns are SET together
+    // so content + envelope can never desynchronize.
+    let update_agent_id = metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let update_sealed = crate::encryption::seal_content(new_content, update_agent_id)?;
+    let update_content_to_store = update_sealed
+        .as_ref()
+        .map_or(new_content, |(_, ph)| ph.as_str());
+    let update_encrypted_envelope: Option<&[u8]> =
+        update_sealed.as_ref().map(|(env, _)| env.as_slice());
+
     // Ultrareview #354: rely on the UNIQUE INDEX on (title, namespace)
     // to enforce collision atomically at the DB layer. The previous
     // check-then-update sequence had a race — another transaction
@@ -1608,9 +1709,9 @@ pub fn update_with_expected_version(
             )?;
         }
         let update_res = conn.execute(
-            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), version = version + 1
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, new_content, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope],
         );
         match update_res {
             Ok(0) => {
@@ -2611,7 +2712,8 @@ pub fn search_with_source_uri(
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -2724,7 +2826,7 @@ pub fn list_by_source_uri(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.version
+                m.version, m.encrypted_envelope
          FROM memories m
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
@@ -3177,6 +3279,11 @@ pub fn recall(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                -- #228 Commit B — encrypted_envelope so row_to_memory
+                -- decrypts at-rest content on this recall path; the trailing
+                -- `score` column is read by name (not positionally) so this
+                -- insertion is safe.
+                m.encrypted_envelope,
                 (fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
@@ -3515,7 +3622,8 @@ fn find_similar_title_candidates(
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1 AND m.namespace = ?2
@@ -7502,6 +7610,15 @@ fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
                 COALESCE(version, 1) AS version
          FROM archived_memories WHERE id = ?1",
     )?;
+    // #228 Commit B — DELIBERATELY does NOT select `encrypted_envelope`.
+    // This Memory feeds only the GOVERNANCE_PRE_WRITE hook, which inspects
+    // namespace / tier / title (all plaintext) and never `content`. If the
+    // envelope were selected, `row_to_memory` would fail-closed on any
+    // archived row whose key has rotated / is absent, blocking the restore
+    // entirely — even though the restore INSERT-SELECT carries the
+    // ciphertext envelope verbatim (Commit A) and the row is fully
+    // restorable. The hook seeing the empty placeholder for `content` is
+    // harmless (content is not a governance input).
     let mem = stmt.query_row(params![id], row_to_memory)?;
     Ok(mem)
 }
@@ -7703,16 +7820,43 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // so a stale peer cannot blank out a value the matcher's index
     // depends on.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #228 Commit B — at-rest content encryption on the federation
+    // newer-wins merge path. Seal the (already-plaintext) inbound content
+    // to the local per-agent key when enabled; the `content` column
+    // carries the placeholder and the ciphertext lands in
+    // `encrypted_envelope`. None (default) stores the plaintext verbatim
+    // with a NULL envelope. NOTE: federation merge re-seals the inbound
+    // plaintext under the LOCAL recipient key — the encrypted_envelope
+    // moves together with content under the SAME newer-wins CASE so a
+    // timestamp winner never desynchronizes placeholder vs ciphertext.
+    let agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+    let content_to_store = sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
     // #1579 B6 — federation catch-up replays this newer-wins upsert
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                            THEN excluded.content ELSE memories.content END,
+            -- #228 Commit B — the at-rest ciphertext envelope moves with
+            -- `content` under the IDENTICAL newer-wins tiebreak so the
+            -- placeholder and its ciphertext are never split across the
+            -- winner boundary (a winner's placeholder with the loser's
+            -- ciphertext would be undecryptable).
+            encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
+                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                      THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
             tags = CASE WHEN excluded.updated_at > memories.updated_at
                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                         THEN excluded.tags ELSE memories.tags END,
@@ -7818,7 +7962,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.tier.as_str(),
             mem.namespace,
             mem.title,
-            mem.content,
+            content_to_store,
             tags_json,
             mem.priority,
             mem.confidence,
@@ -7842,6 +7986,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mentioned_entity_id,
             mem.version,
             mem.lifecycle_state.as_str(),
+            encrypted_envelope,
         ],
         |r| r.get(0),
     )?;
@@ -8995,6 +9140,12 @@ fn fts_keyword_phase(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
+                -- #228 Commit B — encrypted_envelope rides this recall FTS
+                -- SELECT so row_to_memory decrypts at-rest content. It sits
+                -- AFTER m.embedding (positional index 25, read by row.get(25))
+                -- so the embedding index is unchanged; row_to_memory + the
+                -- fts_score read are by-name and unaffected.
+                m.encrypted_envelope,
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -9257,9 +9408,16 @@ fn semantic_phase(
 
     // Fallback: linear scan over all embeddings.
     let sem_sql = format!(
+        // #228 Commit B — `encrypted_envelope` appended AFTER `embedding`
+        // so `row_to_memory` can decrypt at-rest content on this semantic
+        // linear-scan path while the positional `row.get(17)` for
+        // `embedding` (zero-based index 17) stays valid. row_to_memory
+        // reads encrypted_envelope by name, so its position is irrelevant
+        // to the decrypt; only the embedding's positional index is pinned.
         "SELECT id, tier, namespace, title, content, tags, priority,
                 confidence, source, access_count, created_at, updated_at,
-                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding
+                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
+                encrypted_envelope
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -9902,9 +10060,16 @@ pub fn memories_updated_since(
     // the None path read in index order (no predicate) and the Some path
     // use the index as a range bound (`updated_at > ?1`), each with
     // early-stop under the LIMIT.
+    // #228 Commit B — `encrypted_envelope` is included so `row_to_memory`
+    // decrypts at-rest content on this federation catch-up outbound path
+    // (the receiver re-seals under its own local key via `insert_if_newer`).
+    // Omitting it would let the column read as NULL and serve the empty
+    // placeholder as the peer's content. The other named-column reader
+    // (`metadata` etc.) tolerates the addition because `row_to_memory`
+    // reads every column by name.
     const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
-                expires_at, metadata \
+                expires_at, metadata, encrypted_envelope \
          FROM memories ";
     let rows = match since {
         None => {
