@@ -172,6 +172,29 @@ lifecycle surface adds only permissive optional fields to the existing
   `gate_read` unit tests (refuse / escalate-blocks / warn-allows / fast-path /
   surface-narrow / namespace-narrow / empty-matcher-no-blanket / audit-row) + 2
   parity tests (every read surface gated; fast-path passes with no rules).
+- **Crash-durable deferred-audit queue** ([#1732](https://github.com/alphaonedev/ai-memory-mcp/issues/1732),
+  PE-4 / §5.6 / #697 Phase-6). The deferred-audit queue was an in-memory
+  `mpsc`: a SIGKILL before the supervised drainer processed a submitted
+  governance refusal LOST it (`signed_events_dlq` only covers an append
+  FAILURE after the drainer has the event, not the pre-drain window). Added
+  a `DeferredAuditJournal` — an append-only, fsync-per-record shadow file
+  (`<db>.deferred-audit.journal`, mode 0600; frame =
+  `[u32-LE len][canonical_bytes][32-byte sha256]`). `DeferredAuditQueue::submit`
+  now durably journals each refusal BEFORE the mpsc send, and
+  `recover_deferred_audit` replays un-drained records into `signed_events`
+  at boot (then truncates). Design via the deterministic **5-agent vote
+  (4d3ea1c5)** (tripped T4 on-disk format): a journal **file** was chosen
+  over a sqlite pending-table because `submit` fires inside `storage::insert`
+  holding the substrate's `BEGIN IMMEDIATE` write lock — a second connection
+  writing the same DB would self-deadlock; a raw file append touches no
+  `Connection`. Replay is **idempotent** (dedup on the deterministic
+  `payload_hash`, since the sink stamps a random `id`) so a crash between the
+  pre-crash drainer's append and the SIGKILL never double-appends the hash
+  chain; a torn trailing frame (crash mid-append) is detected (short-read or
+  sha256 mismatch) and discarded. Boot recovery is **replay-all-then-go-live**,
+  wired into BOTH the `serve` and `mcp` boot paths (the MCP stdio path has no
+  shutdown drain, so durability + boot recovery is its only safety net).
+  Tests pin crash-recovery, torn-record-discard, and idempotent-replay.
 - **Pillar-2 typed-cognition link relations** — the closed
   `memory_links.relation` CHECK taxonomy extends 6 → 9 with `decomposes_into`
   (parent → child structural: a Goal decomposes_into Plans, a Plan

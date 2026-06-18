@@ -3747,8 +3747,13 @@ pub async fn bootstrap_serve(
     // chain-logged; the deadlock-avoidance came at the cost of
     // breaking the bypass-impossibility audit story for storage
     // writes).
+    // v0.8.0 PE-4 (#1732) — crash-durable journal variant: boot recovery
+    // (replay pre-crash refusals into signed_events) runs first, then the
+    // queue is built with the journal so every submit is durable before
+    // the mpsc send. Runs BEFORE the governance hooks install below
+    // (replay-all-then-go-live).
     let (deferred_audit_queue, deferred_audit_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
     // Capture the shared atomic metrics handle BEFORE the queue is cloned
     // into the governance hooks + moved onto `AppState`. `serve` polls
     // these on shutdown to drain the queue before the WAL checkpoint.
