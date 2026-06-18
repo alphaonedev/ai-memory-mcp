@@ -198,7 +198,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // archive + in-place UPDATE in one BEGIN IMMEDIATE tx in
     // `update_with_expected_version`. No schema change. Measured 19_074;
     // bump 18_985 → 19_090 in lockstep (19_074 + 16 headroom).
-    ("src/storage/mod.rs", 19_090),
+    // 2026-06-18 (#228 / #1728 Commit A-carry) — bumped 19_090 → 19_110:
+    // appending `encrypted_envelope` to the archive/restore INSERT-SELECT
+    // column lists (the restore SELECT adds it on its own line ×2) landed
+    // the file at 19_091. 19_110 = 19_091 + 19 headroom.
+    ("src/storage/mod.rs", 19_110),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
