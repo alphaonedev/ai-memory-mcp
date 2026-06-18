@@ -1578,59 +1578,92 @@ pub fn update_with_expected_version(
     // patch that doesn't touch source_uri must NOT blank it out).
     // When `Some(uri)`, the row's source_uri is rewritten verbatim
     // (rename / scheme migration / bad-data correction).
-    let update_res = conn.execute(
-        "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), version = version + 1
-         WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-        params![effective_tier.as_str(), namespace, new_title, new_content, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version],
-    );
-    match update_res {
-        Ok(0) => {
-            // Either the row vanished between SELECT and UPDATE, or
-            // the version drifted (racing writer slipped in). When
-            // expected_version was supplied, re-read so the CONFLICT
-            // envelope carries the current stored value.
-            if let Some(expected) = expected_version {
-                let current_version: Option<i64> = conn
+    // #1725 (v0.8.0) — lossless default update path. Wrap the
+    // archive-of-prior-content + the in-place UPDATE in ONE
+    // `BEGIN IMMEDIATE` so a mid-failure — or a version-conflict UPDATE
+    // that matches 0 rows — rolls BOTH back, leaving the OLD content
+    // live (no orphan archive row). The prior content is snapshotted
+    // BEFORE the UPDATE overwrites it, under
+    // `archive_reason='in_place_edit'` with the SAME memory_id, and
+    // ONLY when title/content actually changed (metadata / tag /
+    // priority patches don't touch content, so they don't archive). No
+    // caller of `update_with_expected_version` holds an open
+    // transaction, so the IMMEDIATE acquisition cannot nest.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let txn_result = (|| -> Result<(bool, bool)> {
+        if content_changed {
+            archive_memory_insert_only(
+                conn,
+                id,
+                crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT,
+            )?;
+        }
+        let update_res = conn.execute(
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), version = version + 1
+             WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
+            params![effective_tier.as_str(), namespace, new_title, new_content, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version],
+        );
+        match update_res {
+            Ok(0) => {
+                // Either the row vanished between SELECT and UPDATE, or
+                // the version drifted (racing writer slipped in). When
+                // expected_version was supplied, re-read so the CONFLICT
+                // envelope carries the current stored value. Returning an
+                // Err here rolls the tx back, reverting the archive so a
+                // version-conflict snapshots nothing.
+                if let Some(expected) = expected_version {
+                    let current_version: Option<i64> = conn
+                        .query_row(
+                            "SELECT version FROM memories WHERE id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    if let Some(current) = current_version {
+                        return Err(VersionConflict {
+                            id: id.to_string(),
+                            expected,
+                            current,
+                        }
+                        .into());
+                    }
+                }
+                Ok((false, false))
+            }
+            Ok(_) => Ok((true, content_changed)),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                let other: Option<String> = conn
                     .query_row(
-                        "SELECT version FROM memories WHERE id = ?1",
-                        params![id],
+                        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
+                        params![new_title, namespace, id],
                         |r| r.get(0),
                     )
                     .ok();
-                if let Some(current) = current_version {
-                    return Err(VersionConflict {
-                        id: id.to_string(),
-                        expected,
-                        current,
-                    }
-                    .into());
+                if let Some(other_id) = other {
+                    // #962 typed envelope — UniqueConflict surfaces as
+                    // `MemoryError::Conflict` (HTTP 409).
+                    return Err(anyhow::Error::new(StorageError::UniqueConflict {
+                        reason: format!(
+                            "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
+                        ),
+                    }));
                 }
+                Err(anyhow::anyhow!("update failed with constraint violation"))
             }
-            Ok((false, false))
+            Err(e) => Err(e.into()),
         }
-        Ok(_) => Ok((true, content_changed)),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            let other: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
-                    params![new_title, namespace, id],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(other_id) = other {
-                // #962 typed envelope — UniqueConflict surfaces as
-                // `MemoryError::Conflict` (HTTP 409).
-                return Err(anyhow::Error::new(StorageError::UniqueConflict {
-                    reason: format!(
-                        "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
-                    ),
-                }));
-            }
-            Err(anyhow::anyhow!("update failed with constraint violation"))
+    })();
+    match txn_result {
+        Ok(r) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(r)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
     }
 }
 
@@ -1946,6 +1979,62 @@ pub(crate) fn archive_memory_no_tx(
         Ok(removed > 0)
     })();
     result
+}
+
+/// #1725 (v0.8.0) — INSERT-only archive of a STILL-LIVE row. Unlike
+/// [`archive_memory_no_tx`] this does NOT delete the live row or its
+/// `namespace_meta` standard: it snapshots the row's CURRENT content
+/// into `archived_memories` while the row keeps living in `memories`.
+/// Used by the default in-place update path
+/// ([`update_with_expected_version`]) to make a content edit lossless —
+/// the prior content is captured BEFORE the in-place `UPDATE` overwrites
+/// it, under `archive_reason='in_place_edit'`, with the SAME memory_id
+/// (no fork — distinct from the #888 supersede path).
+///
+/// Single-snapshot retention: `INSERT OR REPLACE` keeps the
+/// MOST-RECENT pre-edit snapshot (the "immediately-prior content"). A
+/// second edit replaces the first snapshot — by design (#1725 archives
+/// the immediately-prior content, not a per-edit history; full lineage
+/// is the #888 supersede fork). The only same-id archive row a live,
+/// in-place-editable row can collide with is a PRIOR `in_place_edit`
+/// snapshot: supersede forks a new id + deletes the old live row, GC
+/// deletes the live row, and restore removes the archive row on
+/// success — so this `REPLACE` never clobbers a different
+/// `archive_reason`'s record. Callers MUST already hold a transaction
+/// (the caller wraps archive + UPDATE in one `BEGIN IMMEDIATE` so a
+/// mid-failure rolls both back, leaving the OLD content live).
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    // Mirrors the INSERT-SELECT column carry in `archive_memory_no_tx`
+    // (#1025 full v0.7.0 shape: embedding + original_tier/expires_at +
+    // the Form-4/5/6 provenance columns) so an in_place_edit snapshot
+    // round-trips to the same shape an archive/restore would.
+    conn.execute(
+        "INSERT OR REPLACE INTO archived_memories
+         (id, tier, namespace, title, content, tags, priority, confidence,
+          source, access_count, created_at, updated_at, last_accessed_at,
+          expires_at, archived_at, archive_reason, metadata,
+          embedding, embedding_dim, original_tier, original_expires_at,
+          reflection_depth, atomised_into, atom_of, memory_kind,
+          entity_id, persona_version, citations, source_uri, source_span,
+          confidence_source, confidence_signals, confidence_decayed_at,
+          mentioned_entity_id, version, lifecycle_state)
+         SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, ?1, ?2, metadata,
+                embedding, embedding_dim, tier, expires_at,
+                reflection_depth, atomised_into, atom_of, memory_kind,
+                entity_id, persona_version, citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id, version, lifecycle_state
+         FROM memories WHERE id = ?3",
+        params![now, reason, id],
+    )?;
+    Ok(())
 }
 
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.

@@ -3321,16 +3321,36 @@ impl PostgresStore {
         // alongside `version` so the pre-write hook can evaluate the
         // POST-MERGE row before the UPDATE (parity with the SQLite
         // backend and the insert/supersede PG paths).
-        let current_row: Option<(i64, String, String, String, String, serde_json::Value)> =
-            sqlx::query_as(
-                "SELECT version, namespace, tier, title, memory_kind, metadata \
-                 FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
+        // #1725 — the prior-content archive + the in-place UPDATE run in
+        // ONE transaction so a version-conflict UPDATE (0 rows) rolls the
+        // archive snapshot back, leaving no orphan archived_memories row.
+        // `content` is fetched so the content-change detection matches the
+        // sqlite path byte-for-byte (a metadata-only patch must not
+        // archive).
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("read memories row for update gate", e))?;
-        let Some((current, cur_ns, cur_tier, cur_title, cur_kind, cur_meta)) = current_row else {
+            .map_err(|e| to_store_err("begin update tx", e))?;
+        let current_row: Option<(
+            i64,
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            String,
+        )> = sqlx::query_as(
+            "SELECT version, namespace, tier, title, memory_kind, metadata, content \
+                 FROM memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read memories row for update gate", e))?;
+        let Some((current, cur_ns, cur_tier, cur_title, cur_kind, cur_meta, cur_content)) =
+            current_row
+        else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
 
@@ -3345,6 +3365,19 @@ impl PostgresStore {
                 ),
             });
         }
+
+        // #1725 — compute the content-change flag BEFORE the governance
+        // `governed` builder below moves `cur_title`. Mirrors the sqlite
+        // `content_changed` (title OR content differs); a metadata / tag /
+        // priority patch leaves both untouched and so archives nothing.
+        let content_changed = patch
+            .title
+            .as_deref()
+            .is_some_and(|t| t != cur_title.as_str())
+            || patch
+                .content
+                .as_deref()
+                .is_some_and(|c| c != cur_content.as_str());
 
         // #1451 — consult GOVERNANCE_PRE_WRITE on the post-merge row.
         // Mirror the SQLite tier-downgrade protection so the gate sees
@@ -3366,6 +3399,50 @@ impl PostgresStore {
             ..Memory::default()
         };
         consult_governance_pre_write_pg(&governed)?;
+
+        // #1725 — snapshot the prior content BEFORE the in-place UPDATE
+        // overwrites it, under archive_reason='in_place_edit', SAME
+        // memory_id (no fork). DELETE+INSERT mirrors sqlite's
+        // `INSERT OR REPLACE`, keeping the MOST-RECENT pre-edit snapshot
+        // (the "immediately-prior content"). The DELETE only ever removes
+        // a prior in_place_edit snapshot of this id: supersede forks a new
+        // id + deletes the old live row, GC deletes the live row, and
+        // restore removes the archive row on success — so a live,
+        // in-place-editable row can never collide with a different
+        // archive_reason's record. Runs inside the tx; a 0-row UPDATE
+        // below rolls it back.
+        if content_changed {
+            sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+            sqlx::query(
+                "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+        }
 
         let new_version = current + 1;
         // v0.7.0 Provenance Gap 2 (#906) — source_uri ($10) follows
@@ -3438,16 +3515,24 @@ impl PostgresStore {
         // #1628 — expires_at COALESCE slot ($12); see the SET-clause
         // comment above for the #1626 tier→long interplay.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
         .rows_affected();
 
         if rows_affected == 0 {
             // #1641 — the caller (the retry wrapper) owns the
-            // drift-vs-vanished disposition.
+            // drift-vs-vanished disposition. #1725 — rolling the tx back
+            // reverts the prior-content archive so a version-conflict (or
+            // a vanished row) leaves no orphan archived_memories snapshot.
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("rollback update tx", e))?;
             return Ok(None);
         }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit update tx", e))?;
         Ok(Some(new_version))
     }
 
