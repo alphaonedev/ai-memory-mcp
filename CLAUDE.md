@@ -1287,6 +1287,68 @@ captures feed Lane 6 case-study content.
 - **pm-v1 chain** — `5d703efe-273b-4c84-8f40-ceb97b55d71e` →
   `71ecce23-611b-4984-962d-d37c4309f261`.
 
+## Crossroads decision protocol — deterministic 5-agent adversarial vote (operator-set 2026-06-18)
+
+> Canonical memory: ai-memory `4d3ea1c5-9017-4f97-b966-e0d41e83a801`
+> (`global`, long tier, priority 10). This section is the repo-enforced
+> mirror so EVERY agent — not just one with that memory recalled — applies
+> the same rule.
+
+**The standard (operator, 2026-06-17).** At any genuine crossroads / point
+of contention / architecture-decision inflection, do NOT idle-wait and do
+NOT unilaterally guess: dispatch a **5-adversarial-agent decision vote**,
+synthesize the verdict, and execute it. This satisfies both operator
+demands at once — forward motion (no idle-waiting) AND verified decisions
+(not unilateral guesses).
+
+**Deterministic trigger (operator, 2026-06-18 — tightened from
+judgment-gated to auditable).** The vote is NOT discretionary. "I'll vote
+when it feels like a crossroads" was only as reliable as the agent's
+crossroad-detection; that gap is now closed. Run the vote BEFORE acting
+whenever **ANY** condition `Tn` holds — if it matches, you vote, no
+judgment about whether it "feels" big enough:
+
+- **T1 — public-contract shape change** with ≥2 viable forms: a SAL
+  `MemoryStore` trait method signature add/change; a new/renamed public
+  struct/enum field crossing a module boundary; a new MCP tool / HTTP
+  route / CLI subcommand; a wire-JSON or DB-schema (migration) shape.
+- **T2 — a sync↔async boundary decision** (wiring async into a sync path
+  or vice-versa; `block_on` vs callback-bundle vs channel). *(This is the
+  condition that fired for #1729 signal hooks.)*
+- **T3 — a security/governance posture choice**: fail-open vs
+  fail-closed, a new gate / auth / visibility / encryption boundary, or
+  relaxing an existing gate.
+- **T4 — a hard-to-reverse representation**: on-disk format, persisted /
+  attested / signed-bytes layout, or anything that becomes a back-compat
+  obligation once shipped.
+- **T5 — deviation from a written spec / acceptance criterion** (doing
+  other than what the issue or `§`-spec literally prescribes).
+- **T6 — ≥2 mutually-exclusive implementation paths** where the codebase
+  has **no single clear precedent** to copy.
+
+**Exempt (decide & build, NO vote — record the decision inline in the
+commit / issue comment instead):** internal-only refactors with no
+public-surface change; naming / comments / error-message wording / test
+structure; mechanical edits dictated by an existing precedent (e.g. add a
+field to all N construction sites); single-correct-answer bug fixes;
+error-code / HTTP-status mapping that mirrors an existing pattern; no-op /
+idempotent semantics. When a precedent exists and is being copied, **T6
+does not fire** — copying the precedent IS the decision.
+
+**Vote shape (fixed).** Exactly **5 concurrent `Agent` calls**, each a
+**distinct adversarial lens** (diversity is mandatory so they don't
+converge by groupthink — e.g. precedent / sync-async-correctness /
+spec-literalism / testability / blast-radius for the #1729 decision).
+Each returns `VERDICT / CONFIDENCE / RATIONALE / TOP_RISK /
+KILLER_OBJECTION`. Tally + synthesize into one verdict; `memory_store` the
+decision (options, tally, chosen pathway, why) BEFORE implementing.
+
+**Audit.** If any `Tn` matched, the commit / issue note MUST cite
+`5-agent vote (4d3ea1c5)`. Shipping a `Tn`-matching change WITHOUT a vote
+is a self-flagged process violation the agent must surface to the
+operator (and the orchestrator treats it the same as a C1–C8 hard-block
+on agent return).
+
 ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
 
 **AI NHI is 100% autonomous and makes ALL decisions EXCEPT the
