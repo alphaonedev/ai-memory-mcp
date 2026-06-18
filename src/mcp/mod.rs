@@ -3023,8 +3023,13 @@ pub fn run_mcp_server(
     // that open fails the hook fails CLOSED (#1455). The deferred-audit
     // drainer chain-logs refusals; its supervisor thread is detached for
     // the lifetime of the MCP process.
+    // v0.8.0 PE-4 (#1732) — crash-durable journal variant. The MCP stdio
+    // path has NO shutdown drain, so durability + boot recovery is the
+    // only thing standing between a SIGKILL and a lost refusal row on the
+    // NHI-primary interface. Recovery runs synchronously here, before the
+    // governance hooks install below (replay-all-then-go-live).
     let (mcp_governance_queue, _mcp_governance_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
     let mcp_rule_cache = std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new());
     let mcp_hook_conn: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> =
         match db::open(db_path) {

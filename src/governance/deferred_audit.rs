@@ -68,8 +68,11 @@
 //! `signed_events` before the daemon's tokio runtime is torn down,
 //! or the chain-log property is broken.
 
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
@@ -186,6 +189,53 @@ impl DeferredAuditEvent {
         });
         serde_json::to_vec(&canonical).context("DeferredAuditEvent::canonical_bytes")
     }
+
+    /// v0.8.0 PE-4 (#1732) — inverse of [`Self::canonical_bytes`]:
+    /// decode a journal record's payload back into a
+    /// `DeferredAuditEvent`. `AgentAction` / `Decision` are both
+    /// `Deserialize`, so the flat `{action, decision, agent_id,
+    /// timestamp}` object round-trips. Used by [`recover_deferred_audit`]
+    /// to replay crash-durable journal records on boot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are not the canonical JSON shape
+    /// (missing field, undecodable variant, malformed timestamp) — the
+    /// replay loop treats that as a corrupt trailing record and stops.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self> {
+        let v: serde_json::Value =
+            serde_json::from_slice(bytes).context("from_canonical_bytes: parse json")?;
+        let action: AgentAction = serde_json::from_value(
+            v.get("action")
+                .cloned()
+                .context("from_canonical_bytes: missing action")?,
+        )
+        .context("from_canonical_bytes: decode action")?;
+        let decision: Decision = serde_json::from_value(
+            v.get("decision")
+                .cloned()
+                .context("from_canonical_bytes: missing decision")?,
+        )
+        .context("from_canonical_bytes: decode decision")?;
+        let agent_id = v
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .context("from_canonical_bytes: missing agent_id")?
+            .to_string();
+        let ts_str = v
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .context("from_canonical_bytes: missing timestamp")?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(ts_str)
+            .context("from_canonical_bytes: parse timestamp")?
+            .with_timezone(&chrono::Utc);
+        Ok(Self {
+            agent_id,
+            action,
+            decision,
+            timestamp,
+        })
+    }
 }
 
 /// Shared counters surfaced for observability. Cloning is cheap
@@ -272,6 +322,216 @@ impl DeferredAuditMetrics {
     }
 }
 
+/// v0.8.0 PE-4 (#1732) — crash-durable shadow of the in-memory queue.
+///
+/// The in-memory [`DeferredAuditQueue`] mpsc loses any submitted-but-
+/// not-yet-drained refusal on a SIGKILL (the `signed_events_dlq` only
+/// covers an append FAILURE after the drainer has the event, not the
+/// pre-drain window). This append-only journal closes that hole:
+/// [`DeferredAuditQueue::submit`] durably `write()+fsync`-es each event
+/// here BEFORE handing it to the live drainer, and [`recover_deferred_audit`]
+/// replays un-drained records into `signed_events` at boot.
+///
+/// **Why a file, not a DB table (5-agent vote 4d3ea1c5):** `submit`
+/// fires INSIDE `storage::insert` while it holds the substrate's
+/// `Connection` (a `BEGIN IMMEDIATE` write txn). A second connection
+/// writing to the same SQLite file would block on that write lock —
+/// which cannot release until the hook returns — a self-deadlock. A
+/// raw file append touches no `Connection`, exactly the re-entrancy-safe
+/// property the deferred design exists to preserve. Refusals are rare
+/// (only blocking verdicts enqueue) so the per-record fsync is cheap.
+///
+/// **Frame:** `[u32-LE payload_len][payload = DeferredAuditEvent::canonical_bytes][32-byte sha256(payload)]`.
+/// A crash mid-append leaves a torn trailing record; [`Self::replay`]
+/// detects it (short read OR sha256 mismatch) and discards the tail —
+/// the durability contract is "a record is recovered iff its full frame
+/// landed + fsync'd before the crash."
+pub struct DeferredAuditJournal {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+/// Panic message when the journal mutex is poisoned (a prior holder
+/// panicked while holding the lock). One named const referenced at every
+/// lock site — pm-v3.1 no-hardcoded-duplication discipline.
+const JOURNAL_MUTEX_POISONED: &str = "deferred-audit journal mutex poisoned";
+
+impl DeferredAuditJournal {
+    /// Open (creating if absent) the journal at `path`, tightening to
+    /// mode 0600 on unix.
+    ///
+    /// # Errors
+    /// Propagates the open / chmod IO error.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open deferred-audit journal {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort 0600 — the journal carries refusal payloads.
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
+    }
+
+    /// Durably append one event (`write_all` + `sync_all`). This is the
+    /// crash-durability point — the fsync returns only once the frame is
+    /// on stable storage.
+    ///
+    /// # Errors
+    /// Propagates the serialize / write / fsync IO error.
+    pub fn append(&self, event: &DeferredAuditEvent) -> Result<()> {
+        let payload = event
+            .canonical_bytes()
+            .context("journal append: canonical_bytes")?;
+        let len = u32::try_from(payload.len()).context("journal append: payload too large")?;
+        let hash = payload_hash(&payload); // raw 32-byte sha256
+        let mut frame = Vec::with_capacity(4 + payload.len() + hash.len());
+        frame.extend_from_slice(&len.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&hash);
+        let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
+        f.write_all(&frame).context("journal append: write_all")?;
+        f.sync_all().context("journal append: fsync")?;
+        Ok(())
+    }
+
+    /// Replay every intact record in order, stopping at the first torn
+    /// or corrupt (necessarily trailing) record. A trailing partial
+    /// frame is discarded — it was never fully fsync'd, so by contract
+    /// it is not a recoverable event.
+    ///
+    /// # Errors
+    /// Propagates the seek / read IO error.
+    pub fn replay(&self) -> Result<Vec<DeferredAuditEvent>> {
+        let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
+        f.seek(SeekFrom::Start(0)).context("journal replay: seek")?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).context("journal replay: read")?;
+        drop(f);
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= buf.len() {
+            let len =
+                u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) as usize;
+            let payload_start = off + 4;
+            let hash_start = payload_start + len;
+            let rec_end = hash_start + 32;
+            if rec_end > buf.len() {
+                break; // torn trailing record — discard tail
+            }
+            let payload = &buf[payload_start..hash_start];
+            let stored_hash = &buf[hash_start..rec_end];
+            if payload_hash(payload) != stored_hash {
+                break; // corrupt tail — discard
+            }
+            match DeferredAuditEvent::from_canonical_bytes(payload) {
+                Ok(ev) => out.push(ev),
+                Err(_) => break, // undecodable tail — discard
+            }
+            off = rec_end;
+        }
+        Ok(out)
+    }
+
+    /// Truncate the journal to empty + fsync. Called after a successful
+    /// replay-and-drain at boot (every recovered event is now durably in
+    /// `signed_events`), so the file only ever holds the current run's
+    /// un-drained refusals.
+    ///
+    /// # Errors
+    /// Propagates the truncate / fsync IO error.
+    pub fn truncate(&self) -> Result<()> {
+        let mut f = self.file.lock().expect(JOURNAL_MUTEX_POISONED);
+        f.set_len(0).context("journal truncate: set_len(0)")?;
+        f.seek(SeekFrom::Start(0))
+            .context("journal truncate: seek")?;
+        f.sync_all().context("journal truncate: fsync")?;
+        Ok(())
+    }
+
+    /// The on-disk path (diagnostics).
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// v0.8.0 PE-4 (#1732) — boot drain-on-recovery. Replays every intact
+/// record in the journal at `journal_path` into `signed_events` (via a
+/// fresh-`Connection` [`SqliteSignedEventsSink`]), then truncates the
+/// journal. **Idempotent:** each record is skipped when a
+/// `governance.refusal` row with the same `payload_hash` already exists
+/// (the pre-crash drainer may have landed some before the SIGKILL) — the
+/// sink stamps a random `id` so dedup is on the deterministic
+/// `payload_hash`, not the id, to avoid double-appending the hash chain.
+///
+/// MUST run BEFORE the live governance hooks are installed (replay-all-
+/// then-go-live) so recovered refusals chain ahead of new ones. Wired
+/// into both the `serve` and `mcp` boot paths.
+///
+/// Returns the count of records freshly appended (excludes deduped).
+///
+/// # Errors
+/// Propagates journal IO or DB-open errors. A per-record sink failure is
+/// logged and skipped (best-effort, like the live drainer's DLQ path).
+pub fn recover_deferred_audit(journal_path: &Path, db_path: &Path) -> Result<usize> {
+    use rusqlite::OptionalExtension;
+    if !journal_path.exists() {
+        return Ok(0);
+    }
+    let journal = DeferredAuditJournal::open(journal_path)?;
+    let events = journal.replay()?;
+    if events.is_empty() {
+        journal.truncate()?;
+        return Ok(0);
+    }
+    let conn = crate::db::open(db_path).context("recover_deferred_audit: open db for dedup")?;
+    let mut sink = SqliteSignedEventsSink::new(db_path);
+    let mut recovered = 0usize;
+    for ev in &events {
+        let hash = match ev.canonical_bytes() {
+            Ok(b) => payload_hash(&b),
+            Err(e) => {
+                tracing::warn!("recover_deferred_audit: skipping undecodable record: {e:#}");
+                continue;
+            }
+        };
+        let already: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM signed_events WHERE event_type = ?1 AND payload_hash = ?2 LIMIT 1",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("recover_deferred_audit: dedup query")?;
+        if already.is_some() {
+            continue; // already chained pre-crash — idempotent skip
+        }
+        match sink.append(ev) {
+            Ok(_) => recovered += 1,
+            Err(e) => {
+                tracing::warn!("recover_deferred_audit: sink append failed (skipping): {e:#}");
+            }
+        }
+    }
+    journal.truncate()?;
+    if recovered > 0 {
+        tracing::info!(
+            "recover_deferred_audit: replayed {recovered} pre-crash refusal(s) into signed_events"
+        );
+    }
+    Ok(recovered)
+}
+
 /// Producer-side handle. Cloneable so multiple callsites (HTTP
 /// handler, MCP handler, internal substrate writer) all share one
 /// queue.
@@ -279,6 +539,9 @@ impl DeferredAuditMetrics {
 pub struct DeferredAuditQueue {
     sender: UnboundedSender<DeferredAuditEvent>,
     metrics: DeferredAuditMetrics,
+    /// v0.8.0 PE-4 (#1732) — crash-durable shadow. When `Some`, every
+    /// `submit` durably journals the event before the mpsc send.
+    journal: Option<Arc<DeferredAuditJournal>>,
 }
 
 impl DeferredAuditQueue {
@@ -290,10 +553,25 @@ impl DeferredAuditQueue {
     /// dropped.
     #[must_use]
     pub fn new() -> (Self, UnboundedReceiver<DeferredAuditEvent>) {
+        Self::new_with_journal(None)
+    }
+
+    /// v0.8.0 PE-4 (#1732) — construct with an optional crash-durable
+    /// [`DeferredAuditJournal`]. When `Some`, every [`Self::submit`]
+    /// durably journals the event before the mpsc send so a SIGKILL
+    /// before drain does not lose it (recovered by
+    /// [`recover_deferred_audit`] on next boot). `None` reproduces the
+    /// pre-#1732 in-memory-only behaviour (the `new()` default + the
+    /// test path).
+    #[must_use]
+    pub fn new_with_journal(
+        journal: Option<Arc<DeferredAuditJournal>>,
+    ) -> (Self, UnboundedReceiver<DeferredAuditEvent>) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let queue = Self {
             sender,
             metrics: DeferredAuditMetrics::default(),
+            journal,
         };
         (queue, receiver)
     }
@@ -305,6 +583,19 @@ impl DeferredAuditQueue {
     /// receiver was already closed.
     pub fn submit(&self, event: DeferredAuditEvent) -> bool {
         self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
+        // v0.8.0 PE-4 (#1732) — durability point: journal the event
+        // (write+fsync, NO DB Connection — re-entrancy-safe) BEFORE the
+        // mpsc send, so a SIGKILL before the drainer processes it is
+        // recoverable at next boot. A journal failure degrades durability
+        // but must not drop the live path — log loudly + still enqueue.
+        if let Some(journal) = &self.journal
+            && let Err(e) = journal.append(&event)
+        {
+            tracing::warn!(
+                "deferred_audit_queue: journal append failed (crash-durability degraded for \
+                 this refusal; live drainer still attempted): {e:#}"
+            );
+        }
         match self.sender.send(event) {
             Ok(()) => true,
             Err(_) => {
@@ -883,6 +1174,70 @@ fn drain_accounted(metrics: &DeferredAuditMetrics) -> u64 {
 #[must_use]
 pub fn install_deferred_audit_drainer(db_path: &Path) -> (DeferredAuditQueue, JoinHandle<()>) {
     let (queue, receiver) = DeferredAuditQueue::new();
+    let metrics = queue.metrics();
+    let db_path_buf = db_path.to_path_buf();
+    let metrics_for_factory = metrics.clone();
+    let supervisor = spawn_supervised_drainer(
+        receiver,
+        move || {
+            SqliteSignedEventsSink::with_metrics(db_path_buf.clone(), metrics_for_factory.clone())
+        },
+        metrics,
+        u32::MAX,
+    );
+    (queue, supervisor)
+}
+
+/// v0.8.0 PE-4 (#1732) — filename suffix for the crash-durable journal,
+/// appended to the resolved db path (e.g. `ai-memory.db` →
+/// `ai-memory.db.deferred-audit.journal`).
+const DEFERRED_AUDIT_JOURNAL_SUFFIX: &str = ".deferred-audit.journal";
+
+/// Resolve the journal path that sits beside the db file.
+#[must_use]
+pub fn deferred_audit_journal_path(db_path: &Path) -> PathBuf {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push(DEFERRED_AUDIT_JOURNAL_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// v0.8.0 PE-4 (#1732) — crash-durable variant of
+/// [`install_deferred_audit_drainer`]. Used by the `serve` + `mcp` boot
+/// paths. Performs **boot drain-on-recovery FIRST** (replay any pre-crash
+/// journal records into `signed_events`, idempotently, then truncate),
+/// then opens the journal and builds the queue WITH it so every
+/// subsequent `submit` is durable before the mpsc send. Recovery runs
+/// synchronously before this returns, so the caller installing the live
+/// governance hooks afterward gets replay-all-then-go-live ordering.
+///
+/// Falls back to the in-memory-only behaviour (no durability) only if the
+/// journal file cannot be opened (logged loudly) — the daemon still boots.
+#[must_use]
+pub fn install_deferred_audit_drainer_with_journal(
+    db_path: &Path,
+) -> (DeferredAuditQueue, JoinHandle<()>) {
+    let journal_path = deferred_audit_journal_path(db_path);
+    // Boot recovery FIRST (replay-all-then-go-live): chain any pre-crash
+    // refusals into signed_events before the live queue/hooks exist.
+    if let Err(e) = recover_deferred_audit(&journal_path, db_path) {
+        tracing::warn!(
+            "deferred-audit boot recovery failed for {} (continuing; pre-crash refusals may \
+             remain in the journal for the next boot): {e:#}",
+            journal_path.display()
+        );
+    }
+    let journal = match DeferredAuditJournal::open(&journal_path) {
+        Ok(j) => Some(Arc::new(j)),
+        Err(e) => {
+            tracing::warn!(
+                "deferred-audit journal open failed for {} (crash-durability DISABLED this run; \
+                 in-memory queue only): {e:#}",
+                journal_path.display()
+            );
+            None
+        }
+    };
+    let (queue, receiver) = DeferredAuditQueue::new_with_journal(journal);
     let metrics = queue.metrics();
     let db_path_buf = db_path.to_path_buf();
     let metrics_for_factory = metrics.clone();
@@ -1717,5 +2072,128 @@ mod tests {
     #[test]
     fn governance_refusal_event_type_is_stable() {
         assert_eq!(GOVERNANCE_REFUSAL_EVENT_TYPE, "governance.refusal");
+    }
+
+    // ── PE-4 (#1732) crash-durable journal ───────────────────────────────
+
+    #[test]
+    fn journal_submit_then_crash_recovers_on_boot_1732() {
+        // Refusal durably journaled → SIGKILL before the drainer processed
+        // it (journal dropped without draining) → recover_deferred_audit on
+        // next boot chains it into signed_events.
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("crash-recover.db");
+        let _ = crate::db::open(&db_path).expect("init db schema");
+        let journal_path = deferred_audit_journal_path(&db_path);
+
+        {
+            let journal = DeferredAuditJournal::open(&journal_path).expect("open journal");
+            let ev = DeferredAuditEvent::from_refusal(
+                "agent:crash",
+                &refusal_action(),
+                &refusal_decision(),
+            )
+            .unwrap();
+            journal.append(&ev).expect("durable append");
+            // journal dropped here = process SIGKILL'd; event never drained.
+        }
+
+        let recovered = recover_deferred_audit(&journal_path, &db_path).expect("recover");
+        assert_eq!(recovered, 1, "the pre-crash refusal must be recovered");
+
+        let conn = crate::db::open(&db_path).expect("reopen");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:crash"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "recovered refusal must be chained into signed_events"
+        );
+
+        // Journal truncated after recovery.
+        let after = DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .replay()
+            .unwrap();
+        assert!(after.is_empty(), "journal must be truncated post-recovery");
+    }
+
+    #[test]
+    fn journal_torn_trailing_record_discarded_1732() {
+        // Two intact records + a torn trailing frame (crash mid-write) →
+        // replay returns the 2 intact, discards the torn tail.
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("torn.journal");
+        let journal = DeferredAuditJournal::open(&journal_path).unwrap();
+        let ev =
+            DeferredAuditEvent::from_refusal("agent:a", &refusal_action(), &refusal_decision())
+                .unwrap();
+        journal.append(&ev).unwrap();
+        journal.append(&ev).unwrap();
+        // Append a TORN frame: a u32 length header claiming 999 bytes but
+        // only a few payload bytes present (the crash-mid-append shape).
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal_path)
+                .unwrap();
+            f.write_all(&999u32.to_le_bytes()).unwrap();
+            f.write_all(b"partial").unwrap();
+            f.sync_all().unwrap();
+        }
+        let recovered = journal.replay().unwrap();
+        assert_eq!(
+            recovered.len(),
+            2,
+            "the 2 intact records replay; the torn trailing frame is discarded"
+        );
+    }
+
+    #[test]
+    fn journal_recovery_is_idempotent_no_duplicate_1732() {
+        // A refusal already chained pre-crash must NOT be re-appended on a
+        // second recovery pass (dedup on payload_hash, not the random id).
+        let dir = fresh_tempdir();
+        let db_path = dir.path().join("idem.db");
+        let _ = crate::db::open(&db_path).expect("init db");
+        let journal_path = deferred_audit_journal_path(&db_path);
+        let ev =
+            DeferredAuditEvent::from_refusal("agent:idem", &refusal_action(), &refusal_decision())
+                .unwrap();
+
+        DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .append(&ev)
+            .unwrap();
+        assert_eq!(
+            recover_deferred_audit(&journal_path, &db_path).unwrap(),
+            1,
+            "first recovery chains the refusal"
+        );
+
+        // Same event re-journaled (stale/duplicate) → recovery dedups.
+        DeferredAuditJournal::open(&journal_path)
+            .unwrap()
+            .append(&ev)
+            .unwrap();
+        assert_eq!(
+            recover_deferred_audit(&journal_path, &db_path).unwrap(),
+            0,
+            "an already-chained refusal must not be re-appended (dedup on payload_hash)"
+        );
+
+        let conn = crate::db::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:idem"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one row despite two recovery passes");
     }
 }
