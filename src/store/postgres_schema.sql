@@ -744,6 +744,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
     WHERE replayed_at IS NULL;
 
 -- ─────────────────────────────────────────────────────────────────────
+-- kg_projection_outbox — staggered AGE cold-path projection queue
+-- (v0.8.0 Pillar-4 4.C, schema v69, #1735; Postgres-only — AGE is
+-- Postgres-only). Mirrors `PostgresStore::migrate_v69`. When
+-- `AI_MEMORY_AGE_PROJECTION_MODE=deferred`, `link_internal` enqueues a
+-- pending-projection row here in the SAME tx as the relational
+-- `memory_links` INSERT instead of running the synchronous inline AGE
+-- MERGE; the cold drainer worker projects pending rows into
+-- `memory_graph` out-of-band (eventually consistent; find_paths stays
+-- correct via the always-current relational recursive-CTE). Default
+-- `AI_MEMORY_AGE_PROJECTION_MODE=sync` leaves this table unused.
+-- `projected_at IS NULL` marks a pending row (mirrors
+-- `federation_push_dlq.replayed_at`); quarantine is by `attempt_count`
+-- threshold in the drainer's take-query.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS kg_projection_outbox (
+    id             BIGSERIAL PRIMARY KEY,
+    source_id      TEXT NOT NULL,
+    target_id      TEXT NOT NULL,
+    relation       TEXT NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    projected_at   TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_projection_outbox_pending
+    ON kg_projection_outbox(created_at)
+    WHERE projected_at IS NULL;
+
+-- ─────────────────────────────────────────────────────────────────────
 -- subscription_events / subscription_dlq — A2A correlation IDs, ACK
 -- semantics, retry, and dead-letter queue (v0.7.0 K6, schema v27).
 --

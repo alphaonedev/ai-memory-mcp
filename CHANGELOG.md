@@ -21,6 +21,22 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1735 (Pillar-4 4.C) — staggered AGE cold-path for postgres link writes (opt-in).**
+  `AI_MEMORY_AGE_PROJECTION_MODE=deferred` (default `sync` = byte-identical) takes the
+  ~6 synchronous Apache-AGE Cypher round-trips (`LOAD age`, `create_graph`, node+edge
+  `MERGE`) off the link-write hot path. Under `deferred`, `PostgresStore::link_internal`
+  enqueues a `kg_projection_outbox` row (schema **v69**) in the **same transaction** as the
+  relational `memory_links` INSERT instead of the inline MERGE; a supervised cold drainer
+  (`drain_kg_projection_outbox` + `spawn_drainer`, drain-once boot-recovery + interval loop)
+  projects pending rows into `memory_graph` out-of-band, with bounded retry → quarantine
+  (`MAX_AGE_PROJECTION_ATTEMPTS=100`) mirroring the federation push-DLQ. Postgres `find_paths`
+  routes through the always-current relational recursive-CTE under `deferred` so reads stay
+  read-your-own-write correct during the projection window (`kg_query`/`kg_timeline` observe a
+  bounded staleness window until the drainer catches up). New metrics
+  `ai_memory_age_projection_{pending_depth,failed_total,quarantined_total}`. Postgres-only
+  (AGE is postgres-only); SQLite stamps v69 as a no-op. Mechanism resolved by the mandatory
+  5-agent crossroads vote (memory 4d3ea1c5); the transactional-outbox + supervised-drainer +
+  CTE-fallback design composes the existing push-DLQ and deferred-audit precedents.
 - **#1733 (Pillar-4 4.A) — HTTP admission control (in-flight-request load-shedding).**
   The axum daemon can now bound concurrent in-flight requests: when
   `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or `[limits].max_inflight_requests`) is a positive

@@ -869,6 +869,12 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // quota seeding above.
     let resolved_storage = app_config.resolve_storage();
     crate::storage::set_db_mmap_size(resolved_storage.db_mmap_size_bytes);
+    // #1735 (Pillar-4 4.C) — seed the process-wide AGE-projection mode from
+    // the resolved `[storage]` config (env `AI_MEMORY_AGE_PROJECTION_MODE` >
+    // `[storage].age_projection_mode` > compiled default `sync`).
+    // `PostgresStore::link_internal` reads it at write time. Default sync =
+    // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
+    crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent
@@ -4247,6 +4253,41 @@ pub async fn bootstrap_serve(
             tracing::info!(
                 "federation push DLQ replay worker enabled: polling every {}s",
                 args.catchup_interval_secs,
+            );
+        }
+    }
+
+    // #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer when
+    // deferred mode is active on a postgres+AGE backend. Independent of
+    // federation: deferred link writes enqueue to `kg_projection_outbox` in
+    // the same tx as the relational row, and this worker projects them into
+    // `memory_graph` out-of-band (drain-once boot-recovery + periodic tick,
+    // supervised). Default `sync` mode never enqueues, so this is not spawned.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(
+        crate::config::age_projection_mode(),
+        crate::config::AgeProjectionMode::Deferred
+    ) {
+        if let Some(pg) = store_handle
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+        {
+            let interval = std::time::Duration::from_secs(if args.catchup_interval_secs > 0 {
+                args.catchup_interval_secs
+            } else {
+                30
+            });
+            task_handles.push(std::sync::Arc::new(pg.clone()).spawn_drainer(interval));
+            tracing::info!(
+                "kg_projection drainer enabled (AI_MEMORY_AGE_PROJECTION_MODE=deferred): \
+                 draining kg_projection_outbox every {}s",
+                interval.as_secs()
+            );
+        } else {
+            tracing::warn!(
+                "AI_MEMORY_AGE_PROJECTION_MODE=deferred but store is not PostgresStore; \
+                 deferred AGE projection has no drainer — falling back to inline-equivalent \
+                 (links still commit; AGE graph will lag). Use sync mode on non-postgres."
             );
         }
     }

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 68).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 69).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -650,7 +650,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 68;
+const CURRENT_SCHEMA_VERSION: i64 = 69;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2876,6 +2876,14 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 )?;
             }
         }
+
+        // v69 (#1735, Pillar-4 4.C: kg_projection_outbox) is a SQLite NO-OP.
+        // The outbox backs the staggered AGE cold-path, and Apache AGE is
+        // Postgres-only — SQLite has no graph backend (find_paths always
+        // reads the relational recursive-CTE), so there is no projection to
+        // defer and no table to create here. Postgres applies it via
+        // `PostgresStore::migrate_v69`. The unconditional stamp below moves
+        // the SQLite schema to v69 so both adapters share the logical number.
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
