@@ -10,14 +10,116 @@
 //! `active_keypair` so an outbound signal is Ed25519-signed in place via
 //! [`crate::signals::sign_into`] when a signing keypair is available.
 
+use crate::hooks::events::{SignalAck, SignalDelta};
 use crate::identity::keypair::AgentKeypair;
 use crate::mcp::param_names;
 use serde_json::{Value, json};
 
-/// MCP handler for `memory_signal_send`. Builds a [`crate::models::Signal`]
-/// from the request params, signs it in place when `keypair` is `Some` and
-/// `can_sign()`, inserts it, and returns the created signal as JSON plus the
-/// resulting attestation level (`self_signed` vs `unsigned`).
+/// v0.8.0 Pillar-1 (#1709 / #1729) — substrate-level decision returned by a
+/// `pre_signal_send` hook callback. Mirrors [`crate::hooks::HookDecision`]:
+/// `Allow` (proceed unchanged), `Modify` (rewrite the in-flight signal from
+/// the returned [`SignalDelta`] before it is signed + persisted), `Deny`
+/// (refuse the signal — no sign, no insert), or `AskUser`.
+///
+/// On this **synchronous** in-substrate path (the MCP stdio loop has no
+/// tokio runtime — see `daemon_runtime::run`), `AskUser` is resolved
+/// **fail-closed** to a refusal carrying the prompt as the reason; the
+/// interactive operator-prompt resolution is the async wire-level
+/// [`crate::hooks::HookChain`]'s concern (the broader MCP-dispatch hook
+/// gap is tracked by #1714). This mirrors how [`ReflectHookDecision`] on
+/// the same sync substrate path exposed only the control-flow-affecting
+/// outcomes.
+///
+/// [`ReflectHookDecision`]: crate::storage::reflect::ReflectHookDecision
+//
+// `dead_code`-allowed like the sibling Pillar-1 surfaces (`SignalAckRequest`):
+// the variants are constructed by hook-callback authors — the #1729 tests
+// today and the daemon wire-chain bridge (#1714) tomorrow — not by the
+// substrate handlers, which only match on them.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum SignalHookDecision {
+    /// Proceed with the (possibly already-modified) signal unchanged.
+    Allow,
+    /// Rewrite the in-flight signal's mutable fields from this delta
+    /// before signing + insert.
+    Modify(Box<SignalDelta>),
+    /// Refuse the signal. `reason` surfaces to the caller; `code` is an
+    /// HTTP-style integer for the API surface.
+    Deny { reason: String, code: i32 },
+    /// Pause for operator input. Resolved fail-closed to a refusal on the
+    /// sync substrate path (see the enum docs).
+    AskUser {
+        prompt: String,
+        options: Vec<String>,
+        default: Option<String>,
+    },
+}
+
+/// v0.8.0 Pillar-1 (#1709 / #1729) — optional in-substrate hook callbacks
+/// fired by [`handle_signal_send_with_hooks`] / [`handle_signal_ack_with_hooks`].
+/// Bundled so the handler signatures stay compact and future callbacks land
+/// without churning callers. Both callbacks are `Option`; when `None` the
+/// handlers behave identically to the unhooked thin entry points
+/// [`handle_signal_send`] / [`handle_signal_ack`].
+///
+/// This is the sync-callback analogue of [`crate::storage::reflect::ReflectHooks`]:
+/// the signal handlers are synchronous (`rusqlite::Connection`) and run on the
+/// MCP stdio loop's `spawn_blocking` thread with no tokio runtime, so the
+/// async wire-level [`crate::hooks::HookChain`] cannot be `.await`-ed here. The
+/// daemon layer (where an async runtime exists) is responsible for bridging a
+/// configured chain into these callbacks (#1714).
+pub struct SignalHooks<'a> {
+    /// Fired BEFORE the signal is signed + inserted. Receives the
+    /// rewritable in-flight [`SignalDelta`]; returns a
+    /// [`SignalHookDecision`] (`Deny`/`AskUser` refuse the send,
+    /// `Modify` rewrites the delta).
+    #[allow(clippy::type_complexity)]
+    pub pre_signal_send: Option<Box<dyn Fn(&SignalDelta) -> SignalHookDecision + Send + Sync + 'a>>,
+    /// Fired AFTER the ack stamp commits. Notify-class — receives a
+    /// read-only [`SignalAck`] snapshot; the return value is ignored.
+    #[allow(clippy::type_complexity)]
+    pub post_signal_ack: Option<Box<dyn Fn(&SignalAck) + Send + Sync + 'a>>,
+}
+
+impl<'a> SignalHooks<'a> {
+    /// Empty bundle — both callbacks `None`. Used by the thin
+    /// [`handle_signal_send`] / [`handle_signal_ack`] entry points so
+    /// existing callers stay byte-identical.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            pre_signal_send: None,
+            post_signal_ack: None,
+        }
+    }
+}
+
+impl<'a> Default for SignalHooks<'a> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<'a> std::fmt::Debug for SignalHooks<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalHooks")
+            .field(
+                "pre_signal_send",
+                &self.pre_signal_send.as_ref().map(|_| "<fn>"),
+            )
+            .field(
+                "post_signal_ack",
+                &self.post_signal_ack.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
+}
+
+/// MCP handler for `memory_signal_send`. Thin shim over
+/// [`handle_signal_send_with_hooks`] with an empty hook bundle — preserves
+/// the pre-#1729 signature so every existing caller (the `mcp::mod`
+/// dispatch arm + tests) compiles unchanged.
 ///
 /// # Errors
 /// Returns the stringified signing / `rusqlite` error on failure.
@@ -25,6 +127,29 @@ pub fn handle_signal_send(
     conn: &rusqlite::Connection,
     params: &Value,
     keypair: Option<&AgentKeypair>,
+) -> Result<Value, String> {
+    handle_signal_send_with_hooks(conn, params, keypair, &SignalHooks::empty())
+}
+
+/// v0.8.0 Pillar-1 (#1709 / #1729) — variant of [`handle_signal_send`] that
+/// fires the [`crate::hooks::HookEvent::PreSignalSend`] callback. Builds a
+/// [`crate::models::Signal`] from the request params, fires `pre_signal_send`
+/// (honoring `Allow`/`Modify`/`Deny`/`AskUser`) BEFORE signing, signs it in
+/// place when `keypair` is `Some` and `can_sign()`, inserts it, and returns
+/// the created signal as JSON plus the attestation level.
+///
+/// Firing before signing (not just before the insert) is deliberate: a
+/// `Modify` rewrite must be reflected in the Ed25519-signed canonical bytes,
+/// so the hook runs first and the *final* signal is what gets signed.
+///
+/// # Errors
+/// Returns a stringified error on a `pre_signal_send` refusal
+/// (`Deny`/`AskUser`) or on a signing / `rusqlite` failure.
+pub fn handle_signal_send_with_hooks(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    keypair: Option<&AgentKeypair>,
+    hooks: &SignalHooks<'_>,
 ) -> Result<Value, String> {
     let namespace = params
         .get(param_names::NAMESPACE)
@@ -87,6 +212,49 @@ pub fn handle_signal_send(
         signature: vec![],
         sender_pubkey: vec![],
     };
+
+    // v0.8.0 Pillar-1 (#1709 / #1729) — fire PreSignalSend BEFORE signing +
+    // insert. A `Modify` rewrites the signal's mutable fields (so the final
+    // bytes are what get signed); `Deny` / `AskUser` refuse the send (no
+    // sign, no insert, no audit row). `from_agent` / `id` are provenance-
+    // immutable and not exposed in the delta.
+    if let Some(pre) = hooks.pre_signal_send.as_ref() {
+        let delta = SignalDelta {
+            namespace: signal.namespace.clone(),
+            to_agent: signal.to_agent.clone(),
+            subject: signal.subject.clone(),
+            body: signal.body.clone(),
+            signal_type: signal.signal_type,
+            in_reply_to: signal.in_reply_to.clone(),
+            correlation_id: signal.correlation_id.clone(),
+            reference_ids: signal.reference_ids.clone(),
+        };
+        match pre(&delta) {
+            SignalHookDecision::Allow => {}
+            SignalHookDecision::Modify(d) => {
+                signal.namespace = d.namespace;
+                signal.to_agent = d.to_agent;
+                signal.subject = d.subject;
+                signal.body = d.body;
+                signal.signal_type = d.signal_type;
+                signal.in_reply_to = d.in_reply_to;
+                signal.correlation_id = d.correlation_id;
+                signal.reference_ids = d.reference_ids;
+            }
+            SignalHookDecision::Deny { reason, code } => {
+                return Err(format!(
+                    "signal refused by pre_signal_send hook (code {code}): {reason}"
+                ));
+            }
+            SignalHookDecision::AskUser { prompt, .. } => {
+                // Fail-closed on the sync substrate path (no operator-prompt
+                // loop here); the wire-level HookChain resolves AskUser.
+                return Err(format!(
+                    "signal pending operator decision (pre_signal_send AskUser): {prompt}"
+                ));
+            }
+        }
+    }
 
     let attest_level = match keypair {
         Some(kp) if kp.can_sign() => {
@@ -199,13 +367,30 @@ pub fn handle_signal_thread(conn: &rusqlite::Connection, params: &Value) -> Resu
     }))
 }
 
-/// MCP handler for `memory_signal_ack`. Stamps `acknowledged_at` on a signal
-/// once via [`crate::signals::mark_acked`]. Returns `acknowledged: <bool>` —
-/// `false` when the signal was already acked or no row matched.
+/// MCP handler for `memory_signal_ack`. Thin shim over
+/// [`handle_signal_ack_with_hooks`] with an empty hook bundle — preserves
+/// the pre-#1729 signature so every existing caller compiles unchanged.
 ///
 /// # Errors
 /// Returns the stringified `rusqlite` error on update failure.
 pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+    handle_signal_ack_with_hooks(conn, params, &SignalHooks::empty())
+}
+
+/// v0.8.0 Pillar-1 (#1709 / #1729) — variant of [`handle_signal_ack`] that
+/// fires the [`crate::hooks::HookEvent::PostSignalAck`] callback AFTER the
+/// `acknowledged_at` stamp commits. **Notify-class**: the hook return value
+/// is ignored (the ack has already landed). Stamps `acknowledged_at` once
+/// via [`crate::signals::mark_acked`]; returns `acknowledged: <bool>` —
+/// `false` when the signal was already acked or no row matched.
+///
+/// # Errors
+/// Returns the stringified `rusqlite` error on update failure.
+pub fn handle_signal_ack_with_hooks(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    hooks: &SignalHooks<'_>,
+) -> Result<Value, String> {
     let id = params
         .get(param_names::ID)
         .and_then(Value::as_str)
@@ -220,12 +405,13 @@ pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<
     // must not write a row). The ack handler has no actor param, so resolve
     // the principal by loading the signal: the recipient (`to_agent`) is who
     // acks; fall back to "" for a broadcast (None) or an absent signal.
-    // Best-effort: the ack already committed.
+    // Best-effort: the ack already committed. The same load feeds the
+    // #1729 PostSignalAck snapshot below.
     if acknowledged {
-        let actor = crate::signals::get(conn, id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.to_agent)
+        let signal = crate::signals::get(conn, id).ok().flatten();
+        let actor = signal
+            .as_ref()
+            .and_then(|s| s.to_agent.clone())
             .unwrap_or_default();
         crate::coordination_audit::emit(
             conn,
@@ -233,6 +419,21 @@ pub fn handle_signal_ack(conn: &rusqlite::Connection, params: &Value) -> Result<
             &actor,
             &[id, &actor, "ack"],
         );
+
+        // v0.8.0 Pillar-1 (#1709 / #1729) — fire PostSignalAck post-commit
+        // (notify-only). Skipped when the signal row could not be re-read.
+        if let (Some(post), Some(s)) = (hooks.post_signal_ack.as_ref(), signal.as_ref()) {
+            let ack = SignalAck {
+                id: s.id.clone(),
+                namespace: s.namespace.clone(),
+                from_agent: s.from_agent.clone(),
+                to_agent: s.to_agent.clone(),
+                subject: s.subject.clone(),
+                signal_type: s.signal_type,
+                acknowledged_at: s.acknowledged_at.unwrap_or(now),
+            };
+            post(&ack);
+        }
     }
 
     Ok(json!({ "acknowledged": acknowledged }))
@@ -695,5 +896,135 @@ mod handler_tests {
 
         let report = crate::signed_events::verify_audit_trail(&conn, None).expect("verify");
         assert!(report.chain_intact, "chain must verify; report={report:?}");
+    }
+
+    // ---- #1729 Pillar-1 signal hooks ----------------------------------------
+
+    fn send_params() -> Value {
+        json!({
+            "namespace": "_sig",
+            "from_agent": "agent-from",
+            "to_agent": "agent-to",
+            "subject": "original-subject",
+            "body": {"k": "v"},
+            "signal_type": "request",
+            "correlation_id": "corr-hook",
+        })
+    }
+
+    #[test]
+    fn pre_signal_send_deny_refuses_the_insert_1729() {
+        let conn = fresh();
+        let hooks = SignalHooks {
+            pre_signal_send: Some(Box::new(|_d: &SignalDelta| SignalHookDecision::Deny {
+                reason: "policy: no signals on _sig".to_string(),
+                code: 403,
+            })),
+            post_signal_ack: None,
+        };
+        let err = handle_signal_send_with_hooks(&conn, &send_params(), None, &hooks)
+            .expect_err("Deny must refuse the send");
+        assert!(
+            err.contains("refused by pre_signal_send hook"),
+            "got: {err}"
+        );
+        // Nothing was persisted.
+        let inbox = handle_signal_inbox(
+            &conn,
+            &json!({ "namespace": "_sig", "to_agent": "agent-to" }),
+        )
+        .expect("inbox ok");
+        assert_eq!(
+            inbox["signals"].as_array().expect("array").len(),
+            0,
+            "a denied signal must not be inserted"
+        );
+    }
+
+    #[test]
+    fn pre_signal_send_askuser_refuses_fail_closed_1729() {
+        let conn = fresh();
+        let hooks = SignalHooks {
+            pre_signal_send: Some(Box::new(|_d: &SignalDelta| SignalHookDecision::AskUser {
+                prompt: "approve this signal?".to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                default: None,
+            })),
+            post_signal_ack: None,
+        };
+        let err = handle_signal_send_with_hooks(&conn, &send_params(), None, &hooks)
+            .expect_err("AskUser is fail-closed on the sync path");
+        assert!(err.contains("pending operator decision"), "got: {err}");
+    }
+
+    #[test]
+    fn pre_signal_send_modify_rewrites_field_and_persists_1729() {
+        let conn = fresh();
+        let hooks = SignalHooks {
+            pre_signal_send: Some(Box::new(|d: &SignalDelta| {
+                // Rewrite the subject; carry every other field through verbatim.
+                let mut rewritten = d.clone();
+                rewritten.subject = "rewritten-by-hook".to_string();
+                SignalHookDecision::Modify(Box::new(rewritten))
+            })),
+            post_signal_ack: None,
+        };
+        let sent = handle_signal_send_with_hooks(&conn, &send_params(), None, &hooks)
+            .expect("modified send ok");
+        assert_eq!(
+            sent["signal"]["subject"].as_str(),
+            Some("rewritten-by-hook"),
+            "the Modify rewrite must be reflected in the returned signal"
+        );
+        // The rewrite is durable — re-read the stored row.
+        let id = sent[param_names::ID].as_str().expect("id").to_string();
+        let read = handle_signal_read(&conn, &json!({ "id": id })).expect("read ok");
+        assert_eq!(
+            read["signal"]["subject"].as_str(),
+            Some("rewritten-by-hook"),
+            "the Modify rewrite must be persisted, not just echoed"
+        );
+    }
+
+    #[test]
+    fn post_signal_ack_fires_post_commit_1729() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let conn = fresh();
+        // Send (no hooks) so there is a signal to ack.
+        let sent = handle_signal_send(&conn, &send_params(), None).expect("send ok");
+        let id = sent[param_names::ID].as_str().expect("id").to_string();
+
+        let fired = AtomicUsize::new(0);
+        let seen_subject = std::sync::Mutex::new(String::new());
+        let hooks = SignalHooks {
+            pre_signal_send: None,
+            post_signal_ack: Some(Box::new(|ack: &SignalAck| {
+                fired.fetch_add(1, Ordering::SeqCst);
+                *seen_subject.lock().unwrap() = ack.subject.clone();
+                assert!(
+                    ack.acknowledged_at > 0,
+                    "post hook sees the committed ack timestamp"
+                );
+            })),
+        };
+        let acked =
+            handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), &hooks).expect("ack ok");
+        assert_eq!(acked["acknowledged"].as_bool(), Some(true));
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "post_signal_ack fires once"
+        );
+        assert_eq!(*seen_subject.lock().unwrap(), "original-subject");
+
+        // A no-op re-ack must NOT fire the post hook again (no state change).
+        let reacked =
+            handle_signal_ack_with_hooks(&conn, &json!({ "id": id }), &hooks).expect("re-ack ok");
+        assert_eq!(reacked["acknowledged"].as_bool(), Some(false));
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "a no-op re-ack must not re-fire post_signal_ack"
+        );
     }
 }
