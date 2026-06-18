@@ -1057,6 +1057,111 @@ mod postgres_side {
         );
     }
 
+    /// #228 Commit B — postgres twin of the sqlite ON-path test
+    /// (`commit_b_on_path_seals_content_and_get_decrypts`). With the
+    /// `AI_MEMORY_ENCRYPT_AT_REST` gate on, `PostgresStore::store` seals
+    /// content into `encrypted_envelope` (BYTEA), the `content` column
+    /// holds the empty placeholder, and `MemoryStore::get` transparently
+    /// decrypts. agent_id on the row matches the seal recipient.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_commit_b_on_path_seals_and_get_decrypts_228() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let agent = "pg-commit-b-on-agent";
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let plaintext = "pg sensitive content — #228 Commit B ON";
+        let mut mem = sample_memory(&format!("pg-commitb-on-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": agent });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-228");
+        let id = MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("store under encryption");
+
+        // Raw row: content placeholder empty, envelope non-NULL.
+        let (raw_content, envelope): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw read");
+        assert_eq!(
+            raw_content, "",
+            "content column holds the empty placeholder"
+        );
+        assert!(envelope.is_some(), "encrypted_envelope must be non-NULL");
+
+        // get transparently decrypts.
+        let fetched = MemoryStore::get(&pg, &admin_ctx, &id).await.expect("get");
+        assert_eq!(
+            fetched.content, plaintext,
+            "#228 Commit B (pg): get must recover the plaintext"
+        );
+
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+    }
+
+    /// #228 Commit B — postgres twin of the sqlite fail-closed test. A
+    /// row with a non-NULL envelope whose recipient key cannot decrypt
+    /// (sealed to agent A but the row names agent B) must FAIL the read
+    /// (mapped to a StoreError), never leak the empty placeholder.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_commit_b_missing_key_fails_closed_on_read_228() {
+        use ai_memory::encryption::{encrypt, get_or_create_keypair};
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let seal_agent = "pg-commit-b-seal";
+        let wrong_agent = "pg-commit-b-wrong";
+        let kp = get_or_create_keypair(seal_agent).expect("keypair");
+        let env_bytes = encrypt("pg secret for seal_agent", &kp.public)
+            .expect("encrypt")
+            .to_bytes();
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut mem = sample_memory(&format!("pg-commitb-fc-{run}"));
+        mem.content = String::new();
+        mem.metadata = serde_json::json!({ "agent_id": wrong_agent });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-228");
+        let id = MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("store");
+
+        // Stamp an envelope sealed to a DIFFERENT agent than the row names.
+        sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+            .bind(&env_bytes)
+            .bind(&id)
+            .execute(pg.pool())
+            .await
+            .expect("stamp mismatched envelope");
+
+        let result = MemoryStore::get(&pg, &admin_ctx, &id).await;
+        assert!(
+            result.is_err(),
+            "fail-closed (pg): an undecryptable envelope must error the read"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("decrypt failed"),
+            "fail-closed (pg) error must name the decrypt failure; got: {msg}"
+        );
+    }
+
     /// Gap 2 (#885) — postgres twin of `verify_gap_2_source_uri_sqlite`.
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]

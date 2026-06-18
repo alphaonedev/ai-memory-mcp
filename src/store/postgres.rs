@@ -3449,6 +3449,38 @@ impl PostgresStore {
         };
         consult_governance_pre_write_pg(&governed)?;
 
+        // #228 Commit B — at-rest content encryption (postgres in-place
+        // update parity). Seal the effective NEW content (the patch's
+        // content when supplied, else the stored content) to the per-agent
+        // key when enabled; the UPDATE then writes the placeholder into
+        // `content` and the ciphertext into `encrypted_envelope`. When
+        // disabled (default), seal is None: the COALESCE keeps the patch's
+        // plaintext (or the stored value) AND the envelope is set to NULL,
+        // clearing any stale ciphertext — byte-identical to the pre-wiring
+        // path where the column was always NULL. agent_id resolves from the
+        // patch metadata when supplied, else the stored row's metadata
+        // (`governed.metadata` is exactly that merge). Both `content` and
+        // `encrypted_envelope` are SET together so they never desync.
+        let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
+        let upd_agent_id = governed
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("at-rest seal_content failed: {e}"),
+            })?;
+        // When sealing, write the placeholder verbatim into `content`
+        // (Some); when not sealing, bind None so the SQL COALESCE keeps the
+        // patch-or-stored plaintext exactly as before.
+        let upd_content_bind: Option<String> = upd_sealed
+            .as_ref()
+            .map(|(_, ph)| ph.clone())
+            .or_else(|| patch.content.clone());
+        let upd_encrypted_envelope: Option<Vec<u8>> =
+            upd_sealed.as_ref().map(|(env, _)| env.clone());
+
         // #1725 — snapshot the prior content BEFORE the in-place UPDATE
         // overwrites it, under archive_reason='in_place_edit', SAME
         // memory_id (no fork). DELETE+INSERT mirrors sqlite's
@@ -3502,6 +3534,14 @@ impl PostgresStore {
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
+                -- #228 Commit B — at-rest envelope. $13 carries the sealed
+                -- ciphertext when encryption is on (paired with the $3
+                -- placeholder) and NULL when off (paired with the plaintext
+                -- patch/stored content), so content + envelope always move
+                -- together. Unconditional assignment (not COALESCE): under
+                -- encryption-off this rewrites a previously-encrypted row's
+                -- envelope to NULL, matching the content rewrite.
+                encrypted_envelope = $13,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -3537,7 +3577,7 @@ impl PostgresStore {
         )
         .bind(id)
         .bind(patch.title)
-        .bind(patch.content)
+        .bind(upd_content_bind)
         .bind(patch.tier.as_ref().map(Tier::as_str))
         .bind(patch.namespace)
         .bind(
@@ -3564,6 +3604,9 @@ impl PostgresStore {
         // #1628 — expires_at COALESCE slot ($12); see the SET-clause
         // comment above for the #1626 tier→long interplay.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
+        // #228 Commit B — encrypted_envelope ($13): sealed ciphertext when
+        // encryption is on, NULL when off (paired with the $3 content).
+        .bind(upd_encrypted_envelope)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
@@ -7103,7 +7146,7 @@ impl PostgresStore {
             .and_then(|s| crate::models::MemoryKind::from_str(&s))
             .unwrap_or_default();
 
-        Ok(Memory {
+        let mut memory = Memory {
             id: row_id.clone(),
             tier,
             namespace: row
@@ -7213,7 +7256,39 @@ impl PostgresStore {
                 .ok()
                 .and_then(|s| crate::models::LifecycleState::from_str(&s))
                 .unwrap_or_default(),
-        })
+        };
+
+        // #228 Commit B — at-rest content decryption (postgres parity).
+        // Gated on envelope PRESENCE (a non-NULL BYTEA), NOT on
+        // `encryption_enabled`, so rows written while encryption was on stay
+        // readable after the flag is toggled off. NULL on every legacy row +
+        // every encryption-off row → no-op, so the default path is
+        // byte-identical (content keeps the plaintext read above). A missing
+        // column on a pre-v68 backup surfaces as a try_get error → None.
+        let enc: Option<Vec<u8>> = row
+            .try_get::<Option<Vec<u8>>, _>(field_names::ENCRYPTED_ENVELOPE)
+            .unwrap_or(None);
+        if let Some(bytes) = enc {
+            let agent_id = memory
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match crate::encryption::open_content(&bytes, agent_id) {
+                Ok(plaintext) => memory.content = plaintext,
+                Err(e) => {
+                    // FAIL-CLOSED: a row with a non-NULL envelope MUST
+                    // decrypt or the read errors. Never surface the empty
+                    // placeholder as if it were the plaintext content
+                    // (would mask key loss / corruption).
+                    return Err(StoreError::IntegrityFailed {
+                        detail: format!("decrypt failed for memory {}: {e}", memory.id),
+                    });
+                }
+            }
+        }
+
+        Ok(memory)
     }
 
     /// v0.7.0 recursive-learning Task 4/8 (issue #655) — Postgres parity
@@ -8262,6 +8337,12 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("load archived as memory", e))?;
         let row = row.ok_or_else(|| StoreError::NotFound { id: id.to_string() })?;
+        // #228 Commit B — DELIBERATELY does NOT select `encrypted_envelope`.
+        // This Memory feeds only the GOVERNANCE_PRE_WRITE hook (inspects
+        // namespace / tier / title, never content). Selecting the envelope
+        // would make `row_to_memory` fail-closed on a key-rotated / absent
+        // key and block an otherwise-restorable row; the restore INSERT-
+        // SELECT carries the ciphertext verbatim (Commit A) regardless.
         Self::row_to_memory(&row)
     }
 }
@@ -9499,6 +9580,30 @@ impl MemoryStore for PostgresStore {
         // here, matching the sqlite behaviour.
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
 
+        // #228 Commit B — at-rest content encryption (postgres parity).
+        // Seal the plaintext content to the per-agent X25519 key when
+        // enabled; the `content` column then carries the empty placeholder
+        // and the ciphertext envelope lands in the `encrypted_envelope`
+        // BYTEA column (schema v68). When disabled (default) `sealed` is
+        // None: content is stored verbatim and the envelope binds NULL —
+        // byte-identical to the pre-wiring path. agent_id is the NHI
+        // provenance marker from metadata (fail-closed under an enabled
+        // gate when absent). Content-only: title/tags/metadata stay plain.
+        let store_agent_id = memory
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let store_sealed = crate::encryption::seal_content(&memory.content, store_agent_id)
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("at-rest seal_content failed: {e}"),
+            })?;
+        let store_content_to_store = store_sealed
+            .as_ref()
+            .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
+        let store_encrypted_envelope: Option<&[u8]> =
+            store_sealed.as_ref().map(|(env, _)| env.as_slice());
+
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -9507,14 +9612,19 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state
+                mentioned_entity_id, lifecycle_state, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26, $27)
+                      $26, $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #228 Commit B — content + envelope move together on upsert
+                -- so a re-store replaces both the placeholder and ciphertext
+                -- (encryption-off writes plaintext + NULL, clearing stale
+                -- ciphertext). Mirrors the sqlite `insert` ON CONFLICT.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -9596,7 +9706,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        .bind(store_content_to_store)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -9619,6 +9729,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.persona_version)
         .bind(mentioned_entity_id.as_deref())
         .bind(memory.lifecycle_state.as_str())
+        .bind(store_encrypted_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?

@@ -2259,7 +2259,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
-                if col?.as_str() == "encrypted_envelope" {
+                if col?.as_str() == field_names::ENCRYPTED_ENVELOPE {
                     has_envelope = true;
                 }
             }
@@ -2869,7 +2869,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     "v68: archived_memories table absent (test fixture / archive-less \
                      deployment); skipping encrypted_envelope mirror"
                 );
-            } else if !archived_cols.contains("encrypted_envelope") {
+            } else if !archived_cols.contains(field_names::ENCRYPTED_ENVELOPE) {
                 conn.execute(
                     "ALTER TABLE archived_memories ADD COLUMN encrypted_envelope BLOB",
                     [],

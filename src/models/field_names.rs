@@ -166,6 +166,11 @@ pub const KEY_SOURCE: &str = "key_source";
 pub const LAST_ACCESSED_AT: &str = "last_accessed_at";
 /// `lifecycle_state` — wire/row field name (v0.8.0 Pillar 2 #1709, schema v64).
 pub const LIFECYCLE_STATE: &str = "lifecycle_state";
+/// `encrypted_envelope` — wire/row field name (#228 at-rest content
+/// encryption, schema v44 sqlite / v68 postgres). The BLOB/BYTEA column
+/// carrying the sealed [`crate::encryption::Envelope`] ciphertext when at-rest
+/// encryption is enabled; NULL on every legacy + encryption-off row.
+pub const ENCRYPTED_ENVELOPE: &str = "encrypted_envelope";
 /// `last_seen_at` — wire/row field name.
 pub const LAST_SEEN_AT: &str = "last_seen_at";
 /// `latency_ms` — wire/row field name.
