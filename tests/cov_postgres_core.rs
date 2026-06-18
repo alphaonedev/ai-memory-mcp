@@ -303,27 +303,16 @@ async fn list_by_namespace_prefix_groups_children() {
         .store(&ctx, &mem(&id_b, &child_b, "beta mem", "body"))
         .await
         .unwrap();
-    // Bounded read-retry: under `--test-threads=2` against a shared
-    // persistent DB the sqlx pool can momentarily lag a just-committed
-    // write; the uuid-unique root means only these two children can ever
-    // match, so retry until both appear (or give up after the budget
-    // and let the assertion fail loudly). The budget is generous (~3s)
-    // because under `cargo llvm-cov` instrumentation every statement
-    // runs ~3-5x slower and the two concurrent test threads contend on
-    // the shared `ai:cov4` `agent_quotas` row, so the prior 5x100ms
-    // (500ms) budget under-provisioned the visibility window and the
-    // gate flaked intermittently (only on the alpha-ordered-first row).
-    let mut listed = Vec::new();
-    for _ in 0..20 {
-        listed = store
-            .list_by_namespace_prefix(&ctx, &root, 50)
-            .await
-            .expect("prefix list");
-        if listed.iter().any(|m| m.id == id_a) && listed.iter().any(|m| m.id == id_b) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
+    // `store()` commits synchronously (tx.commit().await before returning),
+    // so a single read sees both committed rows — no retry needed. (An
+    // earlier version retried on a read-after-write theory; the real cause of
+    // the historical flake was a collation bug in `list_by_namespace_prefix`
+    // — see `list_by_namespace_prefix_collation_boundary_pins_byte_range`
+    // below — now fixed at the query layer with `~>=~`/`~<~`.)
+    let listed = store
+        .list_by_namespace_prefix(&ctx, &root, 50)
+        .await
+        .expect("prefix list");
     assert!(
         listed.iter().any(|m| m.id == id_a),
         "prefix must surface child alpha"
@@ -331,6 +320,54 @@ async fn list_by_namespace_prefix_groups_children() {
     assert!(
         listed.iter().any(|m| m.id == id_b),
         "prefix must surface child beta"
+    );
+}
+
+/// v0.8.0 #1709 SHIP-HARDEN — DETERMINISTIC regression pin for the
+/// `list_by_namespace_prefix` collation bug. The root namespace's last byte
+/// is forced to `'9'`, whose byte-incremented upper bound is `':'`. Under a
+/// non-C (glibc `en_US.utf8`) database collation — the CI image + most stock
+/// postgres deployments — `<root>/alpha` collates AFTER `':'`, so the pre-fix
+/// `WHERE namespace >= $1 AND namespace < $2` predicate SILENTLY EXCLUDED the
+/// child (the production data-loss bug; intermittent in the random-uuid test
+/// above at ~1/16). The fix uses byte-ordered `~>=~`/`~<~`. This test fails on
+/// the pre-fix query on any non-C DB and passes on the fix regardless of
+/// collation, so it deterministically pins the byte-range semantics.
+#[tokio::test]
+async fn list_by_namespace_prefix_collation_boundary_pins_byte_range() {
+    use ai_memory::store::MemoryStore;
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:cov4");
+    // Unique, but last byte forced to '9' (upper bound ':' — the glibc
+    // punctuation-reweight boundary that drops `/alpha` under linguistic
+    // collation).
+    let root = format!("cov-coll-{}9", uuid::Uuid::new_v4().simple());
+    let child_a = format!("{root}/alpha");
+    let child_b = format!("{root}/beta");
+    let id_a = uid("c1");
+    let id_b = uid("c2");
+    store
+        .store(&ctx, &mem(&id_a, &child_a, "coll alpha", "body"))
+        .await
+        .unwrap();
+    store
+        .store(&ctx, &mem(&id_b, &child_b, "coll beta", "body"))
+        .await
+        .unwrap();
+    let listed = store
+        .list_by_namespace_prefix(&ctx, &root, 50)
+        .await
+        .expect("prefix list");
+    assert!(
+        listed.iter().any(|m| m.id == id_a),
+        "byte-range must surface `/alpha` even when the prefix ends in '9' \
+         under a non-C collation (collation-bug regression pin)"
+    );
+    assert!(
+        listed.iter().any(|m| m.id == id_b),
+        "byte-range must surface `/beta` for a '9'-terminated prefix"
     );
 }
 
