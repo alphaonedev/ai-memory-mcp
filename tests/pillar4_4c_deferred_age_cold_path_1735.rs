@@ -1,6 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(feature = "sal-postgres")]
 #![allow(clippy::needless_update)]
 
 //! Pillar-4 4.C (#1735) — staggered AGE cold-path integration tests.
@@ -21,9 +22,8 @@
 
 use ai_memory::config::{AgeProjectionMode, set_age_projection_mode};
 use ai_memory::models::{Memory, MemoryLink, MemoryLinkRelation, Tier};
-use ai_memory::store::CallerContext;
-use ai_memory::store::MemoryStore;
 use ai_memory::store::postgres::PostgresStore;
+use ai_memory::store::{CallerContext, KgBackend, MemoryStore};
 
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_AGE_URL")
@@ -61,6 +61,21 @@ async fn deferred_link_enqueues_drains_and_find_paths_via_cte_1735() {
     let store = PostgresStore::connect(&url)
         .await
         .expect("connect postgres adapter");
+
+    // The deferred AGE cold-path only engages when the AGE graph backend is
+    // active (the outbox enqueue + drain live inside the `KgBackend::Age`
+    // arm — without AGE there is no projection to defer and find_paths reads
+    // the relational CTE directly). On a plain-postgres deployment (no AGE
+    // extension) the backend resolves to `Cte` and the whole feature is a
+    // correct no-op, so skip the AGE-specific assertions there.
+    if store.kg_backend() != KgBackend::Age {
+        eprintln!(
+            "skipping deferred_link_enqueues_drains_and_find_paths_via_cte_1735: \
+             postgres backend is not AGE (no graph projection to defer)"
+        );
+        return;
+    }
+
     let ctx = CallerContext::for_agent("t-4c-1735".to_string());
     // Unique namespace per run — the CI test DB persists across runs, so a
     // fresh namespace keeps repeated runs independent.
