@@ -1252,6 +1252,16 @@ This section consolidates the v0.7.0-relevant tuning that
 | T5 multi-DC (250–1000 agents, 50M rows) | 16 | 64 GB | 1 TB | Primary + sync + ≥1 async |
 | T6 multi-region (per region, 100M rows) | 16+ | 64+ GB | 2 TB+ | Per-region T5 |
 
+> **Agent counts are PROVISIONAL (v0.8.0 Pillar-4 4.D, #1737).** The
+> per-module agent ceilings in the table above (and the "1000 agents/module"
+> design default) are **conservative design figures, not benchmarked
+> guarantees** — the per-module bound is AGE write throughput on that module's
+> backbone (PgBouncer fixes connection fan-in, not AGE write concurrency). The
+> empirical per-module envelope **X** is measured by
+> [`infra/pillar4-envelope/`](../infra/pillar4-envelope/); these figures are
+> replaced with the measured X once it lands. Scale past one module's X by
+> composing **independent modules**, never by raising one daemon's caps.
+
 **Disk type matters.** Postgres + AGE on spinning rust is unsupported
 for production — NVMe SSD is the practical baseline. The HNSW index
 on pgvector pages to disk on demand (vs SQLite's in-memory HNSW) and
