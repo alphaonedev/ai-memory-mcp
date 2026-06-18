@@ -457,7 +457,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 36-column carry, the irreducible cost). Landed the file at 20_197.
     // 20_215 = 20_197 + 18 headroom. The postgres/{mod,kg,...}.rs split
     // remains the tracked manageability target (#650 / #867 / #961).
-    ("src/store/postgres.rs", 20_215),
+    // 2026-06-18 (#228 / #1728 Commit A) — bumped 20_215 → 20_260: the
+    // `migrate_v68` arm (ALTER memories + archived_memories ADD COLUMN
+    // encrypted_envelope BYTEA — postgres parity for the sqlite-only #228
+    // primitive + the archive carry) + its dispatch wiring landed the
+    // file at 20_246. 20_260 = 20_246 + 14 headroom.
+    ("src/store/postgres.rs", 20_260),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -662,7 +667,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // assertions, and the v67_target_agent_id_idx_projects_* generated-
     // column regression test landed the file at 4_455. 4_480 = 4_455 + 25
     // headroom.
-    ("src/storage/migrations.rs", 4_480),
+    // 2026-06-18 (#228 / #1728 Commit A) — bumped 4_480 → 4_500: the v68
+    // migration arm (probe-then-ADD encrypted_envelope on
+    // archived_memories) + the pinned-v67 arm + the v68 history
+    // doc-comment landed the file at 4_487. 4_500 = 4_487 + 13 headroom.
+    ("src/storage/migrations.rs", 4_500),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
