@@ -1578,18 +1578,27 @@ pub fn update_with_expected_version(
     // patch that doesn't touch source_uri must NOT blank it out).
     // When `Some(uri)`, the row's source_uri is rewritten verbatim
     // (rename / scheme migration / bad-data correction).
-    // #1725 (v0.8.0) — lossless default update path. Wrap the
-    // archive-of-prior-content + the in-place UPDATE in ONE
-    // `BEGIN IMMEDIATE` so a mid-failure — or a version-conflict UPDATE
-    // that matches 0 rows — rolls BOTH back, leaving the OLD content
-    // live (no orphan archive row). The prior content is snapshotted
-    // BEFORE the UPDATE overwrites it, under
-    // `archive_reason='in_place_edit'` with the SAME memory_id, and
-    // ONLY when title/content actually changed (metadata / tag /
-    // priority patches don't touch content, so they don't archive). No
-    // caller of `update_with_expected_version` holds an open
-    // transaction, so the IMMEDIATE acquisition cannot nest.
-    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    // #1725 (v0.8.0) — lossless default update path. The
+    // archive-of-prior-content + the in-place UPDATE must run atomically
+    // so a mid-failure — or a version-conflict UPDATE that matches 0 rows
+    // — rolls BOTH back, leaving the OLD content live (no orphan archive
+    // row). The prior content is snapshotted BEFORE the UPDATE overwrites
+    // it, under `archive_reason='in_place_edit'` with the SAME memory_id,
+    // and ONLY when title/content actually changed (metadata / tag /
+    // priority patches don't touch content, so they don't archive).
+    //
+    // Transaction-aware: some callers already hold an open transaction —
+    // the synthesis merge path (`src/mcp/tools/store/synthesis.rs`) wraps
+    // candidate updates + provenance rows in ONE `BEGIN IMMEDIATE`. A
+    // nested `BEGIN` there fails with "cannot start a transaction within a
+    // transaction", so we open our own tx ONLY when none is active
+    // (`is_autocommit()` is true only outside a transaction); when the
+    // caller owns the tx, the archive + UPDATE run inside it and the
+    // caller's commit/rollback covers atomicity.
+    let owns_tx = conn.is_autocommit();
+    if owns_tx {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    }
     let txn_result = (|| -> Result<(bool, bool)> {
         if content_changed {
             archive_memory_insert_only(
@@ -1657,11 +1666,17 @@ pub fn update_with_expected_version(
     })();
     match txn_result {
         Ok(r) => {
-            conn.execute_batch(connection::SQL_COMMIT)?;
+            if owns_tx {
+                conn.execute_batch(connection::SQL_COMMIT)?;
+            }
             Ok(r)
         }
         Err(e) => {
-            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            // Only roll back a tx we opened. When the caller owns the tx,
+            // propagating the Err lets THEIR rollback revert the archive.
+            if owns_tx {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            }
             Err(e)
         }
     }
