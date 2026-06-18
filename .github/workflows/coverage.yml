@@ -253,7 +253,20 @@ jobs:
             --json \
             --output-path coverage/current.json \
             --workspace \
-            -- --test-threads=2
+            -- --test-threads=1
+        # v0.8.0 #1709 SHIP-HARDEN — `--test-threads=1` (was `=2`).
+        # The postgres-backed tests share ONE `ai_memory_test` database with
+        # no per-test isolation, so running two concurrently let an
+        # `archive_by_ids` (INSERT archived_memories + DELETE memories)
+        # deadlock on the shared table/index locks (postgres `40P01`),
+        # surfacing as an intermittent `cov_postgres_*` archive flake (the
+        # rows are uuid-unique, so it is index/table-level contention, not a
+        # row-order issue a per-call sort could fix). This mirrors the
+        # `ci.yml` Postgres feature gate, which already runs the
+        # sal-postgres suite at `--test-threads=1` for the same per-DDL
+        # serialisation + llvm-cov-memory reasons. Coverage line/region
+        # counts are thread-count-independent, so the per-module thresholds
+        # are unaffected; the 75-minute job timeout absorbs the serial run.
 
       - name: Enforce per-module thresholds
         run: |
