@@ -1975,7 +1975,7 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -1983,7 +1983,7 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -2037,7 +2037,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
-          mentioned_entity_id, version, lifecycle_state)
+          mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
@@ -2045,7 +2045,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope
          FROM memories WHERE id = ?3",
         params![now, reason, id],
     )?;
@@ -2111,7 +2111,7 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -2119,7 +2119,7 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -2237,7 +2237,7 @@ pub fn forget(
                   reflection_depth, atomised_into, atom_of, memory_kind,
                   entity_id, persona_version, citations, source_uri, source_span,
                   confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version, lifecycle_state)
+                  mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?4, 'forget', metadata,
@@ -2245,7 +2245,7 @@ pub fn forget(
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                  FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
@@ -2269,7 +2269,7 @@ pub fn forget(
                   reflection_depth, atomised_into, atom_of, memory_kind,
                   entity_id, persona_version, citations, source_uri, source_span,
                   confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version, lifecycle_state)
+                  mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, ?3, 'forget', metadata,
@@ -2277,7 +2277,7 @@ pub fn forget(
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                  FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
                 params![namespace, tier_str, now],
             )?;
@@ -6953,7 +6953,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version, lifecycle_state)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -6961,7 +6961,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version, lifecycle_state
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -7313,7 +7313,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -7329,7 +7329,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
                     COALESCE(version, 1),
-                    COALESCE(lifecycle_state, 'open')
+                    COALESCE(lifecycle_state, 'open'),
+                    encrypted_envelope
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
@@ -7439,7 +7440,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -7455,7 +7456,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
                     COALESCE(version, 1),
-                    COALESCE(lifecycle_state, 'open')
+                    COALESCE(lifecycle_state, 'open'),
+                    encrypted_envelope
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;

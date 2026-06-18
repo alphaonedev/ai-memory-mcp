@@ -612,6 +612,54 @@ fn sqlite_parity_gap_1725_in_place_archive() {
 /// update wrap must NOT open a nested `BEGIN` (sqlite errors "cannot
 /// start a transaction within a transaction"). `is_autocommit()` gates
 /// the inner tx so the archive + UPDATE run inside the caller's tx.
+/// #228 / #1728 Commit A-carry — the archive → restore SQL copy paths
+/// carry the `encrypted_envelope` BLOB column, so archiving an encrypted
+/// memory preserves the ciphertext and restoring round-trips it. Without
+/// the carry the archive INSERT-SELECT would drop the column (DEFAULT
+/// NULL) and the ciphertext would be unrecoverable once Commit B wires
+/// encryption. Exercises archive_memory (→ archive_memory_no_tx) +
+/// restore_archived. (pg twin lives in the postgres_side mod once the pg
+/// carry lands.)
+#[test]
+fn sqlite_archive_restore_carries_encrypted_envelope_1728() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1728-env", "test", "enc title", "placeholder");
+    let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
+    conn.execute(
+        "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+        rusqlite::params![&envelope, &id],
+    )
+    .expect("set envelope on live row");
+
+    let archived = db::archive_memory(&conn, &id, Some("manual")).expect("archive");
+    assert!(archived);
+    let arch_env: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("archived row carries envelope");
+    assert_eq!(
+        arch_env, envelope,
+        "archive carries the ciphertext envelope"
+    );
+
+    let restored = db::restore_archived(&conn, &id).expect("restore");
+    assert!(restored);
+    let live_env: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("restored row carries envelope");
+    assert_eq!(
+        live_env, envelope,
+        "restore round-trips the ciphertext envelope"
+    );
+}
+
 #[test]
 fn sqlite_update_inside_caller_transaction_does_not_nest_1725() {
     let conn = fresh_sqlite();
