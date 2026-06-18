@@ -10616,32 +10616,18 @@ impl MemoryStore for PostgresStore {
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
         let limit: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
-        // Sargable prefix scan via a half-open BYTE range on the
-        // `namespace` text_pattern_ops btree (`idx_memories_namespace_path`).
+        // Sargable BYTE-range prefix scan on the `namespace`
+        // text_pattern_ops btree (`idx_memories_namespace_path`).
         //
-        // CRITICAL (v0.8.0 #1709 SHIP-HARDEN): `prefix_upper_bound` computes
-        // the upper bound by BYTE arithmetic (increment the last byte), so the
-        // range comparison MUST be byte-ordered. The `memories.namespace`
-        // column has NO `COLLATE "C"`, so it inherits the DATABASE DEFAULT
-        // collation — which on a stock Debian postgres (the CI `apache/age`
-        // image + most real deployments) is `en_US.utf8` (glibc LINGUISTIC
-        // ordering), NOT byte order. Under linguistic collation a plain
-        // `namespace >= $1 AND namespace < $2` does NOT equal the byte range:
-        // glibc reweights punctuation, so e.g. for a prefix whose last byte is
-        // '9' (upper bound ':') the child `<prefix>/alpha` collates AFTER ':'
-        // and is silently EXCLUDED — dropping valid rows on this per-write
-        // dispatch hot path. (Surfaced as the intermittent ~1/16-of-uuids
-        // `cov_postgres_core::list_by_namespace_prefix_groups_children` flake;
-        // a prior earlier theory blamed read-after-write lag, but `store()`
-        // commits synchronously so that was impossible — the real cause is
-        // collation.)
-        //
-        // Fix: use the byte-comparison operators `~>=~` / `~<~`
-        // (`text_pattern_ops` opclass), which are collation-INDEPENDENT (always
-        // byte-ordered, matching `prefix_upper_bound`) AND sargable on the
-        // `idx_memories_namespace_path` text_pattern_ops index. `ORDER BY ...
-        // USING ~<~` keeps the LIMIT cut byte-ordered too. The in-process
-        // `starts_with` re-filter below is retained as belt-and-suspenders.
+        // `prefix_upper_bound` computes the upper bound by BYTE arithmetic, so
+        // the comparison MUST be byte-ordered. `memories.namespace` has no
+        // `COLLATE "C"`, so plain `>=`/`<` use the DB default collation —
+        // `en_US.utf8` (glibc linguistic) on stock postgres — which is NOT
+        // byte order and silently DROPS valid children (e.g. a '9'-terminated
+        // prefix excludes `<prefix>/alpha`; see #1724). We therefore use the
+        // byte-comparison operators `~>=~` / `~<~` (collation-independent,
+        // sargable on the text_pattern_ops index); the in-process re-filter
+        // below is belt-and-suspenders.
         let upper = prefix_upper_bound(prefix);
         let rows = match upper {
             Some(ref upper) => {
