@@ -192,7 +192,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // stamp on a namespace before scope=private filtering) and its 5
     // in-module storage tests. No schema change. Measured 18_960; bump
     // 18_700 → 18_985 in lockstep (18_960 + 25 headroom).
-    ("src/storage/mod.rs", 18_985),
+    // 2026-06-18 (#1725, P0.2 lossless in-place update) — the
+    // `archive_memory_insert_only` helper (INSERT-only snapshot of a
+    // still-live row, the #1025 full column carry) + wrapping the
+    // archive + in-place UPDATE in one BEGIN IMMEDIATE tx in
+    // `update_with_expected_version`. No schema change. Measured 19_074;
+    // bump 18_985 → 19_090 in lockstep (19_074 + 16 headroom).
+    ("src/storage/mod.rs", 19_090),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -443,7 +449,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // metadata.agent_id + matched/dry_run count, mirroring the sqlite
     // free-fn) landed the file at 20_090. Bump 20_050 → 20_115 in
     // lockstep (20_090 + 25 headroom).
-    ("src/store/postgres.rs", 20_115),
+    // 2026-06-18 (#1725, P0.2 lossless in-place update) — bumped
+    // 20_115 → 20_215: `update_with_expected_version_once` now wraps the
+    // prior-content archive + the in-place UPDATE in one tx (begin /
+    // commit / rollback), fetches `content` for the change check, and
+    // carries the DELETE+INSERT in_place_edit archive (the #1025 full
+    // 36-column carry, the irreducible cost). Landed the file at 20_197.
+    // 20_215 = 20_197 + 18 headroom. The postgres/{mod,kg,...}.rs split
+    // remains the tracked manageability target (#650 / #867 / #961).
+    ("src/store/postgres.rs", 20_215),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

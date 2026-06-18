@@ -48,6 +48,12 @@ pub const ALLOWED_TOOLS: &str = "allowed_tools";
 pub const ARCHIVED_AT: &str = "archived_at";
 /// `archive_reason` — wire/row field name.
 pub const ARCHIVE_REASON: &str = "archive_reason";
+/// #1725 (v0.8.0) — the `archive_reason` VALUE stamped on the
+/// immediately-prior content snapshot captured before a lossless
+/// in-place content edit (the default update path archives the old
+/// content under the SAME memory_id, no fork). Shared SSOT so the
+/// sqlite + postgres backends and the parity test agree on the marker.
+pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.

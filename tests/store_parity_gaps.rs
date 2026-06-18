@@ -340,6 +340,136 @@ fn verify_gap_5_edit_source_sqlite() {
     assert_eq!(new_meta["edit_source"].as_str(), Some("llm"));
 }
 
+/// #1725 (P0.2) — lossless DEFAULT update path. Sqlite reference: a
+/// content edit snapshots the prior content into `archived_memories`
+/// (SAME memory_id, `archive_reason='in_place_edit'`, no fork) BEFORE
+/// the in-place UPDATE; repeated edits keep the MOST-RECENT pre-edit
+/// snapshot (single-snapshot retention); a non-content edit
+/// (priority / metadata only) archives nothing. The postgres twin is
+/// `pg_parity_gap_1725_in_place_archive` below — a 2-edit divergence
+/// (sqlite `INSERT OR REPLACE` keeps v2; a postgres `ON CONFLICT DO
+/// NOTHING` would wrongly keep v1) is exactly what this pins.
+fn verify_gap_1725_in_place_archive_sqlite() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1725-a", "test", "g1725 title", "content-v1");
+
+    // Edit 1: content v1 → v2. Archives v1 under 'in_place_edit'.
+    let (ok, changed) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v2"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("edit 1");
+    assert!(ok && changed, "edit 1 applied with content_changed=true");
+
+    let (a_content, a_reason): (String, String) = conn
+        .query_row(
+            "SELECT content, archive_reason FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("archive row exists after edit 1");
+    assert_eq!(a_content, "content-v1", "archive holds the prior content");
+    assert_eq!(a_reason, "in_place_edit");
+
+    // memory_id UNCHANGED + the live row carries the NEW content.
+    let live_content: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("live row after edit 1");
+    assert_eq!(
+        live_content, "content-v2",
+        "live row has new content under the SAME id"
+    );
+
+    // Edit 2: content v2 → v3. The archive must REPLACE to the
+    // MOST-RECENT pre-edit snapshot (v2), still ONE row, still SAME id.
+    db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v3"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("edit 2");
+    let archive_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("count archive after edit 2");
+    assert_eq!(archive_count, 1, "single-snapshot retention (most-recent)");
+    let a2_content: String = conn
+        .query_row(
+            "SELECT content FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("archive content after edit 2");
+    assert_eq!(
+        a2_content, "content-v2",
+        "keeps the immediately-prior snapshot (v2), not the original (v1)"
+    );
+
+    // Non-content edit (priority only) archives NOTHING.
+    let nid = seed_memory(
+        &conn,
+        "g1725-b",
+        "test",
+        "g1725 prio-only",
+        "stable content",
+    );
+    db::update_with_expected_version(
+        &conn,
+        &nid,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(9),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("priority-only edit");
+    let nonc_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&nid],
+            |r| r.get(0),
+        )
+        .expect("count archive for non-content edit");
+    assert_eq!(
+        nonc_count, 0,
+        "a metadata/priority-only edit archives nothing"
+    );
+}
+
 /// Gap 6 (#889) — `search_with_source_uri` post-filters by URI. Sqlite
 /// reference.
 fn verify_gap_6_search_source_uri_sqlite() {
@@ -470,6 +600,11 @@ fn sqlite_parity_gap_7_get_links_columns() {
     verify_gap_7_get_links_columns_sqlite();
 }
 
+#[test]
+fn sqlite_parity_gap_1725_in_place_archive() {
+    verify_gap_1725_in_place_archive_sqlite();
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // v0.7.0 #1117 — sqlite-side parity pin for the SAL trait `update`
 // version bump (#1024). Postgres parity pin lives in `postgres_side`
@@ -588,6 +723,7 @@ mod postgres_side {
         verify_gap_1_version_sqlite, verify_gap_2_source_uri_sqlite,
         verify_gap_3_recall_observations_sqlite, verify_gap_5_edit_source_sqlite,
         verify_gap_6_search_source_uri_sqlite, verify_gap_7_get_links_columns_sqlite,
+        verify_gap_1725_in_place_archive_sqlite,
     };
     use ai_memory::models::Memory;
     use ai_memory::store::postgres::PostgresStore;
@@ -649,6 +785,100 @@ mod postgres_side {
             msg.contains("VersionConflict"),
             "expected VersionConflict, got: {msg}"
         );
+    }
+
+    /// #1725 (P0.2) — postgres twin of
+    /// `verify_gap_1725_in_place_archive_sqlite`. Drives the lossless
+    /// in-place update path through `PostgresStore` and asserts the
+    /// prior content lands in `archived_memories` with
+    /// `archive_reason='in_place_edit'`, the SAME memory_id, single-
+    /// snapshot (most-recent) retention across two edits, and no archive
+    /// on a non-content edit. Catches the `ON CONFLICT DO NOTHING`
+    /// (keep-oldest) parity divergence the sqlite `INSERT OR REPLACE`
+    /// reference does not have.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_parity_gap_1725_in_place_archive() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        // Sqlite reference still runs to pin the contract shape.
+        verify_gap_1725_in_place_archive_sqlite();
+
+        // The fixture carries no metadata.agent_id, so drive the
+        // caller-owns gate via the admin/bypass context (same idiom as
+        // `pg_parity_gap_1_version`).
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test");
+        let mut mem = sample_memory("pg-g1725");
+        mem.content = "content-v1".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem).await;
+
+        // Edit 1: content v1 → v2. Archives v1 under 'in_place_edit'.
+        let p1 = ai_memory::store::UpdatePatch {
+            content: Some("content-v2".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem.id, p1, None)
+            .await
+            .expect("edit 1");
+        let (a_content, a_reason): (String, String) =
+            sqlx::query_as("SELECT content, archive_reason FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("archive row after edit 1");
+        assert_eq!(a_content, "content-v1", "archive holds the prior content");
+        assert_eq!(a_reason, "in_place_edit");
+
+        // memory_id UNCHANGED + live row carries the NEW content.
+        let live: String = sqlx::query_scalar("SELECT content FROM memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("live row after edit 1");
+        assert_eq!(live, "content-v2", "live row has new content, same id");
+
+        // Edit 2: content v2 → v3. Most-recent snapshot (v2), ONE row.
+        let p2 = ai_memory::store::UpdatePatch {
+            content: Some("content-v3".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem.id, p2, None)
+            .await
+            .expect("edit 2");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("count archive after edit 2");
+        assert_eq!(count, 1, "single-snapshot retention (most-recent)");
+        let a2: String = sqlx::query_scalar("SELECT content FROM archived_memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("archive content after edit 2");
+        assert_eq!(
+            a2, "content-v2",
+            "keeps immediately-prior snapshot (v2), not original (v1)"
+        );
+
+        // Non-content edit (priority only) archives NOTHING.
+        let mut mem2 = sample_memory("pg-g1725-b");
+        mem2.content = "stable content".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem2).await;
+        let p3 = ai_memory::store::UpdatePatch {
+            priority: Some(9),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem2.id, p3, None)
+            .await
+            .expect("priority-only edit");
+        let nonc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE id = $1")
+            .bind(&mem2.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("count archive non-content");
+        assert_eq!(nonc, 0, "metadata/priority-only edit archives nothing");
     }
 
     /// Gap 2 (#885) — postgres twin of `verify_gap_2_source_uri_sqlite`.
