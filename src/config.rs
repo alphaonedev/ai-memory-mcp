@@ -3570,6 +3570,14 @@ pub struct StorageSection {
     /// across-the-board winner of the P1 perf-audit PRAGMA A/B
     /// (15-30% on large-corpus reads).
     pub db_mmap_size_bytes: Option<i64>,
+
+    /// #1735 (Pillar-4 4.C) — AGE graph-projection posture for postgres
+    /// link writes: `"sync"` (default, inline MERGE) or `"deferred"`
+    /// (enqueue to `kg_projection_outbox`, cold drainer projects later).
+    /// Env override: `AI_MEMORY_AGE_PROJECTION_MODE` ([`ENV_AGE_PROJECTION_MODE`]).
+    /// Postgres-only; SQLite has no graph backend and ignores it.
+    /// Unparseable / unset falls through to the compiled default `sync`.
+    pub age_projection_mode: Option<String>,
 }
 
 /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
@@ -3948,6 +3956,12 @@ pub struct ResolvedStorage {
     /// > compiled 256 MiB default). `0` disables memory-mapped I/O.
     /// Seeded into `crate::storage::set_db_mmap_size` at boot.
     pub db_mmap_size_bytes: i64,
+    /// #1735 (Pillar-4 4.C) — resolved AGE-projection mode
+    /// (`AI_MEMORY_AGE_PROJECTION_MODE` env > `[storage].age_projection_mode`
+    /// > compiled default `Sync`). Seeded into
+    /// `crate::config::set_age_projection_mode` at boot; read by
+    /// `PostgresStore::link_internal`.
+    pub age_projection_mode: AgeProjectionMode,
     /// #1590 — per-field provenance of `default_namespace`:
     /// [`ConfigSource::Config`] when `[storage].default_namespace` is
     /// explicitly set, [`ConfigSource::Legacy`] when only the
@@ -4076,6 +4090,11 @@ pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 0;
 /// the `[storage]` section, then to the compiled 256 MiB default
 /// (`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`).
 pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
+/// #1735 (Pillar-4 4.C) — env override for `[storage].age_projection_mode`
+/// (`sync` | `deferred`). Selects whether postgres link writes run the
+/// inline AGE MERGE synchronously (default) or defer it to the cold-path
+/// projection drainer via `kg_projection_outbox`.
+pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
 
 /// #1604 — env override for the tokenized length of rerank inputs
 /// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
@@ -4768,6 +4787,71 @@ impl PermissionsMode {
             Self::Advisory => "advisory",
             Self::Off => "off",
         }
+    }
+}
+
+/// #1735 (Pillar-4 4.C) — AGE graph-projection posture for postgres link
+/// writes. `Sync` (default) runs the inline `project_link_into_age` MERGE
+/// in the link-write transaction (byte-identical to pre-4.C behaviour).
+/// `Deferred` enqueues a `kg_projection_outbox` row in the same tx and lets
+/// the cold drainer project it out-of-band, taking the ~6 synchronous AGE
+/// Cypher round-trips off the link-write hot path. Postgres-only — AGE is
+/// Postgres-only; the SQLite adapter has no graph backend and ignores this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AgeProjectionMode {
+    /// Inline synchronous AGE MERGE in the link-write tx (default).
+    #[default]
+    Sync,
+    /// Enqueue to `kg_projection_outbox`; cold drainer projects later.
+    Deferred,
+}
+
+impl AgeProjectionMode {
+    /// Lowercase wire string for config / doctor / banner surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    /// Parse a case-insensitive `sync` / `deferred` token. Returns `None`
+    /// for anything else so the resolver falls through to its default
+    /// (mirrors `PermissionsMode` parsing).
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sync" => Some(Self::Sync),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
+
+/// Process-wide AGE-projection mode, seeded once at daemon boot from the
+/// resolved `[storage]` config (`AI_MEMORY_AGE_PROJECTION_MODE` env >
+/// `[storage].age_projection_mode` > compiled default `sync`). Read by
+/// `PostgresStore::link_internal` at write time (it has no `AppConfig`
+/// handle), mirroring the `crate::storage::set_db_mmap_size` boot-seeded
+/// global precedent. `0` = `Sync` (default), `1` = `Deferred`.
+static AGE_PROJECTION_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Seed the process-wide AGE-projection mode (#1735). Called once at boot.
+pub fn set_age_projection_mode(mode: AgeProjectionMode) {
+    let v = match mode {
+        AgeProjectionMode::Sync => 0,
+        AgeProjectionMode::Deferred => 1,
+    };
+    AGE_PROJECTION_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide AGE-projection mode (#1735). Defaults to `Sync`.
+#[must_use]
+pub fn age_projection_mode() -> AgeProjectionMode {
+    match AGE_PROJECTION_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => AgeProjectionMode::Deferred,
+        _ => AgeProjectionMode::Sync,
     }
 }
 
@@ -6937,6 +7021,18 @@ impl AppConfig {
             .or_else(|| cfg.and_then(|s| s.db_mmap_size_bytes).filter(|n| *n >= 0))
             .unwrap_or(crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES);
 
+        // #1735 (Pillar-4 4.C) — AGE-projection mode, uniform ladder:
+        // env > [storage] section > compiled default (`Sync`). Unparseable
+        // values warn-and-fall-through (mirrors the PermissionsMode parse).
+        let age_projection_mode = std::env::var(ENV_AGE_PROJECTION_MODE)
+            .ok()
+            .and_then(|s| AgeProjectionMode::from_str_opt(&s))
+            .or_else(|| {
+                cfg.and_then(|s| s.age_projection_mode.as_deref())
+                    .and_then(AgeProjectionMode::from_str_opt)
+            })
+            .unwrap_or_default();
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.default_namespace.is_some()
@@ -6955,6 +7051,7 @@ impl AppConfig {
             archive_max_days,
             max_memory_mb,
             db_mmap_size_bytes,
+            age_projection_mode,
             default_namespace_source,
             source,
         }

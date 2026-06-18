@@ -520,7 +520,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       both adapters carry the column + index. Pure additive ADD COLUMN
 //       IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — idempotent +
 //       replay-safe. CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 68;
+const CURRENT_SCHEMA_VERSION: i32 = 69;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1348,8 +1348,11 @@ impl PostgresStore {
         if current_version < 67 {
             self.migrate_v67().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 68 {
             self.migrate_v68().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v69().await?;
         }
 
         Ok(())
@@ -3178,6 +3181,64 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v68 applied (#228/#1728: encrypted_envelope BYTEA on \
              memories + archived_memories — at-rest encryption column parity + archive carry)"
+        );
+        Ok(())
+    }
+
+    /// v69 (#1735, Pillar-4 4.C) — `kg_projection_outbox` table backing the
+    /// staggered AGE cold-path. When `AI_MEMORY_AGE_PROJECTION_MODE=deferred`,
+    /// `link_internal` enqueues a pending-projection row here in the SAME tx
+    /// as the relational `memory_links` INSERT (instead of running the
+    /// synchronous inline AGE MERGE), and the cold drainer worker projects
+    /// pending rows into `memory_graph` out-of-band. Postgres-only — AGE is
+    /// postgres-only; SQLite's `migrate` stamps v69 as a no-op (no graph
+    /// backend, find_paths always reads the relational recursive-CTE).
+    ///
+    /// `projected_at IS NULL` marks a pending row (mirrors
+    /// `federation_push_dlq.replayed_at`); quarantine is by `attempt_count`
+    /// threshold in the drainer's take-query, not a separate column.
+    async fn migrate_v69(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v69 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kg_projection_outbox ( \
+                 id            BIGSERIAL PRIMARY KEY, \
+                 source_id     TEXT NOT NULL, \
+                 target_id     TEXT NOT NULL, \
+                 relation      TEXT NOT NULL, \
+                 attempt_count INTEGER NOT NULL DEFAULT 0, \
+                 last_error    TEXT NULL, \
+                 created_at    TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 projected_at  TIMESTAMPTZ NULL \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v69 create kg_projection_outbox", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_kg_projection_outbox_pending \
+                 ON kg_projection_outbox(created_at) WHERE projected_at IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v69 index kg_projection_outbox pending", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 69).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v69 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v69 applied (#1735 Pillar-4 4.C: kg_projection_outbox — \
+             staggered AGE cold-path projection queue)"
         );
         Ok(())
     }
@@ -6481,6 +6542,23 @@ impl PostgresStore {
         // backend-blind.
         match self.kg_backend {
             KgBackend::Age => {
+                // #1735 (Pillar-4 4.C) — under deferred AGE-projection mode the
+                // AGE graph lags the relational `memory_links` truth (a
+                // just-created edge sits in `kg_projection_outbox` until the
+                // cold drainer projects it). A healthy-but-stale AGE returns a
+                // successful empty result that the `is_age_runtime_failure`
+                // fallback below would NOT catch, so route `find_paths`
+                // through the always-current relational recursive-CTE to
+                // preserve read-your-own-write. Sync mode (the default) keeps
+                // the AGE-accelerated cypher path unchanged.
+                if matches!(
+                    crate::config::age_projection_mode(),
+                    crate::config::AgeProjectionMode::Deferred
+                ) {
+                    return self
+                        .find_paths_cte(source_id, target_id, max_depth, max_results)
+                        .await;
+                }
                 match self
                     .find_paths_cypher(source_id, target_id, max_depth, max_results)
                     .await
@@ -7086,77 +7164,107 @@ impl PostgresStore {
         .map_err(|e| to_store_err("insert memory_link", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            // v0.7.0 fold-A2A1.3 (#700) extended to the link path
-            // (#858 follow-up, 2026-05-18): AGE projection is
-            // best-effort. The relational `memory_links` insert
-            // above is the canonical source of truth — the AGE
-            // graph projection is a query-acceleration mirror used
-            // by the cypher-backed `find_paths_cypher` path, which
-            // already falls back to the recursive CTE
-            // (`is_age_runtime_failure` → `warn_age_fallback`) when
-            // AGE is unavailable at query time.
-            //
-            // Pre-fix: any AGE runtime failure here (e.g. the test
-            // postgres user lacking permission to `LOAD 'age'`)
-            // propagated up as `BackendUnavailable` → HTTP 503,
-            // even though the link row was successfully inserted
-            // into `memory_links`. That broke every link-creating
-            // postgres test (smoke + 5 handler_parity tests +
-            // anything else that creates a link before reading via
-            // cypher). The canonical link insert had already
-            // committed at this point (well, it was queued in
-            // `tx` — see below); the AGE projection failure should
-            // degrade to a warning, not a 503.
-            //
-            // Treatment: catch the failure, log a structured warn
-            // event with the same shape `warn_age_fallback` uses,
-            // and continue to commit. Operators monitoring the
-            // tracing stream see exactly which link skipped its
-            // AGE projection.
-            // #1542 — the WHOLE projection rides a SAVEPOINT. The
-            // pre-#1542 warn-and-continue arm left the outer tx in the
-            // ABORTED state after a projection error, so the commit
-            // below silently became a ROLLBACK and the canonical
-            // `memory_links` INSERT was lost while the handler
-            // returned 201. Rolling back to the savepoint keeps the
-            // outer tx healthy so the relational row truly commits —
-            // making the warning below honest.
-            sqlx::query("SAVEPOINT age_link_projection")
+            // #1735 (Pillar-4 4.C) — Deferred mode enqueues the AGE
+            // projection to `kg_projection_outbox` in THIS same tx as the
+            // relational `memory_links` INSERT above; the cold drainer
+            // (`drain_kg_projection_outbox`) projects it into `memory_graph`
+            // out-of-band, taking the ~6 synchronous AGE Cypher round-trips
+            // off the link-write hot path. The relational row is the source
+            // of truth and find_paths stays correct via the recursive-CTE
+            // fallback during the eventual-consistency window. Sync (the
+            // default) runs the inline SAVEPOINT+MERGE below — byte-identical
+            // to pre-4.C behaviour.
+            if matches!(
+                crate::config::age_projection_mode(),
+                crate::config::AgeProjectionMode::Deferred
+            ) {
+                sqlx::query(
+                    "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                     VALUES ($1, $2, $3)",
+                )
+                .bind(&link.source_id)
+                .bind(&link.target_id)
+                .bind(link.relation.as_str())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
-            match project_link_into_age(
-                &mut tx,
-                &link.source_id,
-                &link.target_id,
-                link.relation.as_str(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    sqlx::query("RELEASE SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("release savepoint age_link_projection", e))?;
+                .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
+            } else {
+                // v0.7.0 fold-A2A1.3 (#700) extended to the link path
+                // (#858 follow-up, 2026-05-18): AGE projection is
+                // best-effort. The relational `memory_links` insert
+                // above is the canonical source of truth — the AGE
+                // graph projection is a query-acceleration mirror used
+                // by the cypher-backed `find_paths_cypher` path, which
+                // already falls back to the recursive CTE
+                // (`is_age_runtime_failure` → `warn_age_fallback`) when
+                // AGE is unavailable at query time.
+                //
+                // Pre-fix: any AGE runtime failure here (e.g. the test
+                // postgres user lacking permission to `LOAD 'age'`)
+                // propagated up as `BackendUnavailable` → HTTP 503,
+                // even though the link row was successfully inserted
+                // into `memory_links`. That broke every link-creating
+                // postgres test (smoke + 5 handler_parity tests +
+                // anything else that creates a link before reading via
+                // cypher). The canonical link insert had already
+                // committed at this point (well, it was queued in
+                // `tx` — see below); the AGE projection failure should
+                // degrade to a warning, not a 503.
+                //
+                // Treatment: catch the failure, log a structured warn
+                // event with the same shape `warn_age_fallback` uses,
+                // and continue to commit. Operators monitoring the
+                // tracing stream see exactly which link skipped its
+                // AGE projection.
+                // #1542 — the WHOLE projection rides a SAVEPOINT. The
+                // pre-#1542 warn-and-continue arm left the outer tx in the
+                // ABORTED state after a projection error, so the commit
+                // below silently became a ROLLBACK and the canonical
+                // `memory_links` INSERT was lost while the handler
+                // returned 201. Rolling back to the savepoint keeps the
+                // outer tx healthy so the relational row truly commits —
+                // making the warning below honest.
+                sqlx::query("SAVEPOINT age_link_projection")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
+                match project_link_into_age(
+                    &mut tx,
+                    &link.source_id,
+                    &link.target_id,
+                    link.relation.as_str(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        sqlx::query("RELEASE SAVEPOINT age_link_projection")
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                to_store_err("release savepoint age_link_projection", e)
+                            })?;
+                    }
+                    Err(e) if is_age_runtime_failure(&e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e2| {
+                                to_store_err("rollback savepoint age_link_projection", e2)
+                            })?;
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            source_id = %link.source_id,
+                            target_id = %link.target_id,
+                            relation = link.relation.as_str(),
+                            err = %e,
+                            "AGE projection skipped on link insert — \
+                             relational memory_links row still committed. \
+                             find_paths_cypher will degrade to CTE fallback for \
+                             queries that traverse this edge."
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) if is_age_runtime_failure(&e) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
-                    tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        source_id = %link.source_id,
-                        target_id = %link.target_id,
-                        relation = link.relation.as_str(),
-                        err = %e,
-                        "AGE projection skipped on link insert — \
-                         relational memory_links row still committed. \
-                         find_paths_cypher will degrade to CTE fallback for \
-                         queries that traverse this edge."
-                    );
-                }
-                Err(e) => return Err(e),
             }
         }
 
@@ -7165,6 +7273,187 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit link tx", e))?;
 
         Ok(attest_level)
+    }
+
+    /// #1735 (Pillar-4 4.C) — max AGE-projection drain attempts before a
+    /// `kg_projection_outbox` row is quarantined (left pending with
+    /// `attempt_count >= MAX`, excluded from the take-query so a poison row
+    /// can't head-of-line-block the drain). Mirrors
+    /// `crate::federation::push_dlq::MAX_REPLAY_ATTEMPTS`.
+    pub const MAX_AGE_PROJECTION_ATTEMPTS: i32 = 100;
+
+    /// #1735 — default cold-drain batch size per tick (mirrors
+    /// `crate::federation::push_dlq::REPLAY_BATCH_SIZE`).
+    pub const AGE_PROJECTION_DRAIN_BATCH: i64 = 64;
+
+    /// #1735 (Pillar-4 4.C) — cold-path drainer for `kg_projection_outbox`.
+    /// Projects up to `batch` pending rows (oldest first, under the attempt
+    /// ceiling) into the AGE `memory_graph` out-of-band of the link-write hot
+    /// path. Each row is projected in its OWN tx: on success the AGE MERGE +
+    /// the `projected_at = now()` stamp commit atomically; on failure the tx
+    /// rolls back and `attempt_count` is bumped (with `last_error`) in a
+    /// separate statement, so a poison row is retried up to
+    /// [`Self::MAX_AGE_PROJECTION_ATTEMPTS`] then quarantined (the take-query
+    /// excludes `attempt_count >= MAX`, mirroring the federation push-DLQ).
+    /// Returns the count successfully projected this pass. No-op on non-AGE
+    /// backends (the outbox is only ever written when the AGE backend is
+    /// active under deferred mode).
+    pub async fn drain_kg_projection_outbox(&self, batch: i64) -> StoreResult<usize> {
+        let rows: Vec<(i64, i32, String, String, String)> = sqlx::query_as(
+            "SELECT id, attempt_count, source_id, target_id, relation \
+             FROM kg_projection_outbox \
+             WHERE projected_at IS NULL AND attempt_count < $1 \
+             ORDER BY created_at \
+             LIMIT $2",
+        )
+        .bind(Self::MAX_AGE_PROJECTION_ATTEMPTS)
+        .bind(batch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("select kg_projection_outbox pending", e))?;
+
+        let mut projected = 0usize;
+        for (id, attempt_count, source_id, target_id, relation) in rows {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("begin kg_projection drain tx", e))?;
+            match project_link_into_age(&mut tx, &source_id, &target_id, &relation).await {
+                Ok(()) => {
+                    sqlx::query(
+                        "UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1",
+                    )
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("mark kg_projection_outbox projected", e))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| to_store_err("commit kg_projection drain tx", e))?;
+                    projected += 1;
+                }
+                Err(e) => {
+                    // Roll back the failed projection, then record the attempt
+                    // in a fresh statement so the bump survives (drives the row
+                    // toward quarantine after MAX attempts).
+                    let _ = tx.rollback().await;
+                    let err_text = e.to_string();
+                    if let Err(e2) = sqlx::query(
+                        "UPDATE kg_projection_outbox \
+                         SET attempt_count = attempt_count + 1, last_error = $2 WHERE id = $1",
+                    )
+                    .bind(id)
+                    .bind(&err_text)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            err = %e2,
+                            "kg_projection_outbox: failed to record drain attempt bump"
+                        );
+                    }
+                    let metrics = crate::metrics::registry();
+                    metrics.age_projection_failed_total.inc();
+                    // This failure pushes attempt_count to attempt_count+1; if
+                    // that reaches the ceiling the row is now quarantined
+                    // (future take-queries exclude attempt_count >= MAX).
+                    if attempt_count + 1 >= Self::MAX_AGE_PROJECTION_ATTEMPTS {
+                        metrics.age_projection_quarantined_total.inc();
+                        tracing::error!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            attempts = attempt_count + 1,
+                            "kg_projection_outbox: row QUARANTINED after {} failed AGE-projection \
+                             attempts — relational edge exists but will not reach the AGE graph \
+                             until repaired/re-enqueued. Operator action required.",
+                            Self::MAX_AGE_PROJECTION_ATTEMPTS
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            err = %err_text,
+                            "kg_projection_outbox: deferred AGE projection attempt failed; \
+                             will retry until quarantine"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Refresh the pending-depth gauge so operators see relational↔graph
+        // drift even between failures. Best-effort: a count failure must not
+        // abort the drain pass.
+        if let Ok((pending,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT count(*) FROM kg_projection_outbox WHERE projected_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            crate::metrics::registry()
+                .age_projection_pending_depth
+                .set(pending);
+        }
+
+        Ok(projected)
+    }
+
+    /// #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer.
+    /// Drains once immediately at boot (crash-recovery: pick up any
+    /// `kg_projection_outbox` rows a previous process left pending between
+    /// the relational commit and the projection), then drains every
+    /// `interval`. Supervised by construction: every drain step returns a
+    /// `Result` that is logged and swallowed, so a transient AGE/DB error
+    /// never panics the task or aborts the loop. Only spawned by `serve`
+    /// when `AI_MEMORY_AGE_PROJECTION_MODE=deferred` on a postgres+AGE
+    /// backend.
+    pub fn spawn_drainer(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Boot-recovery drain — self-heal projections orphaned by a crash.
+            if let Err(e) = self
+                .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
+                .await
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    err = %e,
+                    "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
+                );
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match self
+                    .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
+                    .await
+                {
+                    Ok(n) if n > 0 => tracing::debug!(
+                        target: TRACE_TARGET_KG,
+                        projected = n,
+                        "kg_projection drainer: projected pending edges into memory_graph"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        target: TRACE_TARGET_KG,
+                        err = %e,
+                        "kg_projection drainer: drain tick failed; will retry next interval"
+                    ),
+                }
+            }
+        })
     }
 
     fn row_to_memory(row: &sqlx::postgres::PgRow) -> StoreResult<Memory> {

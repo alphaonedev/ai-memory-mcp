@@ -255,6 +255,28 @@ pub struct Metrics {
     /// on every deployment that has not opted into admission control
     /// (the cap defaults to disabled).
     pub admission_shed_total: IntCounter,
+
+    /// #1735 (Pillar-4 4.C) — current depth of the `kg_projection_outbox`
+    /// (pending AGE projections not yet drained: `projected_at IS NULL`).
+    /// Refreshed each cold-drainer tick. Sustained non-zero depth means the
+    /// AGE graph is lagging the relational `memory_links` truth (AGE down,
+    /// drainer stalled, or quarantined rows); operators alert on it as the
+    /// relational↔graph drift signal. Always 0 when
+    /// `AI_MEMORY_AGE_PROJECTION_MODE=sync` (the default — nothing enqueued).
+    pub age_projection_pending_depth: IntGauge,
+
+    /// #1735 (Pillar-4 4.C) — monotonic count of deferred AGE-projection
+    /// drain attempts that errored (the MERGE failed; the row's
+    /// `attempt_count` was bumped and it will be retried until quarantine).
+    pub age_projection_failed_total: IntCounter,
+
+    /// #1735 (Pillar-4 4.C) — monotonic count of `kg_projection_outbox` rows
+    /// that reached the [`crate::store::postgres`] attempt ceiling and were
+    /// quarantined (left pending, excluded from the drain take-query).
+    /// Non-zero means a poison projection an operator must investigate; the
+    /// relational edge exists but will never reach the AGE graph until the
+    /// row is repaired/re-enqueued.
+    pub age_projection_quarantined_total: IntCounter,
 }
 
 /// Lazily-built process-global metrics handle.
@@ -591,6 +613,32 @@ impl Metrics {
         )?;
         registry.register(Box::new(admission_shed_total.clone()))?;
 
+        let age_projection_pending_depth = IntGauge::new(
+            "ai_memory_age_projection_pending_depth",
+            "Current depth of the kg_projection_outbox (pending deferred AGE \
+             projections, projected_at IS NULL), refreshed each cold-drainer \
+             tick. Sustained non-zero = AGE graph lagging the relational \
+             memory_links truth (Pillar-4 4.C, #1735). Always 0 under the \
+             default sync projection mode.",
+        )?;
+        registry.register(Box::new(age_projection_pending_depth.clone()))?;
+
+        let age_projection_failed_total = IntCounter::new(
+            "ai_memory_age_projection_failed_total",
+            "Monotonic count of deferred AGE-projection drain attempts that \
+             errored (MERGE failed; row attempt_count bumped, retried until \
+             quarantine). Pillar-4 4.C (#1735).",
+        )?;
+        registry.register(Box::new(age_projection_failed_total.clone()))?;
+
+        let age_projection_quarantined_total = IntCounter::new(
+            "ai_memory_age_projection_quarantined_total",
+            "Monotonic count of kg_projection_outbox rows that hit the \
+             drain attempt ceiling and were quarantined (relational edge \
+             exists but never reached the AGE graph). Pillar-4 4.C (#1735).",
+        )?;
+        registry.register(Box::new(age_projection_quarantined_total.clone()))?;
+
         Ok(Self {
             registry,
             store_total,
@@ -621,6 +669,9 @@ impl Metrics {
             federation_cred_max_age_seconds,
             federation_renewal_lag_seconds,
             admission_shed_total,
+            age_projection_pending_depth,
+            age_projection_failed_total,
+            age_projection_quarantined_total,
         })
     }
 }

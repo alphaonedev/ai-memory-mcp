@@ -617,6 +617,61 @@ fn test_db_mmap_size_env_overrides_config_and_default() {
 }
 
 // ---------------------------------------------------------------------------
+// 8a-bis. #1735 (Pillar-4 4.C) — AI_MEMORY_AGE_PROJECTION_MODE env var
+//     overrides [storage].age_projection_mode through
+//     AppConfig::resolve_storage(); unparseable / unset falls through to the
+//     compiled default `Sync` (byte-identical pre-4.C link-write behaviour).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_age_projection_mode_env_overrides_config_and_default() {
+    use ai_memory::config::{AgeProjectionMode, ENV_AGE_PROJECTION_MODE, StorageSection};
+
+    let cfg = AppConfig {
+        storage: Some(StorageSection {
+            age_projection_mode: Some("deferred".to_string()),
+            ..StorageSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → [storage] config wins over compiled default ----
+    let guard_a = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, None)]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Deferred,
+        "[storage].age_projection_mode must beat the compiled default",
+    );
+    drop(guard_a);
+
+    // ---- Branch B: env beats config (env sync overrides config deferred) ----
+    let guard_b = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, Some("sync"))]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Sync,
+        "AI_MEMORY_AGE_PROJECTION_MODE env MUST beat [storage] config",
+    );
+    drop(guard_b);
+
+    // ---- Branch C: garbage env falls through to config ----
+    let guard_c = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, Some("nonsense"))]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Deferred,
+        "unparseable env must fall through to the [storage] section",
+    );
+    drop(guard_c);
+
+    // ---- Branch D: no usable layer bottoms out on the compiled default Sync ----
+    let guard_d = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, None)]);
+    assert_eq!(
+        AppConfig::default().resolve_storage().age_projection_mode,
+        AgeProjectionMode::Sync,
+        "no env/config layer must bottom out on the compiled default Sync",
+    );
+    drop(guard_d);
+}
+
+// ---------------------------------------------------------------------------
 // 8b. #1604 — AI_MEMORY_RERANK_MAX_SEQ env var overrides the
 //     [reranker].max_seq_tokens config field through
 //     AppConfig::resolve_reranker(); zero / garbage / above-model-ceiling

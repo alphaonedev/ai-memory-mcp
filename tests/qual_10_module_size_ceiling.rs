@@ -492,7 +492,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // typed InvalidTransition → version-bumping UPDATE) + its wiring into the
     // trait `update` + `update_with_expected_version` landed the file at
     // 20_433. +27 headroom.
-    ("src/store/postgres.rs", 20_460),
+    // 2026-06-18 (#1735 Pillar-4 4.C) — bumped 20_460 → 20_800: the staggered
+    // AGE cold-path adds migrate_v69 + the link_internal deferred branch +
+    // drain_kg_projection_outbox + spawn_drainer + the find_paths Deferred
+    // CTE-route (actual 20_722 at the bump).
+    ("src/store/postgres.rs", 20_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -551,7 +555,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `DEFAULT_MAX_INFLIGHT_REQUESTS`), the `LimitsSection` +
     // `ResolvedLimits` `max_inflight_requests` fields, the `resolve_limits`
     // arm, and the lockstep test-fixture updates.
-    ("src/config.rs", 10_460),
+    // 2026-06-18 (#1735 Pillar-4 4.C) — bumped 10_460 → 10_560: the
+    // AgeProjectionMode enum + as_str/from_str_opt + the AGE_PROJECTION_MODE
+    // process-global (set/get) + ENV_AGE_PROJECTION_MODE + the StorageSection /
+    // ResolvedStorage field + resolve_storage ladder arm (actual 10_533).
+    ("src/config.rs", 10_560),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
