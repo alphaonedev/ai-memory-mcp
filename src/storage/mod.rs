@@ -1481,25 +1481,81 @@ impl std::fmt::Display for VersionConflict {
 
 impl std::error::Error for VersionConflict {}
 
-/// v0.8.0 Pillar 2 (#1709) — persist a validated lifecycle-state
-/// transition on a single memory. The transition legality
-/// ([`crate::models::LifecycleState::can_transition_to`]) is enforced by
-/// the caller (the MCP `memory_update` path) BEFORE this write; this
-/// helper is the pure persistence primitive (UPDATE one column). Bumps
-/// the Gap-1 `version` counter because a lifecycle advance IS a mutation
-/// observable to optimistic-concurrency callers.
+/// v0.8.0 Pillar 2 (#1726) — typed error returned when a lifecycle-state
+/// transition is illegal per
+/// [`crate::models::LifecycleState::can_transition_to`] (e.g. `open → done`
+/// skipping `active`, any move out of a terminal state, or a self-loop).
+/// Carries `from`/`to` for a useful diagnostic; surfaced as HTTP 409
+/// Conflict, mirroring [`VersionConflict`].
+#[derive(Debug, Clone)]
+pub struct InvalidTransition {
+    pub id: String,
+    pub from: crate::models::LifecycleState,
+    pub to: crate::models::LifecycleState,
+}
+
+impl std::fmt::Display for InvalidTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CONFLICT: illegal lifecycle transition for memory {}: {} -> {} is not permitted",
+            self.id, self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for InvalidTransition {}
+
+/// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
+/// on a single memory, ENFORCING the transition machine
+/// ([`crate::models::LifecycleState::can_transition_to`]). The current
+/// state is read and an illegal edge (`open → done`, a move out of a
+/// terminal state, a self-loop) is rejected with a typed
+/// [`InvalidTransition`] BEFORE any write — #1726 wired this gate, which
+/// the v64 column previously left inert. Bumps the Gap-1 `version` counter
+/// because a lifecycle advance IS a mutation observable to
+/// optimistic-concurrency callers.
 ///
 /// Returns `true` when a row was updated, `false` when `id` did not match
-/// a live row.
+/// a live row (no transition to validate).
 ///
 /// # Errors
 ///
-/// Propagates rusqlite errors from the UPDATE.
+/// * [`InvalidTransition`] — the `current → state` edge is not permitted.
+/// * Propagates rusqlite errors from the SELECT / UPDATE.
 pub fn set_lifecycle_state(
     conn: &Connection,
     id: &str,
     state: crate::models::LifecycleState,
 ) -> Result<bool> {
+    // #1726 — read the current state and validate the edge before writing.
+    use rusqlite::OptionalExtension;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT lifecycle_state FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current_str) = current else {
+        return Ok(false);
+    };
+    let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
+    // A no-op (requested == current) is idempotent success, not a self-loop
+    // error — mirrors the `memory_update` handler contract ("a request equal
+    // to the stored state is a no-op, no error"). Lets the patch / HTTP
+    // callers pass the current state through without a pre-check.
+    if from == state {
+        return Ok(true);
+    }
+    if !from.can_transition_to(state) {
+        return Err(InvalidTransition {
+            id: id.to_string(),
+            from,
+            to: state,
+        }
+        .into());
+    }
     let now = Utc::now().to_rfc3339();
     let n = conn.execute(
         "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \

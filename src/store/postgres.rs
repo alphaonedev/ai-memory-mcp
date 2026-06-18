@@ -3305,6 +3305,10 @@ impl PostgresStore {
         // semantics while guaranteeing the gate evaluated the row
         // that was actually replaced. Explicit If-Match callers keep
         // exactly-one-winner semantics (no retry).
+        // #1726 — capture the optional lifecycle target before the loop
+        // (LifecycleState is Copy); applied once after the value-gated UPDATE
+        // succeeds so the If-Match HTTP path enforces the transition machine.
+        let lifecycle_target = patch.lifecycle_state;
         const MAX_GATE_RETRIES: usize = 3;
         let mut attempt = 0;
         loop {
@@ -3313,7 +3317,10 @@ impl PostgresStore {
                 .update_with_expected_version_once(ctx, id, patch.clone(), expected_version)
                 .await?
             {
-                Some(new_version) => return Ok(new_version),
+                Some(new_version) => {
+                    self.apply_lifecycle_patch(id, lifecycle_target).await?;
+                    return Ok(new_version);
+                }
                 None => {
                     // 0 rows: row vanished or version drifted.
                     let observed: Option<(i64,)> =
@@ -3343,6 +3350,66 @@ impl PostgresStore {
                 }
             }
         }
+    }
+
+    /// #1726 (Pillar-2 typed cognition) — apply an optional lifecycle
+    /// transition on the postgres backend, ENFORCING the transition machine
+    /// ([`crate::models::LifecycleState::can_transition_to`]). Postgres twin
+    /// of the sqlite primitive [`crate::storage::set_lifecycle_state`]: SELECT
+    /// the current state, reject an illegal edge (`open → done`, a move out
+    /// of a terminal, etc.) with a typed [`StoreError::InvalidTransition`]
+    /// (→ HTTP 409 — byte-parity error detail with the sqlite Display), and
+    /// UPDATE on a legal one (bumping the Gap-1 `version`). A request equal
+    /// to the stored state is an idempotent no-op; `None` leaves the column
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::InvalidTransition`] — the `current → target` edge is
+    ///   not permitted.
+    /// * [`StoreError::NotFound`] — no live memory matches `id`.
+    /// * [`StoreError::BackendUnavailable`] — on SQL failure.
+    async fn apply_lifecycle_patch(
+        &self,
+        id: &str,
+        target: Option<crate::models::LifecycleState>,
+    ) -> StoreResult<()> {
+        use crate::models::LifecycleState;
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read lifecycle_state for transition gate", e))?;
+        let Some((current_str,)) = current else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let from = LifecycleState::from_str(&current_str).unwrap_or_default();
+        // No-op (requested == current) is idempotent success, not a self-loop
+        // error — mirrors the sqlite primitive + the memory_update contract.
+        if from == target {
+            return Ok(());
+        }
+        if !from.can_transition_to(target) {
+            return Err(StoreError::InvalidTransition {
+                detail: format!(
+                    "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
+                ),
+            });
+        }
+        sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
+             WHERE id = $2",
+        )
+        .bind(target.as_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update lifecycle_state", e))?;
+        Ok(())
     }
 
     /// #1641 — single gate-CAS attempt. Returns `Ok(Some(new_version))`
@@ -10616,6 +10683,11 @@ impl MemoryStore for PostgresStore {
         self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
             .await?;
 
+        // #1726 — capture the optional lifecycle target before the binds
+        // below move the rest of `patch` (LifecycleState is Copy); applied
+        // through the self-validating helper after the COALESCE UPDATE lands.
+        let lifecycle_target = patch.lifecycle_state;
+
         // One-shot COALESCE update — each patch field overrides only if
         // Some, otherwise falls through to the existing value.
         //
@@ -10717,10 +10789,13 @@ impl MemoryStore for PostgresStore {
         .rows_affected();
 
         if rows_affected == 0 {
-            Err(StoreError::NotFound { id: id.to_string() })
-        } else {
-            Ok(())
+            return Err(StoreError::NotFound { id: id.to_string() });
         }
+        // #1726 — apply an optional lifecycle transition through the
+        // self-validating helper (the non-If-Match HTTP PUT path routes here).
+        // `lifecycle_target` was captured before the binds moved `patch`.
+        self.apply_lifecycle_patch(id, lifecycle_target).await?;
+        Ok(())
     }
 
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {

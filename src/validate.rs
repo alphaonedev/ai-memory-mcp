@@ -1066,6 +1066,9 @@ pub fn validate_update(update: &UpdateMemory) -> Result<()> {
     if let Some(ref uri) = update.source_uri {
         validate_source_uri(uri)?;
     }
+    // #1726 — reject an unparseable lifecycle_state target up front (naming
+    // the valid set); transition legality is enforced in the update path.
+    validate_lifecycle_state(update.lifecycle_state.as_deref())?;
     Ok(())
 }
 

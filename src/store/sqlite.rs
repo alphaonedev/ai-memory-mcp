@@ -179,11 +179,27 @@ impl MemoryStore for SqliteStore {
             None,
         )
         .map_err(box_err)?;
-        if found {
-            Ok(())
-        } else {
-            Err(StoreError::NotFound { id: id.to_string() })
+        if !found {
+            return Err(StoreError::NotFound { id: id.to_string() });
         }
+        // #1726 — apply an optional lifecycle transition through the
+        // self-validating storage primitive (SELECT-current →
+        // can_transition_to → typed InvalidTransition). A request equal to
+        // the stored state is an idempotent no-op; an illegal edge surfaces
+        // as `StoreError::InvalidTransition` → HTTP 409, byte-parity with the
+        // postgres twin.
+        if let Some(target) = patch.lifecycle_state {
+            db::set_lifecycle_state(&conn, id, target).map_err(|e| {
+                e.downcast_ref::<crate::storage::InvalidTransition>()
+                    .map_or_else(
+                        || box_err(&e),
+                        |it| StoreError::InvalidTransition {
+                            detail: it.to_string(),
+                        },
+                    )
+            })?;
+        }
+        Ok(())
     }
 
     async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
@@ -2140,6 +2156,56 @@ mod tests {
             got.expires_at.as_deref(),
             Some(want),
             "#1634: patch.expires_at must reach the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn trait_update_threads_lifecycle_state_1726() {
+        // #1726 — the SAL `update` path enforces the lifecycle transition
+        // machine via `patch.lifecycle_state`. Legal `open → active` persists;
+        // illegal `open → done` (skips active) is rejected with the typed
+        // `StoreError::InvalidTransition` (→ HTTP 409). Pre-#1726 the gate had
+        // zero callers and any edge was silently written.
+        use crate::models::LifecycleState;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+
+        // Legal: open -> active.
+        let m = test_memory("lc-1726-legal", "lifecycle trait fixture body");
+        store.store(&ctx, &m).await.expect("store legal");
+        let legal = UpdatePatch {
+            lifecycle_state: Some(LifecycleState::Active),
+            ..Default::default()
+        };
+        store
+            .update(&ctx, &m.id, legal)
+            .await
+            .expect("open->active");
+        assert_eq!(
+            store.get(&ctx, &m.id).await.expect("get").lifecycle_state,
+            LifecycleState::Active,
+            "a legal transition through the trait update path must persist"
+        );
+
+        // Illegal: open -> done on a fresh row.
+        let m2 = test_memory("lc-1726-illegal", "lifecycle trait fixture body two");
+        store.store(&ctx, &m2).await.expect("store illegal");
+        let illegal = UpdatePatch {
+            lifecycle_state: Some(LifecycleState::Done),
+            ..Default::default()
+        };
+        let err = store
+            .update(&ctx, &m2.id, illegal)
+            .await
+            .expect_err("open->done must be rejected");
+        assert!(
+            matches!(err, StoreError::InvalidTransition { .. }),
+            "expected StoreError::InvalidTransition, got: {err:?}"
+        );
+        assert_eq!(
+            store.get(&ctx, &m2.id).await.expect("get").lifecycle_state,
+            LifecycleState::Open,
+            "a rejected transition must leave the row untouched"
         );
     }
 

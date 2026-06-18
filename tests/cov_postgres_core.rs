@@ -211,6 +211,7 @@ async fn update_all_patch_fields() {
         source_uri: Some("doc:cov4".to_string()),
         expires_at: None,
         namespace: None,
+        lifecycle_state: None,
     };
     store.update(&ctx, &id, patch).await.expect("update");
     let got = store.get(&ctx, &id).await.unwrap();
@@ -265,6 +266,66 @@ async fn update_with_expected_version_conflict_and_success() {
         .update_with_expected_version(&ctx, &id, patch2, Some(1))
         .await;
     assert!(res.is_err(), "stale version must conflict");
+}
+
+#[tokio::test]
+async fn update_enforces_lifecycle_transition_1726() {
+    // #1726 — postgres twin of the sqlite `trait_update_threads_lifecycle_state_1726`
+    // test: the SAL `update` path must enforce the lifecycle transition
+    // machine via `patch.lifecycle_state`. Legal open→active persists; illegal
+    // open→done (skips active) is rejected with the typed
+    // `StoreError::InvalidTransition` (→ HTTP 409). Skips without a live pg.
+    use ai_memory::models::LifecycleState;
+    use ai_memory::store::MemoryStore;
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:cov4");
+    let ns = uid("cov-lc");
+
+    // Legal: open -> active.
+    let legal_id = uid("lc-legal");
+    store
+        .store(&ctx, &mem(&legal_id, &ns, "lc-legal", "lifecycle pg body"))
+        .await
+        .unwrap();
+    let legal = UpdatePatch {
+        lifecycle_state: Some(LifecycleState::Active),
+        ..UpdatePatch::default()
+    };
+    store
+        .update(&ctx, &legal_id, legal)
+        .await
+        .expect("open->active");
+    assert_eq!(
+        store.get(&ctx, &legal_id).await.unwrap().lifecycle_state,
+        LifecycleState::Active,
+        "a legal transition through the pg trait update path must persist"
+    );
+
+    // Illegal: open -> done on a fresh row.
+    let illegal_id = uid("lc-illegal");
+    store
+        .store(
+            &ctx,
+            &mem(&illegal_id, &ns, "lc-illegal", "lifecycle pg body two"),
+        )
+        .await
+        .unwrap();
+    let illegal = UpdatePatch {
+        lifecycle_state: Some(LifecycleState::Done),
+        ..UpdatePatch::default()
+    };
+    let res = store.update(&ctx, &illegal_id, illegal).await;
+    assert!(
+        matches!(res, Err(StoreError::InvalidTransition { .. })),
+        "open->done must be rejected with InvalidTransition, got: {res:?}"
+    );
+    assert_eq!(
+        store.get(&ctx, &illegal_id).await.unwrap().lifecycle_state,
+        LifecycleState::Open,
+        "a rejected transition must leave the pg row untouched"
+    );
 }
 
 #[tokio::test]

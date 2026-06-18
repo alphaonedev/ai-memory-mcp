@@ -208,7 +208,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // / `update_with_expected_version` / `row_to_memory` + commented
     // `encrypted_envelope` columns on the recall/search/list/by-source-uri
     // SELECTs) landed the file at 19_256. 19_280 = 19_256 + 24 headroom.
-    ("src/storage/mod.rs", 19_280),
+    // 2026-06-18 (#1726 lifecycle gate) — bumped 19_280 → 19_360: the
+    // `InvalidTransition` typed error + the self-validating
+    // `set_lifecycle_state` (SELECT-current → can_transition_to → no-op
+    // short-circuit → typed reject) landed the file at 19_312. +48 headroom.
+    ("src/storage/mod.rs", 19_360),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -479,7 +483,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // fail-closed decrypt branch in the pg `row_to_memory` mapper) landed
     // the file at 20_358. 20_380 = 20_358 + 22 headroom. The
     // postgres/{mod,kg,...}.rs split remains the tracked target (#650).
-    ("src/store/postgres.rs", 20_380),
+    // 2026-06-18 (#1726 lifecycle gate) — bumped 20_380 → 20_460: the
+    // `apply_lifecycle_patch` pg twin (SELECT-current → can_transition_to →
+    // typed InvalidTransition → version-bumping UPDATE) + its wiring into the
+    // trait `update` + `update_with_expected_version` landed the file at
+    // 20_433. +27 headroom.
+    ("src/store/postgres.rs", 20_460),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

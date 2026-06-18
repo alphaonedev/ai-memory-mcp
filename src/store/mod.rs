@@ -290,6 +290,15 @@ pub enum StoreError {
     #[error("integrity check failed: {detail}")]
     IntegrityFailed { detail: String },
 
+    /// #1726 (Pillar-2 typed cognition) — a `lifecycle_state` patch
+    /// requested an illegal transition per
+    /// [`crate::models::LifecycleState::can_transition_to`] (e.g. `open →
+    /// done`, or a move out of a terminal state). `detail` carries the
+    /// [`crate::storage::InvalidTransition`] Display so the trait-routed
+    /// HTTP surface returns the same 409 CONFLICT body on both backends.
+    #[error("{detail}")]
+    InvalidTransition { detail: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -320,6 +329,9 @@ impl StoreError {
             Self::LinkRefused { .. } => error_codes::CONFLICT,
             Self::UnsupportedCapability { .. } => error_codes::STORE_UNSUPPORTED_CAPABILITY,
             Self::IntegrityFailed { .. } => error_codes::STORE_OPERATION_FAILED,
+            // #1726 — an illegal lifecycle transition is a state-conflict
+            // (409), matching the sqlite branch's `InvalidTransition` mapping.
+            Self::InvalidTransition { .. } => error_codes::CONFLICT,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }
@@ -2870,6 +2882,14 @@ pub struct UpdatePatch {
     /// `Some(s)` where `s` is an RFC3339 timestamp string rewrites
     /// it. Validated by the handler / caller before reaching storage.
     pub expires_at: Option<String>,
+    /// v0.8.0 Pillar 2 (#1726) — opt-in lifecycle transition target.
+    /// `None` leaves the stored `lifecycle_state` untouched; `Some(state)`
+    /// requests the transition, enforced against the stored state via
+    /// [`crate::models::LifecycleState::can_transition_to`] in the adapter
+    /// update path (an illegal edge — e.g. `open → done`, or a move out of
+    /// a terminal — surfaces as [`StoreError::InvalidTransition`] → HTTP
+    /// 409). A request equal to the stored state is an idempotent no-op.
+    pub lifecycle_state: Option<crate::models::LifecycleState>,
 }
 
 /// Report produced by `verify`.

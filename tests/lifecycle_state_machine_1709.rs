@@ -161,6 +161,70 @@ fn pre_existing_row_survives_v64_column_add() {
 }
 
 #[test]
+fn set_lifecycle_state_rejects_illegal_transition() {
+    // #1726 — the storage primitive now SELF-VALIDATES the edge. open → done
+    // skips `active` and must be rejected with the typed InvalidTransition,
+    // NOT silently written.
+    let conn = fresh_conn();
+    let mem = make_mem("illegal-skip", LifecycleState::Open);
+    let id = db::insert(&conn, &mem).expect("insert");
+    let err = db::set_lifecycle_state(&conn, &id, LifecycleState::Done)
+        .expect_err("open -> done must be rejected");
+    assert!(
+        err.downcast_ref::<ai_memory::db::InvalidTransition>()
+            .is_some(),
+        "expected a typed InvalidTransition, got: {err}"
+    );
+    assert!(err.to_string().contains("illegal lifecycle transition"));
+    // The row must be untouched (still open, version not bumped).
+    let got = db::get(&conn, &id).unwrap().unwrap();
+    assert_eq!(got.lifecycle_state, LifecycleState::Open);
+    assert_eq!(
+        got.version, mem.version,
+        "rejected transition must not bump version"
+    );
+}
+
+#[test]
+fn set_lifecycle_state_rejects_move_out_of_terminal() {
+    // #1726 — a terminal state accepts no outbound edge. Advance to done
+    // (legal: open -> active -> done) then try done -> active.
+    let conn = fresh_conn();
+    let mem = make_mem("terminal-exit", LifecycleState::Open);
+    let id = db::insert(&conn, &mem).expect("insert");
+    db::set_lifecycle_state(&conn, &id, LifecycleState::Active).expect("open->active");
+    db::set_lifecycle_state(&conn, &id, LifecycleState::Done).expect("active->done");
+    let err = db::set_lifecycle_state(&conn, &id, LifecycleState::Active)
+        .expect_err("done -> active must be rejected");
+    assert!(
+        err.downcast_ref::<ai_memory::db::InvalidTransition>()
+            .is_some(),
+        "expected a typed InvalidTransition, got: {err}"
+    );
+    assert_eq!(
+        db::get(&conn, &id).unwrap().unwrap().lifecycle_state,
+        LifecycleState::Done,
+        "the row must remain in its terminal state"
+    );
+}
+
+#[test]
+fn set_lifecycle_state_noop_is_idempotent_ok() {
+    // #1726 — a request equal to the stored state is a no-op success (NOT a
+    // self-loop InvalidTransition) and must NOT bump the version.
+    let conn = fresh_conn();
+    let mem = make_mem("noop", LifecycleState::Open);
+    let id = db::insert(&conn, &mem).expect("insert");
+    let v0 = db::get(&conn, &id).unwrap().unwrap().version;
+    assert!(
+        db::set_lifecycle_state(&conn, &id, LifecycleState::Open).expect("noop ok"),
+        "no-op transition returns Ok(true)"
+    );
+    let v1 = db::get(&conn, &id).unwrap().unwrap().version;
+    assert_eq!(v1, v0, "a no-op lifecycle request must not bump version");
+}
+
+#[test]
 fn transition_machine_legal_and_illegal_pairs() {
     use LifecycleState::{Abandoned, Active, Blocked, Done, Open};
     // Legal.

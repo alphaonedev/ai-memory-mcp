@@ -629,6 +629,13 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
             StatusCode::CONFLICT,
             sanitize_store_err_message(&e.to_string()),
         ),
+        // #1726 — an illegal lifecycle transition is a state conflict (409),
+        // byte-parity with the sqlite branch's `InvalidTransition` mapping in
+        // handlers/memories.rs.
+        StoreError::InvalidTransition { .. } => (
+            StatusCode::CONFLICT,
+            sanitize_store_err_message(&e.to_string()),
+        ),
         StoreError::UnsupportedCapability { capability } => (
             StatusCode::NOT_IMPLEMENTED,
             format!("backend does not support capability: {capability}"),
@@ -1554,6 +1561,14 @@ mod transport_postgres_gate_tests {
         let r = store_err_to_response(StoreError::LinkRefused {
             detail: "link refused: reflection cycle: a --reflects_on--> b would close a cycle"
                 .to_string(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
+
+        // #1726 — an illegal lifecycle transition maps to 409 CONFLICT.
+        let r = store_err_to_response(StoreError::InvalidTransition {
+            detail:
+                "CONFLICT: illegal lifecycle transition for memory x: open -> done is not permitted"
+                    .to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
 
