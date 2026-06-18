@@ -289,14 +289,19 @@ printf '%s\n' '{"action":"allow"}'
 "#,
     );
 
-    // 60s budget (was 30s, originally 5s) — issue #824: macOS-latest CI
-    // runners have grown slower since 0536e96 bumped 5→30s; runs in
-    // 2026-05-17 timed out at the 30s mark. Local runs finish in ~130ms.
-    // Budget is for CI-flake resilience, not real workload. Real-deployment
-    // hook timeouts are operator-configured. If this bump is also
-    // insufficient, switch to #[cfg_attr(target_os = "macos", ignore)]
-    // and file a runner-investigation follow-up.
-    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 60_000));
+    // 180s budget (was 60s, 30s, originally 5s) — issue #824: macOS-latest
+    // CI runners have grown progressively slower; the 60s budget timed out
+    // again on 2026-06-18 (release/v0.8.0 @ 6b3fd05d: `fire: Timeout { ms:
+    // 60000 }` for a script that runs in ~130ms locally — i.e. the runner
+    // was pathologically contended during the full-suite run, not 2× slow).
+    // Bumped 60→180s to preserve macOS coverage rather than switch to
+    // `#[cfg_attr(target_os = "macos", ignore)]` (keep the success-path
+    // stderr-drain assertion exercised on every platform). The budget is
+    // pure CI-flake resilience, not a real workload — real-deployment hook
+    // timeouts are operator-configured. If 180s still proves insufficient,
+    // the documented fallback is the macOS-only ignore + a runner-perf
+    // follow-up on #824.
+    let executor = ExecExecutor::new(cfg_for(script, HookMode::Exec, 180_000));
     let r = executor
         .fire(HookEvent::PostStore, json!({}))
         .await
