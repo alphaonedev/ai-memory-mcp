@@ -145,6 +145,33 @@ lifecycle surface adds only permissive optional fields to the existing
   (no HTTP/CLI signal route). Tests pin Deny-refuses-insert, Modify-rewrites-
   and-persists, AskUser-fail-closed, and post-fires-once (no re-fire on a no-op
   re-ack).
+- **Engine-level read-action gating** ([#1730](https://github.com/alphaonedev/ai-memory-mcp/issues/1730),
+  PE-2 / §5.5 / #697 Phase-6). Memory reads were never governance-evaluated or
+  audited — only writes / wire-actions were, so a confidentiality rule could not
+  deny a read. New `AgentAction::Read { surface, namespace?, query? }` variant +
+  `read_action` wire kind + a `match_read` matcher (`surface` / `namespace`
+  globs + `query_substring`; an explicit `{"all":true}` blanket; an empty matcher
+  matches nothing, so an operator typo can't lock out every read). A shared
+  `gate_read` / `gate_read_surface` helper is wired into all five MCP read
+  surfaces — `recall` / `search` / `list` / `get` / `session_start` — so a
+  matched `refuse` / `escalate` rule denies the read with the standard
+  governance-refusal wire shape and the decision lands in `signed_events`
+  alongside writes. Design via the deterministic **5-agent vote (4d3ea1c5)**
+  (tripped T1 new public variant + T3 new gate): (a) **zero-config fast-path** —
+  with no enabled `read_action` rules the gate returns immediately (no eval, no
+  audit), keeping the recall hot path free (a per-read `signed_events` INSERT
+  would turn every read into a serialized WAL write); (b) **best-effort,
+  non-fatal audit** — an append failure logs and the read proceeds (read
+  availability is never coupled to audit-sink liveness); (c) **fail-CLOSED** on a
+  matched `refuse`/`escalate` verdict AND on a rule-load error, honoring
+  `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (the same knob the write pre-hook
+  uses). **Scope:** sqlite-MCP-only — `governance_rules` + `check_agent_action`
+  are `rusqlite::Connection`-bound (same posture as signals/actions) and the MCP
+  stdio path is sqlite-only (#1675); HTTP/postgres reads route through the SAL
+  `app.store` (no raw Connection) and are out of scope for this gate. Tests: 8
+  `gate_read` unit tests (refuse / escalate-blocks / warn-allows / fast-path /
+  surface-narrow / namespace-narrow / empty-matcher-no-blanket / audit-row) + 2
+  parity tests (every read surface gated; fast-path passes with no rules).
 - **Pillar-2 typed-cognition link relations** — the closed
   `memory_links.relation` CHECK taxonomy extends 6 → 9 with `decomposes_into`
   (parent → child structural: a Goal decomposes_into Plans, a Plan

@@ -249,7 +249,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // threading through the memory_store / memory_update dispatch +
     // transition-enforcement plumbing, landing the file at 14_734.
     // 14_760 = 14_734 + ~26 headroom.
-    ("src/mcp/mod.rs", 14_760),
+    // 2026-06-18 (#1730 PE-2 read-gating) — bumped 14_760 → 14_900: the
+    // `read_gate_parity_1730` test module (the parity guard asserting every
+    // MCP read surface routes through `gate_read`) landed the file at 14_858.
+    // +42 headroom.
+    ("src/mcp/mod.rs", 14_900),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —

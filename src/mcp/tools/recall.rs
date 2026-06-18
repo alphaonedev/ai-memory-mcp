@@ -812,6 +812,29 @@ pub fn handle_recall_caller(
     recall_scope: Option<&crate::config::RecallScope>,
     caller: Option<&str>,
 ) -> Result<Value, String> {
+    // v0.8.0 PE-2 (#1730) — read-action governance gate. The zero-config
+    // fast-path inside gate_read keeps the recall hot path free when no
+    // read_action rules are configured; a matched refuse/escalate rule
+    // denies the recall with the standard governance-refusal wire shape.
+    let actor = caller
+        .or_else(|| params["agent_id"].as_str())
+        .unwrap_or_default();
+    crate::governance::agent_action::gate_read_surface(
+        conn,
+        actor,
+        "recall",
+        params["namespace"].as_str(),
+        params["context"]
+            .as_str()
+            .or_else(|| params["query"].as_str()),
+    )
+    .map_err(|r| {
+        crate::governance::deny_message(
+            "recall",
+            crate::governance::DenyGate::Governance,
+            &r.reason,
+        )
+    })?;
     let req = RecallRequest::from_mcp_params(params)?;
     handle_recall_dto(
         conn,

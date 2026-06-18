@@ -70,6 +70,21 @@ pub(super) fn handle_list(
     caller: Option<&str>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
+    // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
+    // fast-path when no read_action rules exist).
+    {
+        let actor = caller
+            .or_else(|| params["agent_id"].as_str())
+            .unwrap_or_default();
+        crate::governance::agent_action::gate_read_surface(conn, actor, "list", namespace, None)
+            .map_err(|r| {
+                crate::governance::deny_message(
+                    "list",
+                    crate::governance::DenyGate::Governance,
+                    &r.reason,
+                )
+            })?;
+    }
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     // Ultrareview #339: saturate instead of panic (see handle_search).
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(20)).unwrap_or(usize::MAX);

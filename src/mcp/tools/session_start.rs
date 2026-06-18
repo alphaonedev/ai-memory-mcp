@@ -40,6 +40,25 @@ pub(crate) fn handle_session_start(
     if let Some(ns) = namespace {
         validate::validate_namespace(ns).map_err(|e| e.to_string())?;
     }
+    // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
+    // fast-path when no read_action rules exist).
+    {
+        // Bind the surface name once (the gate kind + the refusal action
+        // share it) so the literal lives on a single site — pm-v3.1
+        // no-hardcoded-duplication discipline.
+        let surface = "session_start";
+        let actor = caller
+            .or_else(|| params["agent_id"].as_str())
+            .unwrap_or_default();
+        crate::governance::agent_action::gate_read_surface(conn, actor, surface, namespace, None)
+            .map_err(|r| {
+            crate::governance::deny_message(
+                surface,
+                crate::governance::DenyGate::Governance,
+                &r.reason,
+            )
+        })?;
+    }
     let limit = usize::try_from(params["limit"].as_u64().unwrap_or(10)).unwrap_or(usize::MAX);
 
     let raw_results = db::list(

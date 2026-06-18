@@ -104,6 +104,11 @@ pub mod action_kinds {
     pub const PROCESS_SPAWN: &str = "process_spawn";
     /// [`AgentAction::Custom`] wire tag.
     pub const CUSTOM: &str = "custom";
+    /// [`AgentAction::Read`] wire tag (PE-2 / §5.5 / #1730 — read-action
+    /// gating). Distinct from the snake_case of the variant name (`read`)
+    /// so the wire kind reads as an action verb consistent with the
+    /// `governance_rules.kind` column the operator authors against.
+    pub const READ_ACTION: &str = "read_action";
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +172,24 @@ pub enum AgentAction {
         custom_kind: String,
         payload: serde_json::Value,
     },
+    /// v0.8.0 PE-2 (§5.5 / #697 / #1730) — a memory READ the substrate is
+    /// about to serve (recall / search / list / get / session_start).
+    /// Unlike the agent-EXTERNAL variants above, this is a substrate read;
+    /// it is modelled here so reads route through the same rule-engine +
+    /// `signed_events` audit chain as the rest of the action vocabulary.
+    /// `surface` names the read entry point; `namespace` / `query` are the
+    /// match dimensions a `read_action` rule can narrow on (both optional —
+    /// a list/session_start read may carry neither). The `#[serde(rename)]`
+    /// pins the wire tag to `read_action` (not the default snake_case
+    /// `read`) to match [`action_kinds::READ_ACTION`].
+    #[serde(rename = "read_action")]
+    Read {
+        surface: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
 }
 
 impl AgentAction {
@@ -180,6 +203,7 @@ impl AgentAction {
             AgentAction::NetworkRequest { .. } => action_kinds::NETWORK_REQUEST,
             AgentAction::ProcessSpawn { .. } => action_kinds::PROCESS_SPAWN,
             AgentAction::Custom { .. } => action_kinds::CUSTOM,
+            AgentAction::Read { .. } => action_kinds::READ_ACTION,
         }
     }
 
@@ -372,6 +396,59 @@ pub fn matcher_applies(rule: &Rule, action: &AgentAction) -> bool {
             custom_kind,
             payload,
         } => match_custom(&matcher, custom_kind, payload),
+        AgentAction::Read {
+            surface,
+            namespace,
+            query,
+        } => match_read(&matcher, surface, namespace.as_deref(), query.as_deref()),
+    }
+}
+
+/// PE-2 (§5.5 / #1730) — match a `read_action` rule against a read.
+/// Recognized matcher fields (all optional, AND-combined when present):
+/// `surface` (glob on the read entry point), `namespace` (glob on the
+/// read's namespace), `query_substring` (literal substring on the query).
+/// A matcher carrying NONE of these is a blanket read rule ONLY when it
+/// sets `{"all": true}` — an empty / unrecognized matcher matches nothing,
+/// so an operator can't accidentally deny every read with a typo. A
+/// `namespace` / `query_substring` matcher against a read that carries no
+/// namespace / query does NOT match (the dimension is absent to narrow on).
+fn match_read(
+    matcher: &serde_json::Value,
+    surface: &str,
+    namespace: Option<&str>,
+    query: Option<&str>,
+) -> bool {
+    let mut saw_field = false;
+    if let Some(glob) = matcher.get("surface").and_then(|v| v.as_str()) {
+        saw_field = true;
+        if !crate::governance::glob_matches(glob, surface) {
+            return false;
+        }
+    }
+    if let Some(glob) = matcher.get("namespace").and_then(|v| v.as_str()) {
+        saw_field = true;
+        match namespace {
+            Some(ns) if crate::governance::glob_matches(glob, ns) => {}
+            _ => return false,
+        }
+    }
+    if let Some(needle) = matcher.get("query_substring").and_then(|v| v.as_str()) {
+        saw_field = true;
+        match query {
+            Some(q) if q.contains(needle) => {}
+            _ => return false,
+        }
+    }
+    if saw_field {
+        // Every present narrowing field matched.
+        true
+    } else {
+        // No narrowing field — only an explicit blanket opt-in matches.
+        matcher
+            .get("all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -905,6 +982,108 @@ fn emit_check_event(
     };
     append_signed_event(conn, &event).context("emit_check_event: append_signed_event")?;
     Ok(())
+}
+
+/// v0.8.0 PE-2 (§5.5 / #697 / #1730) — governance gate for a memory READ
+/// surface (recall / search / list / get / session_start). The read-side
+/// sibling of [`check_agent_action`], shaped by the 5-agent design vote
+/// (ai-memory `4d3ea1c5`):
+///
+/// * **Zero-config fast-path.** When NO enabled `read_action` rules are
+///   configured, returns `Ok(())` immediately — no rule eval, no audit
+///   row. Default deployments pay nothing, so the recall hot path stays
+///   free (a per-read `signed_events` INSERT would turn every read into a
+///   serialized WAL write).
+/// * **Best-effort audit (NON-FATAL).** When read rules exist, the
+///   decision is appended to `signed_events`, but an append failure is
+///   logged and the read PROCEEDS — read availability is never coupled to
+///   audit-sink liveness (the SPLIT fail-posture; the deferred-audit DLQ
+///   keeps the trail recoverable). This is why it does NOT reuse
+///   `check_agent_action`'s fatal `emit_check_event(...)?`.
+/// * **Fail-CLOSED on a blocking verdict** (`Refuse` / `Escalate`) and on a
+///   rule-LOAD error — unless the operator opted into
+///   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (same knob the write
+///   pre-hook honors).
+///
+/// Returns `Err(GovernanceRefusal)` when the read is refused; the caller
+/// maps it to the standard governance-refusal wire shape.
+///
+/// # Errors
+///
+/// Returns [`crate::storage::GovernanceRefusal`] when a `read_action`
+/// rule blocks the read (or governance is unavailable and the deployment
+/// is fail-closed).
+pub fn gate_read(
+    conn: &Connection,
+    agent_id: &str,
+    action: &AgentAction,
+) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    // Load the enabled `read_action` rules. A load error is a governance
+    // outage: fail CLOSED unless the operator opted into the legacy
+    // permissive posture (parity with the write pre-hook).
+    let engine = match RuleEngine::load_for_action(conn, action) {
+        Ok(e) => e,
+        Err(e) => {
+            if crate::daemon_runtime::governance_fail_open_on_error() {
+                tracing::warn!(
+                    "read-gate: rule load failed, failing OPEN per \
+                     AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
+                );
+                return Ok(());
+            }
+            return Err(crate::storage::GovernanceRefusal {
+                reason: "read governance unavailable (failing closed)".to_string(),
+            });
+        }
+    };
+
+    // Zero-config fast-path: no read rules → allow, no eval, no audit.
+    if engine.rules().is_empty() {
+        return Ok(());
+    }
+
+    let decision = engine.evaluate(agent_id, action);
+
+    // Best-effort audit — a read is NEVER blocked by an audit-append
+    // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
+    if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
+        tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
+    }
+    emit_forensic_decision(agent_id, action, &decision);
+
+    if decision.is_blocking() {
+        let reason = match &decision {
+            Decision::Refuse { reason, .. } | Decision::Escalate { reason, .. } => reason.clone(),
+            // Unreachable (is_blocking ⇒ Refuse|Escalate) but keeps the
+            // match total without an unwrap.
+            _ => "read refused by governance".to_string(),
+        };
+        return Err(crate::storage::GovernanceRefusal { reason });
+    }
+    Ok(())
+}
+
+/// PE-2 (#1730) — ergonomic wrapper over [`gate_read`] for the MCP read
+/// handlers: builds the [`AgentAction::Read`] from the surface name + the
+/// optional match dimensions and delegates. Keeps the 5 read call sites to
+/// a single line each (one tested gate, no per-surface drift).
+///
+/// # Errors
+///
+/// Propagates [`gate_read`]'s [`crate::storage::GovernanceRefusal`].
+pub fn gate_read_surface(
+    conn: &Connection,
+    agent_id: &str,
+    surface: &str,
+    namespace: Option<&str>,
+    query: Option<&str>,
+) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    let action = AgentAction::Read {
+        surface: surface.to_string(),
+        namespace: namespace.map(str::to_string),
+        query: query.map(str::to_string),
+    };
+    gate_read(conn, agent_id, &action)
 }
 
 /// v0.7.0 L1-6 Deliverable E — read-only variant of [`check_agent_action`]
@@ -2580,5 +2759,175 @@ mod tests {
             Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R-engine"),
             other => panic!("expected Refuse, got {other:?}"),
         }
+    }
+
+    // ── PE-2 (§5.5 / #1730) read-action gating ───────────────────────────
+
+    /// Full-schema conn so `gate_read`'s best-effort `signed_events` append
+    /// has a table to land in (the bare `fresh_conn` only builds
+    /// `governance_rules`).
+    fn full_conn() -> Connection {
+        crate::storage::open(std::path::Path::new(":memory:")).expect("open full schema")
+    }
+
+    fn read_act(surface: &str, ns: Option<&str>, query: Option<&str>) -> AgentAction {
+        AgentAction::Read {
+            surface: surface.to_string(),
+            namespace: ns.map(str::to_string),
+            query: query.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn gate_read_allows_when_no_read_rules_1730() {
+        // Zero-config fast-path: no read_action rules → allow, no audit.
+        let conn = full_conn();
+        gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), Some("q")))
+            .expect("fast-path must allow when no read rules are configured");
+    }
+
+    #[test]
+    fn gate_read_refuses_on_blanket_refuse_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-read",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "refuse",
+            true,
+        );
+        let err = gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
+            .expect_err("a matching refuse rule must deny the read");
+        assert!(err.reason.contains("R-read"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn gate_read_blocks_on_escalate_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-esc",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "escalate",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("search", None, None)).is_err(),
+            "an escalate verdict must fail CLOSED for a read"
+        );
+    }
+
+    #[test]
+    fn gate_read_allows_on_warn_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-warn",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "warn",
+            true,
+        );
+        gate_read(&conn, "ai:t", &read_act("list", None, None))
+            .expect("a warn rule must NOT block the read");
+    }
+
+    #[test]
+    fn gate_read_narrows_by_surface_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-surf",
+            action_kinds::READ_ACTION,
+            r#"{"surface":"search"}"#,
+            "refuse",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("search", None, None)).is_err(),
+            "the matching surface must be denied"
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", None, None))
+            .expect("a non-matching surface must be allowed");
+    }
+
+    #[test]
+    fn gate_read_narrows_by_namespace_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-ns",
+            action_kinds::READ_ACTION,
+            r#"{"namespace":"secret"}"#,
+            "refuse",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("recall", Some("secret"), None)).is_err(),
+            "a read in the matched namespace must be denied"
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", Some("public"), None))
+            .expect("a read in a different namespace must be allowed");
+        gate_read(&conn, "ai:t", &read_act("get", None, None))
+            .expect("a read with no namespace cannot match a namespace-narrowed rule");
+    }
+
+    #[test]
+    fn gate_read_empty_matcher_does_not_blanket_deny_1730() {
+        // Safety: an empty `{}` matcher must NOT lock out every read — only
+        // an explicit {"all":true} is a blanket. Guards against an operator
+        // typo denying all reads.
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-empty",
+            action_kinds::READ_ACTION,
+            "{}",
+            "refuse",
+            true,
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
+            .expect("an empty matcher must not blanket-deny reads");
+    }
+
+    #[test]
+    fn gate_read_audits_engaged_decision_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-aud",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "refuse",
+            true,
+        );
+        let _ = gate_read(&conn, "ai:auditor", &read_act("recall", None, None));
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_CHECK_EVENT_TYPE, "ai:auditor"],
+                |r| r.get(0),
+            )
+            .expect("count audit rows");
+        assert!(
+            n >= 1,
+            "an engaged read gate must append a governance.check audit row"
+        );
     }
 }

@@ -83,6 +83,21 @@ pub(super) fn handle_search(
 ) -> Result<Value, String> {
     let query = params["query"].as_str();
     let namespace = params["namespace"].as_str();
+    // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
+    // fast-path when no read_action rules exist).
+    {
+        let actor = caller
+            .or_else(|| params["agent_id"].as_str())
+            .unwrap_or_default();
+        crate::governance::agent_action::gate_read_surface(conn, actor, "search", namespace, query)
+            .map_err(|r| {
+                crate::governance::deny_message(
+                    "search",
+                    crate::governance::DenyGate::Governance,
+                    &r.reason,
+                )
+            })?;
+    }
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     // Ultrareview #339: saturate instead of panic on 32-bit targets
     // where u64 may exceed usize::MAX. A malicious client passing
