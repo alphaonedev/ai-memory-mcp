@@ -147,33 +147,99 @@ pub(super) fn check_sender_clock_skew(sender_agent_id: &str, body: &SyncPushBody
     }
 }
 
-/// v0.7.0 S6-M2 — per-agent quota gate for federation receive. Closes
-/// the F7 gap (#639) where mTLS-authenticated peers could push past
-/// the local `agent_quotas` storage caps that would have blocked an
-/// equivalent HTTP `POST /memories` from the same identity.
+/// v0.7.0 S6-M2 / #1464 (v0.8.0, P0, security-high) — resolve the
+/// quota + ownership attribution for an inbound federated memory, gating
+/// the claimed `metadata.agent_id` against the operator's per-peer
+/// authorship allowlist. Returns the agent id the substrate will charge
+/// for the row, and mutates `to_insert` in place when a claim is refused.
 ///
-/// `attribute_agent` is the identity the substrate will charge for the
-/// row. Resolution precedence (mTLS-attested first; falls back to the
-/// claim chain when no cert peeking is available):
-///   1. `mem.metadata.agent_id` — the original author of the row
-///      (NHI provenance preserved across federation). This is what
-///      `quota_status` reports against, so charging this id makes the
-///      receiver-side quota a true mirror of the originator's daily
-///      budget. A misbehaving peer cannot substitute another agent's
-///      id without crashing the upstream signature check (H3).
-///   2. `sender_agent_id` — substrate identity of the peer that
-///      delivered the row. Used when the row carries no
-///      `metadata.agent_id` (legacy / unauthored federation push).
+/// ## The hole this closes
 ///
-/// Returns `Ok(())` on a clean check + record (counters incremented),
-/// `Err(QuotaError)` on a refusal. The caller renders the refusal as
-/// `429 Too Many Requests` with an `X-Quota-Reset-At` header.
-pub(super) fn attribute_agent_for_quota(sender_agent_id: &str, mem: &Memory) -> String {
-    mem.metadata
-        .get("agent_id")
+/// Pre-#1464 the receiver trusted `metadata.agent_id` VERBATIM. The
+/// docstring used to claim "a misbehaving peer cannot substitute another
+/// agent's id without crashing the upstream signature check (H3)" — that
+/// was FALSE (§17 honesty): #791 signs the whole BODY by the *sender*,
+/// not each row's author, and `Memory` carries no per-write signature to
+/// re-verify. So an enrolled peer `mallory` could push a memory claiming
+/// `metadata.agent_id = "alice"` and have alice charged for quota AND
+/// recorded as owner (the #1720 owner-keyed visibility row).
+///
+/// ## The gate (#1464 — chosen by a 5-agent adversarial vote, 4-1)
+///
+/// Extend the shipped #238 allowlist ([`PeerScope::allowed_sender_agent_ids`])
+/// from the body-sender to per-memory granularity:
+///   1. No `metadata.agent_id` → attribute to `sender_agent_id` (legacy /
+///      unauthored push).
+///   2. Claim == `sender_agent_id` → the #238-attested body author; trust.
+///   3. Enrolled posture (operator configured an allowlist): trust the
+///      claim only if the operator authorized this peer to author as that
+///      agent (`scope_for(peer_id).allowed_sender_agent_ids`). Otherwise
+///      attribute to the sender AND rewrite `to_insert.metadata.agent_id`
+///      to the sender so a forged claim cannot own the row, stamping
+///      `attest_level = "claimed"` so downstream knows it is a bare claim.
+///   4. Zero-config (no allowlist): preserve the faith-based posture
+///      (#1056 / #238 — an unenrolled mesh trusts signed peer-ids; the
+///      operator opts into authorship enforcement by enrolling peers).
+///
+/// This preserves legitimate multi-author relay provenance (a hub/curator
+/// relaying a fleet of agents the operator allowlisted) while closing the
+/// forge hole for unauthorized claims.
+pub(super) fn resolve_inbound_attribution(
+    to_insert: &mut Memory,
+    sender_agent_id: &str,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) -> String {
+    let Some(claimed) = to_insert
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| sender_agent_id.to_string())
+    else {
+        return sender_agent_id.to_string();
+    };
+    // The #238-attested body author is always trusted to author as itself.
+    if claimed == sender_agent_id {
+        return claimed;
+    }
+    // Enrolled posture: a relayed third-party claim is trusted ONLY if the
+    // operator authorized this peer to author as that agent. Zero-config
+    // (no allowlist) preserves the faith-based posture.
+    let authorized = if attest_cfg.has_allowlist() {
+        peer_id
+            .and_then(|p| attest_cfg.scope_for(p))
+            .is_some_and(|scope| scope.allowed_sender_agent_ids.iter().any(|a| a == &claimed))
+    } else {
+        true
+    };
+    if authorized {
+        return claimed;
+    }
+    // Unauthorized relayed claim: do not trust it for quota OR ownership.
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        memory_id = %to_insert.id,
+        claimed_agent = %claimed,
+        sender = %sender_agent_id,
+        peer_id = %peer_id.unwrap_or(""),
+        "sync_push: peer not authorized to author as claimed agent_id (#1464); \
+         re-attributing the row to the sender"
+    );
+    if let Some(obj) = to_insert.metadata.as_object_mut() {
+        obj.insert(
+            crate::META_KEY_AGENT_ID.to_string(),
+            serde_json::Value::String(sender_agent_id.to_string()),
+        );
+        obj.insert(
+            crate::models::field_names::ATTEST_LEVEL.to_string(),
+            serde_json::Value::String(
+                crate::identity::verify::AttestLevel::Claimed
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+    }
+    sender_agent_id.to_string()
 }
 
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
@@ -721,10 +787,30 @@ pub async fn sync_push(
         // refusal event (for the cryptographic audit chain) and
         // short-circuit the loop with `quota_refused`; the outer
         // handler renders 429 + X-Quota-Reset-At so callers back off.
-        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
-        let bytes_estimate =
-            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
-                .unwrap_or(i64::MAX);
+        // #1464 (v0.8.0, P0) — build the row first, then resolve its quota
+        // + ownership attribution by gating the claimed `metadata.agent_id`
+        // against the per-peer authorship allowlist (see
+        // `resolve_inbound_attribution`). Done before the quota gate so the
+        // gate charges the attributed agent, and so the persisted row's
+        // owner (`metadata.agent_id`) reflects any re-attribution.
+        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            cap_for_namespace,
+        );
+        let attribute_agent = resolve_inbound_attribution(
+            &mut to_insert,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
+        let bytes_estimate = i64::try_from(
+            to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
+        )
+        .unwrap_or(i64::MAX);
         // v0.7.0 #1156 — charge against the per-namespace accounting
         // row. Federation peers can no longer drain an agent's cap by
         // fanning across namespaces (the per-namespace dimension keeps
@@ -795,28 +881,11 @@ pub async fn sync_push(
                 continue;
             }
         }
-        // v0.7.0 L2-2 (S6-M1) — stamp `metadata.reflection_origin` on
-        // inbound reflection rows before the insert. The stamped copy
-        // carries `peer_origin`, `original_depth`, and the receiver's
-        // local cap at arrival time; the substrate row preserves the
-        // original `reflection_depth` so derived-write cap enforcement
-        // (storage::reflect) sees the same value the source peer saw.
-        // Non-reflection rows (depth == 0) pass through unchanged.
-        //
-        // #961 (SAL-boundary cleanup): use the `db::` namespace alias
-        // (which re-exports `crate::storage` from `src/lib.rs:52`) so
-        // every sqlite-direct call in this branch reads as a single
-        // module surface — keeps the alias hygiene that the rest of
-        // this file already follows (`db::merge_inbound`,
-        // `db::archive_memory`, etc.).
-        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
-        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
-            mem,
-            &body.sender_agent_id,
-            cap_for_namespace,
-        );
+        // (`cap_for_namespace`, `to_insert` + the #1464 per-write
+        // attribution gate were resolved above the quota gate so the gate
+        // operates on the exact row — with any re-attribution applied —
+        // that is persisted here. `stamp_reflection_origin` carried the
+        // `peer_origin` / `original_depth` / local-cap metadata.)
         match db::merge_inbound(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
@@ -1303,6 +1372,85 @@ pub async fn sync_push(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    /// #1464 (v0.8.0, P0, security-high) — the per-memory authorship gate
+    /// `resolve_inbound_attribution` must close the forge hole: an enrolled
+    /// peer cannot have an unauthorized claimed `metadata.agent_id` trusted
+    /// for quota OR ownership. Pins all five arms.
+    #[test]
+    fn resolve_inbound_attribution_gates_per_memory_claims_1464() {
+        use crate::federation::peer_attestation::PeerScope;
+        use std::collections::HashMap;
+
+        fn claiming(agent: &str) -> Memory {
+            Memory {
+                id: "m-1464".to_string(),
+                metadata: serde_json::json!({ "agent_id": agent }),
+                ..Memory::default()
+            }
+        }
+
+        // Enrolled config: peer "ai:relay" is authorized to author as "bob".
+        let mut peers = HashMap::new();
+        peers.insert(
+            "ai:relay".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["bob".to_string()],
+                ..PeerScope::default()
+            },
+        );
+        let cfg = PeerAttestationConfig { peers };
+        let zero = PeerAttestationConfig::default();
+
+        // (1) Zero-config faith posture (no allowlist): the claim is trusted
+        // verbatim and NOT rewritten (preserve #1056/#238 behaviour).
+        let mut m = claiming("alice");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m, "ai:relay", &zero, Some("ai:relay")),
+            "alice"
+        );
+        assert_eq!(m.metadata["agent_id"], "alice");
+
+        // (2) Enrolled, peer NOT authorized to author as "alice" → attribute
+        // to the sender AND rewrite ownership; stamp the bare-claim level.
+        let mut m2 = claiming("alice");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m2, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+        assert_eq!(
+            m2.metadata["agent_id"], "ai:relay",
+            "ownership re-attributed"
+        );
+        assert_eq!(m2.metadata["attest_level"], "claimed");
+
+        // (3) Enrolled, peer authorized to author as "bob" → trusted, preserved.
+        let mut m3 = claiming("bob");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m3, "ai:relay", &cfg, Some("ai:relay")),
+            "bob"
+        );
+        assert_eq!(m3.metadata["agent_id"], "bob");
+
+        // (4) Self-authored (claim == sender, the #238-attested body author)
+        // → trusted regardless of the allowlist.
+        let mut m4 = claiming("ai:relay");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m4, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+
+        // (5) No claim at all → attribute to the sender.
+        let mut m5 = Memory {
+            id: "m-none".to_string(),
+            metadata: serde_json::json!({}),
+            ..Memory::default()
+        };
+        assert_eq!(
+            resolve_inbound_attribution(&mut m5, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+    }
 
     /// v0.7.0 #1049 (Agent-5 #9) — `extract_peer_id` validates the
     /// header value through `crate::validate::validate_agent_id`
