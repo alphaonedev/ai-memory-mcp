@@ -193,6 +193,13 @@ CREATE TABLE IF NOT EXISTS memories (
     -- CHECK. Fresh schemas carry it inline; existing schemas pick it up
     -- via migrate_v64().
     lifecycle_state       TEXT NOT NULL DEFAULT 'open',
+    -- v0.7.0 (#228) / v0.8.0 (#1728, schema v68 pg) — at-rest content
+    -- encryption envelope (X25519 + ChaCha20-Poly1305). NULL unless
+    -- [encryption].at_rest is enabled; `content` carries a placeholder
+    -- when this is non-NULL. The sqlite twin landed at v44; the postgres
+    -- column lands at v68 — fresh schemas carry it inline here, existing
+    -- schemas pick it up via migrate_v68().
+    encrypted_envelope    BYTEA,
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -436,7 +443,12 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     version               BIGINT,
     -- v0.8.0 Pillar 2 (schema v64, #1709) — lifecycle_state mirror so
     -- archive → restore is lossless. Nullable on legacy archived rows.
-    lifecycle_state       TEXT
+    lifecycle_state       TEXT,
+    -- v0.8.0 (#228 / #1728, schema v68) — encrypted_envelope mirror so
+    -- archiving an encrypted memory carries the ciphertext into the
+    -- archive and archive → restore round-trips it losslessly. Nullable;
+    -- NULL until at-rest encryption is wired into the write paths.
+    encrypted_envelope    BYTEA
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

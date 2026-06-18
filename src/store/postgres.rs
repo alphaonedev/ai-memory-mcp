@@ -520,7 +520,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       both adapters carry the column + index. Pure additive ADD COLUMN
 //       IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — idempotent +
 //       replay-safe. CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 67;
+const CURRENT_SCHEMA_VERSION: i32 = 68;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1345,8 +1345,11 @@ impl PostgresStore {
         if current_version < 66 {
             self.migrate_v66().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 67 {
             self.migrate_v67().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v68().await?;
         }
 
         Ok(())
@@ -3129,6 +3132,52 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v67 applied (#1720 A1: memories.target_agent_id_idx \
              STORED generated column + idx_memories_target_agent_id)"
+        );
+        Ok(())
+    }
+
+    /// v68 — #228 / #1728 (v0.8.0 encryption wire-up, Commit A) — add the
+    /// `encrypted_envelope` BYTEA column to `memories` (the postgres twin
+    /// of the sqlite v44 column — the #228 primitive landed it on sqlite
+    /// ONLY) AND mirror it onto `archived_memories` so archiving an
+    /// encrypted memory carries the ciphertext envelope into the archive
+    /// and archive → restore round-trips it losslessly (the v49
+    /// lossless-archive precedent). Additive + nullable: NULL on every row
+    /// until encryption is wired into the write paths (Commit B), so this
+    /// is behaviorally inert today. `ADD COLUMN ... BYTEA` (nullable, no
+    /// default) is a metadata-only operation on postgres — no table
+    /// rewrite. Idempotent via `IF NOT EXISTS` (fresh schemas inherit the
+    /// column inline from `postgres_schema.sql`).
+    async fn migrate_v68(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v68 tx", e))?;
+
+        sqlx::query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS encrypted_envelope BYTEA")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v68 add memories.encrypted_envelope", e))?;
+
+        sqlx::query(
+            "ALTER TABLE archived_memories ADD COLUMN IF NOT EXISTS encrypted_envelope BYTEA",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v68 add archived_memories.encrypted_envelope", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 68).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v68 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v68 applied (#228/#1728: encrypted_envelope BYTEA on \
+             memories + archived_memories — at-rest encryption column parity + archive carry)"
         );
         Ok(())
     }

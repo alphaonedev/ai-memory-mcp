@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 67).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 68).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -650,7 +650,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 67;
+const CURRENT_SCHEMA_VERSION: i64 = 68;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2803,7 +2803,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 67 {
             // v67 = #1720 A1 (v0.8.0 Workstream-A) — index
             // `metadata.target_agent_id` for the A2 owner-keyed `private`
             // visibility clause (`agent_id_idx = ?caller OR
@@ -2843,6 +2843,38 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                  ON memories(target_agent_id_idx)",
                 [],
             )?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v68 = #228 / #1728 (v0.8.0 encryption wire-up, Commit A) —
+            // mirror the `encrypted_envelope` column onto
+            // `archived_memories` so archiving an encrypted memory
+            // (in_place_edit / supersede / GC) carries the ciphertext
+            // envelope into the archive and archive → restore round-trips
+            // it losslessly (the v49 lossless-archive precedent). Without
+            // this, an archived encrypted row would retain only the
+            // `content` placeholder and the ciphertext would be
+            // permanently unrecoverable. Additive + nullable; this lands
+            // BEFORE encryption is wired into the write paths (Commit B),
+            // so in steady state today every value is NULL. Postgres
+            // mirrors via `migrate_v68`. Guarded on table existence
+            // (a test fixture may stamp a version without the v4 CREATE).
+            let archived_cols: std::collections::HashSet<String> = conn
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if archived_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v68: archived_memories table absent (test fixture / archive-less \
+                     deployment); skipping encrypted_envelope mirror"
+                );
+            } else if !archived_cols.contains("encrypted_envelope") {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN encrypted_envelope BLOB",
+                    [],
+                )?;
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
