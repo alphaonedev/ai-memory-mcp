@@ -57,6 +57,22 @@ pub(super) fn handle_get(
         .as_str()
         .ok_or(crate::errors::msg::ID_REQUIRED)?;
     validate::validate_id(id).map_err(|e| e.to_string())?;
+    // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
+    // fast-path when no read_action rules exist). get-by-id carries no
+    // namespace/query match dimension.
+    {
+        let actor = caller
+            .or_else(|| params["agent_id"].as_str())
+            .unwrap_or_default();
+        crate::governance::agent_action::gate_read_surface(conn, actor, "get", None, None)
+            .map_err(|r| {
+                crate::governance::deny_message(
+                    "get",
+                    crate::governance::DenyGate::Governance,
+                    &r.reason,
+                )
+            })?;
+    }
     match db::resolve_id(conn, id).map_err(|e| e.to_string())? {
         Some(mem) => {
             // #1553 — scope=private visibility gate, parity with the sibling

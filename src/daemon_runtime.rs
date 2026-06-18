@@ -3148,7 +3148,11 @@ async fn build_store_handle(
 /// Actor/queue label for wire-action governance consultations.
 const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
 
-fn governance_fail_open_on_error() -> bool {
+// #1730 (PE-2) — `pub` so the read-action gate
+// (`governance::agent_action::gate_read`) honors the SAME fail-open knob as
+// the write pre-hook below, keeping the read + write governance-error posture
+// identical cross-surface.
+pub fn governance_fail_open_on_error() -> bool {
     std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)

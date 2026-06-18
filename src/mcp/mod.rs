@@ -14744,3 +14744,115 @@ mod backfill_resilience_1595_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod read_gate_parity_1730 {
+    //! v0.8.0 PE-2 (§5.5 / #1730) — parity guard: EVERY MCP read surface
+    //! must route through the read-action governance gate
+    //! ([`crate::governance::agent_action::gate_read`]). A single blanket
+    //! `read_action` refuse rule must deny recall / search / list / get /
+    //! session_start; with NO read rules the fast-path lets them through.
+    //! If a 6th read surface is added, gate it + extend this test (mirrors
+    //! the no-silent-coverage discipline of
+    //! `mcp_input_schema_no_false_strict_1052`).
+    use crate::config::{ResolvedScoring, ResolvedTtl};
+    use crate::governance::rules_store::{self, Rule};
+    use serde_json::json;
+
+    fn full_conn() -> rusqlite::Connection {
+        crate::storage::open(std::path::Path::new(":memory:")).expect("open full schema")
+    }
+
+    fn add_blanket_read_deny(conn: &rusqlite::Connection) {
+        rules_store::insert(
+            conn,
+            &Rule {
+                id: "read-deny-all".to_string(),
+                kind: crate::governance::agent_action::action_kinds::READ_ACTION.to_string(),
+                matcher: r#"{"all":true}"#.to_string(),
+                severity: "refuse".to_string(),
+                reason: "parity: deny all reads".to_string(),
+                namespace: "_global".to_string(),
+                created_by: "test".to_string(),
+                created_at: 0,
+                enabled: true,
+                signature: None,
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            },
+        )
+        .expect("insert read-deny rule");
+    }
+
+    #[test]
+    fn every_read_surface_is_gated_1730() {
+        // forensic-sink lock + no-operator-pubkey so the unsigned test rule
+        // passes the L1-6 signature gate in `list_enabled_by_kind`.
+        let _forensic = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _np = rules_store::force_no_operator_pubkey_for_test();
+        let conn = full_conn();
+        add_blanket_read_deny(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+
+        let recall = super::recall::handle_recall(
+            &conn,
+            &json!({"context": "x", "namespace": "ns"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        );
+        assert!(
+            recall.is_err_and(|e| e.contains("denied by")),
+            "recall must be read-gated"
+        );
+
+        let search = super::search::handle_search(&conn, &json!({"query": "x"}), None);
+        assert!(
+            search.is_err_and(|e| e.contains("denied by")),
+            "search must be read-gated"
+        );
+
+        let list = super::list::handle_list(&conn, &json!({}), None);
+        assert!(
+            list.is_err_and(|e| e.contains("denied by")),
+            "list must be read-gated"
+        );
+
+        let get = super::get::handle_get(
+            &conn,
+            &json!({"id": "11111111-2222-3333-4444-555555555555"}),
+            None,
+        );
+        assert!(
+            get.is_err_and(|e| e.contains("denied by")),
+            "get must be read-gated"
+        );
+
+        let ss = super::session_start::handle_session_start(&conn, &json!({}), None, None);
+        assert!(
+            ss.is_err_and(|e| e.contains("denied by")),
+            "session_start must be read-gated"
+        );
+    }
+
+    #[test]
+    fn reads_pass_when_no_read_rules_1730() {
+        // Zero-config fast-path: with NO read_action rules every surface
+        // proceeds (list/search over an empty corpus succeed, not refuse).
+        let conn = full_conn();
+        assert!(
+            super::list::handle_list(&conn, &json!({}), None).is_ok(),
+            "list must pass the fast-path"
+        );
+        assert!(
+            super::search::handle_search(&conn, &json!({"query": "x"}), None).is_ok(),
+            "search must pass the fast-path"
+        );
+    }
+}
