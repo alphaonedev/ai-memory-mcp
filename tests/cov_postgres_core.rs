@@ -684,3 +684,60 @@ async fn export_memories_and_links_and_verify() {
     let report = store.verify(&ctx, &a).await.expect("verify");
     assert_eq!(report.memory_id, a);
 }
+
+// ───────────────────────────────────────────────────────────────────
+// consolidate (#1747 slice-3c1) — the pg consolidate path the store-backed
+// curator ConsolidationPass depends on. Closes the cov_postgres_core
+// consolidate coverage hole flagged by the 5-agent vote (4d3ea1c5).
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn consolidate_merges_and_hard_deletes_sources() {
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-consolidate");
+    let ns = uid("cons-ns");
+    let a = uid("a");
+    let b = uid("b");
+    let dup = "kubernetes rolling canary deploy strategy notes pg consolidate";
+    store
+        .store(&ctx, &mem(&a, &ns, "t1", dup))
+        .await
+        .expect("store a");
+    store
+        .store(&ctx, &mem(&b, &ns, "t2", dup))
+        .await
+        .expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] pg",
+            "merged summary",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-consolidate",
+        )
+        .await
+        .expect("consolidate");
+
+    // The consolidated row exists; both sources were hard-deleted (get →
+    // NotFound). `MemoryStore::get` returns the row or errors, not an Option.
+    store
+        .get(&ctx, &new_id)
+        .await
+        .expect("consolidated row must exist");
+    assert!(
+        store.get(&ctx, &a).await.is_err(),
+        "source a hard-deleted (get → NotFound)"
+    );
+    assert!(
+        store.get(&ctx, &b).await.is_err(),
+        "source b hard-deleted (get → NotFound)"
+    );
+}

@@ -4,6 +4,7 @@
 # Edit deliberately — every entry should be a reviewed exception.
 # See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).
 
+src/cli/curator.rs:AI_CURATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
 src/curator/reflection_pass.rs:agent_id
 src/daemon_runtime.rs:EMBEDDING_BACKFILL

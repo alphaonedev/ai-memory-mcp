@@ -21,6 +21,25 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1747 (Pillar-2.5 slice-3c1) — consolidation on the store-backed (postgres) curator tick.**
+  The SAL `ConsolidationPass` now runs on the postgres / `--store-url` curator path
+  (`cli/curator.rs::store_backed_consolidation_sweep`), the backend-agnostic twin of the
+  reflection sweep, called from both the `--once` and `--daemon` arms **before** reflection
+  (dedup, then reflect over survivors — avoids dangling `reflects_on` edges). It iterates
+  non-reserved namespaces via `MemoryStore::list_namespaces`, re-applies the same
+  `needs_curation` filter + `max_ops_per_cycle` cap the sqlite path uses, and runs the pass
+  real (respecting `dry_run`); a missing LLM folds into the report rather than aborting the
+  daemon. Gated on `compaction.enabled` (default false → no-op). Strengthens the Pillar-2.5
+  §2.4 *improvable* property to backend parity (consolidation no longer sqlite-only). Tests:
+  always-on `SqliteStore` sweep tests (enabled-folds / disabled-noop / no-LLM) + a gated
+  `sal-postgres` `consolidate` integration test (closes the cov_postgres_core hole). Gated by
+  the 5-agent crossroads vote (memory `4d3ea1c5`). **Caveat (tracked as #1748):** on postgres,
+  the operator-reversible rollback rows the pass writes are NOT yet reachable by
+  `ai-memory curator --rollback` (that path is rusqlite-bound) — a runtime WARN is emitted and
+  the SAL-port is slice-3c2. **Note:** `compaction.enabled` is not yet operator-configurable
+  (hardcoded default at all CLI/daemon call sites) — the config wire-up that activates
+  Pillar-2.5 consolidation in production is tracked separately. Code anchors:
+  `src/cli/curator.rs`, `src/curator/candidates.rs` (`needs_curation` → `pub(crate)`).
 - **#1746 (Pillar-2.5 slice-3b2b) — SAL `ConsolidationPass` is the live consolidator (cutover).**
   When `[curator].compaction.enabled` (default `false` → byte-unchanged), `curator::run_once`
   now makes the backend-agnostic SAL `ConsolidationPass` the live memory-consolidator and
