@@ -559,7 +559,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // AgeProjectionMode enum + as_str/from_str_opt + the AGE_PROJECTION_MODE
     // process-global (set/get) + ENV_AGE_PROJECTION_MODE + the StorageSection /
     // ResolvedStorage field + resolve_storage ladder arm (actual 10_533).
-    ("src/config.rs", 10_560),
+    // 2026-06-19 (#1749 Pillar-2.5) — bumped 10_560 → 10_700: the
+    // CuratorCompactionSection { enabled } + ENV_COMPACTION_ENABLED const +
+    // resolve_compaction_enabled ladder arm + the
+    // curator_compaction_enabled_resolver_1749 unit test + the two
+    // CuratorSection fixture updates (compaction: None) (actual 10_651).
+    ("src/config.rs", 10_700),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
