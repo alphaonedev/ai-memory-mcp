@@ -200,16 +200,24 @@ pub struct CuratorReport {
     /// before deleting them, so the count is restorable from the archive.
     #[serde(default)]
     pub memories_evicted_size_gc: usize,
-    /// v0.8.0 Pillar-2.5 (#1738) — clusters the SAL `ConsolidationPass`
+    /// v0.8.0 Pillar-2.5 (#1738/#1746) — clusters the SAL `ConsolidationPass`
     /// found eligible to consolidate this cycle, when
-    /// `compaction.enabled = true`. In the slice-1 SHADOW wiring the pass
-    /// runs observe-only (dry-run): this counts what it *would* consolidate
-    /// without mutating and without double-consolidating against the live
-    /// autonomy Pass-1. Zero when compaction is disabled (the default), in
-    /// dry-run cycles, or on an in-memory DB. The real persist + the
-    /// autonomy-Pass-1 cutover land in slice-3.
+    /// `compaction.enabled = true`. Post-#1746 cutover the pass is the LIVE
+    /// consolidator (autonomy Pass-1 is suppressed); this counts the clusters
+    /// it acted on (or, in a dry-run cycle, would act on). Zero when compaction
+    /// is disabled (the default) or on an in-memory DB. The consolidation
+    /// counts themselves fold into `autonomy.{clusters_formed,
+    /// memories_consolidated, rollback_entries_written}` so the self-report
+    /// stays accurate regardless of which consolidator ran.
     #[serde(default)]
     pub compaction_pass_clusters_eligible: usize,
+    /// v0.8.0 Pillar-2.5 (#1746) — clusters the SAL `ConsolidationPass` rolled
+    /// back this cycle after a Stage-6 (#664) verify failure (sources restored,
+    /// unverifiable summary removed). Preserved as a distinct safety counter —
+    /// `AutonomyPassReport` has no field for it. Zero when compaction is
+    /// disabled or no verify failed.
+    #[serde(default)]
+    pub compaction_pass_rolled_back: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -342,17 +350,30 @@ pub fn run_once(
         .filter(|m| needs_curation(m, cfg))
         .cloned()
         .collect();
-    let pass_report =
-        crate::autonomy::run_autonomy_passes(conn, llm_client, &autonomy_candidates, cfg.dry_run);
+    // v0.8.0 Pillar-2.5 (#1746) — single-source cutover predicate. When
+    // `compaction.enabled`, the SAL `ConsolidationPass` OWNS consolidation:
+    // autonomy Pass-1 is suppressed AND the SAL pass runs live, BOTH driven
+    // from this one bool so they can never drift into double-consolidation
+    // (both run) or zero-consolidation (neither runs). Default false → autonomy
+    // Pass-1 runs and the SAL pass is a no-op (production byte-unchanged).
+    let compaction_owns_consolidation = cfg.compaction.enabled;
+    let pass_report = crate::autonomy::run_autonomy_passes(
+        conn,
+        llm_client,
+        &autonomy_candidates,
+        cfg.dry_run,
+        /* skip_consolidation = */ compaction_owns_consolidation,
+    );
     report.errors.extend(pass_report.errors.clone());
     report.autonomy = pass_report;
 
-    // v0.8.0 Pillar-2.5 (#1738) — SAL `ConsolidationPass` shadow pass.
-    // Gated on `compaction.enabled` (default off → no-op), observe-only
-    // (dry-run) so it does NOT double-consolidate against the autonomy
-    // Pass-1 above. `llm_client: &OllamaClient` coerces to `&dyn
-    // AutonomyLlm`. Best-effort: errors land in report.errors.
-    run_consolidation_shadow_pass(conn, &autonomy_candidates, cfg, llm_client, &mut report);
+    // SAL `ConsolidationPass`. When `compaction.enabled` it is the LIVE
+    // consolidator (real writes, respecting `cfg.dry_run`), and its counts fold
+    // into `report.autonomy` so the self-report is accurate. When disabled it is
+    // a no-op (autonomy Pass-1 above did the consolidation). `llm_client:
+    // &OllamaClient` coerces to `&dyn AutonomyLlm`. Best-effort: errors land in
+    // report.errors.
+    run_consolidation_pass(conn, &autonomy_candidates, cfg, llm_client, &mut report);
 
     // Issue #816 — auto-persona sweep. After auto_tag has populated
     // `mentioned_entity_id` on this cycle's reflections, scan for
@@ -465,25 +486,34 @@ fn run_size_gc_pass(
     }
 }
 
-/// v0.8.0 Pillar-2.5 (#1738 slice-1) — SAL `ConsolidationPass` shadow driver.
+/// v0.8.0 Pillar-2.5 (#1746 cutover) — SAL `ConsolidationPass` live driver.
 ///
 /// Gated on `cfg.compaction.enabled` (default `false` → no-op, production
-/// byte-unchanged). When enabled, opens a second `SqliteStore` handle at the
-/// curator connection's backing file and runs [`ConsolidationPass::run`] in
-/// **dry-run** so it observes what the backend-agnostic SAL pass *would*
-/// consolidate (`report.compaction_pass_clusters_eligible`) WITHOUT mutating
-/// and WITHOUT double-consolidating against the live autonomy Pass-1. The real
-/// persist + the autonomy-Pass-1 cutover are slice-3 (#1738), and Stage-6
-/// rollback is slice-2 (#664).
+/// byte-unchanged: autonomy Pass-1 did the consolidation). When enabled, the
+/// caller has ALSO suppressed autonomy Pass-1 (single-source predicate in
+/// `run_once`), so this pass is the LIVE consolidator: it opens a second
+/// `SqliteStore` handle at the curator connection's backing file and runs
+/// [`ConsolidationPass::run`] with `dry_run = cfg.dry_run` — real writes on a
+/// normal cycle, simulate-only on a `--dry-run` cycle. Its counts FOLD into
+/// `report.autonomy.{clusters_formed, memories_consolidated,
+/// rollback_entries_written}` (the self-report is keyed on those fields, so it
+/// stays accurate regardless of which consolidator ran); `eligible_clusters`
+/// and the Stage-6 (#664) `rolled_back` count surface on the SAL-specific
+/// `report.compaction_pass_*` fields. Operator-reversible rollback rows are
+/// written by the pass itself at autonomy parity (#1745).
+///
+/// `clusters_formed` is folded from the pass's `eligible_clusters` (not its raw
+/// `clusters_formed`) for parity: autonomy's `clusters_formed` is already
+/// post-reserved-namespace-filter, which is what `eligible_clusters` measures.
 ///
 /// Sync↔async bridge: the curator daemon runs on a `spawn_blocking` OS thread
 /// (no ambient runtime), so a scoped current-thread runtime `block_on` is safe
 /// here — never call this from inside the async `serve` runtime. Best-effort:
 /// store/runtime/sweep errors land in `report.errors`, never aborting the
 /// cycle. In-memory (`:memory:`) connections have no path to re-open and are
-/// skipped. Decision provenance: 5-agent vote `4d3ea1c5`.
+/// skipped. Decision provenance: 5-agent vote `4d3ea1c5` (#1746).
 #[cfg(feature = "sal")]
-fn run_consolidation_shadow_pass(
+fn run_consolidation_pass(
     conn: &Connection,
     candidates: &[Memory],
     cfg: &CuratorConfig,
@@ -501,12 +531,15 @@ fn run_consolidation_shadow_pass(
         Err(e) => {
             report
                 .errors
-                .push(format!("consolidation shadow: store open failed: {e}"));
+                .push(format!("consolidation pass: store open failed: {e}"));
             return;
         }
     };
-    let pass =
-        crate::curator::compaction::ConsolidationPass::new(&store, llm, /* dry_run */ true);
+    let pass = crate::curator::compaction::ConsolidationPass::new(
+        &store,
+        llm,
+        /* dry_run = */ cfg.dry_run,
+    );
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -515,23 +548,31 @@ fn run_consolidation_shadow_pass(
         Err(e) => {
             report
                 .errors
-                .push(format!("consolidation shadow: runtime build failed: {e}"));
+                .push(format!("consolidation pass: runtime build failed: {e}"));
             return;
         }
     };
     match rt.block_on(pass.run(candidates)) {
         Ok(out) => {
+            // Fold the SAL consolidator's outcome into the autonomy report so
+            // the self-report (keyed on AutonomyPassReport fields) is accurate
+            // even though autonomy Pass-1 was suppressed this cycle.
+            report.autonomy.clusters_formed += out.eligible_clusters;
+            report.autonomy.memories_consolidated += out.memories_consolidated;
+            report.autonomy.rollback_entries_written += out.rollback_entries_written;
+            // SAL-specific counters (no AutonomyPassReport home).
             report.compaction_pass_clusters_eligible += out.eligible_clusters;
+            report.compaction_pass_rolled_back += out.rolled_back;
             report.errors.extend(out.errors);
         }
-        Err(e) => report.errors.push(format!("consolidation shadow: {e}")),
+        Err(e) => report.errors.push(format!("consolidation pass: {e}")),
     }
 }
 
-/// Non-`sal` builds carry no SAL `ConsolidationPass`; the shadow pass is a
-/// compile-time no-op so `run_once` stays uniform across feature sets.
+/// Non-`sal` builds carry no SAL `ConsolidationPass`; the consolidation pass is
+/// a compile-time no-op so `run_once` stays uniform across feature sets.
 #[cfg(not(feature = "sal"))]
-fn run_consolidation_shadow_pass(
+fn run_consolidation_pass(
     _conn: &Connection,
     _candidates: &[Memory],
     _cfg: &CuratorConfig,
@@ -2395,17 +2436,17 @@ fn cycle_aborts_on_database_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Pillar-2.5 (#1738 slice-1) — ConsolidationPass shadow-pass wiring tests.
+// Pillar-2.5 (#1738/#1746) — ConsolidationPass live-pass wiring tests.
 // ---------------------------------------------------------------------------
 #[cfg(all(test, feature = "sal"))]
-mod consolidation_shadow_tests_1738 {
+mod consolidation_pass_tests_1746 {
     use super::*;
     use crate::autonomy::AutonomyLlm;
     use crate::models::{Memory, Tier};
     use std::sync::Mutex;
 
     /// Counts `summarize_memories` calls so a test can prove the dry-run
-    /// shadow never invokes the LLM.
+    /// path never invokes the LLM (and the real path does).
     struct CountingStubLlm {
         summarize_calls: Mutex<usize>,
     }
@@ -2467,7 +2508,11 @@ mod consolidation_shadow_tests_1738 {
     }
 
     #[test]
-    fn shadow_reports_eligible_and_does_not_write_when_enabled() {
+    fn consolidation_pass_real_consolidates_and_folds_when_enabled() {
+        // #1746 cutover: with compaction.enabled and a normal (non-dry-run)
+        // cycle, the SAL pass is the LIVE consolidator — it summarises, writes
+        // the [consolidated] row, hard-deletes the sources, and FOLDS its counts
+        // into report.autonomy so the self-report is accurate.
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
@@ -2476,33 +2521,85 @@ mod consolidation_shadow_tests_1738 {
                 enabled: true,
                 ..Default::default()
             },
-            ..Default::default()
+            ..Default::default() // dry_run = false → real consolidation
         };
         let llm = CountingStubLlm {
             summarize_calls: Mutex::new(0),
         };
         let mut report = CuratorReport::new(false);
-        run_consolidation_shadow_pass(&conn, &candidates, &cfg, &llm, &mut report);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
 
         assert!(
             report.compaction_pass_clusters_eligible >= 1,
-            "the dup cluster should be reported eligible"
+            "the dup cluster should be eligible"
+        );
+        // Counts folded into report.autonomy (self-report parity).
+        assert_eq!(
+            report.autonomy.memories_consolidated, 2,
+            "both sources folded into report.autonomy"
+        );
+        assert!(report.autonomy.clusters_formed >= 1);
+        assert_eq!(
+            report.autonomy.rollback_entries_written, 1,
+            "one operator-reversible rollback entry persisted (#1745)"
+        );
+        assert!(
+            *llm.summarize_calls.lock().unwrap() >= 1,
+            "real mode summarises via the LLM"
+        );
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert!(
+            rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+            "the live pass writes a consolidated row"
+        );
+        // Source label byte-continuity with the autonomy path (#1746).
+        let consolidated = rows
+            .iter()
+            .find(|m| m.title.starts_with("[consolidated]"))
+            .unwrap();
+        assert_eq!(consolidated.source, crate::autonomy::CURATOR_SOURCE_LABEL);
+    }
+
+    #[test]
+    fn consolidation_pass_dry_run_does_not_write_when_enabled() {
+        // compaction.enabled but a --dry-run cycle: simulate-only, no LLM, no
+        // write — the pass respects cfg.dry_run.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: super::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            dry_run: true,
+            ..Default::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(true);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report.compaction_pass_clusters_eligible >= 1,
+            "eligible counted"
+        );
+        assert_eq!(
+            report.autonomy.memories_consolidated, 0,
+            "dry-run writes nothing"
         );
         assert_eq!(
             *llm.summarize_calls.lock().unwrap(),
             0,
-            "the shadow pass is dry-run and must not call the LLM"
+            "dry-run skips the LLM"
         );
         let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
-        assert!(
-            !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
-            "the shadow pass must not write a consolidated row"
-        );
         assert_eq!(rows.len(), 2, "both source rows remain live");
     }
 
     #[test]
-    fn shadow_is_noop_when_compaction_disabled() {
+    fn consolidation_pass_noop_when_compaction_disabled() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let conn = db::open(tmp.path()).unwrap();
         let candidates = seed(&conn);
@@ -2512,12 +2609,13 @@ mod consolidation_shadow_tests_1738 {
             summarize_calls: Mutex::new(0),
         };
         let mut report = CuratorReport::new(false);
-        run_consolidation_shadow_pass(&conn, &candidates, &cfg, &llm, &mut report);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
 
         assert_eq!(
             report.compaction_pass_clusters_eligible, 0,
-            "disabled compaction must not run the shadow pass"
+            "disabled compaction must not run the pass"
         );
+        assert_eq!(report.autonomy.memories_consolidated, 0);
         assert!(
             report.errors.is_empty(),
             "no errors expected: {:?}",

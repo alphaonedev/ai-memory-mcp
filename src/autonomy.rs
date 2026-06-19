@@ -43,7 +43,12 @@ use crate::models::{Memory, Tier};
 
 /// Source label stamped on memories the autonomy curator writes
 /// (one spelling across the three write paths — #1558).
-const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
+// Shared `source` label for curator-written consolidation + rollback rows.
+// `pub(crate)` so the SAL `ConsolidationPass` (#1746 cutover) stamps the SAME
+// value on consolidated rows — preserving byte-continuity of the `source`
+// column across the autonomy→SAL cutover (the "(autonomy)" suffix is historical
+// and kept stable deliberately; it denotes the curator, not the internal pass).
+pub(crate) const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
@@ -172,6 +177,13 @@ pub struct AutonomyPassReport {
 /// consolidate → forget superseded → priority feedback → record
 /// rollback log → write self-report. `dry_run` suppresses all writes.
 ///
+/// `skip_consolidation` suppresses **Pass 1 only** (forget-superseded +
+/// priority-feedback still run). Set by the curator when the SAL
+/// `ConsolidationPass` owns consolidation (`compaction.enabled`, #1746
+/// cutover) so the corpus is never consolidated twice in one cycle. The two
+/// consolidators are mutually exclusive, driven from a single
+/// `compaction.enabled` predicate in `curator::run_once`.
+///
 /// Returns an `AutonomyPassReport` rather than `Result<…>` because
 /// per-pass errors are already aggregated into `report.errors`;
 /// the function itself cannot fail at the outer level.
@@ -180,26 +192,31 @@ pub fn run_autonomy_passes(
     llm: &dyn AutonomyLlm,
     candidates: &[Memory],
     dry_run: bool,
+    skip_consolidation: bool,
 ) -> AutonomyPassReport {
     let mut report = AutonomyPassReport::default();
 
-    // Pass 1 — consolidation.
-    let clusters = find_consolidation_clusters(conn, candidates);
-    report.clusters_formed = clusters.len();
-    for cluster in clusters {
-        match consolidate_cluster(conn, llm, &cluster, dry_run) {
-            Ok(Some(entry)) => {
-                if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report.errors.push(rollback_log_write_failed(&e));
-                } else {
-                    report.rollback_entries_written += 1;
+    // Pass 1 — consolidation. Skipped when the SAL ConsolidationPass owns
+    // consolidation (#1746); the curator folds that pass's counts into this
+    // report so the self-report stays accurate.
+    if !skip_consolidation {
+        let clusters = find_consolidation_clusters(conn, candidates);
+        report.clusters_formed = clusters.len();
+        for cluster in clusters {
+            match consolidate_cluster(conn, llm, &cluster, dry_run) {
+                Ok(Some(entry)) => {
+                    if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
+                        report.errors.push(rollback_log_write_failed(&e));
+                    } else {
+                        report.rollback_entries_written += 1;
+                    }
+                    if let RollbackEntry::Consolidate { originals, .. } = entry {
+                        report.memories_consolidated += originals.len();
+                    }
                 }
-                if let RollbackEntry::Consolidate { originals, .. } = entry {
-                    report.memories_consolidated += originals.len();
-                }
+                Ok(None) => {}
+                Err(e) => report.errors.push(format!("consolidate failed: {e}")),
             }
-            Ok(None) => {}
-            Err(e) => report.errors.push(format!("consolidate failed: {e}")),
         }
     }
 
@@ -259,7 +276,10 @@ pub fn run_autonomy_passes(
 /// available. The function never errors on a DB read miss; it
 /// silently degrades to Jaccard so a partial-coverage corpus (some
 /// embedded, some not) still clusters productively.
-fn find_consolidation_clusters(conn: &Connection, candidates: &[Memory]) -> Vec<Vec<Memory>> {
+pub(crate) fn find_consolidation_clusters(
+    conn: &Connection,
+    candidates: &[Memory],
+) -> Vec<Vec<Memory>> {
     // Group by namespace first — we never merge across namespaces.
     let mut by_ns: std::collections::HashMap<&str, Vec<&Memory>> = std::collections::HashMap::new();
     for m in candidates {
@@ -1222,7 +1242,7 @@ mod tests {
             m_old.clone(),
             m_new.clone(),
         ];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Consolidated at least once (deploy cluster).
         assert!(report.clusters_formed >= 1);
@@ -1305,7 +1325,7 @@ mod tests {
         let llm = StubLlm::new("LLM-generated consolidated summary");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Key assertions: LLM was used (clusters formed and consolidation happened)
         assert!(report.clusters_formed > 0);
@@ -1336,7 +1356,7 @@ mod tests {
         let llm = StubLlm::new("mock summary result");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Report should reflect successful cycle
         assert_eq!(report.errors.len(), 0, "autonomy cycle should not error");
@@ -1463,7 +1483,7 @@ mod tests {
 
         let llm = StubLlm::new("consolidated");
         let candidates = vec![a, b];
-        let _report = run_autonomy_passes(&conn, &llm, &candidates, true);
+        let _report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
 
         let final_count = db::list(
             &conn,
@@ -1493,7 +1513,7 @@ mod tests {
         let mem = sample_mem("id", "ns", "Title", "content", Tier::Mid);
         let llm = StubLlm::new("summary");
         let candidates = vec![mem];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // At minimum, report structure should be valid
         assert!(report.clusters_formed > 0 || report.clusters_formed == 0);
@@ -1759,7 +1779,7 @@ mod tests {
         assert!(db::get(&conn, "mold").unwrap().is_some());
 
         let llm = StubLlm::new("dry-run summary");
-        let report = run_autonomy_passes(&conn, &llm, &candidates, true);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
 
         // Report still reflects the would-be actions.
         assert!(report.clusters_formed >= 1);

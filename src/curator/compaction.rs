@@ -15,10 +15,13 @@
 //! deterministically by injecting vectors. Thresholds/cap are pinned equal to
 //! autonomy's `CONSOLIDATE_*` by the `constants_match_autonomy` test.
 //!
-//! Status: wired as a gated, observe-only dry-run shadow (#1738) + Stage-6
-//! rollback (#1739). Flipping it to the *live* consolidator (replacing the
-//! autonomy Pass-1 when `compaction.enabled`) is the separate slice-3b cutover;
-//! clustering parity (this module, #1741) is its prerequisite.
+//! Status: the LIVE consolidator (#1746 cutover). When `compaction.enabled`,
+//! `curator::run_once` suppresses autonomy Pass-1 and runs this pass for real
+//! (respecting `cfg.dry_run`), folding its counts into the cycle's autonomy
+//! report. Prereqs landed: clustering parity (#1741), stored-embedding source
+//! parity (#1743), operator-reversible rollback parity (#1745). Default
+//! `compaction.enabled = false` → autonomy Pass-1 still does consolidation and
+//! this pass is a no-op (production byte-unchanged).
 //!
 //! ## Hook events
 //!
@@ -28,9 +31,10 @@
 //!   the cluster is processed.  Deny aborts the cluster (no summary, no
 //!   persist, no verify).
 //! * `HookEvent::OnCompactionRollback` — notify-only (return value
-//!   ignored beyond logging), fired when the verify step fails.
-//!   **Rollback itself is not implemented yet** (deferred to v0.8.0
-//!   Pillar 2.5 — issue #664).
+//!   ignored beyond logging), fired when the verify step fails. The
+//!   Stage-6 auto-rollback restores the pre-merge sources and removes the
+//!   unverifiable summary (#664); on the verified happy path an
+//!   operator-reversible `RollbackEntry::Consolidate` is persisted (#1745).
 //!
 //! ## Visibility contract (R7)
 //!
@@ -72,11 +76,10 @@ const CONSOLIDATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 /// Compaction pass that consolidates near-duplicate memories into a single
 /// canonical memory via LLM summarisation.
 ///
-/// Implements [`CompactionPass`].  Wired into the curator's autonomy loop
-/// by `crate::curator::mod.rs`.
-// L1-7 minimum slice: struct is defined but the call-site wiring (autonomy
-// loop integration) ships in L2-1.  Allow dead_code until then.
-#[allow(dead_code)]
+/// Implements [`CompactionPass`].  The LIVE consolidator (#1746) — wired into
+/// the curator cycle by `crate::curator::run_consolidation_pass`, which runs it
+/// for real when `compaction.enabled` (autonomy Pass-1 suppressed).
+#[allow(dead_code)] // some accessors are exercised only by unit tests
 #[cfg(feature = "sal")]
 pub(crate) struct ConsolidationPass<'a> {
     /// SAL store handle for reads and writes. Works against the SQLite
@@ -98,11 +101,11 @@ pub(crate) struct ConsolidationPass<'a> {
 
 /// Structured outcome of one [`ConsolidationPass::run`] sweep.
 ///
-/// Aggregated into the curator cycle's `CuratorReport`. In the slice-1
-/// shadow wiring (#1738) the pass runs `dry_run = true`, so
-/// `eligible_clusters` carries the observability signal (how many clusters
-/// the SAL pass *would* consolidate) while `memories_consolidated` stays 0
-/// — the real persist + the autonomy-Pass-1 cutover land in slice-3.
+/// Aggregated into the curator cycle's `CuratorReport`. Post-#1746 cutover the
+/// pass runs live (`dry_run = cfg.dry_run`): `eligible_clusters` counts the
+/// clusters acted on and `memories_consolidated` the sources folded in. On a
+/// `--dry-run` cycle the sweep stops after eligibility, so `memories_consolidated`
+/// stays 0 while `eligible_clusters` still reports what *would* consolidate.
 #[cfg(feature = "sal")]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ConsolidationRunReport {
@@ -112,7 +115,7 @@ pub(crate) struct ConsolidationRunReport {
     /// pass would (dry-run) or did (real) act on.
     pub(crate) eligible_clusters: usize,
     /// Source memories actually folded into a consolidated summary. Always
-    /// 0 under `dry_run` (slice-1 shadow).
+    /// 0 under `dry_run`.
     pub(crate) memories_consolidated: usize,
     /// Operator-reversible `RollbackEntry::Consolidate` rows persisted to
     /// `_curator/rollback` (#1745) — one per verified consolidation, so
@@ -127,16 +130,13 @@ pub(crate) struct ConsolidationRunReport {
     pub(crate) errors: Vec<String>,
 }
 
-// L1-7 minimum slice: the struct + its methods are defined but the
-// autonomy-loop call-site wiring is still pending (the live daemon
-// consolidation currently routes through `autonomy::run_autonomy_passes`).
-// `ConsolidationPass` is exercised by the unit tests in this file + the gated
-// dry-run shadow (#1738); the `dead_code` allow keeps the not-yet-live-path
-// methods (real persist / verify reached only when `compaction.enabled`) quiet.
+// The LIVE consolidator (#1746): `run` is driven in production by
+// `curator::run_consolidation_pass` when `compaction.enabled`. The `dead_code`
+// allow remains because a few accessors are reached only from this file's unit
+// tests, not the production path.
 #[cfg(feature = "sal")]
 #[allow(dead_code)]
 impl<'a> ConsolidationPass<'a> {
-    // L1-7: constructor defined here; call-site wiring ships in L2-1.
     #[allow(dead_code)]
     pub(crate) fn new(store: &'a dyn MemoryStore, llm: &'a dyn AutonomyLlm, dry_run: bool) -> Self {
         Self {
@@ -233,7 +233,10 @@ impl<'a> ConsolidationPass<'a> {
             tags: vec![],
             priority,
             confidence: 1.0,
-            source: "ai-memory curator (compaction)".to_string(),
+            // #1746: stamp the SAME source as the autonomy Pass-1 path so the
+            // consolidated row's `source` column is byte-identical across the
+            // cutover (the SAL pass replaces autonomy Pass-1, not a new author).
+            source: crate::autonomy::CURATOR_SOURCE_LABEL.to_string(),
             access_count: 0,
             created_at: now.clone(),
             updated_at: now,
@@ -319,8 +322,8 @@ impl<'a> ConsolidationPass<'a> {
 
     /// Verify the consolidated summary is readable from the store.
     ///
-    /// A failure here is logged but does NOT trigger rollback — that is
-    /// deferred to v0.8.0 Pillar 2.5 (issue #664).
+    /// Returns `Err` on failure; the caller ([`Self::run`]) translates that
+    /// into the Stage-6 auto-rollback (#664) — `verify` itself does not mutate.
     async fn verify(&self, summary_id: MemoryId) -> Result<()> {
         match self.store.get(&self.ctx, &summary_id).await {
             Ok(_) => Ok(()),
@@ -337,16 +340,15 @@ impl<'a> ConsolidationPass<'a> {
     /// → `verify`. Returns a [`ConsolidationRunReport`]; per-cluster
     /// failures are recorded in `report.errors` and never abort the sweep.
     ///
-    /// **Dry-run (slice-1 shadow, #1738):** when `self.dry_run` is set the
-    /// sweep stops after `eligible` — it counts what it *would* consolidate
+    /// **Dry-run (`self.dry_run`, a `--dry-run` curator cycle):** the sweep
+    /// stops after `eligible` — it counts what it *would* consolidate
     /// (`eligible_clusters`) without any LLM summarise, DB write, or verify.
-    /// This is how the curator wires the pass in as an observe-only shadow
-    /// that does not double-consolidate against the live autonomy Pass-1.
     ///
-    /// **Real mode (slice-3 cutover):** summarise → persist → verify run.
-    /// On a `verify` failure the notify-only `OnCompactionRollback` signal
-    /// is logged (rollback itself is deferred to #664 — slice-2); the
-    /// cluster is skipped and the sweep continues.
+    /// **Real mode (#1746 — the live consolidator):** summarise → persist →
+    /// verify → persist operator-reversible rollback (#1745). On a `verify`
+    /// failure the Stage-6 auto-rollback (#664) restores the sources, removes
+    /// the unverifiable summary, fires the notify-only `OnCompactionRollback`,
+    /// and the sweep continues (no rollback entry is left for that cluster).
     pub(crate) async fn run(&self, candidates: &[Memory]) -> Result<ConsolidationRunReport> {
         let mut report = ConsolidationRunReport::default();
 
@@ -850,7 +852,8 @@ mod tests {
             assert_eq!(summary.content, "synthesised summary");
             assert_eq!(summary.tier, Tier::Long); // max
             assert_eq!(summary.priority, 7); // max
-            assert_eq!(summary.source, "ai-memory curator (compaction)");
+            // #1746: source held byte-stable with the autonomy path across cutover.
+            assert_eq!(summary.source, crate::autonomy::CURATOR_SOURCE_LABEL);
         }
 
         #[test]
@@ -1182,6 +1185,90 @@ mod tests {
                 !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "consolidated summary removed by rollback"
             );
+        }
+
+        #[tokio::test]
+        async fn clustering_membership_parity_with_autonomy() {
+            // #1746 equivalence gate: the SAL ConsolidationPass clustering must
+            // produce the SAME cluster membership as the live
+            // autonomy::find_consolidation_clusters on an identical corpus —
+            // multi-namespace + STORED embeddings so the cosine-AND-jaccard path
+            // (not just the jaccard fallback) is exercised. Compared as
+            // sets-of-id-sets because HashMap namespace-iteration order is
+            // non-deterministic (positional compare would flake).
+            use std::collections::BTreeSet;
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+
+            let dup_a = "kubernetes rolling canary deploy strategy notes";
+            let dup_b = "postgres vacuum autovacuum tuning bloat thresholds detail";
+            let a1 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "a",
+                "t1",
+                dup_a,
+                Tier::Mid,
+                5,
+            );
+            let a2 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "a",
+                "t2",
+                dup_a,
+                Tier::Mid,
+                5,
+            );
+            let b1 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "b",
+                "t1",
+                dup_b,
+                Tier::Mid,
+                5,
+            );
+            let b2 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "b",
+                "t2",
+                dup_b,
+                Tier::Mid,
+                5,
+            );
+            for m in [&a1, &a2, &b1, &b2] {
+                crate::db::insert(&conn, m).unwrap();
+            }
+            // Aligned embeddings within each namespace → cosine gate passes.
+            crate::db::set_embedding(&conn, &a1.id, &[1.0, 0.0]).unwrap();
+            crate::db::set_embedding(&conn, &a2.id, &[1.0, 0.0]).unwrap();
+            crate::db::set_embedding(&conn, &b1.id, &[0.0, 1.0]).unwrap();
+            crate::db::set_embedding(&conn, &b2.id, &[0.0, 1.0]).unwrap();
+
+            let cands = vec![a1, a2, b1, b2];
+
+            // Autonomy side (sync) → set of id-sets.
+            let autonomy_sets: BTreeSet<BTreeSet<String>> =
+                crate::autonomy::find_consolidation_clusters(&conn, &cands)
+                    .iter()
+                    .map(|c| c.iter().map(|m| m.id.clone()).collect())
+                    .collect();
+
+            // SAL side (async) → set of id-sets.
+            let llm = StubLlm::new("S");
+            let pass = ConsolidationPass::new(&store, &llm, true);
+            let sal_sets: BTreeSet<BTreeSet<String>> = pass
+                .cluster(&cands)
+                .await
+                .iter()
+                .map(|c| c.iter().cloned().collect())
+                .collect();
+
+            assert_eq!(
+                autonomy_sets, sal_sets,
+                "SAL clustering membership must match autonomy::find_consolidation_clusters"
+            );
+            // Sanity: each namespace formed its own 2-member cluster.
+            assert_eq!(autonomy_sets.len(), 2, "two namespaces → two clusters");
+            assert!(autonomy_sets.iter().all(|s| s.len() == 2));
         }
 
         // ---- Stage-6 rollback (#664, slice-2) -------------------------------
