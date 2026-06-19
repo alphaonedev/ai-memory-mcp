@@ -116,6 +116,9 @@ pub(crate) struct ConsolidationRunReport {
     /// Source memories actually folded into a consolidated summary. Always
     /// 0 under `dry_run` (slice-1 shadow).
     pub(crate) memories_consolidated: usize,
+    /// Clusters rolled back after a failed `verify` (Stage-6, #664): the
+    /// pre-merge sources were restored and the unverifiable summary removed.
+    pub(crate) rolled_back: usize,
     /// Per-cluster errors (summarise / persist / verify). Best-effort: one
     /// cluster failing does not abort the sweep.
     pub(crate) errors: Vec<String>,
@@ -360,24 +363,88 @@ impl<'a> ConsolidationPass<'a> {
                 }
             };
             if let Err(e) = self.verify(new_id.clone()).await {
-                // Notify-only `OnCompactionRollback`: rollback itself is
-                // deferred to #664 (slice-2). Log + record, keep sweeping.
+                // Stage-6 rollback (#664): the consolidate already removed the
+                // source rows and wrote an unverifiable summary. Restore the
+                // cluster from the in-memory pre-merge snapshots and remove the
+                // bad summary. Fires the notify-only `OnCompactionRollback`.
+                let restored = match self.rollback_consolidation(&members, &new_id).await {
+                    Ok(n) => n,
+                    Err(re) => {
+                        report
+                            .errors
+                            .push(format!("{}: rollback failed: {re}", self.name()));
+                        0
+                    }
+                };
+                if restored > 0 {
+                    report.rolled_back += 1;
+                }
                 tracing::warn!(
                     target: "curator::compaction",
                     pass = self.name(),
                     summary_id = %new_id,
+                    restored,
                     error = %e,
-                    "consolidation verify failed (rollback deferred to #664)"
+                    "consolidation verify failed — rolled back (Stage-6, #664)"
                 );
-                report
-                    .errors
-                    .push(format!("{}: verify failed: {e}", self.name()));
+                report.errors.push(format!(
+                    "{}: verify failed (rolled back {restored}): {e}",
+                    self.name()
+                ));
                 continue;
             }
             report.memories_consolidated += members.len();
         }
 
         Ok(report)
+    }
+
+    /// Stage-6 rollback (#664): restore a consolidated cluster after a failed
+    /// `verify`. Re-inserts the pre-merge `originals` (snapshots already in
+    /// memory; the SAL `store` write preserves their ids) THEN deletes the
+    /// unverifiable `result_id` — restore-FIRST so a crash mid-rollback leaves
+    /// a recoverable over-retention (both live), never data loss. Each original
+    /// is collision-guarded: if a *different* id now occupies its
+    /// `(title, namespace)` slot it is skipped + warned (mirrors
+    /// `autonomy::check_no_collision`). Backend-agnostic — uses only the
+    /// existing `find_by_title_namespace` / `store` / `delete` trait ops.
+    /// Returns the number of originals restored.
+    async fn rollback_consolidation(&self, originals: &[Memory], result_id: &str) -> Result<usize> {
+        let mut restored = 0usize;
+        for m in originals {
+            // Collision guard: do not clobber a different memory that took the
+            // (title, namespace) slot after the sources were consolidated away.
+            match self
+                .store
+                .find_by_title_namespace(&m.title, &m.namespace)
+                .await
+            {
+                Ok(Some(existing_id)) if existing_id != m.id => {
+                    tracing::warn!(
+                        target: "curator::compaction",
+                        title = %m.title,
+                        namespace = %m.namespace,
+                        occupant = %existing_id,
+                        original = %m.id,
+                        "rollback: (title, namespace) slot taken by a different id — skipping restore"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
+            self.store
+                .store(&self.ctx, m)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            restored += 1;
+        }
+        // Remove the unverifiable summary only after the originals are back.
+        self.store
+            .delete(&self.ctx, result_id)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(restored)
     }
 }
 
@@ -981,6 +1048,91 @@ mod tests {
                 rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "a consolidated row must exist"
             );
+        }
+
+        // ---- Stage-6 rollback (#664, slice-2) -------------------------------
+
+        #[tokio::test]
+        async fn rollback_consolidation_restores_originals_and_deletes_result() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+            let pass = ConsolidationPass::new(&store, &llm, None, false);
+
+            // Consolidate for real: sources removed, result minted.
+            let summary = pass.summarize(&candidates).unwrap();
+            let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            let result_id = pass.persist(&summary, &ids).await.unwrap();
+            assert!(crate::db::get(&conn, &result_id).unwrap().is_some());
+            for m in &candidates {
+                assert!(
+                    crate::db::get(&conn, &m.id).unwrap().is_none(),
+                    "source merged away"
+                );
+            }
+
+            // Roll back: originals restored (same ids), result removed.
+            let restored = pass
+                .rollback_consolidation(&candidates, &result_id)
+                .await
+                .unwrap();
+            assert_eq!(restored, 2);
+            for m in &candidates {
+                assert!(
+                    crate::db::get(&conn, &m.id).unwrap().is_some(),
+                    "{} restored",
+                    m.id
+                );
+            }
+            assert!(
+                crate::db::get(&conn, &result_id).unwrap().is_none(),
+                "unverifiable summary removed"
+            );
+        }
+
+        #[tokio::test]
+        async fn rollback_consolidation_skips_collided_slot() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+            let pass = ConsolidationPass::new(&store, &llm, None, false);
+
+            let summary = pass.summarize(&candidates).unwrap();
+            let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();
+            let result_id = pass.persist(&summary, &ids).await.unwrap();
+
+            // A NEW memory squats the first original's (title, namespace) slot.
+            let squatter = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "ns",
+                &candidates[0].title,
+                "squatter content",
+                Tier::Mid,
+                5,
+            );
+            crate::db::insert(&conn, &squatter).unwrap();
+
+            // Roll back: collided original is skipped, the other is restored.
+            let restored = pass
+                .rollback_consolidation(&candidates, &result_id)
+                .await
+                .unwrap();
+            assert_eq!(restored, 1, "only the un-collided original is restored");
+            assert!(
+                crate::db::get(&conn, &candidates[0].id).unwrap().is_none(),
+                "collided original was NOT restored"
+            );
+            assert!(
+                crate::db::get(&conn, &candidates[1].id).unwrap().is_some(),
+                "un-collided original restored"
+            );
+            assert!(
+                crate::db::get(&conn, &squatter.id).unwrap().is_some(),
+                "squatter not clobbered"
+            );
+            assert!(crate::db::get(&conn, &result_id).unwrap().is_none());
         }
     } // mod sal_pass_tests
 }
