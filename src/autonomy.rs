@@ -546,9 +546,21 @@ fn rollback_log_write_failed(e: &dyn std::fmt::Display) -> String {
 }
 
 fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()> {
+    db::insert(conn, &build_rollback_memory(entry)?)?;
+    Ok(())
+}
+
+/// Build the `_curator/rollback` `Memory` row for a [`RollbackEntry`] —
+/// the serialised, operator-reversible snapshot that
+/// [`reverse_rollback_entry`] (and `ai-memory curator --rollback`)
+/// consumes. Extracted so the backend-agnostic SAL `ConsolidationPass`
+/// (#1745) can persist a byte-identical rollback row via
+/// [`crate::store::MemoryStore::store`] instead of a raw `Connection`,
+/// keeping the two consolidation paths' rollback rows interchangeable.
+pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
-    let mem = Memory {
+    Ok(Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: format!("{CURATOR_NAMESPACE}/rollback"),
@@ -583,9 +595,7 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
-    };
-    db::insert(conn, &mem)?;
-    Ok(())
+    })
 }
 
 /// Write the cycle's report as a memory in `_curator/reports/<ts>`
