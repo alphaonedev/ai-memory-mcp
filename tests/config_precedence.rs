@@ -389,6 +389,66 @@ fn test_compaction_enabled_env_overrides_config_and_default() {
 }
 
 // ---------------------------------------------------------------------------
+// #1734 (PE-1) — `[hooks].enforce_mode` precedence:
+//   AI_MEMORY_HOOKS_ENFORCE_MODE env > [hooks].enforce_mode > off.
+//   A valid off/advisory/enforce env token wins; unparseable falls through
+//   to the config field then the compiled default `off`.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_hooks_enforce_mode_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, HooksConfig};
+    use ai_memory::hooks::HookEnforceMode;
+
+    let cfg = |mode: Option<HookEnforceMode>| AppConfig {
+        hooks: Some(HooksConfig {
+            subscription: None,
+            enforce_mode: mode,
+            required_events: None,
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- unset env → config field wins; absent config → off ----
+    let g = EnvVarGuard::remove("AI_MEMORY_HOOKS_ENFORCE_MODE");
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Enforce)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Enforce
+    );
+    assert_eq!(
+        AppConfig::default().resolve_hooks_enforce_mode(),
+        HookEnforceMode::Off,
+        "no env + no config → compiled default off"
+    );
+    drop(g);
+
+    // ---- env wins over config (case-insensitive) ----
+    let g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "ENFORCE".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Off)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Enforce,
+        "env=ENFORCE MUST beat config=off"
+    );
+    drop(g);
+
+    // ---- env=off beats config=enforce ----
+    let g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "off".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Enforce)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Off,
+        "env=off MUST beat config=enforce"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to the config field ----
+    let _g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "loud".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Advisory)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Advisory,
+        "garbage env falls through to config=advisory"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #1750 — `[curator.compaction].cosine_threshold` precedence:
 //   AI_MEMORY_COMPACTION_COSINE_THRESHOLD env > [curator.compaction] > 0.75.
 //   A parseable f32 in (0.0, 1.0] wins; unparseable / out-of-range falls
