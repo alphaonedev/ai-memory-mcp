@@ -3,9 +3,21 @@
 
 //! `ConsolidationPass` — `CompactionPass` impl for memory consolidation.
 //!
-//! This is a regression-free refactor of the v0.6.x consolidation logic
-//! from `crate::autonomy`.  The output is byte-for-byte identical to the
-//! original on matching input; only the code structure changes.
+//! A SAL-trait (`MemoryStore`) consolidator derived from the v0.6.x
+//! `crate::autonomy` consolidation logic. **It is NOT a byte-for-byte
+//! refactor** (#1740): the two clustering implementations diverge when
+//! embeddings are present. `crate::autonomy::find_consolidation_clusters`
+//! applies a Jaccard pre-filter **AND** a cosine gate on DB embeddings to
+//! every candidate pair, whereas this pass's `cluster()` method
+//! uses cosine as the *primary* signal with Jaccard only as a **fallback**
+//! (invoked when the cosine pass yields zero clusters). On the no-embedder
+//! path both reduce to the same Jaccard clustering — identical tokenizer,
+//! threshold (`0.55`), and cap (`8`) — so they agree there; with an embedder
+//! wired in they can produce different merge sets. Reconciling the two so
+//! this pass can *replace* the live autonomy Pass-1 (the Pillar-2.5 slice-3
+//! cutover) is a behavior-affecting change, NOT a pure refactor, and is
+//! tracked separately (#1740). Today the pass is wired only as a gated,
+//! observe-only shadow (#1738) plus Stage-6 rollback (#1739).
 //!
 //! ## Primary / fallback paths
 //!
