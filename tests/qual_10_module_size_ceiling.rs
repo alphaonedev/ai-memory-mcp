@@ -564,7 +564,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // resolve_compaction_enabled ladder arm + the
     // curator_compaction_enabled_resolver_1749 unit test + the two
     // CuratorSection fixture updates (compaction: None) (actual 10_651).
-    ("src/config.rs", 10_700),
+    // 2026-06-19 (#1750 Pillar-2.5) — bumped 10_700 → 10_850: the
+    // CuratorCompactionSection.cosine_threshold field + ENV_COMPACTION_COSINE_THRESHOLD
+    // const + resolve_compaction_cosine_threshold ladder arm + the
+    // curator_compaction_cosine_threshold_resolver_1750 unit test + the three
+    // resolver-test fixture updates (cosine_threshold: None) (actual 10_754).
+    ("src/config.rs", 10_850),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

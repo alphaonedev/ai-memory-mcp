@@ -451,6 +451,21 @@ fn run_size_gc_pass(
     cfg: &CuratorConfig,
     report: &mut CuratorReport,
 ) {
+    // #1750 (Pillar-2.5) — DEFENSIVE GATE: size-GC byte-cap eviction is a
+    // hard-DELETE pass (archive-before-delete, restorable) DISTINCT from
+    // consolidation. It must never arm decoupled from the operator's
+    // compaction opt-in: the #1749 5-agent vote (memory `1817bc8f`) flagged the
+    // `max_corpus_bytes.is_some()`-only gate as a hazard — an operator setting
+    // only a byte cap would silently activate a second deletion pass. We
+    // additionally require `compaction.enabled`. `max_corpus_bytes` stays OUT of
+    // operator config this slice (always compiled-default `None` → still inert
+    // in production); this gate is future-proofing. FORWARD-CONSTRAINT (#1750
+    // vote `a9b2fe09`): if `max_corpus_bytes` is ever exposed, it must get its
+    // own dedicated `[curator.size_gc].enabled` switch — NOT ride under
+    // `[curator.compaction]` — and this gate switches to that flag.
+    if !cfg.compaction.enabled {
+        return;
+    }
     let Some(cap) = cfg.compaction.max_corpus_bytes else {
         return;
     };
@@ -539,7 +554,9 @@ fn run_consolidation_pass(
         &store,
         llm,
         /* dry_run = */ cfg.dry_run,
-    );
+    )
+    // #1750 — thread the operator-resolved cosine gate into the clusterer.
+    .with_cosine_threshold(cfg.compaction.cosine_threshold);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1884,6 +1901,8 @@ mod tests {
         let cfg = CuratorConfig {
             include_namespaces: vec!["sgc-ns".to_string()],
             compaction: CompactionConfig {
+                // #1750 — size-GC now additionally requires `enabled`.
+                enabled: true,
                 max_corpus_bytes: Some(1500),
                 ..CompactionConfig::default()
             },
@@ -1936,6 +1955,9 @@ mod tests {
             dry_run: true,
             include_namespaces: vec!["sgc-ns".to_string()],
             compaction: CompactionConfig {
+                // #1750 — `enabled` set so this test pins the dry_run gate
+                // specifically (not the new enabled gate).
+                enabled: true,
                 max_corpus_bytes: Some(1500),
                 ..CompactionConfig::default()
             },
@@ -1951,6 +1973,38 @@ mod tests {
             db::get(&conn, &high.id).unwrap().is_some(),
             "dry_run keeps high"
         );
+    }
+
+    /// #1750 (Pillar-2.5) — the defensive gate: a byte cap set WITHOUT
+    /// `compaction.enabled` must NOT evict. Pins the hazard the #1749 vote
+    /// (`1817bc8f`) flagged — size-GC can no longer arm decoupled from the
+    /// operator's compaction opt-in.
+    #[test]
+    fn run_once_size_gc_cap_without_enabled_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        // Cap is set, but compaction.enabled stays false (default).
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        assert!(!cfg.compaction.enabled, "guard: enabled is false");
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(
+            report.memories_evicted_size_gc, 0,
+            "cap without enabled = no eviction (defensive gate)"
+        );
+        assert!(db::get(&conn, &low.id).unwrap().is_some(), "low kept");
+        assert!(db::get(&conn, &high.id).unwrap().is_some(), "high kept");
     }
 
     /// A multi-row cycle records multiple `operations_attempted` and the

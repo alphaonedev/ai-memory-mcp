@@ -259,16 +259,19 @@ pub async fn run(
     .await
 }
 
-/// v0.8.0 #1749 — build the curator's [`curator::CompactionConfig`] from
-/// operator config. Only `enabled` is operator-reachable in this slice
-/// (resolved via [`config::AppConfig::resolve_compaction_enabled`]: env >
-/// `[curator.compaction]` > default false); `cosine_threshold` /
-/// `max_corpus_bytes` stay at their compiled defaults (not yet wired —
-/// tracked follow-up). Shared by every production `CuratorConfig` build site so
-/// activation resolves identically across the sqlite + store-backed paths.
+/// v0.8.0 #1749/#1750 — build the curator's [`curator::CompactionConfig`] from
+/// operator config. `enabled` (#1749, env > `[curator.compaction]` > false) and
+/// `cosine_threshold` (#1750, env > config > 0.75 — threaded into the live
+/// clusterer via `ConsolidationPass::with_cosine_threshold`) are
+/// operator-reachable; `max_corpus_bytes` stays at its compiled default (size-GC
+/// eviction is gated on `enabled` and not yet operator-exposed — when it is, it
+/// gets its own `[curator.size_gc]` switch per the #1750 vote `a9b2fe09`).
+/// Shared by every production `CuratorConfig` build site so resolution is
+/// identical across the sqlite + store-backed paths.
 fn curator_compaction_config(app_config: &config::AppConfig) -> curator::CompactionConfig {
     curator::CompactionConfig {
         enabled: app_config.resolve_compaction_enabled(),
+        cosine_threshold: app_config.resolve_compaction_cosine_threshold(),
         ..Default::default()
     }
 }
@@ -536,7 +539,9 @@ async fn store_backed_consolidation_sweep(
         return report;
     }
 
-    let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run);
+    // #1750 — thread the operator-resolved cosine gate into the clusterer.
+    let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run)
+        .with_cosine_threshold(cfg.compaction.cosine_threshold);
     match pass.run(&candidates).await {
         Ok(out) => {
             // Preserve any list/namespace errors gathered above.
