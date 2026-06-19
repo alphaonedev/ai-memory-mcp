@@ -21,6 +21,26 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1746 (Pillar-2.5 slice-3b2b) — SAL `ConsolidationPass` is the live consolidator (cutover).**
+  When `[curator].compaction.enabled` (default `false` → byte-unchanged), `curator::run_once`
+  now makes the backend-agnostic SAL `ConsolidationPass` the live memory-consolidator and
+  suppresses the legacy `autonomy::run_autonomy_passes` Pass-1 (forget-superseded + priority
+  feedback still run). Both are driven from a **single** `compaction.enabled` predicate so they
+  can never double-consolidate or zero-consolidate. The SAL pass's counts fold into the cycle's
+  `report.autonomy.{clusters_formed,memories_consolidated,rollback_entries_written}` so the
+  `_curator/reports` self-report stays accurate, with SAL-specific
+  `compaction_pass_{clusters_eligible,rolled_back}` surfaced on `CuratorReport`. Strengthens the
+  Pillar-2.5 §2.4 *improvable* property (consolidation routes through the unified, backend-agnostic
+  SAL path) while preserving §2.3 *stoppable*/reversible: consolidations remain operator-reversible
+  via `curator --rollback` (rollback parity landed in #1745) and the consolidated row's `source`
+  label is held byte-stable across the cutover. Gated by the mandatory 5-agent crossroads vote
+  (memory `4d3ea1c5`), which re-sequenced the work (#1745 rollback-parity prerequisite first) and
+  confirmed clustering membership parity via a new equivalence test. Code anchors:
+  `src/curator/mod.rs` (`run_once`, `run_consolidation_pass`),
+  `src/autonomy.rs::run_autonomy_passes` (`skip_consolidation`),
+  `src/curator/compaction.rs::ConsolidationPass`. Prereqs: #1741 (clustering parity), #1743
+  (stored-embedding source parity), #1745 (rollback parity). Postgres-curator consolidation
+  parity is tracked as the follow-on slice-3c.
 - **#1735 (Pillar-4 4.C) — staggered AGE cold-path for postgres link writes (opt-in).**
   `AI_MEMORY_AGE_PROJECTION_MODE=deferred` (default `sync` = byte-identical) takes the
   ~6 synchronous Apache-AGE Cypher round-trips (`LOAD age`, `create_graph`, node+edge
