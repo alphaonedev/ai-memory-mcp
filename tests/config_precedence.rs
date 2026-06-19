@@ -329,6 +329,63 @@ fn test_require_agent_attestation_env_parsing() {
 }
 
 // ---------------------------------------------------------------------------
+// #1749 — `[curator.compaction].enabled` precedence:
+//   AI_MEMORY_COMPACTION_ENABLED env > [curator.compaction].enabled > false.
+// An explicit truthy/falsy env wins; any other env string falls through to the
+// config field then to the compiled `false` default (opt-in posture).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_compaction_enabled_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, CuratorCompactionSection, CuratorSection};
+
+    let cfg = |enabled: Option<bool>| AppConfig {
+        curator: Some(CuratorSection {
+            reflection_namespaces: None,
+            confidence_decay_half_life_days: None,
+            compaction: Some(CuratorCompactionSection { enabled }),
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- unset env → config field wins; absent config → false ----
+    let g = EnvVarGuard::remove("AI_MEMORY_COMPACTION_ENABLED");
+    assert!(cfg(Some(true)).resolve_compaction_enabled());
+    assert!(!cfg(Some(false)).resolve_compaction_enabled());
+    assert!(
+        !AppConfig::default().resolve_compaction_enabled(),
+        "no env + no config → compiled default false"
+    );
+    drop(g);
+
+    // ---- env=1 overrides [curator.compaction].enabled=false ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "1".to_string());
+    assert!(
+        cfg(Some(false)).resolve_compaction_enabled(),
+        "env=1 MUST beat config=false"
+    );
+    drop(g);
+
+    // ---- env=false overrides config=true (case-insensitive) ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "FALSE".to_string());
+    assert!(
+        !cfg(Some(true)).resolve_compaction_enabled(),
+        "env=FALSE MUST beat config=true"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to the config field ----
+    let _g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "maybe".to_string());
+    assert!(
+        cfg(Some(true)).resolve_compaction_enabled(),
+        "garbage env falls through to config=true"
+    );
+    assert!(
+        !cfg(Some(false)).resolve_compaction_enabled(),
+        "garbage env falls through to config=false"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. [limits] knobs — AI_MEMORY_MAX_* env vars override the `[limits]`
 //    config section, which overrides the compiled defaults.
 // ---------------------------------------------------------------------------

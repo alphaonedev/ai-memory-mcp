@@ -204,7 +204,7 @@ pub async fn run(
         dry_run: args.dry_run,
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
-        compaction: curator::CompactionConfig::default(),
+        compaction: curator_compaction_config(app_config),
     };
 
     let feature_tier = app_config.effective_tier(None);
@@ -242,10 +242,27 @@ pub async fn run(
         args.dry_run,
         args.include_namespaces.clone(),
         args.exclude_namespaces.clone(),
+        // #1749 — resolve compaction.enabled here (the daemon body has no
+        // AppConfig in scope) and thread it as a primitive.
+        app_config.resolve_compaction_enabled(),
         llm.map(std::sync::Arc::new),
         shutdown,
     )
     .await
+}
+
+/// v0.8.0 #1749 — build the curator's [`curator::CompactionConfig`] from
+/// operator config. Only `enabled` is operator-reachable in this slice
+/// (resolved via [`config::AppConfig::resolve_compaction_enabled`]: env >
+/// `[curator.compaction]` > default false); `cosine_threshold` /
+/// `max_corpus_bytes` stay at their compiled defaults (not yet wired —
+/// tracked follow-up). Shared by every production `CuratorConfig` build site so
+/// activation resolves identically across the sqlite + store-backed paths.
+fn curator_compaction_config(app_config: &config::AppConfig) -> curator::CompactionConfig {
+    curator::CompactionConfig {
+        enabled: app_config.resolve_compaction_enabled(),
+        ..Default::default()
+    }
 }
 
 /// v0.7.0 #1548 — resolve the operator-supplied `--store-url` flag in
@@ -297,15 +314,16 @@ async fn run_store_backed_sweep(
     let llm = build_curator_llm(feature_tier);
 
     // v0.8.0 Pillar-2.5 slice-3c1 (#1747) — config for the store-backed
-    // consolidation sweep. `compaction.enabled` defaults false (no-op) until the
-    // operator config wire-up lands; the gate mirrors the sqlite `run_once` path.
+    // consolidation sweep. `compaction.enabled` resolved from operator config
+    // (#1749, env > [curator.compaction] > default false); the gate mirrors the
+    // sqlite `run_once` path.
     let curator_cfg = curator::CuratorConfig {
         interval_secs: args.interval_secs,
         max_ops_per_cycle: args.max_ops,
         dry_run: args.dry_run,
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
-        compaction: curator::CompactionConfig::default(),
+        compaction: curator_compaction_config(app_config),
     };
     // A remote (postgres) store-url means rollback rows the pass writes are not
     // reachable by the rusqlite-bound `curator --rollback` yet (#1748).
@@ -474,8 +492,11 @@ async fn store_backed_consolidation_sweep(
     if store_is_remote {
         tracing::warn!(
             target: curator::compaction::COMPACTION_TRACE_TARGET,
-            "compaction.enabled on a store-url backend: consolidations are NOT yet \
-             reversible via `ai-memory curator --rollback` on this backend (see #1748)"
+            "compaction.enabled on a store-url (postgres) backend: consolidation \
+             HARD-DELETEs the merged source memories, and that delete is NOT yet \
+             reversible via `ai-memory curator --rollback` on this backend (the \
+             reversal path is rusqlite-bound; see #1748). The reversible rollback \
+             rows ARE written and will become reversible once #1748 lands."
         );
     }
 

@@ -3525,6 +3525,36 @@ pub struct CuratorSection {
     /// (`AI_MEMORY_CONFIDENCE_DECAY=1`).
     #[serde(default)]
     pub confidence_decay_half_life_days: Option<std::collections::HashMap<String, f64>>,
+
+    /// #1749 — `[curator.compaction]` activation for the Pillar-2.5
+    /// consolidation pass. See [`CuratorCompactionSection`].
+    #[serde(default)]
+    pub compaction: Option<CuratorCompactionSection>,
+}
+
+/// v0.8.0 #1749 — `[curator.compaction]` activation knobs for the Pillar-2.5
+/// consolidation pass (`crate::curator::compaction::ConsolidationPass`).
+///
+/// ```toml
+/// [curator.compaction]
+/// enabled = true
+/// ```
+///
+/// Only `enabled` is operator-reachable in this slice. Setting it `true` makes
+/// the curator run the SAL `ConsolidationPass` as the LIVE consolidator
+/// (suppressing the legacy autonomy Pass-1) — a hard-DELETE merge of
+/// near-duplicate memories. Default `false` (opt-in). Consolidations are
+/// operator-reversible via `ai-memory curator --rollback` on **sqlite** (#1745);
+/// on **postgres** that reversal is not yet wired (#1748) and the curator emits
+/// a runtime WARN. The clustering `cosine_threshold` + size-GC
+/// `max_corpus_bytes` knobs are intentionally NOT exposed here yet — they need
+/// consumer wiring / independent gating first (tracked follow-up).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CuratorCompactionSection {
+    /// When `true`, the curator runs the SAL `ConsolidationPass` live. Default
+    /// `false`. Env override: `AI_MEMORY_COMPACTION_ENABLED` (see
+    /// [`ENV_COMPACTION_ENABLED`]).
+    pub enabled: Option<bool>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -4112,6 +4142,11 @@ pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
 /// [`crate::reranker::RerankerScoreFloor::Off`]). Unparseable values
 /// fall through to the next layer.
 pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
+
+/// v0.8.0 #1749 — env override for `[curator.compaction].enabled`. Truthy
+/// (`1`/`true`) or falsy (`0`/`false`) wins over config; anything else falls
+/// through to the config field then the compiled default `false`.
+pub const ENV_COMPACTION_ENABLED: &str = "AI_MEMORY_COMPACTION_ENABLED";
 
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
@@ -6865,6 +6900,33 @@ impl AppConfig {
             max_seq_tokens,
             source,
         }
+    }
+
+    /// v0.8.0 #1749 — resolve whether the curator runs Pillar-2.5 consolidation
+    /// (the SAL `ConsolidationPass`) as the live consolidator. Uniform ladder:
+    /// `AI_MEMORY_COMPACTION_ENABLED` env > `[curator.compaction].enabled`
+    /// config > compiled default `false`. An explicit truthy/falsy env value
+    /// wins; any other env string falls through to the config field, then to the
+    /// safe `false` default. Default-false is the opt-in posture — enabling this
+    /// activates a hard-DELETE merge of near-duplicate memories (reversible via
+    /// `curator --rollback` on sqlite; postgres reversal is #1748).
+    #[must_use]
+    pub fn resolve_compaction_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var(ENV_COMPACTION_ENABLED) {
+            let t = v.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") {
+                return true;
+            }
+            if t == "0" || t.eq_ignore_ascii_case("false") {
+                return false;
+            }
+            // Any other value: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.compaction.as_ref())
+            .and_then(|c| c.enabled)
+            .unwrap_or(false)
     }
 
     /// #1691/n14 — resolve the recall-reranker score floor. Uniform
@@ -10335,6 +10397,7 @@ max_page_size = 1000000
             curator: Some(CuratorSection {
                 reflection_namespaces: Some(ns_map),
                 confidence_decay_half_life_days: None,
+                compaction: None,
             }),
             ..AppConfig::default()
         };
@@ -10372,6 +10435,7 @@ max_page_size = 1000000
             curator: Some(CuratorSection {
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: Some(hl),
+                compaction: None,
             }),
             ..AppConfig::default()
         };
@@ -10394,6 +10458,60 @@ max_page_size = 1000000
         let snap = cfg.confidence_decay_half_life_overrides();
         assert_eq!(snap.len(), 1, "only the finite positive entry survives");
         assert!((snap["team/eng"] - 14.0).abs() < f64::EPSILON);
+    }
+
+    /// #1749 — `[curator.compaction].enabled` config-field resolution (the env
+    /// layer is covered by `tests/config_precedence.rs`). Absent → false;
+    /// explicit true/false honored.
+    #[test]
+    fn curator_compaction_enabled_resolver_1749() {
+        // No config / no env → compiled default false.
+        let bare = AppConfig::default();
+        assert!(
+            !bare.resolve_compaction_enabled(),
+            "default-off opt-in posture"
+        );
+
+        let on = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: Some(true),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            on.resolve_compaction_enabled(),
+            "[curator.compaction].enabled=true"
+        );
+
+        let off = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: Some(false),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(!off.resolve_compaction_enabled(), "explicit false honored");
+
+        // Section present but enabled omitted → false.
+        let omitted = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection { enabled: None }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !omitted.resolve_compaction_enabled(),
+            "omitted enabled → false"
+        );
     }
 
     /// #1604 — rerank sequence-cap ladder: env >
