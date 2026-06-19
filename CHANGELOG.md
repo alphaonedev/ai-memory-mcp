@@ -21,6 +21,22 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1714 (Pillar-1) — MCP `memory_signal_ack` now fires the `PostSignalAck` hook (first MCP hook-event wire-in).**
+  The synchronous MCP stdio dispatch held no `HookChain` handle, so no `HookEvent` fired from MCP-driven
+  coordination operations. This wires the highest-value POST coordination event — `PostSignalAck` — through
+  the existing #1729 `SignalHooks` plumbing to the async hook chain via a best-effort observer
+  (`hooks::spawn_post_event_observer`, the runtime-independent sibling of `spawn_eviction_observer`: it owns
+  a self-contained current-thread runtime because the MCP loop runs on a `spawn_blocking` thread with no
+  entered runtime). **Inert by default:** the bridge sink is installed only when the operator has configured
+  a `post_signal_ack` `[[hook]]`; with none configured, dispatch is byte-identical to before (no observer
+  thread spawned). **POST-only:** the async observer drains after the op returned, so it cannot carry a
+  pre-event's deny/modify — `pre_signal_send` *enforcement* over MCP needs a synchronous in-dispatch chain
+  and is tracked as #1752. Coordination observability remains durably available regardless via the
+  `signed_events` audit chain (every signal/checkpoint/routine op emits a `coordination.*` row, e.g.
+  `coordination_audit::emit(SIGNAL_ACK, …)`, pinned by `send_emits_signed_events_audit_row_1714`); the hook
+  bridge adds real-time push to operator-configured subscribers. Decision: 5-agent vote (memory `aa50550b`).
+  Code anchors: `src/hooks/chain.rs` (`spawn_post_event_observer`), `src/mcp/mod.rs`
+  (`build_mcp_signal_hooks`, `dispatch_memory_signal_ack`, serve-init wiring in `run_mcp_server`).
 - **#1464 (P0 security) — agent-attestation v0.8 hardening: deprecation WARN for the permissive store default.**
   Post-#626 Layer-3 follow-up. The federation receive-path forge hole (an enrolled peer claiming
   another agent's authorship → wrong quota/ownership) was **already closed** earlier on this branch

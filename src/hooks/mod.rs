@@ -50,6 +50,7 @@ pub mod pre_store;
 // `crate::hooks::config::HookEvent` compatibility alias) resolving.
 pub use chain::{
     AskUserPrompt, ChainResult, HookChain, fire_on_index_eviction, spawn_eviction_observer,
+    spawn_post_event_observer,
 };
 pub use config::{FailMode, HookConfig, HookMode, HooksConfigError};
 pub use events::{EvictionEvent, HookEvent};

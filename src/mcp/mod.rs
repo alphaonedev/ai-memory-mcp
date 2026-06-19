@@ -983,8 +983,8 @@ use action::{
 };
 // v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
 use signal::{
-    handle_signal_ack, handle_signal_inbox, handle_signal_read, handle_signal_send,
-    handle_signal_thread,
+    handle_signal_ack, handle_signal_ack_with_hooks, handle_signal_inbox, handle_signal_read,
+    handle_signal_send, handle_signal_thread,
 };
 // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination handlers.
 use checkpoint::{
@@ -1317,6 +1317,58 @@ fn dispatch_memory_lease_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String>
     handle_lease_get(ctx.conn, ctx.arguments)
 }
 
+// ---------------------------------------------------------------------------
+// #1714 (v0.8.0, P1) — MCP signal-ack → PostSignalAck hook bridge.
+//
+// The synchronous MCP stdio dispatch holds no `HookChain` handle, so no
+// `HookEvent` fired from MCP operations. This wires the highest-value POST
+// coordination event (`PostSignalAck`) through the existing #1729 `SignalHooks`
+// plumbing to the async hook chain via a best-effort observer.
+//
+// INERT BY DEFAULT: the sink is installed by `run_mcp_server` ONLY when the
+// operator has configured a `post_signal_ack` `[[hook]]`. Unset (the default)
+// → `dispatch_memory_signal_ack` fires nothing, byte-identical to pre-#1714.
+// POST-only: `PostSignalAck` is notify-class (the snapshot is read-only); a
+// pre-event's deny/modify cannot ride an async observer (the op already
+// returned) — `pre_signal_send` enforcement over MCP needs a synchronous
+// in-dispatch chain and is tracked separately. Mirrors the serve-init-set /
+// dispatch-read process-global pattern of `COLOR_ENABLED` + `AGE_PROJECTION_MODE`.
+// ---------------------------------------------------------------------------
+
+/// Process-global send-half of the `PostSignalAck` observer bridge (#1714).
+/// `None` until [`run_mcp_server`] installs it for an operator-configured hook.
+static POST_SIGNAL_ACK_SINK: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+> = std::sync::OnceLock::new();
+
+/// #1714 — install the process `PostSignalAck` hook sink (first-writer-wins).
+/// Called once by [`run_mcp_server`] when a `post_signal_ack` hook is configured.
+pub(crate) fn set_post_signal_ack_sink(tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
+    let _ = POST_SIGNAL_ACK_SINK.set(tx);
+}
+
+/// #1714 — build the [`signal::SignalHooks`] bundle for an MCP signal-ack
+/// dispatch. Pure over `sink` so the wiring is unit-testable without the
+/// process global: `Some` installs a best-effort `post_signal_ack` callback
+/// that serializes the read-only `SignalAck` snapshot and forwards it to the
+/// observer bridge (never blocks the stdio loop); `None` yields an empty,
+/// inert bundle.
+fn build_mcp_signal_hooks(
+    sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+) -> signal::SignalHooks<'static> {
+    match sink {
+        Some(tx) => signal::SignalHooks {
+            pre_signal_send: None,
+            post_signal_ack: Some(Box::new(move |ack: &crate::hooks::events::SignalAck| {
+                let payload = serde_json::to_value(ack).unwrap_or(serde_json::Value::Null);
+                // Best-effort: a closed channel (observer thread gone) drops it.
+                let _ = tx.send(payload);
+            })),
+        },
+        None => signal::SignalHooks::empty(),
+    }
+}
+
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_send`. Threads the
 /// active daemon keypair so an outbound signal is `self_signed` when a
 /// signing key is available, `unsigned` otherwise.
@@ -1339,9 +1391,20 @@ fn dispatch_memory_signal_thread(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Str
     handle_signal_thread(ctx.conn, ctx.arguments)
 }
 
-/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_ack`.
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_ack`. #1714 — fires
+/// `PostSignalAck` through the process hook bridge when an operator configured
+/// the hook; inert (empty bundle, identical to `handle_signal_ack`) otherwise.
 fn dispatch_memory_signal_ack(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_signal_ack(ctx.conn, ctx.arguments)
+    // Inert path (no operator hook configured) takes the thin `handle_signal_ack`
+    // — byte-identical to pre-#1714. Only when a sink is installed do we build
+    // the hook bundle and route through the `_with_hooks` variant.
+    match POST_SIGNAL_ACK_SINK.get().cloned() {
+        Some(sink) => {
+            let hooks = build_mcp_signal_hooks(Some(sink));
+            handle_signal_ack_with_hooks(ctx.conn, ctx.arguments, &hooks)
+        }
+        None => handle_signal_ack(ctx.conn, ctx.arguments),
+    }
 }
 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_create`.
@@ -3060,6 +3123,40 @@ pub fn run_mcp_server(
         mcp_hook_conn,
     );
 
+    // #1714 (v0.8.0, P1) — wire the MCP `memory_signal_ack` → `PostSignalAck`
+    // hook bridge. The synchronous stdio dispatch can't `.await` a hook chain,
+    // so a best-effort observer thread (self-contained runtime) drains acks and
+    // fires the chain. INERT BY DEFAULT: load the operator's `[[hook]]` config,
+    // build the `PostSignalAck` chain, and install the sink ONLY when that
+    // chain is non-empty — a deployment with no such hook configured is
+    // byte-identical to pre-#1714. `pre_signal_send` enforcement over MCP needs
+    // a synchronous in-dispatch chain and is tracked separately.
+    {
+        use crate::hooks::{HookChain, HookEvent, config::HookConfig, spawn_post_event_observer};
+        let all_hooks = HookConfig::default_path()
+            .filter(|p| p.exists())
+            .and_then(|p| HookConfig::load_from_file(&p).ok())
+            .unwrap_or_default();
+        let chain = HookChain::for_event(&all_hooks, HookEvent::PostSignalAck);
+        if !chain.hooks().is_empty() {
+            let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
+            let sink = spawn_post_event_observer(
+                std::sync::Arc::new(chain),
+                registry,
+                HookEvent::PostSignalAck,
+            );
+            set_post_signal_ack_sink(sink);
+            eprintln!(
+                "ai-memory: #1714 — MCP PostSignalAck hook bridge installed \
+                 ({} post_signal_ack hook(s))",
+                all_hooks
+                    .iter()
+                    .filter(|h| h.event == HookEvent::PostSignalAck)
+                    .count()
+            );
+        }
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -3600,6 +3697,49 @@ mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
     use serde_json::json;
+
+    /// #1714 — with no sink configured the MCP signal-ack hook bundle is inert
+    /// (empty), so `dispatch_memory_signal_ack` behaves identically to the
+    /// pre-#1714 `handle_signal_ack`. This is the default for every deployment
+    /// without a `post_signal_ack` `[[hook]]`.
+    #[test]
+    fn build_mcp_signal_hooks_inert_without_sink_1714() {
+        let hooks = build_mcp_signal_hooks(None);
+        assert!(
+            hooks.post_signal_ack.is_none(),
+            "no sink → no post_signal_ack callback (inert)"
+        );
+        assert!(hooks.pre_signal_send.is_none(), "bridge is POST-only");
+    }
+
+    /// #1714 — with a sink, the `post_signal_ack` callback serializes the
+    /// read-only `SignalAck` snapshot and forwards it to the observer channel
+    /// (best-effort, non-blocking). Proves the bridge producer end without
+    /// spinning the observer thread or the full serve loop.
+    #[test]
+    fn build_mcp_signal_hooks_forwards_ack_to_sink_1714() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let hooks = build_mcp_signal_hooks(Some(tx));
+        let post = hooks
+            .post_signal_ack
+            .expect("sink → post_signal_ack callback present");
+        let ack = crate::hooks::events::SignalAck {
+            id: "sig-1714".to_string(),
+            namespace: "coord".to_string(),
+            from_agent: "ai:sender".to_string(),
+            to_agent: Some("ai:recipient".to_string()),
+            subject: "deploy-ready".to_string(),
+            signal_type: crate::models::SignalType::Notify,
+            acknowledged_at: 1_700_000_000,
+        };
+        post(&ack);
+        let payload = rx
+            .try_recv()
+            .expect("ack snapshot forwarded to the observer sink");
+        assert_eq!(payload["id"], "sig-1714");
+        assert_eq!(payload["subject"], "deploy-ready");
+        assert_eq!(payload["signal_type"], "notify");
+    }
 
     // ----- issue #965 audit: MCP dispatch has NO Arc<Mutex<Connection>> -----
     //
