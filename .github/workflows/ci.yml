@@ -492,11 +492,15 @@ jobs:
       # `--features sal-postgres` build (sqlx + sqlx-postgres + AGE +
       # pgvector = massive symbol table).
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # Downgrade dev-profile debug info from level 2 (full DWARF)
-      # to level 1 (line tables only). The Postgres feature gate
-      # uses the dev profile via `cargo test`, not the `coverage`
-      # profile, so the env-var override is the cleanest knob.
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      # Drop dev-profile debug info entirely (level 0). The Postgres
+      # feature gate uses the dev profile via `cargo test`, not the
+      # `coverage` profile, so the env-var override is the cleanest knob.
+      # #1744: line-table DWARF on the heavy sal-postgres test binaries
+      # cost GBs of target/ space — enough to exhaust the ~14 GB runner
+      # disk during the test compile ("No space left on device", run
+      # 27818775169). The #1492 hung-test watchdog uses timeout(1), not
+      # symbolized backtraces, so debug info buys nothing here.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     services:
       postgres:
         # pgvector/pgvector:pg16 ships postgres 16 with pgvector already
@@ -573,6 +577,26 @@ jobs:
 
       - name: Clippy (sal-postgres feature, lib + tests)
         run: cargo clippy --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
+
+      - name: Reclaim disk before test compile (#1744)
+        run: |
+          # #1744 — the Clippy step above lands a full sal-postgres debug
+          # build in target/. The test step then compiles the test
+          # binaries on top, and the sum overflowed the ~14 GB runner disk
+          # ("No space left on device", run 27818775169). The one-shot
+          # "Free disk" step runs before Clippy, too early to help the
+          # test-compile peak. Drop the Clippy-only incremental + dep
+          # artifacts here so the test compile starts with headroom; the
+          # crate's own fresh objects rebuild cheaply.
+          echo "::group::disk before reclaim"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+          rm -rf target/debug/incremental || true
+          cargo clean -p ai-memory 2>/dev/null || true
+          echo "::group::disk after reclaim"
+          df -h /
+          echo "::endgroup::"
 
       - name: Run lib + integration tests (sal-postgres feature, impact-aware)
         env:
