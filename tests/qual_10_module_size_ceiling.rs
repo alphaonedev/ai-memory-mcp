@@ -672,7 +672,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // boot-time `set_max_inflight_requests` seeding block next to the
     // existing `set_quota_defaults` seed (admission-control cap resolved
     // from `[limits]`).
-    ("src/daemon_runtime.rs", 8_760),
+    // 2026-06-19 (#1734 PE-1) — bumped 8_760 → 8_820: the serve-boot
+    // mandatory-hook enforcement banner (resolve_hooks_enforce_mode +
+    // resolve_required_events + preflight_report emit, silent when off).
+    ("src/daemon_runtime.rs", 8_820),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

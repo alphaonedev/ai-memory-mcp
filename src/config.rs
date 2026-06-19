@@ -4163,6 +4163,12 @@ pub const ENV_COMPACTION_ENABLED: &str = "AI_MEMORY_COMPACTION_ENABLED";
 /// default (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]).
 pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_THRESHOLD";
 
+/// v0.8.0 #1734 (PE-1) — env override for `[hooks].enforce_mode`. A valid
+/// `off` / `advisory` / `enforce` token (case-insensitive) wins over config;
+/// anything else falls through to the config field then the compiled default
+/// [`crate::hooks::HookEnforceMode::Off`].
+pub const ENV_HOOKS_ENFORCE_MODE: &str = "AI_MEMORY_HOOKS_ENFORCE_MODE";
+
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
 /// in `docs/enterprise-deployment.md §5.6`.
@@ -4480,6 +4486,19 @@ pub struct HooksConfig {
     /// `[hooks.subscription]` sub-block. Optional — when omitted, no
     /// server-wide HMAC override applies.
     pub subscription: Option<HooksSubscriptionConfig>,
+    /// #1734 PE-1 — mandatory-hook presence enforcement mode
+    /// (`off` / `advisory` / `enforce`). Env override:
+    /// `AI_MEMORY_HOOKS_ENFORCE_MODE` (see [`ENV_HOOKS_ENFORCE_MODE`]).
+    /// `None` / omitted → compiled default `off` (byte-identical to today).
+    #[serde(default)]
+    pub enforce_mode: Option<crate::hooks::HookEnforceMode>,
+    /// #1734 PE-1 — events that MUST have an enabled hook present. Default
+    /// EMPTY (an empty set is a hard no-op even under `enforce` — the
+    /// self-DOS guard). Only pre-* mutation / governance events are eligible;
+    /// ineligible entries are dropped with a WARN by
+    /// [`AppConfig::resolve_required_events`].
+    #[serde(default)]
+    pub required_events: Option<Vec<crate::hooks::HookEvent>>,
 }
 
 /// `[hooks.subscription]` sub-block. K7 ships one knob today
@@ -6345,6 +6364,58 @@ impl AppConfig {
         let configured = self.permissions.as_ref().and_then(|p| p.mode);
         let (mode, _warn) = crate::permissions::resolve_v07_default_mode(configured);
         mode
+    }
+
+    /// v0.8.0 #1734 (PE-1) — resolve the mandatory-hook enforcement mode.
+    /// Ladder: `AI_MEMORY_HOOKS_ENFORCE_MODE` env > `[hooks].enforce_mode`
+    /// config > compiled default [`crate::hooks::HookEnforceMode::Off`]. A
+    /// valid `off`/`advisory`/`enforce` env token wins; an unparseable env
+    /// value falls through to the config field then the default. Mirrors
+    /// [`Self::effective_permissions_mode`]. Default `off` makes the presence
+    /// check a no-op (byte-identical to pre-#1734).
+    #[must_use]
+    pub fn resolve_hooks_enforce_mode(&self) -> crate::hooks::HookEnforceMode {
+        use crate::hooks::HookEnforceMode;
+        if let Ok(raw) = std::env::var(ENV_HOOKS_ENFORCE_MODE) {
+            if let Some(m) = HookEnforceMode::from_str_opt(&raw) {
+                return m;
+            }
+            eprintln!(
+                "ai-memory: {ENV_HOOKS_ENFORCE_MODE}={raw:?} is not a valid mode \
+                 (expected off / advisory / enforce); falling back to config.toml"
+            );
+        }
+        self.hooks
+            .as_ref()
+            .and_then(|h| h.enforce_mode)
+            .unwrap_or(HookEnforceMode::Off)
+    }
+
+    /// v0.8.0 #1734 (PE-1) — resolve the declared `[hooks].required_events`
+    /// (config-only; no env surface). Default empty. INELIGIBLE events
+    /// (post-* / `OnIndexEviction`) are dropped with a WARN — only pre-*
+    /// mutation / governance events may be required (a post-event `Deny` is
+    /// log-only, so "required presence" is meaningless there). The boot
+    /// banner + `ai-memory doctor` pre-flight surface the resolved set.
+    #[must_use]
+    pub fn resolve_required_events(&self) -> Vec<crate::hooks::HookEvent> {
+        let raw = self
+            .hooks
+            .as_ref()
+            .and_then(|h| h.required_events.clone())
+            .unwrap_or_default();
+        raw.into_iter()
+            .filter(|e| {
+                let ok = crate::hooks::is_eligible_required_event(*e);
+                if !ok {
+                    eprintln!(
+                        "ai-memory: [hooks].required_events lists ineligible event {e:?} \
+                         (only pre-* mutation/governance events may be required); ignoring it"
+                    );
+                }
+                ok
+            })
+            .collect()
     }
 
     /// v0.7.0 K9 — resolve the effective declarative rule set

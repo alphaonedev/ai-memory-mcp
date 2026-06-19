@@ -21,6 +21,27 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1734 (PE-1) — mandatory-hook *presence* enforcement (required-event → fail-closed).**
+  Per-hook `FailMode::Open|Closed` already fails closed when a configured hook errors/times out, but an
+  **absent or disabled** hook yields an empty `HookChain` whose `fire` returns `Allow` from its terminal
+  arm — so an operator relying on a pre-write governance/policy hook got **silently no enforcement** if
+  that hook was missing (`FailMode` can never fire on an empty chain). PE-1 closes this presence gap with
+  a tri-state mode + an explicit required-event declaration: `AI_MEMORY_HOOKS_ENFORCE_MODE` /
+  `[hooks].enforce_mode` (`off`|`advisory`|`enforce`, default `off`, resolver ladder env > config > off,
+  mirroring `AI_MEMORY_PERMISSIONS_MODE`) + `[hooks].required_events` (default **empty** — an empty set is
+  a hard no-op **even under `enforce`**, the self-DOS guard, since most daemons run zero hooks). The pure,
+  unit-tested dispatch-layer helper `hooks::enforce_required_event_presence` (checked **around**, never
+  inside, `HookChain::fire`) returns `Deny{code:503}` under `enforce` when a required event has no enabled
+  hook (and `effective_fail_mode` forces required-event hooks to `Closed` so a present-but-fail-open hook
+  can't defeat enforce); `advisory` WARNs (`hooks.enforce.violation`) + allows. Only pre-* mutation/
+  governance events are eligible (`PreStore`/`PreDelete`/`PrePromote`/`PreLink`/`PreConsolidate`/
+  `PreGovernanceDecision`/`PreReflect`); an ineligible entry is dropped with a WARN. **Default `off` is
+  byte-identical to pre-#1734** (regression-pinned). Discoverability: boot banner (silent when `off`) +
+  `ai-memory doctor --hooks` pre-flight ("`PreStore`: REQUIRED but NO enabled hook → WILL DENY"). Design
+  resolved by the 5-agent adversarial vote (memory `4d3ea1c5`); explicitly **not** an `EnforceProfile`
+  type, a parallel enforce engine, a new `ChainResult` variant, or `RuleEngine` integration. Env-table row
+  #83 + `tests/config_precedence.rs` pin. Code anchors: `src/hooks/enforce.rs`, `src/config.rs`
+  (`resolve_hooks_enforce_mode`, `resolve_required_events`), `src/cli/doctor.rs`, `src/daemon_runtime.rs`.
 - **#1714 (Pillar-1) — MCP `memory_signal_ack` now fires the `PostSignalAck` hook (first MCP hook-event wire-in).**
   The synchronous MCP stdio dispatch held no `HookChain` handle, so no `HookEvent` fired from MCP-driven
   coordination operations. This wires the highest-value POST coordination event — `PostSignalAck` — through

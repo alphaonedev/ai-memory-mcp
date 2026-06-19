@@ -380,11 +380,26 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
         _ => Vec::new(),
     };
 
+    // #1734 PE-1 — resolve the mandatory-hook enforcement posture + the
+    // required-event pre-flight ("PreStore: REQUIRED but NO enabled hook →
+    // WILL DENY") so operators can verify enforcement before relying on it.
+    let app_config = crate::config::AppConfig::load();
+    let enforce_mode = app_config.resolve_hooks_enforce_mode();
+    let required_events = app_config.resolve_required_events();
+    let preflight = crate::hooks::preflight_report(&hooks, enforce_mode, &required_events);
+
     if args.json {
         let payload = serde_json::json!({
             (field_names::SCHEMA_VERSION): "v0.7-hooks-1",
             "config_path": path_opt.as_ref().map(|p| p.display().to_string()),
             "hooks_loaded": hooks.len(),
+            // #1734 PE-1 — enforcement posture + pre-flight.
+            "enforce_mode": enforce_mode.as_str(),
+            "required_events": required_events
+                .iter()
+                .map(|e| crate::hooks::enforce::event_wire(*e))
+                .collect::<Vec<_>>(),
+            "enforce_preflight": preflight,
             "executors": hooks.iter().map(|h| serde_json::json!({
                 "event": h.event,
                 "command": h.command.display().to_string(),
@@ -413,6 +428,23 @@ pub fn run_hooks(args: HooksReportArgs, out: &mut CliOutput<'_>) -> Result<i32> 
     }
 
     render_hooks_human_with(out, path_opt.as_deref(), &hooks)?;
+    // #1734 PE-1 — enforcement pre-flight block.
+    if preflight.is_empty() {
+        writeln!(
+            out.stdout,
+            "  PE-1 hook enforcement: {} (no required events declared)",
+            enforce_mode.as_str()
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "  PE-1 hook enforcement: {}",
+            enforce_mode.as_str()
+        )?;
+        for line in &preflight {
+            writeln!(out.stdout, "    - {line}")?;
+        }
+    }
     Ok(0)
 }
 

@@ -4672,6 +4672,33 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         }
     }
 
+    // #1734 PE-1 — surface the mandatory-hook enforcement posture at boot.
+    // Silent when `off` (the default) so the banner doesn't grow on every
+    // boot; under advisory/enforce, emit the resolved mode + a per-required-
+    // event pre-flight ("PreStore: REQUIRED but NO enabled hook → WILL DENY").
+    {
+        let enforce_mode = app_config.resolve_hooks_enforce_mode();
+        if enforce_mode != crate::hooks::HookEnforceMode::Off {
+            let required = app_config.resolve_required_events();
+            let hooks = crate::hooks::config::HookConfig::default_path()
+                .filter(|p| p.exists())
+                .and_then(|p| crate::hooks::config::HookConfig::load_from_file(&p).ok())
+                .unwrap_or_default();
+            tracing::info!(
+                "hooks enforcement: {} ({} required event(s))",
+                enforce_mode.as_str(),
+                required.len()
+            );
+            for line in crate::hooks::preflight_report(&hooks, enforce_mode, &required) {
+                if line.contains("WILL DENY") {
+                    tracing::warn!("hooks.enforce: {line}");
+                } else {
+                    tracing::info!("hooks.enforce: {line}");
+                }
+            }
+        }
+    }
+
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
 

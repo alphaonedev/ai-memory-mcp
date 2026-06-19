@@ -23,6 +23,8 @@
 pub mod chain;
 pub mod config;
 pub mod decision;
+/// PE-1 (#1734) — mandatory-hook presence enforcement.
+pub mod enforce;
 pub mod events;
 pub mod executor;
 // G10 — recall hot-path helper. Wraps `HookChain::fire` with the
@@ -62,6 +64,10 @@ pub use events::{EvictionEvent, HookEvent};
 // `use crate::hooks::executor::HookDecision`) resolving via the
 // canonical `crate::hooks::decision::HookDecision` path.
 pub use decision::{DecisionParseError, HookDecision, ModifyPayload, is_pre_event};
+pub use enforce::{
+    HookEnforceMode, effective_fail_mode, enforce_required_event_presence,
+    is_eligible_required_event, preflight_report,
+};
 // G3 — subprocess hook executor. Re-exports keep call sites
 // (`use crate::hooks::HookExecutor`) tidy without requiring every
 // caller to know the `executor::` submodule path.

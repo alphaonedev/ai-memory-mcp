@@ -101,6 +101,8 @@ hmac_secret = "fleet-wide-secret"
         subscription: Some(HooksSubscriptionConfig {
             hmac_secret: Some("x".into()),
         }),
+        enforce_mode: None,
+        required_events: None,
     };
 }
 
