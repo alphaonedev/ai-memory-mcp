@@ -89,17 +89,20 @@ pub(crate) fn pair_merges(
 // ---------------------------------------------------------------------------
 
 /// The consolidation clusterer for `ConsolidationPass`, reconciled to
-/// `crate::autonomy::find_consolidation_clusters` (#1741).
+/// `crate::autonomy::find_consolidation_clusters` (#1741/#1743).
 ///
 /// ## Algorithm (per namespace, greedy single-link)
 ///
 /// 1. Group candidates by namespace; never merge across namespaces; skip
 ///    reserved (`_`-prefixed) namespaces.
-/// 2. Embed each member once (via `embedder`); a `None` embedder — or a
-///    per-row embed failure — leaves that row's embedding absent.
+/// 2. The caller supplies each member's **stored** embedding (read via
+///    `MemoryStore::get_embedding`, NOT re-embedded live — matching autonomy's
+///    `db::get_embedding` source exactly, #1743). A `None` entry means the row
+///    has no stored embedding (keyword-tier / never-embedded / oversize-skip).
 /// 3. For each unused seed, scan later members; a pair joins the cluster iff
 ///    [`pair_merges`] (Jaccard pre-filter AND cosine gate, Jaccard-only when an
-///    embedding is absent). Clusters are capped at `max_cluster_size`.
+///    embedding is absent on either side). Clusters are capped at
+///    `max_cluster_size`.
 /// 4. Singletons are discarded (only clusters of ≥ 2 are returned).
 pub(crate) struct ConsolidationClustering {
     /// Jaccard pre-filter threshold. Defaults to [`JACCARD_THRESHOLD`].
@@ -108,73 +111,70 @@ pub(crate) struct ConsolidationClustering {
     pub(crate) cosine_threshold: f64,
     /// Maximum members per cluster. Defaults to [`MAX_CLUSTER_SIZE`].
     pub(crate) max_cluster_size: usize,
-    /// Embedding engine. When `None`, every pair falls back to Jaccard-only
-    /// (matching autonomy on a corpus with no stored embeddings).
-    pub(crate) embedder: Option<Embedder>,
 }
 
-impl ConsolidationClustering {
-    /// Construct with the autonomy-matched default thresholds and the given
-    /// embedder (`None` ⇒ Jaccard-only).
-    pub(crate) fn new(embedder: Option<Embedder>) -> Self {
+impl Default for ConsolidationClustering {
+    fn default() -> Self {
         Self {
             jaccard_threshold: JACCARD_THRESHOLD,
             cosine_threshold: f64::from(DEFAULT_COSINE_THRESHOLD),
             max_cluster_size: MAX_CLUSTER_SIZE,
-            embedder,
         }
     }
+}
 
-    /// Partition `memories` into consolidation clusters. Only groups with
-    /// ≥ 2 members are returned.
-    pub(crate) fn cluster_memories(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
-        // Group by namespace — never merge across namespace boundaries; skip
-        // reserved `_`-prefixed namespaces.
-        let mut by_ns: std::collections::HashMap<&str, Vec<&Memory>> =
+impl ConsolidationClustering {
+    /// Construct with the autonomy-matched default thresholds.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Partition `memories` into consolidation clusters. `embeddings` aligns
+    /// 1:1 to `memories` (`embeddings[i]` is the stored vector for
+    /// `memories[i]`, or `None`). Only groups with ≥ 2 members are returned.
+    pub(crate) fn cluster_memories(
+        &self,
+        memories: &[Memory],
+        embeddings: &[Option<Vec<f32>>],
+    ) -> Vec<Vec<MemoryId>> {
+        // Group by namespace (carrying the original index so the aligned
+        // `embeddings` slice is addressable); never merge across namespace
+        // boundaries; skip reserved `_`-prefixed namespaces.
+        let mut by_ns: std::collections::HashMap<&str, Vec<usize>> =
             std::collections::HashMap::new();
-        for m in memories {
+        for (idx, m) in memories.iter().enumerate() {
             if m.namespace.starts_with('_') {
                 continue;
             }
-            by_ns.entry(&m.namespace).or_default().push(m);
+            by_ns.entry(&m.namespace).or_default().push(idx);
         }
 
         let mut clusters: Vec<Vec<MemoryId>> = Vec::new();
-        for (_ns, group) in by_ns {
-            // Embed each member once (None when no embedder or an embed
-            // failure) — mirrors autonomy reading a possibly-absent stored
-            // embedding per row.
-            let embs: Vec<Option<Vec<f32>>> = group
-                .iter()
-                .map(|m| {
-                    self.embedder
-                        .as_ref()
-                        .and_then(|e| e.embed(&m.content).ok())
-                })
-                .collect();
-
-            let mut used = vec![false; group.len()];
-            for i in 0..group.len() {
-                if used[i] {
+        for (_ns, idxs) in by_ns {
+            let mut used = vec![false; idxs.len()];
+            for a in 0..idxs.len() {
+                if used[a] {
                     continue;
                 }
-                let mut cluster = vec![group[i].id.clone()];
-                used[i] = true;
-                for j in (i + 1)..group.len() {
-                    if used[j] {
+                let i = idxs[a];
+                let mut cluster = vec![memories[i].id.clone()];
+                used[a] = true;
+                for b in (a + 1)..idxs.len() {
+                    if used[b] {
                         continue;
                     }
                     if cluster.len() >= self.max_cluster_size {
                         break;
                     }
-                    let jac = jaccard_similarity(&group[i].content, &group[j].content);
-                    let cos = match (embs[i].as_ref(), embs[j].as_ref()) {
-                        (Some(a), Some(b)) => Some(f64::from(Embedder::cosine_similarity(a, b))),
+                    let j = idxs[b];
+                    let jac = jaccard_similarity(&memories[i].content, &memories[j].content);
+                    let cos = match (embeddings[i].as_ref(), embeddings[j].as_ref()) {
+                        (Some(x), Some(y)) => Some(f64::from(Embedder::cosine_similarity(x, y))),
                         _ => None,
                     };
                     if pair_merges(jac, self.jaccard_threshold, cos, self.cosine_threshold) {
-                        cluster.push(group[j].id.clone());
-                        used[j] = true;
+                        cluster.push(memories[j].id.clone());
+                        used[b] = true;
                     }
                 }
                 if cluster.len() >= 2 {
@@ -357,16 +357,27 @@ mod tests {
         assert_eq!(jaccard_similarity("", ""), 0.0);
     }
 
-    // ---- ConsolidationClustering (no-embedder ⇒ Jaccard-only, deterministic) -
+    // ---- ConsolidationClustering (deterministic; injected stored vectors) --
+    //
+    // `embeddings` aligns 1:1 to `memories`; `None` = no stored vector
+    // (Jaccard-only for that pair). No live `Embedder` is constructed — these
+    // are fully deterministic and CI-cache-independent (#1743).
+
+    /// `None` embeddings of length `n` (Jaccard-only path).
+    fn no_embs(n: usize) -> Vec<Option<Vec<f32>>> {
+        vec![None; n]
+    }
 
     #[test]
-    fn clusters_jaccard_only_groups_near_duplicates_without_embedder() {
-        let strategy = ConsolidationClustering::new(None);
+    fn clusters_jaccard_only_groups_near_duplicates_when_no_stored_vectors() {
+        let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
-        let m1 = make_memory("a", "ns", dup);
-        let m2 = make_memory("b", "ns", dup);
-        let m3 = make_memory("c", "ns", "completely different unrelated content here");
-        let clusters = strategy.cluster_memories(&[m1, m2, m3]);
+        let mems = [
+            make_memory("a", "ns", dup),
+            make_memory("b", "ns", dup),
+            make_memory("c", "ns", "completely different unrelated content here"),
+        ];
+        let clusters = strategy.cluster_memories(&mems, &no_embs(3));
         assert_eq!(clusters.len(), 1, "expected one cluster; got {clusters:?}");
         assert!(clusters[0].contains(&"a".to_string()));
         assert!(clusters[0].contains(&"b".to_string()));
@@ -374,12 +385,47 @@ mod tests {
     }
 
     #[test]
+    fn clusters_cosine_gate_splits_keyword_overlap_with_dissimilar_vectors() {
+        // THE AND-GATE at clusterer level, deterministic: identical (high-Jaccard)
+        // content but ORTHOGONAL stored vectors (cos=0 < 0.75) → NO merge — the
+        // over-merge a Jaccard-only path would wrongly produce.
+        let strategy = ConsolidationClustering::new();
+        let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
+        let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
+        let orthogonal = vec![Some(vec![1.0_f32, 0.0]), Some(vec![0.0_f32, 1.0])];
+        assert!(
+            strategy.cluster_memories(&mems, &orthogonal).is_empty(),
+            "cosine gate must block keyword-overlapping but vector-dissimilar pair"
+        );
+        // Same content, IDENTICAL vectors (cos=1.0 ≥ 0.75) → merge.
+        let aligned = vec![Some(vec![1.0_f32, 0.0]), Some(vec![1.0_f32, 0.0])];
+        let clusters = strategy.cluster_memories(&mems, &aligned);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].len(), 2);
+    }
+
+    #[test]
+    fn clusters_missing_one_vector_falls_back_to_jaccard() {
+        // One side has no stored vector → Jaccard-only for the pair (autonomy's
+        // per-pair contract); identical content → merge despite the missing vec.
+        let strategy = ConsolidationClustering::new();
+        let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
+        let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
+        let embs = vec![Some(vec![1.0_f32, 0.0]), None];
+        let clusters = strategy.cluster_memories(&mems, &embs);
+        assert_eq!(
+            clusters.len(),
+            1,
+            "missing-vector pair must Jaccard-fallback-merge"
+        );
+    }
+
+    #[test]
     fn clusters_never_merge_across_namespaces() {
-        let strategy = ConsolidationClustering::new(None);
+        let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy";
-        let m1 = make_memory("a", "ns1", dup);
-        let m2 = make_memory("b", "ns2", dup);
-        let clusters = strategy.cluster_memories(&[m1, m2]);
+        let mems = [make_memory("a", "ns1", dup), make_memory("b", "ns2", dup)];
+        let clusters = strategy.cluster_memories(&mems, &no_embs(2));
         assert!(
             clusters.is_empty(),
             "cross-ns must not cluster; got {clusters:?}"
@@ -388,11 +434,13 @@ mod tests {
 
     #[test]
     fn clusters_skip_reserved_namespaces() {
-        let strategy = ConsolidationClustering::new(None);
+        let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy";
-        let m1 = make_memory("a", "_curator", dup);
-        let m2 = make_memory("b", "_curator", dup);
-        let clusters = strategy.cluster_memories(&[m1, m2]);
+        let mems = [
+            make_memory("a", "_curator", dup),
+            make_memory("b", "_curator", dup),
+        ];
+        let clusters = strategy.cluster_memories(&mems, &no_embs(2));
         assert!(clusters.is_empty(), "reserved ns must be skipped");
     }
 
@@ -402,12 +450,11 @@ mod tests {
             jaccard_threshold: 0.0, // accept all on Jaccard
             cosine_threshold: f64::from(DEFAULT_COSINE_THRESHOLD),
             max_cluster_size: 3,
-            embedder: None, // None ⇒ Jaccard-only, so the 0.0 threshold rules
         };
         let mems: Vec<Memory> = (0..10)
             .map(|i| make_memory(&format!("m{i}"), "ns", "shared token content shared"))
             .collect();
-        let clusters = strategy.cluster_memories(&mems);
+        let clusters = strategy.cluster_memories(&mems, &no_embs(mems.len()));
         for c in &clusters {
             assert!(c.len() <= 3, "cluster size {}", c.len());
         }
@@ -415,51 +462,27 @@ mod tests {
 
     #[test]
     fn clusters_empty_input_returns_empty() {
-        let strategy = ConsolidationClustering::new(None);
-        assert!(strategy.cluster_memories(&[]).is_empty());
+        let strategy = ConsolidationClustering::new();
+        assert!(strategy.cluster_memories(&[], &[]).is_empty());
     }
 
     #[test]
     fn clusters_skip_already_used_member() {
         // a≈b≈c all share tokens → one cluster of 3; exercises the inner
-        // `if used[j] { continue; }` branch.
+        // `if used[b] { continue; }` branch.
         let strategy = ConsolidationClustering {
             jaccard_threshold: 0.3,
             cosine_threshold: f64::from(DEFAULT_COSINE_THRESHOLD),
             max_cluster_size: 10,
-            embedder: None,
         };
         let s = "shared keyword tokens deployment plan strategy";
-        let clusters = strategy.cluster_memories(&[
+        let mems = [
             make_memory("a", "ns", s),
             make_memory("b", "ns", s),
             make_memory("c", "ns", s),
-        ]);
+        ];
+        let clusters = strategy.cluster_memories(&mems, &no_embs(3));
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 3);
-    }
-
-    // ---- ConsolidationClustering with a real Embedder (skip if model cold) -
-    //
-    // Deterministic AND-gate coverage lives in the `pair_merges_*` tests above;
-    // this only exercises the live-embedder cosine path opportunistically on
-    // hosts whose HF model cache is warm (early-returns otherwise).
-
-    fn try_local_embedder() -> Option<Embedder> {
-        Embedder::new_local().ok()
-    }
-
-    #[test]
-    fn clusters_with_embedder_merge_similar_and_split_dissimilar() {
-        let Some(embedder) = try_local_embedder() else {
-            return;
-        };
-        let strategy = ConsolidationClustering::new(Some(embedder));
-        // High Jaccard AND high cosine (identical content) → merge.
-        let dup = "Kubernetes rolling canary deployment strategy notes";
-        let clusters =
-            strategy.cluster_memories(&[make_memory("a", "ns", dup), make_memory("b", "ns", dup)]);
-        assert_eq!(clusters.len(), 1);
-        assert_eq!(clusters[0].len(), 2);
     }
 }

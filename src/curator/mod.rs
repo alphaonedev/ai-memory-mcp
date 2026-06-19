@@ -505,9 +505,8 @@ fn run_consolidation_shadow_pass(
             return;
         }
     };
-    let pass = crate::curator::compaction::ConsolidationPass::new(
-        &store, llm, None, /* dry_run */ true,
-    );
+    let pass =
+        crate::curator::compaction::ConsolidationPass::new(&store, llm, /* dry_run */ true);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

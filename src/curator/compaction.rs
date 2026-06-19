@@ -4,15 +4,16 @@
 //! `ConsolidationPass` — `CompactionPass` impl for memory consolidation.
 //!
 //! A SAL-trait (`MemoryStore`) consolidator. Its clustering is **reconciled
-//! to** `crate::autonomy::find_consolidation_clusters` (#1741): a candidate
-//! pair merges iff it passes a **Jaccard pre-filter AND a cosine gate** — both
-//! when embeddings are available, Jaccard-only per-pair when an embedding is
-//! absent (including when no `Embedder` is wired, matching autonomy on a corpus
-//! with no stored embeddings). Clustering lives in
-//! [`ConsolidationClustering`](super::cluster::ConsolidationClustering); the
-//! per-pair decision is the pure `super::cluster::pair_merges`, unit-tested
-//! deterministically without a live `Embedder`. Thresholds/cap are pinned
-//! equal to autonomy's `CONSOLIDATE_*` by the `constants_match_autonomy` test.
+//! to** `crate::autonomy::find_consolidation_clusters` (#1741/#1743): a
+//! candidate pair merges iff it passes a **Jaccard pre-filter AND a cosine
+//! gate** — both when stored embeddings are available, Jaccard-only per-pair
+//! when a row has no stored embedding. The cosine gate reads each candidate's
+//! **stored** vector via `MemoryStore::get_embedding` (NOT a live re-embed),
+//! matching autonomy's `db::get_embedding` source exactly (#1743). Clustering
+//! lives in [`ConsolidationClustering`](super::cluster::ConsolidationClustering);
+//! the per-pair decision is the pure `super::cluster::pair_merges`, unit-tested
+//! deterministically by injecting vectors. Thresholds/cap are pinned equal to
+//! autonomy's `CONSOLIDATE_*` by the `constants_match_autonomy` test.
 //!
 //! Status: wired as a gated, observe-only dry-run shadow (#1738) + Stage-6
 //! rollback (#1739). Flipping it to the *live* consolidator (replacing the
@@ -42,8 +43,6 @@ use anyhow::Result;
 
 #[cfg(feature = "sal")]
 use crate::autonomy::AutonomyLlm;
-#[cfg(feature = "sal")]
-use crate::embeddings::Embedder;
 #[cfg(not(feature = "sal"))]
 use crate::models::Tier;
 #[cfg(feature = "sal")]
@@ -93,10 +92,6 @@ pub(crate) struct ConsolidationPass<'a> {
     pub(crate) ctx: CallerContext,
     /// LLM client for `summarize_memories`.
     pub(crate) llm: &'a dyn AutonomyLlm,
-    /// Embedding engine for the cosine gate in [`ConsolidationClustering`].
-    /// When `None`, clustering is Jaccard-only (autonomy parity on a corpus
-    /// with no stored embeddings).
-    pub(crate) embedder: Option<Embedder>,
     /// Suppress all writes (simulate-only).
     pub(crate) dry_run: bool,
 }
@@ -138,17 +133,11 @@ pub(crate) struct ConsolidationRunReport {
 impl<'a> ConsolidationPass<'a> {
     // L1-7: constructor defined here; call-site wiring ships in L2-1.
     #[allow(dead_code)]
-    pub(crate) fn new(
-        store: &'a dyn MemoryStore,
-        llm: &'a dyn AutonomyLlm,
-        embedder: Option<Embedder>,
-        dry_run: bool,
-    ) -> Self {
+    pub(crate) fn new(store: &'a dyn MemoryStore, llm: &'a dyn AutonomyLlm, dry_run: bool) -> Self {
         Self {
             store,
             ctx: CallerContext::for_admin(CONSOLIDATOR_AGENT_ID),
             llm,
-            embedder,
             dry_run,
         }
     }
@@ -159,13 +148,27 @@ impl<'a> ConsolidationPass<'a> {
 
     /// Partition `memories` into clusters via [`ConsolidationClustering`] —
     /// the reconciled Jaccard-pre-filter-AND-cosine-gate algorithm (#1741),
-    /// matching `crate::autonomy::find_consolidation_clusters`. When
-    /// `self.embedder` is `None` every pair falls back to Jaccard-only,
-    /// matching autonomy on a corpus with no stored embeddings.
+    /// matching `crate::autonomy::find_consolidation_clusters`. Reads each
+    /// candidate's **stored** embedding via `MemoryStore::get_embedding`
+    /// (#1743) — NOT a live re-embed — so the cosine gate uses the exact same
+    /// vectors autonomy reads; a row with no stored embedding falls back to
+    /// Jaccard-only for its pairs.
     ///
     /// Each cluster element is a `MemoryId` (the memory's `id` field).
-    fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
-        ConsolidationClustering::new(self.embedder.clone()).cluster_memories(memories)
+    async fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
+        let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(memories.len());
+        for m in memories {
+            // Best-effort: a fetch error degrades that row to "no embedding"
+            // (Jaccard-only), never aborts the sweep.
+            let emb = self
+                .store
+                .get_embedding(&self.ctx, &m.id)
+                .await
+                .ok()
+                .flatten();
+            embeddings.push(emb);
+        }
+        ConsolidationClustering::new().cluster_memories(memories, &embeddings)
     }
 
     /// A cluster is eligible when it has ≥ 2 members, all share the same
@@ -314,7 +317,7 @@ impl<'a> ConsolidationPass<'a> {
     pub(crate) async fn run(&self, candidates: &[Memory]) -> Result<ConsolidationRunReport> {
         let mut report = ConsolidationRunReport::default();
 
-        let clusters = self.cluster(candidates);
+        let clusters = self.cluster(candidates).await;
         report.clusters_formed = clusters.len();
 
         // id -> &Memory lookup so cluster member-ids resolve back to rows.
@@ -708,21 +711,21 @@ mod tests {
         fn pass_name_is_consolidation() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             assert_eq!(pass.name(), "consolidation");
         }
 
-        #[test]
-        fn cluster_via_jaccard_fallback_returns_clusters() {
-            // No embedder → ConsolidationClustering runs Jaccard-only; the
-            // identical-content pair passes the Jaccard pre-filter → 1 cluster.
+        #[tokio::test]
+        async fn cluster_via_jaccard_fallback_returns_clusters() {
+            // Candidates not stored → get_embedding returns None → Jaccard-only;
+            // the identical-content pair passes the Jaccard pre-filter → 1 cluster.
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m1 = make_memory_full(
                 "a",
                 "ns",
-                "t",
+                "t1",
                 "kubernetes rolling canary deploy strategy",
                 Tier::Mid,
                 5,
@@ -730,22 +733,22 @@ mod tests {
             let m2 = make_memory_full(
                 "b",
                 "ns",
-                "t",
+                "t2",
                 "kubernetes rolling canary deploy strategy",
                 Tier::Mid,
                 5,
             );
-            let clusters = pass.cluster(&[m1, m2]);
+            let clusters = pass.cluster(&[m1, m2]).await;
             assert_eq!(clusters.len(), 1);
             assert_eq!(clusters[0].len(), 2);
         }
 
-        #[test]
-        fn cluster_empty_returns_no_groups() {
+        #[tokio::test]
+        async fn cluster_empty_returns_no_groups() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
-            let clusters = pass.cluster(&[]);
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            let clusters = pass.cluster(&[]).await;
             assert!(clusters.is_empty());
         }
 
@@ -753,7 +756,7 @@ mod tests {
         fn eligible_accepts_valid_cluster() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m1 = make_memory_full("a", "ns", "t1", "c1", Tier::Long, 5);
             let m2 = make_memory_full("b", "ns", "t2", "c2", Tier::Long, 5);
             assert!(pass.eligible(&[m1, m2]));
@@ -763,7 +766,7 @@ mod tests {
         fn eligible_rejects_singleton_via_pass() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m = make_memory_full("a", "ns", "t", "c", Tier::Long, 5);
             assert!(!pass.eligible(&[m]));
         }
@@ -772,7 +775,7 @@ mod tests {
         fn eligible_rejects_reserved_namespace_via_pass() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m1 = make_memory_full("a", "_curator", "t", "c", Tier::Long, 5);
             let m2 = make_memory_full("b", "_curator", "t", "c", Tier::Long, 5);
             assert!(!pass.eligible(&[m1, m2]));
@@ -782,7 +785,7 @@ mod tests {
         fn eligible_rejects_mixed_ns_via_pass() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m1 = make_memory_full("a", "ns1", "t", "c", Tier::Long, 5);
             let m2 = make_memory_full("b", "ns2", "t", "c", Tier::Long, 5);
             assert!(!pass.eligible(&[m1, m2]));
@@ -792,7 +795,7 @@ mod tests {
         fn summarize_returns_consolidated_memory() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("synthesised summary");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m1 = make_memory_full("a", "ns", "First", "c1", Tier::Mid, 3);
             let m2 = make_memory_full("b", "ns", "Second", "c2", Tier::Long, 7);
             let summary = pass.summarize(&[m1, m2]).unwrap();
@@ -808,7 +811,7 @@ mod tests {
         fn summarize_empty_cluster_errors() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let err = pass.summarize(&[]).unwrap_err().to_string();
             assert!(err.contains("empty cluster"));
         }
@@ -817,7 +820,7 @@ mod tests {
         async fn persist_dry_run_is_noop() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, true /* dry_run */);
+            let pass = ConsolidationPass::new(&store, &llm, true /* dry_run */);
             let summary = make_memory_full("s", "ns", "t", "c", Tier::Mid, 5);
             // dry_run=true → persist short-circuits regardless of sources.
             pass.persist(&summary, &["x".to_string(), "y".to_string()])
@@ -829,7 +832,7 @@ mod tests {
         async fn persist_empty_sources_is_noop() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let summary = make_memory_full("s", "ns", "t", "c", Tier::Mid, 5);
             pass.persist(&summary, &[]).await.unwrap();
         }
@@ -839,7 +842,7 @@ mod tests {
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let llm = StubLlm::new("synth");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             // Insert two source memories.
             let m1 = make_memory_full(
                 &uuid::Uuid::new_v4().to_string(),
@@ -880,7 +883,7 @@ mod tests {
         async fn verify_missing_id_returns_error() {
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let err = pass
                 .verify("no-such-id".to_string())
                 .await
@@ -894,7 +897,7 @@ mod tests {
             let (store, _dir) = open_db();
             let conn = conn_of(&store);
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let m = make_memory_full(
                 &uuid::Uuid::new_v4().to_string(),
                 "ns",
@@ -915,35 +918,62 @@ mod tests {
             assert!(!stub.detect_contradiction("a", "b").unwrap());
         }
 
-        #[test]
-        fn cluster_via_cosine_primary_when_embedder_available() {
-            // With an embedder, ConsolidationClustering applies BOTH gates;
-            // the identical-content pair passes Jaccard AND cosine → 1 cluster.
-            // Requires a real Embedder — skip if the HF model isn't cached.
-            let Some(embedder) = crate::embeddings::Embedder::new_local().ok() else {
-                return;
-            };
+        #[tokio::test]
+        async fn cluster_reads_stored_embeddings_and_applies_cosine_gate() {
+            // Proves the get_embedding wiring end-to-end (deterministic, no live
+            // Embedder): two same-content (high-Jaccard) memories stored with
+            // ORTHOGONAL embeddings (cos=0 < 0.75) must NOT merge. If the pass
+            // failed to fetch the stored vectors it would fall to Jaccard-only
+            // and WRONGLY merge them — so an empty result confirms cluster()
+            // reads the stored vectors and the cosine gate fires.
             let (store, _dir) = open_db();
+            let conn = conn_of(&store);
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, Some(embedder), false);
+            let dup = "kubernetes rolling canary deploy strategy notes";
             let m1 = make_memory_full(
-                "a",
+                &uuid::Uuid::new_v4().to_string(),
                 "ns",
-                "t",
-                "kubernetes rolling canary deploy strategy",
+                "t1",
+                dup,
                 Tier::Mid,
                 5,
             );
             let m2 = make_memory_full(
-                "b",
+                &uuid::Uuid::new_v4().to_string(),
                 "ns",
-                "t",
-                "kubernetes rolling canary deploy strategy",
+                "t2",
+                dup,
                 Tier::Mid,
                 5,
             );
-            let clusters = pass.cluster(&[m1, m2]);
-            assert_eq!(clusters.len(), 1);
+            crate::db::insert(&conn, &m1).unwrap();
+            crate::db::set_embedding(&conn, &m1.id, &[1.0, 0.0]).unwrap();
+            crate::db::insert(&conn, &m2).unwrap();
+            crate::db::set_embedding(&conn, &m2.id, &[0.0, 1.0]).unwrap();
+
+            let pass = ConsolidationPass::new(&store, &llm, false);
+            let clusters = pass.cluster(&[m1, m2]).await;
+            assert!(
+                clusters.is_empty(),
+                "orthogonal stored vectors must block the cosine gate (no merge); \
+                 got {clusters:?} — get_embedding wiring may be broken"
+            );
+
+            // Sanity: the SAL get_embedding round-trips the stored vector.
+            let v = store
+                .get_embedding(&pass.ctx, &candidates_first_id(&conn))
+                .await
+                .unwrap();
+            assert!(v.is_some(), "get_embedding must read back a stored vector");
+        }
+
+        /// First memory id in `ns` (helper for the get_embedding round-trip).
+        fn candidates_first_id(conn: &rusqlite::Connection) -> String {
+            crate::db::list(conn, Some("ns"), None, 1, 0, None, None, None, None, None)
+                .unwrap()
+                .first()
+                .map(|m| m.id.clone())
+                .expect("at least one row")
         }
 
         #[tokio::test]
@@ -952,7 +982,7 @@ mod tests {
             // empty title — consolidate will fail on the missing source rows.
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
             let summary = make_memory_full("s", "ns", "[consolidated] x", "c", Tier::Mid, 5);
             // Non-existent source IDs → consolidate should error.
             let res = pass
@@ -1000,7 +1030,7 @@ mod tests {
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
             let llm = StubLlm::new("synth");
-            let pass = ConsolidationPass::new(&store, &llm, None, true /* dry_run */);
+            let pass = ConsolidationPass::new(&store, &llm, true /* dry_run */);
 
             let out = pass.run(&candidates).await.unwrap();
             assert!(out.clusters_formed >= 1, "should form ≥1 cluster");
@@ -1028,7 +1058,7 @@ mod tests {
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
             let llm = StubLlm::new("synthesised consolidation");
-            let pass = ConsolidationPass::new(&store, &llm, None, false /* real */);
+            let pass = ConsolidationPass::new(&store, &llm, false /* real */);
 
             let out = pass.run(&candidates).await.unwrap();
             assert!(out.clusters_formed >= 1);
@@ -1057,7 +1087,7 @@ mod tests {
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
             let llm = StubLlm::new("synth");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
 
             // Consolidate for real: sources removed, result minted.
             let summary = pass.summarize(&candidates).unwrap();
@@ -1096,7 +1126,7 @@ mod tests {
             let conn = conn_of(&store);
             let candidates = seed_two_dupes(&conn);
             let llm = StubLlm::new("synth");
-            let pass = ConsolidationPass::new(&store, &llm, None, false);
+            let pass = ConsolidationPass::new(&store, &llm, false);
 
             let summary = pass.summarize(&candidates).unwrap();
             let ids: Vec<String> = candidates.iter().map(|m| m.id.clone()).collect();

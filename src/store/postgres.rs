@@ -16321,6 +16321,20 @@ impl MemoryStore for PostgresStore {
         Ok(id)
     }
 
+    async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
+        // Read the stored pgvector `embedding` column for `id`. The outer
+        // Option is "row exists?"; the inner is "embedding non-NULL?" (a
+        // keyword-tier / never-embedded / store-time-skipped row is NULL).
+        // Both collapse to `None`, matching SQLite's `db::get_embedding`.
+        let v: Option<Option<pgvector::Vector>> =
+            sqlx::query_scalar("SELECT embedding FROM memories WHERE id = $1 LIMIT 1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("get_embedding", e))?;
+        Ok(v.flatten().map(|vec| vec.to_vec()))
+    }
+
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
         // Byte-for-byte mirror of `db::next_versioned_title` — try the
         // base title first, then `(2)`, `(3)`, ... up to the substrate's
