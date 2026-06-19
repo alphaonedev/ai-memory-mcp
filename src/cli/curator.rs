@@ -14,6 +14,8 @@
 use crate::cli::CliOutput;
 use crate::curator::reflection_pass;
 use crate::identity::keypair as identity_keypair;
+#[cfg(feature = "sal")]
+use crate::store::{CallerContext, Filter, MemoryStore};
 use crate::{autonomy, config, curator, db, llm};
 use anyhow::{Context, Result};
 use clap::Args;
@@ -294,7 +296,31 @@ async fn run_store_backed_sweep(
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier);
 
+    // v0.8.0 Pillar-2.5 slice-3c1 (#1747) — config for the store-backed
+    // consolidation sweep. `compaction.enabled` defaults false (no-op) until the
+    // operator config wire-up lands; the gate mirrors the sqlite `run_once` path.
+    let curator_cfg = curator::CuratorConfig {
+        interval_secs: args.interval_secs,
+        max_ops_per_cycle: args.max_ops,
+        dry_run: args.dry_run,
+        include_namespaces: args.include_namespaces.clone(),
+        exclude_namespaces: args.exclude_namespaces.clone(),
+        compaction: curator::CompactionConfig::default(),
+    };
+    // A remote (postgres) store-url means rollback rows the pass writes are not
+    // reachable by the rusqlite-bound `curator --rollback` yet (#1748).
+    let store_is_remote = curator_store_url(args).is_some_and(|u| u.starts_with("postgres"));
+
     if args.once {
+        // Consolidation BEFORE reflection (dedup, then reflect over survivors).
+        let consolidation = store_backed_consolidation_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            &curator_cfg,
+            store_is_remote,
+        )
+        .await;
+        log_store_backed_consolidation(&consolidation);
         let report = store_backed_reflection_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
@@ -335,6 +361,15 @@ async fn run_store_backed_sweep(
     );
 
     while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        // Consolidation BEFORE reflection (dedup, then reflect over survivors).
+        let consolidation = store_backed_consolidation_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            &curator_cfg,
+            store_is_remote,
+        )
+        .await;
+        log_store_backed_consolidation(&consolidation);
         let report = store_backed_reflection_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
@@ -395,6 +430,136 @@ async fn store_backed_reflection_sweep(
         |_ns: &str| true,
     )
     .await
+}
+
+/// v0.8.0 Pillar-2.5 slice-3c1 (#1747) — run the SAL `ConsolidationPass` over a
+/// store-backed (postgres or `--store-url` sqlite) curator tick: the
+/// backend-agnostic twin of [`store_backed_reflection_sweep`]. Gated on
+/// `cfg.compaction.enabled` (default `false` → no-op, production byte-unchanged).
+/// Iterates non-reserved namespaces via [`MemoryStore::list_namespaces`], gathers
+/// + filters candidates (`needs_curation`, capped at `max_ops_per_cycle` so a
+/// store-backed cycle consolidates the same population the sqlite path would),
+/// and runs [`ConsolidationPass::run`] real (respecting `cfg.dry_run`). A missing
+/// LLM folds into the report rather than aborting the daemon (mirrors
+/// [`run_reflection_pass_with_optional_llm`]).
+///
+/// **Run BEFORE reflection** in the sweep so consolidation's hard-DELETE of
+/// near-duplicate sources happens before reflection links over the surviving
+/// corpus — avoiding dangling `reflects_on` edges to consolidated-away rows.
+///
+/// **Rollback caveat (#1748):** on a remote (postgres) store the
+/// operator-reversible rollback rows the pass writes are NOT yet reachable by
+/// `ai-memory curator --rollback` (that path is rusqlite-bound); a WARN is
+/// emitted so the operator is not misled. The store-backed reversal SAL-port is
+/// slice-3c2 (#1748).
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` (#1747).
+#[cfg(feature = "sal")]
+async fn store_backed_consolidation_sweep(
+    store: &dyn MemoryStore,
+    llm: Option<&dyn autonomy::AutonomyLlm>,
+    cfg: &curator::CuratorConfig,
+    store_is_remote: bool,
+) -> curator::compaction::ConsolidationRunReport {
+    let mut report = curator::compaction::ConsolidationRunReport::default();
+    if !cfg.compaction.enabled {
+        return report; // default-off → true no-op
+    }
+    let Some(llm) = llm else {
+        report
+            .errors
+            .push("no LLM client configured — consolidation skipped".to_string());
+        return report;
+    };
+    if store_is_remote {
+        tracing::warn!(
+            target: curator::compaction::COMPACTION_TRACE_TARGET,
+            "compaction.enabled on a store-url backend: consolidations are NOT yet \
+             reversible via `ai-memory curator --rollback` on this backend (see #1748)"
+        );
+    }
+
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+    let namespaces = match store.list_namespaces().await {
+        Ok(ns) => ns,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation: list_namespaces failed: {e}"));
+            return report;
+        }
+    };
+
+    // Gather candidates across non-reserved namespaces, applying the SAME
+    // `needs_curation` filter the sqlite path uses, capped at max_ops_per_cycle.
+    let cap = cfg.max_ops_per_cycle.max(1);
+    let mut candidates: Vec<crate::models::Memory> = Vec::new();
+    'ns: for nsc in &namespaces {
+        if nsc.namespace.starts_with('_') {
+            continue;
+        }
+        let filter = Filter {
+            namespace: Some(nsc.namespace.clone()),
+            limit: cap,
+            ..Default::default()
+        };
+        match store.list(&ctx, &filter).await {
+            Ok(rows) => {
+                for m in rows {
+                    if curator::candidates::needs_curation(&m, cfg) {
+                        candidates.push(m);
+                        if candidates.len() >= cap {
+                            break 'ns;
+                        }
+                    }
+                }
+            }
+            Err(e) => report.errors.push(format!(
+                "consolidation: list({}) failed: {e}",
+                nsc.namespace
+            )),
+        }
+    }
+
+    if candidates.is_empty() {
+        return report;
+    }
+
+    let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run);
+    match pass.run(&candidates).await {
+        Ok(out) => {
+            // Preserve any list/namespace errors gathered above.
+            let mut merged = out;
+            merged.errors.splice(0..0, report.errors.clone());
+            report = merged;
+        }
+        Err(e) => report
+            .errors
+            .push(format!("consolidation pass failed: {e}")),
+    }
+    report
+}
+
+/// Emit a `tracing` line summarising a store-backed consolidation sweep, mirroring
+/// the reflection-sweep cycle log. No-op-quiet when compaction is disabled (the
+/// report is all-zero).
+#[cfg(feature = "sal")]
+fn log_store_backed_consolidation(report: &curator::compaction::ConsolidationRunReport) {
+    if report.clusters_formed == 0 && report.memories_consolidated == 0 && report.errors.is_empty()
+    {
+        return;
+    }
+    tracing::info!(
+        target: curator::compaction::COMPACTION_TRACE_TARGET,
+        "curator SAL consolidation: clusters_formed={} eligible={} consolidated={} \
+         rollback_entries={} rolled_back={} errors={}",
+        report.clusters_formed,
+        report.eligible_clusters,
+        report.memories_consolidated,
+        report.rollback_entries_written,
+        report.rolled_back,
+        report.errors.len(),
+    );
 }
 
 /// v0.7.0 #1548 — run the reflection pass over a SAL store with an
@@ -1621,6 +1786,123 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("no LLM client configured"))
+        );
+    }
+
+    // ── #1747 (slice-3c1) — store-backed consolidation sweep ─────────────
+    // Backend-agnostic: drives the actual sweep entry point (not
+    // ConsolidationPass::run directly) over a real SqliteStore, so the same
+    // wiring the postgres curator uses is exercised in always-on CI.
+    #[cfg(feature = "sal")]
+    fn seed_two_dup_memories(db_path: &std::path::Path) {
+        let conn = db::open(db_path).unwrap();
+        let dup = "kubernetes rolling canary deploy strategy notes with enough length";
+        let mk = |id: &str, title: &str| crate::models::Memory {
+            id: id.to_string(),
+            namespace: "ns".to_string(),
+            title: title.to_string(),
+            content: dup.to_string(),
+            tier: crate::models::Tier::Mid,
+            access_count: 5,
+            ..Default::default()
+        };
+        let m1 = mk("aaa11111", "t1");
+        let m2 = mk("bbb22222", "t2");
+        db::insert(&conn, &m1).unwrap();
+        db::insert(&conn, &m2).unwrap();
+        // Aligned embeddings → cosine gate passes (same ns).
+        db::set_embedding(&conn, &m1.id, &[1.0, 0.0]).unwrap();
+        db::set_embedding(&conn, &m2.id, &[1.0, 0.0]).unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_consolidates_and_folds_when_enabled() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let cfg = curator::CuratorConfig {
+            max_ops_per_cycle: 100,
+            compaction: curator::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default() // dry_run = false → real consolidation
+        };
+        let report = store_backed_consolidation_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            &cfg,
+            false,
+        )
+        .await;
+        assert_eq!(
+            report.memories_consolidated, 2,
+            "both sources folded; errors: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.rollback_entries_written, 1,
+            "one operator-reversible rollback entry persisted"
+        );
+        // The [consolidated] row landed.
+        let conn = db::open(&env.db_path).unwrap();
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert!(
+            rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+            "a consolidated row must exist"
+        );
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_noop_when_disabled() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        // Default config → compaction.enabled = false.
+        let cfg = curator::CuratorConfig::default();
+        let report = store_backed_consolidation_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            &cfg,
+            false,
+        )
+        .await;
+        assert_eq!(
+            report.memories_consolidated, 0,
+            "disabled → no consolidation"
+        );
+        assert_eq!(report.clusters_formed, 0);
+        assert!(report.errors.is_empty(), "no errors: {:?}", report.errors);
+        // Both source rows remain; no consolidated row.
+        let conn = db::open(&env.db_path).unwrap();
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 2, "both source rows remain live");
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_no_llm_folds_into_report() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let cfg = curator::CuratorConfig {
+            compaction: curator::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // No LLM → folds an error into the report, never panics.
+        let report = store_backed_consolidation_sweep(&store, None, &cfg, false).await;
+        assert_eq!(report.memories_consolidated, 0);
+        assert!(
+            report.errors.iter().any(|e| e.contains("no LLM")),
+            "no-LLM error surfaced: {:?}",
+            report.errors
         );
     }
 

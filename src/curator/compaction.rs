@@ -69,6 +69,12 @@ use super::pipeline::MemoryId;
 #[cfg(feature = "sal")]
 const CONSOLIDATOR_AGENT_ID: &str = crate::identity::sentinels::AI_CURATOR;
 
+/// `tracing` target for consolidation events — one named const so the string
+/// is not a hardcoded literal duplicated across the pass + the store-backed
+/// curator sweep (pm-v3.1 lint-gate).
+#[cfg(feature = "sal")]
+pub(crate) const COMPACTION_TRACE_TARGET: &str = "curator::compaction";
+
 // ---------------------------------------------------------------------------
 // ConsolidationPass
 // ---------------------------------------------------------------------------
@@ -415,7 +421,7 @@ impl<'a> ConsolidationPass<'a> {
                     report.rolled_back += 1;
                 }
                 tracing::warn!(
-                    target: "curator::compaction",
+                    target: COMPACTION_TRACE_TARGET,
                     pass = self.name(),
                     summary_id = %new_id,
                     restored,
@@ -469,7 +475,7 @@ impl<'a> ConsolidationPass<'a> {
             {
                 Ok(Some(existing_id)) if existing_id != m.id => {
                     tracing::warn!(
-                        target: "curator::compaction",
+                        target: COMPACTION_TRACE_TARGET,
                         title = %m.title,
                         namespace = %m.namespace,
                         occupant = %existing_id,
