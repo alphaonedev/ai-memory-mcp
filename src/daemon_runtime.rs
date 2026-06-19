@@ -5295,6 +5295,9 @@ pub async fn run_curator_daemon_with_primitives(
     dry_run: bool,
     include_namespaces: Vec<String>,
     exclude_namespaces: Vec<String>,
+    // #1749 — Pillar-2.5 consolidation gate, resolved by the caller (which has
+    // the `AppConfig` this daemon body lacks). Default-false at every caller.
+    compaction_enabled: bool,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -5304,7 +5307,10 @@ pub async fn run_curator_daemon_with_primitives(
         dry_run,
         include_namespaces,
         exclude_namespaces,
-        compaction: crate::curator::CompactionConfig::default(),
+        compaction: crate::curator::CompactionConfig {
+            enabled: compaction_enabled,
+            ..Default::default()
+        },
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));

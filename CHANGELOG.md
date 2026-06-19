@@ -21,6 +21,26 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1749 (Pillar-2.5 activation) — `[curator.compaction].enabled` is now operator-configurable.**
+  The curator's Pillar-2.5 consolidation gate (`CompactionConfig.enabled`) was hardcoded
+  `default()` (false) at every production build site, leaving the whole shipped consolidation
+  pillar (3b1/3b2a/3b2b/3c1) dormant. It now resolves from operator config via
+  `AppConfig::resolve_compaction_enabled()` — ladder `AI_MEMORY_COMPACTION_ENABLED` env >
+  `[curator.compaction].enabled` > compiled `false` — threaded into `CuratorConfig.compaction`
+  at every site (`cli/curator.rs` `run` + `run_store_backed_sweep`, and
+  `daemon_runtime.rs::run_curator_daemon_with_primitives` via a primitive param resolved by its
+  caller). Default stays **false (opt-in)**; enabling makes the SAL `ConsolidationPass` the live
+  consolidator (hard-DELETE merge of near-duplicates, suppressing autonomy Pass-1). Strengthens
+  the Pillar-2.5 §2.4 *improvable* property by making the pipeline reachable. **Reversibility:**
+  consolidations are operator-reversible via `curator --rollback` on **sqlite** (#1745); on
+  **postgres** that reversal is not yet wired (#1748) and the curator emits a runtime WARN naming
+  the hard-DELETE + the gap. Scoped to `enabled` only this slice — the clustering `cosine_threshold`
+  (currently unwired into the pass) and the size-GC `max_corpus_bytes` (an independent eviction
+  trigger) are intentionally left at defaults and tracked as a follow-up, per the 5-agent crossroads
+  vote (memory `4d3ea1c5`). Tests: resolver precedence (`tests/config_precedence.rs`) + config-field
+  resolution + build-site coverage. Env-table row #81. Code anchors: `src/config.rs`
+  (`resolve_compaction_enabled`, `CuratorCompactionSection`, `ENV_COMPACTION_ENABLED`),
+  `src/cli/curator.rs` (`curator_compaction_config`), `src/daemon_runtime.rs`.
 - **#1747 (Pillar-2.5 slice-3c1) — consolidation on the store-backed (postgres) curator tick.**
   The SAL `ConsolidationPass` now runs on the postgres / `--store-url` curator path
   (`cli/curator.rs::store_backed_consolidation_sweep`), the backend-agnostic twin of the

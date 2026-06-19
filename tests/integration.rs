@@ -13308,7 +13308,8 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
             true, // dry_run
             Vec::new(),
             Vec::new(),
-            None, // llm — keyword-only path, no LLM (#1440)
+            false, // compaction_enabled (#1749) — default off
+            None,  // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )
         .await
