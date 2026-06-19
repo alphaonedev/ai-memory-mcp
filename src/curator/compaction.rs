@@ -3,31 +3,21 @@
 
 //! `ConsolidationPass` — `CompactionPass` impl for memory consolidation.
 //!
-//! A SAL-trait (`MemoryStore`) consolidator derived from the v0.6.x
-//! `crate::autonomy` consolidation logic. **It is NOT a byte-for-byte
-//! refactor** (#1740): the two clustering implementations diverge when
-//! embeddings are present. `crate::autonomy::find_consolidation_clusters`
-//! applies a Jaccard pre-filter **AND** a cosine gate on DB embeddings to
-//! every candidate pair, whereas this pass's `cluster()` method
-//! uses cosine as the *primary* signal with Jaccard only as a **fallback**
-//! (invoked when the cosine pass yields zero clusters). On the no-embedder
-//! path both reduce to the same Jaccard clustering — identical tokenizer,
-//! threshold (`0.55`), and cap (`8`) — so they agree there; with an embedder
-//! wired in they can produce different merge sets. Reconciling the two so
-//! this pass can *replace* the live autonomy Pass-1 (the Pillar-2.5 slice-3
-//! cutover) is a behavior-affecting change, NOT a pure refactor, and is
-//! tracked separately (#1740). Today the pass is wired only as a gated,
-//! observe-only shadow (#1738) plus Stage-6 rollback (#1739).
+//! A SAL-trait (`MemoryStore`) consolidator. Its clustering is **reconciled
+//! to** `crate::autonomy::find_consolidation_clusters` (#1741): a candidate
+//! pair merges iff it passes a **Jaccard pre-filter AND a cosine gate** — both
+//! when embeddings are available, Jaccard-only per-pair when an embedding is
+//! absent (including when no `Embedder` is wired, matching autonomy on a corpus
+//! with no stored embeddings). Clustering lives in
+//! [`ConsolidationClustering`](super::cluster::ConsolidationClustering); the
+//! per-pair decision is the pure `super::cluster::pair_merges`, unit-tested
+//! deterministically without a live `Embedder`. Thresholds/cap are pinned
+//! equal to autonomy's `CONSOLIDATE_*` by the `constants_match_autonomy` test.
 //!
-//! ## Primary / fallback paths
-//!
-//! * **Primary** — [`CosineClustering`] on 384-dim MiniLM embeddings when
-//!   an `Embedder` is wired in.
-//! * **Fallback** — [`JaccardClustering`] when no embedder is available or
-//!   when the cosine pass produces zero clusters.
-//!
-//! Jaccard acts as a cheap pre-filter only: the cluster membership check
-//! happens in `cluster()`, not in the summarise/persist steps.
+//! Status: wired as a gated, observe-only dry-run shadow (#1738) + Stage-6
+//! rollback (#1739). Flipping it to the *live* consolidator (replacing the
+//! autonomy Pass-1 when `compaction.enabled`) is the separate slice-3b cutover;
+//! clustering parity (this module, #1741) is its prerequisite.
 //!
 //! ## Hook events
 //!
@@ -65,7 +55,7 @@ use crate::store::{CallerContext, MemoryStore, StoreError};
 use crate::hooks::events::HookEvent;
 
 #[cfg(feature = "sal")]
-use super::cluster::{CosineClustering, JaccardClustering};
+use super::cluster::ConsolidationClustering;
 #[cfg(feature = "sal")]
 use super::pipeline::MemoryId;
 
@@ -103,8 +93,9 @@ pub(crate) struct ConsolidationPass<'a> {
     pub(crate) ctx: CallerContext,
     /// LLM client for `summarize_memories`.
     pub(crate) llm: &'a dyn AutonomyLlm,
-    /// Embedding engine for cosine clustering (primary path).
-    /// When `None`, falls back to Jaccard.
+    /// Embedding engine for the cosine gate in [`ConsolidationClustering`].
+    /// When `None`, clustering is Jaccard-only (autonomy parity on a corpus
+    /// with no stored embeddings).
     pub(crate) embedder: Option<Embedder>,
     /// Suppress all writes (simulate-only).
     pub(crate) dry_run: bool,
@@ -139,9 +130,9 @@ pub(crate) struct ConsolidationRunReport {
 // L1-7 minimum slice: the struct + its methods are defined but the
 // autonomy-loop call-site wiring is still pending (the live daemon
 // consolidation currently routes through `autonomy::run_autonomy_passes`).
-// `ConsolidationPass` is exercised by the unit tests in this file; the
-// `dead_code` allow keeps the scaffolding (and the `CosineClustering` /
-// `JaccardClustering` it drives) live until the loop wiring lands.
+// `ConsolidationPass` is exercised by the unit tests in this file + the gated
+// dry-run shadow (#1738); the `dead_code` allow keeps the not-yet-live-path
+// methods (real persist / verify reached only when `compaction.enabled`) quiet.
 #[cfg(feature = "sal")]
 #[allow(dead_code)]
 impl<'a> ConsolidationPass<'a> {
@@ -166,21 +157,15 @@ impl<'a> ConsolidationPass<'a> {
         "consolidation"
     }
 
-    /// Partition `memories` into clusters using cosine similarity (primary)
-    /// with Jaccard fallback.
+    /// Partition `memories` into clusters via [`ConsolidationClustering`] —
+    /// the reconciled Jaccard-pre-filter-AND-cosine-gate algorithm (#1741),
+    /// matching `crate::autonomy::find_consolidation_clusters`. When
+    /// `self.embedder` is `None` every pair falls back to Jaccard-only,
+    /// matching autonomy on a corpus with no stored embeddings.
     ///
     /// Each cluster element is a `MemoryId` (the memory's `id` field).
     fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
-        // Primary path: cosine similarity on MiniLM embeddings.
-        let cosine = CosineClustering::new(self.embedder.clone());
-        let cosine_clusters = cosine.cluster_memories(memories);
-        if !cosine_clusters.is_empty() {
-            return cosine_clusters;
-        }
-
-        // Fallback: Jaccard keyword overlap (v0.6.x-compatible).
-        let jaccard = JaccardClustering::default();
-        jaccard.cluster_memories(memories)
+        ConsolidationClustering::new(self.embedder.clone()).cluster_memories(memories)
     }
 
     /// A cluster is eligible when it has ≥ 2 members, all share the same
@@ -729,7 +714,8 @@ mod tests {
 
         #[test]
         fn cluster_via_jaccard_fallback_returns_clusters() {
-            // No embedder → cosine returns empty → falls back to Jaccard.
+            // No embedder → ConsolidationClustering runs Jaccard-only; the
+            // identical-content pair passes the Jaccard pre-filter → 1 cluster.
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
             let pass = ConsolidationPass::new(&store, &llm, None, false);
@@ -931,8 +917,9 @@ mod tests {
 
         #[test]
         fn cluster_via_cosine_primary_when_embedder_available() {
-            // Drives line 106 (cosine-clusters early-return). Requires a real
-            // Embedder — skip if HF model not cached.
+            // With an embedder, ConsolidationClustering applies BOTH gates;
+            // the identical-content pair passes Jaccard AND cosine → 1 cluster.
+            // Requires a real Embedder — skip if the HF model isn't cached.
             let Some(embedder) = crate::embeddings::Embedder::new_local().ok() else {
                 return;
             };

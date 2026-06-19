@@ -86,8 +86,8 @@ pub struct CompactionConfig {
     /// namespace entirely.  Set to `true` to opt in.
     #[serde(default)]
     pub enabled: bool,
-    /// Cosine similarity threshold for cluster formation.
-    /// Passed through to [`crate::curator::cluster::CosineClustering`].
+    /// Cosine similarity threshold for cluster formation (the cosine gate in
+    /// [`crate::curator::cluster::ConsolidationClustering`]).
     /// Defaults to `0.75` when omitted.
     #[serde(default = "default_cosine_threshold")]
     pub cosine_threshold: f32,
