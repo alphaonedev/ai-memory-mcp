@@ -114,6 +114,11 @@ pub(crate) struct ConsolidationRunReport {
     /// Source memories actually folded into a consolidated summary. Always
     /// 0 under `dry_run` (slice-1 shadow).
     pub(crate) memories_consolidated: usize,
+    /// Operator-reversible `RollbackEntry::Consolidate` rows persisted to
+    /// `_curator/rollback` (#1745) — one per verified consolidation, so
+    /// `ai-memory curator --rollback` can reverse a hard-DELETE merge, at
+    /// parity with the autonomy Pass-1 path. Always 0 under `dry_run`.
+    pub(crate) rollback_entries_written: usize,
     /// Clusters rolled back after a failed `verify` (Stage-6, #664): the
     /// pre-merge sources were restored and the unverifiable summary removed.
     pub(crate) rolled_back: usize,
@@ -250,14 +255,19 @@ impl<'a> ConsolidationPass<'a> {
         })
     }
 
-    /// Persist the consolidated memory and soft-delete the sources.
+    /// Persist the consolidated memory and hard-delete the sources.
     ///
     /// Delegates to [`MemoryStore::consolidate`] (same logic as the
-    /// v0.6.x path) so the DB transaction, rollback log, and
-    /// `derived_from` links are identical to the pre-refactor behaviour.
-    /// The SQLite adapter routes this through `db::consolidate`; the
-    /// Postgres adapter through its native sqlx `consolidate` (issue
-    /// #1548).
+    /// v0.6.x path) so the DB transaction and `derived_from` links are
+    /// identical to the pre-refactor behaviour. The SQLite adapter routes
+    /// this through `db::consolidate`; the Postgres adapter through its
+    /// native sqlx `consolidate` (issue #1548).
+    ///
+    /// NOTE: `consolidate` itself does NOT write an operator-reversible
+    /// rollback row — that is persisted separately by
+    /// [`Self::persist_rollback`] on the happy path in [`Self::run`],
+    /// mirroring how `autonomy::run_autonomy_passes` wraps its Pass-1
+    /// `consolidate_cluster` with a `RollbackEntry` (#1745).
     ///
     /// Returns the **id of the newly-written consolidated memory** so the
     /// caller can hand it to [`Self::verify`] (the consolidate path mints
@@ -282,6 +292,29 @@ impl<'a> ConsolidationPass<'a> {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
         Ok(new_id)
+    }
+
+    /// Persist an operator-reversible `RollbackEntry::Consolidate` snapshot
+    /// to `_curator/rollback` (#1745) so `ai-memory curator --rollback` can
+    /// reverse this hard-DELETE consolidation — at parity with the autonomy
+    /// Pass-1 path, which wraps every `consolidate_cluster` with the same
+    /// entry. Backend-agnostic: reuses [`crate::autonomy::build_rollback_memory`]
+    /// (the exact row shape `reverse_rollback_entry` reads) and writes it via
+    /// [`MemoryStore::store`], so the SQLite and Postgres adapters both land an
+    /// identical, reversible row. Called on the verified happy path only — a
+    /// `verify`-fail cluster is auto-restored by [`Self::rollback_consolidation`]
+    /// instead, so no rollback entry is left pointing at a reversed merge.
+    async fn persist_rollback(&self, originals: &[Memory], result_id: &str) -> Result<()> {
+        let entry = crate::autonomy::RollbackEntry::Consolidate {
+            originals: originals.to_vec(),
+            result_id: result_id.to_string(),
+        };
+        let mem = crate::autonomy::build_rollback_memory(&entry)?;
+        self.store
+            .store(&self.ctx, &mem)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(())
     }
 
     /// Verify the consolidated summary is readable from the store.
@@ -392,6 +425,19 @@ impl<'a> ConsolidationPass<'a> {
                     self.name()
                 ));
                 continue;
+            }
+
+            // Happy path — the consolidation verified and sticks. Persist an
+            // operator-reversible rollback snapshot (#1745) so a bad merge can
+            // be undone via `curator --rollback`, matching autonomy Pass-1
+            // parity. Best-effort: a rollback-log write failure is recorded but
+            // does not un-count the (successful, verified) consolidation.
+            match self.persist_rollback(&members, &new_id).await {
+                Ok(()) => report.rollback_entries_written += 1,
+                Err(e) => report.errors.push(format!(
+                    "{}: rollback-log write failed (consolidation kept): {e}",
+                    self.name()
+                )),
             }
             report.memories_consolidated += members.len();
         }
@@ -1076,6 +1122,65 @@ mod tests {
             assert!(
                 rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "a consolidated row must exist"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_real_mode_persists_reversible_rollback_entry() {
+            // #1745 — real-mode consolidation must leave an operator-reversible
+            // RollbackEntry::Consolidate in _curator/rollback so
+            // `curator --rollback` can undo the hard-DELETE merge, at parity
+            // with the autonomy Pass-1 path.
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synthesised consolidation");
+            let pass = ConsolidationPass::new(&store, &llm, false /* real */);
+
+            let out = pass.run(&candidates).await.unwrap();
+            assert_eq!(out.memories_consolidated, 2);
+            assert_eq!(
+                out.rollback_entries_written, 1,
+                "one reversible rollback entry per verified consolidation"
+            );
+
+            // A _curator/rollback row landed, tagged as a consolidate entry.
+            let log = crate::db::list(
+                &conn,
+                Some("_curator/rollback"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(log.len(), 1, "exactly one rollback entry written");
+            assert!(log[0].content.contains("consolidate"));
+
+            // Round-trip: the entry deserialises and reverses via the SAME
+            // operator path — originals restored, consolidated summary removed —
+            // proving end-to-end `--rollback` parity, not just a written row.
+            let entry: crate::autonomy::RollbackEntry =
+                serde_json::from_str(&log[0].content).unwrap();
+            let applied = crate::autonomy::reverse_rollback_entry(&conn, &entry).unwrap();
+            assert!(applied, "reverse applied");
+            for m in &candidates {
+                assert!(
+                    crate::db::get(&conn, &m.id).unwrap().is_some(),
+                    "{} restored by --rollback",
+                    m.id
+                );
+            }
+            let rows =
+                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
+                    .unwrap();
+            assert!(
+                !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                "consolidated summary removed by rollback"
             );
         }
 
