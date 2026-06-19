@@ -174,6 +174,14 @@ pub async fn run(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     if args.rollback.is_some() || args.rollback_last.is_some() {
+        // #1748 (slice-3c2) — when `--store-url` selects a (postgres) SAL
+        // store, reverse the rollback rows the store-backed curator wrote
+        // (slice-3c1) through the `MemoryStore` trait; the rusqlite path
+        // below only ever sees the local SQLite file.
+        #[cfg(feature = "sal")]
+        if curator_store_url(args).is_some() {
+            return run_store_backed_rollback(db_path, args, app_config, out).await;
+        }
         return run_rollback(db_path, args, out);
     }
 
@@ -325,17 +333,12 @@ async fn run_store_backed_sweep(
         exclude_namespaces: args.exclude_namespaces.clone(),
         compaction: curator_compaction_config(app_config),
     };
-    // A remote (postgres) store-url means rollback rows the pass writes are not
-    // reachable by the rusqlite-bound `curator --rollback` yet (#1748).
-    let store_is_remote = curator_store_url(args).is_some_and(|u| u.starts_with("postgres"));
-
     if args.once {
         // Consolidation BEFORE reflection (dedup, then reflect over survivors).
         let consolidation = store_backed_consolidation_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
             &curator_cfg,
-            store_is_remote,
         )
         .await;
         log_store_backed_consolidation(&consolidation);
@@ -384,7 +387,6 @@ async fn run_store_backed_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
             &curator_cfg,
-            store_is_remote,
         )
         .await;
         log_store_backed_consolidation(&consolidation);
@@ -465,11 +467,11 @@ async fn store_backed_reflection_sweep(
 /// near-duplicate sources happens before reflection links over the surviving
 /// corpus — avoiding dangling `reflects_on` edges to consolidated-away rows.
 ///
-/// **Rollback caveat (#1748):** on a remote (postgres) store the
-/// operator-reversible rollback rows the pass writes are NOT yet reachable by
-/// `ai-memory curator --rollback` (that path is rusqlite-bound); a WARN is
-/// emitted so the operator is not misled. The store-backed reversal SAL-port is
-/// slice-3c2 (#1748).
+/// **Rollback (#1748, slice-3c2):** the operator-reversible rollback rows the
+/// pass writes ARE reversible on both backends — `ai-memory curator --rollback
+/// [--store-url postgres://…]` dispatches to
+/// [`crate::autonomy::reverse_rollback_entry_store`] over the `MemoryStore`
+/// trait. (The slice-3c1 remote-store WARN is gone now that reversal works.)
 ///
 /// Decision provenance: 5-agent vote `4d3ea1c5` (#1747).
 #[cfg(feature = "sal")]
@@ -477,7 +479,6 @@ async fn store_backed_consolidation_sweep(
     store: &dyn MemoryStore,
     llm: Option<&dyn autonomy::AutonomyLlm>,
     cfg: &curator::CuratorConfig,
-    store_is_remote: bool,
 ) -> curator::compaction::ConsolidationRunReport {
     let mut report = curator::compaction::ConsolidationRunReport::default();
     if !cfg.compaction.enabled {
@@ -489,17 +490,6 @@ async fn store_backed_consolidation_sweep(
             .push("no LLM client configured — consolidation skipped".to_string());
         return report;
     };
-    if store_is_remote {
-        tracing::warn!(
-            target: curator::compaction::COMPACTION_TRACE_TARGET,
-            "compaction.enabled on a store-url (postgres) backend: consolidation \
-             HARD-DELETEs the merged source memories, and that delete is NOT yet \
-             reversible via `ai-memory curator --rollback` on this backend (the \
-             reversal path is rusqlite-bound; see #1748). The reversible rollback \
-             rows ARE written and will become reversible once #1748 lands."
-        );
-    }
-
     let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
     let namespaces = match store.list_namespaces().await {
         Ok(ns) => ns,
@@ -912,6 +902,85 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
     // preserves the audit message but keeps the failure recoverable (typed
     // CLI exit code) instead of crashing the process with a panic.
     anyhow::bail!("run_rollback entered without --rollback or --rollback-last");
+}
+
+/// v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed twin of
+/// [`run_rollback`]. Dispatched from [`run`] when `--store-url` selects a
+/// (postgres) SAL store, so `curator --rollback[-last] --store-url
+/// postgres://…` reverses the consolidations the store-backed curator
+/// wrote (slice-3c1, #1747) through
+/// [`autonomy::reverse_rollback_entry_store`] over the
+/// [`crate::store::MemoryStore`] trait — rather than the rusqlite-bound
+/// [`autonomy::reverse_rollback_entry`], which only ever sees the local
+/// SQLite file. Closes the slice-3c1 rollback-trap (the WARN in
+/// [`store_backed_consolidation_sweep`] is removed accordingly).
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` → Option B (memory `ed85b972`).
+#[cfg(feature = "sal")]
+async fn run_store_backed_rollback(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let store =
+        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
+            .await?;
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+
+    if let Some(id) = &args.rollback {
+        let mem = match store.get(&ctx, id).await {
+            Ok(m) => m,
+            Err(crate::store::StoreError::NotFound { .. }) => {
+                anyhow::bail!("rollback entry {id} not found");
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let entry: autonomy::RollbackEntry = serde_json::from_str(&mem.content)
+            .context("rollback entry content is not a valid RollbackEntry JSON")?;
+        let applied = autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+        if !mem.tags.iter().any(|t| t == "_reversed") {
+            let mut tagged = mem.clone();
+            tagged.tags.push("_reversed".to_string());
+            store.store(&ctx, &tagged).await?;
+        }
+        writeln!(
+            out.stdout,
+            "rollback {id}: {}",
+            if applied { "applied" } else { "no-op" }
+        )?;
+        return Ok(());
+    }
+
+    if let Some(n) = args.rollback_last {
+        let filter = Filter {
+            namespace: Some("_curator/rollback".to_string()),
+            limit: n.max(1),
+            ..Default::default()
+        };
+        let log = store.list(&ctx, &filter).await?;
+        let mut reversed = 0usize;
+        for mem in &log {
+            if mem.tags.iter().any(|t| t == "_reversed") {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<autonomy::RollbackEntry>(&mem.content) else {
+                continue;
+            };
+            let applied =
+                autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+            if applied {
+                reversed += 1;
+                let mut tagged = mem.clone();
+                tagged.tags.push("_reversed".to_string());
+                store.store(&ctx, &tagged).await?;
+            }
+        }
+        writeln!(out.stdout, "reversed {reversed} rollback entries")?;
+        return Ok(());
+    }
+
+    anyhow::bail!("run_store_backed_rollback entered without --rollback or --rollback-last");
 }
 
 #[cfg(test)]
@@ -1855,7 +1924,6 @@ mod tests {
             &store,
             Some(&stub as &dyn crate::autonomy::AutonomyLlm),
             &cfg,
-            false,
         )
         .await;
         assert_eq!(
@@ -1889,7 +1957,6 @@ mod tests {
             &store,
             Some(&stub as &dyn crate::autonomy::AutonomyLlm),
             &cfg,
-            false,
         )
         .await;
         assert_eq!(
@@ -1918,7 +1985,7 @@ mod tests {
             ..Default::default()
         };
         // No LLM → folds an error into the report, never panics.
-        let report = store_backed_consolidation_sweep(&store, None, &cfg, false).await;
+        let report = store_backed_consolidation_sweep(&store, None, &cfg).await;
         assert_eq!(report.memories_consolidated, 0);
         assert!(
             report.errors.iter().any(|e| e.contains("no LLM")),

@@ -739,6 +739,113 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
     }
 }
 
+/// v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed, backend-agnostic
+/// twin of [`reverse_rollback_entry`]. Reverses a single rollback-log
+/// entry through the SAL [`crate::store::MemoryStore`] trait so
+/// `ai-memory curator --rollback --store-url postgres://…` reverses a
+/// consolidation the store-backed curator wrote (slice-3c1, #1747) —
+/// closing the "irreversible hard-DELETE behind a reversible-looking
+/// API" gap slice-3c1 disclosed via a runtime WARN.
+///
+/// Returns `true` if a reverse action was applied, `false` if the entry
+/// was already superseded (idempotent rollback) — mirroring
+/// [`reverse_rollback_entry`].
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` → Option B (free async
+/// fn over `&dyn MemoryStore`, 3/5; memory `ed85b972`). The two
+/// dissents' hazards are encoded as guardrails:
+///
+/// * **Collision guard (G2):** before reinserting a snapshot we ask the
+///   store whether a DIFFERENT id now owns the same `(title, namespace)`
+///   key (via [`crate::store::MemoryStore::find_by_title_namespace`]) and
+///   refuse — `store.store` is an UPSERT on that key and would silently
+///   clobber the unrelated row. Mirrors the rusqlite [`check_no_collision`].
+/// * **Fail-safe ordering (G3):** the `Consolidate` arm reinserts the
+///   originals BEFORE deleting the consolidated summary, so a crash mid-
+///   reversal never destroys the summary while the originals are still
+///   missing. The summary's `[consolidated]` title never collides with an
+///   original, so the ordering introduces no UPSERT hazard.
+/// * **Atomicity (G4):** the SAL trait's `begin_transaction` is
+///   Postgres-internal only (SQLite returns `UnsupportedCapability`), so a
+///   backend-agnostic free fn cannot wrap the multi-write in one
+///   transaction. The non-atomic window is EXACT PARITY with the rusqlite
+///   [`reverse_rollback_entry`] (also separate statements, no
+///   BEGIN/COMMIT); G3 ordering minimises it.
+#[cfg(feature = "sal")]
+pub async fn reverse_rollback_entry_store(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+    entry: &RollbackEntry,
+) -> Result<bool> {
+    use crate::store::StoreError;
+
+    // G2 — refuse to overwrite a memory that took the (title, namespace)
+    // slot after the rollback target was forgotten/consolidated.
+    async fn guard_no_collision(store: &dyn crate::store::MemoryStore, m: &Memory) -> Result<()> {
+        if let Some(existing) = store
+            .find_by_title_namespace(&m.title, &m.namespace)
+            .await?
+        {
+            if existing != m.id {
+                anyhow::bail!(
+                    "rollback refused: (title={:?}, namespace={:?}) is now owned by memory \
+                     {existing}, not the snapshot {} — resolve the conflict (delete the \
+                     offender or rename one) before reversing",
+                    m.title,
+                    m.namespace,
+                    m.id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    match entry {
+        RollbackEntry::Consolidate {
+            originals,
+            result_id,
+        } => {
+            for m in originals {
+                guard_no_collision(store, m).await?;
+            }
+            // G3 — reinsert the originals BEFORE deleting the summary.
+            for m in originals {
+                store.store(ctx, m).await?;
+            }
+            // Delete the consolidated summary; `NotFound` → already removed
+            // (idempotent no-op), matching the rusqlite `existed` bool.
+            match store.delete(ctx, result_id).await {
+                Ok(()) => Ok(true),
+                Err(StoreError::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }
+        RollbackEntry::Forget { snapshot } => {
+            guard_no_collision(store, snapshot).await?;
+            store.store(ctx, snapshot).await?;
+            Ok(true)
+        }
+        RollbackEntry::PriorityAdjust {
+            memory_id,
+            before,
+            after: _,
+        } => {
+            // Restore the prior priority. get → mutate → store (UPSERT on the
+            // existing (title, namespace): no new row, so no collision guard
+            // needed). `NotFound` → the row is gone (idempotent no-op).
+            match store.get(ctx, memory_id).await {
+                Ok(mut mem) => {
+                    mem.priority = *before;
+                    store.store(ctx, &mem).await?;
+                    Ok(true)
+                }
+                Err(StoreError::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }
+    }
+}
+
 /// Refuse to overwrite a memory that took the (title, namespace) slot
 /// after the rollback target was forgotten/consolidated.
 fn check_no_collision(
@@ -1178,6 +1285,107 @@ mod tests {
         if let RollbackEntry::Consolidate { result_id, .. } = &entry {
             assert!(db::get(&conn, result_id).unwrap().is_none());
         }
+    }
+
+    // v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed reversal over the
+    // SAL `MemoryStore` trait. Deterministic SQLite-backed twin of the
+    // rusqlite `reverse_consolidation_restores_originals`; the postgres arm
+    // is exercised by tests/cov_postgres_core.rs (soft-skips off-CI).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reverse_rollback_entry_store_restores_originals_sqlite() {
+        use crate::store::MemoryStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
+        let ctx = crate::store::CallerContext::for_admin("ai:test");
+
+        let a = sample_mem(
+            "a",
+            "app",
+            "Deploy plan",
+            "kubernetes rolling canary",
+            Tier::Long,
+        );
+        let b = sample_mem(
+            "b",
+            "app",
+            "Deploy process",
+            "kubernetes canary strategy",
+            Tier::Long,
+        );
+        let summary = sample_mem("c", "app", "[consolidated] Deploy", "merged", Tier::Long);
+
+        // Simulate the post-consolidation state: originals hard-deleted, the
+        // `[consolidated]` summary present, a reversible entry on hand.
+        store.store(&ctx, &summary).await.unwrap();
+        let entry = RollbackEntry::Consolidate {
+            originals: vec![a.clone(), b.clone()],
+            result_id: summary.id.clone(),
+        };
+        assert!(
+            store.get(&ctx, "a").await.is_err(),
+            "original absent pre-reverse"
+        );
+        assert!(
+            store.get(&ctx, &summary.id).await.is_ok(),
+            "summary present pre-reverse"
+        );
+
+        let applied = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap();
+        assert!(applied, "summary existed → reverse applied");
+
+        // Originals restored; summary removed.
+        assert!(store.get(&ctx, "a").await.is_ok(), "original a restored");
+        assert!(store.get(&ctx, "b").await.is_ok(), "original b restored");
+        assert!(
+            store.get(&ctx, &summary.id).await.is_err(),
+            "summary removed"
+        );
+
+        // Idempotent: a second reverse is a no-op (summary already gone).
+        let again = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap();
+        assert!(!again, "summary already removed → no-op");
+    }
+
+    // #1748 — the G2 collision guard: refuse to clobber a DIFFERENT memory
+    // that took the (title, namespace) slot, leaving the summary intact
+    // (G3 ordering guarantees the guard fires before any delete).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reverse_rollback_entry_store_collision_aborts_sqlite() {
+        use crate::store::MemoryStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
+        let ctx = crate::store::CallerContext::for_admin("ai:test");
+
+        let a = sample_mem("a", "app", "Deploy plan", "orig", Tier::Long);
+        let summary = sample_mem("c", "app", "[consolidated] Deploy", "merged", Tier::Long);
+        store.store(&ctx, &summary).await.unwrap();
+        // A DIFFERENT id now owns ("Deploy plan", "app").
+        let intruder = sample_mem("z", "app", "Deploy plan", "unrelated", Tier::Long);
+        store.store(&ctx, &intruder).await.unwrap();
+
+        let entry = RollbackEntry::Consolidate {
+            originals: vec![a],
+            result_id: summary.id.clone(),
+        };
+        let err = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("rollback refused"),
+            "expected collision refusal, got: {err}"
+        );
+        // Guard fired before the delete: summary and intruder both intact.
+        assert!(
+            store.get(&ctx, &summary.id).await.is_ok(),
+            "summary not deleted"
+        );
+        assert!(store.get(&ctx, "z").await.is_ok(), "intruder not clobbered");
     }
 
     #[test]

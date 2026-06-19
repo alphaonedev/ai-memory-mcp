@@ -741,3 +741,79 @@ async fn consolidate_merges_and_hard_deletes_sources() {
         "source b hard-deleted (get → NotFound)"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// reverse_rollback_entry_store (#1748 slice-3c2) — postgres-backed
+// reversal of a consolidation: the store-backed `curator --rollback`
+// path. Postgres twin of the SQLite `reverse_consolidation_restores_
+// originals` / the autonomy `reverse_rollback_entry_store_*_sqlite`
+// unit tests. Decision provenance: 5-agent vote 4d3ea1c5 → Option B
+// (free async fn over &dyn MemoryStore; memory ed85b972).
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn reverse_rollback_restores_consolidated_sources_pg() {
+    use ai_memory::autonomy::{RollbackEntry, reverse_rollback_entry_store};
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-rollback");
+    let ns = uid("rb-ns");
+    let a = uid("a");
+    let b = uid("b");
+    let dup = "kubernetes rolling canary deploy strategy notes pg rollback";
+    let mem_a = mem(&a, &ns, "rb-t1", dup);
+    let mem_b = mem(&b, &ns, "rb-t2", dup);
+    store.store(&ctx, &mem_a).await.expect("store a");
+    store.store(&ctx, &mem_b).await.expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] pg rollback",
+            "merged summary",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-rollback",
+        )
+        .await
+        .expect("consolidate");
+
+    // Post-consolidation: summary present, both sources hard-deleted.
+    store.get(&ctx, &new_id).await.expect("summary present");
+    assert!(store.get(&ctx, &a).await.is_err(), "a gone pre-reverse");
+    assert!(store.get(&ctx, &b).await.is_err(), "b gone pre-reverse");
+
+    // Reverse through the SAL trait — what `--rollback --store-url
+    // postgres://…` now dispatches to (#1748).
+    let entry = RollbackEntry::Consolidate {
+        originals: vec![mem_a, mem_b],
+        result_id: new_id.clone(),
+    };
+    let applied = reverse_rollback_entry_store(&store, &ctx, &entry)
+        .await
+        .expect("reverse");
+    assert!(applied, "summary existed → reverse applied");
+
+    // Originals restored; summary removed.
+    store.get(&ctx, &a).await.expect("a restored");
+    store.get(&ctx, &b).await.expect("b restored");
+    assert!(
+        store.get(&ctx, &new_id).await.is_err(),
+        "consolidated summary removed after reverse"
+    );
+
+    // Idempotent: a second reverse is a no-op (summary already gone).
+    let again = reverse_rollback_entry_store(&store, &ctx, &entry)
+        .await
+        .expect("reverse again");
+    assert!(!again, "summary already removed → no-op");
+
+    // Cleanup.
+    let _ = store.delete(&ctx, &a).await;
+    let _ = store.delete(&ctx, &b).await;
+}

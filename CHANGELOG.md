@@ -21,6 +21,29 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1748 (Pillar-2.5 slice-3c2) — store-backed (postgres) `curator --rollback` reversal.**
+  `ai-memory curator --rollback <id>` / `--rollback-last N` now reverses consolidations the
+  store-backed (postgres) curator wrote (slice-3c1, #1747). Previously the reversal was
+  rusqlite-bound (`autonomy::reverse_rollback_entry` over a `Connection`) and the `--rollback`
+  arm dispatched **before** the `--store-url` branch, so `--rollback --store-url postgres://…`
+  silently no-op'd on the local SQLite file — an irreversible hard-DELETE behind a
+  reversible-looking API. Added `autonomy::reverse_rollback_entry_store`, a backend-agnostic
+  free async fn over the `MemoryStore` trait (`find_by_title_namespace` collision-guard →
+  reinsert originals → delete summary), and a `run_store_backed_rollback` CLI path dispatched on
+  `--store-url` (mirroring `run_store_backed_sweep`). Covers all three `RollbackEntry` variants
+  (Consolidate / Forget / PriorityAdjust). The slice-3c1 runtime WARN is removed now that
+  reversal works on postgres. Guardrails (from the 5-agent vote `4d3ea1c5` → Option B, memory
+  `ed85b972`): a `(title,namespace)` collision guard refuses to clobber a different occupant
+  (the trait `store` is an UPSERT); originals are reinserted **before** the summary is deleted
+  (fail-safe ordering). **Atomicity:** the SAL `begin_transaction` is postgres-internal only
+  (SQLite returns `UnsupportedCapability`), so the free fn cannot wrap the multi-write in one
+  transaction — the non-atomic window is exact parity with the rusqlite path (also non-atomic),
+  minimised by the reinsert-before-delete ordering. Tests: deterministic `SqliteStore` round-trip
+  + collision-abort unit tests (`src/autonomy.rs`) and a gated `sal-postgres` round-trip
+  (`tests/cov_postgres_core.rs`, the postgres twin of the SQLite
+  `reverse_consolidation_restores_originals`). Code anchors: `src/autonomy.rs`
+  (`reverse_rollback_entry_store`), `src/cli/curator.rs` (`run_store_backed_rollback`, dispatch in
+  `run`, WARN removed from `store_backed_consolidation_sweep`).
 - **#1749 (Pillar-2.5 activation) — `[curator.compaction].enabled` is now operator-configurable.**
   The curator's Pillar-2.5 consolidation gate (`CompactionConfig.enabled`) was hardcoded
   `default()` (false) at every production build site, leaving the whole shipped consolidation
@@ -32,9 +55,9 @@ lifecycle surface adds only permissive optional fields to the existing
   caller). Default stays **false (opt-in)**; enabling makes the SAL `ConsolidationPass` the live
   consolidator (hard-DELETE merge of near-duplicates, suppressing autonomy Pass-1). Strengthens
   the Pillar-2.5 §2.4 *improvable* property by making the pipeline reachable. **Reversibility:**
-  consolidations are operator-reversible via `curator --rollback` on **sqlite** (#1745); on
-  **postgres** that reversal is not yet wired (#1748) and the curator emits a runtime WARN naming
-  the hard-DELETE + the gap. Scoped to `enabled` only this slice — the clustering `cosine_threshold`
+  consolidations are operator-reversible via `curator --rollback` on **sqlite** (#1745) **and
+  postgres** (the SAL-port landed in #1748; the earlier runtime WARN is gone). Scoped to
+  `enabled` only this slice — the clustering `cosine_threshold`
   (currently unwired into the pass) and the size-GC `max_corpus_bytes` (an independent eviction
   trigger) are intentionally left at defaults and tracked as a follow-up, per the 5-agent crossroads
   vote (memory `4d3ea1c5`). Tests: resolver precedence (`tests/config_precedence.rs`) + config-field
