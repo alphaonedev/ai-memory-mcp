@@ -2514,6 +2514,28 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// Fetch a memory's stored embedding vector by id, or `None` when the
+    /// row is missing or has no embedding (keyword-tier / never-embedded /
+    /// store-time-skipped). A backend-agnostic read of the *stored* vector —
+    /// the curator's `ConsolidationPass` reads this (NOT a live re-embed) so
+    /// its cosine gate matches the live `autonomy::find_consolidation_clusters`
+    /// embedding source exactly (#1741/#1743). SQLite delegates to
+    /// `crate::db::get_embedding`; Postgres reads its pgvector `embedding`
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_embedding(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<Vec<f32>>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_EMBEDDING".to_string(),
+        })
+    }
+
     /// Pick a title that does not collide with an existing
     /// `(title, namespace)` row by appending `(2)`, `(3)`, ... up to
     /// the substrate's hard cap. Used by `on_conflict='version'`.

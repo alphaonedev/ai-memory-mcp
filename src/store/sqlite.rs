@@ -1753,6 +1753,11 @@ impl MemoryStore for SqliteStore {
         db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
     }
 
+    async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
+        let conn = self.state.lock().await;
+        db::get_embedding(&conn, id).map_err(box_err)
+    }
+
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
         let conn = self.state.lock().await;
         db::next_versioned_title(&conn, base_title, namespace).map_err(box_err)
