@@ -98,6 +98,29 @@ pub(crate) struct ConsolidationPass<'a> {
     pub(crate) dry_run: bool,
 }
 
+/// Structured outcome of one [`ConsolidationPass::run`] sweep.
+///
+/// Aggregated into the curator cycle's `CuratorReport`. In the slice-1
+/// shadow wiring (#1738) the pass runs `dry_run = true`, so
+/// `eligible_clusters` carries the observability signal (how many clusters
+/// the SAL pass *would* consolidate) while `memories_consolidated` stays 0
+/// — the real persist + the autonomy-Pass-1 cutover land in slice-3.
+#[cfg(feature = "sal")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConsolidationRunReport {
+    /// Total clusters the clustering step formed (≥ 2 members each).
+    pub(crate) clusters_formed: usize,
+    /// Clusters that passed [`ConsolidationPass::eligible`] — the work the
+    /// pass would (dry-run) or did (real) act on.
+    pub(crate) eligible_clusters: usize,
+    /// Source memories actually folded into a consolidated summary. Always
+    /// 0 under `dry_run` (slice-1 shadow).
+    pub(crate) memories_consolidated: usize,
+    /// Per-cluster errors (summarise / persist / verify). Best-effort: one
+    /// cluster failing does not abort the sweep.
+    pub(crate) errors: Vec<String>,
+}
+
 // L1-7 minimum slice: the struct + its methods are defined but the
 // autonomy-loop call-site wiring is still pending (the live daemon
 // consolidation currently routes through `autonomy::run_autonomy_passes`).
@@ -233,12 +256,16 @@ impl<'a> ConsolidationPass<'a> {
     /// Postgres adapter through its native sqlx `consolidate` (issue
     /// #1548).
     ///
-    /// No-op when `self.dry_run = true`.
-    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<()> {
+    /// Returns the **id of the newly-written consolidated memory** so the
+    /// caller can hand it to [`Self::verify`] (the consolidate path mints
+    /// its own id, distinct from `summary.id`). No-op returning an empty
+    /// id when `self.dry_run = true` or `sources` is empty.
+    async fn persist(&self, summary: &Memory, sources: &[MemoryId]) -> Result<String> {
         if self.dry_run || sources.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
-        self.store
+        let new_id = self
+            .store
             .consolidate(
                 &self.ctx,
                 sources,
@@ -251,7 +278,7 @@ impl<'a> ConsolidationPass<'a> {
             )
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(())
+        Ok(new_id)
     }
 
     /// Verify the consolidated summary is readable from the store.
@@ -267,6 +294,90 @@ impl<'a> ConsolidationPass<'a> {
             ),
             Err(e) => Err(anyhow::anyhow!(e)),
         }
+    }
+
+    /// Drive the full six-step compaction lifecycle over `candidates`:
+    /// `cluster` → resolve members → `eligible` → `summarize` → `persist`
+    /// → `verify`. Returns a [`ConsolidationRunReport`]; per-cluster
+    /// failures are recorded in `report.errors` and never abort the sweep.
+    ///
+    /// **Dry-run (slice-1 shadow, #1738):** when `self.dry_run` is set the
+    /// sweep stops after `eligible` — it counts what it *would* consolidate
+    /// (`eligible_clusters`) without any LLM summarise, DB write, or verify.
+    /// This is how the curator wires the pass in as an observe-only shadow
+    /// that does not double-consolidate against the live autonomy Pass-1.
+    ///
+    /// **Real mode (slice-3 cutover):** summarise → persist → verify run.
+    /// On a `verify` failure the notify-only `OnCompactionRollback` signal
+    /// is logged (rollback itself is deferred to #664 — slice-2); the
+    /// cluster is skipped and the sweep continues.
+    pub(crate) async fn run(&self, candidates: &[Memory]) -> Result<ConsolidationRunReport> {
+        let mut report = ConsolidationRunReport::default();
+
+        let clusters = self.cluster(candidates);
+        report.clusters_formed = clusters.len();
+
+        // id -> &Memory lookup so cluster member-ids resolve back to rows.
+        let index: std::collections::HashMap<&str, &Memory> =
+            candidates.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        for cluster_ids in clusters {
+            let members: Vec<Memory> = cluster_ids
+                .iter()
+                .filter_map(|id| index.get(id.as_str()).copied().cloned())
+                .collect();
+            // A member that isn't in the candidate batch means the cluster
+            // is stale; skip rather than consolidate a partial cluster.
+            if members.len() != cluster_ids.len() {
+                continue;
+            }
+            if !self.eligible(&members) {
+                continue;
+            }
+            report.eligible_clusters += 1;
+
+            // Shadow stops here: count eligibility, do not mutate.
+            if self.dry_run {
+                continue;
+            }
+
+            let summary = match self.summarize(&members) {
+                Ok(s) => s,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{}: summarize failed: {e}", self.name()));
+                    continue;
+                }
+            };
+            let new_id = match self.persist(&summary, &cluster_ids).await {
+                Ok(id) => id,
+                Err(e) => {
+                    report
+                        .errors
+                        .push(format!("{}: persist failed: {e}", self.name()));
+                    continue;
+                }
+            };
+            if let Err(e) = self.verify(new_id.clone()).await {
+                // Notify-only `OnCompactionRollback`: rollback itself is
+                // deferred to #664 (slice-2). Log + record, keep sweeping.
+                tracing::warn!(
+                    target: "curator::compaction",
+                    pass = self.name(),
+                    summary_id = %new_id,
+                    error = %e,
+                    "consolidation verify failed (rollback deferred to #664)"
+                );
+                report
+                    .errors
+                    .push(format!("{}: verify failed: {e}", self.name()));
+                continue;
+            }
+            report.memories_consolidated += members.len();
+        }
+
+        Ok(report)
     }
 }
 
@@ -787,6 +898,88 @@ mod tests {
             assert!(
                 res.is_err(),
                 "expected consolidate to fail on missing sources"
+            );
+        }
+
+        // ---- run() orchestration (#1738 slice-1) ----------------------------
+
+        /// Seed two near-duplicate memories (high Jaccard overlap, same ns,
+        /// no embedder → Jaccard clustering) and return their live ids +
+        /// in-memory `Memory` rows for use as `run` candidates.
+        fn seed_two_dupes(conn: &rusqlite::Connection) -> Vec<Memory> {
+            let m1 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "ns",
+                "t1",
+                "kubernetes rolling canary deploy strategy notes",
+                Tier::Mid,
+                5,
+            );
+            let m2 = make_memory_full(
+                &uuid::Uuid::new_v4().to_string(),
+                "ns",
+                "t2",
+                "kubernetes rolling canary deploy strategy notes",
+                Tier::Mid,
+                5,
+            );
+            crate::db::insert(conn, &m1).unwrap();
+            crate::db::insert(conn, &m2).unwrap();
+            vec![m1, m2]
+        }
+
+        #[tokio::test]
+        async fn run_dry_run_counts_eligible_without_writing() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synth");
+            let pass = ConsolidationPass::new(&store, &llm, None, true /* dry_run */);
+
+            let out = pass.run(&candidates).await.unwrap();
+            assert!(out.clusters_formed >= 1, "should form ≥1 cluster");
+            assert!(out.eligible_clusters >= 1, "the dup cluster is eligible");
+            assert_eq!(out.memories_consolidated, 0, "dry-run must not consolidate");
+            // No LLM summarise happened in dry-run.
+            assert!(
+                llm.calls.lock().unwrap().is_empty(),
+                "dry-run skips summarize"
+            );
+            // No `[consolidated]` row was written; both sources still live.
+            let rows =
+                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
+                    .unwrap();
+            assert!(
+                !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                "dry-run must not write a consolidated row"
+            );
+            assert_eq!(rows.len(), 2, "both source rows remain");
+        }
+
+        #[tokio::test]
+        async fn run_real_mode_consolidates_cluster() {
+            let (store, _dir) = open_db();
+            let conn = conn_of(&store);
+            let candidates = seed_two_dupes(&conn);
+            let llm = StubLlm::new("synthesised consolidation");
+            let pass = ConsolidationPass::new(&store, &llm, None, false /* real */);
+
+            let out = pass.run(&candidates).await.unwrap();
+            assert!(out.clusters_formed >= 1);
+            assert!(out.eligible_clusters >= 1);
+            assert_eq!(out.memories_consolidated, 2, "both sources folded in");
+            assert!(
+                out.errors.is_empty(),
+                "no per-cluster errors: {:?}",
+                out.errors
+            );
+            // The `[consolidated]` row landed and the sources were soft-deleted.
+            let rows =
+                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
+                    .unwrap();
+            assert!(
+                rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+                "a consolidated row must exist"
             );
         }
     } // mod sal_pass_tests
