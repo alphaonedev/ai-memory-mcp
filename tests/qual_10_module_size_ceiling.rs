@@ -253,7 +253,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `read_gate_parity_1730` test module (the parity guard asserting every
     // MCP read surface routes through `gate_read`) landed the file at 14_858.
     // +42 headroom.
-    ("src/mcp/mod.rs", 14_900),
+    // 2026-06-19 (#1714 Pillar-1) — bumped 14_900 → 15_050: the MCP
+    // signal-ack → PostSignalAck hook bridge (POST_SIGNAL_ACK_SINK global +
+    // set_post_signal_ack_sink + build_mcp_signal_hooks + the inert-by-default
+    // run_mcp_server serve-init wiring + two build_mcp_signal_hooks unit
+    // tests) landed the file at 15_011.
+    ("src/mcp/mod.rs", 15_050),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
