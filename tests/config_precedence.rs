@@ -342,7 +342,10 @@ fn test_compaction_enabled_env_overrides_config_and_default() {
         curator: Some(CuratorSection {
             reflection_namespaces: None,
             confidence_decay_half_life_days: None,
-            compaction: Some(CuratorCompactionSection { enabled }),
+            compaction: Some(CuratorCompactionSection {
+                enabled,
+                cosine_threshold: None,
+            }),
         }),
         ..AppConfig::default()
     };
@@ -382,6 +385,71 @@ fn test_compaction_enabled_env_overrides_config_and_default() {
     assert!(
         !cfg(Some(false)).resolve_compaction_enabled(),
         "garbage env falls through to config=false"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1750 — `[curator.compaction].cosine_threshold` precedence:
+//   AI_MEMORY_COMPACTION_COSINE_THRESHOLD env > [curator.compaction] > 0.75.
+//   A parseable f32 in (0.0, 1.0] wins; unparseable / out-of-range falls
+//   through to the config field then the compiled default.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_compaction_cosine_threshold_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, CuratorCompactionSection, CuratorSection};
+
+    let cfg = |ct: Option<f32>| AppConfig {
+        curator: Some(CuratorSection {
+            reflection_namespaces: None,
+            confidence_decay_half_life_days: None,
+            compaction: Some(CuratorCompactionSection {
+                enabled: None,
+                cosine_threshold: ct,
+            }),
+        }),
+        ..AppConfig::default()
+    };
+    // The compiled default is DEFAULT_COSINE_THRESHOLD (pub(crate), so not
+    // visible from this external test crate); pinned literal 0.75.
+    let default = 0.75_f32;
+    let close = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+
+    // ---- unset env → config field wins; absent config → 0.75 ----
+    let g = EnvVarGuard::remove("AI_MEMORY_COMPACTION_COSINE_THRESHOLD");
+    assert!(close(
+        cfg(Some(0.9)).resolve_compaction_cosine_threshold(),
+        0.9
+    ));
+    assert!(
+        close(
+            AppConfig::default().resolve_compaction_cosine_threshold(),
+            default
+        ),
+        "no env + no config → compiled default 0.75"
+    );
+    drop(g);
+
+    // ---- env wins over config ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "0.6".to_string());
+    assert!(
+        close(cfg(Some(0.9)).resolve_compaction_cosine_threshold(), 0.6),
+        "env=0.6 MUST beat config=0.9"
+    );
+    drop(g);
+
+    // ---- out-of-range env → falls through to config ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "1.5".to_string());
+    assert!(
+        close(cfg(Some(0.8)).resolve_compaction_cosine_threshold(), 0.8),
+        "out-of-range env falls through to config=0.8"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to config ----
+    let _g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "high".to_string());
+    assert!(
+        close(cfg(Some(0.7)).resolve_compaction_cosine_threshold(), 0.7),
+        "garbage env falls through to config=0.7"
     );
 }
 

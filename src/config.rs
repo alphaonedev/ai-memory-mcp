@@ -3546,15 +3546,24 @@ pub struct CuratorSection {
 /// near-duplicate memories. Default `false` (opt-in). Consolidations are
 /// operator-reversible via `ai-memory curator --rollback` on **sqlite** (#1745);
 /// on **postgres** that reversal is not yet wired (#1748) and the curator emits
-/// a runtime WARN. The clustering `cosine_threshold` + size-GC
-/// `max_corpus_bytes` knobs are intentionally NOT exposed here yet — they need
-/// consumer wiring / independent gating first (tracked follow-up).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// a runtime WARN. The clustering `cosine_threshold` is operator-tunable here
+/// (#1750, threaded into the live clusterer). The size-GC `max_corpus_bytes`
+/// knob is still intentionally NOT exposed — when it is, it must get its own
+/// dedicated `[curator.size_gc]` switch rather than ride under this block
+/// (#1750 5-agent vote, memory `a9b2fe09`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CuratorCompactionSection {
     /// When `true`, the curator runs the SAL `ConsolidationPass` live. Default
     /// `false`. Env override: `AI_MEMORY_COMPACTION_ENABLED` (see
     /// [`ENV_COMPACTION_ENABLED`]).
     pub enabled: Option<bool>,
+    /// #1750 — cosine similarity gate for consolidation cluster formation.
+    /// `None` → the compiled default (`0.75`,
+    /// [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]). Env override:
+    /// `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` (see
+    /// [`ENV_COMPACTION_COSINE_THRESHOLD`]). Threaded into the live clusterer via
+    /// `ConsolidationPass::with_cosine_threshold` (previously dead config).
+    pub cosine_threshold: Option<f32>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -4147,6 +4156,12 @@ pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
 /// (`1`/`true`) or falsy (`0`/`false`) wins over config; anything else falls
 /// through to the config field then the compiled default `false`.
 pub const ENV_COMPACTION_ENABLED: &str = "AI_MEMORY_COMPACTION_ENABLED";
+
+/// v0.8.0 #1750 — env override for `[curator.compaction].cosine_threshold`.
+/// A parseable `f32` in `(0.0, 1.0]` wins over config; an unparseable or
+/// out-of-range value falls through to the config field then the compiled
+/// default (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]).
+pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_THRESHOLD";
 
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
@@ -6927,6 +6942,36 @@ impl AppConfig {
             .and_then(|c| c.compaction.as_ref())
             .and_then(|c| c.enabled)
             .unwrap_or(false)
+    }
+
+    /// v0.8.0 #1750 — resolve the consolidation cosine gate threshold. Uniform
+    /// ladder: `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` env >
+    /// `[curator.compaction].cosine_threshold` config > compiled default
+    /// (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]). A value
+    /// is accepted only when it parses as `f32` and lies in `(0.0, 1.0]`
+    /// (cosine similarity range; `0.0` would merge everything, so it is
+    /// rejected); out-of-range / unparseable values at any layer fall through
+    /// to the next. Threaded into the live clusterer via
+    /// `ConsolidationPass::with_cosine_threshold`.
+    #[must_use]
+    pub fn resolve_compaction_cosine_threshold(&self) -> f32 {
+        fn valid(t: f32) -> bool {
+            t > 0.0 && t <= 1.0
+        }
+        if let Ok(v) = std::env::var(ENV_COMPACTION_COSINE_THRESHOLD) {
+            if let Ok(t) = v.trim().parse::<f32>() {
+                if valid(t) {
+                    return t;
+                }
+            }
+            // Unparseable / out-of-range: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.compaction.as_ref())
+            .and_then(|c| c.cosine_threshold)
+            .filter(|t| valid(*t))
+            .unwrap_or(crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
     }
 
     /// #1691/n14 — resolve the recall-reranker score floor. Uniform
@@ -10478,6 +10523,7 @@ max_page_size = 1000000
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
                     enabled: Some(true),
+                    cosine_threshold: None,
                 }),
             }),
             ..AppConfig::default()
@@ -10493,6 +10539,7 @@ max_page_size = 1000000
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
                     enabled: Some(false),
+                    cosine_threshold: None,
                 }),
             }),
             ..AppConfig::default()
@@ -10504,13 +10551,69 @@ max_page_size = 1000000
             curator: Some(CuratorSection {
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
-                compaction: Some(CuratorCompactionSection { enabled: None }),
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: None,
+                }),
             }),
             ..AppConfig::default()
         };
         assert!(
             !omitted.resolve_compaction_enabled(),
             "omitted enabled → false"
+        );
+    }
+
+    /// #1750 — resolve the consolidation cosine gate. Ladder:
+    /// `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` env > `[curator.compaction]`
+    /// config > compiled default 0.75; out-of-range / unparseable falls through.
+    #[test]
+    fn curator_compaction_cosine_threshold_resolver_1750() {
+        // Default (no env, no config) → 0.75.
+        let default_cfg = AppConfig::default();
+        assert!(
+            (default_cfg.resolve_compaction_cosine_threshold()
+                - crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
+                .abs()
+                < f32::EPSILON,
+            "default → DEFAULT_COSINE_THRESHOLD (0.75)"
+        );
+
+        // Config value honored.
+        let cfg = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: Some(0.9),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            (cfg.resolve_compaction_cosine_threshold() - 0.9).abs() < f32::EPSILON,
+            "config value honored"
+        );
+
+        // Out-of-range config value (> 1.0) falls through to default.
+        let bad = AppConfig {
+            curator: Some(CuratorSection {
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: Some(1.5),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            (bad.resolve_compaction_cosine_threshold()
+                - crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
+                .abs()
+                < f32::EPSILON,
+            "out-of-range config → default"
         );
     }
 

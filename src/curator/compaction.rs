@@ -103,6 +103,13 @@ pub(crate) struct ConsolidationPass<'a> {
     pub(crate) llm: &'a dyn AutonomyLlm,
     /// Suppress all writes (simulate-only).
     pub(crate) dry_run: bool,
+    /// Cosine gate threshold for [`ConsolidationClustering`] (#1750). Defaults
+    /// to [`super::cluster::DEFAULT_COSINE_THRESHOLD`] (0.75); production threads
+    /// the operator-resolved `[curator.compaction].cosine_threshold` via
+    /// [`Self::with_cosine_threshold`]. Previously the clusterer hardcoded the
+    /// default, making the config field dead (#1691-class) — this is the live
+    /// consumer.
+    pub(crate) cosine_threshold: f32,
 }
 
 /// Structured outcome of one [`ConsolidationPass::run`] sweep.
@@ -150,7 +157,18 @@ impl<'a> ConsolidationPass<'a> {
             ctx: CallerContext::for_admin(CONSOLIDATOR_AGENT_ID),
             llm,
             dry_run,
+            cosine_threshold: super::cluster::DEFAULT_COSINE_THRESHOLD,
         }
+    }
+
+    /// #1750 — thread the operator-resolved cosine gate threshold
+    /// (`[curator.compaction].cosine_threshold`) into the clusterer. Production
+    /// sites build the pass then call this with `cfg.compaction.cosine_threshold`;
+    /// tests keep the default via [`Self::new`].
+    #[must_use]
+    pub(crate) fn with_cosine_threshold(mut self, cosine_threshold: f32) -> Self {
+        self.cosine_threshold = cosine_threshold;
+        self
     }
 
     fn name(&self) -> &str {
@@ -179,7 +197,14 @@ impl<'a> ConsolidationPass<'a> {
                 .flatten();
             embeddings.push(emb);
         }
-        ConsolidationClustering::new().cluster_memories(memories, &embeddings)
+        // #1750 — use the operator-resolved cosine gate (defaults to the
+        // autonomy-matched 0.75); the Jaccard pre-filter + max_cluster_size keep
+        // their defaults.
+        ConsolidationClustering {
+            cosine_threshold: f64::from(self.cosine_threshold),
+            ..ConsolidationClustering::new()
+        }
+        .cluster_memories(memories, &embeddings)
     }
 
     /// A cluster is eligible when it has ≥ 2 members, all share the same

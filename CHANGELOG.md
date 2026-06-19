@@ -21,6 +21,26 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1750 (Pillar-2.5) — `cosine_threshold` is now live config; size-GC eviction gated on `enabled`.**
+  Closes the two `CompactionConfig` knob hazards the #1749 5-agent vote (`1817bc8f`) scoped out.
+  (1) **`cosine_threshold` was dead config** — `ConsolidationClustering::new()` hardcoded the 0.75
+  default and `CompactionConfig.cosine_threshold` had no consumer (#1691-class). It is now threaded
+  into the live clusterer via `ConsolidationPass::with_cosine_threshold` at both production sites
+  (`cli/curator.rs` store-backed sweep + `curator/mod.rs::run_consolidation_pass`) and exposed via
+  `[curator.compaction].cosine_threshold` + `AppConfig::resolve_compaction_cosine_threshold()`
+  (env `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` > config > `0.75`; a parseable `f32` in `(0.0, 1.0]`
+  wins, out-of-range/unparseable falls through). (2) **`max_corpus_bytes` size-GC was a decoupled
+  hard-delete trigger** — `run_size_gc_pass` gated only on `max_corpus_bytes.is_some() && !dry_run`,
+  NOT on `enabled`. It now additionally requires `compaction.enabled` (defensive: `max_corpus_bytes`
+  stays out of operator config this slice, so size-GC remains inert in production until explicitly
+  exposed). Per the #1750 5-agent vote (`a9b2fe09`, 3-A/2-B), when `max_corpus_bytes` is eventually
+  exposed it gets its own dedicated `[curator.size_gc]` switch rather than riding under
+  `[curator.compaction]`. Tests: cosine resolver unit + precedence (`tests/config_precedence.rs`) +
+  size-GC `cap-without-enabled` no-op test; the 3 existing size-GC tests now set `enabled: true`.
+  Env-table rows #81 (updated) / #82. **Deferred to #1488 4.D:** reconciling the `CapabilityCompaction`
+  "planned" marker to reflect runtime compaction state needs `AppConfig` threaded through the
+  capabilities overlay chain (an envelope change) — tracked there, not in this slice. Code anchors:
+  `src/curator/compaction.rs`, `src/curator/mod.rs`, `src/cli/curator.rs`, `src/config.rs`.
 - **#1748 (Pillar-2.5 slice-3c2) — store-backed (postgres) `curator --rollback` reversal.**
   `ai-memory curator --rollback <id>` / `--rollback-last N` now reverses consolidations the
   store-backed (postgres) curator wrote (slice-3c1, #1747). Previously the reversal was
