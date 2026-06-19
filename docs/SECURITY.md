@@ -18,22 +18,31 @@ capabilities:
 2. **Network attacker** reaching the HTTP daemon. They should NOT be
    able to bypass API-key / mTLS, inject memories with a forged
    `agent_id`, or enumerate memories without authorization.
-3. **Compromised peer** holding valid mTLS cert. Under the v0.7.0
-   default posture they can author only **as themselves**: the
-   peer-attestation layer re-stamps inbound rows with the
-   authenticated peer identity, and a `body.sender_agent_id` claim
-   not on that peer's operator-configured allowlist is refused with
-   `sender_agent_id_mismatch` (see
-   [`docs/federation.md`](federation.md) Layer 3). The legacy
-   trust-the-body posture exists only behind the explicit
-   `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1` escape hatch. Operators
-   should still treat the `agent_id` on synced memories as a claimed
-   identity, not an attested one, and keep the mTLS peer allowlist
-   tight. (Store-path agent attestation —
-   #626 Layer-3 — upgrades *directly authored* CLI/MCP/HTTP writes to
-   `agent_attested` when a valid Ed25519 signature is presented, but the
-   federation **receive** path here remains claimed-by-default; mTLS +
-   the peer allowlist stay the trust boundary for synced writes.)
+3. **Compromised peer** holding valid mTLS cert. Under the default
+   posture they can author only **as themselves**: the peer-attestation
+   layer re-stamps inbound rows with the authenticated peer identity, and
+   a `body.sender_agent_id` claim not on that peer's operator-configured
+   allowlist is refused with `sender_agent_id_mismatch` (see
+   [`docs/federation.md`](federation.md) Layer 3). v0.8.0 (#1464) extends
+   this from the body sender to **per-memory** granularity: each synced
+   row's claimed `metadata.agent_id` is checked against the peer's
+   authorship allowlist, and an unauthorized relayed claim is rewritten to
+   the sender and stamped `attest_level = "claimed"` so a forged claim can
+   never own the row or charge another agent's quota
+   (`resolve_inbound_attribution`). The legacy trust-the-body posture
+   exists only behind the explicit `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`
+   escape hatch. Operators should still treat the `agent_id` on synced
+   memories as a claimed (allowlist-authorized) identity, not a
+   cryptographically attested one, and keep the mTLS peer allowlist tight.
+   (Store-path agent attestation — #626 Layer-3 — upgrades *directly
+   authored* CLI/MCP/HTTP writes to `agent_attested` when a valid Ed25519
+   signature is presented; the store-path default will flip to
+   require-attestation in v0.9 (#1751), preceded by a v0.8.0 deprecation
+   WARN. The federation **receive** path remains claimed-by-default —
+   per-write *cryptographic* attestation of synced memories needs a
+   wire-protocol extension (sender signs each row, receiver verifies) and
+   is tracked under Pillar-3 #1719; mTLS + the per-memory authorship
+   allowlist stay the trust boundary for synced writes.)
 4. **Compromised LLM** (Ollama returning malicious content). Autonomy
    hooks never `exec` or write to disk outside the database. Worst
    case: bad tags, spurious contradiction flags. Reversible via the

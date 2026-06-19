@@ -21,6 +21,27 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Added
 
+- **#1464 (P0 security) — agent-attestation v0.8 hardening: deprecation WARN for the permissive store default.**
+  Post-#626 Layer-3 follow-up. The federation receive-path forge hole (an enrolled peer claiming
+  another agent's authorship → wrong quota/ownership) was **already closed** earlier on this branch
+  by the per-memory authorship gate (`resolve_inbound_attribution`, commit `4985ee0e`): an
+  unauthorized relayed `metadata.agent_id` claim is rewritten to the sender and stamped
+  `attest_level = "claimed"`. This change adds the **store-path secure-default deprecation WARN**:
+  when `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is unset (permissive default) and an unsigned direct
+  CLI/MCP/HTTP write lands `claimed`, the substrate warns **once per process** that v0.9 will flip
+  the store-path default to require attestation (tracked: #1751), with `store --sign` /
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` as the early opt-in. The WARN is deliberately scoped to
+  the **store path** and does not imply it hardens the federation boundary (the receive path attests
+  via the peer-authorship allowlist, not this flag). **Honest scoping (5-agent vote, UNANIMOUS
+  Option A, memory `45a27602`):** the issue's "thread the synced-write signature through
+  `stamp_attestation`" premise was inaccurate — `SyncPushBody.memories` carries no per-memory agent
+  signature on the wire, so per-write *cryptographic* attestation of synced memories (upgrade
+  `claimed→agent_attested`) needs a federation wire-protocol extension and is tracked under Pillar-3
+  CRDT #1719 (item-3: thread attestation into `merge_inbound`); the v0.8.0 default-flip was
+  deferred to v0.9 (#1751) because flipping now would `403` every unsigned writer with no migration
+  path while curator/autonomy self-writes bypass the gate entirely. Code anchors:
+  `src/identity/attest.rs` (`should_warn_permissive_default`, `warn_permissive_attestation_default_once`),
+  `docs/SECURITY.md` threat-model item 3.
 - **#1750 (Pillar-2.5) — `cosine_threshold` is now live config; size-GC eviction gated on `enabled`.**
   Closes the two `CompactionConfig` knob hazards the #1749 5-agent vote (`1817bc8f`) scoped out.
   (1) **`cosine_threshold` was dead config** — `ConsolidationClustering::new()` hardcoded the 0.75
