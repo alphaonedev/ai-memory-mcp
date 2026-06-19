@@ -200,6 +200,16 @@ pub struct CuratorReport {
     /// before deleting them, so the count is restorable from the archive.
     #[serde(default)]
     pub memories_evicted_size_gc: usize,
+    /// v0.8.0 Pillar-2.5 (#1738) — clusters the SAL `ConsolidationPass`
+    /// found eligible to consolidate this cycle, when
+    /// `compaction.enabled = true`. In the slice-1 SHADOW wiring the pass
+    /// runs observe-only (dry-run): this counts what it *would* consolidate
+    /// without mutating and without double-consolidating against the live
+    /// autonomy Pass-1. Zero when compaction is disabled (the default), in
+    /// dry-run cycles, or on an in-memory DB. The real persist + the
+    /// autonomy-Pass-1 cutover land in slice-3.
+    #[serde(default)]
+    pub compaction_pass_clusters_eligible: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -337,6 +347,13 @@ pub fn run_once(
     report.errors.extend(pass_report.errors.clone());
     report.autonomy = pass_report;
 
+    // v0.8.0 Pillar-2.5 (#1738) — SAL `ConsolidationPass` shadow pass.
+    // Gated on `compaction.enabled` (default off → no-op), observe-only
+    // (dry-run) so it does NOT double-consolidate against the autonomy
+    // Pass-1 above. `llm_client: &OllamaClient` coerces to `&dyn
+    // AutonomyLlm`. Best-effort: errors land in report.errors.
+    run_consolidation_shadow_pass(conn, &autonomy_candidates, cfg, llm_client, &mut report);
+
     // Issue #816 — auto-persona sweep. After auto_tag has populated
     // `mentioned_entity_id` on this cycle's reflections, scan for
     // entities that lack a current persona row and synthesise one via
@@ -446,6 +463,82 @@ fn run_size_gc_pass(
                 .push(format!("size_gc failed for namespace {ns}: {e}")),
         }
     }
+}
+
+/// v0.8.0 Pillar-2.5 (#1738 slice-1) — SAL `ConsolidationPass` shadow driver.
+///
+/// Gated on `cfg.compaction.enabled` (default `false` → no-op, production
+/// byte-unchanged). When enabled, opens a second `SqliteStore` handle at the
+/// curator connection's backing file and runs [`ConsolidationPass::run`] in
+/// **dry-run** so it observes what the backend-agnostic SAL pass *would*
+/// consolidate (`report.compaction_pass_clusters_eligible`) WITHOUT mutating
+/// and WITHOUT double-consolidating against the live autonomy Pass-1. The real
+/// persist + the autonomy-Pass-1 cutover are slice-3 (#1738), and Stage-6
+/// rollback is slice-2 (#664).
+///
+/// Sync↔async bridge: the curator daemon runs on a `spawn_blocking` OS thread
+/// (no ambient runtime), so a scoped current-thread runtime `block_on` is safe
+/// here — never call this from inside the async `serve` runtime. Best-effort:
+/// store/runtime/sweep errors land in `report.errors`, never aborting the
+/// cycle. In-memory (`:memory:`) connections have no path to re-open and are
+/// skipped. Decision provenance: 5-agent vote `4d3ea1c5`.
+#[cfg(feature = "sal")]
+fn run_consolidation_shadow_pass(
+    conn: &Connection,
+    candidates: &[Memory],
+    cfg: &CuratorConfig,
+    llm: &dyn crate::autonomy::AutonomyLlm,
+    report: &mut CuratorReport,
+) {
+    if !cfg.compaction.enabled {
+        return;
+    }
+    let Some(path) = conn.path().map(std::path::PathBuf::from) else {
+        return; // in-memory DB — no backing file to open a 2nd SAL handle.
+    };
+    let store = match crate::store::sqlite::SqliteStore::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation shadow: store open failed: {e}"));
+            return;
+        }
+    };
+    let pass = crate::curator::compaction::ConsolidationPass::new(
+        &store, llm, None, /* dry_run */ true,
+    );
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation shadow: runtime build failed: {e}"));
+            return;
+        }
+    };
+    match rt.block_on(pass.run(candidates)) {
+        Ok(out) => {
+            report.compaction_pass_clusters_eligible += out.eligible_clusters;
+            report.errors.extend(out.errors);
+        }
+        Err(e) => report.errors.push(format!("consolidation shadow: {e}")),
+    }
+}
+
+/// Non-`sal` builds carry no SAL `ConsolidationPass`; the shadow pass is a
+/// compile-time no-op so `run_once` stays uniform across feature sets.
+#[cfg(not(feature = "sal"))]
+fn run_consolidation_shadow_pass(
+    _conn: &Connection,
+    _candidates: &[Memory],
+    _cfg: &CuratorConfig,
+    _llm: &dyn crate::autonomy::AutonomyLlm,
+    _report: &mut CuratorReport,
+) {
 }
 
 /// Issue #816 — auto-persona sweep helper.
@@ -2300,4 +2393,136 @@ fn cycle_aborts_on_database_error() {
     let report = result.unwrap();
     // The "no LLM" error is recorded in the report
     assert!(report.errors.iter().any(|e| e.contains("no LLM")));
+}
+
+// ---------------------------------------------------------------------------
+// Pillar-2.5 (#1738 slice-1) — ConsolidationPass shadow-pass wiring tests.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "sal"))]
+mod consolidation_shadow_tests_1738 {
+    use super::*;
+    use crate::autonomy::AutonomyLlm;
+    use crate::models::{Memory, Tier};
+    use std::sync::Mutex;
+
+    /// Counts `summarize_memories` calls so a test can prove the dry-run
+    /// shadow never invokes the LLM.
+    struct CountingStubLlm {
+        summarize_calls: Mutex<usize>,
+    }
+    impl AutonomyLlm for CountingStubLlm {
+        fn auto_tag(&self, _t: &str, _c: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn summarize_memories(&self, _m: &[(String, String)]) -> anyhow::Result<String> {
+            *self.summarize_calls.lock().unwrap() += 1;
+            Ok("synth".to_string())
+        }
+    }
+
+    fn dup(ns: &str, title: &str, content: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        }
+    }
+
+    fn seed(conn: &rusqlite::Connection) -> Vec<Memory> {
+        // Distinct titles so the (title, namespace) upsert keeps both rows;
+        // identical content so Jaccard clusters them.
+        let c = "kubernetes rolling canary deploy strategy notes";
+        let m1 = dup("ns", "t1", c);
+        let m2 = dup("ns", "t2", c);
+        crate::db::insert(conn, &m1).unwrap();
+        crate::db::insert(conn, &m2).unwrap();
+        vec![m1, m2]
+    }
+
+    #[test]
+    fn shadow_reports_eligible_and_does_not_write_when_enabled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: super::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_shadow_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report.compaction_pass_clusters_eligible >= 1,
+            "the dup cluster should be reported eligible"
+        );
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "the shadow pass is dry-run and must not call the LLM"
+        );
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert!(
+            !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+            "the shadow pass must not write a consolidated row"
+        );
+        assert_eq!(rows.len(), 2, "both source rows remain live");
+    }
+
+    #[test]
+    fn shadow_is_noop_when_compaction_disabled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        // Default config → compaction.enabled = false.
+        let cfg = CuratorConfig::default();
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_shadow_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert_eq!(
+            report.compaction_pass_clusters_eligible, 0,
+            "disabled compaction must not run the shadow pass"
+        );
+        assert!(
+            report.errors.is_empty(),
+            "no errors expected: {:?}",
+            report.errors
+        );
+    }
 }
