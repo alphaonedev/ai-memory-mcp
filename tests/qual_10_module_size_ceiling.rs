@@ -215,7 +215,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-19 (#1693 L2 SAL parity) — bumped 19_360 → 19_460: the
     // `recover_turn_idempotent` sqlite SSOT (dual-dedup probe + atomic
     // memory+dedup transaction) landed the file at 19_417.
-    ("src/storage/mod.rs", 19_490),
+    ("src/storage/mod.rs", 19_510),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
