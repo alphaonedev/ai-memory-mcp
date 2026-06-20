@@ -183,6 +183,18 @@ fn pool_for(db: &Db) -> anyhow::Result<Arc<ReadPool>> {
 
     // Cold/stale — learn the path (one brief writer lock) and build.
     let path = { db.blocking_lock().1.clone() };
+    // #1580 — `:memory:` databases are per-connection: a separate
+    // read-only connection opens its OWN empty in-memory DB and would
+    // never see the writer's rows. Disable the pool for in-memory paths
+    // so the caller falls back to the writer connection (the only one
+    // that holds the data). Production HTTP daemons always open a file
+    // DB; this guards `:memory:` test harnesses + misconfigurations.
+    let path_str = path.to_string_lossy();
+    if path_str.is_empty() || path_str.contains(":memory:") {
+        return Err(anyhow::anyhow!(
+            "read-pool disabled for in-memory database ({path_str})"
+        ));
+    }
     let pool = Arc::new(ReadPool::open(&path, DEFAULT_READ_POOL_SIZE)?);
     let weak = Arc::downgrade(db);
 
@@ -241,4 +253,144 @@ where
     })
     .await
     .expect("#1580: db_read_op spawn_blocking worker panicked or runtime shut down")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::params;
+    use std::time::Duration;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Build a FILE-backed `Db` (the read-pool is disabled for `:memory:`
+    /// because separate connections to `:memory:` see separate databases).
+    fn file_db() -> (tempfile::NamedTempFile, Db) {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = crate::storage::open(tmp.path()).expect("open writer");
+        let db: Db = Arc::new(TokioMutex::new((
+            conn,
+            tmp.path().to_path_buf(),
+            crate::config::ResolvedTtl::default(),
+            true,
+        )));
+        (tmp, db)
+    }
+
+    /// Insert a bare memory row on the writer connection (avoids building
+    /// a full 27-field `Memory`; the read-pool tests only need *some* row
+    /// to observe).
+    async fn seed_row(db: &Db, id: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let guard = db.lock().await;
+        guard
+            .0
+            .execute(
+                "INSERT INTO memories \
+                 (id, tier, namespace, title, content, tags, priority, confidence, \
+                  source, access_count, created_at, updated_at, metadata, reflection_depth) \
+                 VALUES (?1, 'mid', 'ns', 't', 'c', '[]', 5, 1.0, 's', 0, ?2, ?2, '{}', 0)",
+                params![id, now],
+            )
+            .expect("seed insert");
+    }
+
+    fn count_rows(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .expect("count")
+    }
+
+    /// Two concurrent reads are genuinely in flight on DISTINCT pool
+    /// connections at the same instant — proven by a `Barrier(2)` rendezvous
+    /// INSIDE both reader closures: if the pool served them on one
+    /// serialized connection the barrier would never release and the
+    /// `timeout` would fire. No wall-clock ratio assertion.
+    #[tokio::test]
+    async fn read_pool_two_concurrent_readers_inflight_during_held_write() {
+        let (_tmp, db) = file_db();
+        seed_row(&db, "r1").await;
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+        let h1 = tokio::spawn(db_read_op(db.clone(), move |conn| {
+            let n = count_rows(conn);
+            b1.wait();
+            n
+        }));
+        let h2 = tokio::spawn(db_read_op(db.clone(), move |conn| {
+            let n = count_rows(conn);
+            b2.wait();
+            n
+        }));
+
+        let joined = tokio::time::timeout(Duration::from_secs(10), async {
+            (h1.await.unwrap(), h2.await.unwrap())
+        })
+        .await
+        .expect("both readers must be in flight concurrently (barrier would hang if serialized)");
+        assert_eq!(joined, (1, 1), "both pooled readers see the seeded row");
+    }
+
+    /// Read-your-writes: a row committed on the writer is visible through a
+    /// freshly-opened pool connection (the pool is built lazily on first
+    /// read, AFTER the write committed; WAL readers see the latest commit).
+    #[tokio::test]
+    async fn read_pool_read_your_writes_after_commit() {
+        let (_tmp, db) = file_db();
+        seed_row(&db, "ryw1").await;
+        let got = db_read_op(db.clone(), |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE id = 'ryw1'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(-1)
+        })
+        .await;
+        assert_eq!(got, 1, "pooled read must see the just-committed row");
+    }
+
+    /// A pooled read completes while the writer's tokio mutex is HELD —
+    /// proving reads no longer serialize behind the single writer lock
+    /// (the F5.11 / recall-touch class of contention). The pool is warmed
+    /// first so the read takes the registry fast-path (no writer lock at
+    /// all); then we hold the writer guard and assert a concurrent read
+    /// still returns under a timeout.
+    #[tokio::test]
+    async fn read_pool_does_not_block_concurrent_writer_hold() {
+        let (_tmp, db) = file_db();
+        seed_row(&db, "nb1").await;
+        // Warm the pool so the registry has a live entry (fast-path).
+        let _ = db_read_op(db.clone(), count_rows).await;
+
+        // Hold the writer's tokio mutex for the whole read.
+        let writer_guard = db.lock().await;
+        let read = tokio::time::timeout(
+            Duration::from_secs(10),
+            db_read_op(db.clone(), count_rows),
+        )
+        .await
+        .expect("pooled read must complete while the writer mutex is held");
+        assert_eq!(read, 1);
+        drop(writer_guard);
+    }
+
+    /// The pool is disabled for `:memory:` (per-connection databases) and
+    /// `db_read_op` falls back to the writer connection — so a read still
+    /// sees rows written on the writer even though no pool is built.
+    #[tokio::test]
+    async fn read_pool_falls_back_to_writer_for_in_memory_db() {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
+        let db: Db = Arc::new(TokioMutex::new((
+            conn,
+            std::path::PathBuf::from(":memory:"),
+            crate::config::ResolvedTtl::default(),
+            true,
+        )));
+        seed_row(&db, "mem1").await;
+        // pool_for returns Err for :memory:; db_read_op falls back to the
+        // writer guard, which DOES hold the row.
+        let got = db_read_op(db.clone(), count_rows).await;
+        assert_eq!(got, 1, "in-memory fallback reads the writer connection");
+    }
 }
