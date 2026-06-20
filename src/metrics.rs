@@ -176,6 +176,16 @@ pub struct Metrics {
     /// zero rows reaching the quarantine threshold.
     pub federation_push_dlq_quarantined: IntCounter,
 
+    /// #1544 — cause-labeled sibling of `federation_push_dlq_quarantined`.
+    /// One closed-set `cause` label
+    /// (`quota`|`unenrolled_peer`|`id_drift`|`permanent`|`peer_removed`|`other`)
+    /// so operators can tell an operator-actionable stall (e.g. `quota` →
+    /// raise `AI_MEMORY_MAX_MEMORIES_PER_DAY`) from a genuinely-broken row
+    /// (`permanent`). Label cardinality is bounded by construction (the
+    /// classifier maps the free-text `last_error` to one of the six
+    /// values), never the raw string.
+    pub federation_push_dlq_quarantined_by_cause: IntCounterVec,
+
     /// pm-v3.1 PR8 (issue #1174) — cumulative HNSW oldest-eviction
     /// count since process start. Replaces the prior process-global
     /// `AtomicU64` `INDEX_EVICTIONS_TOTAL` in `src/hnsw.rs`.
@@ -511,6 +521,20 @@ impl Metrics {
         )?;
         registry.register(Box::new(federation_push_dlq_quarantined.clone()))?;
 
+        // #1544 — cause-labeled quarantine counter (closed-set label).
+        let federation_push_dlq_quarantined_by_cause = IntCounterVec::new(
+            prometheus::Opts::new(
+                "ai_memory_federation_push_dlq_quarantined_by_cause_total",
+                "Federation push-DLQ rows quarantined, labeled by the \
+                 classified cause (quota|unenrolled_peer|id_drift|permanent|\
+                 peer_removed|other). `quota` is operator-actionable (raise \
+                 AI_MEMORY_MAX_MEMORIES_PER_DAY or wait for the daily reset); \
+                 `permanent` is a broken row needing a manual drain. #1544.",
+            ),
+            &["cause"],
+        )?;
+        registry.register(Box::new(federation_push_dlq_quarantined_by_cause.clone()))?;
+
         // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability moved
         // from process-global atomics in `src/hnsw.rs` into the metrics
         // registry. The counter mirrors `INDEX_EVICTIONS_TOTAL`; the
@@ -661,6 +685,7 @@ impl Metrics {
             auto_export_spawn_failed_total,
             federation_push_dlq_depth,
             federation_push_dlq_quarantined,
+            federation_push_dlq_quarantined_by_cause,
             hnsw_evictions_total,
             hnsw_last_eviction_at_nanos,
             subscription_dlq_overflow_total,

@@ -54,6 +54,7 @@
 //!   §federation-push-DLQ.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::FederationConfig;
@@ -268,6 +269,55 @@ pub fn replay_max_batch() -> usize {
 /// systematic-rejection footguns quickly.
 pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 
+/// #1544 — env knob for the federation push-DLQ depth WARN threshold.
+const FED_DLQ_DEPTH_WARN_THRESHOLD_ENV: &str = "AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD";
+/// Compiled default depth at which the rising-edge WARN fires.
+const DEFAULT_FED_DLQ_DEPTH_WARN_THRESHOLD: i64 = 1000;
+
+/// Resolve the depth-WARN threshold (env > compiled default). A
+/// non-positive / unparseable value falls through to the default.
+fn dlq_depth_warn_threshold() -> i64 {
+    std::env::var(FED_DLQ_DEPTH_WARN_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FED_DLQ_DEPTH_WARN_THRESHOLD)
+}
+
+/// #1544 — rising-edge tracker so the DLQ-depth WARN fires ONCE when the
+/// depth crosses up through the threshold (and an INFO once on recovery
+/// below it), not every replay tick — a per-tick WARN at 80k rows would
+/// drown the very signal it is meant to be. `0` = below, `1` = at/over.
+static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
+
+/// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
+/// cause label so the Prometheus label cardinality is bounded by
+/// construction (never the raw string). `quota` is operator-actionable
+/// (raise `AI_MEMORY_MAX_MEMORIES_PER_DAY` / wait for the daily reset);
+/// `permanent` is a broken row needing a manual drain.
+fn classify_quarantine_cause(last_error: &str) -> &'static str {
+    if last_error.contains("429") {
+        "quota"
+    } else if last_error.contains("peer_not_enrolled")
+        || last_error.contains("401")
+        || last_error.contains("403")
+    {
+        "unenrolled_peer"
+    } else if last_error.contains("id_drift") {
+        "id_drift"
+    } else if last_error.contains("no longer in FederationConfig") {
+        "peer_removed"
+    } else if last_error.contains("400")
+        || last_error.contains("422")
+        || last_error.contains("signature")
+        || last_error.contains("schema")
+    {
+        "permanent"
+    } else {
+        "other"
+    }
+}
+
 /// Drive one replay pass. Public so the integration test in
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
@@ -345,18 +395,45 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             crate::metrics::registry()
                 .federation_push_dlq_quarantined
                 .inc();
-            tracing::warn!(
-                target: PUSH_DLQ_TRACE_TARGET,
-                row_id = row.id,
-                peer_id = %row.peer_id,
-                memory_id = %row.memory_id,
-                attempt_count = row.attempt_count,
-                "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}); \
-                 no CLI drain surface ships at v0.7.0 — see docs/TROUBLESHOOTING.md \
-                 §federation-push-DLQ for the data-layer drain procedure (#1578)",
-                row.id,
-                row.attempt_count,
-            );
+            // #1544 — cause-labeled sibling counter (closed-set label).
+            let cause = classify_quarantine_cause(&row.last_error);
+            crate::metrics::registry()
+                .federation_push_dlq_quarantined_by_cause
+                .with_label_values(&[cause])
+                .inc();
+            if cause == "quota" {
+                // Operator-actionable: name the remediation explicitly.
+                // (Post-#1544 a 429 is a Throttle that never burns an
+                // attempt, so reaching quarantine via a quota cause means
+                // a peer-side throttle the leader cannot classify — still
+                // recoverable by raising the cap or waiting for the reset.)
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    peer_id = %row.peer_id,
+                    memory_id = %row.memory_id,
+                    cause,
+                    "replay: row {} quarantined with a QUOTA (429) cause — raise \
+                     AI_MEMORY_MAX_MEMORIES_PER_DAY on the peer or wait for the daily \
+                     quota window to reset; the row will converge once admitted (#1544)",
+                    row.id,
+                );
+            } else {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    peer_id = %row.peer_id,
+                    memory_id = %row.memory_id,
+                    attempt_count = row.attempt_count,
+                    cause,
+                    "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}, \
+                     cause={cause}); no CLI drain surface ships at v0.7.0 — see \
+                     docs/TROUBLESHOOTING.md §federation-push-DLQ for the data-layer drain \
+                     procedure (#1578)",
+                    row.id,
+                    row.attempt_count,
+                );
+            }
             continue;
         }
 
@@ -470,6 +547,35 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
             crate::metrics::registry()
                 .federation_push_dlq_depth
                 .set(depth);
+            // #1544 — edge-triggered, rate-limited depth alarm. Fire ONE
+            // WARN when the backlog crosses UP through the threshold and
+            // ONE INFO when it recovers below it; never per-tick (the
+            // pre-#1544 stall was silent — operators only saw a growing
+            // gauge, never an alert).
+            let threshold = dlq_depth_warn_threshold();
+            let now_over = i64::from(depth >= threshold);
+            let was_over = DLQ_DEPTH_OVER_THRESHOLD.swap(now_over, Ordering::Relaxed);
+            if now_over == 1 && was_over == 0 {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    depth,
+                    threshold,
+                    "federation push-DLQ depth {depth} crossed the alert threshold \
+                     {threshold} — pushes are backing up. Common cause: a peer-side \
+                     per-agent quota (429) throttle on a corpus-scale federation; the \
+                     replayer drains automatically once admitted, or raise \
+                     AI_MEMORY_MAX_MEMORIES_PER_DAY (tune the alarm via \
+                     AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD). #1544",
+                );
+            } else if now_over == 0 && was_over == 1 {
+                tracing::info!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    depth,
+                    threshold,
+                    "federation push-DLQ depth recovered below the alert threshold \
+                     {threshold} (now {depth})"
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -814,8 +920,8 @@ mod replay_arm_tests {
 
     use super::{
         DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
-        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, replay_max_batch,
-        replay_once,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, classify_quarantine_cause,
+        replay_max_batch, replay_once,
     };
     use crate::federation::{FederationConfig, PeerEndpoint};
     use crate::replication::QuorumPolicy;
@@ -1135,6 +1241,37 @@ mod replay_arm_tests {
         assert!(
             sink.rows.lock().unwrap()[0].last_error.contains("429"),
             "last_error refreshed to the throttle reason"
+        );
+    }
+
+    /// #1544 — the quarantine-cause classifier maps free-text last_error
+    /// onto a CLOSED label set (bounded Prometheus cardinality).
+    #[test]
+    fn classify_quarantine_cause_maps_to_closed_set() {
+        assert_eq!(
+            classify_quarantine_cause("http 429 Too Many Requests"),
+            "quota"
+        );
+        assert_eq!(classify_quarantine_cause("http 400 Bad Request"), "permanent");
+        assert_eq!(
+            classify_quarantine_cause("http 422 invalid signature"),
+            "permanent"
+        );
+        assert_eq!(
+            classify_quarantine_cause("peer_not_enrolled"),
+            "unenrolled_peer"
+        );
+        assert_eq!(
+            classify_quarantine_cause("replay observed id_drift on peer ack"),
+            "id_drift"
+        );
+        assert_eq!(
+            classify_quarantine_cause("peer no longer in FederationConfig"),
+            "peer_removed"
+        );
+        assert_eq!(
+            classify_quarantine_cause("connection reset by peer"),
+            "other"
         );
     }
 }
