@@ -66,6 +66,9 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
+/// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
+pub const VERSION_VECTOR: &str = "version_vector";
 /// `budget_tokens` — wire/row field name.
 pub const BUDGET_TOKENS: &str = "budget_tokens";
 /// `by_namespace` — wire/row field name.
