@@ -840,6 +840,7 @@ mod tests {
     /// on re-run, identically to the sqlite `recover_from_transcript` path.
     /// Covers the async store entry on the `SqliteStore` adapter (which
     /// delegates to the same SSOT the postgres adapter mirrors).
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn store_path_recovers_and_dedups_sqlite() {
         let dir = fresh_dir();
