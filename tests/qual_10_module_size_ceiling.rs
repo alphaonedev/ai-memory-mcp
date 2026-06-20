@@ -215,7 +215,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-19 (#1693 L2 SAL parity) — bumped 19_360 → 19_460: the
     // `recover_turn_idempotent` sqlite SSOT (dual-dedup probe + atomic
     // memory+dedup transaction) landed the file at 19_417.
-    ("src/storage/mod.rs", 19_510),
+    // #1580 — bumped 19_510 → 19_520 for the touch_many `PRAGMA query_only`
+    // read-only no-op guard (the WAL read-pool enabler).
+    ("src/storage/mod.rs", 19_520),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -682,7 +684,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-19 (#1734 PE-1) — bumped 8_760 → 8_820: the serve-boot
     // mandatory-hook enforcement banner (one unconditional `hooks
     // enforcement: <mode>` line, matching the `permissions:` banner style).
-    ("src/daemon_runtime.rs", 8_850),
+    // #1580 — bumped 8_850 → 8_890 for the dedicated DLQ-sink + catchup-loop
+    // connections (F5.11: both federation workers off the shared writer).
+    ("src/daemon_runtime.rs", 8_890),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
