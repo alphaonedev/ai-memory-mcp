@@ -673,8 +673,8 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // existing `set_quota_defaults` seed (admission-control cap resolved
     // from `[limits]`).
     // 2026-06-19 (#1734 PE-1) — bumped 8_760 → 8_820: the serve-boot
-    // mandatory-hook enforcement banner (resolve_hooks_enforce_mode +
-    // resolve_required_events + preflight_report emit, silent when off).
+    // mandatory-hook enforcement banner (one unconditional `hooks
+    // enforcement: <mode>` line, matching the `permissions:` banner style).
     ("src/daemon_runtime.rs", 8_820),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
