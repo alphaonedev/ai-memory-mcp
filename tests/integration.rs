@@ -3101,10 +3101,16 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
         let meta = mem["metadata"]
             .as_object()
             .unwrap_or_else(|| panic!("metadata must be an object, got: {}", mem["metadata"]));
-        assert_eq!(
-            meta.len(),
-            1,
-            "invalid input metadata should reduce to just agent_id, got: {meta:?}"
+        // #1757 — handle_store also stamps the system-managed per-memory
+        // vector clock (`version_vector`); the assertion is that NO caller
+        // metadata survived (only the system-injected agent_id + clock).
+        let caller_keys: Vec<&String> = meta
+            .keys()
+            .filter(|k| k.as_str() != "agent_id" && k.as_str() != "version_vector")
+            .collect();
+        assert!(
+            caller_keys.is_empty(),
+            "invalid input metadata should reduce to just agent_id (+ system version_vector), got: {meta:?}"
         );
         assert!(
             meta.contains_key("agent_id"),
