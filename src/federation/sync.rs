@@ -39,6 +39,13 @@ pub(super) enum AckOutcome {
     Throttled(String),
 }
 
+/// Canonical `AckOutcome` reason for a non-2xx peer response. One named
+/// helper so the `"http {status}"` shape lives in exactly one place
+/// (pm-v3.1 no-scattered-literals discipline).
+fn http_status_reason(status: reqwest::StatusCode) -> String {
+    format!("http {status}")
+}
+
 /// Single-attempt POST to a peer, classifying the response into an
 /// `AckOutcome`. No retries — callers that want retry-on-transient-fail
 /// should use [`post_and_classify`].
@@ -208,10 +215,11 @@ pub(super) async fn post_once(
             // not a string-match on the reason) so the push-DLQ replayer can
             // avoid burning a quarantine attempt on a quota window that resets
             // on its own. Every other non-2xx stays a `Fail`.
+            let reason = http_status_reason(status);
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                AckOutcome::Throttled(format!("http {status}"))
+                AckOutcome::Throttled(reason)
             } else {
-                AckOutcome::Fail(format!("http {status}"))
+                AckOutcome::Fail(reason)
             }
         }
         Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
@@ -707,7 +715,8 @@ pub async fn broadcast_delete_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum delete peer {peer_id} did not ack: {reason}"
                     );
@@ -805,7 +814,8 @@ pub async fn broadcast_archive_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum archive peer {peer_id} did not ack: {reason}"
                     );
@@ -904,7 +914,8 @@ pub async fn broadcast_restore_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum restore peer {peer_id} did not ack: {reason}"
                     );
@@ -998,7 +1009,8 @@ pub async fn broadcast_link_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum link peer {peer_id} did not ack: {reason}"
                     );
@@ -1095,7 +1107,8 @@ pub async fn broadcast_consolidate_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum consolidate peer {peer_id} did not ack: {reason}"
                     );
@@ -1194,7 +1207,8 @@ pub async fn broadcast_pending_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum pending peer {peer_id} did not ack: {reason}"
                     );
@@ -1292,7 +1306,8 @@ pub async fn broadcast_pending_decision_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum pending-decision peer {peer_id} did not ack: {reason}"
                     );
@@ -1392,7 +1407,8 @@ pub async fn broadcast_namespace_meta_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum namespace_meta peer {peer_id} did not ack: {reason}"
                     );
@@ -1496,7 +1512,8 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum namespace_meta_clear peer {peer_id} did not ack: {reason}"
                     );
