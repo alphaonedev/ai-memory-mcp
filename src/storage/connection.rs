@@ -97,6 +97,50 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// #1580 — open a **read-only** connection to an already-initialized
+/// database for the HTTP WAL read-pool.
+///
+/// Unlike [`open`], this does NOT run the bootstrap `SCHEMA`, the
+/// migration ladder, or the CHECK-trigger install: a read-only
+/// connection cannot issue DDL, and the writer that seeded the pool
+/// has already brought the on-disk schema to `CURRENT_SCHEMA_VERSION`.
+/// The connection is opened with `SQLITE_OPEN_READ_ONLY`, the same WAL
+/// reader pragmas the writer uses (`busy_timeout`, `mmap_size`), and a
+/// belt-and-suspenders `PRAGMA query_only = ON` so a stray write on a
+/// pool connection surfaces as an error instead of racing the
+/// dedicated writer's `BEGIN IMMEDIATE`.
+///
+/// WAL multi-reader correctness: SQLite permits any number of
+/// concurrent read transactions on distinct connections to the same
+/// WAL database; the `-wal`/`-shm` files were created by the writer's
+/// [`open`] (the pool is always seeded after the writer opens), so a
+/// same-process read-only connection attaches to the existing shared
+/// memory cleanly.
+///
+/// # Errors
+///
+/// Propagates connection-open failures, the SQLCipher unlock failure
+/// (when built with `--features sqlcipher` and the passphrase is wrong),
+/// or any PRAGMA failure.
+pub fn open_read_only(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)
+        .context("failed to open read-only database connection")?;
+    apply_sqlcipher_key(&conn)?;
+    conn.pragma_update(None, "busy_timeout", 5000)?;
+    // #1579 B7 — mirror the writer's memory-mapped I/O budget so the
+    // read-pool shares the OS page cache reservation.
+    conn.pragma_update(None, "mmap_size", db_mmap_size())?;
+    // Enforce read-only at the SQL layer (defense in depth on top of
+    // SQLITE_OPEN_READ_ONLY): any INSERT/UPDATE/DELETE on a pool
+    // connection is rejected rather than silently contending the writer.
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
+}
+
 /// Apply the defense-in-depth CHECK triggers from migration 0023.
 ///
 /// `CREATE TRIGGER IF NOT EXISTS` is idempotent — re-running is a

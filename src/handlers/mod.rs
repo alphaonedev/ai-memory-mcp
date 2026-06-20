@@ -79,6 +79,8 @@ pub mod parity;
 pub mod postgres_gate;
 pub mod power;
 pub mod power_consolidation;
+/// #1580 — WAL read-pool for the HTTP SQLite read path.
+pub mod read_pool;
 pub mod recall;
 /// v0.7.0 #1111 — 14 missing HTTP routes for the MCP-only tools the
 /// SR-4 three-surface-parity audit flagged. Each handler is a thin

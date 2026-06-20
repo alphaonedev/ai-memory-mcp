@@ -431,6 +431,8 @@ pub(crate) mod reflect;
 // is re-published at `crate::storage::*` (and therefore `crate::db::*`
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
+// #1580 — read-only connection opener for the HTTP WAL read-pool.
+pub use connection::open_read_only;
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
