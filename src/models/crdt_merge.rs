@@ -33,18 +33,29 @@
 //! ## Determinism / algebraic properties
 //!
 //! Every "last-write-wins" (LWW) resolution tiebreaks on the total
-//! order `(updated_at, id)` — strictly newer `updated_at` wins, and on
-//! an `updated_at` tie the lexically-greater `id` wins. Because the
-//! tiebreak is a *total order over the two operands* (never "keep the
-//! first argument"), `merge_memory` is:
+//! order `(updated_at, attest_rank, id)` (#1719 item 3a) — strictly
+//! newer `updated_at` wins; on an `updated_at` tie the higher
+//! attestation rank wins (a verified `agent_attested` row beats an
+//! unsigned `claimed` one); and only on a further tie does the
+//! lexically-greater `id` break it. Because the tiebreak is a *total
+//! order over the two operands* (never "keep the first argument"),
+//! `merge_memory` is:
 //!
 //! * **commutative** — `merge(a, b)` and `merge(b, a)` serialise
 //!   identically (max / min / union are order-free; LWW picks the same
-//!   `(updated_at, id)`-maximal side regardless of argument position);
+//!   `(updated_at, attest_rank, id)`-maximal side regardless of argument
+//!   position);
 //! * **idempotent** — `merge(a, a) == a`;
 //! * **associative** on the commutative fields (max/min/union) and on
 //!   the LWW fields (which all collapse to the global
-//!   `(updated_at, id)`-maximal operand).
+//!   `(updated_at, attest_rank, id)`-maximal operand).
+//!
+//! The `attest_rank` middle key is trustworthy only because the
+//! federation merge boundary (`merge_inbound`) calls
+//! [`sanitize_inbound_attestation`] on the untrusted remote first, so a
+//! peer cannot win the tiebreak by self-asserting a verified level — see
+//! that function's docs and #1755 (3b) for the `updated_at`-postdating
+//! residual.
 //!
 //! These are the convergence properties a CRDT needs: peers that
 //! receive the same set of replicas in any order reach the same state.
@@ -67,7 +78,56 @@ use serde_json::{Map, Value};
 use super::crdt_primitives::{OrSet, PnCounter};
 use super::field_names;
 use super::memory::Memory;
+use crate::identity::verify::AttestLevel;
 use crate::mcp::param_names;
+
+/// #1719 item 3a — trust rank of a row's stamped `metadata.attest_level`
+/// for the attested-identity LWW tiebreak. A `claimed` / unsigned /
+/// absent level is the floor (0); a verified `agent_attested` level
+/// outranks it (1).
+///
+/// Reads the row's OWN stamped string. The federation merge boundary
+/// (`merge_inbound`) calls [`sanitize_inbound_attestation`] on the
+/// untrusted remote first, so a peer can NOT win this tiebreak by
+/// self-asserting `agent_attested` — only the receiver's own stored
+/// local level can win on attestation.
+fn attest_rank(m: &Memory) -> u8 {
+    let level = if m
+        .metadata
+        .get(field_names::ATTEST_LEVEL)
+        .and_then(Value::as_str)
+        == Some(AttestLevel::AgentAttested.as_str())
+    {
+        AttestLevel::AgentAttested
+    } else {
+        AttestLevel::Claimed
+    };
+    level.rank()
+}
+
+/// #1719 item 3a — neutralize an UNTRUSTED inbound row's self-asserted
+/// `metadata.attest_level` to `claimed` before it is merged, so a peer
+/// cannot win the attested-identity LWW tiebreak by self-asserting a
+/// verified level. The local (receiver-stored) row keeps its own level.
+///
+/// Returns a sanitized clone; the key is only rewritten when it is
+/// already present (so no `attest_level` key is introduced on a row that
+/// never carried one — its rank is the `claimed` floor either way).
+/// Applied identically by both adapters' `merge_inbound` so there is no
+/// per-backend trust drift.
+#[must_use]
+pub fn sanitize_inbound_attestation(inbound: &Memory) -> Memory {
+    let mut sanitized = inbound.clone();
+    if let Some(obj) = sanitized.metadata.as_object_mut() {
+        if obj.contains_key(field_names::ATTEST_LEVEL) {
+            obj.insert(
+                field_names::ATTEST_LEVEL.to_string(),
+                Value::String(AttestLevel::Claimed.as_str().to_string()),
+            );
+        }
+    }
+    sanitized
+}
 
 /// Delegate a #224 max-merged counter field to the [`PnCounter`] lattice
 /// (monotonic — a merge never rolls the value backwards). Used for
@@ -82,20 +142,33 @@ fn merge_counter<T: PartialOrd + Clone>(local: T, remote: T) -> T {
 /// Total-order LWW verdict: `true` when `remote` should win the
 /// last-write-wins tiebreak over `local`.
 ///
-/// The order is `(updated_at, id)`: a strictly-greater `updated_at`
-/// wins; on an `updated_at` tie the lexically-greater `id` wins. Using
-/// a total order over BOTH operands (rather than "remote wins only on
+/// The order is `(updated_at, attest_rank, id)` (#1719 item 3a): a
+/// strictly-greater `updated_at` wins; on an `updated_at` tie the
+/// higher attestation rank wins ([`attest_rank`] — a verified
+/// `agent_attested` row beats an unsigned `claimed` one); and only on a
+/// further tie does the lexically-greater `id` break it. Using a total
+/// order over BOTH operands (rather than "remote wins only on
 /// strict-greater, else keep local") is what makes [`merge_memory`]
 /// fully commutative — `merge(a, b)` and `merge(b, a)` pick the same
 /// side because the winner is a property of the pair, not of argument
-/// position.
+/// position. Inserting `attest_rank` as the middle key keeps that
+/// property (it is a deterministic function of each operand) while
+/// preventing a same-`updated_at` unsigned edit from clobbering a
+/// locally-attested row by `id` manipulation.
 fn remote_wins_lww(local: &Memory, remote: &Memory) -> bool {
-    (remote.updated_at.as_str(), remote.id.as_str())
-        > (local.updated_at.as_str(), local.id.as_str())
+    (
+        remote.updated_at.as_str(),
+        attest_rank(remote),
+        remote.id.as_str(),
+    ) > (
+        local.updated_at.as_str(),
+        attest_rank(local),
+        local.id.as_str(),
+    )
 }
 
 /// LWW pick of a cloneable field: returns `remote`'s value when it wins
-/// the `(updated_at, id)` tiebreak, else `local`'s.
+/// the `(updated_at, attest_rank, id)` tiebreak, else `local`'s.
 fn lww<T: Clone>(local: &Memory, remote: &Memory, local_val: &T, remote_val: &T) -> T {
     if remote_wins_lww(local, remote) {
         remote_val.clone()
@@ -107,8 +180,8 @@ fn lww<T: Clone>(local: &Memory, remote: &Memory, local_val: &T, remote_val: &T)
 /// "Prefer non-null, else LWW" pick for an `Option` field (#224
 /// provenance / structural fields): a present value beats absence
 /// (preservation over loss); when BOTH are present, the
-/// `(updated_at, id)` LWW winner's value is taken; when both are absent
-/// the result is absent. Deterministic + commutative because the
+/// `(updated_at, attest_rank, id)` LWW winner's value is taken; when both
+/// are absent the result is absent. Deterministic + commutative because the
 /// both-present branch defers to the symmetric LWW order.
 fn prefer_non_null_else_lww<T: Clone>(
     local: &Memory,
@@ -634,6 +707,88 @@ mod tests {
     /// same-id debug_assert so the id tiebreak can be tested directly).
     fn merge_lww_title(a: &Memory, b: &Memory) -> String {
         lww(a, b, &a.title, &b.title)
+    }
+
+    /// Set `metadata.attest_level` on a row (test helper).
+    fn with_attest(mut m: Memory, level: &str) -> Memory {
+        m.metadata = json!({ "attest_level": level });
+        m
+    }
+
+    #[test]
+    fn attest_rank_reads_metadata_level() {
+        let claimed = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "claimed");
+        let attested = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        let absent = base("a", "2026-06-16T00:00:00+00:00"); // metadata {}
+        assert_eq!(attest_rank(&claimed), 0);
+        assert_eq!(attest_rank(&attested), 1);
+        assert_eq!(attest_rank(&absent), 0);
+    }
+
+    #[test]
+    fn merge_tiebreak_prefers_higher_attest_rank_on_updated_at_tie() {
+        // Same id, same updated_at — the attested row must win the LWW
+        // tiebreak ahead of the lexical-id fallback, regardless of order.
+        let mut local = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        local.title = "attested".into();
+        let mut remote = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "claimed");
+        remote.title = "unsigned".into();
+
+        assert_eq!(merge_memory(&local, &remote).title, "attested");
+        // Commutative: the attested side wins regardless of argument order.
+        assert_eq!(merge_memory(&remote, &local).title, "attested");
+    }
+
+    #[test]
+    fn merge_updated_at_still_dominates_attest_rank() {
+        // A strictly-newer unsigned edit still wins over an older attested
+        // one — attest_rank only breaks an `updated_at` TIE, it is the
+        // middle key, not the primary one.
+        let attested_old = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        let mut claimed_new = with_attest(base("a", "2026-06-16T09:00:00+00:00"), "claimed");
+        claimed_new.title = "newer".into();
+        assert_eq!(merge_memory(&attested_old, &claimed_new).title, "newer");
+    }
+
+    #[test]
+    fn sanitize_inbound_attestation_neutralizes_self_asserted_level() {
+        // A forged remote self-asserting agent_attested is reset to claimed.
+        let forged = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        let sanitized = sanitize_inbound_attestation(&forged);
+        assert_eq!(attest_rank(&sanitized), 0);
+        assert_eq!(
+            sanitized
+                .metadata
+                .get("attest_level")
+                .and_then(Value::as_str),
+            Some("claimed")
+        );
+    }
+
+    #[test]
+    fn sanitize_inbound_attestation_leaves_absent_level_absent() {
+        // A row that never carried attest_level does not gain the key.
+        let no_level = base("a", "2026-06-16T00:00:00+00:00"); // metadata {}
+        let sanitized = sanitize_inbound_attestation(&no_level);
+        assert!(sanitized.metadata.get("attest_level").is_none());
+        assert_eq!(attest_rank(&sanitized), 0);
+    }
+
+    #[test]
+    fn forged_remote_cannot_win_attest_tiebreak_after_sanitize() {
+        // The federation-boundary contract: local is genuinely attested,
+        // a forged remote self-asserts agent_attested at the same
+        // updated_at. After sanitize the remote is claimed (rank 0) and
+        // loses the tiebreak, so the local attested title survives.
+        let mut local = with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        local.title = "genuine".into();
+        let mut forged_remote =
+            with_attest(base("a", "2026-06-16T00:00:00+00:00"), "agent_attested");
+        forged_remote.title = "forged".into();
+
+        let sanitized = sanitize_inbound_attestation(&forged_remote);
+        assert_eq!(merge_memory(&local, &sanitized).title, "genuine");
+        assert_eq!(merge_memory(&sanitized, &local).title, "genuine");
     }
 
     #[test]

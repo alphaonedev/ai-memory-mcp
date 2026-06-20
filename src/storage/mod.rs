@@ -8200,9 +8200,16 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
     let tx_result = (|| -> Result<Option<String>> {
         match get(conn, &inbound.id)? {
             Some(existing) => {
+                // #1719 item 3a — NEVER trust a peer's self-asserted
+                // attestation for the merge tiebreak: neutralize the
+                // inbound's `metadata.attest_level` to `claimed` so a
+                // forged remote cannot win the attested-identity LWW
+                // tiebreak by self-asserting `agent_attested`. Only the
+                // receiver's own stored local level can win on attestation.
+                let sanitized = crate::models::sanitize_inbound_attestation(inbound);
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
-                let merged = crate::models::merge_memory(&existing, inbound);
+                let merged = crate::models::merge_memory(&existing, &sanitized);
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }

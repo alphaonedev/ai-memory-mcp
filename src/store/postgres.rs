@@ -12185,7 +12185,13 @@ impl MemoryStore for PostgresStore {
         };
 
         let existing = Self::row_to_memory(&row)?;
-        let merged = crate::models::merge_memory(&existing, inbound);
+        // #1719 item 3a — neutralize the untrusted inbound's self-asserted
+        // `metadata.attest_level` to `claimed` before merge (identical to
+        // the sqlite `db::merge_inbound` boundary, no per-backend drift) so
+        // a forged peer cannot win the attested-identity LWW tiebreak by
+        // self-asserting a verified level.
+        let sanitized = crate::models::sanitize_inbound_attestation(inbound);
+        let merged = crate::models::merge_memory(&existing, &sanitized);
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.
