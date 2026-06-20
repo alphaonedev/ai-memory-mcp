@@ -4266,10 +4266,21 @@ pub async fn bootstrap_serve(
                              falling back to sqlite sink (DLQ writes WILL error \
                              on postgres-backed daemons until the cast is restored)"
                     );
-                    std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone()))
+                    std::sync::Arc::new(
+                        federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    )
                 }
             }
-            _ => std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone())),
+            // #1580 / F5.11 — the sqlite DLQ sink opens its OWN dedicated
+            // connection (learned from `db_state`'s path) so the replay
+            // worker never contends the shared HTTP writer mutex.
+            _ => std::sync::Arc::new(
+                federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            ),
         };
         fed.dlq_sink = Some(sink);
     }
@@ -4283,18 +4294,38 @@ pub async fn bootstrap_serve(
         && args.catchup_interval_secs > 0
     {
         let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
+        // #1580 — dedicated connection for the catchup/replication loop so
+        // its sync-state reads (`sync_state_load`) and writes
+        // (`sync_state_observe`, the legacy `insert_if_newer` fallback)
+        // never contend the shared HTTP writer mutex. The loop only ever
+        // reads tuple field `.0` (the connection), so the resolved-TTL /
+        // archive flag carried alongside are inert here but kept so the
+        // `Db` tuple shape matches.
+        let catchup_db: Db = {
+            let conn = db::open(db_path)?;
+            let (resolved_ttl, archive_on_gc) = {
+                let guard = db_state.lock().await;
+                (guard.2.clone(), guard.3)
+            };
+            Arc::new(Mutex::new((
+                conn,
+                db_path.to_path_buf(),
+                resolved_ttl,
+                archive_on_gc,
+            )))
+        };
         #[cfg(feature = "sal")]
         {
             federation::spawn_catchup_loop_with_store(
                 fed.clone(),
-                db_state.clone(),
+                catchup_db,
                 Some(store_handle.clone()),
                 interval,
             );
         }
         #[cfg(not(feature = "sal"))]
         {
-            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
+            federation::spawn_catchup_loop(fed.clone(), catchup_db, interval);
         }
 
         // v0.7.0 Track D #933 — federation push DLQ replay worker.

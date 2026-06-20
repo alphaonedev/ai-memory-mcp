@@ -423,22 +423,43 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
     }
 }
 
-/// Sqlite implementation of [`FederationDlqSink`] backed by the
-/// shared `handlers::Db` mutex-wrapped `rusqlite::Connection`.
+/// Sqlite implementation of [`FederationDlqSink`] backed by a
+/// **dedicated** writable `rusqlite::Connection` (#1580 / F5.11).
 ///
-/// All methods acquire the mutex for the duration of one SQL call so
-/// the sink stays compatible with the legacy single-connection
-/// posture. Concurrent callers serialise on the mutex; for v0.7.0 GA
-/// loads the per-failure SQL is microseconds so this is acceptable.
+/// Previously the sink wrapped the shared `handlers::Db` writer mutex
+/// and `take_pending_dlq_rows` held that mutex across its SELECT — so a
+/// DLQ poll blocked every concurrent HTTP request at the coarse tokio
+/// mutex (Reviewer-5 F5.11). The sink now owns a private connection to
+/// the same database file: its reads run WAL-concurrently with the HTTP
+/// writer, and its brief writes serialize with the writer only at
+/// SQLite's fine-grained WAL lock (`busy_timeout`), never the process
+/// mutex. The DLQ table lives in the same DB, so a second WAL connection
+/// is consistent with whatever the HTTP path commits.
 pub struct SqliteDlqSink {
-    db: crate::handlers::Db,
+    conn: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
 }
 
 impl SqliteDlqSink {
-    /// Build a new sink over the daemon's shared sqlite connection.
-    #[must_use]
-    pub fn new(db: crate::handlers::Db) -> Self {
-        Self { db }
+    /// Open a dedicated writable connection for the DLQ worker, learning
+    /// the on-disk path from the daemon's shared [`crate::handlers::Db`]
+    /// (so callers keep passing the same handle they already hold).
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted open-error string when the dedicated
+    /// connection cannot be opened (e.g. the path is unwritable). The
+    /// shared handle was already opened successfully by the caller, so
+    /// this is not expected in practice.
+    pub async fn new(db: crate::handlers::Db) -> Result<Self, String> {
+        let db_path = {
+            let guard = db.lock().await;
+            guard.1.clone()
+        };
+        let conn = crate::storage::open(&db_path)
+            .map_err(|e| format!("SqliteDlqSink: open dedicated connection: {e}"))?;
+        Ok(Self {
+            conn: std::sync::Arc::new(tokio::sync::Mutex::new(conn)),
+        })
     }
 }
 
@@ -453,13 +474,13 @@ impl FederationDlqSink for SqliteDlqSink {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let payload_str = payload_json.to_string();
-        let conn = self.db.lock().await;
+        let conn = self.conn.lock().await;
         // Use `ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS
         // NULL DO UPDATE` so a flapping peer doesn't stack duplicate
         // pending rows — bumps attempt_count + refreshes last_error
         // instead. Partial unique index from the v48 migration backs
         // this conflict target.
-        conn.0
+        conn
             .execute(
                 "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
@@ -478,9 +499,8 @@ impl FederationDlqSink for SqliteDlqSink {
         &self,
         limit: usize,
     ) -> Result<Vec<FederationPushDlqRow>, String> {
-        let conn = self.db.lock().await;
+        let conn = self.conn.lock().await;
         let mut stmt = conn
-            .0
             .prepare(
                 "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
                  FROM federation_push_dlq \
@@ -514,8 +534,8 @@ impl FederationDlqSink for SqliteDlqSink {
 
     async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.db.lock().await;
-        conn.0
+        let conn = self.conn.lock().await;
+        conn
             .execute(
                 "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
                 rusqlite::params![now, id],
@@ -525,8 +545,8 @@ impl FederationDlqSink for SqliteDlqSink {
     }
 
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
-        let conn = self.db.lock().await;
-        conn.0
+        let conn = self.conn.lock().await;
+        conn
             .execute(
                 "UPDATE federation_push_dlq \
                  SET attempt_count = attempt_count + 1, last_error = ?1 \
@@ -538,8 +558,8 @@ impl FederationDlqSink for SqliteDlqSink {
     }
 
     async fn pending_dlq_count(&self) -> Result<i64, String> {
-        let conn = self.db.lock().await;
-        conn.0
+        let conn = self.conn.lock().await;
+        conn
             .query_row(
                 "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
                 [],
