@@ -835,6 +835,30 @@ mod tests {
         assert!(second.memories_created.is_empty());
     }
 
+    /// #1693 — the SAL store path (`recover_from_transcript_store`) recovers
+    /// turns through `MemoryStore::recover_turn_idempotent` and is idempotent
+    /// on re-run, identically to the sqlite `recover_from_transcript` path.
+    /// Covers the async store entry on the `SqliteStore` adapter (which
+    /// delegates to the same SSOT the postgres adapter mirrors).
+    #[tokio::test]
+    async fn store_path_recovers_and_dedups_sqlite() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1, USER_LINE_2]);
+        let store = crate::store::sqlite::SqliteStore::open(&db).expect("open store");
+        let opts = base_opts(transcript, "ai:test:store");
+
+        let first = recover_from_transcript_store(&store, &opts).await.unwrap();
+        assert_eq!(first.lines_atomised, 2, "errors: {:?}", first.errors);
+        assert_eq!(first.memories_created.len(), 2);
+
+        // Re-run → every line dedup-skipped (idempotent), nothing new.
+        let second = recover_from_transcript_store(&store, &opts).await.unwrap();
+        assert_eq!(second.lines_atomised, 0);
+        assert_eq!(second.lines_skipped_dedup, 2);
+        assert!(second.memories_created.is_empty());
+    }
+
     #[test]
     fn limit_caps_atomised_lines() {
         let dir = fresh_dir();
