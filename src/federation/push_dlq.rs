@@ -131,6 +131,25 @@ pub trait FederationDlqSink: Send + Sync {
     /// replay worker to maintain the `federation_push_dlq_depth`
     /// Prometheus gauge.
     async fn pending_dlq_count(&self) -> Result<i64, String>;
+
+    /// #1544 — refresh `last_error` on a pending row WITHOUT bumping
+    /// `attempt_count`. Called when a replay attempt is THROTTLED (peer
+    /// 429): the row is left pending so it converges once the quota
+    /// window rolls, and the attempt budget is preserved so a transient
+    /// throttle never quarantines a valid row. Recording the throttle
+    /// reason lets the cause-label classifier + the un-quarantine sweep
+    /// recognise the row.
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String>;
+
+    /// #1544 — un-quarantine rows that were quarantined SOLELY because a
+    /// 429 throttle burned their `attempt_count` past
+    /// [`MAX_REPLAY_ATTEMPTS`] before the quota window rolled. Resets
+    /// `attempt_count = 0` for pending rows at/over the ceiling whose
+    /// `last_error` indicates a throttle (429) — scoped to throttles so
+    /// genuinely-systematic failures (signature/schema refusals) stay
+    /// quarantined (resetting those would resume infinite no-op POST
+    /// amplification). Returns the number of rows un-quarantined.
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String>;
 }
 
 /// Spawn the federation push DLQ replay worker.
@@ -253,6 +272,24 @@ pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
 pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) {
+    // #1544 — before draining, un-quarantine rows that were quarantined
+    // SOLELY because a 429 throttle (per-agent / federation quota window)
+    // burned their attempt budget past MAX_REPLAY_ATTEMPTS before the
+    // window rolled (the #1535 atlas-corpus burst stalled ~75k valid
+    // rows this way). Throttle-scoped, so genuinely-systematic failures
+    // stay quarantined. Cheap bounded UPDATE that no-ops when nothing is
+    // throttle-quarantined.
+    match sink.reset_throttled_quarantine().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: un-quarantined {n} throttle-stalled (429) DLQ row(s) for retry"
+        ),
+        Err(e) => tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: reset_throttled_quarantine failed (non-fatal): {e}"
+        ),
+    }
     // #1579 B5 — adaptive drain batch. Scale the per-tick take with
     // the live backlog (`min(backlog, configurable cap)`, floored at
     // the historical REPLAY_BATCH_SIZE) so a bulk backlog drains at
@@ -395,6 +432,26 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                     target: PUSH_DLQ_TRACE_TARGET,
                     row_id = row.id,
                     "replay: peer {} still failing on row {}: {reason}",
+                    row.peer_id,
+                    row.id,
+                );
+            }
+            // #1544 — a THROTTLE (peer 429: per-agent / federation quota
+            // window) is retryable on its own once the window rolls. Do
+            // NOT call `bump_dlq_attempt` — burning a `MAX_REPLAY_ATTEMPTS`
+            // attempt on a throttle is exactly what quarantined ~75k valid
+            // rows before the daily quota reset (#1544). Refresh
+            // `last_error` for operator visibility (so the cause-label
+            // classifier + un-quarantine sweep can see it) but leave the
+            // attempt budget intact so the row keeps retrying until it
+            // lands.
+            AckOutcome::Throttled(reason) => {
+                let _ = sink.note_dlq_throttled(row.id, &reason).await;
+                tracing::debug!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    "replay: peer {} throttled (429) on row {} — leaving pending without \
+                     burning a quarantine attempt: {reason}",
                     row.peer_id,
                     row.id,
                 );
@@ -563,6 +620,35 @@ impl FederationDlqSink for SqliteDlqSink {
         )
         .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
     }
+
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+        // #1544 — refresh last_error ONLY; do NOT touch attempt_count.
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE federation_push_dlq SET last_error = ?1 \
+             WHERE id = ?2 AND replayed_at IS NULL",
+            rusqlite::params![last_error, id],
+        )
+        .map_err(|e| format!("sqlite note_dlq_throttled: {e}"))?;
+        Ok(())
+    }
+
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        // #1544 — un-quarantine rows quarantined SOLELY by a 429 throttle.
+        // Scoped to throttle rows (last_error names a 429) so genuinely
+        // systematic failures stay quarantined.
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE federation_push_dlq SET attempt_count = 0 \
+                 WHERE replayed_at IS NULL \
+                   AND attempt_count >= ?1 \
+                   AND last_error LIKE '%429%'",
+                rusqlite::params![MAX_REPLAY_ATTEMPTS],
+            )
+            .map_err(|e| format!("sqlite reset_throttled_quarantine: {e}"))?;
+        Ok(n as u64)
+    }
 }
 
 /// Postgres implementation of [`FederationDlqSink`] backed by the
@@ -683,6 +769,37 @@ impl FederationDlqSink for PostgresDlqSink {
                 .map_err(|e| format!("postgres pending_dlq_count: {e}"))?;
         Ok(row.0)
     }
+
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+        // #1544 — refresh last_error ONLY; do NOT touch attempt_count.
+        let pool = self.store.pool();
+        sqlx::query(
+            "UPDATE federation_push_dlq SET last_error = $1 \
+             WHERE id = $2 AND replayed_at IS NULL",
+        )
+        .bind(last_error)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres note_dlq_throttled: {e}"))?;
+        Ok(())
+    }
+
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        // #1544 — un-quarantine 429-throttled rows only (see trait doc).
+        let pool = self.store.pool();
+        let res = sqlx::query(
+            "UPDATE federation_push_dlq SET attempt_count = 0 \
+             WHERE replayed_at IS NULL \
+               AND attempt_count >= $1 \
+               AND last_error LIKE '%429%'",
+        )
+        .bind(MAX_REPLAY_ATTEMPTS)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres reset_throttled_quarantine: {e}"))?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -721,6 +838,9 @@ mod replay_arm_tests {
         rows: Mutex<Vec<FederationPushDlqRow>>,
         marked_replayed: Mutex<Vec<i64>>,
         bumped: Mutex<Vec<(i64, String)>>,
+        // #1544 — records note_dlq_throttled calls so a test can assert a
+        // 429 throttle did NOT go through bump_dlq_attempt.
+        throttled: Mutex<Vec<(i64, String)>>,
         count_should_err: bool,
         take_should_err: bool,
         take_calls: AtomicUsize,
@@ -775,6 +895,32 @@ mod replay_arm_tests {
                 return Err("mock count error".to_string());
             }
             Ok(self.rows.lock().unwrap().len() as i64)
+        }
+
+        async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+            // Record the throttle WITHOUT bumping attempt_count, then
+            // refresh last_error on the matching row.
+            self.throttled
+                .lock()
+                .unwrap()
+                .push((id, last_error.to_string()));
+            for row in self.rows.lock().unwrap().iter_mut() {
+                if row.id == id {
+                    row.last_error = last_error.to_string();
+                }
+            }
+            Ok(())
+        }
+
+        async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+            let mut n = 0u64;
+            for row in self.rows.lock().unwrap().iter_mut() {
+                if row.attempt_count >= MAX_REPLAY_ATTEMPTS && row.last_error.contains("429") {
+                    row.attempt_count = 0;
+                    n += 1;
+                }
+            }
+            Ok(n)
         }
     }
 
@@ -928,5 +1074,67 @@ mod replay_arm_tests {
         // Take errored → early return, no replay/bump.
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
         assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    // ----- #1544 throttle / un-quarantine -----------------------------
+
+    fn dlq_row(id: i64, attempt_count: i32, last_error: &str) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: format!("m{id}"),
+            peer_id: "peer-0".to_string(),
+            payload_json: serde_json::json!({}),
+            attempt_count,
+            last_error: last_error.to_string(),
+        }
+    }
+
+    /// #1544 — a 429 throttle must un-quarantine ONLY rows whose
+    /// last_error names the throttle; a genuinely-systematic failure
+    /// (e.g. http 400) stays quarantined so the worker doesn't resume
+    /// infinite no-op POST amplification against a permanently-broken row.
+    #[tokio::test]
+    async fn reset_throttled_quarantine_is_scoped_to_429_rows() {
+        let sink = MockSink::default();
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.push(dlq_row(1, MAX_REPLAY_ATTEMPTS, "http 429 Too Many Requests"));
+            rows.push(dlq_row(2, MAX_REPLAY_ATTEMPTS, "http 400 Bad Request"));
+            rows.push(dlq_row(3, 5, "http 429 Too Many Requests")); // not quarantined
+        }
+        let n = sink.reset_throttled_quarantine().await.expect("reset");
+        assert_eq!(n, 1, "only the quarantined 429 row is un-quarantined");
+        let rows = sink.rows.lock().unwrap();
+        let by_id = |id: i64| rows.iter().find(|r| r.id == id).unwrap().attempt_count;
+        assert_eq!(by_id(1), 0, "429-quarantined row reset to 0");
+        assert_eq!(
+            by_id(2),
+            MAX_REPLAY_ATTEMPTS,
+            "permanent-failure (400) row STAYS quarantined"
+        );
+        assert_eq!(by_id(3), 5, "below-ceiling 429 row untouched");
+    }
+
+    /// #1544 — a throttle records via note_dlq_throttled and must NOT go
+    /// through bump_dlq_attempt (which would burn a quarantine attempt).
+    #[tokio::test]
+    async fn throttle_notes_without_bumping_attempt_count() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(dlq_row(1, 5, "previous error"));
+        sink.note_dlq_throttled(1, "http 429 Too Many Requests")
+            .await
+            .expect("note");
+        assert!(
+            sink.bumped.lock().unwrap().is_empty(),
+            "a throttle must NOT bump attempt_count"
+        );
+        assert_eq!(sink.throttled.lock().unwrap().len(), 1);
+        assert!(
+            sink.rows.lock().unwrap()[0].last_error.contains("429"),
+            "last_error refreshed to the throttle reason"
+        );
     }
 }
