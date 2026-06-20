@@ -11,14 +11,24 @@
 //! committed through a W-of-N quorum that **fences stale leaders by
 //! `term`**.
 //!
-//! ## What this module is (4a) — and is NOT
+//! ## What this module is
 //!
-//! This module is the **pure leadership state machine**: the
-//! [`SequencerState`] (a monotonic `term` + the current leader) and the
-//! pure [`SequencerState::evaluate`] verdict that lifts the proven
-//! [`crate::actions::lease_acquire`] gate (`expires_at > now && holder !=
-//! candidate` ⇒ conflict) to the sequencer term, bumping `term` on every
-//! leadership CHANGE.
+//! The complete in-process R6 primitive, in three layers:
+//!
+//! * **4a — leadership** ([`SequencerState`]): a monotonic `term` + the
+//!   current leader; [`SequencerState::evaluate`] lifts the proven
+//!   [`crate::actions::lease_acquire`] gate (`expires_at > now && holder !=
+//!   candidate` ⇒ conflict) to the sequencer term.
+//! * **4b — safety** ([`AcceptorState`] + [`commit_assignment`]): the
+//!   term-fence. Each quorum peer rejects an assignment whose `term` is
+//!   below its `max_term_seen`, so a deposed leader cannot collect `W`
+//!   acks. This — NOT the lease — is what prevents two live leaders from
+//!   both committing.
+//! * **4c — integration** ([`Sequencer`] + [`committed_assignment_event`]):
+//!   the full round (acquire leadership → assign `(term, seq)` → commit
+//!   through the term-fenced quorum) and the durable, append-only,
+//!   hash-chained `signed_events` record of the agreed total order
+//!   (commit-once / never-retract).
 //!
 //! **The lease is a LIVENESS optimization only — it is NOT the safety
 //! boundary.** A GC-paused leader whose lease has not yet expired on its
@@ -36,6 +46,12 @@
 //! deterministically unit-testable with no real timers.
 
 use crate::models::action::Lease;
+use crate::signed_events::{SignedEvent, payload_hash};
+
+/// `signed_events.event_type` for an R6-committed `(term, seq)` assignment
+/// (#1760). The append-only chain of these events is the durable,
+/// tamper-evident record of the agreed total order.
+pub const R6_ASSIGNMENT_COMMITTED_EVENT: &str = "r6.assignment.committed";
 
 /// The sequencer's leadership view: a monotonically-increasing `term` and
 /// the current leader's holder id.
@@ -256,6 +272,137 @@ pub fn commit_assignment(
     }
 }
 
+/// A committed R6 assignment (#1760): the operation `op` was agreed to
+/// occupy slot `seq` under leadership epoch `term`. The pair `(term, seq)`
+/// is the agreed TOTAL ORDER key — ordered by `term`, then `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedAssignment {
+    /// The leadership epoch that committed this assignment.
+    pub term: i64,
+    /// The slot within the epoch (per-`term` monotonic from 0).
+    pub seq: i64,
+    /// The committed operation payload.
+    pub op: String,
+}
+
+/// The R6 quorum-elected sequencer (#1760 item 4c) — the in-process
+/// integration of the leadership state machine (4a) and the term-fenced
+/// W-of-N quorum (4b).
+///
+/// A node runs [`Sequencer::commit_op`] to propose an operation: it
+/// acquires/renews leadership via the lease (liveness), assigns the next
+/// `(term, seq)`, and commits the assignment through the term-fenced
+/// quorum (safety). On success the committed `(term, seq, op)` is appended
+/// to the `signed_events` log via [`committed_assignment_event`] — the
+/// append-only, hash-chained chain of those events IS the durable,
+/// tamper-evident agreed total order (commit-once / never-retract, so the
+/// chain is never broken by a leader change).
+///
+/// **Boundary (documented per the vote `4d3ea1c5`):** this is a
+/// quorum-ordered + leader-serialized + term-fenced total order. It is
+/// NOT partition-linearizable beyond the term-fence — under a partition a
+/// minority leader simply cannot commit (it never reaches `W`). The
+/// leadership `term` is recoverable from the log (the max committed term),
+/// so no separate leader-lease table is persisted; a wire transport / SAL
+/// surface binds when a real R6 consumer lands.
+#[derive(Debug, Clone, Default)]
+pub struct Sequencer {
+    /// Leadership view (4a).
+    pub state: SequencerState,
+    /// Next slot to assign within the current `term`. Reset on each
+    /// leadership change so every epoch has its own `seq` space.
+    next_seq: i64,
+}
+
+impl Sequencer {
+    /// A fresh sequencer (no leader, term 0).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run one R6 round for `candidate` proposing `op` against the `quorum`
+    /// of acceptors (each term-fenced) requiring `w` acks, at injected
+    /// `now` with the current leader-`lease` snapshot.
+    ///
+    /// Returns the [`CommittedAssignment`] on success, or `None` when
+    /// `candidate` is not the leader (a live lease is held by another) or
+    /// the quorum rejected the assignment (a stale `term` was fenced, or
+    /// too few acceptors were reachable). Pure — no I/O, `now` injected.
+    pub fn commit_op(
+        &mut self,
+        quorum: &mut [AcceptorState],
+        lease: Option<&Lease>,
+        candidate: &str,
+        op: &str,
+        w: usize,
+        now: i64,
+    ) -> Option<CommittedAssignment> {
+        let term = match self.state.evaluate(lease, candidate, now) {
+            // A live lease held by another holder ⇒ not the leader.
+            LeadershipOutcome::Conflict { .. } => return None,
+            // Leadership changed hands ⇒ a NEW epoch. The term is GLOBAL,
+            // not node-local: a new leader fences the prior one by claiming
+            // strictly above the quorum's highest acknowledged term (so a
+            // fresh node taking over does not collide with the prior term).
+            // A fresh per-`term` seq space starts at 0.
+            LeadershipOutcome::Acquired { .. } => {
+                let quorum_max = quorum.iter().map(|a| a.max_term_seen).max().unwrap_or(0);
+                let new_term = quorum_max.max(self.state.term) + 1;
+                self.state.term = new_term;
+                self.state.leader = Some(candidate.to_string());
+                self.next_seq = 0;
+                new_term
+            }
+            // The current leader re-acquiring keeps its OWN epoch's term —
+            // a deposed leader that still believes it leads (clock skew)
+            // therefore proposes its STALE term and is fenced by the quorum.
+            LeadershipOutcome::Renewed { .. } => self.state.term,
+        };
+        let seq = self.next_seq;
+        match commit_assignment(quorum, term, seq, w) {
+            AssignmentOutcome::Committed { .. } => {
+                self.next_seq += 1;
+                Some(CommittedAssignment {
+                    term,
+                    seq,
+                    op: op.to_string(),
+                })
+            }
+            AssignmentOutcome::Rejected { .. } => None,
+        }
+    }
+}
+
+/// Build the append-ready [`SignedEvent`] for a committed R6 assignment
+/// (#1760): a deterministic id `r6:<term>:<seq>` (one per slot, so the
+/// `signed_events` `(id)` PK enforces the commit-once / single-value
+/// invariant), the `payload_hash` over the canonical `(term, seq, op)`
+/// bytes, and the [`R6_ASSIGNMENT_COMMITTED_EVENT`] type. `prev_hash` and
+/// `sequence` are left empty for [`crate::signed_events::append_signed_event`]
+/// to fill (the hash chain + monotonic rank). Unsigned by default; the
+/// daemon signing key is applied by the append path when present.
+#[must_use]
+pub fn committed_assignment_event(
+    agent_id: &str,
+    assignment: &CommittedAssignment,
+    timestamp: &str,
+) -> SignedEvent {
+    let canonical = format!(
+        "{}\u{0}{}\u{0}{}",
+        assignment.term, assignment.seq, assignment.op
+    );
+    SignedEvent {
+        id: format!("r6:{}:{}", assignment.term, assignment.seq),
+        agent_id: agent_id.to_string(),
+        event_type: R6_ASSIGNMENT_COMMITTED_EVENT.to_string(),
+        payload_hash: payload_hash(canonical.as_bytes()),
+        attest_level: "unsigned".to_string(),
+        timestamp: timestamp.to_string(),
+        ..SignedEvent::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +601,129 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- 4c: Sequencer integration + durable-log event + interleaving --
+
+    fn lease_of(holder: &str, expires_at: i64) -> Lease {
+        Lease {
+            action_id: "_seq_leader:default".to_string(),
+            holder: holder.to_string(),
+            acquired_at: 0,
+            expires_at,
+            heartbeat_at: 0,
+        }
+    }
+
+    #[test]
+    fn sequencer_commits_ops_in_per_term_order() {
+        let mut q = vec![AcceptorState::default(); 3];
+        let mut s = Sequencer::new();
+        let a = s.commit_op(&mut q, None, "A", "op1", 2, 100).unwrap();
+        let b = s
+            .commit_op(&mut q, Some(&lease_of("A", 500)), "A", "op2", 2, 150)
+            .unwrap();
+        let c = s
+            .commit_op(&mut q, Some(&lease_of("A", 500)), "A", "op3", 2, 200)
+            .unwrap();
+        assert_eq!((a.term, a.seq, a.op.as_str()), (1, 0, "op1"));
+        assert_eq!((b.term, b.seq, b.op.as_str()), (1, 1, "op2"));
+        assert_eq!((c.term, c.seq, c.op.as_str()), (1, 2, "op3"));
+    }
+
+    #[test]
+    fn sequencer_non_leader_does_not_commit() {
+        let mut q = vec![AcceptorState::default(); 3];
+        // A holds a live lease; B is not the leader → no commit.
+        let mut b = Sequencer::new();
+        let out = b.commit_op(&mut q, Some(&lease_of("A", 500)), "B", "op", 2, 100);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn sequencer_new_term_resets_seq_space() {
+        let mut q = vec![AcceptorState::default(); 3];
+        let mut a = Sequencer::new();
+        a.commit_op(&mut q, None, "A", "op1", 2, 100); // (1, 0)
+        a.commit_op(&mut q, Some(&lease_of("A", 200)), "A", "op2", 2, 150); // (1, 1)
+        // B takes over (A's lease expired) → new term 2, seq resets to 0.
+        let mut b = Sequencer::new();
+        let first = b
+            .commit_op(&mut q, Some(&lease_of("A", 200)), "B", "op3", 2, 250)
+            .unwrap();
+        assert_eq!(
+            (first.term, first.seq),
+            (2, 0),
+            "new leadership epoch restarts the seq space"
+        );
+    }
+
+    #[test]
+    fn committed_assignment_event_is_deterministic_per_slot() {
+        let asg = CommittedAssignment {
+            term: 2,
+            seq: 5,
+            op: "op-x".to_string(),
+        };
+        let e1 = committed_assignment_event("node-a", &asg, "2026-06-20T00:00:00+00:00");
+        let e2 = committed_assignment_event("node-a", &asg, "2026-06-20T00:00:00+00:00");
+        // Deterministic id pins one event per (term, seq) slot (the
+        // signed_events PK then enforces commit-once at the DB).
+        assert_eq!(e1.id, "r6:2:5");
+        assert_eq!(e1.event_type, R6_ASSIGNMENT_COMMITTED_EVENT);
+        assert_eq!(e1.payload_hash.len(), 32, "sha256 digest");
+        assert_eq!(
+            e1.payload_hash, e2.payload_hash,
+            "stable hash for the same assignment"
+        );
+        // prev_hash / sequence left empty for the append path to fill.
+        assert!(e1.prev_hash.is_empty());
+        assert_eq!(e1.sequence, 0);
+    }
+
+    /// The load-bearing R6 end-to-end SAFETY proof (the vote's interleaving
+    /// requirement): a deposed leader that STILL BELIEVES it holds
+    /// leadership (clock skew — it sees its own lease as live) is fenced by
+    /// the quorum's `term`, not the lease, so it cannot commit; and no two
+    /// committed assignments ever share a `(term, seq)` slot.
+    #[test]
+    fn interleaving_deposed_leader_is_fenced_by_quorum_term() {
+        let mut quorum = vec![AcceptorState::default(); 3];
+        let w = 2;
+        let mut committed: Vec<(i64, i64)> = Vec::new();
+
+        // A leads at term 1, commits (1, 0).
+        let mut a = Sequencer::new();
+        let c1 = a.commit_op(&mut quorum, None, "A", "op1", w, 100).unwrap();
+        committed.push((c1.term, c1.seq));
+
+        // B takes leadership (A's lease expired at 200, now 250), term 2,
+        // commits (2, 0) — the quorum advances its max_term to 2.
+        let mut b = Sequencer::new();
+        let c2 = b
+            .commit_op(&mut quorum, Some(&lease_of("A", 200)), "B", "op2", w, 250)
+            .unwrap();
+        committed.push((c2.term, c2.seq));
+
+        // DEPOSED A still thinks it is leader: clock skew makes its OWN
+        // lease look live (now 150 < expires 200), so the liveness gate
+        // passes (A "renews") and A proposes again at its stale term 1.
+        // The quorum's term-fence (max_term = 2) REJECTS it → not committed.
+        let fenced = a.commit_op(&mut quorum, Some(&lease_of("A", 200)), "A", "op3", w, 150);
+        assert!(
+            fenced.is_none(),
+            "a deposed leader's stale-term op MUST be fenced by the quorum (not the lease), got {fenced:?}"
+        );
+
+        // Single total order: every committed slot is unique.
+        let mut sorted = committed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            committed.len(),
+            "no two committed assignments may share a (term, seq) slot"
+        );
+        assert_eq!(committed, vec![(1, 0), (2, 0)]);
     }
 }
