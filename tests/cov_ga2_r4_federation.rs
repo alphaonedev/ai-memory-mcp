@@ -30,8 +30,10 @@
 //!   `sync_push_via_store` arms the prior wave skipped: the
 //!   batch-size-cap `400` refusal, and the per-agent quota-refusal `429`
 //!   short-circuit (a pre-seeded `agent_quotas` row with
-//!   `max_memories_per_day = 0` trips `QuotaError::Quota`, exercising the
-//!   quota WARN, the signed-event emit, and the `429` envelope).
+//!   `max_storage_bytes = 0` trips `QuotaError::Quota{StorageBytes}` —
+//!   #1544: receive charges storage-bytes only, not the daily
+//!   write-count — exercising the quota WARN, the signed-event emit, and
+//!   the `429` envelope).
 //! - **`src/cli/schema_init.rs`** — the live-Postgres `embedding_dim`
 //!   in-place conversion arm (`init_and_enumerate_postgres` →
 //!   `migrate_embedding_dim` returning `true`) + the AGE-bootstrap branch
@@ -676,12 +678,16 @@ async fn pg_sync_push_quota_refusal_returns_429() {
     let peer = uid("ai:cov-ga2-r4-quota");
     let ns = uid("cov-ga2-r4-quota");
 
-    // Pre-seed a zero-budget agent_quotas row for (attribute_agent, ns) on the
-    // sqlite metadata DB. `ensure_row` short-circuits on an existing row, so
-    // the daily-memory cap stays 0 → the first apply trips
-    // QuotaError::Quota → the quota-refusal WARN + signed-event + 429.
-    // `attribute_agent_for_quota` resolves to the memory's metadata.agent_id
-    // (== peer here), so the seeded row keys on (peer, ns).
+    // #1544 — the federation RECEIVE path now charges the per-agent
+    // STORAGE-BYTES ceiling ONLY (not the daily write-count), so a
+    // zero-budget refusal is driven by `max_storage_bytes`, not
+    // `max_memories_per_day`. Pre-seed a zero-STORAGE-budget row (with a
+    // generous daily-memory cap so it is provably NOT the trigger): the
+    // first inbound row's byte estimate trips QuotaError::Quota with
+    // `StorageBytes` → the quota-refusal WARN + signed-event + 429.
+    // `ensure_row` short-circuits on an existing row, so the seeded caps
+    // stand. `attribute_agent_for_quota` resolves to the memory's
+    // metadata.agent_id (== peer here), so the row keys on (peer, ns).
     let db = fresh_metadata_db();
     {
         let conn = db.lock().await;
@@ -694,10 +700,10 @@ async fn pg_sync_push_quota_refusal_returns_429() {
                     max_memories_per_day, max_storage_bytes, max_links_per_day,
                     current_memories_today, current_storage_bytes, current_links_today,
                     day_started_at, created_at, updated_at)
-                 VALUES (?1, ?2, 0, 104857600, 5000, 0, 0, 0, ?3, ?4, ?4)",
+                 VALUES (?1, ?2, 1000, 0, 5000, 0, 0, 0, ?3, ?4, ?4)",
                 rusqlite::params![peer, ns, day, now],
             )
-            .expect("seed zero-budget quota row");
+            .expect("seed zero-storage-budget quota row");
     }
 
     let r = pg_router_with_db(&url, db).await;
@@ -715,10 +721,12 @@ async fn pg_sync_push_quota_refusal_returns_429() {
     assert_eq!(
         status,
         StatusCode::TOO_MANY_REQUESTS,
-        "zero-budget quota must refuse with 429; body={b}"
+        "zero storage-budget quota must refuse with 429; body={b}"
     );
     assert_eq!(b["error"], "QUOTA_EXCEEDED", "body={b}");
-    assert_eq!(b["limit"], "memories_per_day", "body={b}");
+    // #1544 — receive charges storage-bytes only, so the refusal limit is
+    // `storage_bytes` (NOT `memories_per_day`).
+    assert_eq!(b["limit"], "storage_bytes", "body={b}");
     assert_eq!(
         b["applied_before_refusal"].as_i64().unwrap_or(-1),
         0,
