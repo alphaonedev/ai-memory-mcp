@@ -101,24 +101,26 @@ pub async fn get_memory(
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
-    // PERF-1 (FX-3): wrap the rusqlite read sequence in `db_op` so the
-    // FTS5 + memory_links lookups run on the blocking pool, not on the
-    // tokio worker. `get_memory` is on the per-id retrieval hot path.
-    // The visibility check is pure CPU on the owned Memory so it stays
-    // outside the helper; only the SQL touches the DB lock.
+    // #1580 (PERF, supersedes the PERF-1/FX-3 `db_op` wrap): `get_memory`
+    // is a pure read (resolve_id + get_links), so it dispatches through
+    // the WAL read-pool (`db_read_op`) instead of the single writer
+    // mutex — concurrent GETs now run on distinct read-only connections
+    // rather than serializing. The visibility check is pure CPU on the
+    // owned Memory so it stays outside the helper; only the SELECTs touch
+    // a pool connection.
     let id_clone = id.clone();
     let lookup: Result<
         Option<(crate::models::Memory, Vec<crate::models::MemoryLink>)>,
         anyhow::Error,
-    > = super::db_op(app.db.clone(), move |guard| {
-        match db::resolve_id(&guard.0, &id_clone) {
+    > = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+        match db::resolve_id(conn, &id_clone) {
             Ok(Some(mem)) => {
                 // #869 audit (Category B — safe default): a substrate
                 // failure on `get_links` is non-fatal — the memory
                 // body itself was retrieved cleanly. Empty `links`
                 // array degrades graph navigation rather than
                 // failing the GET.
-                let links = db::get_links(&guard.0, &mem.id).unwrap_or_default();
+                let links = db::get_links(conn, &mem.id).unwrap_or_default();
                 Ok(Some((mem, links)))
             }
             Ok(None) => Ok(None),
