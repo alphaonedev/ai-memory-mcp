@@ -64,7 +64,7 @@
 //!
 //! `metadata` is a deep JSON merge (objects merge key-wise recursively;
 //! disjoint keys both survive; non-object collisions fall back to LWW),
-//! with three overrides applied AFTER the deep merge:
+//! with four overrides applied AFTER the deep merge:
 //!
 //! * `metadata.agent_id` — **immutable, original (`local`) wins**
 //!   (NHI provenance is write-once; a peer must not rewrite it).
@@ -72,14 +72,33 @@
 //!   visibility change, like `title`).
 //! * `metadata.governance` — **keep `local`'s** (owner-only override; a
 //!   merge must never let a peer rewrite governance).
+//! * `metadata.version_vector` — **pointwise-max [`VectorClock`] merge**
+//!   (#1756 / #1719 item 2): the per-memory CRDT clock must join by
+//!   per-peer max, NOT the default deep-merge/LWW (which would discard a
+//!   peer observation carried by the row that lost the row-level LWW).
+//!   Carried + merged only at this milestone — not yet read to gate a
+//!   dominant-side discard (#1709 ship-but-don't-gate).
 
 use serde_json::{Map, Value};
 
 use super::crdt_primitives::{OrSet, PnCounter};
 use super::field_names;
+use super::link::VectorClock;
 use super::memory::Memory;
 use crate::identity::verify::AttestLevel;
 use crate::mcp::param_names;
+
+/// #1756 / #1719 item 2 — extract a row's per-memory CRDT vector clock
+/// from its `metadata.version_vector` key. An absent or malformed value
+/// yields the empty clock (`VectorClock::default()`), which is the
+/// minimal lattice element ("never observed anything") — so legacy rows
+/// that predate the clock merge byte-identically to today.
+fn parse_version_vector(metadata: &Value) -> VectorClock {
+    metadata
+        .get(field_names::VERSION_VECTOR)
+        .and_then(|v| serde_json::from_value::<VectorClock>(v.clone()).ok())
+        .unwrap_or_default()
+}
 
 /// #1719 item 3a — trust rank of a row's stamped `metadata.attest_level`
 /// for the attested-identity LWW tiebreak. A `claimed` / unsigned /
@@ -350,6 +369,27 @@ fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
             None => {
                 map.remove(field_names::GOVERNANCE);
             }
+        }
+
+        // version_vector — per-memory CRDT vector clock (#1756 / #1719
+        // item 2). MUST merge by pointwise-max (`VectorClock::merge`), NOT
+        // the `deep_merge_json` above: a deep merge resolves a per-peer
+        // timestamp collision by row-level LWW (`(updated_at, attest_rank,
+        // id)`), which would silently DISCARD a peer observation the
+        // LWW-losing row carried — corrupting the clock (the 5-agent vote
+        // 4d3ea1c5 correctness finding). The pointwise-max join keeps the
+        // later timestamp per peer regardless of which row won the row-LWW,
+        // preserving the commutative/associative/idempotent semilattice.
+        // Carried + merged only (ship-but-don't-gate, #1709 / 0623aebf):
+        // the clock advances and converges, but is NOT yet read to gate a
+        // dominant-side discard. Absent on both sides ⇒ key stays absent
+        // (the empty clock is the minimal element).
+        let mut merged_vc = parse_version_vector(&local.metadata);
+        merged_vc.merge(&parse_version_vector(&remote.metadata));
+        if merged_vc.entries.is_empty() {
+            map.remove(field_names::VERSION_VECTOR);
+        } else if let Ok(vc_value) = serde_json::to_value(&merged_vc) {
+            map.insert(field_names::VERSION_VECTOR.to_string(), vc_value);
         }
     }
 
@@ -772,6 +812,101 @@ mod tests {
         let sanitized = sanitize_inbound_attestation(&no_level);
         assert!(sanitized.metadata.get("attest_level").is_none());
         assert_eq!(attest_rank(&sanitized), 0);
+    }
+
+    /// Set `metadata.version_vector` from `(peer, ts)` pairs (test helper).
+    fn with_clock(mut m: Memory, pairs: &[(&str, &str)]) -> Memory {
+        let entries: serde_json::Map<String, Value> = pairs
+            .iter()
+            .map(|(p, t)| ((*p).to_string(), Value::String((*t).to_string())))
+            .collect();
+        m.metadata = json!({ "version_vector": { "entries": entries } });
+        m
+    }
+
+    fn clock_of(m: &Memory) -> std::collections::BTreeMap<String, String> {
+        parse_version_vector(&m.metadata).entries
+    }
+
+    #[test]
+    fn version_vector_merges_by_pointwise_max_union() {
+        // Disjoint peers both survive; a shared peer takes the later ts.
+        let local = with_clock(
+            base("a", "2026-06-16T00:00:00+00:00"),
+            &[
+                ("node-a", "2026-06-16T05:00:00+00:00"),
+                ("shared", "2026-06-16T01:00:00+00:00"),
+            ],
+        );
+        let remote = with_clock(
+            base("a", "2026-06-16T00:00:01+00:00"),
+            &[
+                ("node-b", "2026-06-16T07:00:00+00:00"),
+                ("shared", "2026-06-16T09:00:00+00:00"),
+            ],
+        );
+        let merged = clock_of(&merge_memory(&local, &remote));
+        assert_eq!(
+            merged.get("node-a").map(String::as_str),
+            Some("2026-06-16T05:00:00+00:00")
+        );
+        assert_eq!(
+            merged.get("node-b").map(String::as_str),
+            Some("2026-06-16T07:00:00+00:00")
+        );
+        // shared → the LATER timestamp (pointwise max), not a row-LWW pick.
+        assert_eq!(
+            merged.get("shared").map(String::as_str),
+            Some("2026-06-16T09:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn version_vector_preserves_observation_of_lww_losing_row() {
+        // The 5-agent vote (4d3ea1c5) correctness regression case: the
+        // row with the OLDER updated_at LOSES the row-level LWW, yet it
+        // carries a NEWER timestamp for `peer-x`. A deep-merge/LWW path
+        // would discard that observation; pointwise-max MUST keep it.
+        let lww_loser = with_clock(
+            base("a", "2026-06-16T00:00:00+00:00"), // older updated_at (loses LWW)
+            &[("peer-x", "2026-06-16T23:00:00+00:00")], // but newer peer-x obs
+        );
+        let lww_winner = with_clock(
+            base("a", "2026-06-16T09:00:00+00:00"), // newer updated_at (wins LWW)
+            &[("peer-x", "2026-06-16T02:00:00+00:00")],
+        );
+        let merged = clock_of(&merge_memory(&lww_winner, &lww_loser));
+        // peer-x keeps the LATER (23:00) timestamp even though its carrier
+        // lost the row-LWW — causal history is not lost.
+        assert_eq!(
+            merged.get("peer-x").map(String::as_str),
+            Some("2026-06-16T23:00:00+00:00")
+        );
+    }
+
+    #[test]
+    fn version_vector_merge_is_commutative_and_idempotent() {
+        let local = with_clock(
+            base("a", "2026-06-16T00:00:00+00:00"),
+            &[("node-a", "2026-06-16T05:00:00+00:00")],
+        );
+        let remote = with_clock(
+            base("a", "2026-06-16T00:00:01+00:00"),
+            &[("node-b", "2026-06-16T07:00:00+00:00")],
+        );
+        let ab = clock_of(&merge_memory(&local, &remote));
+        let ba = clock_of(&merge_memory(&remote, &local));
+        assert_eq!(ab, ba, "version_vector merge commutative");
+        // Idempotent: merging a row with itself is unchanged.
+        assert_eq!(clock_of(&merge_memory(&local, &local)), clock_of(&local));
+    }
+
+    #[test]
+    fn version_vector_absent_on_both_stays_absent() {
+        let local = base("a", "2026-06-16T00:00:00+00:00"); // metadata {}
+        let remote = base("a", "2026-06-16T09:00:00+00:00");
+        let merged = merge_memory(&local, &remote);
+        assert!(merged.metadata.get("version_vector").is_none());
     }
 
     #[test]
