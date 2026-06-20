@@ -8,6 +8,7 @@ pub mod audit;
 pub mod capture_turn;
 pub mod checkpoint;
 pub mod crdt_merge;
+pub mod crdt_primitives;
 pub mod field_names;
 pub mod link;
 pub mod memory;
@@ -27,6 +28,8 @@ pub use capture_turn::*;
 #[allow(unused_imports)]
 pub use checkpoint::*;
 pub use crdt_merge::merge_memory;
+#[allow(unused_imports)]
+pub use crdt_primitives::{OrSet, PnCounter};
 pub use link::*;
 pub use memory::*;
 pub use namespace::*;
