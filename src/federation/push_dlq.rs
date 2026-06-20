@@ -298,10 +298,10 @@ static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 fn classify_quarantine_cause(last_error: &str) -> &'static str {
     if last_error.contains("429") {
         "quota"
-    } else if last_error.contains("peer_not_enrolled")
-        || last_error.contains("401")
-        || last_error.contains("403")
-    {
+    } else if last_error.contains("401") || last_error.contains("403") {
+        // The replay last_error is the `http {status}` shape, so 401/403
+        // is the enrolment/auth signal (the peer's JSON `peer_not_enrolled`
+        // body is not carried in last_error).
         "unenrolled_peer"
     } else if last_error.contains("id_drift") {
         "id_drift"
@@ -1204,7 +1204,11 @@ mod replay_arm_tests {
         let sink = MockSink::default();
         {
             let mut rows = sink.rows.lock().unwrap();
-            rows.push(dlq_row(1, MAX_REPLAY_ATTEMPTS, "http 429 Too Many Requests"));
+            rows.push(dlq_row(
+                1,
+                MAX_REPLAY_ATTEMPTS,
+                "http 429 Too Many Requests",
+            ));
             rows.push(dlq_row(2, MAX_REPLAY_ATTEMPTS, "http 400 Bad Request"));
             rows.push(dlq_row(3, 5, "http 429 Too Many Requests")); // not quarantined
         }
@@ -1252,13 +1256,16 @@ mod replay_arm_tests {
             classify_quarantine_cause("http 429 Too Many Requests"),
             "quota"
         );
-        assert_eq!(classify_quarantine_cause("http 400 Bad Request"), "permanent");
+        assert_eq!(
+            classify_quarantine_cause("http 400 Bad Request"),
+            "permanent"
+        );
         assert_eq!(
             classify_quarantine_cause("http 422 invalid signature"),
             "permanent"
         );
         assert_eq!(
-            classify_quarantine_cause("peer_not_enrolled"),
+            classify_quarantine_cause("http 401 Unauthorized"),
             "unenrolled_peer"
         );
         assert_eq!(
