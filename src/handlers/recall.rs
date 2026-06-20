@@ -645,124 +645,149 @@ async fn recall_response(
     // so no second lock is ever taken. Recorded INSIDE the lock block,
     // before the guard drops at the end of the block.
     let recall_id = uuid::Uuid::new_v4().to_string();
-    // Stage (b) — DB lock for the FTS5 query + get_many for the
-    // pre-computed HNSW hits + touch ops. Scoped tightly so the
-    // guard drops as soon as `recall_hybrid_precomputed_hnsw` /
-    // `recall` returns.
-    let (result, mode) = {
-        let lock = app.db.lock().await;
-        let short_extend = lock.2.short_extend_secs;
-        let mid_extend = lock.2.mid_extend_secs;
-        let (result, mode) = if let Some(ref qe) = query_emb {
+    // #1580 — recall is split across the WAL read-pool and the writer:
+    //
+    //   PHASE 1 (read-pool, `db_read_op`): the FTS5 query + `get_many`
+    //   for the pre-computed HNSW hits + scoring run on a read-only pool
+    //   connection so concurrent recalls overlap instead of serializing
+    //   on the single writer mutex. `recall_hybrid_precomputed_hnsw` /
+    //   `recall` internally call `touch_many`, which no-ops on a
+    //   read-only connection (`PRAGMA query_only = ON`) — so the read
+    //   phase performs ZERO writes (the `short_extend`/`mid_extend`
+    //   arguments are inert here; the authoritative touch runs in
+    //   phase 2). The returned `Memory` rows carry pre-touch
+    //   `access_count`, byte-identical to the pre-split response.
+    //
+    //   PHASE 2 (writer, `db_op`): the authoritative `touch_many`
+    //   (access bump / TTL floor-extend / promotion) + the #1710
+    //   recall_observations ledger write run together under one brief
+    //   writer lock. Both are best-effort: a failure logs at warn and
+    //   never reshapes the response.
+    //
+    // RYW: `touch_many` is a blind relative UPDATE under `BEGIN
+    // IMMEDIATE` (`access_count + 1`, `MAX(expires_at, …)`, promotion
+    // gated by `WHERE access_count >= …`), so splitting the SELECT off
+    // the writer introduces no read-modify-write race.
+    let ctx_owned = context.to_string();
+    let ns_owned = namespace.map(str::to_string);
+    let tags_owned = tags.map(str::to_string);
+    let since_owned = since.map(str::to_string);
+    let until_owned = until.map(str::to_string);
+    let source_uri_owned = source_uri_prefix.map(str::to_string);
+    let agent_owned = as_agent.or(caller_principal).map(str::to_string);
+    let caller_owned = caller_principal.map(str::to_string);
+    let scoring = app.scoring.clone();
+    let qe_owned = query_emb.clone();
+    let hits_owned = precomputed_hits.clone();
+    let (result, mode) = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+        if let Some(qe) = qe_owned.as_deref() {
             // SAFETY: `precomputed_hits` is Some when `query_emb` is
             // Some, by construction of the if-let above. The empty
             // slice case (no HNSW index) still threads through the
             // precomputed-hits path; `semantic_phase` short-circuits
-            // on `hits.is_empty()` and the linear-scan fallback at
-            // the bottom of the function runs (same behaviour as the
-            // pre-fix `idx = None` branch).
-            let hits = precomputed_hits
+            // on `hits.is_empty()` and the linear-scan fallback runs.
+            let hits = hits_owned
                 .as_deref()
                 .expect("precomputed_hits set when query_emb is Some");
             let r = db::recall_hybrid_precomputed_hnsw(
-                &lock.0,
-                context,
+                conn,
+                &ctx_owned,
                 qe,
-                namespace,
+                ns_owned.as_deref(),
                 limit,
-                tags,
-                since,
-                until,
+                tags_owned.as_deref(),
+                since_owned.as_deref(),
+                until_owned.as_deref(),
                 hits,
-                short_extend,
-                mid_extend,
-                // #928 SECURITY-medium (Track A P5, 2026-05-20):
-                // thread the header-resolved caller_principal as the
-                // visibility-filter principal so scope=private rows
-                // owned by other agents are NOT leaked when the
-                // caller doesn't set body.as_agent. See the matching
-                // longer note on the pre-FX-4 code for the rationale.
-                as_agent.or(caller_principal),
+                // #1580 — extends inert on the read-only pool conn; the
+                // internal touch no-ops and phase 2 does the real touch.
+                0,
+                0,
+                // #928 SECURITY-medium — visibility-filter principal.
+                agent_owned.as_deref(),
                 budget_tokens,
-                app.scoring.as_ref(),
+                scoring.as_ref(),
                 false,
-                // v0.7.0 Cluster-A PERF-3 — push the prefix into SQL
-                // on both FTS and semantic branches so the partial
-                // idx_memories_source_uri index covers the lookup;
-                // the post-fetch apply_form4_recall_filters below
-                // remains for the `has_citations` axis.
-                source_uri_prefix,
-                // v0.8.0 #1720 A3 — owner-keyed visibility caller. The
-                // header-resolved `caller_principal` is the agent's
-                // `metadata.agent_id` (DISTINCT from the `as_agent`
-                // namespace), so the owner-keyed private arm gates on
-                // ownership, not namespace.
-                caller_principal,
+                // v0.7.0 Cluster-A PERF-3 — source_uri prefix pushed to SQL.
+                source_uri_owned.as_deref(),
+                // v0.8.0 #1720 A3 — owner-keyed visibility caller.
+                caller_owned.as_deref(),
             );
             (r, "hybrid")
         } else {
             let r = db::recall(
-                &lock.0,
-                context,
-                namespace,
+                conn,
+                &ctx_owned,
+                ns_owned.as_deref(),
                 limit,
-                tags,
-                since,
-                until,
-                short_extend,
-                mid_extend,
-                // #928 — same caller_principal fallback as the hybrid
-                // branch above; see the longer note there.
-                as_agent.or(caller_principal),
+                tags_owned.as_deref(),
+                since_owned.as_deref(),
+                until_owned.as_deref(),
+                0,
+                0,
+                agent_owned.as_deref(),
                 budget_tokens,
                 false,
-                // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
-                source_uri_prefix,
-                // v0.8.0 #1720 A3 — owner-keyed visibility caller.
-                caller_principal,
+                source_uri_owned.as_deref(),
+                caller_owned.as_deref(),
             );
             (r, "keyword")
-        };
-        // #1710 — record the recalled set into the ledger WHILE the DB
-        // lock is still held (the `&lock.0` connection is in scope here;
-        // the guard drops at the end of this block). NON-FATAL: a ledger
-        // error logs at warn and never blocks / reshapes the recall
-        // response. Records the RECALLED set (pre-post-filter), exactly
-        // as the MCP path records its candidates — the heavy
-        // post-processing (form4 / rerank / kinds) stays OUTSIDE the lock
-        // below. Identity stamping (`agent_id` + `namespace`) mirrors the
-        // postgres branch: `as_agent.or(caller_principal)` for the agent,
-        // the in-scope `namespace` param for the namespace.
-        if let Ok((rows, _)) = result.as_ref()
-            && crate::observations::table_exists(&lock.0)
-        {
-            #[allow(clippy::cast_possible_wrap)]
-            let candidates: Vec<crate::observations::Candidate<'_>> = rows
-                .iter()
-                .enumerate()
-                .map(|(i, (m, s))| crate::observations::Candidate {
-                    memory_id: m.id.as_str(),
-                    retriever: mode,
-                    rank: (i + 1) as i64,
-                    score: *s,
-                })
-                .collect();
-            if let Err(e) = crate::observations::record_recall_with_identity(
-                &lock.0,
-                &recall_id,
-                &candidates,
-                as_agent.or(caller_principal),
-                namespace,
-            ) {
-                tracing::warn!("recall (sqlite-http): record_recall failed (non-fatal): {e}");
-            }
         }
-        (result, mode)
-        // `lock` drops here — every line below this block runs
-        // WITHOUT the DB mutex held. short_extend / mid_extend are
-        // consumed by the recall call above and are not needed after
-        // the lock releases.
-    };
+    })
+    .await;
+
+    // PHASE 2 (writer) — authoritative touch + recall_observations
+    // ledger, batched under one brief writer lock. Mirrors the postgres
+    // branch's post-response touch + #1705 ledger.
+    if let Ok((rows, _)) = result.as_ref() {
+        #[allow(clippy::cast_possible_wrap)]
+        let recorded: Vec<(String, i64, f64)> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (m, s))| (m.id.clone(), (i + 1) as i64, *s))
+            .collect();
+        let recall_id_w = recall_id.clone();
+        // Owned ledger identity, re-derived from the still-in-scope
+        // borrowed params (the phase-1 copies were moved into the pool
+        // closure). Mirrors the pre-split `as_agent.or(caller_principal)`
+        // + `namespace` stamping.
+        let agent_for_ledger = as_agent.or(caller_principal).map(str::to_string);
+        let ns_for_ledger = namespace.map(str::to_string);
+        super::db_op(app.db.clone(), move |guard| {
+            let id_refs: Vec<&str> = recorded.iter().map(|(id, _, _)| id.as_str()).collect();
+            if let Err(e) = db::touch_many(
+                &guard.0,
+                &id_refs,
+                guard.2.short_extend_secs,
+                guard.2.mid_extend_secs,
+            ) {
+                tracing::warn!("recall (sqlite-http): touch_many failed (non-fatal): {e}");
+            }
+            // #1710 — record the recalled set into the ledger on the
+            // writer connection (no second lock; mirrors the MCP free-fn).
+            if crate::observations::table_exists(&guard.0) {
+                let candidates: Vec<crate::observations::Candidate<'_>> = recorded
+                    .iter()
+                    .map(|(id, rank, score)| crate::observations::Candidate {
+                        memory_id: id.as_str(),
+                        retriever: mode,
+                        rank: *rank,
+                        score: *score,
+                    })
+                    .collect();
+                if let Err(e) = crate::observations::record_recall_with_identity(
+                    &guard.0,
+                    &recall_id_w,
+                    &candidates,
+                    agent_for_ledger.as_deref(),
+                    ns_for_ledger.as_deref(),
+                ) {
+                    tracing::warn!("recall (sqlite-http): record_recall failed (non-fatal): {e}");
+                }
+            }
+        })
+        .await;
+    }
 
     match result {
         Ok((r, outcome)) => {
