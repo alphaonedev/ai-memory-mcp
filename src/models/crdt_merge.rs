@@ -64,9 +64,20 @@
 
 use serde_json::{Map, Value};
 
+use super::crdt_primitives::{OrSet, PnCounter};
 use super::field_names;
 use super::memory::Memory;
 use crate::mcp::param_names;
+
+/// Delegate a #224 max-merged counter field to the [`PnCounter`] lattice
+/// (monotonic — a merge never rolls the value backwards). Used for
+/// `priority` / `confidence` / `access_count` / `version` /
+/// `reflection_depth`.
+fn merge_counter<T: PartialOrd + Clone>(local: T, remote: T) -> T {
+    PnCounter::new(local)
+        .merge(&PnCounter::new(remote))
+        .into_inner()
+}
 
 /// Total-order LWW verdict: `true` when `remote` should win the
 /// last-write-wins tiebreak over `local`.
@@ -120,13 +131,9 @@ fn prefer_non_null_else_lww<T: Clone>(
 /// ordering is local-first by design and is asserted as a set in the
 /// commutativity test.
 fn merge_tags(local: &[String], remote: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(local.len() + remote.len());
-    for tag in local.iter().chain(remote.iter()) {
-        if !out.iter().any(|seen| seen == tag) {
-            out.push(tag.clone());
-        }
-    }
-    out
+    OrSet::new(local.to_vec())
+        .merge(&OrSet::new(remote.to_vec()))
+        .into_inner()
 }
 
 /// `tier` resolution (#224): **max durability** on the total order
@@ -309,14 +316,14 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         content: lww(local, remote, &local.content, &remote.content),
         // `tags` — union (dedup, stable local-first order).
         tags: merge_tags(&local.tags, &remote.tags),
-        // `priority` — max.
-        priority: local.priority.max(remote.priority),
-        // `confidence` — max.
-        confidence: local.confidence.max(remote.confidence),
+        // `priority` — max (PN-Counter).
+        priority: merge_counter(local.priority, remote.priority),
+        // `confidence` — max (PN-Counter).
+        confidence: merge_counter(local.confidence, remote.confidence),
         // `source` — LWW by updated_at.
         source: lww(local, remote, &local.source, &remote.source),
-        // `access_count` — max.
-        access_count: local.access_count.max(remote.access_count),
+        // `access_count` — max (PN-Counter).
+        access_count: merge_counter(local.access_count, remote.access_count),
         // `created_at` — min (earliest creation). RFC3339 UTC strings
         // compare lexically in chronological order.
         created_at: if remote.created_at < local.created_at {
@@ -340,9 +347,9 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `metadata` — deep JSON merge + 3 sub-rules (agent_id→local,
         // scope LWW, governance→local).
         metadata: merge_metadata(local, remote),
-        // `reflection_depth` — max (monotonic; the reflection signal must
-        // not be lost on merge).
-        reflection_depth: local.reflection_depth.max(remote.reflection_depth),
+        // `reflection_depth` — max (PN-Counter; monotonic — the
+        // reflection signal must not be lost on merge).
+        reflection_depth: merge_counter(local.reflection_depth, remote.reflection_depth),
         // #224: memory_kind not in design table — LWW per table
         // philosophy (a conscious typing choice, like title).
         memory_kind: lww(local, remote, &local.memory_kind, &remote.memory_kind),
@@ -403,9 +410,9 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
             &local.confidence_decayed_at,
             &remote.confidence_decayed_at,
         ),
-        // #224: version not in design table — max (monotonic
+        // #224: version not in design table — max (PN-Counter; monotonic
         // optimistic-concurrency counter; never roll backwards).
-        version: local.version.max(remote.version),
+        version: merge_counter(local.version, remote.version),
         // #224: lifecycle_state not in design table — LWW per table
         // philosophy (a conscious state transition, like memory_kind).
         lifecycle_state: lww(
