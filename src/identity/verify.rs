@@ -172,6 +172,24 @@ impl AttestLevel {
             Self::AgentAttested => "agent_attested",
         }
     }
+
+    /// Monotonic trust rank for the #1719 item-3a attested-identity LWW
+    /// tiebreak: a strictly-higher rank wins a same-`updated_at` CRDT
+    /// merge tiebreak ahead of the lexical-`id` fallback. `Claimed` (an
+    /// unsigned bare claim) is the floor; `AgentAttested` (a verified
+    /// signature against the bound key) outranks it.
+    ///
+    /// Resolved via an explicit method rather than a derived `Ord` so the
+    /// wire enum stays non-comparable (the #970 enum-discipline convention
+    /// `Tier` follows) — the rank is a merge-policy concern, not an
+    /// intrinsic ordering of the variants.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Claimed => 0,
+            Self::AgentAttested => 1,
+        }
+    }
 }
 
 /// Reason a store-path write was refused (or could not be attested) by
