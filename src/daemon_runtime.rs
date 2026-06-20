@@ -1604,14 +1604,39 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // taken so no `!Send` lock is held across an `.await`.
             let code = match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
                 Some(url) => {
-                    let store = build_curator_store(Some(url), &db_path, app_config).await?;
-                    let stdout = std::io::stdout();
-                    let stderr = std::io::stderr();
-                    let mut so = stdout.lock();
-                    let mut se = stderr.lock();
-                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                    cli::commands::recover_previous_session::run_store(store.as_ref(), &a, &mut out)
+                    // The postgres SAL recover path only exists in `sal` builds;
+                    // in the default build, fall back to the local sqlite `--db`
+                    // path with a WARN so the subcommand never hard-fails on an
+                    // unsupported `--store-url`.
+                    #[cfg(feature = "sal")]
+                    let c = {
+                        let store = build_curator_store(Some(url), &db_path, app_config).await?;
+                        let stdout = std::io::stdout();
+                        let stderr = std::io::stderr();
+                        let mut so = stdout.lock();
+                        let mut se = stderr.lock();
+                        let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                        cli::commands::recover_previous_session::run_store(
+                            store.as_ref(),
+                            &a,
+                            &mut out,
+                        )
                         .await?
+                    };
+                    #[cfg(not(feature = "sal"))]
+                    let c = {
+                        tracing::warn!(
+                            store_url = %url,
+                            "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
+                        );
+                        let stdout = std::io::stdout();
+                        let stderr = std::io::stderr();
+                        let mut so = stdout.lock();
+                        let mut se = stderr.lock();
+                        let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                        cli::commands::recover_previous_session::run(&db_path, &a, &mut out)?
+                    };
+                    c
                 }
                 None => {
                     let stdout = std::io::stdout();
