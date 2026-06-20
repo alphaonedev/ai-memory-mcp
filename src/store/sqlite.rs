@@ -133,6 +133,34 @@ impl MemoryStore for SqliteStore {
         db::capture_turn_idempotent(&conn, write).map_err(box_err)
     }
 
+    /// #1693 — L2 transcript-recovery idempotent write. Delegates to the
+    /// sqlite SSOT `db::recover_turn_idempotent`, which the sync recover path
+    /// also calls, so the dual-dedup lookup + atomic two-row transaction
+    /// lives in exactly one place.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        let conn = self.state.lock().await;
+        db::recover_turn_idempotent(&conn, write).map_err(box_err)
+    }
+
+    /// #1693 — L2 recovery fast-path watermark (indexed
+    /// `MAX(created_at) WHERE agent_id_idx`). Mirrors the inline sqlite query
+    /// the sync `recover_from_transcript` uses.
+    async fn agent_max_created_at(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT MAX(created_at) FROM memories WHERE agent_id_idx = ?1",
+                rusqlite::params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None);
+        Ok(v)
+    }
+
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
         let conn = self.state.lock().await;
         match db::get(&conn, id).map_err(box_err)? {

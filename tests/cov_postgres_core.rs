@@ -817,3 +817,98 @@ async fn reverse_rollback_restores_consolidated_sources_pg() {
     let _ = store.delete(&ctx, &a).await;
     let _ = store.delete(&ctx, &b).await;
 }
+
+// ───────────────────────────────────────────────────────────────────
+// recover_turn_idempotent (#1693) — postgres L2 transcript-recovery
+// parity. Proves a postgres-backed daemon can rehydrate from host
+// transcripts (the gap #1693 closes): a turn writes a memory + dedup row
+// on first recovery, and a re-recovery is an idempotent no-op (dedup_hit,
+// no duplicate memory). The postgres twin of the sqlite recover path.
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recover_turn_idempotent_writes_then_dedups_pg() {
+    use ai_memory::models::RecoverTurnWrite;
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:cov-recover");
+    let ns = uid("rec-ns");
+    let mid = uid("rec-mem");
+    let norm_sha = format!("recnorm-{}", uuid::Uuid::new_v4()).into_bytes();
+    let raw_sha = format!("recraw-{}", uuid::Uuid::new_v4()).into_bytes();
+    let sid = uid("sess");
+
+    let write = RecoverTurnWrite {
+        memory: mem(
+            &mid,
+            &ns,
+            "L2 recovered user turn pg",
+            "operator directive recovered on pg",
+        ),
+        normalized_sha256: norm_sha.clone(),
+        raw_sha256: raw_sha.clone(),
+        host_kind: "claude-code".to_string(),
+        transcript_path: "/host/transcript.jsonl".to_string(),
+        host_session_id: Some(sid.clone()),
+        host_turn_index: Some(7),
+        recovered_at_ms: 1_700_000_000_000,
+    };
+
+    // First recovery → writes the memory + dedup row.
+    let r1 = store
+        .recover_turn_idempotent(&ctx, &write)
+        .await
+        .expect("first recover_turn");
+    assert!(!r1.dedup_hit, "first recovery is a fresh write");
+    store
+        .get(&ctx, &r1.memory_id)
+        .await
+        .expect("recovered memory exists");
+
+    // Re-recovery (same (sid,tix)) → idempotent no-op.
+    let r2 = store
+        .recover_turn_idempotent(&ctx, &write)
+        .await
+        .expect("second recover_turn");
+    assert!(
+        r2.dedup_hit,
+        "re-recovery dedups on (host_session_id, host_turn_index)"
+    );
+    assert_eq!(
+        r2.memory_id, r1.memory_id,
+        "same memory id returned, no duplicate"
+    );
+
+    // Sha-only dedup path: a write with no (sid,tix) but the same normalized
+    // sha must also dedup to the existing row.
+    let sha_only = RecoverTurnWrite {
+        memory: mem(
+            &uid("rec-mem2"),
+            &ns,
+            "L2 recovered user turn pg 2",
+            "different title same sha",
+        ),
+        normalized_sha256: norm_sha.clone(),
+        raw_sha256: raw_sha.clone(),
+        host_kind: "claude-code".to_string(),
+        transcript_path: "/host/transcript.jsonl".to_string(),
+        host_session_id: None,
+        host_turn_index: None,
+        recovered_at_ms: 1_700_000_000_001,
+    };
+    let r3 = store
+        .recover_turn_idempotent(&ctx, &sha_only)
+        .await
+        .expect("sha-only recover_turn");
+    assert!(
+        r3.dedup_hit,
+        "re-recovery dedups on content sha when (sid,tix) absent"
+    );
+    assert_eq!(r3.memory_id, r1.memory_id);
+
+    // Cleanup.
+    let _ = store.delete(&ctx, &r1.memory_id).await;
+}

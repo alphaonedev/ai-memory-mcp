@@ -807,6 +807,39 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1693 — L2 transcript-recovery idempotent write (the L2 sibling of
+    /// [`Self::capture_turn_idempotent`]). Given a prepared
+    /// [`crate::models::RecoverTurnWrite`]: dedup-probe on the canonical
+    /// `(host_session_id, host_turn_index)` AND the content sha (normalized +
+    /// raw-line); on hit return `{memory_id, dedup_hit: true}` with NO write;
+    /// on miss INSERT the memory + the `transcript_line_dedup` row in ONE
+    /// transaction — NO `signed_events` row (L2 is an unsigned backstop). This
+    /// routes the L2 recovery transaction through the SAL so postgres-backed
+    /// daemons gain a callable L2 surface (#1693); the sqlite
+    /// `recover_from_transcript` reaches the same logic via
+    /// [`crate::storage::recover_turn_idempotent`]. Default returns
+    /// `UnsupportedCapability` so a test/in-memory adapter round-trips cleanly.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        _write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "L2_RECOVER_TURN".to_string(),
+        })
+    }
+
+    /// #1693 — the L2 recovery fast-path watermark: the most recent
+    /// `created_at` across all memories owned by `agent_id` (the indexed
+    /// `MAX(created_at) WHERE agent_id` query), or `None` when the agent has
+    /// written none. Lets the recover path skip the parse + write phases when
+    /// the transcript has not changed since the agent's last write. Default
+    /// returns `Ok(None)` (no watermark → never short-circuit; always
+    /// correct, just skips the optimisation).
+    async fn agent_max_created_at(&self, _agent_id: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+
     /// Fetch a memory by id. Returns `NotFound` when the memory does
     /// not exist OR when the caller lacks read permission (the trait
     /// deliberately does not leak existence; adapters must fold
