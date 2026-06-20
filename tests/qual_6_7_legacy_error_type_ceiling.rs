@@ -131,7 +131,17 @@ const QUAL_6_CEILING: usize = 112;
 /// MUST match the trait signature. These 3 sites are test-only and
 /// unavoidable; no new production string-error contract was added
 /// (the trait pre-existed). Net acknowledged addition: +3.
-const QUAL_7_CEILING: usize = 29;
+///
+/// 2026-06-20 (#1544) — raised 29 → 33 for the new
+/// `FederationDlqSink::note_dlq_throttled` method (refresh `last_error`
+/// without bumping `attempt_count` on a 429 throttle). It MUST match the
+/// trait's existing `Result<(), String>` convention — the same documented
+/// closure-framework carve-out as `mark_dlq_row_replayed` /
+/// `bump_dlq_attempt` above — so the trait decl + the sqlite + postgres +
+/// test-mock impls add 4 sites. No new error contract; the legacy String
+/// shape is required for signature parity with the pre-existing trait.
+/// Net acknowledged addition: +4.
+const QUAL_7_CEILING: usize = 33;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
