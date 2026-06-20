@@ -182,13 +182,16 @@ pub(super) async fn sync_push_via_store(
             let conn = app.db.lock().await;
             // v0.7.0 #1156 — charge against the per-namespace
             // accounting row on the postgres-receive path too.
-            match crate::quotas::check_and_record(
+            // #1544 — storage-bytes-only charge on the postgres receive
+            // path too (see federation_receive.rs for the full rationale:
+            // replication != authorship; the daily write-count charge
+            // caused a cross-tenant DoS + the 429 DLQ storm). 5-agent vote
+            // (memory 4d3ea1c5).
+            match crate::quotas::check_and_record_storage_only(
                 &conn.0,
                 &attribute_agent,
                 &mem.namespace,
-                crate::quotas::QuotaOp::Memory {
-                    bytes: bytes_estimate,
-                },
+                bytes_estimate,
             ) {
                 Ok(()) => {}
                 Err(crate::quotas::QuotaCheckError::Quota(q)) => {
@@ -319,14 +322,14 @@ pub(super) async fn sync_push_via_store(
                 {
                     let conn = app.db.lock().await;
                     // #1156 — refund on the same `(agent_id,
-                    // namespace)` row check_and_record incremented.
-                    let _ = crate::quotas::refund_op(
+                    // namespace)` row check_and_record_storage_only
+                    // incremented (#1544 — storage-bytes only; the daily
+                    // write-count is never charged on receive).
+                    let _ = crate::quotas::refund_storage_only(
                         &conn.0,
                         &attribute_agent,
                         &mem.namespace,
-                        crate::quotas::QuotaOp::Memory {
-                            bytes: bytes_estimate,
-                        },
+                        bytes_estimate,
                     );
                 }
                 tracing::warn!("sync_push: apply_remote_memory failed for {}: {e}", mem.id);

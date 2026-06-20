@@ -815,13 +815,21 @@ pub async fn sync_push(
         // row. Federation peers can no longer drain an agent's cap by
         // fanning across namespaces (the per-namespace dimension keeps
         // each namespace's allotment intact).
-        match crate::quotas::check_and_record(
+        // #1544 — charge the per-agent STORAGE-BYTES ceiling only (NOT the
+        // daily write-COUNT) on the federation RECEIVE path. Replicating an
+        // already-attested peer memory is not net-new authorship: the
+        // pre-#1544 daily-count charge double-counted a memory that already
+        // cleared the author's quota at its origin AND let an enrolled peer
+        // exhaust an absent author's daily cap (503-ing that author's own
+        // local writes — a cross-tenant DoS) AND 429-stormed the push DLQ
+        // past 1000/day. Storage-bytes stays enforced (anti-flood). The
+        // five inbound controls (enrollment + mTLS pin + attestation +
+        // signature + nonce) gate fan-in; see 5-agent vote (memory 4d3ea1c5).
+        match crate::quotas::check_and_record_storage_only(
             &lock.0,
             &attribute_agent,
             &mem.namespace,
-            crate::quotas::QuotaOp::Memory {
-                bytes: bytes_estimate,
-            },
+            bytes_estimate,
         ) {
             Ok(()) => {}
             Err(crate::quotas::QuotaCheckError::Quota(q)) => {
