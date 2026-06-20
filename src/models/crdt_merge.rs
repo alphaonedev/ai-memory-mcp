@@ -100,6 +100,28 @@ fn parse_version_vector(metadata: &Value) -> VectorClock {
         .unwrap_or_default()
 }
 
+/// #1757 / #1719 item 2b — advance the LOCAL node's component of a row's
+/// per-memory vector clock at local-authorship write time, in place on
+/// `metadata.version_vector`.
+///
+/// Monotonic ([`VectorClock::observe`] = per-peer max), so a re-stamp
+/// never regresses an entry. A no-op when `node_id` is empty or
+/// `metadata` is not a JSON object. **Vector-clock discipline:** only a
+/// LOCAL write advances this node's own component — the federation
+/// *receive* write paths (`insert_if_newer` / `merge_inbound`) must NOT
+/// call this; they learn other nodes' components solely via the
+/// pointwise-max merge in [`merge_memory`].
+pub fn stamp_version_vector(metadata: &mut Value, node_id: &str, at: &str) {
+    if node_id.is_empty() {
+        return;
+    }
+    let mut clock = parse_version_vector(metadata);
+    clock.observe(node_id, at);
+    if let (Some(obj), Ok(vc_value)) = (metadata.as_object_mut(), serde_json::to_value(&clock)) {
+        obj.insert(field_names::VERSION_VECTOR.to_string(), vc_value);
+    }
+}
+
 /// #1719 item 3a — trust rank of a row's stamped `metadata.attest_level`
 /// for the attested-identity LWW tiebreak. A `claimed` / unsigned /
 /// absent level is the floor (0); a verified `agent_attested` level
@@ -899,6 +921,59 @@ mod tests {
         assert_eq!(ab, ba, "version_vector merge commutative");
         // Idempotent: merging a row with itself is unchanged.
         assert_eq!(clock_of(&merge_memory(&local, &local)), clock_of(&local));
+    }
+
+    #[test]
+    fn stamp_version_vector_advances_local_node_entry() {
+        let mut md = json!({});
+        stamp_version_vector(&mut md, "node-a", "2026-06-16T05:00:00+00:00");
+        assert_eq!(
+            md["version_vector"]["entries"]["node-a"],
+            "2026-06-16T05:00:00+00:00"
+        );
+        // Monotonic: an older stamp does NOT regress the entry.
+        stamp_version_vector(&mut md, "node-a", "2026-06-16T01:00:00+00:00");
+        assert_eq!(
+            md["version_vector"]["entries"]["node-a"],
+            "2026-06-16T05:00:00+00:00"
+        );
+        // A newer stamp advances it.
+        stamp_version_vector(&mut md, "node-a", "2026-06-16T09:00:00+00:00");
+        assert_eq!(
+            md["version_vector"]["entries"]["node-a"],
+            "2026-06-16T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn stamp_version_vector_preserves_other_node_entries() {
+        // Stamping this node never touches another node's component
+        // (learned via merge, not local stamping).
+        let mut md =
+            json!({ "version_vector": { "entries": { "node-b": "2026-06-16T03:00:00+00:00" } } });
+        stamp_version_vector(&mut md, "node-a", "2026-06-16T05:00:00+00:00");
+        assert_eq!(
+            md["version_vector"]["entries"]["node-b"],
+            "2026-06-16T03:00:00+00:00"
+        );
+        assert_eq!(
+            md["version_vector"]["entries"]["node-a"],
+            "2026-06-16T05:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn stamp_version_vector_empty_node_id_is_noop() {
+        let mut md = json!({});
+        stamp_version_vector(&mut md, "", "2026-06-16T05:00:00+00:00");
+        assert!(md.get("version_vector").is_none());
+    }
+
+    #[test]
+    fn stamp_version_vector_non_object_metadata_is_noop() {
+        let mut md = json!("scalar-metadata");
+        stamp_version_vector(&mut md, "node-a", "2026-06-16T05:00:00+00:00");
+        assert_eq!(md, json!("scalar-metadata"));
     }
 
     #[test]
