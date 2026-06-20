@@ -57,3 +57,47 @@ pub struct CaptureTurnResult {
     /// had a row — no write happened and the audit chain was untouched.
     pub dedup_hit: bool,
 }
+
+/// #1693 — fully-prepared, backend-agnostic payload for the L2
+/// transcript-recovery idempotent write. The L2 sibling of
+/// [`CaptureTurnWrite`]: same `memory + transcript_line_dedup` atomic
+/// write, but L2 recovery is a backstop layer that does NOT append a
+/// `signed_events` audit row (it is not a host-signed capture) and dedups
+/// on a DUAL key — `(host_session_id, host_turn_index)` when the host
+/// format provides both (bridging to L4 capture rows for the same turn),
+/// AND the content sha (normalized + raw-line) so a host re-serialization
+/// can never re-recover an already-captured turn.
+#[derive(Debug, Clone)]
+pub struct RecoverTurnWrite {
+    /// Memory inserted on a dedup miss — already fully populated (L2 tags,
+    /// the per-line unique title, `metadata.agent_id`, the turn's own
+    /// `created_at` timestamp, …).
+    pub memory: Memory,
+    /// Normalized-content sha256 — the `transcript_line_dedup` row's
+    /// `sha256` and the primary dedup probe (invariant under host
+    /// re-serialization, #1573).
+    pub normalized_sha256: Vec<u8>,
+    /// Raw-line sha256 — also probed so rows written by pre-#1573
+    /// recoveries keep deduping across a host upgrade.
+    pub raw_sha256: Vec<u8>,
+    /// Host implementation id (`claude-code` / `codex` / …).
+    pub host_kind: String,
+    /// Absolute transcript path stamped on the `transcript_line_dedup` row.
+    pub transcript_path: String,
+    /// Dedup key half 1 — `None` when the host format omits it (sha-only
+    /// dedup then applies).
+    pub host_session_id: Option<String>,
+    /// Dedup key half 2 — `None` when the host format omits it.
+    pub host_turn_index: Option<i64>,
+    /// Unix epoch milliseconds stamped on the `transcript_line_dedup` row.
+    pub recovered_at_ms: i64,
+}
+
+/// Outcome of [`crate::store::MemoryStore::recover_turn_idempotent`].
+#[derive(Debug, Clone)]
+pub struct RecoverTurnResult {
+    /// id of the existing (dedup hit) or newly-inserted memory.
+    pub memory_id: String,
+    /// `true` when the turn was already recovered (dedup hit) — no write.
+    pub dedup_hit: bool,
+}

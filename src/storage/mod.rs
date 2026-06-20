@@ -1065,6 +1065,111 @@ pub fn capture_turn_idempotent(
     }
 }
 
+/// #1693 — L2 transcript-recovery idempotent write (sqlite SSOT). The L2
+/// sibling of [`capture_turn_idempotent`]: dedup-probe → `BEGIN IMMEDIATE`
+/// → insert memory + `transcript_line_dedup` row → `COMMIT`. Differs from
+/// the L4 path in two ways: L2 is an unsigned backstop so it appends NO
+/// `signed_events` audit row, and it dedups on a DUAL key — the canonical
+/// `(host_session_id, host_turn_index)` when the host format provides both
+/// (bridging to L4 capture rows for the same turn), OR the content sha
+/// (normalized + raw-line, so a host re-serialization can't re-recover an
+/// already-captured turn). Reached directly by the sync recover path and via
+/// `SqliteStore::recover_turn_idempotent` through the SAL trait (#1693 gives
+/// postgres-backed daemons a callable L2 surface).
+///
+/// # Errors
+///
+/// Returns a stringified failure label (`DEDUP_QUERY_FAILED` /
+/// `TX_BEGIN_FAILED` / `MEMORY_INSERT_FAILED` / `DEDUP_INSERT_FAILED` /
+/// `TX_COMMIT_FAILED`); the transaction rolls back so an orphaned memory can
+/// never exist without its dedup row.
+pub fn recover_turn_idempotent(
+    conn: &Connection,
+    write: &crate::models::RecoverTurnWrite,
+) -> std::result::Result<crate::models::RecoverTurnResult, String> {
+    use rusqlite::OptionalExtension;
+
+    // Dedup probe 1 — canonical (host_session_id, host_turn_index), when the
+    // host format provides both (also bridges to L4 `capture_turn` rows).
+    if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
+        let hit: Option<String> = conn
+            .prepare_cached(
+                "SELECT memory_id FROM transcript_line_dedup \
+                 WHERE host_session_id = ?1 AND host_turn_index = ?2",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![sid, tix], |row| row.get(0))
+                    .optional()
+            })
+            .map_err(|e| format!("DEDUP_SIDTIX_QUERY_FAILED: {e}"))?;
+        if let Some(memory_id) = hit {
+            return Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+    }
+    // Dedup probe 2 — content sha (normalized this version writes + raw-line
+    // pre-#1573 recoveries wrote).
+    let sha_hit: Option<String> = conn
+        .prepare_cached("SELECT memory_id FROM transcript_line_dedup WHERE sha256 IN (?1, ?2)")
+        .and_then(|mut stmt| {
+            stmt.query_row(params![write.normalized_sha256, write.raw_sha256], |row| {
+                row.get(0)
+            })
+            .optional()
+        })
+        .map_err(|e| format!("DEDUP_SHA_QUERY_FAILED: {e}"))?;
+    if let Some(memory_id) = sha_hit {
+        return Ok(crate::models::RecoverTurnResult {
+            memory_id,
+            dedup_hit: true,
+        });
+    }
+
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
+        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+
+    let tx_result = (|| -> std::result::Result<String, String> {
+        let inserted_id =
+            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+        conn.prepare_cached(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                write.normalized_sha256,
+                inserted_id,
+                write.host_kind,
+                write.transcript_path,
+                write.host_session_id,
+                write.host_turn_index,
+                write.recovered_at_ms,
+            ])
+        })
+        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        Ok(inserted_id)
+    })();
+
+    match tx_result {
+        Ok(memory_id) => {
+            conn.execute_batch(connection::SQL_COMMIT)
+                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+            Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: false,
+            })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
 /// v0.7.0 fix campaign R1-M3 (#690) — insert a memory under an
 /// explicit [`ConflictMode`].
 ///

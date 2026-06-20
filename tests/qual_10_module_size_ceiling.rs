@@ -212,7 +212,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `InvalidTransition` typed error + the self-validating
     // `set_lifecycle_state` (SELECT-current → can_transition_to → no-op
     // short-circuit → typed reject) landed the file at 19_312. +48 headroom.
-    ("src/storage/mod.rs", 19_360),
+    // 2026-06-19 (#1693 L2 SAL parity) — bumped 19_360 → 19_460: the
+    // `recover_turn_idempotent` sqlite SSOT (dual-dedup probe + atomic
+    // memory+dedup transaction) landed the file at 19_417.
+    ("src/storage/mod.rs", 19_460),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -501,7 +504,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // AGE cold-path adds migrate_v69 + the link_internal deferred branch +
     // drain_kg_projection_outbox + spawn_drainer + the find_paths Deferred
     // CTE-route (actual 20_722 at the bump).
-    ("src/store/postgres.rs", 20_800),
+    // 2026-06-19 (#1693 L2 SAL parity) — bumped 20_800 → 21_000: the
+    // PostgresStore `recover_turn_idempotent` (dual-dedup probe + atomic
+    // memory+dedup tx, no signed_events) + `agent_max_created_at` watermark
+    // (actual 20_958).
+    ("src/store/postgres.rs", 21_000),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

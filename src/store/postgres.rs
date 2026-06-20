@@ -10633,6 +10633,228 @@ impl MemoryStore for PostgresStore {
         })
     }
 
+    /// #1693 — L2 transcript-recovery idempotent write (postgres parity).
+    /// The L2 sibling of [`Self::capture_turn_idempotent`]: same atomic
+    /// `memories` upsert + `transcript_line_dedup` row, but L2 is an unsigned
+    /// backstop so NO `signed_events` row is appended, and the dedup probe is
+    /// DUAL — the canonical `(host_session_id, host_turn_index)` when present
+    /// (bridging to L4 capture rows), then the content sha (normalized +
+    /// raw-line). Closes the postgres-daemon L2 gap (#1693): a postgres
+    /// deployment can now rehydrate from host transcripts.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        // Step 1 — dual dedup fast-path (no transaction needed for the read).
+        if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
+            let hit: Option<String> = sqlx::query_scalar(
+                "SELECT memory_id FROM transcript_line_dedup \
+                 WHERE host_session_id = $1 AND host_turn_index = $2",
+            )
+            .bind(sid)
+            .bind(tix)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recover_turn dedup (sid,tix) query", e))?;
+            if let Some(memory_id) = hit {
+                return Ok(crate::models::RecoverTurnResult {
+                    memory_id,
+                    dedup_hit: true,
+                });
+            }
+        }
+        let sha_hit: Option<String> = sqlx::query_scalar(
+            "SELECT memory_id FROM transcript_line_dedup WHERE sha256 IN ($1, $2)",
+        )
+        .bind(&write.normalized_sha256)
+        .bind(&write.raw_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("recover_turn dedup (sha) query", e))?;
+        if let Some(memory_id) = sha_hit {
+            return Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+
+        // ARCH-1 — substrate governance pre-write parity with the sqlite L2
+        // path (`storage::recover_turn_idempotent` → `storage::insert` →
+        // `consult_governance_pre_write`).
+        let memory = &write.memory;
+        consult_governance_pre_write_pg(memory)?;
+
+        let created_at = parse_rfc3339_required(&memory.created_at)?;
+        let updated_at = parse_rfc3339_required(&memory.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
+        let tags_json =
+            serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("tags", e),
+            })?;
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            })?;
+        let source_span_json = match memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
+        // Step 2 — atomic two-row write (memory + dedup; NO signed_events).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin recover_turn tx", e))?;
+
+        let inserted_id: String = sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23,
+                      $24)
+            ON CONFLICT (title, namespace) DO UPDATE SET
+                content = EXCLUDED.content,
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                tags = EXCLUDED.tags,
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                source = EXCLUDED.source,
+                updated_at = EXCLUDED.updated_at,
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
+                metadata = CASE
+                    WHEN memories.metadata ? 'agent_id'
+                        THEN jsonb_set(
+                            EXCLUDED.metadata,
+                            '{agent_id}',
+                            memories.metadata -> 'agent_id'
+                        )
+                    ELSE EXCLUDED.metadata
+                END,
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE EXCLUDED.memory_kind END,
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                version = memories.version + 1
+            RETURNING id",
+        )
+        .bind(&memory.id)
+        .bind(memory.tier.as_str())
+        .bind(&memory.namespace)
+        .bind(&memory.title)
+        .bind(&memory.content)
+        .bind(&tags_json)
+        .bind(memory.priority)
+        .bind(memory.confidence)
+        .bind(&memory.source)
+        .bind(memory.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&memory.metadata)
+        .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
+        .bind(mentioned_entity_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("recover_turn insert memory", e))?
+        .try_get::<String, _>("id")
+        .map_err(|e| to_store_err("recover_turn read returned id", e))?;
+
+        // `transcript_line_dedup` row (normalized sha + transcript_path).
+        // `ON CONFLICT (sha256) DO NOTHING` guards the concurrent-duplicate
+        // race under READ COMMITTED (the sqlite path serializes via
+        // BEGIN IMMEDIATE).
+        sqlx::query(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(&write.normalized_sha256)
+        .bind(&inserted_id)
+        .bind(&write.host_kind)
+        .bind(&write.transcript_path)
+        .bind(&write.host_session_id)
+        .bind(write.host_turn_index)
+        .bind(write.recovered_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("recover_turn insert dedup row", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit recover_turn tx", e))?;
+
+        Ok(crate::models::RecoverTurnResult {
+            memory_id: inserted_id,
+            dedup_hit: false,
+        })
+    }
+
+    /// #1693 — L2 recovery fast-path watermark on postgres: the most recent
+    /// `created_at` across the agent's memories, rendered RFC3339 to match
+    /// the sqlite string watermark the recover fast-path compares against.
+    async fn agent_max_created_at(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let v: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT MAX(created_at) FROM memories WHERE metadata->>'agent_id' = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("agent_max_created_at", e))?;
+        Ok(v.map(|dt| dt.to_rfc3339()))
+    }
+
     async fn store_with_embedding(
         &self,
         ctx: &CallerContext,
