@@ -834,7 +834,10 @@ async fn recover_turn_idempotent_writes_then_dedups_pg() {
         eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
         return;
     };
-    let ctx = CallerContext::for_agent("ai:cov-recover");
+    // `for_admin` (bypass_visibility) so the post-write `get` reads the row
+    // regardless of the `mem()` helper's hardcoded `agent_id` — this test
+    // validates the recover idempotency contract, not the visibility gate.
+    let ctx = CallerContext::for_admin("ai:cov-recover");
     let ns = uid("rec-ns");
     let mid = uid("rec-mem");
     let norm_sha = format!("recnorm-{}", uuid::Uuid::new_v4()).into_bytes();
