@@ -480,18 +480,17 @@ impl FederationDlqSink for SqliteDlqSink {
         // pending rows — bumps attempt_count + refreshes last_error
         // instead. Partial unique index from the v48 migration backs
         // this conflict target.
-        conn
-            .execute(
-                "INSERT INTO federation_push_dlq \
+        conn.execute(
+            "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
                  VALUES (?1, ?2, ?3, 1, ?4, ?5) \
                  ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
                  DO UPDATE SET \
                    attempt_count = attempt_count + 1, \
                    last_error    = excluded.last_error",
-                rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
-            )
-            .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+            rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
+        )
+        .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
         Ok(())
     }
 
@@ -535,37 +534,34 @@ impl FederationDlqSink for SqliteDlqSink {
     async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.conn.lock().await;
-        conn
-            .execute(
-                "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, id],
-            )
-            .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
+        conn.execute(
+            "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
         Ok(())
     }
 
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
-        conn
-            .execute(
-                "UPDATE federation_push_dlq \
+        conn.execute(
+            "UPDATE federation_push_dlq \
                  SET attempt_count = attempt_count + 1, last_error = ?1 \
                  WHERE id = ?2 AND replayed_at IS NULL",
-                rusqlite::params![last_error, id],
-            )
-            .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
+            rusqlite::params![last_error, id],
+        )
+        .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
         Ok(())
     }
 
     async fn pending_dlq_count(&self) -> Result<i64, String> {
         let conn = self.conn.lock().await;
-        conn
-            .query_row(
-                "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
+        conn.query_row(
+            "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
     }
 }
 

@@ -55,9 +55,11 @@ fn read_access_count(conn: &rusqlite::Connection, id: &str) -> i64 {
 }
 
 fn read_tier(conn: &rusqlite::Connection, id: &str) -> String {
-    conn.query_row("SELECT tier FROM memories WHERE id = ?1", params![id], |r| {
-        r.get(0)
-    })
+    conn.query_row(
+        "SELECT tier FROM memories WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )
     .expect("read tier")
 }
 
@@ -71,13 +73,20 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
     let ro = ai_memory::storage::open_read_only(tmp.path()).expect("open read-only");
     let n = ai_memory::storage::touch_many(&ro, &["m1"], SHORT_EXTEND, MID_EXTEND)
         .expect("touch_many on read-only conn must succeed (as a no-op)");
-    assert_eq!(n, 0, "touch_many must report zero touched rows on a read-only connection");
+    assert_eq!(
+        n, 0,
+        "touch_many must report zero touched rows on a read-only connection"
+    );
     assert_eq!(
         read_access_count(&writer, "m1"),
         4,
         "access_count must be UNCHANGED after a touch on the read-only pool connection"
     );
-    assert_eq!(read_tier(&writer, "m1"), "mid", "tier must be unchanged on the read phase");
+    assert_eq!(
+        read_tier(&writer, "m1"),
+        "mid",
+        "tier must be unchanged on the read phase"
+    );
 
     // PHASE 2 — writer connection: the authoritative touch applies the
     // full ladder (bump 4→5, then mid→long promotion at the threshold).
@@ -95,11 +104,9 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
         "writer touch must promote mid→long at PROMOTION_THRESHOLD (access_count >= 5)"
     );
     let expires_at: Option<String> = writer
-        .query_row(
-            "SELECT expires_at FROM memories WHERE id = 'm1'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT expires_at FROM memories WHERE id = 'm1'", [], |r| {
+            r.get(0)
+        })
         .expect("read expires_at");
     assert!(
         expires_at.is_none(),

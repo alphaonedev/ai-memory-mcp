@@ -173,7 +173,9 @@ fn pool_for(db: &Db) -> anyhow::Result<Arc<ReadPool>> {
 
     // Fast path — live cached entry, no writer lock.
     {
-        let map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((weak, pool)) = map.get(&key) {
             if weak.strong_count() > 0 {
                 return Ok(Arc::clone(pool));
@@ -198,7 +200,9 @@ fn pool_for(db: &Db) -> anyhow::Result<Arc<ReadPool>> {
     let pool = Arc::new(ReadPool::open(&path, DEFAULT_READ_POOL_SIZE)?);
     let weak = Arc::downgrade(db);
 
-    let mut map = registry().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut map = registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Double-check: another reader may have built it while we opened
     // connections.
     if let Some((w, p)) = map.get(&key) {
@@ -339,11 +343,9 @@ mod tests {
         let (_tmp, db) = file_db();
         seed_row(&db, "ryw1").await;
         let got = db_read_op(db.clone(), |conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM memories WHERE id = 'ryw1'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM memories WHERE id = 'ryw1'", [], |r| {
+                r.get::<_, i64>(0)
+            })
             .unwrap_or(-1)
         })
         .await;
@@ -365,12 +367,10 @@ mod tests {
 
         // Hold the writer's tokio mutex for the whole read.
         let writer_guard = db.lock().await;
-        let read = tokio::time::timeout(
-            Duration::from_secs(10),
-            db_read_op(db.clone(), count_rows),
-        )
-        .await
-        .expect("pooled read must complete while the writer mutex is held");
+        let read =
+            tokio::time::timeout(Duration::from_secs(10), db_read_op(db.clone(), count_rows))
+                .await
+                .expect("pooled read must complete while the writer mutex is held");
         assert_eq!(read, 1);
         drop(writer_guard);
     }
