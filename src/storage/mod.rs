@@ -1521,6 +1521,22 @@ pub fn touch_many(
     if ids.is_empty() {
         return Ok(0);
     }
+    // #1580 — the WAL read-pool opens its connections with
+    // `PRAGMA query_only = ON`. `touch_many` is best-effort access
+    // bookkeeping (access_count bump / TTL extend / promotion), so on a
+    // read-only pool connection it no-ops: the read path stays
+    // write-free and the *authoritative* touch runs afterwards on the
+    // writer connection (see `handlers::recall`). Without this guard the
+    // recall SELECT, when dispatched through the read-pool, would hit a
+    // guaranteed `BEGIN IMMEDIATE` failure + a WARN on every request.
+    // The pragma read is one cheap round-trip; on the writer connection
+    // `query_only` is `0` and the touch proceeds normally.
+    let query_only: i64 = conn
+        .query_row("PRAGMA query_only", [], |r| r.get(0))
+        .unwrap_or(0);
+    if query_only != 0 {
+        return Ok(0);
+    }
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
