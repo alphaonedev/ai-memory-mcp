@@ -1596,12 +1596,33 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // Graceful by design: the SessionStart-hook chain MUST
             // NOT wedge the agent boot, so per-line parse errors
             // surface in the report rather than as Err.
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::commands::recover_previous_session::run(&db_path, &a, &mut out)? {
+            //
+            // #1693 — a `--store-url postgres://…` routes L2 recovery through
+            // the SAL `recover_turn_idempotent` path so a postgres-backed
+            // daemon rehydrates from transcripts (parity with the sqlite
+            // `--db` path). The async recovery runs BEFORE the stdout lock is
+            // taken so no `!Send` lock is held across an `.await`.
+            let code = match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+                Some(url) => {
+                    let store = build_curator_store(Some(url), &db_path, app_config).await?;
+                    let stdout = std::io::stdout();
+                    let stderr = std::io::stderr();
+                    let mut so = stdout.lock();
+                    let mut se = stderr.lock();
+                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                    cli::commands::recover_previous_session::run_store(store.as_ref(), &a, &mut out)
+                        .await?
+                }
+                None => {
+                    let stdout = std::io::stdout();
+                    let stderr = std::io::stderr();
+                    let mut so = stdout.lock();
+                    let mut se = stderr.lock();
+                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                    cli::commands::recover_previous_session::run(&db_path, &a, &mut out)?
+                }
+            };
+            match code {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
