@@ -8225,9 +8225,18 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
                 // tiebreak by self-asserting `agent_attested`. Only the
                 // receiver's own stored local level can win on attestation.
                 let sanitized = crate::models::sanitize_inbound_attestation(inbound);
+                // #1755 item 3b — cap a relayed row's post-dated
+                // `updated_at` (the primary LWW key) to a freshness ceiling
+                // so an enrolled relay cannot win the merge by stamping a
+                // far-future timestamp. now + the attestation skew window.
+                let prepared = crate::models::clamp_inbound_updated_at(
+                    sanitized,
+                    &chrono::Utc::now().to_rfc3339(),
+                    crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
+                );
                 // #224 field-wise merge — the SAME pure reconciler the
                 // postgres adapter calls in Rust (no per-backend drift).
-                let merged = crate::models::merge_memory(&existing, &sanitized);
+                let merged = crate::models::merge_memory(&existing, &prepared);
                 overwrite_full_row_by_id(conn, &merged)?;
                 Ok(Some(merged.id))
             }

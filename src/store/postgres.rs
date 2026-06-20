@@ -12208,7 +12208,16 @@ impl MemoryStore for PostgresStore {
         // a forged peer cannot win the attested-identity LWW tiebreak by
         // self-asserting a verified level.
         let sanitized = crate::models::sanitize_inbound_attestation(inbound);
-        let merged = crate::models::merge_memory(&existing, &sanitized);
+        // #1755 item 3b — cap a relayed row's post-dated `updated_at` (the
+        // primary LWW key) to a freshness ceiling (identical to the sqlite
+        // `db::merge_inbound` boundary, no per-backend drift) so an enrolled
+        // relay cannot win the merge by stamping a far-future timestamp.
+        let prepared = crate::models::clamp_inbound_updated_at(
+            sanitized,
+            &chrono::Utc::now().to_rfc3339(),
+            crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
+        );
+        let merged = crate::models::merge_memory(&existing, &prepared);
 
         // Encode the JSON-shaped columns the same way the
         // `apply_remote_memory` insert path does.

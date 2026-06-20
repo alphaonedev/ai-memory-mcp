@@ -170,6 +170,35 @@ pub fn sanitize_inbound_attestation(inbound: &Memory) -> Memory {
     sanitized
 }
 
+/// #1755 item 3b — cap an UNTRUSTED inbound row's `updated_at` to a
+/// freshness ceiling (`now + skew_secs`) before it is merged, so a
+/// federated relay cannot post-date `updated_at` — the PRIMARY LWW
+/// tiebreak key — far into the future to clobber genuinely-newer local
+/// rows. The signed envelope can't bind `updated_at` (it is system-mutated
+/// after signing and not client-known at sign time), so a receive-boundary
+/// freshness clamp — mirroring the `created_at` ±`ATTEST_CREATED_AT_SKEW_SECS`
+/// window and the [`sanitize_inbound_attestation`] hook — is the
+/// proportionate defense. Honest clock-skew (a few seconds) is untouched;
+/// only an absurdly-future `updated_at` is clamped, bounding the relay's
+/// post-dating reach from unbounded to `skew_secs`.
+///
+/// Takes the already-sanitized inbound by value (one clone for the whole
+/// receive-boundary preparation). A malformed `now` / `updated_at` is a
+/// no-op — never break the merge on a parse error.
+#[must_use]
+pub fn clamp_inbound_updated_at(mut inbound: Memory, now_rfc3339: &str, skew_secs: i64) -> Memory {
+    if let (Ok(now), Ok(updated)) = (
+        chrono::DateTime::parse_from_rfc3339(now_rfc3339),
+        chrono::DateTime::parse_from_rfc3339(&inbound.updated_at),
+    ) {
+        let ceiling = now + chrono::Duration::seconds(skew_secs);
+        if updated > ceiling {
+            inbound.updated_at = ceiling.to_rfc3339();
+        }
+    }
+    inbound
+}
+
 /// Delegate a #224 max-merged counter field to the [`PnCounter`] lattice
 /// (monotonic — a merge never rolls the value backwards). Used for
 /// `priority` / `confidence` / `access_count` / `version` /
@@ -999,6 +1028,58 @@ mod tests {
         let sanitized = sanitize_inbound_attestation(&forged_remote);
         assert_eq!(merge_memory(&local, &sanitized).title, "genuine");
         assert_eq!(merge_memory(&sanitized, &local).title, "genuine");
+    }
+
+    // ---- #1755 item 3b: inbound updated_at freshness clamp -----------
+
+    #[test]
+    fn clamp_inbound_updated_at_caps_far_future_postdate() {
+        // A relayed row post-dated 1 year into the future is clamped to
+        // now + skew, so it cannot win the LWW over genuinely-newer rows.
+        let now = "2026-06-20T12:00:00+00:00";
+        let skew = 300; // 5 min
+        let postdated = base("a", "2027-06-20T12:00:00+00:00");
+        let clamped = clamp_inbound_updated_at(postdated, now, skew);
+        // Clamped to now + 300s = 12:05:00.
+        let ceil =
+            chrono::DateTime::parse_from_rfc3339(now).unwrap() + chrono::Duration::seconds(skew);
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&clamped.updated_at).unwrap(),
+            ceil
+        );
+    }
+
+    #[test]
+    fn clamp_inbound_updated_at_leaves_honest_timestamp_untouched() {
+        // An honest updated_at at-or-before now + skew (incl. small clock
+        // skew) is unchanged.
+        let now = "2026-06-20T12:00:00+00:00";
+        let skew = 300;
+        // 2s of clock skew — well within the window.
+        let honest = base("a", "2026-06-20T12:00:02+00:00");
+        let out = clamp_inbound_updated_at(honest, now, skew);
+        assert_eq!(out.updated_at, "2026-06-20T12:00:02+00:00");
+        // A past timestamp is also untouched.
+        let past = base("a", "2026-06-20T09:00:00+00:00");
+        assert_eq!(
+            clamp_inbound_updated_at(past, now, skew).updated_at,
+            "2026-06-20T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn clamp_inbound_updated_at_noop_on_unparseable() {
+        // A malformed now or updated_at never breaks the merge — pass through.
+        let garbage = base("a", "not-a-timestamp");
+        assert_eq!(
+            clamp_inbound_updated_at(garbage, "2026-06-20T12:00:00+00:00", 300).updated_at,
+            "not-a-timestamp"
+        );
+        let ok = base("a", "2027-06-20T12:00:00+00:00");
+        assert_eq!(
+            clamp_inbound_updated_at(ok, "also-garbage", 300).updated_at,
+            "2027-06-20T12:00:00+00:00"
+        );
     }
 
     #[test]
