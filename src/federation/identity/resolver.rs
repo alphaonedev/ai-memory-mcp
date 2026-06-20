@@ -54,6 +54,18 @@ pub fn resolve_federation_identity(configured: Option<&str>) -> String {
     default_hostname_identity()
 }
 
+/// #1757 / #1719 item 2b — process-cached LOCAL node identity for the
+/// per-memory vector clock. Resolved once via
+/// [`resolve_federation_identity`] (env [`FED_IDENTITY_ENV`] → host) so
+/// the hot local-insert write path pays no repeated env read. This is the
+/// node's own component key in [`crate::models::stamp_version_vector`];
+/// it mirrors the sync-state vector-clock node identity.
+#[must_use]
+pub fn local_node_identity() -> &'static str {
+    static NODE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NODE_ID.get_or_init(|| resolve_federation_identity(None))
+}
+
 /// The historical default identity: `host:<hostname>`. Exposed so other
 /// call sites (and tests) can assert behaviour-preservation against the
 /// pre-resolver bootstrap expression.

@@ -9872,6 +9872,23 @@ impl MemoryStore for PostgresStore {
                 detail: serialize_err("tags", e),
             })?;
 
+        // #1757 / #1719 item 2b — populate-on-write: advance THIS node's
+        // own component of the per-memory vector clock on the LOCAL store
+        // path (postgres twin of the sqlite `db::insert` stamp). The
+        // federation RECEIVE writes are the separate `apply_remote_memory`
+        // / `merge_inbound`, so a remote-applied row never bumps this node.
+        // ON CONFLICT updates `metadata = EXCLUDED.metadata` (agent_id
+        // preserved), so a re-store persists the advanced clock too.
+        let store_stamped_metadata = {
+            let mut m = memory.metadata.clone();
+            crate::models::stamp_version_vector(
+                &mut m,
+                crate::federation::identity::resolver::local_node_identity(),
+                &memory.updated_at,
+            );
+            m
+        };
+
         // v0.7.0.1 G1 — INSERT memories + record quota usage in a single
         // transaction so the postgres path matches the SQLite parity laid
         // out in `quotas::check_and_record`. Without this, S61's wire
@@ -10072,7 +10089,7 @@ impl MemoryStore for PostgresStore {
         .bind(updated_at)
         .bind(last_accessed_at)
         .bind(expires_at)
-        .bind(&memory.metadata)
+        .bind(&store_stamped_metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
         .bind(&citations_json)

@@ -722,7 +722,25 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     consult_governance_pre_write(mem)?;
 
     let tags_json = serde_json::to_string(&mem.tags)?;
-    let metadata_json = serde_json::to_string(&mem.metadata)?;
+    // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
+    // component of the per-memory vector clock. `db::insert` is the
+    // LOCAL-authorship sqlite chokepoint (SAL `store()` + MCP
+    // `handle_store` + CLI all land here); the federation RECEIVE writes
+    // use the separate `insert_if_newer` / `overwrite_full_row_by_id`, so
+    // a remote-applied row never falsely bumps this node. Stamp a cloned
+    // metadata so the in-memory `mem` is untouched; the ON CONFLICT arm
+    // updates `metadata = excluded.metadata`, so a re-store persists the
+    // advanced clock too.
+    let stamped_metadata = {
+        let mut m = mem.metadata.clone();
+        crate::models::stamp_version_vector(
+            &mut m,
+            crate::federation::identity::resolver::local_node_identity(),
+            &mem.updated_at,
+        );
+        m
+    };
+    let metadata_json = serde_json::to_string(&stamped_metadata)?;
     // v0.7.0 Form 4 — encode citations/source_span to JSON for the
     // schema v38 TEXT columns. citations always lands as a JSON array
     // (default `[]` when caller supplied nothing); source_span lands as
@@ -14921,6 +14939,39 @@ mod tests {
         assert_eq!(got.content, "Updated via sync");
     }
 
+    /// #1757 / #1719 item 2b — populate-on-write. A LOCAL `insert`
+    /// advances THIS node's own component of the per-memory vector clock;
+    /// the federation RECEIVE write (`insert_if_newer`) does NOT stamp, so
+    /// a remote row the receiver did not author never gains a fabricated
+    /// clock component (it only learns peers' components via merge).
+    #[test]
+    fn insert_stamps_local_clock_but_insert_if_newer_does_not_1757() {
+        let conn = test_db();
+
+        // Local authorship → this node's entry is stamped = updated_at.
+        let local = make_memory("VV local", "test", Tier::Long, 5);
+        let id = insert(&conn, &local).unwrap();
+        let stored = get(&conn, &id).unwrap().unwrap();
+        let node = crate::federation::identity::resolver::local_node_identity();
+        assert_eq!(
+            stored.metadata["version_vector"]["entries"][node].as_str(),
+            Some(stored.updated_at.as_str()),
+            "local insert advances this node's version_vector entry"
+        );
+
+        // Federation receive (insert_if_newer) on a remote row that
+        // carries NO clock → no stamp (receiver does not fabricate a
+        // component for a row it did not author).
+        let mut remote = make_memory("VV remote", "test", Tier::Long, 5);
+        remote.id = "remote-id-1757".to_string();
+        let rid = insert_if_newer(&conn, &remote).unwrap();
+        let got_remote = get(&conn, &rid).unwrap().unwrap();
+        assert!(
+            got_remote.metadata.get("version_vector").is_none(),
+            "federation receive must NOT stamp the receiver's node"
+        );
+    }
+
     // --- v0.8.0 Pillar-3 (#1709 / #224) merge_inbound tests ---
 
     /// A divergent same-`id` inbound row is FIELD-MERGED per #224
@@ -15130,7 +15181,14 @@ mod tests {
         let mem = make_memory("Default metadata", "test", Tier::Long, 5);
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
-        assert_eq!(got.metadata, serde_json::json!({}));
+        // #1757 — `insert` stamps the system-managed per-memory vector
+        // clock (`version_vector`); strip it so the assertion still pins
+        // that the caller-visible metadata DEFAULT is the empty object.
+        let mut md = got.metadata.clone();
+        md.as_object_mut()
+            .unwrap()
+            .remove(crate::models::field_names::VERSION_VECTOR);
+        assert_eq!(md, serde_json::json!({}));
     }
 
     #[test]
@@ -15329,7 +15387,13 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(metadata_str, "{}");
+        // #1757 — `insert` stamps the system-managed `version_vector`;
+        // strip it so this still pins the default metadata column shape.
+        let mut md: serde_json::Value = serde_json::from_str(&metadata_str).unwrap();
+        md.as_object_mut()
+            .unwrap()
+            .remove(crate::models::field_names::VERSION_VECTOR);
+        assert_eq!(md, serde_json::json!({}));
     }
 
     #[test]

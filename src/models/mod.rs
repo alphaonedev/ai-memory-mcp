@@ -27,7 +27,7 @@ pub use audit::*;
 pub use capture_turn::*;
 #[allow(unused_imports)]
 pub use checkpoint::*;
-pub use crdt_merge::{merge_memory, sanitize_inbound_attestation};
+pub use crdt_merge::{merge_memory, sanitize_inbound_attestation, stamp_version_vector};
 #[allow(unused_imports)]
 pub use crdt_primitives::{OrSet, PnCounter};
 pub use link::*;
