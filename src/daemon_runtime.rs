@@ -820,6 +820,70 @@ pub struct CompletionsArgs {
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+/// #1389 / #1693 — dispatch the `recover-previous-session` subcommand.
+///
+/// Graceful by design: the SessionStart-hook chain MUST NOT wedge the agent
+/// boot, so per-line parse errors surface in the report rather than as `Err`.
+///
+/// A `--store-url postgres://…` routes L2 recovery through the SAL
+/// `recover_turn_idempotent` path so a postgres-backed daemon rehydrates from
+/// transcripts (parity with the sqlite `--db` path); the async store build
+/// runs BEFORE the stdout lock is taken so no `!Send` lock is held across an
+/// `.await`. In the default (non-`sal`) build the postgres path is unavailable,
+/// so it WARNs and falls back to the local sqlite `--db` path rather than
+/// hard-failing on an unsupported flag.
+///
+/// Extracted from the `Command::RecoverPreviousSession` match arm so the
+/// sqlite routing is unit-testable (coverage of the lock/emit wrapper).
+async fn dispatch_recover_previous_session(
+    a: &cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
+    db_path: &std::path::Path,
+    app_config: &AppConfig,
+) -> Result<i32> {
+    // `app_config` only feeds the postgres store build, which is `sal`-only.
+    #[cfg(not(feature = "sal"))]
+    let _ = app_config;
+    match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+        Some(url) => {
+            #[cfg(feature = "sal")]
+            let c = {
+                let store = build_curator_store(Some(url), db_path, app_config).await?;
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::commands::recover_previous_session::run_store(store.as_ref(), a, &mut out)
+                    .await?
+            };
+            #[cfg(not(feature = "sal"))]
+            let c = {
+                tracing::warn!(
+                    store_url = %url,
+                    "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
+                );
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::commands::recover_previous_session::run(db_path, a, &mut out)?
+            };
+            Ok(c)
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            Ok(cli::commands::recover_previous_session::run(
+                db_path, a, &mut out,
+            )?)
+        }
+    }
+}
+
 /// Top-level CLI dispatch. Called from `main()` after `Cli::parse()`.
 ///
 /// Handles:
@@ -1592,61 +1656,7 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             }
         }
         Command::RecoverPreviousSession(a) => {
-            // Issue #1389 — fail-safe recovery from host transcripts.
-            // Graceful by design: the SessionStart-hook chain MUST
-            // NOT wedge the agent boot, so per-line parse errors
-            // surface in the report rather than as Err.
-            //
-            // #1693 — a `--store-url postgres://…` routes L2 recovery through
-            // the SAL `recover_turn_idempotent` path so a postgres-backed
-            // daemon rehydrates from transcripts (parity with the sqlite
-            // `--db` path). The async recovery runs BEFORE the stdout lock is
-            // taken so no `!Send` lock is held across an `.await`.
-            let code = match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
-                Some(url) => {
-                    // The postgres SAL recover path only exists in `sal` builds;
-                    // in the default build, fall back to the local sqlite `--db`
-                    // path with a WARN so the subcommand never hard-fails on an
-                    // unsupported `--store-url`.
-                    #[cfg(feature = "sal")]
-                    let c = {
-                        let store = build_curator_store(Some(url), &db_path, app_config).await?;
-                        let stdout = std::io::stdout();
-                        let stderr = std::io::stderr();
-                        let mut so = stdout.lock();
-                        let mut se = stderr.lock();
-                        let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                        cli::commands::recover_previous_session::run_store(
-                            store.as_ref(),
-                            &a,
-                            &mut out,
-                        )
-                        .await?
-                    };
-                    #[cfg(not(feature = "sal"))]
-                    let c = {
-                        tracing::warn!(
-                            store_url = %url,
-                            "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
-                        );
-                        let stdout = std::io::stdout();
-                        let stderr = std::io::stderr();
-                        let mut so = stdout.lock();
-                        let mut se = stderr.lock();
-                        let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                        cli::commands::recover_previous_session::run(&db_path, &a, &mut out)?
-                    };
-                    c
-                }
-                None => {
-                    let stdout = std::io::stdout();
-                    let stderr = std::io::stderr();
-                    let mut so = stdout.lock();
-                    let mut se = stderr.lock();
-                    let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                    cli::commands::recover_previous_session::run(&db_path, &a, &mut out)?
-                }
-            };
+            let code = dispatch_recover_previous_session(&a, &db_path, app_config).await?;
             match code {
                 0 => Ok(()),
                 code => std::process::exit(code),
@@ -5508,6 +5518,37 @@ mod tests {
             !logs.contains(secret),
             "store-URL password leaked into the boot log:\n{logs}"
         );
+    }
+
+    /// #1693 — `dispatch_recover_previous_session` routes a `None` /
+    /// non-postgres store-url through the local sqlite `--db` path and returns
+    /// exit 0 on a clean (empty-transcript) recovery. Covers the stdout-lock +
+    /// report-emit wrapper that the postgres branch shares, so the routing
+    /// extraction does not regress `daemon_runtime.rs` line coverage.
+    #[tokio::test]
+    async fn dispatch_recover_previous_session_sqlite_path_1693() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("mem.db");
+        // Explicit empty-transcript override → resolver bypassed, deterministic
+        // (no dependency on host transcript dirs in the test environment).
+        let transcript = dir.path().join("empty.jsonl");
+        std::fs::write(&transcript, b"").expect("write empty transcript");
+        let args = cli::commands::recover_previous_session::RecoverPreviousSessionArgs {
+            host: "auto".to_string(),
+            transcript: Some(transcript),
+            since: None,
+            namespace: None,
+            limit: 100,
+            dry_run: false,
+            quiet: true,
+            json: false,
+            store_url: None,
+        };
+        let cfg = AppConfig::default();
+        let code = dispatch_recover_previous_session(&args, &db, &cfg)
+            .await
+            .expect("dispatch ok");
+        assert_eq!(code, 0, "empty-transcript recover exits 0 via sqlite path");
     }
 
     /// #1455 (SEC, MED) — when a governance hook's rule-consultation
