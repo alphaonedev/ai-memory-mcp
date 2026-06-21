@@ -38,6 +38,26 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// #1742 — these e2e tests cold-build (`cargo build --release`) and spawn a
+/// SEPARATE workspace tool crate (`ai-memory-post-ship-converge`). Under
+/// `cargo llvm-cov` that child build inherits the coverage RUSTFLAGS
+/// (3-4× slower) and trips the #1492 hung-test watchdog — while adding ZERO
+/// `ai-memory` coverage (the spawned binary is a different crate, not the
+/// instrumented lib). So skip the build+spawn under coverage; the tests
+/// still run on every normal `Check` job (all OSes) for the e2e assurance.
+/// cargo-llvm-cov sets `CARGO_LLVM_COV` in the test process environment.
+fn skip_under_llvm_cov() -> bool {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        eprintln!(
+            "#1742: skipping subprocess-tool e2e under llvm-cov (adds no ai-memory \
+             coverage; avoids the instrumented cold-build watchdog hang)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Build the verifier binary once per `cargo test` run and return
 /// the absolute path to it. Same `OnceLock` pattern as
 /// `tests/g11_auto_link_detector.rs` and
@@ -98,6 +118,9 @@ fn build_verifier_once() -> PathBuf {
 
 #[test]
 fn e2_dry_run_emits_well_formed_envelope() {
+    if skip_under_llvm_cov() {
+        return;
+    }
     let bin = verifier_bin();
 
     let out = Command::new(bin)
@@ -172,6 +195,9 @@ fn e2_dry_run_supports_brew_install_method() {
     // arg parser doesn't regress on the non-default methods. (The
     // real brew install path is exercised manually by the release
     // captain.)
+    if skip_under_llvm_cov() {
+        return;
+    }
     let bin = verifier_bin();
     let out = Command::new(bin)
         .arg("--dry-run")
@@ -196,6 +222,9 @@ fn e2_missing_version_flag_is_usage_error() {
     // silent default to "latest". The release captain MUST type the
     // version they expect to verify so they cannot accidentally
     // verify the wrong tag.
+    if skip_under_llvm_cov() {
+        return;
+    }
     let bin = verifier_bin();
     let out = Command::new(bin)
         .arg("--dry-run")
