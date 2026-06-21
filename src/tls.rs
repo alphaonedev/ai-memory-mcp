@@ -848,6 +848,20 @@ impl rustls::client::danger::ServerCertVerifier for DangerousAnyServerVerifier {
     }
 }
 
+/// Shared serialization lock for any test that mutates the process-wide
+/// `AI_MEMORY_FED_PEER_FINGERPRINTS` env var. `env::set_var`/`remove_var`
+/// are process-global, so the `tls` unset-path test and the
+/// `federation::peer` build-pinning coverage test (different modules, same
+/// test binary) MUST take this lock or they race (the #5d4e3ca3 parallel-
+/// global-state flake class). Poison-tolerant: a panicking test still yields
+/// the guard so the next test isn't blocked.
+#[cfg(test)]
+pub(crate) fn fed_pin_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — pure-function and verifier coverage. Integration tests
 // (anything requiring on-disk PEM fixtures end-to-end) live in
@@ -1472,11 +1486,38 @@ mod tests {
 
     #[test]
     fn peer_fingerprint_env_unset_returns_none() {
-        // SAFETY: single-threaded test; remove then assert.
+        let _g = super::fed_pin_env_lock();
+        // SAFETY: serialised via fed_pin_env_lock(); the only other writer of
+        // this var (the federation::peer build-pinning test) takes the same
+        // lock, so no concurrent reader observes the transient state.
         unsafe {
             std::env::remove_var(FED_PEER_FINGERPRINTS_ENV);
         }
         assert!(peer_fingerprint_map_from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn build_pinning_client_config_with_client_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls/valid_cert.pem");
+        let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls/valid_key_pkcs8.pem");
+        let cfg = build_rustls_pinning_client_config(
+            pin_map("peer.example", b"x"),
+            Some(cert.as_path()),
+            Some(key.as_path()),
+        )
+        .expect("pinning client config with client cert (mTLS identity) must build");
+        drop(cfg);
+    }
+
+    #[test]
+    fn build_pinning_client_config_without_client_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = build_rustls_pinning_client_config(pin_map("peer.example", b"x"), None, None)
+            .expect("pinning client config with no client auth must build");
+        drop(cfg);
     }
 
     // -----------------------------------------------------------------------

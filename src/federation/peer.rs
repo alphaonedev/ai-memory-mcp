@@ -314,3 +314,45 @@ mod resolve_signing_key_tests {
         assert_eq!(got.to_bytes(), expected, "the loaded key is preserved");
     }
 }
+
+#[cfg(test)]
+mod build_pinning_tests {
+    use super::FederationConfig;
+    use std::time::Duration;
+
+    /// #1678 — exercise the outbound-pinning branch of `build()`: with
+    /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set to a valid host→fp file, the
+    /// shared quorum client is constructed via `use_preconfigured_tls` with
+    /// the fail-closed pin verifier (no mTLS identity here → with_no_client_auth).
+    /// Serialised on the shared env lock so it never races the `tls` unset
+    /// test that reads the same var.
+    #[test]
+    fn build_takes_pinning_branch_when_env_set() {
+        let _g = crate::tls::fed_pin_env_lock();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), format!("peer.example {}\n", "a".repeat(64))).unwrap();
+        // SAFETY: serialised via fed_pin_env_lock(); removed before asserts so
+        // a failed assertion never leaks the var to a later test.
+        unsafe {
+            std::env::set_var(
+                crate::tls::FED_PEER_FINGERPRINTS_ENV,
+                tmp.path().as_os_str(),
+            );
+        }
+        let built = FederationConfig::build(
+            1,
+            &["https://peer.example:9077".to_string()],
+            Duration::from_secs(5),
+            None, // client_cert_path → with_no_client_auth in the pinning config
+            None, // client_key_path
+            None, // ca_cert_path (ignored under pinning)
+            "ai:pinning-build-test".to_string(),
+            None, // api_key
+        );
+        unsafe {
+            std::env::remove_var(crate::tls::FED_PEER_FINGERPRINTS_ENV);
+        }
+        let cfg = built.expect("pinning build must succeed");
+        assert!(cfg.is_some(), "quorum_writes=1 with a peer must yield Some");
+    }
+}
