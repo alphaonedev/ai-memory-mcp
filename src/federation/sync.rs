@@ -1324,6 +1324,238 @@ pub async fn broadcast_pending_decision_quorum(
     Ok(tracker)
 }
 
+/// #1718 — wire element for a federated action-state TRANSITION, carried on
+/// the `/sync/push` envelope's `action_transitions` subcollection. Commit B
+/// (this) broadcasts it; Commit A receives + applies it idempotently.
+///
+/// `from_state` is the CAS guard — the receiver applies the transition only
+/// when the local action is still in `from_state` — and `vector_clock`
+/// carries causal ordering, so a delayed re-broadcast of a stale transition
+/// is dropped rather than re-applied. This is load-bearing because the
+/// action state machine is **not monotonic** (`Claimed → Pending` release is
+/// legal), so the target state alone is not a safe idempotency key (#1718
+/// hazard H1). The end-to-end author-attestation fields (signature / signer
+/// / nonce) are added by Commit A as `#[serde(default)]` extensions (#1052
+/// permissive-deserialize forward-compat), so a peer omitting them decodes
+/// byte-identically.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActionTransitionOp {
+    /// Target action id.
+    pub action_id: String,
+    /// Expected current state (compare-and-swap guard, H1).
+    pub from_state: crate::models::action::ActionState,
+    /// New state to transition into.
+    pub to_state: crate::models::action::ActionState,
+    /// Attested actor that drove the transition (Commit A binds this to an
+    /// enrolled key; carried here so the wire shape is fixed once).
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    /// Causal-ordering clock for the non-monotonic state machine (H1).
+    #[serde(default)]
+    pub vector_clock: serde_json::Value,
+    /// Epoch seconds of the transition.
+    pub updated_at: i64,
+}
+
+/// #1718 Commit B — fan out an action-state transition to peers via the
+/// `/sync/push` envelope's `action_transitions` subcollection and collect
+/// W-of-N acks. Mirrors [`broadcast_pending_quorum`] exactly (reusing
+/// `AckTracker` + `finalise_quorum`); only the subcollection key + target id
+/// differ. Wired into the action-transition write path by Commit C.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on the pathological detach race
+/// where the tracker `Arc` is still referenced after fan-out.
+pub async fn broadcast_action_transition_quorum(
+    config: &FederationConfig,
+    op: &ActionTransitionOp,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "action_transitions": [op],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = op.action_id.clone();
+        let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(
+                &client,
+                &url,
+                &payload,
+                &target_id,
+                Some(&target_id),
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            )
+            .await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
+                tracing::warn!(
+                    "federation: action-transition peer {peer_id} failed for {}: {reason}",
+                    op.action_id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: action-transition peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
+                    tracing::debug!(
+                        "federation: post-quorum action-transition peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
+/// #1718 Commit B — fan out a freshly-created signal to peers via the
+/// `/sync/push` envelope's `signals` subcollection and collect W-of-N acks.
+/// Mirrors [`broadcast_pending_quorum`] exactly. The `Signal` model already
+/// carries its Ed25519 `signature` + `sender_pubkey`, so the receiver
+/// (Commit A) can verify authorship end-to-end; signals dedupe on their
+/// UUID `id` (idempotent `INSERT … ON CONFLICT(id) DO NOTHING`). Wired into
+/// the `signal_send` write path by Commit C.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on the pathological detach race.
+pub async fn broadcast_signal_create_quorum(
+    config: &FederationConfig,
+    signal: &crate::models::signal::Signal,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "signals": [signal],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = signal.id.clone();
+        let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(
+                &client,
+                &url,
+                &payload,
+                &target_id,
+                Some(&target_id),
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            )
+            .await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
+                tracing::warn!(
+                    "federation: signal peer {peer_id} failed for {}: {reason}",
+                    signal.id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: signal peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
+                    tracing::debug!(
+                        "federation: post-quorum signal peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
 /// v0.6.2 (S35): fan out a `namespace_meta` row (the `(namespace,
 /// standard_id, parent_namespace)` tuple set by `set_namespace_standard`)
 /// to peers via `sync_push.namespace_meta`. Without this, peers see the
