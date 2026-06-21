@@ -1607,6 +1607,30 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1718 Pillar-1 federation — **compare-and-swap** transition: apply
+    /// `from → to` only when the action is still in `from`, atomically (the
+    /// state guard is in the write predicate, not a separate read). The
+    /// federation receive path uses this — not [`MemoryStore::action_transition`] —
+    /// because the action state machine is non-monotonic (`Claimed → Pending`
+    /// release is legal), so the target state alone is not a safe idempotency
+    /// key for a replayed/out-of-order remote transition; the *expected source*
+    /// state is the guard (#1718 H1). A CAS miss is a non-error
+    /// [`crate::actions::CasOutcome::StateMismatch`] (safe no-op), not a failure.
+    /// Default `UnsupportedCapability`.
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _from: crate::models::ActionState,
+        _to: crate::models::ActionState,
+        _claimed_by: Option<&str>,
+        _now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
     /// #1709 Pillar 1 — list actions, optionally filtered by `namespace`
     /// and/or `state`, newest-`updated_at` first, capped at `limit`. Default
     /// `UnsupportedCapability`.

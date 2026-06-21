@@ -36,6 +36,15 @@ pub const ACTION_SELECT_SQL: &str = "SELECT id, namespace, kind, state, title, p
      priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
      FROM actions";
 
+/// The single-row-by-id action SELECT, built from [`ACTION_SELECT_SQL`] with a
+/// `WHERE id = ?1` tail. Hoisted into one helper so the read paths
+/// (`get` / `transition` / `transition_cas`) share one spelling of the
+/// template rather than duplicating it (pm-v3.1 hardcoded-literal gate).
+#[must_use]
+fn action_select_by_id_sql() -> String {
+    format!("{ACTION_SELECT_SQL} WHERE id = ?1")
+}
+
 /// Map a `rusqlite` row (the [`ACTION_SELECT_SQL`] column order) to an
 /// [`Action`].
 ///
@@ -94,12 +103,8 @@ pub fn create(conn: &Connection, action: &Action) -> rusqlite::Result<String> {
 /// # Errors
 /// Propagates the `rusqlite` query error.
 pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<Action>> {
-    conn.query_row(
-        &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
-        params![id],
-        row_to_action,
-    )
-    .optional()
+    conn.query_row(&action_select_by_id_sql(), params![id], row_to_action)
+        .optional()
 }
 
 /// Canonical wire-message for an illegal coordination transition,
@@ -148,12 +153,92 @@ pub fn transition(
         "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 WHERE id = ?4",
         params![to.as_str(), claimed_by, now, id],
     )?;
-    let action = conn.query_row(
-        &format!("{ACTION_SELECT_SQL} WHERE id = ?1"),
-        params![id],
-        row_to_action,
-    )?;
+    let action = conn.query_row(&action_select_by_id_sql(), params![id], row_to_action)?;
     Ok(TransitionOutcome::Updated(action))
+}
+
+/// Outcome of a compare-and-swap [`transition_cas`]. Unlike
+/// [`TransitionOutcome`], a `from`-state mismatch is a first-class
+/// **non-error** variant ([`CasOutcome::StateMismatch`]) because a CAS miss on
+/// the federation receive path is a normal, safe no-op — a stale re-broadcast
+/// of a transition that local state has already moved past (#1718 hazard H1:
+/// the action state machine is non-monotonic, so the target state alone is not
+/// a safe idempotency key — the *expected source* state is the guard).
+#[derive(Debug, Clone)]
+pub enum CasOutcome {
+    /// No `actions` row matched the id.
+    NotFound,
+    /// The row exists but its current state is not the expected `from` state —
+    /// the compare-and-swap guard rejected the transition. Carries the actual
+    /// current state for the caller's causal-ordering decision.
+    StateMismatch {
+        /// The action's actual current state (≠ the expected `from`).
+        current: crate::models::ActionState,
+    },
+    /// `from → to` is not a legal coordination transition.
+    Illegal {
+        /// Source state of the rejected edge.
+        from: crate::models::ActionState,
+        /// Target state of the rejected edge.
+        to: crate::models::ActionState,
+    },
+    /// The compare-and-swap held and the transition applied; carries the
+    /// re-fetched action.
+    Applied(Action),
+}
+
+/// Compare-and-swap transition: apply `from → to` **only** when the action is
+/// still in `from`. The state guard lives in the `UPDATE ... WHERE id = ?
+/// AND state = ?` predicate so the compare and the swap are a single atomic
+/// statement — there is no read-then-write TOCTOU window for a concurrent
+/// transition (or a duplicate federated re-broadcast) to slip through, unlike
+/// composing [`get`] + [`transition`] across two statements (#1718 H1).
+///
+/// Returns [`CasOutcome::Applied`] when the swap held, [`CasOutcome::StateMismatch`]
+/// when the row exists but has moved on (a safe federation no-op),
+/// [`CasOutcome::NotFound`] when no row matches, and [`CasOutcome::Illegal`]
+/// when `from → to` is not a legal edge.
+///
+/// # Errors
+/// Propagates the `rusqlite` query/update error.
+pub fn transition_cas(
+    conn: &Connection,
+    id: &str,
+    from: crate::models::ActionState,
+    to: crate::models::ActionState,
+    claimed_by: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<CasOutcome> {
+    // Legality is a static property of the edge — reject illegal edges before
+    // touching the row (cheap, and keeps an illegal op from racing a legal one).
+    if !from.can_transition_to(to) {
+        return Ok(CasOutcome::Illegal { from, to });
+    }
+    // Atomic compare-and-swap: the `AND state = ?5` predicate is the guard.
+    let changed = conn.execute(
+        "UPDATE actions SET state = ?1, claimed_by = ?2, updated_at = ?3 \
+         WHERE id = ?4 AND state = ?5",
+        params![to.as_str(), claimed_by, now, id, from.as_str()],
+    )?;
+    if changed == 0 {
+        // Either the row does not exist, or it was no longer in `from`
+        // (lost the CAS). Disambiguate for the caller's causal decision.
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT state FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        return Ok(match current {
+            None => CasOutcome::NotFound,
+            Some(cs) => CasOutcome::StateMismatch {
+                current: crate::models::ActionState::from_str(&cs).unwrap_or_default(),
+            },
+        });
+    }
+    let action = conn.query_row(&action_select_by_id_sql(), params![id], row_to_action)?;
+    Ok(CasOutcome::Applied(action))
 }
 
 /// List actions filtered by optional `namespace` / `state`, newest-first,
@@ -537,6 +622,101 @@ mod tests {
         assert!(matches!(
             transition(&conn, "missing", ActionState::Claimed, None, 1_700_000_700).unwrap(),
             TransitionOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn transition_cas_guards_on_from_state() {
+        let conn = fresh();
+        create(&conn, &sample("c1")).unwrap();
+
+        // CAS holds: pending → claimed when still pending.
+        match transition_cas(
+            &conn,
+            "c1",
+            ActionState::Pending,
+            ActionState::Claimed,
+            Some("holder-1"),
+            1_700_000_500,
+        )
+        .unwrap()
+        {
+            CasOutcome::Applied(a) => {
+                assert_eq!(a.state, ActionState::Claimed);
+                assert_eq!(a.claimed_by.as_deref(), Some("holder-1"));
+                assert_eq!(a.updated_at, 1_700_000_500);
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+
+        // Stale replay: the same pending → claimed op now misses the CAS
+        // because local state has moved to `claimed` (#1718 H1 — non-monotonic
+        // state machine, so the guard is the expected SOURCE state). Safe no-op.
+        match transition_cas(
+            &conn,
+            "c1",
+            ActionState::Pending,
+            ActionState::Claimed,
+            Some("holder-2"),
+            1_700_000_600,
+        )
+        .unwrap()
+        {
+            CasOutcome::StateMismatch { current } => assert_eq!(current, ActionState::Claimed),
+            other => panic!("expected StateMismatch, got {other:?}"),
+        }
+        // The losing CAS left the row untouched — holder-1 still owns it.
+        let still = get(&conn, "c1").unwrap().expect("present");
+        assert_eq!(still.claimed_by.as_deref(), Some("holder-1"));
+        assert_eq!(still.updated_at, 1_700_000_500);
+
+        // Legal non-monotonic release: claimed → pending applies when the
+        // guard matches the current state.
+        match transition_cas(
+            &conn,
+            "c1",
+            ActionState::Claimed,
+            ActionState::Pending,
+            None,
+            1_700_000_700,
+        )
+        .unwrap()
+        {
+            CasOutcome::Applied(a) => assert_eq!(a.state, ActionState::Pending),
+            other => panic!("expected Applied (release), got {other:?}"),
+        }
+
+        // Illegal edge is rejected before the row is touched, regardless of a
+        // matching guard (pending → done must route via claimed/in_progress).
+        match transition_cas(
+            &conn,
+            "c1",
+            ActionState::Pending,
+            ActionState::Done,
+            None,
+            1_700_000_800,
+        )
+        .unwrap()
+        {
+            CasOutcome::Illegal { from, to } => {
+                assert_eq!(from, ActionState::Pending);
+                assert_eq!(to, ActionState::Done);
+            }
+            other => panic!("expected Illegal, got {other:?}"),
+        }
+
+        // Unknown id with a legal edge → NotFound (no row matched the CAS).
+        assert!(matches!(
+            transition_cas(
+                &conn,
+                "missing",
+                ActionState::Pending,
+                ActionState::Claimed,
+                None,
+                1_700_000_900,
+            )
+            .unwrap(),
+            CasOutcome::NotFound
         ));
     }
 

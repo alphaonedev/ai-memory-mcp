@@ -13845,6 +13845,65 @@ impl MemoryStore for PostgresStore {
         Ok(action)
     }
 
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        from: crate::models::ActionState,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        use crate::actions::CasOutcome;
+        // Reject illegal edges before locking the row (mirrors the sqlite
+        // free-fn order in `crate::actions::transition_cas`).
+        if !from.can_transition_to(to) {
+            return Ok(CasOutcome::Illegal { from, to });
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin action_transition_cas tx", e))?;
+        // `FOR UPDATE` locks the row for the compare-and-swap window so a
+        // concurrent transition cannot slip between the read and the write.
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("action_transition_cas select", e))?;
+        let Some(cs) = current else {
+            // tx rolls back on drop — nothing was written.
+            return Ok(CasOutcome::NotFound);
+        };
+        let cur = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+        if cur != from {
+            // Lost the CAS — local state has moved past `from`. Safe no-op.
+            return Ok(CasOutcome::StateMismatch { current: cur });
+        }
+        sqlx::query(
+            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 WHERE id = $4",
+        )
+        .bind(to.as_str())
+        .bind(claimed_by)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("action_transition_cas update", e))?;
+        let row = sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition_cas refetch", e))?;
+        let action = pg_row_to_action(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit action_transition_cas", e))?;
+        Ok(CasOutcome::Applied(action))
+    }
+
     async fn action_list(
         &self,
         _ctx: &CallerContext,
