@@ -370,6 +370,10 @@ mod tests {
         Ack,
         Fail,
         Hang,
+        /// Sleep briefly then return HTTP 500 — a straggler that resolves to a
+        /// failure AFTER quorum is met, so the post-quorum detach task
+        /// processes a `Fail` outcome (#1718 inner-detach coverage).
+        SlowFail,
         /// Return HTTP 500 on the first `fail_until` calls, then 200.
         /// Used to exercise the S40 retry-once path.
         FailThenAck {
@@ -400,6 +404,13 @@ mod tests {
             MockBehaviour::Hang => {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 (StatusCode::OK, AxumJson(serde_json::json!({"applied":1})))
+            }
+            MockBehaviour::SlowFail => {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({"error":"stub slow failure"})),
+                )
             }
             MockBehaviour::FailThenAck { fail_until } => {
                 if call <= fail_until {
@@ -1175,35 +1186,40 @@ mod tests {
         assert_eq!(tracker.id_drift_count(), 1);
     }
 
-    /// #1718 — quorum met (W=1) by the fast peer while a hung peer is still
-    /// in-flight exercises the post-quorum DETACH-stragglers block (`if
-    /// !joins.is_empty() { tokio::spawn(...) }`) of
-    /// `broadcast_action_transition_quorum`. The memory-op broadcasts hit this
-    /// via their own straggler tests; this keeps `federation/sync.rs` above
-    /// its coverage floor as the broadcast family grows.
+    /// #1718 — quorum met (W=1) by the fast peer while a slow-failing peer is
+    /// still in-flight exercises the post-quorum DETACH-stragglers block of
+    /// `broadcast_action_transition_quorum` END-TO-END: the outer `if
+    /// !joins.is_empty() { tokio::spawn(...) }` AND the detached task's
+    /// `while`-loop processing the straggler's eventual `Fail` outcome. The
+    /// post-broadcast sleep gives the detached task time to drain the
+    /// `SlowFail` peer. Keeps `federation/sync.rs` above its coverage floor as
+    /// the broadcast family grows.
     #[tokio::test]
     async fn action_transition_quorum_met_with_straggler_detaches() {
         let (url_fast, _) = spawn_mock_peer(MockBehaviour::Ack).await;
-        let (url_slow, _) = spawn_mock_peer(MockBehaviour::Hang).await;
+        let (url_slow, _) = spawn_mock_peer(MockBehaviour::SlowFail).await;
         let cfg = build_config(vec![url_fast, url_slow], 1, 2000);
         let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
             .await
             .unwrap();
-        // local + the fast peer's ack meet W=1; the hung peer is detached.
+        // local + the fast peer's ack meet W=1; the slow-fail peer is detached.
         assert!(finalise_quorum(&tracker).is_ok());
+        // Let the detached task drain the SlowFail peer (covers the inner arm).
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
-    /// #1718 — same detach-stragglers coverage for
+    /// #1718 — same end-to-end detach-stragglers coverage for
     /// `broadcast_signal_create_quorum`.
     #[tokio::test]
     async fn signal_create_quorum_met_with_straggler_detaches() {
         let (url_fast, _) = spawn_mock_peer(MockBehaviour::Ack).await;
-        let (url_slow, _) = spawn_mock_peer(MockBehaviour::Hang).await;
+        let (url_slow, _) = spawn_mock_peer(MockBehaviour::SlowFail).await;
         let cfg = build_config(vec![url_fast, url_slow], 1, 2000);
         let tracker = broadcast_signal_create_quorum(&cfg, &sample_signal())
             .await
             .unwrap();
         assert!(finalise_quorum(&tracker).is_ok());
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     // --- broadcast_pending_decision_quorum tests (Wave 3) ---
