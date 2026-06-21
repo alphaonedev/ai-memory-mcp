@@ -35,6 +35,11 @@ const FED_CLIENT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// the next quorum push.
 const FED_CLIENT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
+/// `tracing` target for federation peer-construction events. Hoisted to a
+/// named const so the bare `"federation"` string lives at one site (the
+/// pm-v3.1 no-hardcoded-literal discipline), referenced by name everywhere.
+const FED_LOG_TARGET: &str = "federation";
+
 impl FederationConfig {
     /// Build a `FederationConfig` from the serve-time CLI flags. Returns
     /// `None` when federation is disabled (`quorum_writes == 0` or the
@@ -94,7 +99,7 @@ impl FederationConfig {
                 // label space as deployment size grew.)
                 let trimmed = raw.trim_end_matches('/');
                 tracing::debug!(
-                    target: "federation",
+                    target: FED_LOG_TARGET,
                     peer_index = i,
                     url = trimmed,
                     "registered peer"
@@ -137,49 +142,73 @@ impl FederationConfig {
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(2))
             .pool_idle_timeout(FED_CLIENT_POOL_IDLE_TIMEOUT)
-            .tcp_keepalive(FED_CLIENT_TCP_KEEPALIVE)
-            .use_rustls_tls();
-        // --quorum-ca-cert: trust a caller-supplied root CA for outbound
-        // federation POSTs. Required whenever peers present a cert NOT
-        // rooted in webpki-roots (Mozilla CA bundle) — e.g. a self-
-        // signed / ephemeral CA generated for an isolated test fleet.
-        // Without this, reqwest's rustls-tls feature (webpki-roots
-        // only) rejects the peer cert and every quorum write times
-        // out as quorum_not_met. See alphaonedev/ai-memory-mcp#333.
-        if let Some(ca_path) = ca_cert_path {
-            let ca_pem = std::fs::read(ca_path)
-                .map_err(|e| anyhow::anyhow!("read --quorum-ca-cert: {e}"))?;
-            // v0.7.0 #1070 follow-up — `reqwest::Certificate::from_pem`
-            // post-#1070 (rustls-only backend, no native-tls fallback)
-            // accepts a file with no PEM markers as an empty cert chain
-            // without erroring. That breaks the strict-validation
-            // contract `config_build_rejects_invalid_ca_cert_pem` pins.
-            // Pre-flight the file content for a `-----BEGIN ` marker so
-            // a non-PEM operator-supplied path produces the same
-            // explicit error message the legacy native-tls parser
-            // emitted.
-            let has_pem_marker = ca_pem.windows(11).any(|w| w == b"-----BEGIN ");
-            if !has_pem_marker {
-                anyhow::bail!(
-                    "parse --quorum-ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
-                    ca_path.display()
-                );
+            .tcp_keepalive(FED_CLIENT_TCP_KEEPALIVE);
+        // #1678 — outbound server-cert pinning. When the operator sets
+        // `AI_MEMORY_FED_PEER_FINGERPRINTS`, install a preconfigured rustls
+        // config carrying the per-SNI-host pin verifier (fail-CLOSED for any
+        // unpinned host) plus the mTLS client identity. This REPLACES the
+        // use_rustls_tls + --quorum-ca-cert + identity path: under pinning the
+        // fingerprint is the trust anchor (CA roots are not consulted) and an
+        // unpinned peer is refused rather than silently CA-validated. With
+        // pinning OFF the `else` arm below is byte-identical to the pre-#1678
+        // client.
+        if let Some(pins) = crate::tls::peer_fingerprint_map_from_env()? {
+            tracing::info!(
+                target: FED_LOG_TARGET,
+                pinned_hosts = pins.len(),
+                "outbound federation TLS: server-cert PINNING active, fail-closed for \
+                 unpinned peers (#1678)"
+            );
+            let pinning_config = crate::tls::build_rustls_pinning_client_config(
+                pins,
+                client_cert_path,
+                client_key_path,
+            )?;
+            client_builder = client_builder.use_preconfigured_tls(pinning_config);
+        } else {
+            client_builder = client_builder.use_rustls_tls();
+            // --quorum-ca-cert: trust a caller-supplied root CA for outbound
+            // federation POSTs. Required whenever peers present a cert NOT
+            // rooted in webpki-roots (Mozilla CA bundle) — e.g. a self-
+            // signed / ephemeral CA generated for an isolated test fleet.
+            // Without this, reqwest's rustls-tls feature (webpki-roots
+            // only) rejects the peer cert and every quorum write times
+            // out as quorum_not_met. See alphaonedev/ai-memory-mcp#333.
+            if let Some(ca_path) = ca_cert_path {
+                let ca_pem = std::fs::read(ca_path)
+                    .map_err(|e| anyhow::anyhow!("read --quorum-ca-cert: {e}"))?;
+                // v0.7.0 #1070 follow-up — `reqwest::Certificate::from_pem`
+                // post-#1070 (rustls-only backend, no native-tls fallback)
+                // accepts a file with no PEM markers as an empty cert chain
+                // without erroring. That breaks the strict-validation
+                // contract `config_build_rejects_invalid_ca_cert_pem` pins.
+                // Pre-flight the file content for a `-----BEGIN ` marker so
+                // a non-PEM operator-supplied path produces the same
+                // explicit error message the legacy native-tls parser
+                // emitted.
+                let has_pem_marker = ca_pem.windows(11).any(|w| w == b"-----BEGIN ");
+                if !has_pem_marker {
+                    anyhow::bail!(
+                        "parse --quorum-ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
+                        ca_path.display()
+                    );
+                }
+                let ca = reqwest::Certificate::from_pem(&ca_pem)
+                    .map_err(|e| anyhow::anyhow!("parse --quorum-ca-cert: {e}"))?;
+                client_builder = client_builder.add_root_certificate(ca);
             }
-            let ca = reqwest::Certificate::from_pem(&ca_pem)
-                .map_err(|e| anyhow::anyhow!("parse --quorum-ca-cert: {e}"))?;
-            client_builder = client_builder.add_root_certificate(ca);
-        }
-        if let (Some(cert), Some(key)) = (client_cert_path, client_key_path) {
-            let cert_pem =
-                std::fs::read(cert).map_err(|e| anyhow::anyhow!("read --client-cert: {e}"))?;
-            let key_pem =
-                std::fs::read(key).map_err(|e| anyhow::anyhow!("read --client-key: {e}"))?;
-            let mut pem = cert_pem;
-            pem.extend_from_slice(b"\n");
-            pem.extend_from_slice(&key_pem);
-            let identity = reqwest::Identity::from_pem(&pem)
-                .map_err(|e| anyhow::anyhow!("build mTLS identity: {e}"))?;
-            client_builder = client_builder.identity(identity);
+            if let (Some(cert), Some(key)) = (client_cert_path, client_key_path) {
+                let cert_pem =
+                    std::fs::read(cert).map_err(|e| anyhow::anyhow!("read --client-cert: {e}"))?;
+                let key_pem =
+                    std::fs::read(key).map_err(|e| anyhow::anyhow!("read --client-key: {e}"))?;
+                let mut pem = cert_pem;
+                pem.extend_from_slice(b"\n");
+                pem.extend_from_slice(&key_pem);
+                let identity = reqwest::Identity::from_pem(&pem)
+                    .map_err(|e| anyhow::anyhow!("build mTLS identity: {e}"))?;
+                client_builder = client_builder.identity(identity);
+            }
         }
         let client = client_builder
             .build()
@@ -239,7 +268,7 @@ fn resolve_daemon_signing_key(
         Ok(maybe_key) => maybe_key.map(std::sync::Arc::new),
         Err(e) => {
             tracing::warn!(
-                target: "federation",
+                target: FED_LOG_TARGET,
                 sender_agent_id = %sender_agent_id,
                 error = %e,
                 "could not resolve the daemon key directory; federation \
