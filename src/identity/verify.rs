@@ -43,8 +43,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use crate::identity::keypair;
 use crate::identity::sign::{
     SignableCheckpointResolution, SignableLink, SignableRoutineFreeze, SignableSignal,
-    SignableWrite, canonical_cbor, canonical_cbor_checkpoint_resolution,
-    canonical_cbor_routine_freeze, canonical_cbor_signal, canonical_cbor_write,
+    SignableTransition, SignableWrite, canonical_cbor, canonical_cbor_checkpoint_resolution,
+    canonical_cbor_routine_freeze, canonical_cbor_signal, canonical_cbor_transition,
+    canonical_cbor_write,
 };
 
 /// Length of an Ed25519 signature in bytes. Mirrors the constant
@@ -359,6 +360,44 @@ pub fn verify_signal(
     let sig = Signature::from_bytes(&sig_arr);
 
     let Ok(payload) = canonical_cbor_signal(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
+}
+
+/// Verify a federated action-state transition's Ed25519 signature (#1718 H2).
+///
+/// Mirror of [`verify_signal`]: rebuilds the [`VerifyingKey`] from the 32-byte
+/// `signer_pubkey`, re-derives the exact bytes
+/// [`crate::identity::sign::sign_transition`] signed, and checks the 64-byte
+/// signature. Any divergence between the wire transition fields and what the
+/// signer committed to makes the verify fail. The CALLER must additionally
+/// bind `signer_pubkey` to an enrolled identity (the #1718 H2 "attested-not-
+/// claimed" gate) — this function only proves the holder of `signer_pubkey`
+/// signed exactly these transition fields.
+///
+/// Returns `false` — never panics — on ANY error: a `signer_pubkey` not
+/// exactly 32 bytes or not a valid point, a `signature` not exactly 64 bytes,
+/// a CBOR-encode failure, or a signature that does not validate.
+#[must_use]
+pub fn verify_transition(
+    signable: &SignableTransition<'_>,
+    signature: &[u8],
+    signer_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = signer_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_transition(signable) else {
         return false;
     };
     public.verify_strict(&payload, &sig).is_ok()
@@ -942,6 +981,86 @@ mod tests {
         assert!(!verify_signal(&signal, &sig, &[0u8; 16]));
         // empty pubkey.
         assert!(!verify_signal(&signal, &sig, &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1718) — verify_transition (action-state edges)
+    // -----------------------------------------------------------------
+
+    fn transition_fixture() -> SignableTransition<'static> {
+        SignableTransition {
+            action_id: "act-001",
+            namespace: "team/alpha",
+            from_state: "pending",
+            to_state: "claimed",
+            claimed_by: Some("ai:worker"),
+            nonce: b"nonce-abc",
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn verify_transition_accepts_valid_signature() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&kp, &t).unwrap();
+        assert!(
+            verify_transition(&t, &sig, &kp.public.to_bytes()),
+            "happy-path transition verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_transition_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let mut sig = sign::sign_transition(&kp, &t).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_transition(&t, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_mutated_edge() {
+        // A signature minted for `pending -> claimed` must NOT verify for a
+        // different target state (cross-edge replay guard, #1718 H1/H2).
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let original = transition_fixture();
+        let sig = sign::sign_transition(&kp, &original).unwrap();
+        let mut tampered = original.clone();
+        tampered.to_state = "abandoned";
+        assert!(!verify_transition(&tampered, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_replay_under_fresh_nonce() {
+        // The nonce binds the signature to a single delivery — a captured
+        // (bytes, sig) pair must NOT replay under a different nonce.
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let original = transition_fixture();
+        let sig = sign::sign_transition(&kp, &original).unwrap();
+        let mut replayed = original.clone();
+        replayed.nonce = b"different-nonce";
+        assert!(!verify_transition(&replayed, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&alice, &t).unwrap();
+        assert!(!verify_transition(&t, &sig, &bob.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_malformed_lengths() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&kp, &t).unwrap();
+        assert!(!verify_transition(&t, &[0u8; 32], &kp.public.to_bytes()));
+        assert!(!verify_transition(&t, &[], &kp.public.to_bytes()));
+        assert!(!verify_transition(&t, &sig, &[0u8; 16]));
+        assert!(!verify_transition(&t, &sig, &[]));
     }
 
     // -----------------------------------------------------------------

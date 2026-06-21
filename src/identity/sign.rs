@@ -540,6 +540,106 @@ pub fn sign_signal(keypair: &AgentKeypair, signal: &SignableSignal<'_>) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1718) — SignableTransition + sign_transition
+// (end-to-end author attestation for FEDERATED action-state transitions)
+// ---------------------------------------------------------------------------
+
+/// The fields a federated action-state TRANSITION signature commits to — the
+/// end-to-end author attestation answering "which attested actor drove THIS
+/// action from `from_state` to `to_state`, with what nonce, when" (#1718 H2).
+///
+/// Decoupled from [`crate::models::Action`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableCheckpointResolution`]): the full `Action`
+/// carries mutable columns (`title`, `payload`, `priority`, `metadata`,
+/// `vector_clock`) the transition attestation deliberately does NOT bind. The
+/// signature commits to the immutable transition surface only, so a captured
+/// signature cannot be replayed onto a different action, edge, actor, or
+/// timestamp, and the receiver can re-derive the bytes from the wire op
+/// without the full `Action` shape. `nonce` binds the signature to a single
+/// delivery so a captured `(bytes, sig)` pair cannot be replayed under a fresh
+/// nonce without the private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableTransition<'a> {
+    /// The action's id (UUIDv4). Pinned so a signature minted for one action
+    /// cannot be replayed onto another.
+    pub action_id: &'a str,
+    /// Namespace the action lives in.
+    pub namespace: &'a str,
+    /// Expected current state (canonical `ActionState::as_str`). Pinned so a
+    /// signature for one edge (e.g. `pending -> claimed`) cannot be replayed as
+    /// a different edge.
+    pub from_state: &'a str,
+    /// Target state (canonical `ActionState::as_str`).
+    pub to_state: &'a str,
+    /// The attested actor the transition claims (e.g. the lease holder), or
+    /// `None`. The receiver persists THIS attested value, never a peer-supplied
+    /// claimed field.
+    pub claimed_by: Option<&'a str>,
+    /// Per-delivery anti-replay nonce.
+    pub nonce: &'a [u8],
+    /// Epoch seconds of the transition.
+    pub created_at: i64,
+}
+
+/// Canonical CBOR bytes for a [`SignableTransition`]. Field order is
+/// normalised by the `BTreeMap` key-sort at encode time (same determinism
+/// contract as [`canonical_cbor_signal`]), so producer and verifier commit to
+/// byte-identical bytes regardless of struct-literal field order.
+///
+/// # Errors
+/// Returns the `ciborium` encode error on a pathological serialization
+/// failure.
+pub fn canonical_cbor_transition(t: &SignableTransition<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("action_id", ciborium::Value::Text(t.action_id.to_string()));
+    map.insert("namespace", ciborium::Value::Text(t.namespace.to_string()));
+    map.insert(
+        "from_state",
+        ciborium::Value::Text(t.from_state.to_string()),
+    );
+    map.insert("to_state", ciborium::Value::Text(t.to_state.to_string()));
+    map.insert("claimed_by", text_or_null(t.claimed_by));
+    map.insert("nonce", ciborium::Value::Bytes(t.nonce.to_vec()));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Integer(ciborium::value::Integer::from(t.created_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableTransition")?;
+    Ok(out)
+}
+
+/// Sign a [`SignableTransition`] with `keypair`'s private key, returning the
+/// 64-byte Ed25519 signature. Verified inbound by
+/// [`crate::identity::verify::verify_transition`].
+///
+/// # Errors
+/// Returns an error when `keypair` is public-only (`can_sign() == false`) or
+/// the CBOR encode fails.
+pub fn sign_transition(
+    keypair: &AgentKeypair,
+    transition: &SignableTransition<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign transition",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_transition(transition)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
 // v0.8.0 Pillar-1 (#1709) — SignableCheckpointResolution + sign_checkpoint_resolution
 // ---------------------------------------------------------------------------
 
