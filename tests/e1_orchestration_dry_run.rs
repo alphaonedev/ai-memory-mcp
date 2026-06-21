@@ -33,6 +33,25 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// #1742 — these e2e tests cold-build (`cargo build --release`) and spawn a
+/// SEPARATE workspace tool crate (`ai-memory-t0`). Under `cargo llvm-cov`
+/// that child build inherits the coverage RUSTFLAGS (3-4× slower) and trips
+/// the #1492 hung-test watchdog — while adding ZERO `ai-memory` coverage
+/// (the spawned binary is a different crate). So skip the build+spawn under
+/// coverage; the tests still run on every normal `Check` job for the e2e
+/// assurance. cargo-llvm-cov sets `CARGO_LLVM_COV` in the test environment.
+fn skip_under_llvm_cov() -> bool {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        eprintln!(
+            "#1742: skipping subprocess-tool e2e under llvm-cov (adds no ai-memory \
+             coverage; avoids the instrumented cold-build watchdog hang)"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Build the orchestrator binary once per `cargo test` run and
 /// return the absolute path to it.
 ///
@@ -118,6 +137,9 @@ fn run_dry_run() -> String {
 
 #[test]
 fn e1_dry_run_exits_clean_and_names_all_four_llms() {
+    if skip_under_llvm_cov() {
+        return;
+    }
     let out = run_dry_run();
 
     for llm in &["claude", "gpt5", "gemini", "grok"] {
@@ -130,6 +152,9 @@ fn e1_dry_run_exits_clean_and_names_all_four_llms() {
 
 #[test]
 fn e1_dry_run_covers_every_calibration_cell_id() {
+    if skip_under_llvm_cov() {
+        return;
+    }
     let out = run_dry_run();
 
     // Question ids must match the calibration cells in
@@ -152,6 +177,9 @@ fn e1_dry_run_covers_every_calibration_cell_id() {
 
 #[test]
 fn e1_dry_run_advertises_result_file_template() {
+    if skip_under_llvm_cov() {
+        return;
+    }
     let out = run_dry_run();
 
     assert!(
@@ -176,6 +204,9 @@ fn e1_dry_run_advertises_result_file_template() {
 fn e1_dry_run_makes_no_api_calls() {
     // Sanity: dry-run must terminate with the explicit marker so we
     // never confuse a silent abort with a clean dry-run.
+    if skip_under_llvm_cov() {
+        return;
+    }
     let out = run_dry_run();
     assert!(
         out.contains("dry-run complete (no API calls made)"),
