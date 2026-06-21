@@ -64,10 +64,12 @@ across chat sessions** (the common request), approve the read-mostly
 working set including the `memory_store` write:
 
 ```json
-"autoApprove": [
-  "memory_store", "memory_recall", "memory_search", "memory_list",
-  "memory_get", "memory_load_family", "memory_smart_load", "memory_capabilities"
-]
+{
+  "autoApprove": [
+    "memory_store", "memory_recall", "memory_search", "memory_list",
+    "memory_get", "memory_load_family", "memory_smart_load", "memory_capabilities"
+  ]
+}
 ```
 
 Note this includes `memory_store` (a write) so the model can persist
