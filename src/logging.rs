@@ -67,20 +67,72 @@ pub(crate) fn level_filter_or_info_fallback(level: &str) -> tracing_subscriber::
     })
 }
 
+/// One-shot detection of a configured-but-unrecognized log sink value
+/// (env `AI_MEMORY_LOG_SINK` or `[logging].sink`), so a typo like
+/// `sink = "stout"` doesn't silently route to the file sink. Returns the
+/// offending raw value (env wins over the section, matching
+/// [`crate::config::resolve_log_sink`]). PURE — reads env but installs no
+/// subscriber — so the WARN trigger can be asserted deterministically
+/// without the fragile global-install path (the #1711 lesson).
+pub(crate) fn unrecognized_sink_value(cfg: &LoggingConfig) -> Option<String> {
+    let raw = std::env::var(crate::config::ENV_LOG_SINK)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| cfg.sink.clone().filter(|s| !s.trim().is_empty()));
+    classify_unrecognized_sink(raw.as_deref())
+}
+
+/// Pure core of [`unrecognized_sink_value`]: given the already-resolved raw
+/// sink string (env-or-section), return it iff it is non-empty AND not a
+/// recognized [`crate::config::LogSink`]. Split out so the WARN trigger is
+/// unit-testable without reading the process environment (no cross-module
+/// `AI_MEMORY_LOG_SINK` env race).
+fn classify_unrecognized_sink(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if crate::config::LogSink::from_str_opt(raw).is_none() {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
 pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
     if !cfg.enabled.unwrap_or(false) {
         return Ok(None);
     }
-    let dir = resolve_log_dir(cfg);
-    log_paths::ensure_dir_secure(&dir)
-        .with_context(|| format!("creating log dir {}", dir.display()))?;
-    // COVERAGE: build_appender Err-arm (line 57) reachable when the
-    //           rolling-file builder rejects the dir; exercised
-    //           indirectly by build_appender_returns_context_on_unwritable_dir
-    //           and propagates here in production. Not deterministic on
-    //           macOS because the appender accepts non-dir paths lazily.
-    let appender = build_appender(&dir, cfg)?;
-    let (writer, guard) = tracing_appender::non_blocking(appender);
+    // #1463 Tier 1 — resolve the sink ONCE here at boot. The store/recall
+    // hot path never reads this; it only selects WHERE the global tracing
+    // subscriber's non-blocking worker writes (file appender vs stdout), so
+    // the two sinks are byte-identical on every request path. A configured
+    // but unrecognized value falls back to `file` with a loud WARN rather
+    // than silently misrouting (louder than `rotation_for`'s silent default).
+    if let Some(bad) = unrecognized_sink_value(cfg) {
+        tracing::warn!(
+            target: "logging",
+            value = %bad,
+            "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
+             falling back to the file sink. Valid: file | stdout"
+        );
+    }
+    let (writer, guard) = match crate::config::resolve_log_sink(cfg) {
+        // Structured/plain stdout for OS-tier capture (systemd-journald /
+        // launchd unified log / Windows Event Log). Same non-blocking worker
+        // as the file path, so the `write(2)` to a possibly-pipe stdout fd
+        // happens on the worker thread, NEVER on a store/recall call site.
+        crate::config::LogSink::Stdout => tracing_appender::non_blocking(std::io::stdout()),
+        crate::config::LogSink::File => {
+            let dir = resolve_log_dir(cfg);
+            log_paths::ensure_dir_secure(&dir)
+                .with_context(|| format!("creating log dir {}", dir.display()))?;
+            // COVERAGE: build_appender Err-arm (line 57) reachable when the
+            //           rolling-file builder rejects the dir; exercised
+            //           indirectly by build_appender_returns_context_on_unwritable_dir
+            //           and propagates here in production. Not deterministic on
+            //           macOS because the appender accepts non-dir paths lazily.
+            let appender = build_appender(&dir, cfg)?;
+            tracing_appender::non_blocking(appender)
+        }
+    };
     // Capture the writer in the static slot so the daemon's tracing
     // subscriber can drain it. `try_init` so multiple test runs
     // (each spinning a fresh subscriber) don't poison the global.
@@ -360,6 +412,50 @@ mod tests {
         // Guard drop flushes the buffer; explicit drop confirms no
         // panic on shutdown.
         drop(guard);
+    }
+
+    /// #1463 Tier 1 — `sink = "stdout"` selects the stdout non-blocking
+    /// worker (no log dir created) and still returns a guard. The
+    /// `is_some()` assertion is independent of any concurrent
+    /// `AI_MEMORY_LOG_SINK` env value (both sink branches return `Some`),
+    /// so this is race-free.
+    #[test]
+    fn init_file_logging_returns_guard_when_stdout_sink() {
+        let _g = subscriber_lock();
+        let cfg = LoggingConfig {
+            enabled: Some(true),
+            sink: Some("stdout".to_string()),
+            structured: Some(true),
+            level: Some("info".to_string()),
+            ..Default::default()
+        };
+        let guard = init_file_logging(&cfg).unwrap();
+        assert!(
+            guard.is_some(),
+            "stdout sink must return a WorkerGuard when enabled"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn classify_unrecognized_sink_flags_only_bad_values() {
+        // Recognized / empty / absent → no warn.
+        assert_eq!(classify_unrecognized_sink(Some("file")), None);
+        assert_eq!(classify_unrecognized_sink(Some("stdout")), None);
+        assert_eq!(classify_unrecognized_sink(Some("  STDOUT ")), None);
+        assert_eq!(classify_unrecognized_sink(Some("")), None);
+        assert_eq!(classify_unrecognized_sink(Some("   ")), None);
+        assert_eq!(classify_unrecognized_sink(None), None);
+        // Unrecognized (incl. the not-yet-implemented Tier-2 names) → warn,
+        // returning the trimmed offending value.
+        assert_eq!(
+            classify_unrecognized_sink(Some(" stout ")),
+            Some("stout".to_string())
+        );
+        assert_eq!(
+            classify_unrecognized_sink(Some("journald")),
+            Some("journald".to_string())
+        );
     }
 
     #[test]

@@ -583,7 +583,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // const + resolve_compaction_cosine_threshold ladder arm + the
     // curator_compaction_cosine_threshold_resolver_1750 unit test + the three
     // resolver-test fixture updates (cosine_threshold: None) (actual 10_754).
-    ("src/config.rs", 10_850),
+    // 2026-06-21 (#1463 Tier 1 — OS-tier logging) — bumped 10_850 → 11_050: the
+    // `LoggingConfig.sink` field + the `LogSink { File, Stdout }` enum
+    // (as_str/from_str_opt) + ENV_LOG_SINK const + the free `resolve_log_sink`
+    // ladder (env > [logging].sink > file) + the five resolver/from_str unit
+    // tests (log_sink_from_str_opt_and_as_str_roundtrip, resolve_log_sink_*).
+    // Sectioned-config split still tracked under v0.8.0 EPIC #1709 (actual 10_986).
+    ("src/config.rs", 11_050),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
