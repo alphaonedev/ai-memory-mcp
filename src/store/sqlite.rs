@@ -968,6 +968,19 @@ impl MemoryStore for SqliteStore {
         }
     }
 
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        from: crate::models::ActionState,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        let conn = self.state.lock().await;
+        crate::actions::transition_cas(&conn, id, from, to, claimed_by, now).map_err(box_err)
+    }
+
     async fn action_list(
         &self,
         _ctx: &CallerContext,
