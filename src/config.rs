@@ -4135,6 +4135,11 @@ pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
 /// projection drainer via `kg_projection_outbox`.
 pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
 
+/// #1463 Tier 1 — env override for the operational-log sink destination
+/// (`[logging].sink`). Highest layer of the `env > [logging].sink > file`
+/// ladder; see [`resolve_log_sink`] / [`LogSink`].
+pub const ENV_LOG_SINK: &str = "AI_MEMORY_LOG_SINK";
+
 /// #1604 — env override for the tokenized length of rerank inputs
 /// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
 /// unparseable, or above the model ceiling
@@ -4898,6 +4903,62 @@ impl AgeProjectionMode {
     }
 }
 
+/// #1463 Tier 1 — operational-log sink destination. `File` (default) is the
+/// existing rolling file appender (byte-identical to pre-#1463); `Stdout`
+/// emits to stdout via the SAME `tracing_appender::non_blocking` worker so
+/// the init system (systemd-journald / launchd unified log / Windows Event
+/// Log) captures and routes it. The native `journald` / `syslog` protocol
+/// sinks are the dep-gated Tier 2 (a separate follow-up issue), which will
+/// add further variants here behind cargo features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogSink {
+    /// Rolling file appender under the resolved log dir (default).
+    #[default]
+    File,
+    /// Structured/plain lines to stdout for OS-tier capture.
+    Stdout,
+}
+
+impl LogSink {
+    /// Lowercase wire string for config / doctor / banner surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Stdout => "stdout",
+        }
+    }
+
+    /// Parse a case-insensitive `file` / `stdout` token. Returns `None` for
+    /// anything else so the resolver falls through to its default (mirrors
+    /// [`AgeProjectionMode::from_str_opt`]).
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "stdout" => Some(Self::Stdout),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the operational-log sink, uniform ladder `AI_MEMORY_LOG_SINK`
+/// env > `[logging].sink` > compiled default (`File`). Mirrors the
+/// `resolve_storage` mmap/age ladders: an unrecognized value at any layer
+/// falls THROUGH rather than erroring (the `logging::init_file_logging`
+/// path emits a one-shot operator WARN when a configured value was
+/// unrecognized — see `logging::unrecognized_sink_value`). Pure + free of
+/// global state so the precedence is unit-testable without the fragile
+/// process-global subscriber install (the #1711 lesson).
+#[must_use]
+pub fn resolve_log_sink(cfg: &LoggingConfig) -> LogSink {
+    std::env::var(ENV_LOG_SINK)
+        .ok()
+        .and_then(|s| LogSink::from_str_opt(&s))
+        .or_else(|| cfg.sink.as_deref().and_then(LogSink::from_str_opt))
+        .unwrap_or_default()
+}
+
 /// Process-wide AGE-projection mode, seeded once at daemon boot from the
 /// resolved `[storage]` config (`AI_MEMORY_AGE_PROJECTION_MODE` env >
 /// `[storage].age_projection_mode` > compiled default `sync`). Read by
@@ -5245,6 +5306,15 @@ pub struct LoggingConfig {
     pub rotation: Option<String>,
     /// Override the rotated-file prefix. Default `"ai-memory.log"`.
     pub filename_prefix: Option<String>,
+    /// Operational-log SINK destination (#1463 Tier 1): `file` (default —
+    /// the rolling file appender, byte-identical to pre-#1463) or `stdout`
+    /// (structured-stdout, so the init system — systemd-journald / macOS
+    /// unified logging / Windows Event Log — captures + routes/retains it
+    /// natively). The native `journald` / `syslog` sinks are the dep-gated
+    /// Tier 2 (separate issue). An unrecognized value falls back to `file`
+    /// with a one-shot WARN. Resolved once at boot (env `AI_MEMORY_LOG_SINK`
+    /// > this field > `file`); never read on the store/recall hot path.
+    pub sink: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -10384,6 +10454,97 @@ max_page_size = 1000000
         );
         unsafe {
             std::env::remove_var(ENV_DB_MMAP_SIZE);
+        }
+    }
+
+    // ── #1463 Tier 1 — `[logging].sink` / AI_MEMORY_LOG_SINK ladder ──
+
+    #[test]
+    fn log_sink_from_str_opt_and_as_str_roundtrip() {
+        assert_eq!(LogSink::from_str_opt("file"), Some(LogSink::File));
+        assert_eq!(LogSink::from_str_opt("STDOUT"), Some(LogSink::Stdout));
+        assert_eq!(LogSink::from_str_opt("  Stdout  "), Some(LogSink::Stdout));
+        assert_eq!(
+            LogSink::from_str_opt("journald"),
+            None,
+            "Tier 2 not honored yet"
+        );
+        assert_eq!(LogSink::from_str_opt("garbage"), None);
+        assert_eq!(LogSink::File.as_str(), "file");
+        assert_eq!(LogSink::Stdout.as_str(), "stdout");
+        assert_eq!(LogSink::default(), LogSink::File);
+    }
+
+    #[test]
+    fn resolve_log_sink_compiled_default_is_file() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+        assert_eq!(
+            resolve_log_sink(&LoggingConfig::default()),
+            LogSink::File,
+            "no env + no [logging].sink must bottom out on file (byte-identical to pre-#1463)"
+        );
+    }
+
+    #[test]
+    fn resolve_log_sink_section_selects_stdout() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(resolve_log_sink(&cfg), LogSink::Stdout);
+    }
+
+    #[test]
+    fn resolve_log_sink_env_overrides_section() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_LOG_SINK, "file");
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(
+            resolve_log_sink(&cfg),
+            LogSink::File,
+            "env must beat the [logging].sink section"
+        );
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+    }
+
+    #[test]
+    fn resolve_log_sink_garbage_falls_through() {
+        let _g = env_var_lock();
+        // Unparseable env falls THROUGH to the section (mirrors mmap/age).
+        unsafe {
+            std::env::set_var(ENV_LOG_SINK, "not-a-sink");
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(
+            resolve_log_sink(&cfg),
+            LogSink::Stdout,
+            "garbage env falls through to the section value"
+        );
+        // Garbage at BOTH layers bottoms out on the compiled default.
+        let cfg_bad = LoggingConfig {
+            sink: Some("also-bad".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(resolve_log_sink(&cfg_bad), LogSink::File);
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
         }
     }
 
