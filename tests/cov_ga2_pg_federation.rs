@@ -351,6 +351,134 @@ async fn pg_sync_push_via_store_applies_signal() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #1718 — sync_push_via_store action_transitions loop (FAIL-CLOSED): a signed
+// transition attested to the actor's enrolled key applies via the CAS; an
+// unsigned one is refused under the default-secure posture.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pg_sync_push_via_store_applies_action_transition() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_sync_push_via_store_applies_action_transition: env unset");
+        return;
+    };
+    clear_fed_env();
+    let keydir = tempfile::tempdir().expect("keydir");
+    let actor = uniq("ai:cov-ga2-pg-txactor");
+    let kp = ai_memory::identity::keypair::generate(&actor).expect("kp");
+    ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
+    // SAFETY: holds FED_ENV_LOCK for the duration.
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+        std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
+    }
+    let ns = uniq("covga2pgtx");
+    let aid_signed = uniq("ga2pg-act-signed");
+    let aid_unsigned = uniq("ga2pg-act-unsigned");
+    // Seed two Pending actions on the same postgres DB the router uses.
+    let ctx = ai_memory::store::CallerContext::for_agent(actor.clone());
+    let seeder = PostgresStore::connect(&url).await.expect("seed connect");
+    let mk_action = |id: &str| ai_memory::models::Action {
+        id: id.to_string(),
+        namespace: ns.clone(),
+        kind: "test".to_string(),
+        state: ai_memory::models::ActionState::Pending,
+        title: "tx".to_string(),
+        payload: json!({}),
+        priority: 5,
+        agent_id: Some(actor.clone()),
+        claimed_by: None,
+        vector_clock: json!({}),
+        metadata: json!({}),
+        created_at: 1_700_009_000,
+        updated_at: 1_700_009_000,
+    };
+    seeder
+        .action_create(&ctx, &mk_action(&aid_signed))
+        .await
+        .expect("seed signed action");
+    seeder
+        .action_create(&ctx, &mk_action(&aid_unsigned))
+        .await
+        .expect("seed unsigned action");
+
+    let r = pg_router(&url).await;
+    let nonce = b"cov-ga2-pg-tx-nonce".to_vec();
+    let signable = ai_memory::identity::sign::SignableTransition {
+        action_id: &aid_signed,
+        namespace: &ns,
+        from_state: "pending",
+        to_state: "claimed",
+        claimed_by: Some(&actor),
+        nonce: &nonce,
+        created_at: 1_700_009_100,
+    };
+    let sig = ai_memory::identity::sign::sign_transition(&kp, &signable).expect("sign tx");
+    let signed_op = ai_memory::federation::sync::ActionTransitionOp {
+        action_id: aid_signed.clone(),
+        from_state: ai_memory::models::ActionState::Pending,
+        to_state: ai_memory::models::ActionState::Claimed,
+        claimed_by: Some(actor.clone()),
+        vector_clock: json!({}),
+        updated_at: 1_700_009_100,
+        signature: sig,
+        signer_pubkey: kp.public.to_bytes().to_vec(),
+        nonce,
+    };
+    let unsigned_op = ai_memory::federation::sync::ActionTransitionOp {
+        action_id: aid_unsigned.clone(),
+        from_state: ai_memory::models::ActionState::Pending,
+        to_state: ai_memory::models::ActionState::Claimed,
+        claimed_by: Some(actor.clone()),
+        vector_clock: json!({}),
+        updated_at: 1_700_009_200,
+        signature: vec![],
+        signer_pubkey: vec![],
+        nonce: vec![],
+    };
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": actor,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": chrono::Utc::now().to_rfc3339(),
+        "memories": [],
+        "action_transitions": [
+            serde_json::to_value(&signed_op).unwrap(),
+            serde_json::to_value(&unsigned_op).unwrap(),
+        ]
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    clear_fed_env();
+    assert!(
+        status.is_success(),
+        "tx push acks; status={status} body={b}"
+    );
+    assert_eq!(b["storage_backend"], "postgres");
+    assert_eq!(
+        b["action_transitions_applied"].as_i64().unwrap_or(-1),
+        1,
+        "signed enrolled tx applies; unsigned refused fail-closed; body={b}"
+    );
+    let signed_got = seeder
+        .action_get(&ctx, &aid_signed)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(signed_got.state, ai_memory::models::ActionState::Claimed);
+    let unsigned_got = seeder
+        .action_get(&ctx, &aid_unsigned)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
+}
+
 #[tokio::test]
 async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
     let _g = FED_ENV_LOCK.lock().await;
