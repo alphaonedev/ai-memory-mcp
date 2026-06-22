@@ -43,6 +43,11 @@ pub(crate) mod pipeline;
 // the CLI's `--reflect` mode. Items inside the module that should
 // stay crate-private use `pub(crate)` directly.
 pub mod reflection_pass;
+/// #1393 sub-unit 2 — curator transcript-classify pass. Entirely
+/// `sal`-gated: it operates exclusively through the `MemoryStore` trait
+/// (`reclassify_memory_kind` + `list`), so it only exists in `sal` builds.
+#[cfg(feature = "sal")]
+pub mod transcript_classify_pass;
 
 use anyhow::Result;
 use rusqlite::Connection;

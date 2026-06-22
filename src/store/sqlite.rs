@@ -1763,6 +1763,63 @@ impl MemoryStore for SqliteStore {
         db::health_check(&conn).map_err(box_err)
     }
 
+    /// #1393 sub-unit 2 — see the trait doc. One `BEGIN`/`COMMIT`: read the
+    /// current kind, refuse `reflection`/`persona` (mirror the upsert CASE),
+    /// no-op when already the target, `UPDATE` kind + bump `version`, then
+    /// append the `memory.reclassified` `signed_event` in the SAME tx so the
+    /// audit is atomic with the write.
+    async fn reclassify_memory_kind(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        let mut conn = self.state.lock().await;
+        let tx = conn.transaction().map_err(box_err)?;
+        let old_kind: Option<String> = tx
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(box_err)?;
+        let Some(old_kind) = old_kind else {
+            return Ok(false);
+        };
+        let new_kind_str = new_kind.as_str();
+        // Protection: never clobber a reflection/persona kind (mirror the
+        // upsert-CASE invariant in crate::storage); no-op when unchanged.
+        if old_kind == crate::models::MemoryKind::Reflection.as_str()
+            || old_kind == crate::models::MemoryKind::Persona.as_str()
+            || old_kind == new_kind_str
+        {
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE memories SET memory_kind = ?1, version = version + 1 \
+                 WHERE id = ?2 AND memory_kind NOT IN ('reflection', 'persona')",
+                rusqlite::params![new_kind_str, id],
+            )
+            .map_err(box_err)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            "memory.reclassified".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        crate::signed_events::append_signed_event_no_tx(&tx, &event).map_err(box_err)?;
+        tx.commit().map_err(box_err)?;
+        Ok(true)
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         let conn = self.state.lock().await;
         db::stats(&conn, &self.path).map_err(box_err)

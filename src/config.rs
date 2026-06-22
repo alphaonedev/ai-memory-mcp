@@ -3530,6 +3530,18 @@ pub struct CuratorSection {
     /// consolidation pass. See [`CuratorCompactionSection`].
     #[serde(default)]
     pub compaction: Option<CuratorCompactionSection>,
+
+    /// #1393 sub-unit 2 — `[curator].transcript_classify_enabled` activation
+    /// for the transcript-classify pass
+    /// (`crate::curator::transcript_classify_pass::TranscriptClassifyPass`):
+    /// when `true`, `curator --reflect` also reclassifies recovered-from-
+    /// transcript `Observation` memories whose LLM-classified kind is more
+    /// specific (Decision / Claim / Event …) via the audited
+    /// `reclassify_memory_kind` path. Default `false` (opt-in). Env override:
+    /// `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` (see
+    /// [`ENV_TRANSCRIPT_CLASSIFY_ENABLED`]).
+    #[serde(default)]
+    pub transcript_classify_enabled: Option<bool>,
 }
 
 /// v0.8.0 #1749 — `[curator.compaction]` activation knobs for the Pillar-2.5
@@ -4179,6 +4191,12 @@ pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
 /// (`1`/`true`) or falsy (`0`/`false`) wins over config; anything else falls
 /// through to the config field then the compiled default `false`.
 pub const ENV_COMPACTION_ENABLED: &str = "AI_MEMORY_COMPACTION_ENABLED";
+
+/// #1393 sub-unit 2 — env override for the transcript-classify pass
+/// activation (`[curator].transcript_classify_enabled`). Uniform ladder:
+/// this env > config field > compiled `false`. See
+/// [`AppConfig::resolve_transcript_classify_enabled`].
+pub const ENV_TRANSCRIPT_CLASSIFY_ENABLED: &str = "AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED";
 
 /// v0.8.0 #1750 — env override for `[curator.compaction].cosine_threshold`.
 /// A parseable `f32` in `(0.0, 1.0]` wins over config; an unparseable or
@@ -7133,6 +7151,30 @@ impl AppConfig {
             .as_ref()
             .and_then(|c| c.compaction.as_ref())
             .and_then(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// #1393 sub-unit 2 — resolve the transcript-classify pass activation.
+    /// Uniform ladder: `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` env >
+    /// `[curator].transcript_classify_enabled` config > compiled `false`
+    /// (opt-in). Mirrors [`Self::resolve_compaction_enabled`]: an explicit
+    /// truthy/falsy env wins; any other env string falls through to the
+    /// config field then the default.
+    #[must_use]
+    pub fn resolve_transcript_classify_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var(ENV_TRANSCRIPT_CLASSIFY_ENABLED) {
+            let t = v.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") {
+                return true;
+            }
+            if t == "0" || t.eq_ignore_ascii_case("false") {
+                return false;
+            }
+            // Any other value: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.transcript_classify_enabled)
             .unwrap_or(false)
     }
 
@@ -10730,6 +10772,7 @@ max_page_size = 1000000
         );
         let cfg = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: Some(ns_map),
                 confidence_decay_half_life_days: None,
                 compaction: None,
@@ -10768,6 +10811,7 @@ max_page_size = 1000000
         hl.insert("team/nan".to_string(), f64::NAN); // non-finite → falls through
         let cfg = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: Some(hl),
                 compaction: None,
@@ -10809,6 +10853,7 @@ max_page_size = 1000000
 
         let on = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
@@ -10825,6 +10870,7 @@ max_page_size = 1000000
 
         let off = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
@@ -10839,6 +10885,7 @@ max_page_size = 1000000
         // Section present but enabled omitted → false.
         let omitted = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
@@ -10851,6 +10898,61 @@ max_page_size = 1000000
         assert!(
             !omitted.resolve_compaction_enabled(),
             "omitted enabled → false"
+        );
+    }
+
+    #[test]
+    fn transcript_classify_enabled_resolver_1393() {
+        // #1393 sub-unit 2 — config-layer resolution (env layer is process-
+        // global and asserted by the resolver's shared ladder; mirrors the
+        // compaction resolver test which is also config-only).
+        let bare = AppConfig::default();
+        assert!(
+            !bare.resolve_transcript_classify_enabled(),
+            "default-off opt-in posture"
+        );
+
+        let on = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: Some(true),
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            on.resolve_transcript_classify_enabled(),
+            "[curator].transcript_classify_enabled=true"
+        );
+
+        let off = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: Some(false),
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !off.resolve_transcript_classify_enabled(),
+            "explicit false honored"
+        );
+
+        // Section present but the field omitted → false.
+        let omitted = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !omitted.resolve_transcript_classify_enabled(),
+            "omitted field → false"
         );
     }
 
@@ -10872,6 +10974,7 @@ max_page_size = 1000000
         // Config value honored.
         let cfg = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {
@@ -10889,6 +10992,7 @@ max_page_size = 1000000
         // Out-of-range config value (> 1.0) falls through to default.
         let bad = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: None,
                 compaction: Some(CuratorCompactionSection {

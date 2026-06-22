@@ -340,6 +340,7 @@ fn test_compaction_enabled_env_overrides_config_and_default() {
 
     let cfg = |enabled: Option<bool>| AppConfig {
         curator: Some(CuratorSection {
+            transcript_classify_enabled: None,
             reflection_namespaces: None,
             confidence_decay_half_life_days: None,
             compaction: Some(CuratorCompactionSection {
@@ -460,6 +461,7 @@ fn test_compaction_cosine_threshold_env_overrides_config_and_default() {
 
     let cfg = |ct: Option<f32>| AppConfig {
         curator: Some(CuratorSection {
+            transcript_classify_enabled: None,
             reflection_namespaces: None,
             confidence_decay_half_life_days: None,
             compaction: Some(CuratorCompactionSection {

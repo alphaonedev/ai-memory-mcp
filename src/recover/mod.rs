@@ -36,6 +36,14 @@ use serde::{Deserialize, Serialize};
 
 pub use transcript_paths::{HostKind, resolve_transcript};
 
+/// Tag stamped on every memory L2-recovered from a host transcript
+/// (see [`recover_from_transcript`]). The #1393 curator
+/// transcript-classify pass scans for this tag to find recovered
+/// `Observation` memories that are candidates for LLM reclassification.
+/// SSOT for the literal so the recover write-site and the curator scan
+/// filter can never drift.
+pub const RECOVERED_FROM_TRANSCRIPT_TAG: &str = "recovered-from-transcript";
+
 /// Per-call recovery report. Doubles as the JSON wire shape for
 /// `ai-memory recover-previous-session --json` and as the MCP-tool
 /// return shape; field names + serialization order are the wire
@@ -654,7 +662,7 @@ fn prepare_recover_turn_write(
 
     let mut tags = vec![
         "captured-via-l2".to_string(),
-        "recovered-from-transcript".to_string(),
+        RECOVERED_FROM_TRANSCRIPT_TAG.to_string(),
         format!("host:{host_kind}"),
         format!("role:{role}"),
     ];
