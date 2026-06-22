@@ -775,62 +775,102 @@ async fn run_reflect(
     // #1764 (v0.8.0 slice) — reflection-corpus decorrelation VISIBILITY probe,
     // opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE` (default `off`). Reuses
     // the same SAL store + keypair-derived curator identity the reflection pass
-    // ran with; read-only (no writes). Default `off` → byte-unchanged curator.
-    // `enforce` is INERT at v0.8.0 (runs advisory) — write-time N≥3
-    // model-family-distinct REFUSAL is the tracked v0.9 lane (#1719/#1171).
-    // Design: 5-agent vote (4d3ea1c5).
-    let decorrelation_mode = config::reflect_decorrelation_mode();
-    if decorrelation_mode.is_active() {
-        let agent_id = keypair.as_ref().map_or_else(
-            || crate::identity::sentinels::AI_CURATOR.to_string(),
-            |k| k.agent_id.clone(),
-        );
-        let probe_result = crate::curator::decorrelation_probe::run_decorrelation_probe(
-            store.as_ref(),
-            &agent_id,
-            args.namespace.as_deref(),
-            decorrelation_mode,
-            config::reflect_decorrelation_dominance_threshold(),
-            crate::curator::decorrelation_probe::MIN_REFLECTIONS_FLOOR,
-        )
-        .await;
-        match probe_result {
-            Ok(probe) => {
-                if args.json {
-                    writeln!(out.stdout, "{}", serde_json::to_string_pretty(&probe)?)?;
-                } else {
-                    writeln!(
-                        out.stdout,
-                        "decorrelation-probe: mode={} threshold={:.2} namespaces={} \
-                         reflections={} advisories={}{}",
-                        probe.mode,
-                        probe.threshold,
-                        probe.namespaces_scanned,
-                        probe.reflections_scanned,
-                        probe.advisories.len(),
-                        if probe.enforce_degraded_to_advisory {
-                            " (enforce INERT at v0.8.0 → advisory)"
-                        } else {
-                            ""
-                        },
-                    )?;
-                    for adv in &probe.advisories {
-                        writeln!(
-                            out.stdout,
-                            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={} — {}",
-                            adv.namespace,
-                            adv.report.dominance_ratio,
-                            adv.report.dominant_producer.as_deref().unwrap_or("?"),
-                            adv.report.distinct_producers,
-                            adv.caveat,
-                        )?;
-                    }
-                }
-            }
-            Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
-        }
-    }
+    // ran with; read-only (no writes). Called unconditionally — the step
+    // early-returns when the mode is `off` (the default), so the curator's
+    // output + DB are byte-unchanged when disabled. Design: 5-agent vote
+    // (4d3ea1c5).
+    let decorrelation_agent_id = keypair.as_ref().map_or_else(
+        || crate::identity::sentinels::AI_CURATOR.to_string(),
+        |k| k.agent_id.clone(),
+    );
+    run_decorrelation_probe_step(
+        store.as_ref(),
+        &decorrelation_agent_id,
+        args,
+        config::reflect_decorrelation_mode(),
+        config::reflect_decorrelation_dominance_threshold(),
+        out,
+    )
+    .await?;
 
+    Ok(())
+}
+
+/// #1764 (v0.8.0 slice) — run the reflection-corpus decorrelation VISIBILITY
+/// probe and render its report. Early-returns (no output, no scan) when `mode`
+/// is `off` (the default). Split out of [`run_reflect`] so the active path is
+/// unit-testable by passing `mode` directly — no env mutation, no test races.
+/// `enforce` is INERT at v0.8.0 (the runner degrades it to advisory with a
+/// one-shot WARN) — write-time N≥3 model-family-distinct REFUSAL is the tracked
+/// v0.9 lane (#1719 / #1171).
+#[cfg(feature = "sal")]
+async fn run_decorrelation_probe_step(
+    store: &dyn crate::store::MemoryStore,
+    agent_id: &str,
+    args: &CuratorArgs,
+    mode: config::ReflectDecorrelationMode,
+    threshold: f64,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if !mode.is_active() {
+        return Ok(());
+    }
+    let probe_result = crate::curator::decorrelation_probe::run_decorrelation_probe(
+        store,
+        agent_id,
+        args.namespace.as_deref(),
+        mode,
+        threshold,
+        crate::curator::decorrelation_probe::MIN_REFLECTIONS_FLOOR,
+    )
+    .await;
+    match probe_result {
+        Ok(probe) => print_decorrelation_report(&probe, args.json, out)?,
+        Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
+    }
+    Ok(())
+}
+
+/// #1764 — render a [`crate::curator::decorrelation_probe::DecorrelationProbeReport`]
+/// to `out` as pretty JSON (`json = true`) or a one-line summary + an indented
+/// `ADVISORY` line per dominated namespace (each carrying the CLAIMED-not-attested
+/// caveat).
+#[cfg(feature = "sal")]
+fn print_decorrelation_report(
+    probe: &crate::curator::decorrelation_probe::DecorrelationProbeReport,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if json {
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(probe)?)?;
+        return Ok(());
+    }
+    writeln!(
+        out.stdout,
+        "decorrelation-probe: mode={} threshold={:.2} namespaces={} \
+         reflections={} advisories={}{}",
+        probe.mode,
+        probe.threshold,
+        probe.namespaces_scanned,
+        probe.reflections_scanned,
+        probe.advisories.len(),
+        if probe.enforce_degraded_to_advisory {
+            " (enforce INERT at v0.8.0 → advisory)"
+        } else {
+            ""
+        },
+    )?;
+    for adv in &probe.advisories {
+        writeln!(
+            out.stdout,
+            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={} — {}",
+            adv.namespace,
+            adv.report.dominance_ratio,
+            adv.report.dominant_producer.as_deref().unwrap_or("?"),
+            adv.report.distinct_producers,
+            adv.caveat,
+        )?;
+    }
     Ok(())
 }
 
@@ -1861,6 +1901,131 @@ mod tests {
         }
         let s = env.stdout_str();
         assert!(s.contains("reflection pass report"));
+    }
+
+    // ── #1764 — decorrelation VISIBILITY probe wiring coverage ──────────
+    #[cfg(feature = "sal")]
+    fn sample_decorrelation_report(
+        degraded: bool,
+    ) -> crate::curator::decorrelation_probe::DecorrelationProbeReport {
+        use crate::curator::decorrelation_probe::{
+            CLAIMED_NOT_ATTESTED_CAVEAT, DecorrelationAdvisory, DecorrelationProbeReport,
+            DominanceReport,
+        };
+        DecorrelationProbeReport {
+            mode: "advisory".to_string(),
+            enforce_degraded_to_advisory: degraded,
+            threshold: 0.8,
+            namespaces_scanned: 1,
+            reflections_scanned: 5,
+            advisories: vec![DecorrelationAdvisory {
+                namespace: "team/eng".to_string(),
+                report: DominanceReport {
+                    total: 5,
+                    distinct_producers: 1,
+                    dominant_producer: Some("ai:solo".to_string()),
+                    dominant_count: 5,
+                    dominance_ratio: 1.0,
+                },
+                threshold: 0.8,
+                caveat: CLAIMED_NOT_ATTESTED_CAVEAT.to_string(),
+            }],
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn print_decorrelation_report_text_emits_advisory_line() {
+        // Text branch + the `for adv` loop body + the enforce-degraded suffix.
+        let report = sample_decorrelation_report(true);
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            print_decorrelation_report(&report, false, &mut out).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("decorrelation-probe: mode=advisory"));
+        assert!(s.contains("advisories=1"));
+        assert!(s.contains("enforce INERT at v0.8.0"));
+        assert!(s.contains("ADVISORY ns=team/eng"));
+        assert!(s.contains("dominant=ai:solo"));
+        assert!(s.contains("CLAIMED"));
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn print_decorrelation_report_json_round_trips() {
+        // JSON branch (no enforce-degraded suffix).
+        let report = sample_decorrelation_report(false);
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            print_decorrelation_report(&report, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+        assert_eq!(v["mode"], "advisory");
+        assert_eq!(v["advisories"].as_array().unwrap().len(), 1);
+        assert_eq!(v["advisories"][0]["namespace"], "team/eng");
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn decorrelation_step_off_is_silent() {
+        // Off mode → early return, no output (the default-safe path; also
+        // exercised by every existing `--reflect` test through `run_reflect`).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace = Some("team/eng".to_string());
+        let store = build_reflect_store(&db, &args, &cfg).await.unwrap();
+        {
+            let mut out = env.output();
+            run_decorrelation_probe_step(
+                store.as_ref(),
+                "ai:curator",
+                &args,
+                config::ReflectDecorrelationMode::Off,
+                0.8,
+                &mut out,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(env.stdout_str().is_empty());
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn decorrelation_step_advisory_empty_store_reports_zero() {
+        // Advisory mode against an empty store → runner scans, no reflections,
+        // 0 advisories. Covers the active path (runner call + Ok arm + the
+        // text formatter) without env mutation.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace = Some("team/eng".to_string());
+        let store = build_reflect_store(&db, &args, &cfg).await.unwrap();
+        {
+            let mut out = env.output();
+            run_decorrelation_probe_step(
+                store.as_ref(),
+                "ai:curator",
+                &args,
+                config::ReflectDecorrelationMode::Advisory,
+                0.8,
+                &mut out,
+            )
+            .await
+            .unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("decorrelation-probe: mode=advisory"));
+        assert!(s.contains("advisories=0"));
     }
 
     // ── #1548 coverage — the SAL `--store-url` curator path ──────────
