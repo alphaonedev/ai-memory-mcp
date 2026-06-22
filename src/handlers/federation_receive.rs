@@ -416,6 +416,15 @@ pub struct SyncPushBody {
     /// node-2's peer, breaking cross-peer rule-lifecycle assertions.
     #[serde(default)]
     pub namespace_meta_clears: Vec<String>,
+    /// #1718 v0.8.0 Pillar-1 — signed inter-agent signals the sender wants
+    /// propagated (the v60 `signals` table). Applied accept-and-flag-unsigned
+    /// like memories/links (a signal is a *message*, not an authority grant):
+    /// idempotent on the signal UUID, a present-but-invalid signature is
+    /// refused as forged, an unsigned signal lands verbatim. See
+    /// `crate::federation::receive_auth` for why action *transitions* (the
+    /// authority-granting sibling) are fail-closed instead.
+    #[serde(default)]
+    pub signals: Vec<crate::models::Signal>,
     /// Preview mode — classify and count, do not write.
     #[serde(default)]
     pub dry_run: bool,
@@ -628,6 +637,15 @@ pub async fn sync_push(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!("sync_push limited to {} pendings per request", app.max_page_size)
+            })),
+        )
+            .into_response();
+    }
+    if body.signals.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("sync_push limited to {} signals per request", app.max_page_size)
             })),
         )
             .into_response();
@@ -1239,6 +1257,64 @@ pub async fn sync_push(
         }
     }
 
+    // #1718 v0.8.0 Pillar-1 — process incoming signals. Accept-and-flag-unsigned
+    // (a signal is a message, not an authority grant — same posture as
+    // memories/links; the authority-granting action *transition* sibling is
+    // fail-closed in `receive_auth`). Idempotent on the signal UUID; a
+    // present-but-invalid signature is refused as forged. #1544: the receive
+    // path charges the storage-bytes quota only (replication is not net-new
+    // authorship) — a refusal skips the offending signal without 429-ing the
+    // whole push (signals are not the primary write surface).
+    let mut signals_applied = 0usize;
+    for sig in &body.signals {
+        if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if !sig.signature.is_empty() && !crate::signals::verify(sig) {
+            tracing::warn!(
+                "sync_push: signal {} has an invalid signature — skipping (forged)",
+                sig.id
+            );
+            skipped += 1;
+            continue;
+        }
+        match crate::signals::get(&lock.0, &sig.id) {
+            Ok(Some(_)) => {
+                noop += 1; // already have it — idempotent replay
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("sync_push: signal get failed for {}: {e}", sig.id);
+                skipped += 1;
+                continue;
+            }
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
+        if let Err(e) = crate::quotas::check_and_record_storage_only(
+            &lock.0,
+            &sig.from_agent,
+            &sig.namespace,
+            bytes,
+        ) {
+            tracing::warn!("sync_push: signal {} refused by storage quota: {e}", sig.id);
+            skipped += 1;
+            continue;
+        }
+        match crate::signals::insert(&lock.0, sig) {
+            Ok(_) => signals_applied += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: signal insert failed for {}: {e}", sig.id);
+                skipped += 1;
+            }
+        }
+    }
+
     // v0.6.2 (S35): process incoming namespace_meta rows. Applies via
     // `set_namespace_standard` so the peer's inheritance-chain walk has
     // the originator's explicit parent link. The standard memory itself
@@ -1363,6 +1439,7 @@ pub async fn sync_push(
             "links_applied": links_applied,
             "pendings_applied": pendings_applied,
             "pending_decisions_applied": pending_decisions_applied,
+            "signals_applied": signals_applied,
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,

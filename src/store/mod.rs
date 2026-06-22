@@ -1245,6 +1245,47 @@ pub trait MemoryStore: Send + Sync {
         }
     }
 
+    /// #1718 — apply a remote-origin signal via the accept-and-flag-unsigned
+    /// posture (a signal is a *message*, not an authority grant — same as
+    /// [`apply_remote_memory`](MemoryStore::apply_remote_memory) /
+    /// [`apply_remote_link`](MemoryStore::apply_remote_link); the
+    /// authority-granting action-transition sibling is fail-closed instead, see
+    /// `crate::federation::receive_auth`). Default impl composes
+    /// [`signal_get`](MemoryStore::signal_get) + [`crate::signals::verify`] +
+    /// [`signal_send`](MemoryStore::signal_send) so both adapters get it with no
+    /// per-backend SQL (mirrors [`apply_remote_deletion`](MemoryStore::apply_remote_deletion)).
+    ///
+    /// Idempotent on the signal UUID (a replay no-ops, returning the
+    /// `unsigned` label). The signal is persisted verbatim with its embedded
+    /// signature / `sender_pubkey` (never re-signed). Returns `self_signed`
+    /// when that embedded signature verifies, else `unsigned`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when the signal carries a present-but-invalid
+    /// signature (forged), or `Backend` on a storage error.
+    async fn apply_remote_signal(
+        &self,
+        ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<&'static str> {
+        if self.signal_get(ctx, &signal.id).await?.is_some() {
+            return Ok(crate::models::AttestLevel::Unsigned.as_str());
+        }
+        let signed_ok = !signal.signature.is_empty() && crate::signals::verify(signal);
+        if !signal.signature.is_empty() && !signed_ok {
+            return Err(StoreError::InvalidInput {
+                detail: format!("signal {} has an invalid signature", signal.id),
+            });
+        }
+        self.signal_send(ctx, signal, None).await?;
+        Ok(if signed_ok {
+            crate::models::AttestLevel::SelfSigned.as_str()
+        } else {
+            crate::models::AttestLevel::Unsigned.as_str()
+        })
+    }
+
     // ==================================================================
     // v0.7.0 Wave-3 Continuation 2 — full hybrid recall pipeline
     // (Phase 10).
