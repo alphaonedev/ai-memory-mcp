@@ -1,0 +1,274 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  Enterprise positioning / "wazoo" feature narrative — marketing page.
+  Source narrative tracked in issue #1769 (non-development reference).
+  Self-contained (inline styles, palette ported from index.html) so it
+  renders independently without coupling to the landing-page CSS.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ai-memory for Enterprise &mdash; self-improving, governed, bias-resistant AI memory</title>
+<meta name="description" content="ai-memory turns AI agents from amnesiac chatbots into a coordinated workforce with a shared, governed, auditable institutional memory: cryptographic audit trail, fail-closed governance, attested NHI identity, recursive self-improvement, and anti-echo-chamber decorrelation. Apache-2.0.">
+<meta name="theme-color" content="#000">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/enterprise.html">
+<style>
+:root{
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666;
+  --p1:#6ee7ff; --p2:#ffb86b; --p3:#c8a2ff;
+  --good:#2ea043; --warn:#ffb86b; --bad:#f85149;
+  --accent:#6ee7ff;
+  --font-mono:"SF Mono","Cascadia Code","Fira Code",Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+  --max-w:1200px; --max-w-narrow:880px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none;transition:filter .15s}
+a:hover{filter:brightness(1.25)}
+code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px;color:#d4d4d4}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+.container-narrow{max-width:var(--max-w-narrow);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3,h4{font-weight:700;letter-spacing:-.02em;color:#fff}
+h1{font-size:clamp(2.2rem,5.5vw,3.8rem);line-height:1.05;letter-spacing:-.04em;margin-bottom:1.25rem}
+h2{font-size:clamp(1.6rem,3vw,2.1rem);margin-bottom:.6rem;letter-spacing:-.025em}
+h3{font-size:1.15rem;margin-bottom:.5rem}
+p{color:var(--text-muted);margin-bottom:1rem}
+p.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2rem}
+.eyebrow{font-family:var(--font-mono);font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--p1);margin-bottom:1rem}
+/* topnav */
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,.88);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav .left{display:flex;align-items:center;gap:1.5rem}
+.topnav a{color:var(--text-muted)}
+.topnav a:hover{color:var(--text)}
+.topnav .brand{color:var(--text);font-weight:700;letter-spacing:-.01em;font-size:1rem}
+.topnav .right{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
+@media(max-width:780px){.topnav .left{gap:.85rem}.topnav .right{display:none}}
+/* hero */
+.hero{padding:5rem 0 3.5rem;border-bottom:1px solid var(--border);background:radial-gradient(120% 80% at 50% -10%,rgba(110,231,255,.08),transparent 60%)}
+.hero .badge{display:inline-block;font-family:var(--font-mono);font-size:.74rem;letter-spacing:.08em;color:var(--text-muted);border:1px solid var(--border-hl);border-radius:999px;padding:.3rem .8rem;margin-bottom:1.5rem}
+.oneliner{font-size:1.2rem;color:#cfcfcf;max-width:820px;margin:1.5rem 0 0}
+.oneliner strong{color:#fff}
+/* sections */
+section{padding:4rem 0;border-bottom:1px solid var(--border)}
+.section-head{max-width:820px;margin-bottom:2.25rem}
+/* problem/solution split */
+.split{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+@media(max-width:780px){.split{grid-template-columns:1fr}}
+.panel{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem}
+.panel.problem{border-left:3px solid var(--bad)}
+.panel.solution{border-left:3px solid var(--good)}
+.panel h3{margin-bottom:.75rem}
+/* card grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-top:1.5rem}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.4rem;transition:border-color .15s,transform .15s}
+.card:hover{border-color:var(--border-hl);transform:translateY(-2px)}
+.card .n{font-family:var(--font-mono);font-size:.75rem;color:var(--p2);letter-spacing:.06em;margin-bottom:.6rem}
+.card h3{font-size:1.05rem;margin-bottom:.5rem}
+.card p{font-size:.92rem;margin-bottom:0}
+.card.feat .n{color:var(--p3)}
+/* wazoo block */
+.wazoo{display:grid;gap:1rem}
+.wband{background:linear-gradient(180deg,var(--bg-card),var(--bg-raised));border:1px solid var(--border);border-radius:14px;padding:1.6rem 1.7rem}
+.wband.crown{border:1px solid var(--p1);box-shadow:0 0 0 1px rgba(110,231,255,.15),0 8px 40px -12px rgba(110,231,255,.2)}
+.wband h3{font-size:1.2rem;display:flex;align-items:center;gap:.6rem;margin-bottom:.7rem}
+.wband ul{list-style:none;margin:.4rem 0 0}
+.wband li{position:relative;padding-left:1.3rem;color:var(--text-muted);font-size:.94rem;margin-bottom:.55rem}
+.wband li::before{content:"▸";position:absolute;left:0;color:var(--p1)}
+.wband li strong{color:#e8e8e8}
+.pill{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.06em;color:var(--p3);border:1px solid var(--border-hl);border-radius:999px;padding:.15rem .55rem;vertical-align:middle}
+.flow{font-family:var(--font-mono);font-size:.82rem;color:#cfcfcf;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:.9rem 1rem;margin-top:.8rem;overflow-x:auto}
+.flow b{color:var(--p1)}
+/* sharpest 3 */
+.sharp{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-top:1.5rem}
+@media(max-width:780px){.sharp{grid-template-columns:1fr}}
+.sharp .s{background:var(--bg-elev);border:1px solid var(--border);border-radius:12px;padding:1.3rem;text-align:center}
+.sharp .s .ic{font-size:1.6rem;margin-bottom:.5rem}
+.sharp .s h4{color:var(--p1);margin-bottom:.4rem}
+.sharp .s p{font-size:.88rem;margin-bottom:0}
+/* footer */
+footer{padding:3rem 0 4rem;color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+.kicker{color:var(--p1)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <div class="left">
+      <a class="brand" href="./index.html">ai-memory</a>
+      <a href="./index.html">Home</a>
+      <a href="./architectures.html">Architecture</a>
+      <a href="./adoption.html">Adoption</a>
+    </div>
+    <div class="right">
+      <a href="./enterprise.html" class="kicker">Enterprise</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="container">
+    <span class="badge">Enterprise &middot; Non-Human Intelligence (NHI) memory substrate</span>
+    <p class="eyebrow">Self-improving &middot; Governed &middot; Bias-resistant</p>
+    <h1>Memory your AI fleet can<br>trust, prove, and control.</h1>
+    <p class="oneliner"><strong>ai-memory turns AI agents from amnesiac chatbots into a coordinated workforce</strong> with a shared, governed, auditable institutional memory &mdash; what you need before you can trust AI to operate autonomously at scale. One Rust binary. Your infrastructure. Any LLM. Apache-2.0.</p>
+  </div>
+</header>
+
+<!-- PROBLEM / SOLUTION -->
+<section>
+  <div class="container">
+    <div class="section-head">
+      <p class="eyebrow">The problem</p>
+      <h2>AI assistants have amnesia.</h2>
+    </div>
+    <div class="split">
+      <div class="panel problem">
+        <h3>Without memory</h3>
+        <p>Every conversation starts from zero. The AI forgot what you told it yesterday, what it figured out last week, and every decision you made together. Across a <em>team</em> of agents it's worse: they each forget, redo each other's work, and leave no shared record of what any of them knew or did.</p>
+      </div>
+      <div class="panel solution">
+        <h3>With ai-memory</h3>
+        <p>A long-term memory layer underneath your agents &mdash; durable, shared, and trustworthy. The difference between an employee who keeps an organized notebook (and can hand it to a teammate) and one who wakes up every morning with no recollection of the job.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- WHY ENTERPRISE CARES -->
+<section>
+  <div class="container">
+    <div class="section-head">
+      <p class="eyebrow">For the CISO / CTO room</p>
+      <h2>Eight reasons enterprises care.</h2>
+      <p class="lede">Built like infrastructure, not a demo &mdash; because autonomous AI at scale is where the value <em>and</em> the risk both live.</p>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="n">01 &middot; PROVENANCE</div><h3>Cryptographic audit trail</h3><p>Append-only, hash-chained, Ed25519-signed ledger. Prove who recorded or changed what, and when &mdash; tamper-evident. Turns "the AI did something" into a defensible record.</p></div>
+      <div class="card"><div class="n">02 &middot; CONTROL</div><h3>Governance that fails <em>closed</em></h3><p>Per-namespace policy (write / promote / delete / approve), signed rules, secure-by-default. A policy-check error <em>refuses</em> the write &mdash; no silent bypass.</p></div>
+      <div class="card"><div class="n">03 &middot; IDENTITY</div><h3>Attestation for non-human actors</h3><p>Real cryptographic agent identities, mTLS, cert-chain delegation, replay protection. Enrol, scope, and revoke AI agents like service accounts.</p></div>
+      <div class="card"><div class="n">04 &middot; SOVEREIGNTY</div><h3>Deploy anywhere, no lock-in</h3><p>SQLite (single binary, air-gappable, edge) or PostgreSQL + Apache AGE (scale, graph). Works with <em>any</em> LLM / embedding provider, switchable by config. Offline is first-class.</p></div>
+      <div class="card"><div class="n">05 &middot; SECURITY</div><h3>Encryption + secret hygiene</h3><p>At-rest encryption (SQLCipher), per-memory encrypted envelopes, TLS in transit, SSRF guards. Secrets structurally barred from logs, audit, and capabilities.</p></div>
+      <div class="card"><div class="n">06 &middot; SCALE</div><h3>Multi-agent, not one chatbot</h3><p>Federation with quorum (W-of-N) agreement before knowledge becomes authoritative, per-agent quotas, and graceful load-shedding admission control.</p></div>
+      <div class="card"><div class="n">07 &middot; SAFETY</div><h3>AI-safety guardrails</h3><p>Governance gates, attestation, and anti-monoculture controls that make "is our shared AI knowledge being corrupted or dominated?" visible and measurable.</p></div>
+      <div class="card"><div class="n">08 &middot; LONGEVITY</div><h3>Built to last &amp; be audited</h3><p>Three interfaces (API, CLI, the MCP standard), a versioned wire/schema contract, lossless archive/restore, enforced engineering discipline. A 5-year foundation.</p></div>
+    </div>
+    <div class="sharp">
+      <div class="s"><div class="ic">🔏</div><h4>Prove it</h4><p>Cryptographic audit trail.</p></div>
+      <div class="s"><div class="ic">🛡️</div><h4>Govern it</h4><p>Fail-closed policy + attested identity.</p></div>
+      <div class="s"><div class="ic">🏛️</div><h4>Own it</h4><p>Your infra, no AI-vendor lock-in.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- THE WAZOO TIER -->
+<section>
+  <div class="container">
+    <div class="section-head">
+      <p class="eyebrow">The wazoo tier</p>
+      <h2>Self-improving, bias-resistant AI cognition.</h2>
+      <p class="lede">Most "AI memory" is a notepad. This is a self-improving cognitive substrate for non-human intelligence &mdash; it learns from its own learning, governs itself, proves what it knows, and actively fights the echo chamber.</p>
+    </div>
+    <div class="wazoo">
+
+      <div class="wband">
+        <h3>♻️ Recursive learning &amp; self-improvement</h3>
+        <ul>
+          <li><strong>Reflections are memories about memories</strong> &mdash; clusters observations into higher-level insights, and reflects on reflections: a tower of abstraction.</li>
+          <li><strong>Depth-capped by design</strong> &mdash; a governance-enforced recursion ceiling with a signed audit row per refusal. Smarter without runaway self-reference.</li>
+          <li><strong>Autonomous curator daemon</strong> &mdash; background reflect / consolidate near-duplicates / decay stale confidence / re-classify, all audited and operator-reversible. Improves while no human watches.</li>
+          <li><strong>Confidence calibration + decay</strong> &mdash; beliefs lose authority over time unless reinforced. Knowledge ages like a mind, not a static dump.</li>
+        </ul>
+      </div>
+
+      <div class="wband">
+        <h3>🧩 Memory skills &mdash; learning becomes capability</h3>
+        <ul>
+          <li>Register, retrieve, compose, and export reusable <strong>skills</strong> across the whole fleet.</li>
+          <li><strong>Promote-from-reflection</strong>: a hard-won insight becomes a callable, composable capability. Recursive self-improvement made concrete &mdash; learn → reflect → distill into a skill → reuse → learn faster.</li>
+        </ul>
+      </div>
+
+      <div class="wband">
+        <h3>🦇 Batman Mode &mdash; structured (typed) cognition</h3>
+        <ul>
+          <li>Every memory carries a <strong>cognitive type</strong> (Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision) plus a lifecycle state, enforced by a CI acceptance gate.</li>
+          <li>The system reasons differently about a raw observation vs. a derived reflection vs. an authoritative decision &mdash; and it's what makes the anti-bias machinery possible.</li>
+        </ul>
+      </div>
+
+      <div class="wband">
+        <h3>⚖️ Rules, standards, policy engine &amp; governance enforcement</h3>
+        <ul>
+          <li><strong>Signed substrate rules</strong> (L1&ndash;L6) requiring the operator's cryptographic key.</li>
+          <li><strong>Namespace standards</strong> &mdash; per-domain policy with a fail-closed default.</li>
+          <li><strong>Tri-state enforcement</strong> (off / advisory / enforce) with a mandatory-hook presence gate: under <code>enforce</code>, a write whose required governance hook is <em>missing</em> is denied. You can't accidentally run ungoverned.</li>
+        </ul>
+      </div>
+
+      <div class="wband">
+        <h3>🔐 Cryptographic attestation + encryption</h3>
+        <ul>
+          <li><strong>Ed25519 signing</strong> of memories, links, and every audit event; a tamper-evident hash chain across rows.</li>
+          <li><strong>Attestation levels</strong> &mdash; claimed vs. agent-attested vs. signed-by-peer; forged signatures rejected unconditionally.</li>
+          <li><strong>Identity chains</strong> &mdash; mTLS, cert-chain delegation with namespace confinement, replay-nonce protection.</li>
+          <li><strong>Encryption</strong> &mdash; at-rest (SQLCipher) + per-memory encrypted envelope (lossless archive/restore) + TLS in transit + TLS-framed syslog for off-host audit shipping.</li>
+        </ul>
+      </div>
+
+      <div class="wband crown">
+        <h3>🧬 Anti-bias &amp; anti-echo-chamber for recursive AI <span class="pill">the differentiator</span></h3>
+        <p><strong>The danger:</strong> if one LLM family does all the reflecting, its blind spots get laundered into "authoritative" knowledge and recursively reinforced &mdash; a monoculture echo chamber compounding bias into bedrock. (The DeepMind "From-AGI-to-ASI" audit's #1 structural risk.) The layered answer:</p>
+        <ul>
+          <li><strong>Decorrelation visibility</strong> &mdash; continuously measures producer dominance across the reflection corpus; raises an advisory when knowledge is dominated by one source, with an honest "claimed-not-attested" caveat so it never gives false confidence.</li>
+          <li><strong>Model-family attestation</strong> &mdash; bind a reflection to a <em>verifiable</em> model family, so "distinct" means provably-different-model, not a forgeable label.</li>
+          <li><strong>Heterogeneous evaluator panel</strong> &mdash; route judgments through genuinely different model families.</li>
+          <li><strong>N&ge;3 model-family-distinct quorum</strong> &mdash; a bias-displaced reflection is <em>refused</em> as authoritative unless &ge;3 attested, model-family-distinct reflectors agree. Knowledge becomes "true" by cross-model consensus, not one model's repetition.</li>
+          <li>Backed by <strong>contradiction detection</strong> and <strong>bitemporal validity</strong> (valid-from / valid-until) so the substrate holds disagreement and change over time instead of flattening to one voice.</li>
+        </ul>
+        <div class="flow">echo-chamber defense:&nbsp; <b>measure</b> dominance → <b>attest</b> model family → <b>panel</b> of distinct models → <b>quorum</b> refuses single-source "truth"</div>
+      </div>
+
+      <div class="wband">
+        <h3>✨ Other wazoo</h3>
+        <ul>
+          <li><strong>Federation + W-of-N quorum</strong> &mdash; knowledge replicates across machines/regions and becomes authoritative only by quorum.</li>
+          <li><strong>Native knowledge graph</strong> (Apache AGE) &mdash; typed relationships, multi-hop path-finding, timeline queries.</li>
+          <li><strong>Atomisation</strong> &mdash; shatters compound memories into atomic, individually-citable facts with provenance.</li>
+          <li><strong>Persona-as-artifact</strong> &mdash; generate a versioned, signed persona from an entity's memory cluster.</li>
+          <li><strong>Layered capture &amp; crash-recovery (L1&ndash;L4)</strong> &mdash; operator directives and conversation turns survive process kills via idempotent, deduplicated capture and transcript replay.</li>
+          <li><strong>Forensic bundle export/verify</strong> &mdash; package and cryptographically verify a slice of the audit trail for compliance and incident response.</li>
+        </ul>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- CLOSER -->
+<section style="border-bottom:none">
+  <div class="container-narrow" style="text-align:center">
+    <p class="eyebrow" style="justify-content:center">The NHI vision, in one line</p>
+    <h2 style="margin-bottom:1.25rem">A self-improving, self-governing AI mind that reflects on its own knowledge to get smarter &mdash; while cryptographically proving what it knows, enforcing policy it can't bypass, and actively refusing to become an echo chamber.</h2>
+    <p><a href="https://github.com/alphaonedev/ai-memory-mcp">Explore the substrate on GitHub →</a></p>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p>&copy; 2026 AlphaOne LLC &middot; ai-memory is Apache-2.0. &middot; Positioning narrative tracked in <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1769">issue #1769</a>. &middot; <a href="./index.html">Back to home</a></p>
+  </div>
+</footer>
+
+</body>
+</html>
