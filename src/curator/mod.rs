@@ -42,6 +42,12 @@ pub(crate) mod pipeline;
 // `run_reflection_pass`) consumed by the integration test crate plus
 // the CLI's `--reflect` mode. Items inside the module that should
 // stay crate-private use `pub(crate)` directly.
+/// #1764 (v0.8.0 slice) — reflection-corpus decorrelation VISIBILITY probe.
+/// The pure dominance analyzer (`compute_producer_dominance` /
+/// `evaluate_namespace`) is backend-agnostic; the `sal`-gated
+/// `run_decorrelation_probe` scans the Reflection corpus through the
+/// `MemoryStore` trait. Opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE`.
+pub mod decorrelation_probe;
 pub mod reflection_pass;
 /// #1393 sub-unit 2 — curator transcript-classify pass. Entirely
 /// `sal`-gated: it operates exclusively through the `MemoryStore` trait

@@ -613,7 +613,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `transcript_classify_enabled_resolver_1393` config-layer test + the
     // lockstep `transcript_classify_enabled: None` addition at the 7 in-file
     // CuratorSection test literals (actual 11_148).
-    ("src/config.rs", 11_250),
+    // 2026-06-22 (#1764 v0.8.0 slice) — bumped 11_250 → 11_300: the
+    // `ReflectDecorrelationMode` enum + 2 `ENV_REFLECT_DECORRELATION_*` consts +
+    // the `reflect_decorrelation_mode` / `reflect_decorrelation_dominance_threshold`
+    // env-only resolvers for the reflection-corpus decorrelation visibility probe
+    // (actual 11_252).
+    ("src/config.rs", 11_300),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
