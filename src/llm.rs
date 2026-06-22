@@ -445,6 +445,32 @@ async fn read_capped_text(resp: reqwest::Response) -> String {
     }
 }
 
+/// #1393 — system prompt for [`OllamaClient::classify_kind`]. Constrains the
+/// model to a single lowercase kind word drawn from the Form-6
+/// [`crate::models::MemoryKind`] vocabulary, defaulting to `observation` when
+/// unsure so the classifier never invents a kind.
+const CLASSIFY_KIND_SYSTEM: &str = "You classify a memory into exactly ONE kind. \
+Reply with ONLY the single lowercase kind word and nothing else. Valid kinds: \
+observation, decision, claim, event, concept, entity, relation, conversation. \
+Use 'decision' for a choice / plan / commitment the author made; 'claim' for a \
+factual assertion; 'event' for a time-bounded happening; 'observation' for a \
+neutral note or a question. When unsure, reply 'observation'.";
+
+/// Build the per-memory classification user prompt (#1393).
+fn classify_kind_prompt(title: &str, content: &str) -> String {
+    format!("Title: {title}\nContent: {content}\n\nKind:")
+}
+
+/// #1393 — parse a classifier completion into a [`crate::models::MemoryKind`].
+/// Scans alphabetic tokens and returns the first that names a valid kind, so a
+/// chatty reply ("This is a decision.") still resolves. Returns `None` when no
+/// token names a kind — the caller then ABSTAINS (keeps the existing kind).
+pub(crate) fn parse_classified_kind(text: &str) -> Option<crate::models::MemoryKind> {
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|t| !t.is_empty())
+        .find_map(|tok| crate::models::MemoryKind::from_str(&tok.to_ascii_lowercase()))
+}
+
 /// #1603 — parse a batched OpenAI-compatible `/embeddings` response
 /// (`{"data": [{"index": i, "embedding": [...]}, ...]}`) into one
 /// vector per input, in INPUT order. The spec allows providers to
@@ -1380,6 +1406,27 @@ impl OllamaClient {
     ///
     /// `num_predict` is hard-capped at 64 tokens regardless of model — defense
     /// in depth against unbounded chain-of-thought emissions on any model.
+    /// #1393 — classify a recovered transcript turn into a refined
+    /// [`crate::models::MemoryKind`] (the "decision-detector"). Returns `None`
+    /// to ABSTAIN — an unparseable / unrecognized completion leaves the
+    /// caller's existing kind untouched. Uses the generic [`Self::generate`]
+    /// completion with a constrained single-word classification prompt.
+    ///
+    /// # Errors
+    /// Propagates the underlying [`Self::generate`] error (circuit-breaker
+    /// open, governance refusal, transport / non-2xx / malformed response).
+    pub fn classify_kind(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        let out = self.generate(
+            &classify_kind_prompt(title, content),
+            Some(CLASSIFY_KIND_SYSTEM),
+        )?;
+        Ok(parse_classified_kind(&out))
+    }
+
     pub fn auto_tag(
         &self,
         title: &str,
@@ -5361,5 +5408,49 @@ mod perf9_async_tests {
             .join()
             .unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod classify_kind_parse_tests {
+    use super::parse_classified_kind;
+    use crate::models::MemoryKind;
+
+    #[test]
+    fn bare_kind_word_parses() {
+        assert_eq!(
+            parse_classified_kind("decision"),
+            Some(MemoryKind::Decision)
+        );
+        assert_eq!(
+            parse_classified_kind("observation"),
+            Some(MemoryKind::Observation)
+        );
+        assert_eq!(parse_classified_kind("claim"), Some(MemoryKind::Claim));
+        assert_eq!(parse_classified_kind("event"), Some(MemoryKind::Event));
+    }
+
+    #[test]
+    fn case_and_punctuation_tolerant() {
+        assert_eq!(
+            parse_classified_kind("Decision."),
+            Some(MemoryKind::Decision)
+        );
+        assert_eq!(parse_classified_kind("  CLAIM\n"), Some(MemoryKind::Claim));
+    }
+
+    #[test]
+    fn chatty_reply_resolves_first_kind_token() {
+        assert_eq!(
+            parse_classified_kind("This is a decision the author made."),
+            Some(MemoryKind::Decision)
+        );
+    }
+
+    #[test]
+    fn unrecognized_output_abstains() {
+        assert_eq!(parse_classified_kind("dunno"), None);
+        assert_eq!(parse_classified_kind(""), None);
+        assert_eq!(parse_classified_kind("42!!"), None);
     }
 }

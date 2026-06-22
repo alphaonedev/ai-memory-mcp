@@ -775,7 +775,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // vLLM first-class backend alias added the `BACKEND_VLLM` const +
     // its doc block, the `default_base_url_for_alias` / `alias_api_key_env_vars`
     // arms, and 2 pinning-test rows (file grew to 5_352); 5_400 = 48 headroom.
-    ("src/llm.rs", 5_400),
+    // 2026-06-22 (v0.8.0 #1393) — bumped 5_400 → 5_500: the decision-detector
+    // `OllamaClient::classify_kind` + `CLASSIFY_KIND_SYSTEM` prompt +
+    // `classify_kind_prompt` / `parse_classified_kind` helpers + 4 parser-pin
+    // tests (file grew to 5_456); 5_500 = 44 headroom.
+    ("src/llm.rs", 5_500),
 ];
 
 #[test]
