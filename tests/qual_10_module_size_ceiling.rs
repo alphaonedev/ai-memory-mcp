@@ -510,7 +510,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // PostgresStore `recover_turn_idempotent` (dual-dedup probe + atomic
     // memory+dedup tx, no signed_events) + `agent_max_created_at` watermark
     // (actual 20_958).
-    ("src/store/postgres.rs", 21_000),
+    // 2026-06-21 (#1718 Commit A-core) — bumped 21_000 → 21_100: the
+    // PostgresStore `action_transition_cas` (atomic federation receive-path
+    // compare-and-swap — `SELECT ... FOR UPDATE` + `state == from` guard
+    // inside the tx) added ~49 LOC (actual 21_049). Per-domain split of this
+    // module is tracked under #650.
+    ("src/store/postgres.rs", 21_100),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
