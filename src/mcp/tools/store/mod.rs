@@ -23,7 +23,7 @@
 mod embed;
 mod legacy_classifier;
 mod synthesis;
-mod transport;
+pub(crate) mod transport;
 mod validation;
 
 use crate::db;
