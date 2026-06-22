@@ -164,6 +164,8 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // the SAL trait on postgres (`action_get` + `action_transition_cas`),
         // so the gate permits it to reach the handler's postgres path.
         ("POST", p) if actions_transition_path(p) => true,
+        // #1718 — signal send write surface (SAL `signal_send` on postgres).
+        ("POST", super::routes::SIGNALS) => true,
         // Wave-3 Continuation 2 — governance write paths (Phase 11).
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,

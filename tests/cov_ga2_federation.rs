@@ -515,6 +515,47 @@ async fn http_action_transition_single_node() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "invalid state is 400");
 }
 
+/// #1718 Commit C2 — the signal HTTP write surface (POST /api/v1/signals) on
+/// the single-node fast path: builds + persists the signal stamped with the
+/// authenticated caller as from_agent, returns its id.
+#[tokio::test]
+async fn http_send_signal_single_node() {
+    let (r, t) = sqlite_router(); // federation: None, active_keypair: None
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/signals")
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ai:cov-sig")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "namespace": "covga2sig",
+                "subject": "hi",
+                "body": {"k": "v"},
+                "signal_type": "notify",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, b) = decode(&r, req).await;
+    assert!(
+        status.is_success(),
+        "signal POST acks; status={status} body={b}"
+    );
+    let id = b["id"].as_str().expect("signal id in response").to_string();
+    assert_eq!(
+        b["from_agent"], "ai:cov-sig",
+        "from_agent is the authenticated caller, not body-supplied; body={b}"
+    );
+    // Persisted + retrievable.
+    let conn = ai_memory::db::open(t.path()).expect("verify conn");
+    let got = ai_memory::signals::get(&conn, &id)
+        .expect("get")
+        .expect("signal present");
+    assert_eq!(got.namespace, "covga2sig");
+    assert_eq!(got.from_agent, "ai:cov-sig");
+    assert_eq!(got.signal_type, ai_memory::models::SignalType::Notify);
+}
+
 #[tokio::test]
 async fn sync_push_sender_mismatch_is_attestation_refusal_403() {
     let _g = FED_ENV_LOCK.lock().await;

@@ -307,10 +307,12 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // contributes regardless of which test module declares it.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 90;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 91;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
+// 2026-06-22 (#1718 Commit C2) — bumped 90 → 91: the signal send write surface
+// `POST /api/v1/signals` (`handlers::send_signal`) — local write + W-of-N fanout.
 // 2026-06-18 (#1733 Pillar-4 4.A) — bumped 1 → 3: the
 // `admission_control_1733_tests` helper router adds a `/slow` (blocking
 // handler for the concurrency test) + a `/health` (exemption assertion)
@@ -327,7 +329,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 /// was cited in 30+ doc sites with no const.
 // 2026-06-22 (#1718 Commit C) — bumped 75 → 76: the new unique path
 // `/api/v1/actions/{id}/transition` (coordination action-transition write).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 76;
+// 2026-06-22 (#1718 Commit C2) — bumped 76 → 77: the new unique path
+// `/api/v1/signals` (signal send write surface).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -838,6 +842,9 @@ pub fn build_router_with_timeout(
             handlers::routes::ACTIONS_ID_TRANSITION,
             post(handlers::transition_action),
         )
+        // #1718 v0.8.0 Pillar-1 — signal send write surface (local write +
+        // W-of-N federation fanout).
+        .route(handlers::routes::SIGNALS, post(handlers::send_signal))
         .route(handlers::routes::MEMORIES_BULK, post(handlers::bulk_create))
         .route(handlers::routes::MEMORIES_ID, get(handlers::get_memory))
         .route(handlers::routes::MEMORIES_ID, put(handlers::update_memory))
