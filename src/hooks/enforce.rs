@@ -83,6 +83,12 @@ pub const ELIGIBLE_REQUIRED_EVENTS: &[HookEvent] = &[
     HookEvent::PreConsolidate,
     HookEvent::PreGovernanceDecision,
     HookEvent::PreReflect,
+    // #1752 — PreSignalSend is a deny-capable pre-event now enforced
+    // synchronously on the MCP `memory_signal_send` path, so it is eligible to
+    // be a required event (required-presence → deny when absent; the configured
+    // hook runs FailMode::Closed so a hook error/timeout → Deny rather than a
+    // silently-allowed send).
+    HookEvent::PreSignalSend,
 ];
 
 /// `true` when `event` may legally be declared a required event.

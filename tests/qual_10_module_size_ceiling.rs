@@ -263,7 +263,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // set_post_signal_ack_sink + build_mcp_signal_hooks + the inert-by-default
     // run_mcp_server serve-init wiring + two build_mcp_signal_hooks unit
     // tests) landed the file at 15_011.
-    ("src/mcp/mod.rs", 15_050),
+    // 2026-06-22 (#1752) — bumped 15_050 → 15_300: the MCP PreSignalSend
+    // ENFORCEMENT gate (PreSignalSendGate struct + PRE_SIGNAL_SEND_GATE global +
+    // set_pre_signal_send_gate + map_chain_result_to_signal_decision +
+    // pre_signal_send_decision block_on_local bridge + dispatch_memory_signal_send
+    // gate wiring + run_mcp_server inert-by-default install + the
+    // map_chain_result_to_signal_decision_1752 unit test) landed the file at 15_213.
+    ("src/mcp/mod.rs", 15_300),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
