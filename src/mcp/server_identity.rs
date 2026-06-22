@@ -628,17 +628,45 @@ mod tests {
     // --- performance smoke test ----------------------------------------------
 
     #[test]
-    fn build_signed_identity_completes_under_10ms_one_iteration() {
+    fn build_signed_identity_sign_is_sub_10ms_median() {
+        // #1766 — a single-sample wall-clock assertion is flaky on
+        // contended / throttled shared CI runners (the windows `Check`
+        // job intermittently saw one sign exceed 10ms, then passed on
+        // rerun). Smoke-check the ORDER OF MAGNITUDE robustly instead:
+        // warm up once, then assert the MEDIAN over N iterations — a
+        // single jittery sample is discarded by the median, so the test
+        // measures steady-state cost, not scheduler noise. The budget
+        // honors `AI_MEMORY_TEST_TIMING_BUDGET_MULT` (env #68) so a slow
+        // host can widen it without editing the test.
         let kp = make_test_keypair("ai:nhi@host");
-        let start = std::time::Instant::now();
+        // Warm up — the first call pays cold-cache / allocator costs.
         let _ = build_signed_identity(Some(&kp), fixed_timestamp()).unwrap();
-        let elapsed = start.elapsed();
-        // Ed25519 sign over ~150 bytes is ~10-50µs on modern hardware;
-        // 10ms is a 200-1000x margin to absorb CI noise. The test
-        // smoke-checks the order of magnitude is correct.
+
+        const ITERS: usize = 32;
+        let mut samples_us: Vec<u128> = Vec::with_capacity(ITERS);
+        for _ in 0..ITERS {
+            let start = std::time::Instant::now();
+            let _ = build_signed_identity(Some(&kp), fixed_timestamp()).unwrap();
+            samples_us.push(start.elapsed().as_micros());
+        }
+        samples_us.sort_unstable();
+        let median_us = samples_us[ITERS / 2];
+
+        // Ed25519 sign over ~150 bytes is ~10-50µs on modern hardware; the
+        // 10ms ceiling is a 200-1000x margin. The median absorbs the
+        // per-sample jitter a single reading cannot.
+        let mult = std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| (1..=100).contains(&n))
+            .unwrap_or(1);
+        let budget_us = 10_000u128 * u128::from(mult);
         assert!(
-            elapsed.as_millis() < 10,
-            "single sign must be sub-10ms (was {elapsed:?})"
+            median_us < budget_us,
+            "median sign over {ITERS} iters must be sub-{}ms \
+             (median was {median_us}µs; slowest sample {}µs)",
+            budget_us / 1000,
+            samples_us[ITERS - 1],
         );
     }
 }
