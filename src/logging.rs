@@ -111,8 +111,16 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
             target: "logging",
             value = %bad,
             "unrecognized log sink (AI_MEMORY_LOG_SINK / [logging].sink); \
-             falling back to the file sink. Valid: file | stdout"
+             falling back to the file sink. Valid: file | stdout | syslog"
         );
+    }
+    // #1765 Tier 2 — the remote syslog sink uses a level-aware `MakeWriter`
+    // (so each record's RFC-5424 PRI severity reflects the event's tracing
+    // Level) rather than the File/Stdout `NonBlocking` writer, so it installs
+    // its own subscriber and returns early. It fail-CLOSES when the crate was
+    // built WITHOUT `--features syslog` (see `init_syslog_logging`).
+    if crate::config::resolve_log_sink(cfg) == crate::config::LogSink::Syslog {
+        return init_syslog_logging(cfg);
     }
     let (writer, guard) = match crate::config::resolve_log_sink(cfg) {
         // Structured/plain stdout for OS-tier capture (systemd-journald /
@@ -131,6 +139,10 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
             //           macOS because the appender accepts non-dir paths lazily.
             let appender = build_appender(&dir, cfg)?;
             tracing_appender::non_blocking(appender)
+        }
+        // Dispatched to `init_syslog_logging` by the early-return above.
+        crate::config::LogSink::Syslog => {
+            unreachable!("LogSink::Syslog is handled before this match")
         }
     };
     // Capture the writer in the static slot so the daemon's tracing
@@ -160,6 +172,627 @@ pub fn init_file_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
         tracing::debug!("file logging subscriber already initialised: {e}");
     }
     Ok(Some(guard))
+}
+
+/// #1765 Tier 2 — install the OS-agnostic remote-syslog tracing subscriber.
+/// Split out of [`init_file_logging`] because the syslog sink uses a
+/// level-aware `MakeWriter` (so each record's RFC-5424 PRI severity reflects
+/// the event's tracing `Level`) instead of the File/Stdout `NonBlocking`
+/// writer. The actual framing + socket writer live in the `syslog` submodule,
+/// compiled only under `--features syslog`.
+#[cfg(feature = "syslog")]
+fn init_syslog_logging(cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
+    let (make_writer, guard) = syslog::build_syslog_make_writer(cfg)?;
+    let level = cfg.level.as_deref().unwrap_or("info");
+    let filter = level_filter_or_info_fallback(level);
+    let structured = cfg.structured.unwrap_or(false);
+    let res = if structured {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(make_writer)
+            .json()
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(make_writer)
+            .try_init()
+    };
+    if let Err(e) = res {
+        tracing::debug!("syslog logging subscriber already initialised: {e}");
+    }
+    Ok(Some(guard))
+}
+
+/// #1765 Tier 2 — fail-CLOSED stub when the crate was built WITHOUT
+/// `--features syslog`. The operator explicitly selected the off-host syslog
+/// sink (`AI_MEMORY_LOG_SINK=syslog` / `[logging].sink = "syslog"`); silently
+/// falling back to a LOCAL file would be a confidentiality surprise (they
+/// believe logs are shipped to a hardened collector), so we error at boot
+/// instead — unlike Tier-1's warn-and-fallback for an *unrecognized* value.
+#[cfg(not(feature = "syslog"))]
+fn init_syslog_logging(_cfg: &LoggingConfig) -> Result<Option<WorkerGuard>> {
+    anyhow::bail!(
+        "log sink 'syslog' (AI_MEMORY_LOG_SINK / [logging].sink) requires a build with \
+         `--features syslog`; this binary was compiled without it. Rebuild with the \
+         feature enabled, or select the `file` / `stdout` sink."
+    )
+}
+
+/// #1765 Tier 2 — OS-agnostic remote syslog sink: RFC 5424 records over TCP
+/// (with optional rustls TLS, RFC 5425) to a collector/SIEM. Entirely
+/// `#[cfg(feature = "syslog")]`-gated so default / mobile / sal builds are
+/// byte-identical to today (the zero-cost-when-off guarantee). Dep-free: reuses
+/// the existing rustls 0.23 (sync `StreamOwned`), chrono (RFC 3339 timestamps),
+/// and gethostname deps — no `tracing-journald` / syslog crate.
+#[cfg(feature = "syslog")]
+mod syslog {
+    use super::{LoggingConfig, WorkerGuard};
+    use anyhow::{Context, Result, bail};
+    use std::io::{self, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tracing::Metadata;
+    use tracing_appender::non_blocking::NonBlocking;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use crate::config::{
+        ENV_LOG_SYSLOG_ADDRESS, ENV_LOG_SYSLOG_TLS_CA_FILE, ENV_LOG_SYSLOG_TRANSPORT,
+    };
+
+    /// RFC 5424 facility `local0` (16); `PRI = facility*8 + severity`.
+    const SYSLOG_FACILITY_LOCAL0: u8 = 16;
+    /// Bounded connect timeout so a dead / blackholed collector can never stall
+    /// the appender worker thread indefinitely (it is lossy, never blocking).
+    const SYSLOG_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Default RFC 5424 `APP-NAME` when the operator sets none.
+    const DEFAULT_APP_NAME: &str = "ai-memory";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Transport {
+        Tcp,
+        Tls,
+    }
+
+    impl Transport {
+        fn from_str_opt(s: &str) -> Option<Self> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "tcp" => Some(Self::Tcp),
+                "tls" => Some(Self::Tls),
+                _ => None,
+            }
+        }
+    }
+
+    /// Resolved syslog target (env > `[logging]` section > default).
+    #[derive(Debug)]
+    struct SyslogSinkConfig {
+        address: String,
+        transport: Transport,
+        tls_ca_file: Option<PathBuf>,
+        app_name: String,
+    }
+
+    fn env_nonempty(key: &str) -> Option<String> {
+        std::env::var(key)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn section_nonempty(field: Option<&String>) -> Option<String> {
+        field
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Resolve the syslog target. TLS is the default transport (RFC 5425, the
+    /// norm for any routable collector) and REQUIRES a CA PEM — plaintext `tcp`
+    /// is only for a loopback / sidecar forwarder. Errors propagate to the
+    /// boot path so a misconfigured syslog sink fails loudly, not silently.
+    fn resolve_syslog_config(cfg: &LoggingConfig) -> Result<SyslogSinkConfig> {
+        let address = env_nonempty(ENV_LOG_SYSLOG_ADDRESS)
+            .or_else(|| section_nonempty(cfg.syslog_address.as_ref()))
+            .context(
+                "log sink 'syslog' requires a collector address \
+                 (AI_MEMORY_LOG_SYSLOG_ADDRESS or [logging].syslog_address), \
+                 e.g. logs.example.com:6514",
+            )?;
+        let transport_raw = env_nonempty(ENV_LOG_SYSLOG_TRANSPORT)
+            .or_else(|| section_nonempty(cfg.syslog_transport.as_ref()));
+        let transport = match transport_raw.as_deref() {
+            Some(s) => Transport::from_str_opt(s).with_context(|| {
+                format!("invalid syslog transport {s:?}; expected `tls` or `tcp`")
+            })?,
+            None => Transport::Tls,
+        };
+        let tls_ca_file = env_nonempty(ENV_LOG_SYSLOG_TLS_CA_FILE)
+            .or_else(|| section_nonempty(cfg.syslog_tls_ca_file.as_ref()))
+            .map(PathBuf::from);
+        if transport == Transport::Tls && tls_ca_file.is_none() {
+            bail!(
+                "syslog transport `tls` requires the collector CA PEM \
+                 (AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE or [logging].syslog_tls_ca_file). \
+                 Use transport `tcp` only for a trusted loopback / sidecar forwarder."
+            );
+        }
+        let app_name = section_nonempty(cfg.syslog_app_name.as_ref())
+            .unwrap_or_else(|| DEFAULT_APP_NAME.to_string());
+        Ok(SyslogSinkConfig {
+            address,
+            transport,
+            tls_ca_file,
+            app_name,
+        })
+    }
+
+    /// RFC 5424 §6.2.1 severity for a tracing `Level` (facility fixed at
+    /// `local0`): ERROR→3 WARN→4 INFO→6 DEBUG/TRACE→7.
+    fn severity_for(level: tracing::Level) -> u8 {
+        match level {
+            tracing::Level::ERROR => 3,
+            tracing::Level::WARN => 4,
+            tracing::Level::INFO => 6,
+            tracing::Level::DEBUG | tracing::Level::TRACE => 7,
+        }
+    }
+
+    fn pri(severity: u8) -> u16 {
+        u16::from(SYSLOG_FACILITY_LOCAL0) * 8 + u16::from(severity)
+    }
+
+    /// Build one RFC 5424 record:
+    /// `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID - - <BOM>MSG`
+    /// (MSGID + STRUCTURED-DATA are NILVALUE `-`; MSG carries a UTF-8 BOM per
+    /// §6.4 to signal a UTF-8 body). PURE — no I/O — so it is unit-testable
+    /// against a verbatim spec example. A single trailing `\n` the fmt layer
+    /// appends is trimmed so the framed MSG is one clean line.
+    fn format_rfc5424(
+        severity: u8,
+        ts: &str,
+        host: &str,
+        app: &str,
+        procid: &str,
+        msg: &[u8],
+    ) -> Vec<u8> {
+        let header = format!(
+            "<{}>1 {ts} {host} {app} {procid} - - \u{feff}",
+            pri(severity)
+        );
+        let msg = msg.strip_suffix(b"\n").unwrap_or(msg);
+        let mut out = Vec::with_capacity(header.len() + msg.len());
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(msg);
+        out
+    }
+
+    /// RFC 6587 octet-counting TCP frame: `MSG-LEN SP RFC5424-RECORD`. Robust
+    /// vs LF-delimited framing because a 5424 MSG can legally contain LF / BOM.
+    fn octet_count(record: &[u8]) -> Vec<u8> {
+        let prefix = format!("{} ", record.len());
+        let mut out = Vec::with_capacity(prefix.len() + record.len());
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(record);
+        out
+    }
+
+    /// Best-effort RFC 5424 NAME token: printable ASCII, no spaces; an empty /
+    /// unusable value collapses to NILVALUE `-`.
+    fn nilvalue_token(s: &str) -> String {
+        let t: String = s.chars().filter(|c| ('!'..='~').contains(c)).collect();
+        if t.is_empty() { "-".to_string() } else { t }
+    }
+
+    /// Strip the `:port` from a `host:port` (handles the IPv6 bracket form) so
+    /// the bare host can seed the TLS `ServerName`.
+    fn host_from_address(address: &str) -> String {
+        match address.rsplit_once(':') {
+            Some((host, _port)) => host.trim_matches(['[', ']']).to_string(),
+            None => address.to_string(),
+        }
+    }
+
+    /// Build a dep-free server-verifying rustls `ClientConfig` for the syslog
+    /// TLS path: the operator's CA / self-signed PEM is the trust anchor (no
+    /// public-roots dependency), parsed via the existing
+    /// [`crate::tls::rustls_pki_pem_iter_certs`] helper. No client-auth, and —
+    /// critically — NO cert-verification-skip escape hatch.
+    fn build_tls_client_config(ca_file: &Path) -> Result<rustls::ClientConfig> {
+        // rustls 0.23 needs an explicit CryptoProvider; install ring (idempotent —
+        // mirrors src/tls.rs + daemon_runtime.rs).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca_pem = std::fs::read(ca_file)
+            .with_context(|| format!("reading syslog TLS CA file {}", ca_file.display()))?;
+        let cert_ders = crate::tls::rustls_pki_pem_iter_certs(&ca_pem)?;
+        if cert_ders.is_empty() {
+            bail!(
+                "syslog TLS CA file {} contained no PEM certificates",
+                ca_file.display()
+            );
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for der in cert_ders {
+            roots
+                .add(der)
+                .context("adding syslog TLS CA cert to the root store")?;
+        }
+        Ok(rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth())
+    }
+
+    /// A live collector connection owned by the appender worker thread.
+    enum Conn {
+        Plain(TcpStream),
+        Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    }
+
+    /// `io::Write` that ships already-framed RFC-5424 records to the collector
+    /// over TCP/TLS. Lives behind `tracing_appender::non_blocking`, so every
+    /// `write` here runs on the dedicated appender worker thread — NEVER on a
+    /// store/recall call site. LOSSY: a connect/send failure drops the record
+    /// (bumping `dropped`) and clears the connection for a fresh attempt next
+    /// time; it never blocks the daemon and never errors upward (which would
+    /// crash the worker). Blocking on an attacker-reachable/dead collector
+    /// would be self-DoS, so lossy is the secure posture.
+    struct SyslogSocketWriter {
+        address: String,
+        transport: Transport,
+        tls: Option<(
+            Arc<rustls::ClientConfig>,
+            rustls::pki_types::ServerName<'static>,
+        )>,
+        conn: Option<Conn>,
+        dropped: u64,
+    }
+
+    impl SyslogSocketWriter {
+        fn connect(&self) -> io::Result<Conn> {
+            let addr = self
+                .address
+                .to_socket_addrs()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                .next()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "syslog address {:?} resolved to no socket addr",
+                            self.address
+                        ),
+                    )
+                })?;
+            let tcp = TcpStream::connect_timeout(&addr, SYSLOG_CONNECT_TIMEOUT)?;
+            match (self.transport, &self.tls) {
+                (Transport::Tls, Some((config, server_name))) => {
+                    let client = rustls::ClientConnection::new(config.clone(), server_name.clone())
+                        .map_err(io::Error::other)?;
+                    Ok(Conn::Tls(Box::new(rustls::StreamOwned::new(client, tcp))))
+                }
+                _ => Ok(Conn::Plain(tcp)),
+            }
+        }
+
+        fn send(&mut self, framed: &[u8]) -> io::Result<()> {
+            if self.conn.is_none() {
+                self.conn = Some(self.connect()?);
+            }
+            let res = match self.conn.as_mut().expect("conn set above") {
+                Conn::Plain(s) => s.write_all(framed).and_then(|()| s.flush()),
+                Conn::Tls(s) => s.write_all(framed).and_then(|()| s.flush()),
+            };
+            if res.is_err() {
+                self.conn = None;
+            }
+            res
+        }
+    }
+
+    impl io::Write for SyslogSocketWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            // `buf` is exactly one octet-counted frame (the frame writer enqueues
+            // each record with a single write; `NonBlocking` forwards it whole).
+            if self.send(buf).is_err() {
+                self.dropped = self.dropped.saturating_add(1);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Level-aware `MakeWriter`: `make_writer_for(meta)` captures the event's
+    /// tracing `Level` so each record's RFC-5424 PRI severity is correct (the
+    /// fmt layer renders the level into bytes BEFORE a plain writer would see
+    /// them, so a non-level-aware shim could only emit a flat severity). Holds
+    /// a clone of the `NonBlocking` handle whose worker owns the socket.
+    #[derive(Clone)]
+    pub(super) struct SyslogMakeWriter {
+        nb: NonBlocking,
+        host: Arc<str>,
+        app: Arc<str>,
+        procid: Arc<str>,
+    }
+
+    impl SyslogMakeWriter {
+        fn frame_writer(&self, severity: u8) -> SyslogFrameWriter {
+            SyslogFrameWriter {
+                nb: self.nb.clone(),
+                severity,
+                host: self.host.clone(),
+                app: self.app.clone(),
+                procid: self.procid.clone(),
+                buf: Vec::new(),
+            }
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SyslogMakeWriter {
+        type Writer = SyslogFrameWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            // No event metadata available — default to INFO severity.
+            self.frame_writer(6)
+        }
+        fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+            self.frame_writer(severity_for(*meta.level()))
+        }
+    }
+
+    /// Per-event writer handed to the fmt layer: buffers the rendered line, then
+    /// on Drop builds ONE RFC-5424 record (captured severity + a fresh RFC 3339
+    /// timestamp), octet-counts it, and enqueues it to the `NonBlocking` worker.
+    /// Buffer-then-frame-on-drop guarantees exactly one frame per event no
+    /// matter how many `write` calls the fmt layer makes.
+    pub(super) struct SyslogFrameWriter {
+        nb: NonBlocking,
+        severity: u8,
+        host: Arc<str>,
+        app: Arc<str>,
+        procid: Arc<str>,
+        buf: Vec<u8>,
+    }
+
+    impl io::Write for SyslogFrameWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for SyslogFrameWriter {
+        fn drop(&mut self) {
+            if self.buf.is_empty() {
+                return;
+            }
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            let record = format_rfc5424(
+                self.severity,
+                &ts,
+                &self.host,
+                &self.app,
+                &self.procid,
+                &self.buf,
+            );
+            let framed = octet_count(&record);
+            // `NonBlocking::write` enqueues to the worker; lossy if the bounded
+            // channel is full (back-pressure drop, never a block).
+            let _ = self.nb.write(&framed);
+        }
+    }
+
+    /// Build the level-aware syslog `MakeWriter` + its `WorkerGuard`. The
+    /// `SyslogSocketWriter` (TCP/TLS) is wrapped in `tracing_appender::non_blocking`
+    /// so all socket I/O runs on the worker thread, off every call site.
+    pub(super) fn build_syslog_make_writer(
+        cfg: &LoggingConfig,
+    ) -> Result<(SyslogMakeWriter, WorkerGuard)> {
+        let sc = resolve_syslog_config(cfg)?;
+        let tls = match sc.transport {
+            Transport::Tls => {
+                let ca = sc
+                    .tls_ca_file
+                    .as_ref()
+                    .expect("resolve_syslog_config guarantees a CA for tls");
+                let config = build_tls_client_config(ca)?;
+                let host = host_from_address(&sc.address);
+                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|e| anyhow::anyhow!("invalid TLS server name {host:?}: {e}"))?;
+                Some((Arc::new(config), server_name))
+            }
+            Transport::Tcp => None,
+        };
+        let socket = SyslogSocketWriter {
+            address: sc.address.clone(),
+            transport: sc.transport,
+            tls,
+            conn: None,
+            dropped: 0,
+        };
+        let (nb, guard) = tracing_appender::non_blocking(socket);
+        let host = nilvalue_token(&gethostname::gethostname().to_string_lossy());
+        let make = SyslogMakeWriter {
+            nb,
+            host: Arc::from(host.as_str()),
+            app: Arc::from(nilvalue_token(&sc.app_name).as_str()),
+            procid: Arc::from(std::process::id().to_string().as_str()),
+        };
+        Ok((make, guard))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::config::LoggingConfig;
+
+        // ── RFC 5424 framing (pure, no I/O) ─────────────────────────────────
+
+        #[test]
+        fn pri_is_facility_times_8_plus_severity() {
+            // local0 (16) * 8 = 128; +severity. RFC 5424 §6.2.1.
+            assert_eq!(pri(3), 131); // local0.error
+            assert_eq!(pri(6), 134); // local0.info
+            assert_eq!(pri(7), 135); // local0.debug
+        }
+
+        #[test]
+        fn severity_maps_tracing_levels_per_rfc5424() {
+            assert_eq!(severity_for(tracing::Level::ERROR), 3);
+            assert_eq!(severity_for(tracing::Level::WARN), 4);
+            assert_eq!(severity_for(tracing::Level::INFO), 6);
+            assert_eq!(severity_for(tracing::Level::DEBUG), 7);
+            assert_eq!(severity_for(tracing::Level::TRACE), 7);
+        }
+
+        #[test]
+        fn format_rfc5424_matches_spec_shape() {
+            // Shape pinned against RFC 5424 §6.5 Example 1's header layout:
+            //   <34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ...
+            // We assert OUR fields land in the exact §6 column order, MSGID +
+            // STRUCTURED-DATA are NILVALUE "-", and the MSG carries the UTF-8 BOM.
+            let frame = format_rfc5424(
+                3,
+                "2003-10-11T22:14:15.003Z",
+                "mymachine.example.com",
+                "ai-memory",
+                "1234",
+                b"a syslog message\n", // trailing newline must be trimmed
+            );
+            let s = String::from_utf8(frame).unwrap();
+            assert_eq!(
+                s,
+                "<131>1 2003-10-11T22:14:15.003Z mymachine.example.com ai-memory 1234 - - \u{feff}a syslog message",
+            );
+            // No trailing newline survived into the framed MSG.
+            assert!(!s.ends_with('\n'));
+        }
+
+        #[test]
+        fn octet_count_prefixes_byte_length_and_space() {
+            // RFC 6587 octet-counting: "<len> <record>".
+            let framed = octet_count(b"hello");
+            assert_eq!(framed, b"5 hello");
+            // Length is the BYTE count (multibyte aware).
+            let framed = octet_count("héllo".as_bytes()); // 6 bytes
+            assert_eq!(&framed[..2], b"6 ");
+        }
+
+        #[test]
+        fn nilvalue_token_collapses_empty_and_strips_spaces() {
+            assert_eq!(nilvalue_token(""), "-");
+            assert_eq!(nilvalue_token("   "), "-");
+            assert_eq!(nilvalue_token("host name"), "hostname");
+            assert_eq!(nilvalue_token("ok-host"), "ok-host");
+        }
+
+        #[test]
+        fn host_from_address_strips_port_and_brackets() {
+            assert_eq!(
+                host_from_address("logs.example.com:6514"),
+                "logs.example.com"
+            );
+            assert_eq!(host_from_address("[::1]:6514"), "::1");
+            assert_eq!(host_from_address("bare-host"), "bare-host");
+        }
+
+        // ── config resolution ───────────────────────────────────────────────
+
+        #[test]
+        fn resolve_requires_address() {
+            let cfg = LoggingConfig::default();
+            let err = resolve_syslog_config(&cfg).unwrap_err().to_string();
+            assert!(err.contains("requires a collector address"), "got: {err}");
+        }
+
+        #[test]
+        fn resolve_tls_requires_ca() {
+            let cfg = LoggingConfig {
+                syslog_address: Some("logs.example.com:6514".into()),
+                syslog_transport: Some("tls".into()),
+                ..LoggingConfig::default()
+            };
+            let err = resolve_syslog_config(&cfg).unwrap_err().to_string();
+            assert!(err.contains("requires the collector CA PEM"), "got: {err}");
+        }
+
+        #[test]
+        fn resolve_tcp_loopback_needs_no_ca() {
+            let cfg = LoggingConfig {
+                syslog_address: Some("127.0.0.1:5514".into()),
+                syslog_transport: Some("tcp".into()),
+                ..LoggingConfig::default()
+            };
+            let sc = resolve_syslog_config(&cfg).expect("plaintext tcp needs no CA");
+            assert_eq!(sc.transport, Transport::Tcp);
+            assert_eq!(sc.address, "127.0.0.1:5514");
+            assert_eq!(sc.app_name, DEFAULT_APP_NAME);
+        }
+
+        #[test]
+        fn resolve_default_transport_is_tls() {
+            // No transport set + a CA present → defaults to TLS (the routable norm).
+            let cfg = LoggingConfig {
+                syslog_address: Some("logs.example.com:6514".into()),
+                syslog_tls_ca_file: Some("/nonexistent/ca.pem".into()),
+                ..LoggingConfig::default()
+            };
+            let sc = resolve_syslog_config(&cfg).expect("tls default with ca present");
+            assert_eq!(sc.transport, Transport::Tls);
+        }
+
+        #[test]
+        fn resolve_rejects_bad_transport() {
+            let cfg = LoggingConfig {
+                syslog_address: Some("h:1".into()),
+                syslog_transport: Some("udp".into()),
+                ..LoggingConfig::default()
+            };
+            let err = resolve_syslog_config(&cfg).unwrap_err().to_string();
+            assert!(err.contains("invalid syslog transport"), "got: {err}");
+        }
+
+        // ── socket writer: lossy on a dead collector (dead-port precedent) ──
+
+        #[test]
+        fn socket_writer_is_lossy_on_connect_refused() {
+            // Port 1 on loopback: nothing binds → connect refused → the write
+            // must DROP (bump the counter) and return Ok, never panic / block /
+            // error upward (which would crash the appender worker).
+            let mut w = SyslogSocketWriter {
+                address: "127.0.0.1:1".to_string(),
+                transport: Transport::Tcp,
+                tls: None,
+                conn: None,
+                dropped: 0,
+            };
+            let framed = octet_count(&format_rfc5424(6, "t", "h", "a", "1", b"hi"));
+            let n = w.write(&framed).expect("lossy write returns Ok");
+            assert_eq!(n, framed.len());
+            assert_eq!(
+                w.dropped, 1,
+                "the refused send must increment the drop counter"
+            );
+            assert!(
+                w.conn.is_none(),
+                "a failed send clears the connection for retry"
+            );
+        }
+
+        #[test]
+        fn build_tls_client_config_errors_on_missing_ca() {
+            // An obviously-missing CA path errors cleanly (no panic).
+            let err = build_tls_client_config(Path::new("/nonexistent/ai-memory-syslog-ca.pem"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("reading syslog TLS CA file"), "got: {err}");
+        }
+    }
 }
 
 /// Resolve the configured log directory honouring the user-mandated
@@ -373,6 +1006,40 @@ mod tests {
         };
         let guard = init_file_logging(&cfg).unwrap();
         assert!(guard.is_none());
+    }
+
+    #[cfg(not(feature = "syslog"))]
+    #[test]
+    fn syslog_sink_fails_closed_without_feature() {
+        // #1765 — selecting the syslog sink in a build WITHOUT `--features
+        // syslog` MUST fail closed (not silently fall back to a local file:
+        // the operator opted into off-host shipping). Calls the dispatcher
+        // directly so it is independent of the AI_MEMORY_LOG_SINK env.
+        let cfg = LoggingConfig {
+            enabled: Some(true),
+            sink: Some("syslog".to_string()),
+            syslog_address: Some("logs.example.com:6514".to_string()),
+            ..Default::default()
+        };
+        let err = init_syslog_logging(&cfg).unwrap_err().to_string();
+        assert!(
+            err.contains("requires a build with `--features syslog`"),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(feature = "syslog")]
+    #[test]
+    fn syslog_sink_compiled_errors_on_missing_address() {
+        // #1765 — with the feature compiled, the syslog branch is wired and
+        // fails fast on a misconfigured target (resolve errors BEFORE any
+        // global-subscriber install, so the test leaves global state clean).
+        let cfg = LoggingConfig {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let err = init_syslog_logging(&cfg).unwrap_err().to_string();
+        assert!(err.contains("requires a collector address"), "got: {err}");
     }
 
     /// Process-wide lock so tests that swap the global tracing

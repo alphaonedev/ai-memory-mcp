@@ -257,6 +257,15 @@ test-with-models = []
 # unconditional and load-bearing; this feature is for the optional
 # end-to-end "did Claude actually see the seeded memory?" smoke.
 e2e = []
+# #1765 (v0.8.0) — OS-agnostic remote syslog sink: RFC 5424 over TCP, with
+# optional rustls TLS (RFC 5425), to a collector/SIEM. Pure network I/O so it
+# behaves identically on Linux/macOS/Windows/mobile. OFF by default and
+# zero-cost when off (the `LogSink::Syslog` writer + framer in `src/logging.rs`
+# are entirely `#[cfg(feature = "syslog")]`-gated). Reuses the existing rustls
+# 0.23 + chrono + gethostname deps — NO new dependency (the re-scope dropped the
+# Linux-only journald sink, avoiding the operator-gated dep additions of the
+# original #1765). cfg(feature) consumer: `src/logging.rs` (arch-11 audit).
+syslog = []
 
 [dev-dependencies]
 proptest = "1"
