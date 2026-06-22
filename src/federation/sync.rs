@@ -1355,6 +1355,28 @@ pub struct ActionTransitionOp {
     pub vector_clock: serde_json::Value,
     /// Epoch seconds of the transition.
     pub updated_at: i64,
+    /// #1718 H2 — Ed25519 signature over the canonical [`SignableTransition`]
+    /// surface (`action_id`/`namespace`/`from_state`/`to_state`/`claimed_by`/
+    /// `nonce`/`created_at`). Empty for an unsigned op. The receiver
+    /// (`authorize_remote_transition`) verifies this against the *enrolled* key
+    /// of the attested actor (`claimed_by`), not against `signer_pubkey`, so a
+    /// captured signature cannot authorize a transition for an actor whose
+    /// private key the sender does not hold.
+    ///
+    /// [`SignableTransition`]: crate::identity::sign::SignableTransition
+    #[serde(default)]
+    pub signature: Vec<u8>,
+    /// #1718 H2 — the 32-byte Ed25519 public key the producer signed with.
+    /// Carried for diagnostics / non-enrolled verification; the *authoritative*
+    /// verify uses the locally looked-up enrolled key, so a mismatch between
+    /// this and the enrolled key surfaces as a refused (forged) transition.
+    #[serde(default)]
+    pub signer_pubkey: Vec<u8>,
+    /// #1718 H2 — per-delivery anti-replay nonce bound into the signed surface
+    /// so a captured `(transition, signature)` pair cannot be replayed under a
+    /// fresh delivery without the private key.
+    #[serde(default)]
+    pub nonce: Vec<u8>,
 }
 
 /// #1718 Commit B — fan out an action-state transition to peers via the
