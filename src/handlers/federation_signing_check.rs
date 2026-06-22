@@ -74,6 +74,8 @@ pub(super) async fn sync_push_via_store(
         // #1566 / #1579 B1 — shipped-vector array, the largest
         // per-element payload on this surface (sqlite-twin parity).
         || body.embeddings.len() > cap
+        // #1718 — signals subcollection (sqlite-twin parity).
+        || body.signals.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -468,6 +470,54 @@ pub(super) async fn sync_push_via_store(
         + body.namespace_meta.len()
         + body.namespace_meta_clears.len();
 
+    // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
+    // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
+    // sqlite-twin parity. The #1544 storage-bytes quota lives on the SQLite
+    // metadata DB even on postgres-backed daemons (same as the memories loop
+    // above), so it is charged via `app.db` before the trait write.
+    let mut signals_applied = 0usize;
+    for sig in &body.signals {
+        if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
+        {
+            let lock = app.db.lock().await;
+            if let Err(e) = crate::quotas::check_and_record_storage_only(
+                &lock.0,
+                &sig.from_agent,
+                &sig.namespace,
+                bytes,
+            ) {
+                tracing::warn!(
+                    "sync_push(store): signal {} refused by storage quota: {e}",
+                    sig.id
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        match app.store.apply_remote_signal(&ctx, sig).await {
+            Ok(_) => signals_applied += 1,
+            Err(crate::store::StoreError::InvalidInput { .. }) => {
+                tracing::warn!(
+                    "sync_push(store): signal {} refused (invalid signature)",
+                    sig.id
+                );
+                skipped += 1;
+            }
+            Err(e) => {
+                tracing::warn!("sync_push(store): signal apply failed for {}: {e}", sig.id);
+                skipped += 1;
+            }
+        }
+    }
+
     // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
     // quorum ack) returns now; rows still needing a locally-computed
     // vector are embedded by this detached task.
@@ -479,6 +529,7 @@ pub(super) async fn sync_push_via_store(
             "applied": applied,
             "deleted": deleted,
             "links_applied": links_applied,
+            "signals_applied": signals_applied,
             "noop": noop,
             "skipped": skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,

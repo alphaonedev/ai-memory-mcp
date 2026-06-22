@@ -659,6 +659,82 @@ async fn exercise_sal_surface(store: &dyn MemoryStore) {
         Some(1_700_003_100)
     );
 
+    // #1718 — apply_remote_signal (federation receive, accept-and-flag-unsigned)
+    // round-trips on BOTH adapters: signed → applied + self_signed; replay →
+    // idempotent no-op; forged → refused; unsigned → landed verbatim.
+    let make_signal = |id: &str| Signal {
+        id: id.to_string(),
+        namespace: TEST_NS.to_string(),
+        from_agent: TEST_AGENT.to_string(),
+        to_agent: Some(TEST_AGENT.to_string()),
+        subject: "apply-remote".to_string(),
+        body: serde_json::json!({"k": "v"}),
+        signal_type: SignalType::Notify,
+        in_reply_to: None,
+        correlation_id: None,
+        reference_ids: serde_json::json!([]),
+        created_at: 1_700_005_000,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: vec![],
+        sender_pubkey: vec![],
+    };
+    // Signed remote signal → applied, reports self_signed, verifies on read-back.
+    let signed_id = format!("sal-cov-rsig-{}", uuid_like());
+    let mut signed_remote = make_signal(&signed_id);
+    ai_memory::signals::sign_into(&mut signed_remote, &kp).expect("sign signal");
+    assert_eq!(
+        store
+            .apply_remote_signal(&ctx, &signed_remote)
+            .await
+            .expect("apply_remote_signal signed ok"),
+        "self_signed"
+    );
+    assert!(
+        ai_memory::signals::verify(
+            &store
+                .signal_get(&ctx, &signed_id)
+                .await
+                .expect("get ok")
+                .expect("present")
+        ),
+        "applied remote signal verifies"
+    );
+    // Replay → idempotent no-op (still present, no error).
+    store
+        .apply_remote_signal(&ctx, &signed_remote)
+        .await
+        .expect("apply_remote_signal replay ok");
+    // Forged → refused (signature present but does not verify).
+    let forged_id = format!("sal-cov-forged-{}", uuid_like());
+    let mut forged = make_signal(&forged_id);
+    forged.signature = vec![0u8; 64];
+    forged.sender_pubkey = kp.public.to_bytes().to_vec();
+    assert!(
+        store.apply_remote_signal(&ctx, &forged).await.is_err(),
+        "forged signal is refused"
+    );
+    assert!(
+        store
+            .signal_get(&ctx, &forged_id)
+            .await
+            .expect("get forged ok")
+            .is_none(),
+        "forged signal was not persisted"
+    );
+    // Unsigned → landed verbatim, reports unsigned.
+    let unsigned_id = format!("sal-cov-unsig-{}", uuid_like());
+    let unsigned = make_signal(&unsigned_id);
+    assert_eq!(
+        store
+            .apply_remote_signal(&ctx, &unsigned)
+            .await
+            .expect("apply_remote_signal unsigned ok"),
+        "unsigned"
+    );
+
     // #1709 Pillar 1 — checkpoint_create / checkpoint_get / checkpoint_list /
     // checkpoint_resolve round-trip through the SAL surface on BOTH adapters
     // (the v61 attested-checkpoints substrate). The SIGNED resolution path is
