@@ -449,8 +449,15 @@ jobs:
           du -sh target 2>/dev/null || true
           echo "::endgroup::"
 
-      - name: Build release
-        if: needs.classify.outputs.docs_only != 'true'
+      # CI-speed: the release build here is only a release-PROFILE compile
+      # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
+      # produced by release.yml on tag, and a release-profile-only break that
+      # the debug `cargo test` build on ubuntu wouldn't already catch is
+      # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
+      # on ubuntu ONLY takes it off the windows critical path (-759s) and macos
+      # (-~400s) — the prep `cargo clean` step above is already ubuntu-only.
+      - name: Build release (ubuntu — release-profile smoke)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: cargo build --release
 
   # M16 — Postgres-feature gate. The cross-platform `check` matrix above
