@@ -7,6 +7,7 @@
 src/cli/curator.rs:AI_CURATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
 src/curator/reflection_pass.rs:agent_id
+src/curator/transcript_classify_pass.rs:agent_id
 src/daemon_runtime.rs:EMBEDDING_BACKFILL
 src/federation/receive.rs:FEDERATION_CATCHUP
 src/handlers/admin.rs:DAEMON_PRINCIPAL
