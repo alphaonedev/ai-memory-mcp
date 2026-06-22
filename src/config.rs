@@ -4140,6 +4140,24 @@ pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
 /// ladder; see [`resolve_log_sink`] / [`LogSink`].
 pub const ENV_LOG_SINK: &str = "AI_MEMORY_LOG_SINK";
 
+/// #1765 Tier 2 — env override for the remote syslog collector address
+/// (`host:port`, e.g. `logs.example.com:6514`). Highest layer of the
+/// `env > [logging].syslog_address` ladder; consulted only when the resolved
+/// [`LogSink`] is [`LogSink::Syslog`]. Read by the `syslog`-feature sink
+/// builder in `src/logging.rs`.
+pub const ENV_LOG_SYSLOG_ADDRESS: &str = "AI_MEMORY_LOG_SYSLOG_ADDRESS";
+
+/// #1765 Tier 2 — env override for the syslog transport: `tls` (RFC 5425, the
+/// norm for any routable collector) or `tcp` (plaintext; intended only for a
+/// loopback / sidecar forwarder). `env > [logging].syslog_transport > tls`.
+pub const ENV_LOG_SYSLOG_TRANSPORT: &str = "AI_MEMORY_LOG_SYSLOG_TRANSPORT";
+
+/// #1765 Tier 2 — env override for the PEM file holding the collector's CA (or
+/// self-signed leaf) used to verify the TLS server certificate. Required when
+/// the syslog transport is `tls` (the dep-free trust anchor — no public-roots
+/// dependency). `env > [logging].syslog_tls_ca_file`.
+pub const ENV_LOG_SYSLOG_TLS_CA_FILE: &str = "AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE";
+
 /// #1604 — env override for the tokenized length of rerank inputs
 /// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
 /// unparseable, or above the model ceiling
@@ -4917,6 +4935,19 @@ pub enum LogSink {
     File,
     /// Structured/plain lines to stdout for OS-tier capture.
     Stdout,
+    /// #1765 (v0.8.0) Tier 2 — OS-agnostic remote syslog: RFC 5424 framed
+    /// records over TCP (with optional rustls TLS, RFC 5425) to a
+    /// collector/SIEM. Pure network I/O, so unlike the Linux-only journald
+    /// sink it behaves identically on every platform. The target lives in the
+    /// `[logging].syslog_*` fields (env `AI_MEMORY_LOG_SYSLOG_*`). The writer
+    /// is compiled only under `--features syslog`; selecting this sink in a
+    /// build WITHOUT that feature fail-CLOSES at boot (`init_file_logging`
+    /// returns an error) rather than silently falling back to a local file —
+    /// the operator explicitly opted into off-host shipping, so a silent local
+    /// write would be a confidentiality surprise. The variant itself (and its
+    /// `as_str`/`from_str_opt` parsing) is always compiled so config / doctor /
+    /// banner surfaces recognize the value uniformly.
+    Syslog,
 }
 
 impl LogSink {
@@ -4926,17 +4957,21 @@ impl LogSink {
         match self {
             Self::File => "file",
             Self::Stdout => "stdout",
+            Self::Syslog => "syslog",
         }
     }
 
-    /// Parse a case-insensitive `file` / `stdout` token. Returns `None` for
-    /// anything else so the resolver falls through to its default (mirrors
-    /// [`AgeProjectionMode::from_str_opt`]).
+    /// Parse a case-insensitive `file` / `stdout` / `syslog` token. Returns
+    /// `None` for anything else so the resolver falls through to its default
+    /// (mirrors [`AgeProjectionMode::from_str_opt`]). `syslog` parses in every
+    /// build (feature-independent); the fail-closed-when-not-compiled check
+    /// lives at the `init_file_logging` consumer, not here.
     #[must_use]
     pub fn from_str_opt(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "file" => Some(Self::File),
             "stdout" => Some(Self::Stdout),
+            "syslog" => Some(Self::Syslog),
             _ => None,
         }
     }
@@ -5315,6 +5350,22 @@ pub struct LoggingConfig {
     /// with a one-shot WARN. Resolved once at boot (env `AI_MEMORY_LOG_SINK`
     /// > this field > `file`); never read on the store/recall hot path.
     pub sink: Option<String>,
+    /// #1765 Tier 2 — remote syslog collector address `host:port` (e.g.
+    /// `logs.example.com:6514`). Required when `sink = "syslog"`. Consulted
+    /// only for the syslog sink; env `AI_MEMORY_LOG_SYSLOG_ADDRESS` wins.
+    pub syslog_address: Option<String>,
+    /// #1765 Tier 2 — syslog transport: `tls` (RFC 5425, default, the norm for
+    /// any routable collector) or `tcp` (plaintext; only for a loopback /
+    /// sidecar forwarder). Env `AI_MEMORY_LOG_SYSLOG_TRANSPORT` wins.
+    pub syslog_transport: Option<String>,
+    /// #1765 Tier 2 — PEM file with the collector's CA / self-signed cert used
+    /// to verify the TLS server certificate (the dep-free trust anchor; no
+    /// public-roots dependency). Required when the transport is `tls`. Env
+    /// `AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE` wins.
+    pub syslog_tls_ca_file: Option<String>,
+    /// #1765 Tier 2 — RFC 5424 `APP-NAME` field stamped on every emitted
+    /// record. `None` → `"ai-memory"`. Consulted only for the syslog sink.
+    pub syslog_app_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -10464,14 +10515,21 @@ max_page_size = 1000000
         assert_eq!(LogSink::from_str_opt("file"), Some(LogSink::File));
         assert_eq!(LogSink::from_str_opt("STDOUT"), Some(LogSink::Stdout));
         assert_eq!(LogSink::from_str_opt("  Stdout  "), Some(LogSink::Stdout));
+        // #1765 Tier 2 — `syslog` now parses in every build (the fail-closed-
+        // when-not-compiled check lives at the init_file_logging consumer).
+        assert_eq!(LogSink::from_str_opt("syslog"), Some(LogSink::Syslog));
+        assert_eq!(LogSink::from_str_opt("  SYSLOG "), Some(LogSink::Syslog));
+        // journald was DROPPED from #1765's re-scope (Linux-only, can't be
+        // OS-agnostic); it is not a recognized sink.
         assert_eq!(
             LogSink::from_str_opt("journald"),
             None,
-            "Tier 2 not honored yet"
+            "journald dropped (Linux-only); not OS-agnostic"
         );
         assert_eq!(LogSink::from_str_opt("garbage"), None);
         assert_eq!(LogSink::File.as_str(), "file");
         assert_eq!(LogSink::Stdout.as_str(), "stdout");
+        assert_eq!(LogSink::Syslog.as_str(), "syslog");
         assert_eq!(LogSink::default(), LogSink::File);
     }
 
