@@ -265,6 +265,92 @@ async fn pg_sync_push_via_store_applies_nonempty_memory_batch() {
     assert_eq!(applied, 2, "fresh-id rows apply cleanly; body={b}");
 }
 
+// ---------------------------------------------------------------------------
+// #1718 — sync_push_via_store signals loop: signed applies, unsigned applies
+// (accept-and-flag), forged is refused. Drives the postgres signal-receive
+// arm (apply_remote_signal dispatch + #1544 storage-quota charge + counting).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pg_sync_push_via_store_applies_signal() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_sync_push_via_store_applies_signal: env unset");
+        return;
+    };
+    clear_fed_env();
+    // SAFETY: this test holds FED_ENV_LOCK for the duration.
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+    }
+    let r = pg_router(&url).await;
+    let peer = uniq("ai:cov-ga2-pg-sigpeer");
+    let ns = uniq("cov-ga2-pg-sig");
+    let kp = ai_memory::identity::keypair::generate(&peer).expect("keypair");
+
+    let mk = |id: String| ai_memory::models::Signal {
+        id,
+        namespace: ns.clone(),
+        from_agent: peer.clone(),
+        to_agent: None,
+        subject: "cov-ga2-pg signal".to_string(),
+        body: json!({"k": "v"}),
+        signal_type: ai_memory::models::SignalType::Notify,
+        in_reply_to: None,
+        correlation_id: None,
+        reference_ids: json!([]),
+        created_at: 1_700_006_000,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: vec![],
+        sender_pubkey: vec![],
+    };
+    // Signed → applies (verifies against embedded key).
+    let mut signed = mk(uniq("ga2pg-sig"));
+    ai_memory::signals::sign_into(&mut signed, &kp).expect("sign");
+    // Unsigned → applies verbatim (accept-and-flag).
+    let unsigned = mk(uniq("ga2pg-sig"));
+    // Forged → refused (signature present, does not verify).
+    let mut forged = mk(uniq("ga2pg-sig"));
+    forged.signature = vec![0u8; 64];
+    forged.sender_pubkey = kp.public.to_bytes().to_vec();
+
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": peer,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": chrono::Utc::now().to_rfc3339(),
+        "memories": [],
+        "signals": [
+            serde_json::to_value(&signed).unwrap(),
+            serde_json::to_value(&unsigned).unwrap(),
+            serde_json::to_value(&forged).unwrap(),
+        ]
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    clear_fed_env();
+    assert!(
+        status.is_success(),
+        "signal push must ack; status={status} body={b}"
+    );
+    assert_eq!(b["storage_backend"], "postgres");
+    assert_eq!(
+        b["signals_applied"].as_i64().unwrap_or(-1),
+        2,
+        "signed + unsigned apply, forged is refused; body={b}"
+    );
+    assert!(
+        b["skipped"].as_i64().unwrap_or(0) >= 1,
+        "the forged signal is counted as skipped; body={b}"
+    );
+}
+
 #[tokio::test]
 async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
     let _g = FED_ENV_LOCK.lock().await;
