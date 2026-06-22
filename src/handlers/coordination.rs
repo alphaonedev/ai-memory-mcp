@@ -36,6 +36,10 @@ use serde_json::json;
 
 use crate::handlers::AppState;
 
+/// Response field carrying the W-of-N acknowledgement count on a successful
+/// fanout (one spelling, pm-v3.1 literal gate).
+const QUORUM_ACKS_FIELD: &str = "quorum_acks";
+
 /// Request body for `POST /api/v1/actions/{id}/transition`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionTransitionRequest {
@@ -46,6 +50,35 @@ pub struct ActionTransitionRequest {
     /// federated broadcast attests the NODE, not this value (see module docs).
     #[serde(default)]
     pub claimed_by: Option<String>,
+}
+
+/// Request body for `POST /api/v1/signals`. `from_agent` is NOT taken from the
+/// body — it is the authenticated caller (the node), mirroring the `create_memory`
+/// provenance posture.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SendSignalRequest {
+    /// Namespace the signal is sent within.
+    pub namespace: String,
+    /// Free-text subject line.
+    pub subject: String,
+    /// Recipient agent, or `None` for a namespace broadcast.
+    #[serde(default)]
+    pub to_agent: Option<String>,
+    /// JSON-typed payload.
+    #[serde(default)]
+    pub body: serde_json::Value,
+    /// Canonical [`crate::models::SignalType`] spelling; defaults when absent.
+    #[serde(default)]
+    pub signal_type: Option<String>,
+    /// Threads a response back onto its request.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// Groups the signal into a conversation thread.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    /// JSON array of related signal/memory ids.
+    #[serde(default)]
+    pub reference_ids: Option<serde_json::Value>,
 }
 
 /// `POST /api/v1/actions/{id}/transition` — apply a coordination-action state
@@ -138,7 +171,7 @@ pub async fn transition_action(
         match crate::federation::broadcast_action_transition_quorum(fed, &op).await {
             Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
                 Ok(got) => {
-                    response["quorum_acks"] = json!(got);
+                    response[QUORUM_ACKS_FIELD] = json!(got);
                     return (StatusCode::OK, Json(response)).into_response();
                 }
                 Err(err) => {
@@ -155,6 +188,141 @@ pub async fn transition_action(
 
     // Single-node fast path: no peers configured.
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// `POST /api/v1/signals` — send a signal locally, then fan it out to peers
+/// under W-of-N quorum when the daemon is federation-configured. Mirrors
+/// [`transition_action`]: local write FIRST, 503 on a failed quorum (no
+/// rollback, ADR-0001), single-node fast path when no peers. The signal is
+/// signed with the daemon's keypair (backend-agnostic) BEFORE insert + broadcast
+/// so the inserted row and the broadcast carry the same verifying signature
+/// (peers apply signals accept-and-flag — see `federation::receive_auth`).
+pub async fn send_signal(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SendSignalRequest>,
+) -> impl IntoResponse {
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let node_agent_id = match crate::identity::resolve_http_agent_id(None, header_agent_id) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
+            )
+                .into_response();
+        }
+    };
+    let signal_type = body
+        .signal_type
+        .as_deref()
+        .and_then(crate::models::SignalType::from_str)
+        .unwrap_or_default();
+    let now = chrono::Utc::now().timestamp();
+    let mut signal = crate::models::Signal {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: body.namespace,
+        from_agent: node_agent_id,
+        to_agent: body.to_agent,
+        subject: body.subject,
+        body: body.body,
+        signal_type,
+        in_reply_to: body.in_reply_to,
+        correlation_id: body.correlation_id,
+        reference_ids: body.reference_ids.unwrap_or_else(|| json!([])),
+        created_at: now,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: Vec::new(),
+        sender_pubkey: Vec::new(),
+    };
+    // Sign with the daemon keypair (backend-agnostic) so the inserted row + the
+    // broadcast carry the same verifying signature. Unsigned when no keypair.
+    if let Some(kp) = app.active_keypair.as_ref().as_ref() {
+        if kp.can_sign() {
+            if let Err(e) = crate::signals::sign_into(&mut signal, kp) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("sign signal failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // Local insert (dual-path: postgres via SAL under --features sal, else sqlite).
+    let insert_res: Result<(), Response> = {
+        #[cfg(feature = "sal")]
+        {
+            if matches!(
+                app.storage_backend,
+                crate::handlers::StorageBackend::Postgres
+            ) {
+                let ctx = crate::store::CallerContext::for_agent(signal.from_agent.clone());
+                app.store
+                    .signal_send(&ctx, &signal, None)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| signal_insert_error(&e.to_string()))
+            } else {
+                let lock = app.db.lock().await;
+                crate::signals::insert(&lock.0, &signal)
+                    .map(|_| ())
+                    .map_err(|e| signal_insert_error(&e.to_string()))
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let lock = app.db.lock().await;
+            crate::signals::insert(&lock.0, &signal)
+                .map(|_| ())
+                .map_err(|e| signal_insert_error(&e.to_string()))
+        }
+    };
+    if let Err(resp) = insert_res {
+        return resp;
+    }
+
+    let mut response = json!({
+        "id": signal.id,
+        (crate::mcp::param_names::NAMESPACE): signal.namespace,
+        (crate::mcp::param_names::FROM_AGENT): signal.from_agent,
+        (crate::mcp::param_names::SIGNAL_TYPE): signal.signal_type.as_str(),
+        (crate::models::field_names::CREATED_AT): signal.created_at,
+    });
+
+    if let Some(fed) = app.federation.as_ref() {
+        match crate::federation::broadcast_signal_create_quorum(fed, &signal).await {
+            Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
+                Ok(got) => {
+                    response[QUORUM_ACKS_FIELD] = json!(got);
+                    return (StatusCode::OK, Json(response)).into_response();
+                }
+                Err(err) => {
+                    let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                    return super::quorum_not_met_response(&payload);
+                }
+            },
+            Err(err) => {
+                let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
+                return super::quorum_not_met_response(&payload);
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Shared `500` response for a failed signal insert (one spelling, literal gate).
+fn signal_insert_error(detail: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("signal insert failed: {detail}")})),
+    )
+        .into_response()
 }
 
 /// Map a [`crate::actions::CasOutcome`] to either the updated action or the
