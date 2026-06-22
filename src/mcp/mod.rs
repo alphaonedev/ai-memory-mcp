@@ -1269,6 +1269,17 @@ fn dispatch_memory_action_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String
 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_transition`.
 fn dispatch_memory_action_transition(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1718 — when a federation forward URL is configured, an MCP-stdio
+    // transition forwards to the HTTP daemon so its W-of-N fanout takes over
+    // (mirrors `dispatch_memory_store`; vote c2fa96aa). MCP stdio is sqlite-only
+    // and cannot reach `app.federation` directly.
+    if let Some(url) = ctx.federation_forward_url {
+        return store::transport::forward_action_transition_to_http(
+            url,
+            ctx.arguments,
+            ctx.mcp_client,
+        );
+    }
     handle_action_transition(ctx.conn, ctx.arguments)
 }
 
@@ -1373,6 +1384,11 @@ fn build_mcp_signal_hooks(
 /// active daemon keypair so an outbound signal is `self_signed` when a
 /// signing key is available, `unsigned` otherwise.
 fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1718 — forward to the HTTP daemon for W-of-N federation fanout when a
+    // forward URL is configured (mirrors `dispatch_memory_store`; vote c2fa96aa).
+    if let Some(url) = ctx.federation_forward_url {
+        return store::transport::forward_signal_send_to_http(url, ctx.arguments, ctx.mcp_client);
+    }
     handle_signal_send(ctx.conn, ctx.arguments, ctx.active_keypair)
 }
 
