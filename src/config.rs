@@ -4210,6 +4210,26 @@ pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_T
 /// [`crate::hooks::HookEnforceMode::Off`].
 pub const ENV_HOOKS_ENFORCE_MODE: &str = "AI_MEMORY_HOOKS_ENFORCE_MODE";
 
+/// v0.8.0 #1764 — env-only knob for the reflection-corpus DECORRELATION
+/// VISIBILITY probe (DeepMind From-AGI-to-ASI audit rec #1; 5-agent vote
+/// `4d3ea1c5`). A valid `off` / `advisory` / `enforce` token (case-insensitive)
+/// selects the mode; anything else (incl. unset) falls through to the compiled
+/// default [`ReflectDecorrelationMode::Off`]. Env-only direct-read (no
+/// `[curator]` field, mirroring #1718/#1765) — no `config_precedence` entry.
+/// At v0.8.0 `enforce` is documented-but-INERT: it degrades to advisory with a
+/// one-shot WARN because binding N≥3 model-family-distinct REFUSAL is gated on
+/// the unbuilt attested-provenance primitive (#1719 / #1171), deferred to v0.9.
+/// See [`reflect_decorrelation_mode`].
+pub const ENV_REFLECT_DECORRELATION_MODE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE";
+
+/// v0.8.0 #1764 — env-only override for the producer-dominance threshold above
+/// which the decorrelation probe emits an advisory (a parseable `f64` in
+/// `(0.0, 1.0]` wins; unparseable / out-of-range falls through to the compiled
+/// default [`crate::curator::decorrelation_probe::DEFAULT_DOMINANCE_THRESHOLD`]
+/// = `0.8`). See [`reflect_decorrelation_dominance_threshold`].
+pub const ENV_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD: &str =
+    "AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD";
+
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
 /// in `docs/enterprise-deployment.md §5.6`.
@@ -4937,6 +4957,90 @@ impl AgeProjectionMode {
             _ => None,
         }
     }
+}
+
+/// v0.8.0 #1764 — tri-state posture for the reflection-corpus DECORRELATION
+/// VISIBILITY probe (DeepMind audit rec #1; 5-agent vote `4d3ea1c5`). Mirrors
+/// [`crate::hooks::HookEnforceMode`] / [`AgeProjectionMode`].
+///
+/// `Off` (default) = no probe (byte-identical to pre-#1764). `Advisory` = scan
+/// the Reflection corpus, compute single-producer dominance, and emit a
+/// structured WARN + advisory report when dominance crosses the threshold —
+/// the safe visibility rung. `Enforce` is RESERVED for the v0.9 write-time N≥3
+/// model-family-distinct REFUSAL: at v0.8.0 it is **inert** and degrades to
+/// `Advisory` (with a one-shot WARN) because binding "distinct" requires
+/// attested model-family provenance that does not exist yet (#1719 / #1171) —
+/// so a probe that refused on CLAIMED distinctness would be security theater
+/// (the unanimous 5-agent finding). Distinctness measured here is therefore
+/// CLAIMED, not ATTESTED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReflectDecorrelationMode {
+    /// No probe (default).
+    #[default]
+    Off,
+    /// Scan + WARN on producer dominance; never refuse. The visibility rung.
+    Advisory,
+    /// RESERVED for v0.9 write-time refusal; INERT at v0.8.0 (→ `Advisory`).
+    Enforce,
+}
+
+impl ReflectDecorrelationMode {
+    /// Lowercase wire string for config / banner / report surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// Case-insensitive parse of `off` / `advisory` / `enforce`. Returns `None`
+    /// for anything else so the resolver falls through to the compiled default
+    /// (mirrors [`AgeProjectionMode::from_str_opt`]).
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "advisory" => Some(Self::Advisory),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+
+    /// `true` when the probe should run (`Advisory` or `Enforce`). `Off` is the
+    /// only inactive posture.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// v0.8.0 #1764 — resolve the reflection-decorrelation probe mode. Env-only
+/// direct-read (`AI_MEMORY_REFLECT_DECORRELATION_MODE` > compiled
+/// [`ReflectDecorrelationMode::Off`]); a valid `off`/`advisory`/`enforce` token
+/// wins, anything else (incl. unset) yields `Off`. Mirrors the
+/// [`age_projection_mode`] env-only reader convention.
+#[must_use]
+pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
+    std::env::var(ENV_REFLECT_DECORRELATION_MODE)
+        .ok()
+        .and_then(|s| ReflectDecorrelationMode::from_str_opt(&s))
+        .unwrap_or_default()
+}
+
+/// v0.8.0 #1764 — resolve the producer-dominance threshold for the probe.
+/// Env-only direct-read (`AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD`
+/// > compiled default `0.8`). A parseable `f64` in `(0.0, 1.0]` wins; an
+/// unparseable / out-of-range value falls through to the default.
+#[must_use]
+pub fn reflect_decorrelation_dominance_threshold() -> f64 {
+    const DEFAULT: f64 = 0.8;
+    std::env::var(ENV_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(DEFAULT)
 }
 
 /// #1463 Tier 1 — operational-log sink destination. `File` (default) is the

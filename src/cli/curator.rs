@@ -772,6 +772,65 @@ async fn run_reflect(
         }
     }
 
+    // #1764 (v0.8.0 slice) — reflection-corpus decorrelation VISIBILITY probe,
+    // opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE` (default `off`). Reuses
+    // the same SAL store + keypair-derived curator identity the reflection pass
+    // ran with; read-only (no writes). Default `off` → byte-unchanged curator.
+    // `enforce` is INERT at v0.8.0 (runs advisory) — write-time N≥3
+    // model-family-distinct REFUSAL is the tracked v0.9 lane (#1719/#1171).
+    // Design: 5-agent vote (4d3ea1c5).
+    let decorrelation_mode = config::reflect_decorrelation_mode();
+    if decorrelation_mode.is_active() {
+        let agent_id = keypair.as_ref().map_or_else(
+            || crate::identity::sentinels::AI_CURATOR.to_string(),
+            |k| k.agent_id.clone(),
+        );
+        let probe_result = crate::curator::decorrelation_probe::run_decorrelation_probe(
+            store.as_ref(),
+            &agent_id,
+            args.namespace.as_deref(),
+            decorrelation_mode,
+            config::reflect_decorrelation_dominance_threshold(),
+            crate::curator::decorrelation_probe::MIN_REFLECTIONS_FLOOR,
+        )
+        .await;
+        match probe_result {
+            Ok(probe) => {
+                if args.json {
+                    writeln!(out.stdout, "{}", serde_json::to_string_pretty(&probe)?)?;
+                } else {
+                    writeln!(
+                        out.stdout,
+                        "decorrelation-probe: mode={} threshold={:.2} namespaces={} \
+                         reflections={} advisories={}{}",
+                        probe.mode,
+                        probe.threshold,
+                        probe.namespaces_scanned,
+                        probe.reflections_scanned,
+                        probe.advisories.len(),
+                        if probe.enforce_degraded_to_advisory {
+                            " (enforce INERT at v0.8.0 → advisory)"
+                        } else {
+                            ""
+                        },
+                    )?;
+                    for adv in &probe.advisories {
+                        writeln!(
+                            out.stdout,
+                            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={} — {}",
+                            adv.namespace,
+                            adv.report.dominance_ratio,
+                            adv.report.dominant_producer.as_deref().unwrap_or("?"),
+                            adv.report.distinct_producers,
+                            adv.caveat,
+                        )?;
+                    }
+                }
+            }
+            Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
+        }
+    }
+
     Ok(())
 }
 
