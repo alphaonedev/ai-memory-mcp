@@ -250,7 +250,16 @@ jobs:
       # ~7 GB ubuntu ceiling. Cross-OS safe: only narrows debuginfo,
       # does not affect the `--release` build (debug=0). Mirrors the
       # postgres-feature / coverage jobs' knob.
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      #
+      # CI-speed (windows): windows is the slowest of the three REQUIRED
+      # `Check (os)` gates (the only checks that block a merge to
+      # main/develop), and its `cargo test` cost is dominated by MSVC
+      # link + PDB generation. Drop dev debuginfo to 0 on windows ONLY so
+      # no PDB is generated/linked — pure link-time win, behavior-identical
+      # (tests pass/fail exactly the same; only panic backtraces lose
+      # line numbers, which ubuntu/macos still retain at debug=1). Keep
+      # ubuntu at 1 for the OOM posture above + readable backtraces.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
     strategy:
       fail-fast: false
       matrix:
