@@ -102,6 +102,24 @@ pub trait AutonomyLlm {
 
     /// Produce a consolidated summary of N memories.
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String>;
+
+    /// #1393 — classify a recovered transcript turn into a refined
+    /// [`crate::models::MemoryKind`] (the "decision-detector": is this
+    /// observation actually a Decision / Claim / Event …?). Returns `None`
+    /// to ABSTAIN — the caller leaves the existing kind untouched. The default
+    /// abstains so the 17 stub/mock impls compile unchanged; only the real
+    /// LLM-backed [`OllamaClient`] overrides it (mirrors the curator's other
+    /// LLM passes, which run only against the real backend).
+    ///
+    /// # Errors
+    /// Propagates the underlying LLM client error.
+    fn classify_kind(
+        &self,
+        _title: &str,
+        _content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        Ok(None)
+    }
 }
 
 impl AutonomyLlm for OllamaClient {
@@ -116,6 +134,13 @@ impl AutonomyLlm for OllamaClient {
     }
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String> {
         Self::summarize_memories(self, memories)
+    }
+    fn classify_kind(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        Self::classify_kind(self, title, content)
     }
 }
 
