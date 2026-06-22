@@ -106,7 +106,15 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// return `Result<Value, String>` for the same uniform `McpTool`
 /// dispatch-contract reason as the action/lease/signal families above.
 /// Net acknowledged addition: +2.
-const QUAL_6_CEILING: usize = 112;
+///
+/// 2026-06-22 — raised 112 → 114 for the #1718 Commit C3 MCP→HTTP
+/// federation-forward bridge in `src/mcp/tools/store/transport.rs`: the 2 new
+/// `forward_action_transition_to_http` + `forward_signal_send_to_http` helpers
+/// each return `Result<Value, String>` to match the established
+/// `forward_store_to_http` (#318) forward-family contract (the value flows
+/// straight back into the `Result<Value, String>` MCP dispatch envelope).
+/// Net acknowledged addition: +2.
+const QUAL_6_CEILING: usize = 114;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
