@@ -257,6 +257,88 @@ async fn sync_push_empty_batch_acks_and_runs_deferred_embed_noop() {
     );
 }
 
+/// #1718 — the sqlite `/sync/push` signals loop: signed + unsigned apply
+/// (accept-and-flag), forged is refused, replay no-ops. Drives the
+/// `federation_receive::sync_push` signal arm (validate-id → forged-check →
+/// idempotency → storage-quota → insert → count).
+#[tokio::test]
+async fn sync_push_applies_signals_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+    }
+    let (r, _t) = sqlite_router();
+    let peer = "ai:cov-ga2-sigpeer";
+    let kp = ai_memory::identity::keypair::generate(peer).expect("keypair");
+    let mk = |id: &str| ai_memory::models::Signal {
+        id: id.to_string(),
+        namespace: "covga2sig".to_string(),
+        from_agent: peer.to_string(),
+        to_agent: None,
+        subject: "cov-ga2 signal".to_string(),
+        body: json!({"k": "v"}),
+        signal_type: ai_memory::models::SignalType::Notify,
+        in_reply_to: None,
+        correlation_id: None,
+        reference_ids: json!([]),
+        created_at: 1_700_007_000,
+        expires_at: None,
+        delivered_at: None,
+        read_at: None,
+        acknowledged_at: None,
+        signature: vec![],
+        sender_pubkey: vec![],
+    };
+    let mut signed = mk("cov-ga2-sig-signed");
+    ai_memory::signals::sign_into(&mut signed, &kp).expect("sign");
+    let unsigned = mk("cov-ga2-sig-unsigned");
+    let mut forged = mk("cov-ga2-sig-forged");
+    forged.signature = vec![0u8; 64];
+    forged.sender_pubkey = kp.public.to_bytes().to_vec();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": peer,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": now,
+        "memories": [],
+        "signals": [
+            serde_json::to_value(&signed).unwrap(),
+            serde_json::to_value(&unsigned).unwrap(),
+            serde_json::to_value(&forged).unwrap(),
+            // replay of the signed one → idempotent no-op
+            serde_json::to_value(&signed).unwrap(),
+        ]
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
+        std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+    }
+    assert!(
+        status.is_success(),
+        "signal push acks; status={status} body={b}"
+    );
+    assert_eq!(
+        b["signals_applied"].as_i64().unwrap_or(-1),
+        2,
+        "signed + unsigned apply; forged refused; replay no-ops; body={b}"
+    );
+    assert!(
+        b["skipped"].as_i64().unwrap_or(0) >= 1,
+        "the forged signal is skipped; body={b}"
+    );
+    assert!(
+        b["noop"].as_i64().unwrap_or(0) >= 1,
+        "the replayed signal is an idempotent no-op; body={b}"
+    );
+}
+
 #[tokio::test]
 async fn sync_push_sender_mismatch_is_attestation_refusal_403() {
     let _g = FED_ENV_LOCK.lock().await;
