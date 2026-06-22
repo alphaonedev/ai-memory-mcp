@@ -51,6 +51,7 @@ pub mod peer_attestation;
 pub mod push_dlq;
 pub mod quorum;
 pub mod receive;
+pub mod receive_auth;
 pub mod reflection_bookkeeping;
 // v0.7.0 #791 — per-message Ed25519 signing of federation POSTs.
 // Outbound POSTs (`broadcast_*_quorum`) attach an `X-Memory-Sig`
@@ -1067,6 +1068,9 @@ mod tests {
             claimed_by: Some("ai:worker".to_string()),
             vector_clock: serde_json::json!({}),
             updated_at: 0,
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
+            nonce: Vec::new(),
         }
     }
 
