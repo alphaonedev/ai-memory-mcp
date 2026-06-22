@@ -95,7 +95,12 @@ pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 /// `*_async` variants and skip the bridge entirely — the FX-D1
 /// surgical fix at `daemon_runtime::build_llm_client` does exactly
 /// this for the known callsite that surfaced the regression.
-fn block_on_local<F, Fut, T>(make_fut: F) -> T
+/// #1752 — exposed `pub(crate)` so the MCP `pre_signal_send` enforcement
+/// bridge (`src/mcp/mod.rs`) can drive the async `HookChain::fire` synchronously
+/// from the sync stdio dispatch through the SAME three-flavor bridge (the
+/// `spawn_blocking`-under-multi-thread case uses `block_in_place`, never a
+/// panicking `Handle::current().block_on`).
+pub(crate) fn block_on_local<F, Fut, T>(make_fut: F) -> T
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,

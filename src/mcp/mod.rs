@@ -984,7 +984,7 @@ use action::{
 // v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
 use signal::{
     handle_signal_ack, handle_signal_ack_with_hooks, handle_signal_inbox, handle_signal_read,
-    handle_signal_send, handle_signal_thread,
+    handle_signal_send, handle_signal_send_with_hooks, handle_signal_thread,
 };
 // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination handlers.
 use checkpoint::{
@@ -1358,6 +1358,105 @@ pub(crate) fn set_post_signal_ack_sink(tx: tokio::sync::mpsc::UnboundedSender<se
     let _ = POST_SIGNAL_ACK_SINK.set(tx);
 }
 
+// ---------------------------------------------------------------------------
+// #1752 (v0.8.0, P1) — MCP memory_signal_send → PreSignalSend ENFORCEMENT gate.
+//
+// Unlike the #1714 PostSignalAck observer (async, notify-only — a post-event
+// `Deny` is unactionable because the op already returned), PreSignalSend is a
+// PRE/deny-capable event: its decision MUST be honored synchronously, before
+// the signal is signed + inserted. The MCP stdio dispatch is synchronous (a
+// `spawn_blocking` thread), so the gate fires the async `HookChain` inline via
+// `crate::llm::block_on_local` (the multi-thread arm reuses the outer runtime
+// via `block_in_place`; never a panicking `Handle::current().block_on`).
+//
+// INERT BY DEFAULT: installed by `run_mcp_server` ONLY when an operator
+// `pre_signal_send` `[[hook]]` is configured; unset → `dispatch_memory_signal_send`
+// takes the thin `handle_signal_send`, byte-identical to pre-#1752 (zero added
+// cost on the send hot path). Design: 5-agent vote (memory `4d3ea1c5`).
+// ---------------------------------------------------------------------------
+
+/// #1752 — the process-global PreSignalSend enforcement gate: the configured
+/// chain + its executor registry. `fire` needs `&mut` the registry, so it is
+/// held behind a `Mutex` (the sync stdio loop is single-threaded, so the lock
+/// is uncontended). `None` until [`run_mcp_server`] installs it.
+struct PreSignalSendGate {
+    chain: std::sync::Arc<crate::hooks::HookChain>,
+    registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
+}
+
+static PRE_SIGNAL_SEND_GATE: std::sync::OnceLock<PreSignalSendGate> = std::sync::OnceLock::new();
+
+/// #1752 — install the process PreSignalSend gate (first-writer-wins). Called
+/// once by [`run_mcp_server`] when a `pre_signal_send` hook is configured.
+fn set_pre_signal_send_gate(
+    chain: std::sync::Arc<crate::hooks::HookChain>,
+    registry: crate::hooks::ExecutorRegistry,
+) {
+    let _ = PRE_SIGNAL_SEND_GATE.set(PreSignalSendGate {
+        chain,
+        registry: std::sync::Mutex::new(registry),
+    });
+}
+
+/// #1752 — map the async chain's [`crate::hooks::chain::ChainResult`] onto the
+/// synchronous [`signal::SignalHookDecision`] the in-dispatch `pre_signal_send`
+/// callback returns. `Deny` is the core enforcement; `AskUser` carries the
+/// first queued prompt (the existing eval arm fail-closes it to a refusal on
+/// the prompt-less stdio path). `ModifiedAllow` carries a `MemoryDelta`, which
+/// has NO signal-shaped mapping, so the send proceeds unmodified with a WARN —
+/// signal rewriting remains available via an in-process `pre_signal_send`
+/// closure (the #1729 path), not the external memory-shaped chain.
+fn map_chain_result_to_signal_decision(
+    cr: crate::hooks::chain::ChainResult,
+) -> signal::SignalHookDecision {
+    use crate::hooks::chain::ChainResult;
+    match cr {
+        ChainResult::Allow => signal::SignalHookDecision::Allow,
+        ChainResult::Deny { reason, code } => signal::SignalHookDecision::Deny { reason, code },
+        ChainResult::AskUser { queued } => {
+            let (prompt, options, default) = queued.into_iter().next().map_or_else(
+                || ("operator decision required".to_string(), Vec::new(), None),
+                |p| (p.prompt, p.options, p.default),
+            );
+            signal::SignalHookDecision::AskUser {
+                prompt,
+                options,
+                default,
+            }
+        }
+        ChainResult::ModifiedAllow(_delta) => {
+            tracing::warn!(
+                target: "hooks",
+                "PreSignalSend hook returned ModifiedAllow (a MemoryDelta) which has no \
+                 signal-field mapping; proceeding unmodified. Use an in-process \
+                 pre_signal_send hook to rewrite a signal."
+            );
+            signal::SignalHookDecision::Allow
+        }
+    }
+}
+
+/// #1752 — evaluate the installed PreSignalSend gate for one in-flight signal.
+/// Fires the configured async `HookChain` synchronously (via `block_on_local`)
+/// and maps the outcome. The registry `Mutex` is uncontended (single-threaded
+/// stdio loop); a poisoned lock recovers its inner value.
+fn pre_signal_send_decision(
+    gate: &'static PreSignalSendGate,
+    delta: &crate::hooks::events::SignalDelta,
+) -> signal::SignalHookDecision {
+    let payload = serde_json::to_value(delta).unwrap_or(serde_json::Value::Null);
+    let cr = crate::llm::block_on_local(move || async move {
+        let mut reg = gate
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.chain
+            .fire(crate::hooks::HookEvent::PreSignalSend, payload, &mut reg)
+            .await
+    });
+    map_chain_result_to_signal_decision(cr)
+}
+
 /// #1714 — build the [`signal::SignalHooks`] bundle for an MCP signal-ack
 /// dispatch. Pure over `sink` so the wiring is unit-testable without the
 /// process global: `Some` installs a best-effort `post_signal_ack` callback
@@ -1389,7 +1488,24 @@ fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
     if let Some(url) = ctx.federation_forward_url {
         return store::transport::forward_signal_send_to_http(url, ctx.arguments, ctx.mcp_client);
     }
-    handle_signal_send(ctx.conn, ctx.arguments, ctx.active_keypair)
+    // #1752 — when an operator PreSignalSend hook is installed, enforce it
+    // synchronously before sign+insert (Deny refuses; the in-process eval arms
+    // in `handle_signal_send_with_hooks` apply the decision). Inert default:
+    // no gate → the thin `handle_signal_send`, byte-identical to pre-#1752.
+    match PRE_SIGNAL_SEND_GATE.get() {
+        Some(gate) => {
+            let hooks = signal::SignalHooks {
+                pre_signal_send: Some(Box::new(
+                    move |delta: &crate::hooks::events::SignalDelta| {
+                        pre_signal_send_decision(gate, delta)
+                    },
+                )),
+                post_signal_ack: None,
+            };
+            handle_signal_send_with_hooks(ctx.conn, ctx.arguments, ctx.active_keypair, &hooks)
+        }
+        None => handle_signal_send(ctx.conn, ctx.arguments, ctx.active_keypair),
+    }
 }
 
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_read`.
@@ -3173,6 +3289,30 @@ pub fn run_mcp_server(
         }
     }
 
+    // #1752 — MCP PreSignalSend ENFORCEMENT gate. Same inert-by-default load as
+    // the #1714 PostSignalAck bridge, but PRE/deny-capable: the dispatch fires
+    // the chain synchronously before sign+insert (via `block_on_local`), so a
+    // `Deny` actually refuses the send. Installed only when an operator
+    // `pre_signal_send` `[[hook]]` is configured; otherwise byte-identical to
+    // pre-#1752. Design: 5-agent vote (memory `4d3ea1c5`).
+    {
+        use crate::hooks::{HookChain, HookEvent, config::HookConfig};
+        let all_hooks = HookConfig::default_path()
+            .filter(|p| p.exists())
+            .and_then(|p| HookConfig::load_from_file(&p).ok())
+            .unwrap_or_default();
+        let chain = HookChain::for_event(&all_hooks, HookEvent::PreSignalSend);
+        if !chain.hooks().is_empty() {
+            let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
+            let n = chain.hooks().len();
+            set_pre_signal_send_gate(std::sync::Arc::new(chain), registry);
+            eprintln!(
+                "ai-memory: #1752 — MCP PreSignalSend enforcement gate installed \
+                 ({n} pre_signal_send hook(s))"
+            );
+        }
+    }
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -3755,6 +3895,60 @@ mod tests {
         assert_eq!(payload["id"], "sig-1714");
         assert_eq!(payload["subject"], "deploy-ready");
         assert_eq!(payload["signal_type"], "notify");
+    }
+
+    /// #1752 — the ChainResult → SignalHookDecision translation the MCP
+    /// PreSignalSend gate applies. Deny is the core enforcement; AskUser
+    /// carries the first queued prompt (fail-closed downstream); ModifiedAllow
+    /// (a memory-shaped delta) has no signal mapping so it proceeds as Allow.
+    #[test]
+    fn map_chain_result_to_signal_decision_1752() {
+        use crate::hooks::chain::ChainResult;
+        use signal::SignalHookDecision;
+
+        assert!(matches!(
+            map_chain_result_to_signal_decision(ChainResult::Allow),
+            SignalHookDecision::Allow
+        ));
+
+        match map_chain_result_to_signal_decision(ChainResult::Deny {
+            reason: "policy: no cross-namespace signals".to_string(),
+            code: 403,
+        }) {
+            SignalHookDecision::Deny { reason, code } => {
+                assert_eq!(code, 403);
+                assert!(reason.contains("cross-namespace"));
+            }
+            other => panic!("Deny must map to Deny, got {other:?}"),
+        }
+
+        match map_chain_result_to_signal_decision(ChainResult::AskUser {
+            queued: vec![crate::hooks::chain::AskUserPrompt {
+                prompt: "approve this signal?".to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                default: Some("no".to_string()),
+                origin_command: "hook.sh".to_string(),
+            }],
+        }) {
+            SignalHookDecision::AskUser {
+                prompt,
+                options,
+                default,
+            } => {
+                assert_eq!(prompt, "approve this signal?");
+                assert_eq!(options, vec!["yes".to_string(), "no".to_string()]);
+                assert_eq!(default.as_deref(), Some("no"));
+            }
+            other => panic!("AskUser must map to AskUser, got {other:?}"),
+        }
+
+        // ModifiedAllow carries a MemoryDelta (no signal mapping) → Allow.
+        assert!(matches!(
+            map_chain_result_to_signal_decision(ChainResult::ModifiedAllow(
+                crate::hooks::events::MemoryDelta::default()
+            )),
+            SignalHookDecision::Allow
+        ));
     }
 
     // ----- issue #965 audit: MCP dispatch has NO Arc<Mutex<Connection>> -----
