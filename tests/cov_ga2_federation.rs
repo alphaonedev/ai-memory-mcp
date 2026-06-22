@@ -339,6 +339,129 @@ async fn sync_push_applies_signals_sqlite() {
     );
 }
 
+/// #1718 — the sqlite `/sync/push` action-transitions loop is FAIL-CLOSED: a
+/// signed transition attested to the actor's enrolled key applies via the CAS;
+/// an unsigned one is refused under the default-secure require-sig posture.
+#[tokio::test]
+async fn sync_push_applies_action_transition_sqlite() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let keydir = tempfile::tempdir().expect("keydir");
+    let actor = "ai:cov-ga2-txactor";
+    let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
+    ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+        std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
+        // AI_MEMORY_FED_REQUIRE_TRANSITION_SIG unset → default fail-closed.
+    }
+    let (r, t) = sqlite_router();
+    let ns = "covga2tx";
+    let seed = |conn: &rusqlite::Connection, id: &str| {
+        let action = ai_memory::models::Action {
+            id: id.to_string(),
+            namespace: ns.to_string(),
+            kind: "test".to_string(),
+            state: ai_memory::models::ActionState::Pending,
+            title: "tx".to_string(),
+            payload: json!({}),
+            priority: 5,
+            agent_id: Some(actor.to_string()),
+            claimed_by: None,
+            vector_clock: json!({}),
+            metadata: json!({}),
+            created_at: 1_700_008_000,
+            updated_at: 1_700_008_000,
+        };
+        ai_memory::actions::create(conn, &action).expect("seed action");
+    };
+    {
+        let conn = ai_memory::db::open(t.path()).expect("seed conn");
+        seed(&conn, "cov-ga2-act-signed");
+        seed(&conn, "cov-ga2-act-unsigned");
+    }
+    // Signed pending→claimed for the first action.
+    let nonce = b"cov-ga2-tx-nonce".to_vec();
+    let signable = ai_memory::identity::sign::SignableTransition {
+        action_id: "cov-ga2-act-signed",
+        namespace: ns,
+        from_state: "pending",
+        to_state: "claimed",
+        claimed_by: Some(actor),
+        nonce: &nonce,
+        created_at: 1_700_008_100,
+    };
+    let sig = ai_memory::identity::sign::sign_transition(&kp, &signable).expect("sign tx");
+    let signed_op = ai_memory::federation::sync::ActionTransitionOp {
+        action_id: "cov-ga2-act-signed".to_string(),
+        from_state: ai_memory::models::ActionState::Pending,
+        to_state: ai_memory::models::ActionState::Claimed,
+        claimed_by: Some(actor.to_string()),
+        vector_clock: json!({}),
+        updated_at: 1_700_008_100,
+        signature: sig,
+        signer_pubkey: kp.public.to_bytes().to_vec(),
+        nonce,
+    };
+    // Unsigned pending→claimed for the second action → refused (fail-closed).
+    let unsigned_op = ai_memory::federation::sync::ActionTransitionOp {
+        action_id: "cov-ga2-act-unsigned".to_string(),
+        from_state: ai_memory::models::ActionState::Pending,
+        to_state: ai_memory::models::ActionState::Claimed,
+        claimed_by: Some(actor.to_string()),
+        vector_clock: json!({}),
+        updated_at: 1_700_008_200,
+        signature: vec![],
+        signer_pubkey: vec![],
+        nonce: vec![],
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": actor,
+        "sender_clock": {"entries": {}},
+        "sender_wall_clock": now,
+        "memories": [],
+        "action_transitions": [
+            serde_json::to_value(&signed_op).unwrap(),
+            serde_json::to_value(&unsigned_op).unwrap(),
+        ],
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
+        std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::identity::keypair::KEY_DIR_ENV);
+    }
+    assert!(
+        status.is_success(),
+        "tx push acks; status={status} body={b}"
+    );
+    assert_eq!(
+        b["action_transitions_applied"].as_i64().unwrap_or(-1),
+        1,
+        "signed enrolled tx applies; unsigned is refused fail-closed; body={b}"
+    );
+    assert!(
+        b["skipped"].as_i64().unwrap_or(0) >= 1,
+        "the unsigned tx is skipped; body={b}"
+    );
+    // The signed action is now claimed; the unsigned one stayed pending.
+    let conn = ai_memory::db::open(t.path()).expect("verify conn");
+    let signed_got = ai_memory::actions::get(&conn, "cov-ga2-act-signed")
+        .expect("get")
+        .expect("present");
+    assert_eq!(signed_got.state, ai_memory::models::ActionState::Claimed);
+    assert_eq!(signed_got.claimed_by.as_deref(), Some(actor));
+    let unsigned_got = ai_memory::actions::get(&conn, "cov-ga2-act-unsigned")
+        .expect("get")
+        .expect("present");
+    assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
+}
+
 #[tokio::test]
 async fn sync_push_sender_mismatch_is_attestation_refusal_403() {
     let _g = FED_ENV_LOCK.lock().await;

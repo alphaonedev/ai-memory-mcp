@@ -96,6 +96,26 @@ pub fn authorize_remote_transition(
     }
 }
 
+/// Env knob gating the inbound action-transition signature requirement
+/// (`require_sig` fed to [`authorize_remote_transition`]).
+pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG";
+
+/// Whether inbound action transitions must be cryptographically attested.
+///
+/// **Default fail-closed (`true`)** per the #1718 5-agent vote (`4d3ea1c5`) —
+/// a transition is an authority-granting write, so an unsigned / non-enrolled
+/// one is refused unless the operator opts out for a rollout window by setting
+/// `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` to a falsy value (`0`/`false`/`no`/
+/// `off`). Mirrors the escape-hatch shape of `AI_MEMORY_FED_REQUIRE_SIG`
+/// (envelope signatures) — a *forged* signature is still rejected
+/// unconditionally regardless of this knob (see [`authorize_remote_transition`]).
+#[must_use]
+pub fn require_transition_sig_enabled() -> bool {
+    std::env::var(REQUIRE_TRANSITION_SIG_ENV)
+        .ok()
+        .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

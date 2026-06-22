@@ -425,6 +425,14 @@ pub struct SyncPushBody {
     /// authority-granting sibling) are fail-closed instead.
     #[serde(default)]
     pub signals: Vec<crate::models::Signal>,
+    /// #1718 v0.8.0 Pillar-1 — coordination-action state transitions the sender
+    /// wants propagated (the v59 `actions` table). Applied FAIL-CLOSED: a
+    /// transition is an *authority-granting* write, so each op is cryptographically
+    /// authorized (`receive_auth::authorize_remote_transition`) before the atomic
+    /// compare-and-swap on the expected `from_state` (#1718 H1/H2; 5-agent vote
+    /// `4d3ea1c5`). An op for an action this node does not have is a no-op.
+    #[serde(default)]
+    pub action_transitions: Vec<crate::federation::sync::ActionTransitionOp>,
     /// Preview mode — classify and count, do not write.
     #[serde(default)]
     pub dry_run: bool,
@@ -646,6 +654,18 @@ pub async fn sync_push(
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": format!("sync_push limited to {} signals per request", app.max_page_size)
+            })),
+        )
+            .into_response();
+    }
+    if body.action_transitions.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} action_transitions per request",
+                    app.max_page_size
+                )
             })),
         )
             .into_response();
@@ -1315,6 +1335,93 @@ pub async fn sync_push(
         }
     }
 
+    // #1718 v0.8.0 Pillar-1 — process incoming action-state transitions.
+    // FAIL-CLOSED authorization (a transition is an authority-granting write,
+    // unlike signals/memories): each op is cryptographically authorized via
+    // `receive_auth::authorize_remote_transition` (signature verified against
+    // the attested actor's ENROLLED key + best-effort local lease-holder auth;
+    // 5-agent vote `4d3ea1c5`) BEFORE the atomic compare-and-swap on the
+    // expected `from_state` (H1). An op for an action this node does not have,
+    // or that loses the CAS, is a safe no-op. No storage quota is charged: a
+    // transition mutates existing action state — it is not net-new storage
+    // (#1544 scope is replication bytes, not state changes).
+    let mut action_transitions_applied = 0usize;
+    let require_tx_sig = crate::federation::receive_auth::require_transition_sig_enabled();
+    for op in &body.action_transitions {
+        if validate::validate_id(&op.action_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let local = match crate::actions::get(&lock.0, &op.action_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                noop += 1; // action unknown here — nothing to transition
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("sync_push: action get failed for {}: {e}", op.action_id);
+                skipped += 1;
+                continue;
+            }
+        };
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let enrolled = op
+            .claimed_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let lease_holder = crate::actions::lease_get(&lock.0, &op.action_id)
+            .ok()
+            .flatten()
+            .map(|l| l.holder);
+        let signable = crate::identity::sign::SignableTransition {
+            action_id: &op.action_id,
+            namespace: &local.namespace,
+            from_state: op.from_state.as_str(),
+            to_state: op.to_state.as_str(),
+            claimed_by: op.claimed_by.as_deref(),
+            nonce: &op.nonce,
+            created_at: op.updated_at,
+        };
+        match crate::federation::receive_auth::authorize_remote_transition(
+            &signable,
+            &op.signature,
+            enrolled.as_ref(),
+            lease_holder.as_deref(),
+            require_tx_sig,
+        ) {
+            crate::federation::receive_auth::TransitionAuthz::Accept => {
+                match crate::actions::transition_cas(
+                    &lock.0,
+                    &op.action_id,
+                    op.from_state,
+                    op.to_state,
+                    op.claimed_by.as_deref(),
+                    op.updated_at,
+                ) {
+                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
+                    Ok(_) => noop += 1, // CAS miss / not-found / illegal edge — safe no-op
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push: action transition {} cas failed: {e}",
+                            op.action_id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    "sync_push: action transition {} refused ({verdict:?})",
+                    op.action_id
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // v0.6.2 (S35): process incoming namespace_meta rows. Applies via
     // `set_namespace_standard` so the peer's inheritance-chain walk has
     // the originator's explicit parent link. The standard memory itself
@@ -1440,6 +1547,7 @@ pub async fn sync_push(
             "pendings_applied": pendings_applied,
             "pending_decisions_applied": pending_decisions_applied,
             "signals_applied": signals_applied,
+            "action_transitions_applied": action_transitions_applied,
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,

@@ -76,6 +76,8 @@ pub(super) async fn sync_push_via_store(
         || body.embeddings.len() > cap
         // #1718 — signals subcollection (sqlite-twin parity).
         || body.signals.len() > cap
+        // #1718 — action_transitions subcollection (sqlite-twin parity).
+        || body.action_transitions.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -518,6 +520,98 @@ pub(super) async fn sync_push_via_store(
         }
     }
 
+    // #1718 — action transitions round-trip via the SAL trait. FAIL-CLOSED
+    // authorization (sqlite-twin parity): each op is authorized against the
+    // attested actor's enrolled key + best-effort local lease before the atomic
+    // compare-and-swap on the expected `from_state`. No storage quota — a
+    // transition mutates existing action state, not net-new storage.
+    let mut action_transitions_applied = 0usize;
+    let require_tx_sig = crate::federation::receive_auth::require_transition_sig_enabled();
+    for op in &body.action_transitions {
+        if validate::validate_id(&op.action_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let local = match app.store.action_get(&ctx, &op.action_id).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                noop += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sync_push(store): action get failed for {}: {e}",
+                    op.action_id
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let enrolled = op
+            .claimed_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let lease_holder = app
+            .store
+            .lease_get(&ctx, &op.action_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|l| l.holder);
+        let signable = crate::identity::sign::SignableTransition {
+            action_id: &op.action_id,
+            namespace: &local.namespace,
+            from_state: op.from_state.as_str(),
+            to_state: op.to_state.as_str(),
+            claimed_by: op.claimed_by.as_deref(),
+            nonce: &op.nonce,
+            created_at: op.updated_at,
+        };
+        match crate::federation::receive_auth::authorize_remote_transition(
+            &signable,
+            &op.signature,
+            enrolled.as_ref(),
+            lease_holder.as_deref(),
+            require_tx_sig,
+        ) {
+            crate::federation::receive_auth::TransitionAuthz::Accept => {
+                match app
+                    .store
+                    .action_transition_cas(
+                        &ctx,
+                        &op.action_id,
+                        op.from_state,
+                        op.to_state,
+                        op.claimed_by.as_deref(),
+                        op.updated_at,
+                    )
+                    .await
+                {
+                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
+                    Ok(_) => noop += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push(store): action transition {} cas failed: {e}",
+                            op.action_id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    "sync_push(store): action transition {} refused ({verdict:?})",
+                    op.action_id
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
     // quorum ack) returns now; rows still needing a locally-computed
     // vector are embedded by this detached task.
@@ -530,6 +624,7 @@ pub(super) async fn sync_push_via_store(
             "deleted": deleted,
             "links_applied": links_applied,
             "signals_applied": signals_applied,
+            "action_transitions_applied": action_transitions_applied,
             "noop": noop,
             "skipped": skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
