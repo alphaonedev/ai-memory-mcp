@@ -325,7 +325,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 /// cannot drift silently. v0.7.0 multi-agent literal-sweep (scanner
 /// A, finding F-A4.1) — previously the `73 unique URL paths` count
 /// was cited in 30+ doc sites with no const.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 75;
+// 2026-06-22 (#1718 Commit C) — bumped 75 → 76: the new unique path
+// `/api/v1/actions/{id}/transition` (coordination action-transition write).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 76;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
