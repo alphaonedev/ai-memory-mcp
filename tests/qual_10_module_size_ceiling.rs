@@ -515,7 +515,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // compare-and-swap — `SELECT ... FOR UPDATE` + `state == from` guard
     // inside the tx) added ~49 LOC (actual 21_049). Per-domain split of this
     // module is tracked under #650.
-    ("src/store/postgres.rs", 21_100),
+    // 2026-06-22 (#1393 sub-unit 2) — bumped 21_100 → 21_200: the
+    // `PostgresStore::reclassify_memory_kind` override (tx: `SELECT ... FOR
+    // UPDATE` the kind, refuse reflection/persona, `UPDATE` kind + version,
+    // atomic `memory.reclassified` signed_event via
+    // `pg_append_signed_event_with_chain_in_tx`) added ~76 LOC (actual 21_124).
+    ("src/store/postgres.rs", 21_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -594,7 +599,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ladder (env > [logging].sink > file) + the five resolver/from_str unit
     // tests (log_sink_from_str_opt_and_as_str_roundtrip, resolve_log_sink_*).
     // Sectioned-config split still tracked under v0.8.0 EPIC #1709 (actual 10_986).
-    ("src/config.rs", 11_050),
+    // 2026-06-22 (#1765 Tier 2 syslog) — +the LogSink::Syslog variant + the
+    // syslog_* LoggingConfig fields + the 3 AI_MEMORY_LOG_SYSLOG_* env consts.
+    // 2026-06-22 (#1393 sub-unit 2) — bumped 11_050 → 11_250: the
+    // `CuratorSection.transcript_classify_enabled` field + ENV_TRANSCRIPT_CLASSIFY_ENABLED
+    // const + the `resolve_transcript_classify_enabled` ladder + the
+    // `transcript_classify_enabled_resolver_1393` config-layer test + the
+    // lockstep `transcript_classify_enabled: None` addition at the 7 in-file
+    // CuratorSection test literals (actual 11_148).
+    ("src/config.rs", 11_250),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

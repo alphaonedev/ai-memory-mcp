@@ -763,6 +763,35 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1393 sub-unit 2 — reclassify a memory's `memory_kind` (the curator
+    /// transcript-classify pass: a recovered `Observation` → an
+    /// LLM-classified kind). This is a DEDICATED, audited path, NOT a field
+    /// on the general [`UpdatePatch`], so kind-mutation is not exposed on the
+    /// general update / HTTP-PUT / MCP-update surface (resolved by the 5-agent
+    /// vote, memory `4d3ea1c5`). Adapters MUST, atomically in ONE transaction:
+    /// (1) refuse to clobber `reflection` / `persona` kinds (mirroring the
+    /// upsert-CASE protection in `crate::storage`), (2) `UPDATE memory_kind`
+    /// + bump `version`, and (3) emit a `memory.reclassified` `signed_event`
+    /// in the SAME transaction so the audit can never lag the write (the
+    /// #1552 SAL-port-fanout failure mode). Returns `true` when a row was
+    /// reclassified, `false` on not-found / protected-kind / no-op (already
+    /// the target kind).
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default (in-memory / test
+    /// adapters round-trip cleanly).
+    async fn reclassify_memory_kind(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECLASSIFY_MEMORY_KIND".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`

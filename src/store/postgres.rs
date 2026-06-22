@@ -16516,6 +16516,81 @@ impl MemoryStore for PostgresStore {
         Ok(one == 1)
     }
 
+    /// #1393 sub-unit 2 — see the trait doc. Postgres twin of the SQLite
+    /// path: one tx — `SELECT ... FOR UPDATE` the current kind, refuse
+    /// `reflection`/`persona` (mirror the upsert CASE), no-op when unchanged,
+    /// `UPDATE` kind + bump `version`, then append the `memory.reclassified`
+    /// `signed_event` in the SAME tx (the #1552 parity requirement).
+    async fn reclassify_memory_kind(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        let new_kind_str = new_kind.as_str();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("reclassify_memory_kind begin", e))?;
+        let old_kind: Option<String> =
+            sqlx::query_scalar("SELECT memory_kind FROM memories WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("reclassify_memory_kind select", e))?;
+        let Some(old_kind) = old_kind else {
+            return Ok(false);
+        };
+        if old_kind == crate::models::MemoryKind::Reflection.as_str()
+            || old_kind == crate::models::MemoryKind::Persona.as_str()
+            || old_kind == new_kind_str
+        {
+            return Ok(false);
+        }
+        let changed = sqlx::query(
+            "UPDATE memories SET memory_kind = $1, version = version + 1 \
+             WHERE id = $2 AND memory_kind NOT IN ('reflection', 'persona')",
+        )
+        .bind(new_kind_str)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("reclassify_memory_kind update", e))?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now();
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            "memory.reclassified".to_string(),
+            now.to_rfc3339(),
+        );
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("reclassify_memory_kind append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("reclassify_memory_kind commit", e))?;
+        Ok(true)
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         // Mirrors the SQLite adapter's `db::stats` shape; postgres has
         // no on-disk file path so `db_size_bytes` reports the size of

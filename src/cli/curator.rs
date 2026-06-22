@@ -721,6 +721,57 @@ async fn run_reflect(
     } else {
         print_reflection_report(&report, out)?;
     }
+
+    // #1393 sub-unit 2 — transcript-classify pass, opt-in via
+    // `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED`. Reuses the same SAL store +
+    // LLM + keypair-derived identity the reflection pass just ran with, so
+    // `curator --reflect` reclassifies recovered Observations the LLM refines
+    // (Decision/Claim/Event…) via the audited `reclassify_memory_kind` path.
+    // `classify_kind` is a no-op on stub/abstaining backends, so the pass is
+    // inert without a real LLM — skip with a note rather than scan for nothing.
+    if app_config.resolve_transcript_classify_enabled() {
+        if let Some(client) = llm.as_ref() {
+            let agent_id = keypair.as_ref().map_or_else(
+                || crate::identity::sentinels::AI_CURATOR.to_string(),
+                |k| k.agent_id.clone(),
+            );
+            let tc_result = crate::curator::transcript_classify_pass::run_transcript_classify_pass(
+                store.as_ref(),
+                client as &dyn crate::autonomy::AutonomyLlm,
+                &agent_id,
+                args.namespace.as_deref(),
+                args.dry_run,
+                0, // default per-cycle cap
+            )
+            .await;
+            match tc_result {
+                Ok(tc) => {
+                    if args.json {
+                        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&tc)?)?;
+                    } else {
+                        writeln!(
+                            out.stdout,
+                            "transcript-classify: scanned={} classified={} reclassified={} \
+                             abstained={} errors={} (dry_run={})",
+                            tc.observations_scanned,
+                            tc.classified,
+                            tc.reclassified,
+                            tc.abstained,
+                            tc.errors.len(),
+                            tc.dry_run,
+                        )?;
+                    }
+                }
+                Err(e) => writeln!(out.stderr, "transcript-classify pass error: {e}")?,
+            }
+        } else {
+            writeln!(
+                out.stderr,
+                "transcript-classify: skipped (AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED set but no LLM backend configured)"
+            )?;
+        }
+    }
+
     Ok(())
 }
 
