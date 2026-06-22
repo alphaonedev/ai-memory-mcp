@@ -462,6 +462,59 @@ async fn sync_push_applies_action_transition_sqlite() {
     assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
 }
 
+/// #1718 Commit C — the action-transition HTTP write surface
+/// (POST /api/v1/actions/{id}/transition) on the single-node fast path
+/// (no federation): applies the local CAS transition + returns the new state;
+/// rejects illegal edges, unknown actions, and invalid state names.
+#[tokio::test]
+async fn http_action_transition_single_node() {
+    let (r, t) = sqlite_router(); // federation: None → single-node fast path
+    let aid = "cov-ga2-http-act";
+    {
+        let conn = ai_memory::db::open(t.path()).expect("seed conn");
+        let action = ai_memory::models::Action {
+            id: aid.to_string(),
+            namespace: "covga2http".to_string(),
+            kind: "test".to_string(),
+            state: ai_memory::models::ActionState::Pending,
+            title: "tx".to_string(),
+            payload: json!({}),
+            priority: 5,
+            agent_id: Some("ai:cov".to_string()),
+            claimed_by: None,
+            vector_clock: json!({}),
+            metadata: json!({}),
+            created_at: 1_700_010_000,
+            updated_at: 1_700_010_000,
+        };
+        ai_memory::actions::create(&conn, &action).expect("seed action");
+    }
+    let post = |id: &str, bodyv: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/actions/{id}/transition"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&bodyv).unwrap()))
+            .unwrap()
+    };
+    // Legal pending → claimed applies on the single-node fast path.
+    let (status, b) = decode(&r, post(aid, json!({"to": "claimed"}))).await;
+    assert!(
+        status.is_success(),
+        "transition acks; status={status} body={b}"
+    );
+    assert_eq!(b["state"], "claimed", "state advanced; body={b}");
+    // Illegal claimed → done (must route via in_progress).
+    let (status, _b) = decode(&r, post(aid, json!({"to": "done"}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "illegal edge is 400");
+    // Unknown action → 404.
+    let (status, _b) = decode(&r, post("no-such-action", json!({"to": "claimed"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown action is 404");
+    // Invalid state name → 400.
+    let (status, _b) = decode(&r, post(aid, json!({"to": "bogus"}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "invalid state is 400");
+}
+
 #[tokio::test]
 async fn sync_push_sender_mismatch_is_attestation_refusal_403() {
     let _g = FED_ENV_LOCK.lock().await;

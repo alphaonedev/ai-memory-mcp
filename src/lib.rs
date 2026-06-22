@@ -307,7 +307,10 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // contributes regardless of which test module declares it.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 89;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 90;
+// 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
+// action-transition write surface `POST /api/v1/actions/{id}/transition`
+// (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
 // 2026-06-18 (#1733 Pillar-4 4.A) — bumped 1 → 3: the
 // `admission_control_1733_tests` helper router adds a `/slow` (blocking
 // handler for the concurrency test) + a `/health` (exemption assertion)
@@ -827,6 +830,12 @@ pub fn build_router_with_timeout(
         .route(handlers::routes::METRICS, get(handlers::prometheus_metrics))
         .route(handlers::routes::MEMORIES, get(handlers::list_memories))
         .route(handlers::routes::MEMORIES, post(handlers::create_memory))
+        // #1718 v0.8.0 Pillar-1 — coordination action-transition write surface
+        // (local CAS write + W-of-N federation fanout).
+        .route(
+            handlers::routes::ACTIONS_ID_TRANSITION,
+            post(handlers::transition_action),
+        )
         .route(handlers::routes::MEMORIES_BULK, post(handlers::bulk_create))
         .route(handlers::routes::MEMORIES_ID, get(handlers::get_memory))
         .route(handlers::routes::MEMORIES_ID, put(handlers::update_memory))
