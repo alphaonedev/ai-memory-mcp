@@ -160,6 +160,10 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Wave-3 Continuation 2 — federation push/pull (Phase 8).
         ("POST", super::routes::SYNC_PUSH) => true,
         ("GET", super::routes::SYNC_SINCE) => true,
+        // #1718 — coordination action-transition write surface. Routes through
+        // the SAL trait on postgres (`action_get` + `action_transition_cas`),
+        // so the gate permits it to reach the handler's postgres path.
+        ("POST", p) if actions_transition_path(p) => true,
         // Wave-3 Continuation 2 — governance write paths (Phase 11).
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,
@@ -304,6 +308,18 @@ fn agents_pubkey_path(p: &str) -> bool {
         return false;
     };
     rest.strip_suffix("/pubkey")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// #1718 — matches `POST /api/v1/actions/{id}/transition` (the coordination
+/// action-transition write surface), where `{id}` is a single non-empty,
+/// non-slash path segment.
+#[cfg(feature = "sal")]
+fn actions_transition_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/actions/") else {
+        return false;
+    };
+    rest.strip_suffix("/transition")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
