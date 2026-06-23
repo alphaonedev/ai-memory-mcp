@@ -549,7 +549,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `pg_append_signed_event_with_chain_in_tx`) added ~76 LOC (actual 21_124).
     // 2026-06-23 (#1771) — bumped 21_200 → 21_300 (lockstep): the
     // `migrate_v70` arm + `archived_memory_links` DDL landed it at 21_254.
-    ("src/store/postgres.rs", 21_300),
+    // 2026-06-23 (#1771 FINAL) — bumped 21_300 → 21_500 (lockstep): the
+    // postgres snapshot/restore wiring (forget + archive_by_ids snapshots,
+    // archive_restore re-insert) + the `archive_restore_preserves_links_pg_1771`
+    // PG-gated parity test landed it at 21_423.
+    ("src/store/postgres.rs", 21_500),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

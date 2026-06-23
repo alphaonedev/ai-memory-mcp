@@ -13355,6 +13355,45 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("forget archive copy", e))?;
         }
 
+        // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
+        // memories' `memory_links` into `archived_memory_links` BEFORE the
+        // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
+        // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
+        // subquery so the snapshot and the delete pin to the same row set
+        // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
+        // twin of the SQLite `archive_links_for_memory` snapshot.
+        sqlx::query(
+            "INSERT INTO archived_memory_links (
+                 source_id, target_id, relation, created_at, valid_from,
+                 valid_until, observed_by, signature, attest_level, archived_at
+             )
+             SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                    ml.attest_level, now()
+             FROM memory_links ml
+             WHERE ml.source_id IN (
+                       SELECT id FROM memories
+                       WHERE ($1::text IS NULL OR namespace = $1)
+                         AND ($2::text IS NULL OR tier = $2)
+                         AND ($3::text IS NULL
+                              OR title ILIKE $3
+                              OR content ILIKE $3))
+                OR ml.target_id IN (
+                       SELECT id FROM memories
+                       WHERE ($1::text IS NULL OR namespace = $1)
+                         AND ($2::text IS NULL OR tier = $2)
+                         AND ($3::text IS NULL
+                              OR title ILIKE $3
+                              OR content ILIKE $3))
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+        )
+        .bind(namespace)
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("forget snapshot links", e))?;
+
         let res = sqlx::query(
             "DELETE FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
@@ -15102,6 +15141,34 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
 
+        // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
+        // `archived_memory_links` edges back into `memory_links`, AFTER the
+        // memory row is restored above and within the same tx. Only edges
+        // whose BOTH endpoints currently exist in `memories` are restored —
+        // `memory_links` carries an `ON DELETE CASCADE` FK on both
+        // endpoints, so an edge whose OTHER endpoint is permanently gone
+        // would be rejected (and is correctly skipped here). Idempotent via
+        // the PK `ON CONFLICT`. Postgres twin of the SQLite
+        // `restore_links_for_memory` re-insert.
+        sqlx::query(
+            "INSERT INTO memory_links (
+                 source_id, target_id, relation, created_at, valid_from,
+                 valid_until, observed_by, signature, attest_level
+             )
+             SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                    aml.valid_from, aml.valid_until, aml.observed_by,
+                    aml.signature, aml.attest_level
+             FROM archived_memory_links aml
+             WHERE (aml.source_id = $1 OR aml.target_id = $1)
+               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
+               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
         sqlx::query("DELETE FROM archived_memories WHERE id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -15250,6 +15317,28 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids insert", e))?;
+            // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
+            // `memory_links` into `archived_memory_links` BEFORE the
+            // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
+            // Postgres twin of the SQLite `archive_links_for_memory`
+            // snapshot wired into `archive_memory_no_tx`. Idempotent via
+            // the PK `ON CONFLICT`.
+            sqlx::query(
+                "INSERT INTO archived_memory_links (
+                     source_id, target_id, relation, created_at, valid_from,
+                     valid_until, observed_by, signature, attest_level, archived_at
+                 )
+                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                        ml.valid_from, ml.valid_until, ml.observed_by,
+                        ml.signature, ml.attest_level, now()
+                 FROM memory_links ml
+                 WHERE ml.source_id = $1 OR ml.target_id = $1
+                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_by_ids snapshot links", e))?;
             sqlx::query(SQL_DELETE_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
@@ -21250,5 +21339,85 @@ mod tests {
             .await
             .expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
+    }
+
+    /// #1771 (5-agent vote 4d3ea1c5) — postgres parity for the SQLite
+    /// `archive_memory_then_restore_preserves_links_1771` test. Archiving a
+    /// memory via `archive_by_ids` snapshots its `memory_links` into
+    /// `archived_memory_links` BEFORE the cascade delete reaps them, and
+    /// `archive_restore` re-inserts every preserved edge whose both
+    /// endpoints exist. Gated on `AI_MEMORY_TEST_POSTGRES_URL`; skips
+    /// cleanly when unset so the default offline `cargo test` flow is
+    /// unaffected. CI's Postgres-gate sets the env and runs this for real.
+    #[tokio::test]
+    async fn archive_restore_preserves_links_pg_1771() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("amlinks-1771-{unique}");
+        let a_id = format!("aml-a-{unique}");
+        let b_id = format!("aml-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "aml-a", "edge endpoint a");
+        let b = sample_memory(&b_id, &ns, "aml-b", "edge endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+
+        // Create the A -> B edge.
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+
+        // Sanity: A has the edge before archiving.
+        let before = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor before");
+        assert!(
+            before
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "A should have the A->B edge before archive"
+        );
+
+        // Archive A (explicit archive-by-id path) — the cascade delete
+        // reaps the edge from `memory_links`, but the snapshot must have
+        // preserved it into `archived_memory_links` in the same tx.
+        let moved = store
+            .archive_by_ids(&ctx, std::slice::from_ref(&a_id), Some("test-1771"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1, "exactly one memory archived");
+
+        // Restore A — the preserved edge must be re-inserted because both
+        // endpoints (A restored, B never archived) currently exist.
+        let restored = store
+            .archive_restore(&ctx, &a_id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "archive_restore must report success");
+
+        let after = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor after");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "A->B edge must be preserved across archive_by_ids + archive_restore"
+        );
     }
 }
