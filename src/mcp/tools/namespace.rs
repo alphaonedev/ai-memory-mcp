@@ -493,6 +493,37 @@ pub(crate) fn handle_namespace_clear_standard(
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
         .unwrap_or_else(|_| sentinels::ANONYMOUS_INVALID.to_string());
+
+    // #1777 — owner gate, MIRRORING the #929 SET gate above. Clearing a
+    // namespace's governance STANDARD reverts it to permissive allow-on-silence,
+    // disarming the delete/write/promote gates that protect EVERY memory in the
+    // namespace — so it must be gated identically to SETTING it (else a
+    // non-owner could disarm protections others rely on, and a non-admin owner
+    // could set-but-never-clear). Gate ONLY when identity is claimed
+    // (params.agent_id present); daemon-internal + unclaimed callers pass, same
+    // as SET. The bare DELETE carries no owner, but the standard memory's
+    // metadata.agent_id is recoverable via get_namespace_standard → db::get.
+    let identity_claimed = params
+        .get(param_names::AGENT_ID)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    if identity_claimed
+        && let Ok(Some(standard_id)) = db::get_namespace_standard(conn, namespace)
+        && let Ok(Some(existing_mem)) = db::get(conn, &standard_id)
+    {
+        let recorded_owner = existing_mem
+            .metadata
+            .get(param_names::AGENT_ID)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let is_unowned = recorded_owner.is_empty() || recorded_owner == "system";
+        if !is_unowned && recorded_owner != caller && caller != sentinels::DAEMON_PRINCIPAL {
+            return Err(format!(
+                "caller does not own this namespace standard (caller={caller}, owner={recorded_owner})"
+            ));
+        }
+    }
+
     crate::governance::audit::record_decision(
         &caller,
         "allow",
@@ -637,6 +668,81 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
+    }
+
+    fn insert_owned(conn: &rusqlite::Connection, ns: &str, title: &str, owner: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({ "agent_id": owner }),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    #[test]
+    fn clear_standard_owner_gate_1777() {
+        // #1777 — clearing a namespace standard mirrors the SET #929 owner gate:
+        // a claimed cross-owner caller is refused; the owner (and an unclaimed
+        // caller) may clear.
+        let conn = fresh_conn();
+        let id = insert_owned(&conn, "ns-clear-1777", "standard", "ai:alice");
+        handle_namespace_set_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-1777", "id": id, "agent_id": "ai:alice"}),
+        )
+        .expect("alice sets the standard");
+
+        // ai:bob (claimed, ≠ owner) is refused; the standard remains.
+        let err = handle_namespace_clear_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-1777", "agent_id": "ai:bob"}),
+        )
+        .expect_err("cross-owner clear must be refused");
+        assert!(err.contains("does not own"), "got: {err}");
+        assert!(
+            db::get_namespace_standard(&conn, "ns-clear-1777")
+                .unwrap()
+                .is_some(),
+            "standard must survive a refused cross-owner clear"
+        );
+
+        // The owner ai:alice CAN clear it.
+        let ok = handle_namespace_clear_standard(
+            &conn,
+            &json!({"namespace": "ns-clear-1777", "agent_id": "ai:alice"}),
+        );
+        assert!(ok.is_ok(), "owner clear must succeed: {ok:?}");
+        assert!(
+            db::get_namespace_standard(&conn, "ns-clear-1777")
+                .unwrap()
+                .is_none(),
+            "owner clear removes the standard"
+        );
     }
 
     // set_standard: happy path without governance.
