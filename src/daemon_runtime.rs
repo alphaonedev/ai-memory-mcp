@@ -4690,6 +4690,11 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
+    // sweep + memory_forget become permanent hard-delete). One-shot via
+    // an internal `std::sync::Once`; safe to call on both serve + mcp boot.
+    app_config.warn_if_archive_on_gc_disabled();
+
     Ok(ServeBootstrap {
         app_state,
         api_key_state,

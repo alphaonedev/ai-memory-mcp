@@ -6731,6 +6731,31 @@ impl AppConfig {
         self.archive_on_gc.unwrap_or(true)
     }
 
+    /// #1775 — one-shot boot WARN when the resolved `archive_on_gc` is
+    /// `false`. An explicit `[storage].archive_on_gc = false` turns the
+    /// GC TTL sweep AND `memory_forget` into **permanent hard-delete with
+    /// no archive and no rollback** — the one spot where expiry-deletion
+    /// becomes irreversible. The default (`true`) is safe and silent; this
+    /// only fires on the misconfigured-false path. Mirrors the #1570
+    /// [`crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST`] boot-WARN
+    /// convention. Called from BOTH `serve` (`bootstrap_serve`) and `mcp`
+    /// boot; a [`std::sync::Once`] keeps it to a single emission even when
+    /// one process runs both surfaces.
+    pub fn warn_if_archive_on_gc_disabled(&self) {
+        if self.effective_archive_on_gc() {
+            return;
+        }
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "[storage].archive_on_gc = false: the GC TTL sweep AND memory_forget will \
+                 PERMANENTLY HARD-DELETE expired/forgotten memories with NO archive and NO \
+                 rollback. Set archive_on_gc = true (the default) to archive before deletion \
+                 so memories remain restorable (#1775)."
+            );
+        });
+    }
+
     /// v0.7.0 H7 (round-2) — resolved per-request HTTP timeout.
     /// Falls back to [`DEFAULT_REQUEST_TIMEOUT_SECS`] when the
     /// `request_timeout_secs` config field is unset.
@@ -8727,6 +8752,30 @@ legacy_scoring = false
             ..AppConfig::default()
         };
         assert!(!cfg.effective_archive_on_gc());
+    }
+
+    // #1775 — the boot WARN helper is a pure side-effecting `eprintln`/
+    // `tracing::warn!` gated by `effective_archive_on_gc()`, so the WARN
+    // text itself is not deterministically observable from a unit test
+    // (it routes through the process-wide tracing subscriber + a one-shot
+    // `Once`). What IS tractable: assert the gate branches correctly and
+    // neither call path panics — the default-true config takes the early
+    // return, the explicit-false config takes the WARN branch.
+    #[test]
+    fn warn_if_archive_on_gc_disabled_is_noop_on_safe_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.effective_archive_on_gc());
+        cfg.warn_if_archive_on_gc_disabled(); // early-return path, no panic
+    }
+
+    #[test]
+    fn warn_if_archive_on_gc_disabled_fires_branch_on_explicit_false() {
+        let cfg = AppConfig {
+            archive_on_gc: Some(false),
+            ..AppConfig::default()
+        };
+        assert!(!cfg.effective_archive_on_gc());
+        cfg.warn_if_archive_on_gc_disabled(); // WARN branch, no panic
     }
 
     #[test]

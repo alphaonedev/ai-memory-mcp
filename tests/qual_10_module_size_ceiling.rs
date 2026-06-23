@@ -651,7 +651,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the `reflect_decorrelation_mode` / `reflect_decorrelation_dominance_threshold`
     // env-only resolvers for the reflection-corpus decorrelation visibility probe
     // (actual 11_252).
-    ("src/config.rs", 11_300),
+    // 2026-06-23 (#1775) — bumped 11_300 → 11_350: the
+    // `warn_if_archive_on_gc_disabled` one-shot boot-WARN helper (emitted at
+    // serve + mcp boot when [storage].archive_on_gc = false) + its two
+    // gate-branch unit tests (actual 11_301).
+    ("src/config.rs", 11_350),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

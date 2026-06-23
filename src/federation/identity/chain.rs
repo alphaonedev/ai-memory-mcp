@@ -60,6 +60,18 @@ pub const CHAIN_HEADER: &str = "x-memory-cred-chain";
 /// for deliberately deeper hierarchies.
 pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 2;
 
+/// #1790 finding 1 — pre-auth byte cap on the `X-Memory-Cred-Chain`
+/// header value (the base64 payload after the `v1=` prefix) checked
+/// BEFORE base64+CBOR decode on the unauthenticated receive path. The
+/// chain header is a CBOR array of intermediate credentials (anchor
+/// first); the design depth is [`DEFAULT_MAX_CHAIN_DEPTH`] = 2, so a
+/// handful of leaf-sized envelopes. We budget
+/// `MAX_CRED_HEADER_BYTES * 8` — generous headroom for an operator who
+/// raises the depth cap for a deeper hierarchy, while still rejecting a
+/// runaway payload outright. Over-cap values are refused as
+/// [`CredentialError::Malformed`].
+pub const MAX_CRED_CHAIN_HEADER_BYTES: usize = super::credential::MAX_CRED_HEADER_BYTES * 8;
+
 /// Reasons a certificate chain fails to verify. `tag()` yields a stable
 /// machine string for structured logging + JSON error envelopes, mirroring
 /// [`CredentialError::tag`].
@@ -201,6 +213,11 @@ impl CertChain {
         let b64 = value
             .strip_prefix(CREDENTIAL_PREFIX)
             .ok_or(CredentialError::Malformed)?;
+        // #1790 finding 1 — reject an oversize payload BEFORE decoding it
+        // on the pre-auth path.
+        if b64.len() > MAX_CRED_CHAIN_HEADER_BYTES {
+            return Err(CredentialError::Malformed);
+        }
         let wire = B64.decode(b64).map_err(|_| CredentialError::Malformed)?;
         let parsed: ciborium::Value =
             ciborium::de::from_reader(&wire[..]).map_err(|_| CredentialError::Malformed)?;
@@ -609,6 +626,19 @@ mod tests {
         let err = load_intermediates_from_path(&path).expect_err("malformed must error");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // #1790 finding 1 — an over-cap chain header is rejected as Malformed
+    // BEFORE the base64+CBOR decode runs, bounding the pre-auth decode work
+    // an anonymous peer can trigger on the unauthenticated receive path.
+    #[test]
+    fn oversize_chain_header_is_rejected_pre_decode() {
+        let payload = "A".repeat(MAX_CRED_CHAIN_HEADER_BYTES + 1);
+        let header = format!("{CREDENTIAL_PREFIX}{payload}");
+        assert_eq!(
+            CertChain::intermediates_from_header_value(&header).unwrap_err(),
+            CredentialError::Malformed
+        );
     }
 
     #[test]
