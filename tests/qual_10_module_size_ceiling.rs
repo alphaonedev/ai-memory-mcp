@@ -238,7 +238,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + `restore_links_for_memory` helpers, the snapshot-before-delete blocks in
     // `forget` / `forget_for_caller`, the restore re-insert calls, and the three
     // 1771 regression tests — landed it at 20_350.
-    ("src/storage/mod.rs", 20_400),
+    // 2026-06-23 (#1773 + #1779) — bumped 20_400 → 20_550 (lockstep): the
+    // federation-merge seal+envelope+pre-merge-snapshot fix in
+    // `overwrite_full_row_by_id` (#1773) and the embed-fetch decrypt-or-skip
+    // helpers (`resolve_embeddable_content` / `resolve_embeddable_rows` /
+    // `embeddable_row_mapper`) routing get_memory_texts_batch +
+    // get_unembedded_ids_batch[_after] (#1779) landed it at 20_446.
+    ("src/storage/mod.rs", 20_550),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
