@@ -774,8 +774,8 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a pattern, namespace, or tier (archives first).",
-      "docs": "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every whitespace-separated token must match (#1601). Archives first (recover via memory_archive_restore). dry_run previews the matched rows (id/title/namespace/tier, capped + truncated flag); live runs return deleted_ids (same cap).",
+      "description": "Bulk delete memories matching a pattern, namespace, or tier (archived first when archive-on-gc is on, else permanent).",
+      "docs": "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every whitespace-separated token must match (#1601). When archive-on-gc is enabled (the default) matched rows are archived first, so recovery via memory_archive_restore is one call; when archive-on-gc is disabled this is a permanent hard-delete with no recoverable copy (the response's `archived` field reports which happened). dry_run previews the matched rows (id/title/namespace/tier, capped + truncated flag); live runs return deleted_ids (same cap).",
       "inputSchema": {
         "properties": {
           "dry_run": {
