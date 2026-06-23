@@ -164,6 +164,9 @@ fn clear_fed_env() {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_NONCE_ENV);
         std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        // #1789 — also clear the v0.8 escape hatch so a prior test's
+        // AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 cannot leak into the next.
+        std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         std::env::remove_var(ai_memory::identity::keypair::KEY_DIR_ENV);
     }
 }
@@ -615,9 +618,13 @@ async fn sync_push_malformed_body_is_400() {
 async fn sync_push_unsigned_no_enrolled_key_permissive_allows() {
     let _g = FED_ENV_LOCK.lock().await;
     clear_fed_env();
-    // REQUIRE_SIG defaults ON (env unset). No sig header, no enrolled key,
-    // peer-enrollment NOT strict → the (None, None) permissive arm: allow.
+    // REQUIRE_SIG defaults ON (env unset). No sig header, no enrolled key.
+    // #1789 flipped peer-enrollment to the v0.8 secure default (ON), so the
+    // (None, None) permissive arm is now reached only via an explicit opt-out.
+    // Preserved-intent: this test still pins the permissive arm — set the
+    // falsy revert AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0.
     unsafe {
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
         std::env::set_var(
             ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
             "1",

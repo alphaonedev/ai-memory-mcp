@@ -19,6 +19,22 @@ for the §22 PE-5 `Decision::Escalate` verdict at v66; the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).
 
+### Breaking / secure-default changes
+
+- **[#1789](https://github.com/alphaonedev/ai-memory-mcp/issues/1789) — federation now requires peer enrollment by default.**
+  `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` flipped its default OFF → **ON** (env-table row #43):
+  inbound `/sync/push` and `/sync/since` now refuse an `X-Peer-Id` that has no enrolled Ed25519
+  key (and no valid `X-Memory-Sig`) with `401 peer_not_enrolled` — the v0.8 secure default,
+  closing the v0.7.0 zero-config unenrolled-peer attribution-spoofing window. **Migration:**
+  enroll each peer's Ed25519 key via the operator workflow; OR revert to the v0.7.x permissive
+  posture with `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0` (any falsy value: `0`/`false`/`no`/`off`);
+  OR keep accepting unenrolled peers during a rollout window with the now-WIRED escape hatch
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` (env-table row #44 — previously documented but inert,
+  wired by this change so the flip is not a hard break with no opt-out). The combined gate is
+  `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()` at both
+  `/sync/push` and `/sync/since`. Design fixed by the 5-agent adversarial vote (memory `4d3ea1c5`).
+  Code anchor: `src/handlers/federation_signing_check.rs`.
+
 ### Added
 
 - **#1734 (PE-1) — mandatory-hook *presence* enforcement (required-event → fail-closed).**
