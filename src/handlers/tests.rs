@@ -93,6 +93,57 @@ fn test_state() -> Db {
 /// an in-flight request.
 pub(super) static APPROVE_HMAC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// #1789 — these `http_sync_push_*` / `http_sync_since_*` handler tests
+/// exercise DOWNSTREAM business logic (oversize-batch 400, applies-clock,
+/// skips-invalid-id, dry-run no-apply, …), NOT the peer-enrollment gate.
+/// They send a sync request with NO `X-Peer-Id` header + no signature
+/// (the `(None, None)` unenrolled-peer arm). Commit `6672312b` (#1789)
+/// flipped `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` to default-ON, so that
+/// arm now `401 peer_not_enrolled`s BEFORE the handler reaches the logic
+/// these tests assert. Opt back to permissive via the wired escape hatch
+/// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` so the secure default stays
+/// semantically ON while the test exercises the permissive path.
+///
+/// RAII: sets on `new`, restores the prior value on `Drop`. It acquires
+/// the SAME crate-level lock ([`crate::handlers::fed_env_test_lock`]) the
+/// strict enrollment tests in `federation_signing_check` hold, so the two
+/// test sets are mutually serialised and a parallel Check-matrix run can
+/// never leak the enrollment env across them.
+struct PermissiveFedEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+impl PermissiveFedEnv {
+    fn new() -> Self {
+        let guard = crate::handlers::fed_env_test_lock();
+        let key = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation under the shared test-scoped lock; the var
+        // is read by handler code only (no concurrent writer while held).
+        unsafe {
+            std::env::set_var(key, "1");
+        }
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+}
+
+impl Drop for PermissiveFedEnv {
+    fn drop(&mut self) {
+        let key = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+        // SAFETY: still holding the shared lock for the guard's lifetime.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// S5-C1 fix campaign (2026-05-13): synthesise a K7-style
 /// `(timestamp, signature)` pair for an inbound approve/reject body.
 /// Mirrors the reference helper in `tests/k10_approval_http.rs::sign`
@@ -742,6 +793,8 @@ async fn http_update_memory_enforces_lifecycle_transition_1726() {
 
 #[tokio::test]
 async fn http_sync_push_applies_and_advances_clock() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Smoke test for POST /api/v1/sync/push — memories land in the
     // receiver's DB and the vector clock records the sender's latest
     // `updated_at`. Full CRDT semantics are the v0.8.0 follow-up.
@@ -814,6 +867,8 @@ async fn http_sync_push_applies_and_advances_clock() {
 
 #[tokio::test]
 async fn http_sync_push_links_over_cap_rejected_1556() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // #1556 — `links` was the sole /sync/push subcollection missing the
     // max_page_size cap, leaving an unbounded per-link insert+verify loop under
     // the shared write Mutex (DoS). A body with > max_page_size links must be
@@ -870,6 +925,8 @@ async fn http_sync_push_links_over_cap_rejected_1556() {
 
 #[tokio::test]
 async fn http_sync_push_applies_archives() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // S29 — sync_push must accept an `archives` field and move matching
     // rows from `memories` to `archived_memories` via
     // `db::archive_memory`. Missing ids no-op. The response exposes a
@@ -1308,6 +1365,8 @@ async fn http_bulk_create_fans_out_with_federation() {
 
 #[tokio::test]
 async fn http_sync_push_rejects_oversized_batch_redteam_242() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Red-team #242 — sync_push must cap memories per request, matching
     // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
     // flood the receiver and bottleneck the SQLite Mutex.
@@ -1414,6 +1473,8 @@ async fn http_bulk_create_honors_operator_resolved_max_page_size() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_applies_nothing() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Phase 3 — dry_run=true must not write.
     let state = test_state();
     let app = Router::new()
@@ -1581,6 +1642,8 @@ async fn http_contradictions_requires_topic_or_namespace() {
 
 #[tokio::test]
 async fn http_sync_push_applies_deletions() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // v0.6.0.1 — sync_push's `deletions` field removes the listed ids
     // from the receiver so peer-side tombstone fanout works for
     // scenario-10. (a2a-hermes r14.)
@@ -1661,6 +1724,8 @@ async fn http_sync_push_applies_deletions() {
 
 #[tokio::test]
 async fn http_sync_push_applies_incoming_links() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // v0.6.2 (#325) — sync_push's `links` field applies the listed
     // (source, target, relation) triples via db::create_link on the
     // receiver so peer-side link fanout works for scenario-11.
@@ -1785,6 +1850,8 @@ async fn http_sync_push_applies_incoming_links() {
 // grant peers the right to corrupt the local reflection DAG.
 #[tokio::test]
 async fn http_sync_push_refuses_reflection_cycle_from_peer() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     use crate::config::{
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
@@ -1917,6 +1984,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
 // MCP-only — A3 closes that with the bypass keyed on attest_level.
 #[tokio::test]
 async fn http_sync_push_governance_bypass_on_peer_attested() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     use crate::config::{
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
@@ -2033,6 +2102,8 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
 
 #[tokio::test]
 async fn http_sync_since_streams_new_memories_only() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Phase 3 — GET /api/v1/sync/since?since=<ts> returns only memories
     // with updated_at > ts.
     //
@@ -2111,6 +2182,8 @@ async fn http_sync_since_streams_new_memories_only() {
 
 #[tokio::test]
 async fn http_sync_since_includes_s39_diagnostic_fields() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // S39 — the response must echo `updated_since` (parsed `since`)
     // and earliest/latest `updated_at` from the returned set. This
     // lets the scenario pin whether the server saw the expected
@@ -4297,6 +4370,8 @@ async fn http_recall_post_keyword_mode_returns_mode_field() {
 
 #[tokio::test]
 async fn http_sync_since_empty_db_returns_zero_count() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
@@ -4322,6 +4397,8 @@ async fn http_sync_since_empty_db_returns_zero_count() {
 
 #[tokio::test]
 async fn http_sync_since_clamps_oversized_limit() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
@@ -4346,6 +4423,8 @@ async fn http_sync_since_clamps_oversized_limit() {
 
 #[tokio::test]
 async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // since="" must NOT be parsed as RFC 3339. The handler short-circuits
     // empty strings to "no since filter" and returns a full snapshot.
     let state = test_state();
@@ -4367,6 +4446,8 @@ async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
 
 #[tokio::test]
 async fn http_sync_since_records_peer_via_observe() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Hitting sync_since with a `peer=` param and an X-Agent-Id header
     // exercises the side-effect sync_state_observe write path.
     let state = test_state();
@@ -5912,6 +5993,8 @@ async fn http_get_stats_empty_db() {
 
 #[tokio::test]
 async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // namespace_meta_clears with a malformed namespace must be skipped
     // (not crash, not cleared).
     let state = test_state();
@@ -5939,6 +6022,8 @@ async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_pending_decision_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // pending_decisions with an invalid id must be skipped (not crash).
     let state = test_state();
     let app = Router::new()
@@ -5967,6 +6052,8 @@ async fn http_sync_push_pending_decision_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_namespace_meta_invalid_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // namespace_meta with an invalid namespace OR invalid standard_id
     // should be skipped (incremented under skipped, not applied).
     let state = test_state();
@@ -5996,6 +6083,8 @@ async fn http_sync_push_namespace_meta_invalid_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_namespace_meta_no_apply() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // dry_run: namespace_meta entries are counted as noop, not applied.
     let state = test_state();
     let app = Router::new()
@@ -12798,6 +12887,8 @@ fn over_max_string_vec(n: usize) -> Vec<String> {
 
 #[tokio::test]
 async fn http_sync_push_oversize_deletions_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12834,6 +12925,8 @@ async fn http_sync_push_oversize_deletions_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_archives_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12864,6 +12957,8 @@ async fn http_sync_push_oversize_archives_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_restores_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12894,6 +12989,8 @@ async fn http_sync_push_oversize_restores_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12929,6 +13026,8 @@ async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_invalid_sender_agent_id_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12959,6 +13058,8 @@ async fn http_sync_push_invalid_sender_agent_id_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12986,6 +13087,8 @@ async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_pending_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -13028,6 +13131,8 @@ async fn http_sync_push_pending_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_links_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -13065,6 +13170,8 @@ async fn http_sync_push_links_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_links_no_apply() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let src = insert_test_memory(&state, "dryrun-links", "src").await;
     let tgt = insert_test_memory(&state, "dryrun-links", "tgt").await;

@@ -7663,6 +7663,18 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_build_router_with_mtls_enforced_allows_sync_without_api_key() {
+        // #1789 — this test asserts the api_key_auth `/sync/*` BYPASS
+        // (response != 401 proves the bypass fired), NOT the peer-enrollment
+        // gate. Commit 6672312b flipped `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`
+        // default-ON, so the unenrolled `(None,None)` arm now 401s deeper in
+        // the handler and masks the bypass. Opt back to permissive via the
+        // wired escape hatch, serialised on the SAME shared lock the strict
+        // enrollment tests hold so a parallel run can't leak the env.
+        let _fed_guard = crate::handlers::fed_env_test_lock();
+        let _fed_prev = std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS").ok();
+        // SAFETY: env mutation under the shared test-scoped lock; restored
+        // below before the lock is released.
+        unsafe { std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1") };
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
         let api_key_state = ApiKeyState {
@@ -7690,6 +7702,14 @@ decision = "allow"
             StatusCode::UNAUTHORIZED,
             "expected /sync/* to bypass api-key with mtls_enforced=true, got 401"
         );
+        // Restore the prior env while still holding the shared lock.
+        // SAFETY: lock held; no concurrent writer of this var.
+        unsafe {
+            match &_fed_prev {
+                Some(v) => std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", v),
+                None => std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS"),
+            }
+        }
     }
 
     #[tokio::test]
