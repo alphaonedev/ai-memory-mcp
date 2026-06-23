@@ -58,6 +58,14 @@ fn install_federation_legacy_bypass() {
     FED_LEGACY_BYPASS_INIT.call_once(|| unsafe {
         std::env::set_var("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
         std::env::set_var("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+        // #1789 — v0.8 flipped peer enrollment to the secure default
+        // (strict). These SAL round-trip tests push /sync with no
+        // X-Peer-Id (the (None,None) unenrolled-peer arm) and assert a
+        // downstream outcome (200 / applied counts / dry-run), so opt
+        // back out of the enrollment requirement to keep the pre-v0.8
+        // permissive posture. The secure default stays ON globally; this
+        // is the documented rollout escape hatch.
+        std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
     });
 }
 
