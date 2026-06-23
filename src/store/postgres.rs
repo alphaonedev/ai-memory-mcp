@@ -13188,6 +13188,19 @@ impl MemoryStore for PostgresStore {
         let pattern_like = pattern.map(|p| format!("%{p}%"));
         let now = chrono::Utc::now().to_rfc3339();
 
+        // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
+        // the #1026 fix). Pre-fix the archive INSERT and the DELETE each ran on
+        // a SEPARATE pooled connection in autocommit, so a crash,
+        // statement_timeout, pool-checkout failure, OR an ordinary concurrent
+        // write landing between them could leave the archived-set and
+        // deleted-set diverging → a row DELETEd that the archive-SELECT never
+        // captured = irrecoverable loss. One tx pins both to the same snapshot.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("forget begin tx", e))?;
+
         if archive {
             // Insert matching rows into archived_memories before deletion.
             sqlx::query(
@@ -13224,7 +13237,7 @@ impl MemoryStore for PostgresStore {
             .bind(tier_str.as_deref())
             .bind(pattern_like.as_deref())
             .bind(parse_rfc3339_required(&now)?)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("forget archive copy", e))?;
         }
@@ -13240,9 +13253,13 @@ impl MemoryStore for PostgresStore {
         .bind(namespace)
         .bind(tier_str.as_deref())
         .bind(pattern_like.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget delete", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("forget commit tx", e))?;
 
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }

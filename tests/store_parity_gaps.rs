@@ -1592,6 +1592,59 @@ mod postgres_side {
         );
     }
 
+    /// #1776 — `forget(archive=true)` must archive AND delete the matched set in
+    /// ONE transaction (the postgres twin of the sqlite
+    /// `forget_archive_and_delete_are_atomic_1776` test, mirroring
+    /// `run_gc_is_transactional_1026`). Pre-fix the archive INSERT and the DELETE
+    /// ran on SEPARATE pooled connections in autocommit, so a concurrent write
+    /// or crash between them could delete a row the archive-SELECT never
+    /// captured = irrecoverable loss. After forget commits, the row MUST be gone
+    /// from live `memories` AND restorable from the archive (proving it was
+    /// archived, not lost). A regression that removed the
+    /// `tx = self.pool.begin()` + `tx.commit()` shape would break this.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn forget_is_transactional_1776() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1776");
+        let mut mem = sample_memory("pg-1776-forget");
+        mem.namespace = "parity-forget-1776".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+
+        let deleted = ai_memory::store::MemoryStore::forget(
+            &pg,
+            &ctx,
+            Some("parity-forget-1776"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("forget");
+        assert!(
+            deleted >= 1,
+            "#1776: forget(archive=true) MUST delete the fixture; got {deleted}"
+        );
+
+        // Deleted from live `memories`.
+        let live = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id).await;
+        assert!(
+            live.is_err(),
+            "#1776: forgotten memory MUST be deleted from live `memories`; got {live:?}"
+        );
+
+        // Archived (recoverable), not lost: restore-by-id succeeds iff the
+        // archive INSERT committed in the same tx as the delete.
+        let restored = ai_memory::store::MemoryStore::archive_restore(&pg, &ctx, &mem.id).await;
+        assert!(
+            matches!(restored, Ok(true)),
+            "#1776: forgotten memory MUST be archived (restorable), proving the \
+             archive committed with the delete; got {restored:?}"
+        );
+    }
+
     // -----------------------------------------------------------------
     // v0.8.0 #1709/#1720 Workstream-A (unit A7) — postgres twin of the
     // sqlite cross-tenant `scope=private` leak regression
