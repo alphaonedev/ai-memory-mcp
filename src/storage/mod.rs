@@ -2698,6 +2698,269 @@ pub fn forget_matches(
     Ok(rows)
 }
 
+/// #1772 — owner-scoped twin of [`forget_count`] for the multi-tenant
+/// opt-in (`AI_MEMORY_AGENT_ID` set → MCP `handle_forget` resolves a
+/// `caller` via [`crate::identity::resolve_read_visibility_caller`]).
+///
+/// Identical to [`forget_count`] except every row-selection branch gains
+/// an **unstamped-inclusive** owner clause (mirrors #936/#940
+/// `purge_archive_for_caller`): the caller counts their OWN rows + legacy
+/// unstamped rows (`metadata.agent_id` NULL or `''`), never a different
+/// named owner's. `caller` is always `Some(...)` at the call site.
+pub fn forget_count_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: &str,
+) -> Result<usize> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE rowid IN (
+                SELECT m.rowid FROM memories_fts fts
+                JOIN memories m ON m.rowid = fts.rowid
+                WHERE memories_fts MATCH ?1
+                  AND (?2 IS NULL OR m.namespace = ?2)
+                  AND (?3 IS NULL OR m.tier = ?3)
+                  AND (json_extract(m.metadata,'$.agent_id') = ?4
+                       OR json_extract(m.metadata,'$.agent_id') IS NULL
+                       OR json_extract(m.metadata,'$.agent_id') = '')
+            )",
+            params![fts_query, namespace, tier_str, caller],
+            |r| r.get(0),
+        )?;
+        return Ok(usize::try_from(count).unwrap_or(0));
+    }
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+           AND (?2 IS NULL OR tier = ?2)
+           AND (json_extract(metadata,'$.agent_id') = ?3
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')",
+        params![namespace, tier_str, caller],
+        |r| r.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// #1772 — owner-scoped twin of [`forget_matches`] for the multi-tenant
+/// opt-in. Identical to [`forget_matches`] except both row-selection
+/// branches gain the **unstamped-inclusive** owner clause (caller's own
+/// rows + legacy unstamped rows, never a different named owner's), so the
+/// preview reflects exactly the set [`forget_for_caller`] would delete.
+/// `caller` is always `Some(...)` at the call site.
+pub fn forget_matches_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    limit: usize,
+    caller: &str,
+) -> Result<Vec<ForgetMatch>> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — same refusal as `forget` / `forget_count`.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let row_to_match = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ForgetMatch> {
+        Ok(ForgetMatch {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            namespace: row.get(2)?,
+            tier: row.get(3)?,
+        })
+    };
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, m.namespace, m.tier
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.namespace = ?2)
+               AND (?3 IS NULL OR m.tier = ?3)
+               AND (json_extract(m.metadata,'$.agent_id') = ?5
+                    OR json_extract(m.metadata,'$.agent_id') IS NULL
+                    OR json_extract(m.metadata,'$.agent_id') = '')
+             ORDER BY m.rowid
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![fts_query, namespace, tier_str, limit_i64, caller],
+                row_to_match,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, title, namespace, tier FROM memories
+         WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+           AND (json_extract(metadata,'$.agent_id') = ?4
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')
+         ORDER BY rowid
+         LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![namespace, tier_str, limit_i64, caller],
+            row_to_match,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// #1772 — owner-scoped twin of [`forget`] for the multi-tenant opt-in.
+/// Identical to [`forget`] (including the #1776 `BEGIN IMMEDIATE`
+/// archive+delete atomic transaction, preserved verbatim) except every
+/// SQL row-selection site — both archive INSERT-SELECT branches AND both
+/// DELETE branches — gains the **unstamped-inclusive** owner clause, so
+/// the caller forgets only their OWN rows + legacy unstamped rows, never a
+/// different named owner's. `caller` is always `Some(...)` at the call
+/// site.
+pub fn forget_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    archive: bool,
+    caller: &str,
+) -> Result<usize> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+
+    // #1776 — archive + delete MUST be ONE atomic transaction (see [`forget`]
+    // for the full rationale). The owner clause (#1772) is pinned to the
+    // identical row set across the archive SELECT and the DELETE because the
+    // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let result = (|| -> Result<usize> {
+        if archive {
+            // Archive matching memories before deletion.
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?4, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE rowid IN (
+                        SELECT m.rowid FROM memories_fts fts
+                        JOIN memories m ON m.rowid = fts.rowid
+                        WHERE memories_fts MATCH ?1
+                          AND (?2 IS NULL OR m.namespace = ?2)
+                          AND (?3 IS NULL OR m.tier = ?3)
+                          AND (json_extract(m.metadata,'$.agent_id') = ?5
+                               OR json_extract(m.metadata,'$.agent_id') IS NULL
+                               OR json_extract(m.metadata,'$.agent_id') = '')
+                     )",
+                    params![fts_query, namespace, tier_str, now, caller],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?3, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                       AND (?2 IS NULL OR tier = ?2)
+                       AND (json_extract(metadata,'$.agent_id') = ?4
+                            OR json_extract(metadata,'$.agent_id') IS NULL
+                            OR json_extract(metadata,'$.agent_id') = '')",
+                    params![namespace, tier_str, now, caller],
+                )?;
+            }
+        }
+
+        // Delete the same matched set (same tx, same write lock → same rows).
+        if let Some(pat) = pattern {
+            let fts_query = forget_fts_query(pat);
+            let tier_str = tier.map(|t| t.as_str().to_string());
+            conn.execute(
+                "DELETE FROM memories WHERE rowid IN (
+                    SELECT m.rowid FROM memories_fts fts
+                    JOIN memories m ON m.rowid = fts.rowid
+                    WHERE memories_fts MATCH ?1
+                      AND (?2 IS NULL OR m.namespace = ?2)
+                      AND (?3 IS NULL OR m.tier = ?3)
+                      AND (json_extract(m.metadata,'$.agent_id') = ?4
+                           OR json_extract(m.metadata,'$.agent_id') IS NULL
+                           OR json_extract(m.metadata,'$.agent_id') = '')
+                )",
+                params![fts_query, namespace, tier_str, caller],
+            )
+        } else {
+            let tier_str = tier.map(|t| t.as_str().to_string());
+            conn.execute(
+                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                   AND (?2 IS NULL OR tier = ?2)
+                   AND (json_extract(metadata,'$.agent_id') = ?3
+                        OR json_extract(metadata,'$.agent_id') IS NULL
+                        OR json_extract(metadata,'$.agent_id') = '')",
+                params![namespace, tier_str, caller],
+            )
+        }
+        .map_err(anyhow::Error::from)
+    })();
+
+    match result {
+        Ok(deleted) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(deleted)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
 /// #1579 A2 — build the sargable `list` SQL + parameter vector.
 ///
 /// The legacy single-shape query expressed every optional filter as a

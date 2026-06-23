@@ -12629,6 +12629,10 @@ mod tests {
     /// State — pattern filter under forget hits the with-pattern branch.
     #[test]
     fn chunkc_forget_pattern_filter_actual_run_deletes() {
+        // #1772 — serialize against the owner-scoped forget tests that mutate
+        // AI_MEMORY_AGENT_ID (these chunkc rows are owned by a different id, so
+        // a leaked env would scope this forget to zero rows and break the count).
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-pat", "abc-xyz", Tier::Mid);
         let _ = chunkc_seed_memory(&conn, "chunkc-pat", "def-xyz", Tier::Mid);
@@ -12651,6 +12655,10 @@ mod tests {
     /// (matches the substrate-level `forget_count` branch).
     #[test]
     fn chunkc_forget_dry_run_pattern_with_tier_filter() {
+        // #1772 — see chunkc_forget_pattern_filter_actual_run_deletes: this
+        // env lock serializes against the AI_MEMORY_AGENT_ID-mutating forget
+        // tests so the env-unset would_delete count assertion is stable.
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-mix", "a-short", Tier::Short);
         let _ = chunkc_seed_memory(&conn, "chunkc-mix", "a-long", Tier::Long);
@@ -14573,6 +14581,9 @@ mod tests {
     /// extraction branch.
     #[test]
     fn chunkc_forget_invalid_tier_string_silently_dropped() {
+        // #1772 — env lock: serialize against the AI_MEMORY_AGENT_ID-mutating
+        // forget tests so this env-unset would_delete assertion is stable.
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-forget-tier", "v1", Tier::Mid);
         let req = make_tools_call(

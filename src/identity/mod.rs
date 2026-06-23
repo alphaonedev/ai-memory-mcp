@@ -287,6 +287,27 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
     Some(v)
 }
 
+/// #1772 — crate-wide, test-only process serialization guard for any test
+/// that mutates `AI_MEMORY_AGENT_ID` (`ENV_AGENT_ID`). `cargo test` runs
+/// test fns in parallel, so a `set_var`/`remove_var` in one test can leak
+/// into a sibling that resolves the same var mid-run (e.g. an owner-scoped
+/// `memory_forget` test setting the var while an env-unset count assertion
+/// reads it). The pre-existing per-module `agent_id_env_lock` helpers
+/// (delete.rs/promote.rs) only serialize WITHIN one module; this single
+/// shared `OnceLock<Mutex>` serializes ACROSS modules so the owner-scoped
+/// forget tests (`src/mcp/tools/forget.rs`) and the env-sensitive forget
+/// count tests (`src/mcp/mod.rs`) can never observe each other's mutation.
+/// Acquire it before any env mutation OR any env-sensitive assertion.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn agent_id_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// #1720 B3 — env flag that turns a detected boot-time owner-lockout into a
 /// hard REFUSAL instead of a WARN. Truthy (`1`/`true`/`yes`/`on`) makes
 /// [`enforce_owner_lockout_guard`] return an error (aborting MCP boot) when
