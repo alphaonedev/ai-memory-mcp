@@ -63,6 +63,83 @@ pub(super) fn handle_forget(
     // #1786 promote keying.
     let owner = crate::identity::resolve_read_visibility_caller();
 
+    // #1772 — namespace-conditional governance gate (5-agent vote 4d3ea1c5 → C).
+    // Single-id `handle_delete` runs the K9 permission pipeline + Task-1.9
+    // `enforce_governance(Delete)` on its one resolved memory; this bulk path
+    // bypassed both. `enforce_governance` / `PermissionContext` are
+    // single-namespace + single-owner BY SIGNATURE, so a coherent gate is only
+    // well-defined when BOTH (a) a SPECIFIC namespace is named — a
+    // cross-namespace `namespace=None` forget spans many policies with no
+    // single one to apply — AND (b) the multi-tenant owner opt-in is on
+    // (`owner = Some(caller)`), where the owner-scope below guarantees every
+    // matched row is caller-owned, so the Owner level resolves `caller == owner`
+    // instead of false-denying on a None owner (`evaluate_level`:
+    // Delete+Owner+None => Deny "no resolvable owner"). When namespace is None,
+    // or in the single-operator trust-all default (owner None), the gate is
+    // skipped: per-namespace governance is not enforceable across all
+    // namespaces, and the trust-all default keeps bulk cleanup byte-unchanged
+    // (the unanimous no-regression finding). `enforce_governance` is itself
+    // allow-on-silence + honours AI_MEMORY_PERMISSIONS_MODE, so an un-governed
+    // namespace is always Allow and this is a no-op there. Runs before the
+    // dry_run branch so the preview surfaces the same refusal as a live run.
+    if let (Some(ns), Some(caller)) = (namespace, owner.as_deref()) {
+        use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
+        let payload = json!({
+            "namespace": ns,
+            "pattern": pattern,
+            "tier": tier.as_ref().map(Tier::as_str),
+            "bulk": true,
+        });
+        // A `delete: Approve` namespace cannot coherently queue ONE pending row
+        // for a pattern matching an unbounded set, so refuse it up front (under
+        // Enforce) BEFORE `enforce_governance` would queue a stray
+        // `pending_actions` row — direct the caller to per-memory
+        // `memory_delete`, which queues a single reviewable action.
+        if crate::config::active_permissions_mode() == crate::config::PermissionsMode::Enforce
+            && db::resolve_governance_policy(conn, ns)
+                .is_some_and(|p| matches!(p.core.delete, GovernanceLevel::Approve))
+        {
+            return Err(crate::governance::deny_message(
+                "forget",
+                crate::governance::DenyGate::Governance,
+                crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+            ));
+        }
+        // Task-1.9 governance (namespace-standard delete level). memory_owner =
+        // caller is correct: the owner-scope restricts the match set to
+        // caller-owned rows, so the Owner level resolves caller == owner;
+        // Registered + signed-rule levels gate here too.
+        match db::enforce_governance(
+            conn,
+            GovernedAction::Delete,
+            ns,
+            caller,
+            None,
+            Some(caller),
+            &payload,
+        )
+        .map_err(|e| e.to_string())?
+        {
+            GovernanceDecision::Allow => {}
+            GovernanceDecision::Deny(refusal) => {
+                return Err(crate::governance::deny_message(
+                    "forget",
+                    crate::governance::DenyGate::Governance,
+                    &refusal.reason,
+                ));
+            }
+            // Approve was refused above under Enforce; under Advisory/Off
+            // enforce_governance returns Allow, so a Pending here is defensive.
+            GovernanceDecision::Pending(_) => {
+                return Err(crate::governance::deny_message(
+                    "forget",
+                    crate::governance::DenyGate::Governance,
+                    crate::errors::msg::GOVERNANCE_REQUIRES_APPROVAL,
+                ));
+            }
+        }
+    }
+
     if dry_run {
         let count = match owner {
             Some(ref c) => db::forget_count_for_caller(conn, namespace, pattern, tier.as_ref(), c),
@@ -85,10 +162,12 @@ pub(super) fn handle_forget(
     }
 
     // #1602 — capture the matched ids BEFORE deletion so the live-run
-    // response can carry `deleted_ids`; rows are archived on forget,
-    // so recovery via memory_archive_restore becomes one call instead
-    // of an archive-list expedition. Same connection, synchronous
-    // dispatch — the set cannot drift between the SELECT and DELETE.
+    // response can carry `deleted_ids`; when `archive` is true (wired from
+    // archive_on_gc) the rows are archived on forget, so recovery via
+    // memory_archive_restore becomes one call instead of an archive-list
+    // expedition — but with archive_on_gc=false (`archive` false) this is a
+    // permanent hard-delete (#1772). Same connection, synchronous dispatch —
+    // the set cannot drift between the SELECT and DELETE.
     let (matched, truncated) =
         forget_preview(conn, namespace, pattern, tier.as_ref(), owner.as_deref())?;
     let deleted_ids: Vec<String> = matched.into_iter().map(|m| m.id).collect();
@@ -150,14 +229,19 @@ impl McpTool for ForgetTool {
         crate::mcp::registry::tool_names::MEMORY_FORGET
     }
     fn description() -> &'static str {
-        "Bulk delete memories matching a pattern, namespace, or tier (archives first)."
+        "Bulk delete memories matching a pattern, namespace, or tier (archived first when archive-on-gc is on, else permanent)."
     }
     fn docs() -> &'static str {
         // #1601 — pattern matching is conservative AND, not fuzzy OR.
         // #1602 — dry_run lists the matched rows; live runs list ids.
+        // #1772 — archive is conditional on archive_on_gc; the response's
+        // `archived` field reports the actual disposition per call.
         "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every \
-         whitespace-separated token must match (#1601). Archives first (recover via \
-         memory_archive_restore). dry_run previews the matched rows \
+         whitespace-separated token must match (#1601). When archive-on-gc is enabled \
+         (the default) matched rows are archived first, so recovery via \
+         memory_archive_restore is one call; when archive-on-gc is disabled this is a \
+         permanent hard-delete with no recoverable copy (the response's `archived` \
+         field reports which happened). dry_run previews the matched rows \
          (id/title/namespace/tier, capped + truncated flag); live runs return \
          deleted_ids (same cap)."
     }
@@ -548,5 +632,140 @@ mod tests {
         );
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    // #1772 — install a namespace standard on `ns` gating `delete` at
+    // `delete_level`, owned by `owner` (so Owner-level checks have a target).
+    fn install_delete_policy(
+        conn: &rusqlite::Connection,
+        ns: &str,
+        delete_level: crate::models::GovernanceLevel,
+        owner: &str,
+    ) {
+        use crate::models::{CorePolicy, GovernancePolicy, default_metadata};
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                delete: delete_level,
+                ..CorePolicy::default()
+            },
+            ..Default::default()
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut metadata = default_metadata();
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert("agent_id".to_string(), Value::String(owner.to_string()));
+            obj.insert(
+                "governance".to_string(),
+                serde_json::to_value(&policy).unwrap(),
+            );
+        }
+        let standard = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Long,
+            namespace: format!("_standards-{ns}"),
+            title: format!("std-{ns}"),
+            content: "policy".to_string(),
+            tags: vec![],
+            priority: 9,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        let sid = db::insert(conn, &standard).expect("insert standard");
+        db::set_namespace_standard(conn, ns, &sid, None).expect("set standard");
+    }
+
+    // #1772 — namespace-conditional governance gate (5-agent vote 4d3ea1c5 → C).
+    // When a SPECIFIC namespace carries a delete policy AND the multi-tenant
+    // owner opt-in is on, bulk forget honours the same Task-1.9
+    // `enforce_governance(Delete)` gate single-id `memory_delete` runs; the
+    // single-operator trust-all default (env unset → owner None) skips it
+    // (the unanimous no-regression finding).
+    #[test]
+    fn forget_governance_gate_1772() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let _modeg = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Enforce,
+        );
+        let conn = fresh_conn();
+
+        // (1) delete:Approve under Enforce + multi-tenant opt-in → REFUSED
+        //     (bulk cannot coherently pend a per-row approval), dry-run too.
+        let ns_appr = "gov-forget-approve-1772";
+        install_delete_policy(
+            &conn,
+            ns_appr,
+            crate::models::GovernanceLevel::Approve,
+            "ai:alice",
+        );
+        let id_appr = insert_meta(&conn, ns_appr, "appr row", json!({"agent_id": "ai:alice"}));
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        let err = handle_forget(&conn, &json!({"namespace": ns_appr}), true).unwrap_err();
+        assert!(
+            err.contains("approval") || err.contains("governance"),
+            "approve-policy bulk forget must be refused; got: {err}"
+        );
+        assert!(
+            db::get(&conn, &id_appr).expect("get appr").is_some(),
+            "row must survive a refused forget"
+        );
+        assert!(
+            handle_forget(&conn, &json!({"namespace": ns_appr, "dry_run": true}), true).is_err(),
+            "dry-run must surface the same governance refusal"
+        );
+
+        // (2) delete:Owner, caller IS the owner → ALLOWED (owner-scope
+        //     guarantees caller owns matched rows → Owner resolves caller==owner).
+        let ns_own = "gov-forget-owner-1772";
+        install_delete_policy(
+            &conn,
+            ns_own,
+            crate::models::GovernanceLevel::Owner,
+            "ai:alice",
+        );
+        let id_own = insert_meta(&conn, ns_own, "own row", json!({"agent_id": "ai:alice"}));
+        let ok =
+            handle_forget(&conn, &json!({"namespace": ns_own}), true).expect("owner forget ok");
+        assert_eq!(ok["deleted"].as_u64(), Some(1), "owner may forget own rows");
+        assert!(
+            db::get(&conn, &id_own).expect("get own").is_none(),
+            "owner's row must be deleted"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        // (3) NO REGRESSION: same Approve namespace, single-operator default
+        //     (env unset → owner None) → gate SKIPPED, forget proceeds.
+        let id_appr2 = insert_meta(&conn, ns_appr, "appr row2", json!({"agent_id": "ai:alice"}));
+        let ok2 = handle_forget(&conn, &json!({"namespace": ns_appr}), true)
+            .expect("single-operator forget must not be governance-gated");
+        assert!(
+            ok2["deleted"].as_u64().unwrap_or(0) >= 1,
+            "single-operator forget proceeds despite the Approve policy"
+        );
+        assert!(
+            db::get(&conn, &id_appr2).expect("get appr2").is_none(),
+            "single-operator forget deleted the row"
+        );
+
+        crate::config::clear_permissions_mode_override_for_test();
     }
 }
