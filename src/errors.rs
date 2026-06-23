@@ -120,6 +120,11 @@ pub mod msg {
     pub const AGENT_ID_QUERY_MISMATCH: &str =
         "agent_id query parameter does not match authenticated caller";
     pub const INVALID_OR_MISSING_SIGNATURE: &str = "invalid or missing X-AI-Memory-Signature";
+    /// #1786 — MCP mutation owner-gate refusal (delete / update / promote /
+    /// link). The single SSOT so the gate message is one named const across all
+    /// four MCP mutation handlers (the HTTP twin lives in
+    /// `handlers::parity::require_caller_owns_memory`).
+    pub const CALLER_DOES_NOT_OWN_MEMORY: &str = "caller does not own this memory";
 
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =

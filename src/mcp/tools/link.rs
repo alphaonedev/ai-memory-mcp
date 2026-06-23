@@ -245,6 +245,17 @@ pub(super) fn handle_link(
         || crate::quotas::GLOBAL_NAMESPACE.to_string(),
         |mem| mem.namespace.clone(),
     );
+    // #1786 — owner gate: refuse forging a link ROOTED at a source memory owned
+    // by a DIFFERENT agent (the MCP link path bypasses the HTTP source-owner
+    // gate, leaving a graph-forge primitive). Only gates when the source
+    // resolves and is owned by a named other agent; lenient + single-tenant-safe.
+    if let Some(ref src) = link_owner {
+        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
+            .map_err(|e| e.to_string())?;
+        if !crate::visibility::caller_owns_for_mutation(src, &caller, false) {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+    }
     // H12 (#628 blocker): combine the link quota check + counter
     // increment in a single atomic transaction. The check + record
     // pair was previously a TOCTOU window; `check_and_record` closes

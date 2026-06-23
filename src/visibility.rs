@@ -77,6 +77,50 @@ pub fn is_visible_to_caller(mem: &Memory, caller: &str) -> bool {
     target == caller
 }
 
+/// #1786 — ownership predicate for MUTATION gating (delete / update / promote /
+/// link). Returns `true` when `caller` may MUTATE `mem`. This is the canonical
+/// twin of the HTTP `handlers::parity::require_caller_owns_memory` gate, lifted
+/// here so the MCP mutation surface (which calls raw `db::*` and historically
+/// skipped the owner check that HTTP + the postgres SAL enforce) inherits the
+/// IDENTICAL, deliberately LENIENT, single-tenant-safe semantics:
+///
+///   * an UNSTAMPED row (no `agent_id`) is mutable by anyone — legacy / unowned
+///     rows are not locked out (this is what keeps the single-operator default,
+///     where rows may carry no stamp, working);
+///   * a SELF-OWNED row (`agent_id == caller`) is mutable;
+///   * the `daemon` principal bypasses (curator / internal);
+///   * when `allow_inbox`, the inbox recipient (`target_agent_id == caller`)
+///     may mutate (mirrors the HTTP delete-side `allow_inbox=true`).
+///
+/// Only a row owned by a DIFFERENT, named agent is refused — closing the
+/// cross-owner MCP mutation gap (#1786) without breaking the single-tenant
+/// default. NOTE: `agent_id` is a CLAIMED identity, so this gate's strength is
+/// bounded by caller attestation (#48) — it closes the unstamped/cross-id gap,
+/// not impersonation by a caller who claims the owner's id.
+#[must_use]
+pub fn caller_owns_for_mutation(mem: &Memory, caller: &str, allow_inbox: bool) -> bool {
+    let owner = mem
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if owner.is_empty() || owner == caller || caller == crate::identity::sentinels::DAEMON_PRINCIPAL
+    {
+        return true;
+    }
+    if allow_inbox {
+        let target = mem
+            .metadata
+            .get(crate::META_KEY_TARGET_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !target.is_empty() && target == caller {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,5 +227,40 @@ mod tests {
         // without understanding the call-site contract.
         let m = mem_with_metadata(json!({"scope": "private"}));
         assert!(is_visible_to_caller(&m, ""));
+    }
+
+    #[test]
+    fn caller_owns_for_mutation_1786() {
+        // Unstamped row → ANYONE may mutate (single-tenant-safe: legacy/unowned
+        // rows are not locked out). This is the deliberate lenience that keeps
+        // the single-operator default working.
+        let unstamped = mem_with_metadata(json!({}));
+        assert!(caller_owns_for_mutation(&unstamped, "ai:alice", false));
+
+        // Self-owned → ok; cross-owner → REFUSED (the gap #1786 closes).
+        let alice = mem_with_metadata(json!({"agent_id": "ai:alice"}));
+        assert!(caller_owns_for_mutation(&alice, "ai:alice", false));
+        assert!(!caller_owns_for_mutation(&alice, "ai:bob", false));
+
+        // Daemon principal bypasses (curator / internal mutations).
+        assert!(caller_owns_for_mutation(
+            &alice,
+            crate::identity::sentinels::DAEMON_PRINCIPAL,
+            false
+        ));
+
+        // Inbox carve-out applies ONLY when allow_inbox=true (delete-side).
+        let inbox = mem_with_metadata(json!({
+            "agent_id": "ai:alice",
+            "target_agent_id": "ai:bob"
+        }));
+        assert!(
+            !caller_owns_for_mutation(&inbox, "ai:bob", false),
+            "no inbox carve-out without allow_inbox"
+        );
+        assert!(
+            caller_owns_for_mutation(&inbox, "ai:bob", true),
+            "inbox recipient may mutate with allow_inbox"
+        );
     }
 }
