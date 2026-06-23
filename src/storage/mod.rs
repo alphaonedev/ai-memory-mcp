@@ -7390,13 +7390,31 @@ pub fn size_gc(
             break;
         };
 
-        if archive {
-            // Restorable eviction: archive-before-delete in one step,
-            // reusing the same primitive the supersede / GC paths use.
-            archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
-        } else {
-            conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
-            conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
+        // #1782 — wrap each victim's archive+delete in ONE `BEGIN IMMEDIATE`.
+        // `archive_memory_no_tx` does an archive INSERT followed by a DELETE and
+        // its contract REQUIRES the caller to already hold a transaction; pre-fix
+        // `size_gc` opened none, so each victim's INSERT + DELETE ran as two
+        // autocommit statements → a crash between them left that victim both
+        // archived AND live (duplicate). Per-victim tx bounds the lock-hold
+        // (mirrors `gc`'s chunked sweep) while making each eviction atomic.
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let victim_result = (|| -> Result<()> {
+            if archive {
+                // Restorable eviction: archive-before-delete in one step,
+                // reusing the same primitive the supersede / GC paths use.
+                archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
+            } else {
+                conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+                conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
+            }
+            Ok(())
+        })();
+        match victim_result {
+            Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+            Err(e) => {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+                return Err(e);
+            }
         }
 
         evicted += 1;
@@ -14021,6 +14039,41 @@ mod tests {
         assert!(
             namespace_corpus_bytes(&conn, "sgc").unwrap() <= cap,
             "corpus is back at/under cap"
+        );
+    }
+
+    #[test]
+    fn size_gc_archive_eviction_is_atomic_1782() {
+        // #1782 — each victim's archive+delete must commit ATOMICALLY: an
+        // evicted row must land in archived_memories (reason 'size_gc'), never
+        // deleted-but-not-archived. The per-victim `BEGIN IMMEDIATE` wrapper
+        // guarantees this; a regression to the unwrapped `archive_memory_no_tx`
+        // call (the pre-#1782 shape, two autocommit statements) fails here.
+        let conn = test_db();
+        let low = sized_memory("low", "sgc2", Tier::Long, 1, 1000);
+        let high = sized_memory("high", "sgc2", Tier::Long, 9, 1000);
+        insert(&conn, &low).unwrap();
+        insert(&conn, &high).unwrap();
+
+        let evicted = size_gc(&conn, "sgc2", 1500, true).unwrap();
+        assert_eq!(evicted, 1, "one lowest-value row evicted to reach cap");
+        assert!(
+            get(&conn, &low.id).unwrap().is_none(),
+            "low-value row evicted from live memories"
+        );
+
+        // The evicted row was archived (archive committed in the same tx).
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories \
+                 WHERE id = ?1 AND archive_reason = 'size_gc'",
+                params![low.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archived, 1,
+            "#1782: evicted row must be archived (restorable), not lost"
         );
     }
 

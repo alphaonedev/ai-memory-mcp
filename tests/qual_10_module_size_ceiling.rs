@@ -221,7 +221,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // BEGIN IMMEDIATE transaction wrapper (atomicity fix porting #1026) + the
     // `forget_archive_and_delete_are_atomic_1776` regression test landed the
     // file at 19_567.
-    ("src/storage/mod.rs", 19_600),
+    // 2026-06-22 (#1782) — bumped 19_600 → 19_700: the `size_gc` per-victim
+    // BEGIN IMMEDIATE wrapper (same #1026 atomicity fix) + the
+    // `size_gc_archive_eviction_is_atomic_1782` regression test landed it at
+    // 19_620.
+    ("src/storage/mod.rs", 19_700),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
