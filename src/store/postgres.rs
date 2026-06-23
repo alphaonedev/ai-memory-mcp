@@ -520,7 +520,15 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       both adapters carry the column + index. Pure additive ADD COLUMN
 //       IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — idempotent +
 //       replay-safe. CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 69;
+// v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+//       edge-preservation snapshot table. Mirrors `memory_links` columns
+//       sans the `REFERENCES memories(id)` FK (archive table) + an
+//       `archived_at` stamp. Created on both backends for adapter-schema
+//       consistency; SQLite wires snapshot/restore this commit, postgres
+//       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
+//       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 70;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1351,8 +1359,11 @@ impl PostgresStore {
         if current_version < 68 {
             self.migrate_v68().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 69 {
             self.migrate_v69().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v70().await?;
         }
 
         Ok(())
@@ -3239,6 +3250,81 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v69 applied (#1735 Pillar-4 4.C: kg_projection_outbox — \
              staggered AGE cold-path projection queue)"
+        );
+        Ok(())
+    }
+
+    /// v70 (#1771, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+    /// edge-preservation snapshot table. archive-then-delete copies only
+    /// the memory ROW into `archived_memories`; the same-tx cascade
+    /// `DELETE FROM memories` reaps the row's `memory_links` (FK
+    /// `ON DELETE CASCADE`), so `restore_archived` brought the row back
+    /// with an empty edge graph. This table is the snapshot destination.
+    ///
+    /// **Postgres scope this commit:** the table + schema bump only — the
+    /// snapshot-before-delete + restore-re-insert wiring is wired on
+    /// SQLite this commit and is a tracked POSTGRES follow-up. The table
+    /// is created on both backends now so the two adapters share the
+    /// logical schema number and a future postgres wiring commit has the
+    /// destination already present.
+    ///
+    /// Additive `CREATE TABLE IF NOT EXISTS` (the v59/v60/v69 precedent) —
+    /// no rewrite of an existing table, replay-safe. Mirrors `memory_links`
+    /// columns but carries NO `REFERENCES memories(id)` FK (archive table,
+    /// like `archived_memories`) plus an `archived_at` stamp.
+    async fn migrate_v70(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v70 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS archived_memory_links ( \
+                 source_id    TEXT NOT NULL, \
+                 target_id    TEXT NOT NULL, \
+                 relation     TEXT NOT NULL DEFAULT 'related_to', \
+                 created_at   TIMESTAMPTZ NOT NULL, \
+                 valid_from   TIMESTAMPTZ, \
+                 valid_until  TIMESTAMPTZ, \
+                 observed_by  TEXT, \
+                 signature    BYTEA, \
+                 attest_level TEXT, \
+                 archived_at  TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (source_id, target_id, relation) \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 create archived_memory_links", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx \
+                 ON archived_memory_links(source_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 index archived_memory_links source", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS archived_memory_links_target_idx \
+                 ON archived_memory_links(target_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 index archived_memory_links target", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 70).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v70 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v70 applied (#1771: archived_memory_links — \
+             archive-link edge-preservation snapshot table)"
         );
         Ok(())
     }

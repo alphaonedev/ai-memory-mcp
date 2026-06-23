@@ -233,7 +233,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `ApproverType::Human` opt-in self-approval + is_registered_agent gate in
     // `approve_with_approver_type` + the `human_arm_self_approval_gated_under_opt_in_1787`
     // regression test landed it at 19_991.
-    ("src/storage/mod.rs", 20_050),
+    // 2026-06-23 (#1771) — bumped 20_050 → 20_400 (lockstep): the
+    // `archived_memory_links` edge-preservation wiring — `archive_links_for_memory`
+    // + `restore_links_for_memory` helpers, the snapshot-before-delete blocks in
+    // `forget` / `forget_for_caller`, the restore re-insert calls, and the three
+    // 1771 regression tests — landed it at 20_350.
+    ("src/storage/mod.rs", 20_400),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -542,7 +547,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // UPDATE` the kind, refuse reflection/persona, `UPDATE` kind + version,
     // atomic `memory.reclassified` signed_event via
     // `pg_append_signed_event_with_chain_in_tx`) added ~76 LOC (actual 21_124).
-    ("src/store/postgres.rs", 21_200),
+    // 2026-06-23 (#1771) — bumped 21_200 → 21_300 (lockstep): the
+    // `migrate_v70` arm + `archived_memory_links` DDL landed it at 21_254.
+    ("src/store/postgres.rs", 21_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -798,7 +805,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // migration arm (probe-then-ADD encrypted_envelope on
     // archived_memories) + the pinned-v67 arm + the v68 history
     // doc-comment landed the file at 4_487. 4_500 = 4_487 + 13 headroom.
-    ("src/storage/migrations.rs", 4_500),
+    // 2026-06-23 (#1771) — bumped 4_500 → 4_600 (lockstep): the v70
+    // `archived_memory_links` migration arm + bootstrap-SCHEMA CREATE landed
+    // it at 4_560.
+    ("src/storage/migrations.rs", 4_600),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 69).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 70).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -256,6 +256,31 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- / `advances` for the Goal/Plan/Step wiring relations.
     CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
+
+-- v70 (#1771) — edge-preservation snapshot table. Mirrors memory_links
+-- columns but carries NO `REFERENCES memories(id)` FK (it is an archive
+-- table, like archived_memories itself) plus an `archived_at` stamp. The
+-- explicit/recovery-expected delete paths snapshot a memory's edges here
+-- BEFORE the cascade DELETE so restore can re-insert them. Also created by
+-- migration v70 for upgrading DBs; carried inline here so a fresh bootstrap
+-- that applies SCHEMA has it even before the ladder runs.
+CREATE TABLE IF NOT EXISTS archived_memory_links (
+    source_id    TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    relation     TEXT NOT NULL DEFAULT 'related_to',
+    created_at   TEXT NOT NULL,
+    valid_from   TEXT,
+    valid_until  TEXT,
+    observed_by  TEXT,
+    signature    BLOB,
+    attest_level TEXT,
+    archived_at  TEXT NOT NULL,
+    PRIMARY KEY (source_id, target_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
+    ON archived_memory_links(source_id);
+CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
+    ON archived_memory_links(target_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -650,7 +675,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 69;
+const CURRENT_SCHEMA_VERSION: i64 = 70;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2845,7 +2870,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 68 {
             // v68 = #228 / #1728 (v0.8.0 encryption wire-up, Commit A) —
             // mirror the `encrypted_envelope` column onto
             // `archived_memories` so archiving an encrypted memory
@@ -2884,6 +2909,46 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // defer and no table to create here. Postgres applies it via
         // `PostgresStore::migrate_v69`. The unconditional stamp below moves
         // the SQLite schema to v69 so both adapters share the logical number.
+
+        if version < 70 {
+            // v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+            // edge-preservation snapshot table. archive-then-delete copies only
+            // the memory ROW into `archived_memories`; the same-tx cascade
+            // `DELETE FROM memories` reaps the row's `memory_links`
+            // (FK `ON DELETE CASCADE`), so a `restore_archived` brought the row
+            // back with an EMPTY edge graph. This table is the snapshot
+            // destination: the explicit/recovery-expected delete paths (`forget`,
+            // `forget_for_caller`, `archive_memory_no_tx`) copy the memory's
+            // edges here BEFORE the DELETE, and `restore_archived` /
+            // `restore_archived_for_caller` re-insert the preserved edges whose
+            // both endpoints still exist.
+            //
+            // PURE ADDITIVE `CREATE TABLE IF NOT EXISTS` — NO full-table rebuild.
+            // (A rebuild silently drops every trigger — the project's hard lesson,
+            // v63→v65.) Mirrors `memory_links` columns but carries NO
+            // `REFERENCES memories(id)` FK (it is an archive table, like
+            // `archived_memories` itself) plus an `archived_at` stamp. Also added
+            // inline to the bootstrap `SCHEMA` const so fresh DBs have it.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS archived_memory_links (
+                    source_id    TEXT NOT NULL,
+                    target_id    TEXT NOT NULL,
+                    relation     TEXT NOT NULL DEFAULT 'related_to',
+                    created_at   TEXT NOT NULL,
+                    valid_from   TEXT,
+                    valid_until  TEXT,
+                    observed_by  TEXT,
+                    signature    BLOB,
+                    attest_level TEXT,
+                    archived_at  TEXT NOT NULL,
+                    PRIMARY KEY (source_id, target_id, relation)
+                );
+                CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
+                    ON archived_memory_links(source_id);
+                CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
+                    ON archived_memory_links(target_id);",
+            )?;
+        }
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
