@@ -35,6 +35,23 @@ lifecycle surface adds only permissive optional fields to the existing
   `/sync/push` and `/sync/since`. Design fixed by the 5-agent adversarial vote (memory `4d3ea1c5`).
   Code anchor: `src/handlers/federation_signing_check.rs`.
 
+- **[#1774](https://github.com/alphaonedev/ai-memory-mcp/issues/1774) — consolidation now requires a
+  stored embedding on BOTH sides of a pair.** Consolidation clustering merges a candidate pair only
+  when it passes **BOTH** the Jaccard pre-filter **AND** the cosine gate; the cosine gate now requires
+  a stored embedding on each side. When either side lacks a stored embedding (keyword-tier /
+  never-embedded / oversize-skip rows, no embedder wired, or an embed failure) the pair **no longer
+  merges**. This closes a destructive false-positive-merge gap: previously an un-embedded pair could
+  merge-and-delete on lexical Jaccard overlap **alone**, bypassing the cosine safety gate — and two
+  distinct memories can share high Jaccard (e.g. templated content), so lexical overlap is not a safe
+  basis for a destructive op. **Behavior change:** un-embedded / keyword-tier corpora no longer
+  auto-consolidate; deployments that want consolidation must run the embedder. This mirrors the
+  substrate's skip-on-missing-embedding posture for the other destructive path
+  (`proactive_conflict_check` filters `embedding IS NOT NULL`). **No config knob** is added. Affects
+  both the autonomy Pass-1 consolidator (`crate::autonomy::find_consolidation_clusters`) and the SAL
+  `ConsolidationPass` (`crate::curator::cluster::pair_merges`, `ConsolidationClustering`), kept
+  byte-consistent. Design fixed by the 5-agent adversarial vote (memory `4d3ea1c5`). Code anchors:
+  `src/curator/cluster.rs`, `src/autonomy.rs`, `src/curator/compaction.rs`.
+
 ### Added
 
 - **#1734 (PE-1) — mandatory-hook *presence* enforcement (required-event → fail-closed).**

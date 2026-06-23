@@ -5,13 +5,16 @@
 //!
 //! [`ConsolidationClustering`] is the single consolidation clusterer used by
 //! `ConsolidationPass`. It is **reconciled to** `crate::autonomy::
-//! find_consolidation_clusters` (#1740/#1741): a pair merges iff it passes a
-//! **Jaccard pre-filter AND a cosine gate** — both must hold when embeddings
-//! are available; when either side's embedding is missing (no embedder wired,
-//! or an embed failure) the pair falls back to **Jaccard-only**, exactly
-//! mirroring autonomy's per-pair contract. Greedy single-link, namespace-
-//! scoped (never merges across namespaces, skips reserved `_`-prefixed), and
-//! capped at [`MAX_CLUSTER_SIZE`].
+//! find_consolidation_clusters` (#1740/#1741): a pair merges iff it passes
+//! **BOTH a Jaccard pre-filter AND a cosine gate** — both must hold, and the
+//! cosine gate requires a stored embedding on **each** side. When either
+//! side's embedding is missing (no embedder wired, an embed failure, a
+//! keyword-tier / never-embedded / oversize-skip row) the pair does **NOT**
+//! merge (#1774, 5-agent vote 4d3ea1c5): a destructive consolidation merge is
+//! never decided on lexical Jaccard overlap alone — the cosine safety gate is
+//! mandatory. This exactly mirrors autonomy's per-pair contract. Greedy
+//! single-link, namespace-scoped (never merges across namespaces, skips
+//! reserved `_`-prefixed), and capped at [`MAX_CLUSTER_SIZE`].
 //!
 //! The per-pair decision is factored into the pure [`pair_merges`] function so
 //! the AND-gate semantics are unit-tested deterministically WITHOUT a live
@@ -64,9 +67,10 @@ pub(crate) const DEFAULT_COSINE_THRESHOLD: f32 = 0.75;
 ///
 /// Mirrors `crate::autonomy::find_consolidation_clusters`'s per-pair contract
 /// exactly: the Jaccard pre-filter is mandatory (`jaccard >= jaccard_threshold`),
-/// then the cosine gate applies **only when a cosine value is available**
-/// (`Some(c) => c >= cosine_threshold`); when no embedding is available for one
-/// or both sides (`None`) the pair clusters on the Jaccard signal alone.
+/// then the cosine gate must ALSO hold (`Some(c) => c >= cosine_threshold`).
+/// #1774 — when no embedding is available for one or both sides (`None`) the
+/// pair does NOT merge: a destructive consolidation merge requires the cosine
+/// safety gate, never Jaccard lexical overlap alone.
 ///
 /// Pure + total, so the AND-gate is unit-tested without a live `Embedder`.
 pub(crate) fn pair_merges(
@@ -80,7 +84,19 @@ pub(crate) fn pair_merges(
     }
     match cos {
         Some(c) => c >= cosine_threshold,
-        None => true,
+        // #1774 (5-agent vote 4d3ea1c5 → A) — REQUIRE a cosine value (both
+        // sides embedded) for a destructive merge. Pre-fix `None => true`
+        // merged un-embedded rows (keyword-tier / never-embedded / oversize)
+        // on Jaccard lexical overlap ALONE, bypassing the cosine safety gate
+        // — a false-positive merge then merge-and-deletes a distinct memory.
+        // Lexical overlap is not a safe basis for a destructive op (two
+        // distinct memories can share high Jaccard, e.g. templated content),
+        // and there is no defensible lexical-only threshold comparable to the
+        // semantic gate. This mirrors the codebase's skip-on-missing-embedding
+        // posture for the other DESTRUCTIVE path (proactive_conflict_check
+        // filters `embedding IS NOT NULL`). Un-embedded corpora no longer
+        // auto-consolidate (documented behavior change).
+        None => false,
     }
 }
 
@@ -100,9 +116,11 @@ pub(crate) fn pair_merges(
 ///    `db::get_embedding` source exactly, #1743). A `None` entry means the row
 ///    has no stored embedding (keyword-tier / never-embedded / oversize-skip).
 /// 3. For each unused seed, scan later members; a pair joins the cluster iff
-///    [`pair_merges`] (Jaccard pre-filter AND cosine gate, Jaccard-only when an
-///    embedding is absent on either side). Clusters are capped at
-///    `max_cluster_size`.
+///    [`pair_merges`] — the Jaccard pre-filter AND the cosine gate must BOTH
+///    hold. When an embedding is absent on either side the pair does NOT merge
+///    (#1774): a missing embedding means no cosine value, and a destructive
+///    merge is never decided on Jaccard lexical overlap alone. Clusters are
+///    capped at `max_cluster_size`.
 /// 4. Singletons are discarded (only clusters of ≥ 2 are returned).
 pub(crate) struct ConsolidationClustering {
     /// Jaccard pre-filter threshold. Defaults to [`JACCARD_THRESHOLD`].
@@ -295,9 +313,19 @@ mod tests {
     }
 
     #[test]
-    fn pair_merges_high_jaccard_missing_embedding_falls_back_to_jaccard() {
-        // No cosine available → Jaccard-only fallback (autonomy's contract).
-        assert!(pair_merges(0.80, JACCARD_THRESHOLD, None, 0.75));
+    fn pair_merges_high_jaccard_missing_embedding_does_not_merge() {
+        // #1774 — no cosine available (embedding absent on a side) → NO merge:
+        // a destructive merge is never decided on Jaccard lexical overlap alone.
+        assert!(!pair_merges(0.80, JACCARD_THRESHOLD, None, 0.75));
+    }
+
+    #[test]
+    fn pair_merges_1774_missing_embedding_blocks_merge_present_embedding_merges() {
+        // #1774 (5-agent vote 4d3ea1c5) focused pin: a missing embedding on a
+        // side blocks the merge even at high Jaccard; both sides embedded and
+        // above the cosine gate still merges.
+        assert!(!pair_merges(0.9, JACCARD_THRESHOLD, None, 0.75));
+        assert!(pair_merges(0.9, JACCARD_THRESHOLD, Some(0.8), 0.75));
     }
 
     #[test]
@@ -359,17 +387,30 @@ mod tests {
 
     // ---- ConsolidationClustering (deterministic; injected stored vectors) --
     //
-    // `embeddings` aligns 1:1 to `memories`; `None` = no stored vector
-    // (Jaccard-only for that pair). No live `Embedder` is constructed — these
-    // are fully deterministic and CI-cache-independent (#1743).
+    // `embeddings` aligns 1:1 to `memories`; `None` = no stored vector. Per
+    // #1774 a pair with a `None` on either side does NOT merge (the cosine
+    // safety gate is mandatory for a destructive merge). No live `Embedder` is
+    // constructed — these are fully deterministic and CI-cache-independent
+    // (#1743).
 
-    /// `None` embeddings of length `n` (Jaccard-only path).
+    /// `None` embeddings of length `n` — the un-embedded / keyword-tier path.
+    /// Per #1774 a pair lacking a stored vector on either side never merges.
     fn no_embs(n: usize) -> Vec<Option<Vec<f32>>> {
         vec![None; n]
     }
 
+    /// Identical aligned stored vectors of length `n` (cosine = 1.0 for every
+    /// pair) — drives the embedded merge path deterministically post-#1774,
+    /// for tests whose subject is namespace/cap logic, not the missing-vector
+    /// contract.
+    fn aligned_embs(n: usize) -> Vec<Option<Vec<f32>>> {
+        vec![Some(vec![1.0_f32, 0.0]); n]
+    }
+
     #[test]
-    fn clusters_jaccard_only_groups_near_duplicates_when_no_stored_vectors() {
+    fn clusters_no_stored_vectors_do_not_merge_1774() {
+        // #1774 — un-embedded corpus: even near-identical (high-Jaccard)
+        // content does NOT cluster without a cosine value on both sides.
         let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
         let mems = [
@@ -378,10 +419,10 @@ mod tests {
             make_memory("c", "ns", "completely different unrelated content here"),
         ];
         let clusters = strategy.cluster_memories(&mems, &no_embs(3));
-        assert_eq!(clusters.len(), 1, "expected one cluster; got {clusters:?}");
-        assert!(clusters[0].contains(&"a".to_string()));
-        assert!(clusters[0].contains(&"b".to_string()));
-        assert!(!clusters[0].contains(&"c".to_string()));
+        assert!(
+            clusters.is_empty(),
+            "un-embedded pairs must not merge on Jaccard alone; got {clusters:?}"
+        );
     }
 
     #[test]
@@ -405,18 +446,18 @@ mod tests {
     }
 
     #[test]
-    fn clusters_missing_one_vector_falls_back_to_jaccard() {
-        // One side has no stored vector → Jaccard-only for the pair (autonomy's
-        // per-pair contract); identical content → merge despite the missing vec.
+    fn clusters_missing_one_vector_does_not_merge_1774() {
+        // #1774 — one side has no stored vector → no cosine value → NO merge,
+        // even for identical (high-Jaccard) content. A destructive merge is
+        // never decided on Jaccard lexical overlap alone.
         let strategy = ConsolidationClustering::new();
         let dup = "kubernetes rolling canary deploy strategy kubernetes deploy";
         let mems = [make_memory("a", "ns", dup), make_memory("b", "ns", dup)];
         let embs = vec![Some(vec![1.0_f32, 0.0]), None];
         let clusters = strategy.cluster_memories(&mems, &embs);
-        assert_eq!(
-            clusters.len(),
-            1,
-            "missing-vector pair must Jaccard-fallback-merge"
+        assert!(
+            clusters.is_empty(),
+            "missing-vector pair must NOT merge; got {clusters:?}"
         );
     }
 
@@ -454,7 +495,14 @@ mod tests {
         let mems: Vec<Memory> = (0..10)
             .map(|i| make_memory(&format!("m{i}"), "ns", "shared token content shared"))
             .collect();
-        let clusters = strategy.cluster_memories(&mems, &no_embs(mems.len()));
+        // Aligned stored vectors (cosine = 1.0) so pairs actually merge
+        // post-#1774 — this test's subject is the size cap, not the
+        // missing-vector contract.
+        let clusters = strategy.cluster_memories(&mems, &aligned_embs(mems.len()));
+        assert!(
+            !clusters.is_empty(),
+            "expected clusters to exercise the cap"
+        );
         for c in &clusters {
             assert!(c.len() <= 3, "cluster size {}", c.len());
         }
@@ -481,7 +529,9 @@ mod tests {
             make_memory("b", "ns", s),
             make_memory("c", "ns", s),
         ];
-        let clusters = strategy.cluster_memories(&mems, &no_embs(3));
+        // Aligned stored vectors (cosine = 1.0) so all three pairs merge
+        // post-#1774 — this test's subject is the `used[b]` skip branch.
+        let clusters = strategy.cluster_memories(&mems, &aligned_embs(3));
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].len(), 3);
     }
