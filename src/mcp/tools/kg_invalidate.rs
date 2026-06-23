@@ -128,6 +128,19 @@ pub fn handle_kg_invalidate(
         }
     }
 
+    // #1778 — owner gate: refuse invalidating a link ROOTED at a source memory
+    // owned by a DIFFERENT agent (the MCP kg_invalidate path lacked the
+    // caller-owns-source check its HTTP twin #938 enforces, leaving a
+    // cross-owner edge-tamper primitive). Keyed on the enforced-read caller
+    // (`resolve_read_visibility_caller`) so it fires ONLY when AI_MEMORY_AGENT_ID
+    // is set (multi-tenant opt-in); single-operator trust-all default unchanged.
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller()
+        && let Some(src) = db::get(conn, source_id).map_err(|e| e.to_string())?
+        && !crate::visibility::caller_owns_for_mutation(&src, &caller, false)
+    {
+        return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+    }
+
     match db::invalidate_link(conn, source_id, target_id, relation, valid_until)
         .map_err(|e| e.to_string())?
     {
