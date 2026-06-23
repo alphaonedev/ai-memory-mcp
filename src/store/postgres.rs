@@ -12747,9 +12747,36 @@ impl MemoryStore for PostgresStore {
 
     async fn clear_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
     ) -> StoreResult<bool> {
+        // #1777 — owner gate (parity with the MCP/sqlite #929 mirror). Clearing a
+        // namespace's governance standard disarms the delete/write/promote gates
+        // protecting every memory in the namespace, so it must be owner-gated
+        // like SET. The standard memory's owner is `metadata->>'agent_id'`;
+        // refuse a clear by a different named agent (admin/bypass + unowned pass).
+        if !ctx.bypass_visibility {
+            let recorded_owner: Option<String> = sqlx::query_scalar(
+                "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+                 JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+            )
+            .bind(namespace)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?
+            .flatten();
+            if let Some(owner) = recorded_owner
+                && !owner.is_empty()
+                && owner != "system"
+                && owner != ctx.effective_principal()
+            {
+                return Err(StoreError::PermissionDenied {
+                    action: "clear_namespace_standard".to_string(),
+                    target: namespace.to_string(),
+                    reason: format!("caller does not own this namespace standard (owner: {owner})"),
+                });
+            }
+        }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")
             .bind(namespace)
             .execute(&self.pool)
