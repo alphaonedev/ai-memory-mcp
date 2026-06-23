@@ -147,6 +147,14 @@ fn reset_env() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+        // #1789 — these tests pin the #238 SENDER-ATTESTATION layer (which
+        // runs AFTER the signing-check gate in sync_push). They push an
+        // unenrolled X-Peer-Id with no signature, so the v0.8 strict
+        // peer-enrollment default would short-circuit with a 401 and mask
+        // the attestation 200/403 the cases assert. Opt back to the
+        // permissive enrollment posture so the attestation layer is reached.
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+        std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
     }
 }
 

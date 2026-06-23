@@ -156,6 +156,13 @@ fn reset_env() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::SYNC_TRUST_PEER_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
+        // #1789 — these tests pin the #978 legacy-row visibility filter on
+        // /sync/since with an unenrolled X-Peer-Id and no signature, hitting
+        // the (None,None) arm. v0.8 flipped that arm's secure default to
+        // strict (401); opt back to permissive to preserve each test's
+        // visibility-filter intent.
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+        std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
     }
 }
 

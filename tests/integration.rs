@@ -8926,6 +8926,12 @@ fn install_federation_legacy_bypass() {
         unsafe {
             std::env::set_var("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
             std::env::set_var("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+            // #1789 — v0.8 flipped peer enrollment to the secure default
+            // (strict). This helper restores the pre-v0.7.0 permissive
+            // posture for the in-process suite, so opt back out of the
+            // enrollment requirement too (the per-issue g_issue_239_* /
+            // 978 binaries pin the strict default in their own processes).
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
         }
     });
 }

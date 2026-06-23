@@ -1022,27 +1022,30 @@ pub(super) fn verify_signature_or_reject(
         }
         (None, None) => {
             // v0.7.0 #1088 (SR-1 #3, MEDIUM) — fail-CLOSED on
-            // unenrolled-peer attribution spoofing when the operator
-            // opts in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
-            // Default-off at v0.7.0 so existing zero-config peers keep
-            // working; v0.8 will flip the secure default. Companion
-            // env var to `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (the
-            // permissive escape hatch on the SAME arm post-#1056).
-            if require_peer_enrollment_enabled() {
+            // unenrolled-peer attribution spoofing. v0.8.0 #1789 flipped
+            // the secure default ON: enrollment is REQUIRED by default,
+            // and the companion escape hatch
+            // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` opens a rollout
+            // window that accepts unenrolled peers on this SAME arm.
+            // 5-agent vote (memory `4d3ea1c5`) fixed the flip.
+            if require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled() {
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
-                    "sync_push: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                    "sync_push: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
-                                     X-Peer-Id without an enrolled key (#1088). Enroll \
-                                     the peer's Ed25519 key via the operator workflow, \
-                                     or unset the env var to revert to permissive.",
+                            "note": "Federation requires peer enrollment by default at \
+                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
+                                     key is refused. Enroll the peer's key via the operator \
+                                     workflow, or set AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 \
+                                     to revert to v0.7.x permissive, OR set \
+                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
+                                     unenrolled peers during a rollout window.",
                         })),
                     )
                         .into_response(),
@@ -1058,16 +1061,55 @@ pub(super) fn verify_signature_or_reject(
     }
 }
 
-/// v0.7.0 #1088 — `true` when the operator has opted into the
-/// stricter zero-config federation posture by setting
-/// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`. Returns `false`
-/// (default permissive) otherwise. Honored by both
+/// v0.8.0 #1789 — `true` when peer-enrollment is required (the v0.8
+/// **secure default**). UNSET — or any non-falsy value — returns `true`:
+/// federation refuses an `X-Peer-Id` without an enrolled Ed25519 key.
+/// An explicit falsy value (`0` / `false` / `no` / `off`, case-insensitive,
+/// trimmed) returns `false`, reverting to the v0.7.x permissive posture
+/// where unenrolled peers are accepted. Honored by both
 /// `verify_signature_or_reject` and `verify_get_signature_or_reject`
-/// so the `(None, None)` arm fails closed on both surfaces when the
-/// operator enables it.
+/// so the `(None, None)` arm fails closed on both surfaces by default.
+///
+/// History: at v0.7.0 (#1088) this defaulted OFF (permissive) and only
+/// `1`/`true` opted IN to strict enforcement. v0.8.0 (#1789) flipped the
+/// secure default ON; the companion escape hatch
+/// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (`allow_unenrolled_peers_enabled`)
+/// preserves a rollout opt-out. The 5-agent vote (memory `4d3ea1c5`)
+/// fixed this flip.
 fn require_peer_enrollment_enabled() -> bool {
-    std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    match std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT") {
+        Ok(v) => {
+            let t = v.trim();
+            // Explicit falsy values revert to v0.7.x permissive; everything
+            // else (including the truthy `1`/`true`/`yes`/`on` and any other
+            // non-empty string) keeps the v0.8 secure default ON.
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
+        }
+        // UNSET → secure default ON (#1789).
+        Err(_) => true,
+    }
+}
+
+/// v0.8.0 #1789 — companion permissive escape hatch (env #44).
+/// Returns `true` when `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` is truthy
+/// (`1` / `true` / `yes` / `on`, case-insensitive, trimmed), `false`
+/// otherwise (the default). When enabled it accepts unenrolled peers on
+/// the `(None, None)` arm even though enrollment is required by the v0.8
+/// secure default — the rollout window opt-out so the #1789 flip is not a
+/// hard break with no escape. Honored by both `verify_signature_or_reject`
+/// and `verify_get_signature_or_reject`.
+fn allow_unenrolled_peers_enabled() -> bool {
+    std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS")
+        .map(|v| {
+            let t = v.trim();
+            t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        })
         .unwrap_or(false)
 }
 
@@ -1291,21 +1333,31 @@ pub(super) fn verify_get_signature_or_reject(
         }
         (None, None) => {
             // v0.7.0 #1088 — same fail-CLOSED arm as
-            // `verify_signature_or_reject`. Honors the operator
-            // opt-in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
-            if require_peer_enrollment_enabled() {
+            // `verify_signature_or_reject`. v0.8.0 #1789 flipped the
+            // secure default ON: enrollment is REQUIRED by default, and
+            // the companion escape hatch
+            // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` opens a rollout
+            // window that accepts unenrolled peers on this SAME arm.
+            // 5-agent vote (memory `4d3ea1c5`) fixed the flip.
+            if require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled() {
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
-                    "sync_since: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                    "sync_since: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
-                                     X-Peer-Id without an enrolled key on /sync/since (#1088).",
+                            "note": "Federation requires peer enrollment by default at \
+                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
+                                     key is refused on /sync/since. Enroll the peer's key \
+                                     via the operator workflow, or set \
+                                     AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 to revert to \
+                                     v0.7.x permissive, OR set \
+                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
+                                     unenrolled peers during a rollout window.",
                         })),
                     )
                         .into_response(),
@@ -1354,8 +1406,8 @@ mod verify_arm_tests {
     //! with synthetic headers rather than going through the router.
 
     use super::{
-        canonical_get_bytes, require_peer_enrollment_enabled, verify_get_signature_or_reject,
-        verify_signature_or_reject,
+        allow_unenrolled_peers_enabled, canonical_get_bytes, require_peer_enrollment_enabled,
+        verify_get_signature_or_reject, verify_signature_or_reject,
     };
     use crate::federation::signing::{
         ED25519_PREFIX, REQUIRE_NONCE_ENV, REQUIRE_SIG_ENV, SIGNATURE_HEADER,
@@ -1390,10 +1442,15 @@ mod verify_arm_tests {
     fn require_peer_enrollment_env_arms() {
         let _g = env_lock();
         // SAFETY: env mutation under the test-scoped lock.
+        // v0.8.0 #1789 — UNSET is now the SECURE DEFAULT (strict), the
+        // inverse of the v0.7.0 permissive default.
         unsafe {
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
-        assert!(!require_peer_enrollment_enabled(), "unset → permissive");
+        assert!(
+            require_peer_enrollment_enabled(),
+            "unset → strict (v0.8 secure default #1789)"
+        );
         unsafe {
             std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
         }
@@ -1404,6 +1461,71 @@ mod verify_arm_tests {
         assert!(require_peer_enrollment_enabled(), "true → strict");
         unsafe {
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+    }
+
+    #[test]
+    fn require_peer_enrollment_falsy_opt_out() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — explicit falsy values revert to v0.7.x permissive.
+        // SAFETY: env mutation under the test-scoped lock.
+        for falsy in ["0", "false", "FALSE", "no", "No", "off", "OFF", " off "] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", falsy);
+            }
+            assert!(
+                !require_peer_enrollment_enabled(),
+                "{falsy:?} → permissive (falsy opt-out)"
+            );
+        }
+        // Truthy + any other non-falsy string keeps the secure default ON.
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", truthy);
+            }
+            assert!(
+                require_peer_enrollment_enabled(),
+                "{truthy:?} → strict (non-falsy)"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+    }
+
+    #[test]
+    fn allow_unenrolled_peers_env_arms() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — companion escape hatch (#44). Default false;
+        // truthy 1/true/yes/on enables it.
+        // SAFETY: env mutation under the test-scoped lock.
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        assert!(
+            !allow_unenrolled_peers_enabled(),
+            "unset → escape hatch closed"
+        );
+        for truthy in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " on "] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", truthy);
+            }
+            assert!(
+                allow_unenrolled_peers_enabled(),
+                "{truthy:?} → escape hatch open"
+            );
+        }
+        for non_truthy in ["0", "false", "no", "off", "garbage"] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", non_truthy);
+            }
+            assert!(
+                !allow_unenrolled_peers_enabled(),
+                "{non_truthy:?} → escape hatch closed"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
     }
 
@@ -1440,35 +1562,69 @@ mod verify_arm_tests {
     }
 
     #[test]
-    fn push_none_none_permissive_when_not_strict() {
+    fn push_none_none_permissive_when_falsy_opt_out() {
         let _g = env_lock();
+        // v0.8.0 #1789 — UNSET is now strict, so the permissive arm is
+        // reached by an explicit falsy opt-out. (Preserved-intent: this
+        // test still pins that the (None,None) arm CAN allow.)
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
-            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        // No sig, no enrolled key, not strict → allow-with-WARN (None).
+        // No sig, no enrolled key, falsy opt-out → allow-with-WARN (None).
         let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
-        assert!(out.is_none(), "(None,None) permissive arm must allow");
+        assert!(
+            out.is_none(),
+            "(None,None) permissive arm must allow under falsy opt-out"
+        );
     }
 
     #[test]
-    fn push_none_none_strict_refuses_1088() {
+    fn push_none_none_permissive_when_escape_hatch() {
         let _g = env_lock();
+        // v0.8.0 #1789 — escape hatch: enrollment required by default but
+        // AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 allows unenrolled peers
+        // during a rollout window.
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
-            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
         let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
-            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
-        let resp = out.expect("#1088 strict must refuse unenrolled peer");
+        assert!(
+            out.is_none(),
+            "(None,None) escape-hatch arm must allow during rollout"
+        );
+    }
+
+    #[test]
+    fn push_none_none_strict_refuses_by_default_1789() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — UNSET is the secure default; refuses with no
+        // opt-out set. The escape hatch is explicitly removed so the
+        // strict path is deterministic.
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        let resp = out.expect("#1789 secure default must refuse unenrolled peer");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -1525,6 +1681,7 @@ mod verify_arm_tests {
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
             std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
         let out = verify_get_signature_or_reject(
@@ -1541,6 +1698,34 @@ mod verify_arm_tests {
         }
         let resp = out.expect("#1088 strict must refuse on GET path");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn get_none_none_escape_hatch_allows_1789() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — escape hatch on the GET surface mirrors push.
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_get_signature_or_reject(
+            "GET",
+            "/api/v1/sync/since",
+            "limit=10",
+            &HeaderMap::new(),
+            Some("unenrolled"),
+            &cache,
+        );
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        assert!(
+            out.is_none(),
+            "escape hatch must allow unenrolled peer on GET during rollout"
+        );
     }
 }
 
