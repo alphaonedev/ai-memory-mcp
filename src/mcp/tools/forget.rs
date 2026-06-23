@@ -22,9 +22,23 @@ fn forget_preview(
     namespace: Option<&str>,
     pattern: Option<&str>,
     tier: Option<&Tier>,
+    owner: Option<&str>,
 ) -> Result<(Vec<db::ForgetMatch>, bool), String> {
-    let mut rows = db::forget_matches(conn, namespace, pattern, tier, DRY_RUN_PREVIEW_CAP + 1)
-        .map_err(|e| e.to_string())?;
+    // #1772 — owner-scope the preview when the multi-tenant opt-in is on so
+    // the dry-run / live-run match listing reflects exactly what
+    // `forget_for_caller` would delete; `None` preserves trust-all default.
+    let mut rows = match owner {
+        Some(c) => db::forget_matches_for_caller(
+            conn,
+            namespace,
+            pattern,
+            tier,
+            DRY_RUN_PREVIEW_CAP + 1,
+            c,
+        ),
+        None => db::forget_matches(conn, namespace, pattern, tier, DRY_RUN_PREVIEW_CAP + 1),
+    }
+    .map_err(|e| e.to_string())?;
     let truncated = rows.len() > DRY_RUN_PREVIEW_CAP;
     rows.truncate(DRY_RUN_PREVIEW_CAP);
     Ok((rows, truncated))
@@ -40,14 +54,27 @@ pub(super) fn handle_forget(
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     let dry_run = params["dry_run"].as_bool().unwrap_or(false);
 
+    // #1772 — owner gate: when the multi-tenant opt-in is on
+    // (`AI_MEMORY_AGENT_ID` set), bulk forget only ever touches the CALLER's
+    // own rows (+ legacy unstamped rows). The MCP forget path calls raw
+    // `db::*` directly (bypassing the HTTP owner gate), so the scoping is
+    // applied here by resolving the ENFORCED-read caller. `None` (unset) =
+    // single-tenant trust-all default → byte-unchanged behaviour. Mirrors the
+    // #1786 promote keying.
+    let owner = crate::identity::resolve_read_visibility_caller();
+
     if dry_run {
-        let count =
-            db::forget_count(conn, namespace, pattern, tier.as_ref()).map_err(|e| e.to_string())?;
+        let count = match owner {
+            Some(ref c) => db::forget_count_for_caller(conn, namespace, pattern, tier.as_ref(), c),
+            None => db::forget_count(conn, namespace, pattern, tier.as_ref()),
+        }
+        .map_err(|e| e.to_string())?;
         // #1602 — sighted preview: the matched rows (id/title/
         // namespace/tier) ride along with the count so callers can see
         // WHAT a destructive pattern is about to remove. The
         // `would_delete` count stays byte-compatible (exact, uncapped).
-        let (rows, truncated) = forget_preview(conn, namespace, pattern, tier.as_ref())?;
+        let (rows, truncated) =
+            forget_preview(conn, namespace, pattern, tier.as_ref(), owner.as_deref())?;
         let rows_json = serde_json::to_value(rows).map_err(|e| e.to_string())?;
         return Ok(json!({
             "would_delete": count,
@@ -62,10 +89,14 @@ pub(super) fn handle_forget(
     // so recovery via memory_archive_restore becomes one call instead
     // of an archive-list expedition. Same connection, synchronous
     // dispatch — the set cannot drift between the SELECT and DELETE.
-    let (matched, truncated) = forget_preview(conn, namespace, pattern, tier.as_ref())?;
+    let (matched, truncated) =
+        forget_preview(conn, namespace, pattern, tier.as_ref(), owner.as_deref())?;
     let deleted_ids: Vec<String> = matched.into_iter().map(|m| m.id).collect();
-    let deleted =
-        db::forget(conn, namespace, pattern, tier.as_ref(), archive).map_err(|e| e.to_string())?;
+    let deleted = match owner {
+        Some(ref c) => db::forget_for_caller(conn, namespace, pattern, tier.as_ref(), archive, c),
+        None => db::forget(conn, namespace, pattern, tier.as_ref(), archive),
+    }
+    .map_err(|e| e.to_string())?;
     Ok(json!({
         "deleted": deleted,
         "archived": archive,
@@ -260,6 +291,7 @@ mod tests {
     // Dry-run path: returns would_delete count without removing rows.
     #[test]
     fn forget_dry_run_counts_without_deleting() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "forget-ns", "a", Tier::Short);
         let _ = insert_one(&conn, "forget-ns", "b", Tier::Short);
@@ -285,6 +317,7 @@ mod tests {
     // Real-delete path: removes matching rows, returns deleted count.
     #[test]
     fn forget_deletes_matching_rows() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "del-ns", "a", Tier::Short);
         let _ = insert_one(&conn, "del-ns", "b", Tier::Short);
@@ -301,6 +334,7 @@ mod tests {
     // Archive flag wired through verbatim.
     #[test]
     fn forget_with_archive_propagates_flag() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "arc-ns", "a", Tier::Mid);
         let resp = handle_forget(&conn, &json!({"namespace": "arc-ns"}), true).expect("ok");
@@ -311,6 +345,7 @@ mod tests {
     // Tier filter is parsed and forwarded.
     #[test]
     fn forget_with_tier_filter() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "tier-ns", "s", Tier::Short);
         let _ = insert_one(&conn, "tier-ns", "m", Tier::Mid);
@@ -327,6 +362,7 @@ mod tests {
     // Invalid tier string falls back to None (tier not applied).
     #[test]
     fn forget_with_invalid_tier_string_treated_as_none() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "bad-tier-ns", "x", Tier::Mid);
         let resp = handle_forget(
@@ -359,6 +395,7 @@ mod tests {
     // id/title/namespace/tier ride along with the count.
     #[test]
     fn forget_dry_run_lists_matched_rows_1602() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let id_a = insert_one(&conn, "preview-ns", "alpha row", Tier::Short);
         let id_b = insert_one(&conn, "preview-ns", "beta row", Tier::Short);
@@ -384,6 +421,7 @@ mod tests {
     // caps the listing, and keeps the count exact.
     #[test]
     fn forget_dry_run_truncates_past_preview_cap_1602() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let total = DRY_RUN_PREVIEW_CAP + 5;
         for i in 0..total {
@@ -407,6 +445,7 @@ mod tests {
     // one memory_archive_restore call.
     #[test]
     fn forget_live_run_returns_deleted_ids_1602() {
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let id_a = insert_one(&conn, "live-ns", "a", Tier::Mid);
         let id_b = insert_one(&conn, "live-ns", "b", Tier::Mid);
@@ -420,5 +459,94 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(ids.contains(&id_a.as_str()) && ids.contains(&id_b.as_str()));
+    }
+
+    // #1772 — insert a memory carrying an explicit `metadata` (so the test can
+    // control `agent_id` — owned by `owner`, or unstamped via `{}`).
+    fn insert_meta(conn: &rusqlite::Connection, ns: &str, title: &str, metadata: Value) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("body for {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata,
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    // #1772 — with AI_MEMORY_AGENT_ID set (multi-tenant opt-in), a bulk forget
+    // deletes ONLY the caller's own rows + legacy unstamped rows; a different
+    // named owner's row SURVIVES. Dry-run reports the same matched set (parity).
+    #[test]
+    fn forget_owner_scoped_1772() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+        let ns = "forget-own-1772";
+        let id_alice = insert_meta(&conn, ns, "alice row", json!({"agent_id": "ai:alice"}));
+        let id_bob = insert_meta(&conn, ns, "bob row", json!({"agent_id": "ai:bob"}));
+        let id_unstamped = insert_meta(&conn, ns, "unstamped row", json!({}));
+
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // Dry-run parity: must report exactly alice's + the unstamped row.
+        let preview = handle_forget(&conn, &json!({"namespace": ns, "dry_run": true}), true)
+            .expect("dry-run ok");
+        assert_eq!(preview["would_delete"].as_u64(), Some(2), "dry-run count");
+        let preview_ids: Vec<&str> = preview["rows"]
+            .as_array()
+            .expect("rows array")
+            .iter()
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert!(preview_ids.contains(&id_alice.as_str()));
+        assert!(preview_ids.contains(&id_unstamped.as_str()));
+        assert!(
+            !preview_ids.contains(&id_bob.as_str()),
+            "bob's row must not appear in alice's preview"
+        );
+
+        // Live run (archive=true): deletes alice's + unstamped; bob survives.
+        let resp = handle_forget(&conn, &json!({"namespace": ns}), true).expect("live ok");
+        assert_eq!(resp["deleted"].as_u64(), Some(2), "live deleted count");
+
+        assert!(
+            db::get(&conn, &id_bob).expect("get bob").is_some(),
+            "bob's row must SURVIVE a cross-owner forget"
+        );
+        assert!(
+            db::get(&conn, &id_alice).expect("get alice").is_none(),
+            "alice's own row must be gone"
+        );
+        assert!(
+            db::get(&conn, &id_unstamped)
+                .expect("get unstamped")
+                .is_none(),
+            "the legacy unstamped row must be gone (unstamped-inclusive)"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 }

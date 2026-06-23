@@ -225,7 +225,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // BEGIN IMMEDIATE wrapper (same #1026 atomicity fix) + the
     // `size_gc_archive_eviction_is_atomic_1782` regression test landed it at
     // 19_620.
-    ("src/storage/mod.rs", 19_700),
+    // 2026-06-23 (#1772) — bumped 19_700 → 19_900 (lockstep): the three
+    // additive owner-scoped `forget_*_for_caller` fns (owner-clause twins of
+    // the existing public forget/forget_count/forget_matches for the
+    // multi-tenant `AI_MEMORY_AGENT_ID` opt-in) landed it at 19_883.
+    ("src/storage/mod.rs", 19_900),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
