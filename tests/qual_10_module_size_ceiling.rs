@@ -758,7 +758,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // enforcement: <mode>` line, matching the `permissions:` banner style).
     // #1580 — bumped 8_850 → 8_890 for the dedicated DLQ-sink + catchup-loop
     // connections (F5.11: both federation workers off the shared writer).
-    ("src/daemon_runtime.rs", 8_890),
+    // 2026-06-23 (#1789) — bumped 8_890 → 8_910: the mtls-router `/sync/*`
+    // bypass test opts back to permissive peer-enrollment (shared-lock RAII
+    // set/restore of AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS) now that the
+    // #1789 secure default 401s the unenrolled arm before the bypass asserts.
+    ("src/daemon_runtime.rs", 8_910),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

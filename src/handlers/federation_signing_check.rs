@@ -1416,12 +1416,13 @@ mod verify_arm_tests {
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine as _;
 
+    // #1789 — delegate to the ONE crate-level `fed_env_test_lock` so the
+    // strict enrollment tests here serialise against the permissive
+    // opt-back guard the `tests` module's `http_sync_*` handler tests use.
+    // A second independent lock would not serialise the two test sets,
+    // letting a parallel run leak the flipped enrollment env across them.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::handlers::fed_env_test_lock()
     }
 
     fn sig_header_value() -> HeaderValue {
