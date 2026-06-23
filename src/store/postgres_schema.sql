@@ -455,6 +455,33 @@ CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories
 CREATE INDEX IF NOT EXISTS archived_memories_archived_at_idx ON archived_memories (archived_at);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- archived_memory_links — v70 (#1771) edge-preservation snapshot.
+-- Mirrors memory_links columns but carries NO `REFERENCES memories(id)`
+-- FK (it is an archive table, like archived_memories itself) plus an
+-- `archived_at` stamp. The explicit/recovery-expected delete paths
+-- snapshot a memory's edges here BEFORE the cascade DELETE so restore can
+-- re-insert them. SQLite wires snapshot/restore this commit; the postgres
+-- snapshot/restore wiring is a tracked follow-up — this table is created
+-- on both backends now for adapter-schema consistency. Fresh installs get
+-- it inline here; upgraded installs via PostgresStore::migrate_v70.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS archived_memory_links (
+    source_id    TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    relation     TEXT NOT NULL DEFAULT 'related_to',
+    created_at   TIMESTAMPTZ NOT NULL,
+    valid_from   TIMESTAMPTZ,
+    valid_until  TIMESTAMPTZ,
+    observed_by  TEXT,
+    signature    BYTEA,
+    attest_level TEXT,
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_id, target_id, relation)
+);
+CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx ON archived_memory_links (source_id);
+CREATE INDEX IF NOT EXISTS archived_memory_links_target_idx ON archived_memory_links (target_id);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- namespace_meta — namespace standard / policy (Tasks 1.6–1.8).
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS namespace_meta (

@@ -2242,6 +2242,72 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
     }
 }
 
+/// #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — snapshot a memory's
+/// `memory_links` edges into `archived_memory_links` BEFORE the memory
+/// row is deleted, so [`restore_archived`] can re-insert them.
+///
+/// archive-then-delete copies only the memory ROW into
+/// `archived_memories`; the same-tx cascade `DELETE FROM memories` reaps
+/// the row's `memory_links` (FK `ON DELETE CASCADE`). Without this
+/// snapshot a restored memory comes back with an EMPTY edge graph. Every
+/// edge where the memory is either endpoint (`source_id = id OR
+/// target_id = id`) is copied; `INSERT OR IGNORE` keeps the snapshot
+/// idempotent against a prior snapshot of the same edge (the archive
+/// PK is `(source_id, target_id, relation)`, same as `memory_links`).
+///
+/// Callers MUST already hold an open transaction — this is called WITHIN
+/// the same `BEGIN IMMEDIATE` as the subsequent `DELETE`, so the snapshot
+/// and the delete pin to the identical row set. Returns the number of
+/// rows snapshotted.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+pub fn archive_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let snapshotted = conn.execute(
+        "INSERT OR IGNORE INTO archived_memory_links
+             (source_id, target_id, relation, created_at, valid_from, valid_until,
+              observed_by, signature, attest_level, archived_at)
+         SELECT source_id, target_id, relation, created_at, valid_from, valid_until,
+                observed_by, signature, attest_level, ?2
+         FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+        params![id, now],
+    )?;
+    Ok(snapshotted)
+}
+
+/// #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — re-insert a restored memory's
+/// preserved `archived_memory_links` edges back into `memory_links`.
+///
+/// Called from [`restore_archived`] / [`restore_archived_for_caller`]
+/// AFTER the memory row is re-inserted, still inside the restore tx. Only
+/// edges whose BOTH endpoints currently exist in `memories` are restored —
+/// `memory_links` carries an `ON DELETE CASCADE` FK on both endpoints, so
+/// an edge whose OTHER endpoint is permanently gone would be rejected (and
+/// is correctly skipped here). Idempotent via `INSERT OR IGNORE`. Returns
+/// the number of edges re-inserted.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+fn restore_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
+    let restored = conn.execute(
+        "INSERT OR IGNORE INTO memory_links
+             (source_id, target_id, relation, created_at, valid_from, valid_until,
+              observed_by, signature, attest_level)
+         SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                aml.valid_from, aml.valid_until, aml.observed_by, aml.signature,
+                aml.attest_level
+         FROM archived_memory_links aml
+         WHERE (aml.source_id = ?1 OR aml.target_id = ?1)
+           AND EXISTS (SELECT 1 FROM memories WHERE id = aml.source_id)
+           AND EXISTS (SELECT 1 FROM memories WHERE id = aml.target_id)",
+        params![id],
+    )?;
+    Ok(restored)
+}
+
 /// #1638 — transaction-free core of [`archive_memory`], for callers
 /// that already hold an open transaction (the supersede path wraps
 /// archive + insert in ONE `BEGIN IMMEDIATE` so a mid-failure leaves
@@ -2285,6 +2351,9 @@ pub(crate) fn archive_memory_no_tx(
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
+        // #1771 — snapshot the row's memory_links BEFORE the cascade DELETE
+        // reaps them, so restore_archived can re-insert the edge graph.
+        archive_links_for_memory(conn, id)?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
         conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
@@ -2581,6 +2650,65 @@ pub fn forget(
                             confidence_source, confidence_signals, confidence_decayed_at,
                             mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                      FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
+                    params![namespace, tier_str, now],
+                )?;
+            }
+        }
+
+        // #1771 — snapshot the to-be-deleted set's memory_links into
+        // archived_memory_links BEFORE the cascade DELETE reaps them, so
+        // restore_archived can re-insert the edge graph. Snapshots edges
+        // touching ANY victim id (source or target endpoint), reusing the
+        // identical victim-id subquery the DELETE below uses so the two pin
+        // to the same row set. Runs only when `archive` so a hard
+        // (non-recoverable) forget keeps its documented edge-loss.
+        if archive {
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?4
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                        )
+                        OR ml.target_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                        )",
+                    params![fts_query, namespace, tier_str, now],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?3
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                        )
+                        OR ml.target_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                        )",
                     params![namespace, tier_str, now],
                 )?;
             }
@@ -2913,6 +3041,75 @@ pub fn forget_for_caller(
                        AND (json_extract(metadata,'$.agent_id') = ?4
                             OR json_extract(metadata,'$.agent_id') IS NULL
                             OR json_extract(metadata,'$.agent_id') = '')",
+                    params![namespace, tier_str, now, caller],
+                )?;
+            }
+        }
+
+        // #1771 — snapshot the to-be-deleted set's memory_links into
+        // archived_memory_links BEFORE the cascade DELETE reaps them (see
+        // [`forget`] for the full rationale). The owner clause (#1772) is
+        // carried into the victim-id subquery so the snapshot pins to the same
+        // owner-scoped row set as the DELETE. Runs only when `archive`.
+        if archive {
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?4
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                              AND (json_extract(m.metadata,'$.agent_id') = ?5
+                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
+                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                        )
+                        OR ml.target_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                              AND (json_extract(m.metadata,'$.agent_id') = ?5
+                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
+                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                        )",
+                    params![fts_query, namespace, tier_str, now, caller],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?3
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                              AND (json_extract(metadata,'$.agent_id') = ?4
+                                   OR json_extract(metadata,'$.agent_id') IS NULL
+                                   OR json_extract(metadata,'$.agent_id') = '')
+                        )
+                        OR ml.target_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                              AND (json_extract(metadata,'$.agent_id') = ?4
+                                   OR json_extract(metadata,'$.agent_id') IS NULL
+                                   OR json_extract(metadata,'$.agent_id') = '')
+                        )",
                     params![namespace, tier_str, now, caller],
                 )?;
             }
@@ -7843,15 +8040,25 @@ pub fn list_archived(
 
 /// Restore an archived memory ROW back into the live `memories` table.
 ///
-/// **Recovery scope (#1771).** This restores the memory row (with full
-/// v0.7.0 column carry per #1025), but NOT its relationship graph: when
-/// the memory was originally archived-then-deleted, its `memory_links`
-/// edges + other `ON DELETE CASCADE` provenance (`recall_observations`,
-/// confidence-calibration rows, `memory_transcript_links`) were
-/// cascade-reaped in the same transaction and were never copied into the
-/// archive. So a restored memory comes back with an EMPTY edge graph.
-/// Edge preservation (an `archived_memory_links` snapshot taken before
-/// the delete, re-inserted here) is the #1771 structural follow-up.
+/// **Recovery scope (#1771).** Restores the memory row (with full v0.7.0
+/// column carry per #1025) AND its `memory_links` edge graph, on sqlite.
+/// The explicit/recovery-expected delete paths (`forget`,
+/// `forget_for_caller`, `archive_memory_no_tx`) snapshot the memory's
+/// edges into `archived_memory_links` BEFORE the same-tx cascade
+/// `DELETE FROM memories` reaps them, and this restore re-inserts every
+/// preserved edge whose BOTH endpoints currently exist (an edge whose
+/// other endpoint is permanently gone is correctly skipped — the FK would
+/// reject it). Idempotent.
+///
+/// **NOT recovered:** edges lost to the auto-eviction paths (`gc` /
+/// `size_gc`) — those are intentionally NOT snapshotted (nobody restores
+/// an auto-eviction; snapshotting there is a perf regression per the
+/// 5-agent vote 4d3ea1c5), so a memory archived by gc restores with an
+/// empty edge graph. Other `ON DELETE CASCADE` provenance
+/// (`recall_observations`, confidence-calibration rows,
+/// `memory_transcript_links`) is regenerable telemetry and is NOT
+/// preserved by design. POSTGRES edge restore is a tracked follow-up
+/// (this commit wires sqlite only).
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
@@ -7946,6 +8153,10 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
+        // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
+        // idempotent). Edges whose other endpoint is permanently gone are
+        // correctly skipped (the FK would reject them).
+        restore_links_for_memory(conn, id)?;
         conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
         Ok(true)
     })();
@@ -8073,6 +8284,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
+        // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
+        // idempotent). See [`restore_archived`] for the contract.
+        restore_links_for_memory(conn, id)?;
         conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
         Ok(true)
     })();
@@ -14202,6 +14416,95 @@ mod tests {
             "#1771 DOCUMENTED LOSS: a restored memory's memory_links are NOT \
              recovered (cascade-reaped at delete time, not archived). Flip this \
              to expect 1 when archived_memory_links preservation lands."
+        );
+    }
+
+    /// #1771 (5-agent vote 4d3ea1c5) — `forget(archive=true)` then restore
+    /// preserves the archived memory's `memory_links`. A is in a namespace
+    /// the forget targets; B is permanent in a DIFFERENT namespace so it
+    /// survives the forget and is a live endpoint at restore time.
+    #[test]
+    fn forget_then_restore_preserves_links_1771() {
+        let conn = test_db();
+        let a = make_memory("forget-link-A", "ns-forget-A", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("forget-link-B", "ns-survives-B", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "precondition: A has one outbound link to B"
+        );
+
+        // Forget (archive) only A's namespace; B is in another namespace.
+        let deleted = forget(&conn, Some("ns-forget-A"), None, None, true).unwrap();
+        assert_eq!(deleted, 1, "forget archives+deletes A only");
+        assert!(get(&conn, &a_id).unwrap().is_none(), "A removed from live");
+        assert!(
+            get(&conn, &b_id).unwrap().is_some(),
+            "B survives the forget"
+        );
+
+        // Restore A: the A->B edge returns (B is still a live endpoint).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "#1771: restore re-inserts the preserved A->B link (B survived)"
+        );
+    }
+
+    /// #1771 — `archive_memory` (single-row clean archive) then restore
+    /// preserves the memory's `memory_links`. Both A and B are permanent.
+    #[test]
+    fn archive_memory_then_restore_preserves_links_1771() {
+        let conn = test_db();
+        let a = make_memory("archive-link-A", "ns1771b", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("archive-link-B", "ns1771b", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(get_links(&conn, &a_id).unwrap().len(), 1);
+
+        assert!(
+            archive_memory(&conn, &a_id, None).unwrap(),
+            "A archived+deleted"
+        );
+        assert!(get(&conn, &a_id).unwrap().is_none(), "A removed from live");
+
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "#1771: restore re-inserts the preserved A->B link"
+        );
+    }
+
+    /// #1771 — restore SKIPS a preserved edge whose OTHER endpoint is
+    /// permanently gone (the FK `ON DELETE CASCADE` would reject it). No FK
+    /// error; the orphan edge is simply not restored.
+    #[test]
+    fn restore_skips_link_whose_other_endpoint_is_gone_1771() {
+        let conn = test_db();
+        let a = make_memory("orphan-link-A", "ns1771c", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("orphan-link-B", "ns1771c", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(get_links(&conn, &a_id).unwrap().len(), 1);
+
+        // Archive A (snapshots the A->B edge), then HARD-delete B so its
+        // endpoint is permanently gone.
+        assert!(archive_memory(&conn, &a_id, None).unwrap());
+        assert!(delete(&conn, &b_id).unwrap(), "B hard-deleted");
+
+        // Restore A: the A->B edge is skipped (B no longer exists).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            0,
+            "#1771: orphan edge correctly skipped (B's endpoint is gone) — no FK error"
         );
     }
 
