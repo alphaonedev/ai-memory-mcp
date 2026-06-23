@@ -180,14 +180,16 @@ pub(super) fn handle_update(
         .map_err(|e| e.to_string())?;
     // #1786 — owner gate: refuse a cross-owner update. The MCP update path calls
     // raw `db::update_with_*` directly (bypassing the SAL trait + the HTTP
-    // `require_caller_owns_memory`), so without this a multi-tenant caller could
-    // overwrite another agent's private memory by id. Lenient + single-tenant-
-    // safe; `allow_inbox = false` mirrors the HTTP `PUT /memories/{id}` gate (#954).
-    {
+    // `require_caller_owns_memory`). Keyed on the ENFORCED-read caller
+    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
+    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in), leaving the
+    // single-operator trust-all default byte-unchanged. `allow_inbox = false`
+    // mirrors the HTTP `PUT /memories/{id}` gate (#954).
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
         let target = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
             .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
-        if !crate::visibility::caller_owns_for_mutation(&target, &agent_id, false) {
+        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
     }

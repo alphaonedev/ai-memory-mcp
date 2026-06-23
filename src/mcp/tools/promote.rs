@@ -105,11 +105,11 @@ pub(super) fn handle_promote(
 
     // #1786 — owner gate: refuse a cross-owner promote / namespace-clone. The
     // MCP promote path calls raw `db::*` directly (bypassing the HTTP
-    // `require_caller_owns_memory`, #930). Lenient + single-tenant-safe;
-    // `allow_inbox = false`.
-    {
-        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+    // `require_caller_owns_memory`, #930). Keyed on the ENFORCED-read caller
+    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
+    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
+    // trust-all default byte-unchanged. `allow_inbox = false`.
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
         if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
