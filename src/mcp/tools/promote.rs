@@ -103,6 +103,18 @@ pub(super) fn handle_promote(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // #1786 — owner gate: refuse a cross-owner promote / namespace-clone. The
+    // MCP promote path calls raw `db::*` directly (bypassing the HTTP
+    // `require_caller_owns_memory`, #930). Lenient + single-tenant-safe;
+    // `allow_inbox = false`.
+    {
+        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+    }
+
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};

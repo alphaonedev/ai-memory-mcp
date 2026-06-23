@@ -178,6 +178,19 @@ pub(super) fn handle_update(
     // governance write gate further down.
     let agent_id = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
         .map_err(|e| e.to_string())?;
+    // #1786 — owner gate: refuse a cross-owner update. The MCP update path calls
+    // raw `db::update_with_*` directly (bypassing the SAL trait + the HTTP
+    // `require_caller_owns_memory`), so without this a multi-tenant caller could
+    // overwrite another agent's private memory by id. Lenient + single-tenant-
+    // safe; `allow_inbox = false` mirrors the HTTP `PUT /memories/{id}` gate (#954).
+    {
+        let target = db::get(conn, &resolved_id)
+            .map_err(|e| e.to_string())?
+            .ok_or(crate::errors::msg::MEMORY_NOT_FOUND)?;
+        if !crate::visibility::caller_owns_for_mutation(&target, &agent_id, false) {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+    }
     // v0.7.0 Provenance Gap 5 (#888) — typed `edit_source`
     // discriminator. `Llm` and `Hook` route through the
     // append-and-archive path so the pre-edit content is preserved

@@ -194,6 +194,20 @@ pub(super) fn handle_delete(
         }
     }
 
+    // #1786 — owner gate: refuse a cross-owner delete. The MCP surface calls
+    // raw `db::delete` directly (bypassing the SAL trait + the HTTP handler's
+    // `require_caller_owns_memory`), so without this a multi-tenant / shared-DB
+    // caller could delete another agent's private memory by id. Lenient +
+    // single-tenant-safe (unstamped / self-owned / daemon / inbox-target pass);
+    // mirrors the HTTP delete-side gate (`allow_inbox = true`).
+    {
+        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
+            .map_err(|e| e.to_string())?;
+        if !crate::visibility::caller_owns_for_mutation(&target, &caller, true) {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+    }
+
     let deleted = db::delete(conn, &target.id).map_err(|e| e.to_string())?;
     if deleted {
         if let Some(idx) = vector_index {
@@ -645,6 +659,51 @@ mod tests {
         assert_eq!(out["status"].as_str(), Some("pending"));
         assert_eq!(out["action"].as_str(), Some("delete"));
         assert!(out["pending_id"].as_str().is_some());
+        crate::config::clear_permissions_mode_override_for_test();
+    }
+
+    #[test]
+    fn cross_owner_delete_refused_1786() {
+        // #1786 — on a DEFAULT deployment (no governance policy, permissions
+        // off) a delete of another owner's row by id must be REFUSED by the
+        // owner gate, and the owner themselves can still delete it.
+        let _gate = crate::config::lock_permissions_mode_for_test();
+        crate::config::override_active_permissions_mode_for_test(
+            crate::config::PermissionsMode::Off,
+        );
+        let conn = fresh_conn();
+        let mem = make_mem("alice-private", "owner-gate-1786"); // owner = ai:alice
+        let id = db::insert(&conn, &mem).expect("insert");
+        let db_path = db_path();
+
+        // ai:bob (≠ owner) is refused; the row stays live.
+        let err = handle_delete(
+            &conn,
+            &db_path,
+            &json!({"id": id, "agent_id": "ai:bob"}),
+            None,
+            None,
+        )
+        .expect_err("cross-owner delete must be refused");
+        assert!(err.contains("does not own"), "got: {err}");
+        assert!(
+            db::get(&conn, &id).unwrap().is_some(),
+            "row must remain live after a refused cross-owner delete"
+        );
+
+        // The owner ai:alice CAN delete it.
+        let ok = handle_delete(
+            &conn,
+            &db_path,
+            &json!({"id": id, "agent_id": "ai:alice"}),
+            None,
+            None,
+        );
+        assert!(ok.is_ok(), "owner delete must succeed: {ok:?}");
+        assert!(
+            db::get(&conn, &id).unwrap().is_none(),
+            "owner delete removes the row"
+        );
         crate::config::clear_permissions_mode_override_for_test();
     }
 }
