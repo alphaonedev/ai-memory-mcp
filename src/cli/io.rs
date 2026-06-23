@@ -4,13 +4,48 @@
 //! `cmd_export`, `cmd_import`, `cmd_mine` migrations.
 
 use crate::cli::CliOutput;
+use crate::db::ConflictMode;
 use crate::models::ConfidenceSource;
 use crate::{config, db, identity, mine, models, validate};
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use models::Tier;
 use std::path::{Path, PathBuf};
+
+/// `--on-conflict <mode>` selector for `import` / `mine` writes (#1780,
+/// 5-agent vote 4d3ea1c5). A `(title, namespace)` collision is the
+/// substrate's silent-clobber footgun: the legacy `db::insert`
+/// (`ConflictMode::Merge`) UPSERT silently overwrote a distinct
+/// pre-existing memory. This clap wrapper maps the three operator
+/// dispositions onto the storage [`ConflictMode`] enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+pub enum OnConflict {
+    /// Refuse a colliding row with a typed per-row error; the existing
+    /// memory is left untouched and the import continues with the rest.
+    Error,
+    /// Legacy silent-upsert: merge the incoming row into the existing
+    /// `(title, namespace)` memory. This is the prior (pre-#1780)
+    /// idempotent behaviour — opt into it explicitly to re-import a
+    /// backup without creating suffixed duplicates.
+    Merge,
+    /// Auto-suffix the title (`title (2)`, `title (3)`, …) until a free
+    /// `(title, namespace)` slot is found, then insert a new row.
+    /// Never clobbers; both old and new rows persist. The #1780 default
+    /// — completes the import losslessly and is recoverable.
+    #[default]
+    Version,
+}
+
+impl From<OnConflict> for ConflictMode {
+    fn from(v: OnConflict) -> Self {
+        match v {
+            OnConflict::Error => ConflictMode::Error,
+            OnConflict::Merge => ConflictMode::Merge,
+            OnConflict::Version => ConflictMode::Version,
+        }
+    }
+}
 
 #[derive(Args)]
 pub struct ImportArgs {
@@ -18,6 +53,12 @@ pub struct ImportArgs {
     /// Only use this when importing a JSON export you fully trust (e.g., your own backup).
     #[arg(long, default_value_t = false)]
     pub trust_source: bool,
+    /// Disposition on a `(title, namespace)` collision with an existing
+    /// memory: `version` (default — auto-suffix `title (N)`, never
+    /// clobber), `merge` (legacy silent idempotent upsert), or `error`
+    /// (refuse + skip the colliding row, continue the import).
+    #[arg(long, value_enum, default_value_t = OnConflict::Version)]
+    pub on_conflict: OnConflict,
 }
 
 #[derive(Args)]
@@ -45,6 +86,12 @@ pub struct MineArgs {
     /// Dry run — show what would be imported without writing
     #[arg(long, default_value_t = false)]
     pub dry_run: bool,
+    /// Disposition on a `(title, namespace)` collision with an existing
+    /// memory: `version` (default — auto-suffix `title (N)`, never
+    /// clobber), `merge` (legacy silent idempotent upsert), or `error`
+    /// (refuse + skip the colliding conversation, continue the mine).
+    #[arg(long, value_enum, default_value_t = OnConflict::Version)]
+    pub on_conflict: OnConflict,
 }
 
 /// `export` handler. Dumps every memory + link as pretty JSON.
@@ -95,6 +142,7 @@ pub(crate) fn import_from_str(
         serde_json::from_value(data.get("links").cloned().unwrap_or_default()).unwrap_or_default();
 
     let caller_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    let conflict_mode: ConflictMode = args.on_conflict.into();
 
     let conn = db::open(db_path)?;
     let mut imported = 0usize;
@@ -127,7 +175,11 @@ pub(crate) fn import_from_str(
             errors.push(format!("{}: {}", mem.id, e));
             continue;
         }
-        match db::insert(&conn, &mem) {
+        // #1780 — honour the operator's collision disposition instead
+        // of the legacy silent merge. A Version "no free suffix" error
+        // or an Error-mode collision is reported per-row and the loop
+        // continues; the whole import is never aborted on one row.
+        match db::insert_with_conflict(&conn, &mem, conflict_mode) {
             Ok(_) => imported += 1,
             Err(e) => errors.push(format!("{}: {}", mem.id, e)),
         }
@@ -187,6 +239,7 @@ pub fn mine(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let miner_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    let conflict_mode: ConflictMode = args.on_conflict.into();
     let format = mine::Format::from_str(&args.format).ok_or_else(|| {
         anyhow::anyhow!(
             "invalid format: {} (use claude, chatgpt, slack)",
@@ -325,7 +378,13 @@ pub fn mine(
             entity_id: None,
             persona_version: None,
             citations: Vec::new(),
-            source_uri: None,
+            // #1780 root-cause — distinct conversations that truncate to
+            // the same 100-char title still carry a distinct provenance
+            // pointer. `Conversation::id` is the source's own stable
+            // unique id (Claude `uuid` / ChatGPT `id` / Slack thread id),
+            // namespaced by the source-format tag so the URI is globally
+            // unambiguous: `mine-claude:<conv-id>`.
+            source_uri: Some(format!("{}:{}", format.source_tag(), conv.id)),
             source_span: None,
             confidence_source: ConfidenceSource::CallerProvided,
             confidence_signals: None,
@@ -334,7 +393,12 @@ pub fn mine(
             lifecycle_state: crate::models::LifecycleState::Open,
         };
 
-        match db::insert(&conn, &mem) {
+        // #1780 — honour the operator's collision disposition. The
+        // default `version` mode auto-suffixes a colliding title so a
+        // distinct same-title conversation is never clobbered; an
+        // Error-mode collision or a Version "no free suffix" error is
+        // counted + warned per-row and the loop continues.
+        match db::insert_with_conflict(&conn, &mem, conflict_mode) {
             Ok(_) => imported += 1,
             Err(e) => {
                 errors += 1;
@@ -473,6 +537,7 @@ mod tests {
         let dst_db = dst.db_path.clone();
         let args = ImportArgs {
             trust_source: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = dst.output();
@@ -517,7 +582,10 @@ mod tests {
 
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = dst.output();
             import_from_str(&payload, &dst_db, &args, false, Some("caller"), &mut out).unwrap();
@@ -578,7 +646,10 @@ mod tests {
             "exported_at": "2026-01-01T00:00:00+00:00"
         })
         .to_string();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = dst.output();
             import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
@@ -607,7 +678,10 @@ mod tests {
             "exported_at": "2026-01-01T00:00:00+00:00"
         })
         .to_string();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = dst.output();
             import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
@@ -618,6 +692,11 @@ mod tests {
 
     #[test]
     fn test_import_roundtrip_export_import_preserves_data() {
+        // #1780 — the idempotent re-import contract now lives behind the
+        // EXPLICIT `--on-conflict merge` mode (the new `version` default
+        // would auto-suffix the second import into `rt-title (2)`). This
+        // test pins the merge-mode no-dupe behaviour: a double import of
+        // the same payload still yields exactly one row.
         let src = TestEnv::fresh();
         let src_db = src.db_path.clone();
         let _id = seed_memory(&src_db, "rt-ns", "rt-title", "rt-content");
@@ -625,17 +704,171 @@ mod tests {
 
         let mut dst = TestEnv::fresh();
         let dst_db = dst.db_path.clone();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Merge,
+        };
         {
             let mut out = dst.output();
+            // Import the same payload twice — merge mode is idempotent.
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
             import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
         }
         let conn = db::open(&dst_db).unwrap();
         let all = db::export_all(&conn).unwrap();
-        assert_eq!(all.len(), 1);
+        assert_eq!(all.len(), 1, "merge mode re-import must not duplicate");
         assert_eq!(all[0].title, "rt-title");
         assert_eq!(all[0].content, "rt-content");
         assert_eq!(all[0].namespace, "rt-ns");
+    }
+
+    /// Build a single-memory import payload colliding on `(title, ns)`
+    /// with a distinct content, used by the #1780 conflict-mode tests.
+    fn colliding_payload(id: &str, ns: &str, title: &str, content: &str) -> String {
+        serde_json::json!({
+            "memories": [
+                {
+                    "id": id,
+                    "tier": Tier::Mid.as_str(),
+                    "namespace": ns,
+                    "title": title,
+                    "content": content,
+                    "tags": [],
+                    "priority": 5,
+                    "confidence": 1.0,
+                    "source": "import",
+                    "access_count": 0,
+                    "created_at": "2026-01-01T00:00:00+00:00",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "last_accessed_at": null,
+                    "expires_at": null,
+                    "metadata": {"agent_id": "x"}
+                }
+            ],
+            "links": [],
+            "count": 1,
+            "exported_at": "2026-01-01T00:00:00+00:00"
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn test_import_default_version_suffixes_collision_preserves_both() {
+        // #1780 — the new default `version` mode must NOT clobber a
+        // distinct pre-existing same-title memory: it auto-suffixes the
+        // incoming row to `title (2)` and BOTH rows persist.
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        // Seed a distinct existing memory at (clash-title, clash-ns).
+        let existing_id = seed_memory(&dst_db, "clash-ns", "clash-title", "ORIGINAL-content");
+        let payload = colliding_payload(
+            "99999999-9999-9999-9999-999999999999",
+            "clash-ns",
+            "clash-title",
+            "INCOMING-content",
+        );
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(dst.stdout_str().trim()).unwrap();
+        assert_eq!(v["imported"].as_u64().unwrap(), 1, "incoming row imported");
+        let conn = db::open(&dst_db).unwrap();
+        // Assert via id / title lookups (NOT export_all, which filters
+        // expired rows — the import fixture carries a past created_at).
+        // Original is untouched — no clobber.
+        let original = db::get(&conn, &existing_id).unwrap().unwrap();
+        assert_eq!(original.title, "clash-title");
+        assert_eq!(original.content, "ORIGINAL-content");
+        // Incoming landed under the `(2)` suffix with its own content.
+        let suffixed_id = db::find_by_title_namespace(&conn, "clash-title (2)", "clash-ns")
+            .unwrap()
+            .expect("a `clash-title (2)` suffixed sibling row must exist");
+        let suffixed = db::get(&conn, &suffixed_id).unwrap().unwrap();
+        assert_eq!(suffixed.content, "INCOMING-content");
+        // Both rows are distinct + both present.
+        assert_ne!(suffixed_id, existing_id);
+    }
+
+    #[test]
+    fn test_import_error_mode_reports_and_skips_without_clobber() {
+        // #1780 — `--on-conflict error` refuses the colliding row with a
+        // per-row error, leaves the existing memory UNTOUCHED, and the
+        // import continues (here there is only one row, but the error is
+        // collected per-row, not bubbled as an abort).
+        let mut dst = TestEnv::fresh();
+        let dst_db = dst.db_path.clone();
+        let existing_id = seed_memory(&dst_db, "err-ns", "err-title", "KEEP-content");
+        let payload = colliding_payload(
+            "88888888-8888-8888-8888-888888888888",
+            "err-ns",
+            "err-title",
+            "REJECTED-content",
+        );
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Error,
+        };
+        {
+            let mut out = dst.output();
+            import_from_str(&payload, &dst_db, &args, true, Some("caller"), &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(dst.stdout_str().trim()).unwrap();
+        assert_eq!(v["imported"].as_u64().unwrap(), 0, "collision not imported");
+        let errs = v["errors"].as_array().unwrap();
+        assert!(!errs.is_empty(), "expected a per-row conflict error");
+        assert!(
+            errs[0].as_str().unwrap().contains("CONFLICT"),
+            "error should be the typed CONFLICT diagnostic: {errs:?}"
+        );
+        // Existing row untouched, no suffixed sibling created.
+        let conn = db::open(&dst_db).unwrap();
+        let all = db::export_all(&conn).unwrap();
+        assert_eq!(all.len(), 1, "error mode must not write a new row");
+        let original = db::get(&conn, &existing_id).unwrap().unwrap();
+        assert_eq!(original.content, "KEEP-content", "existing not clobbered");
+    }
+
+    #[test]
+    fn test_mine_populates_source_uri_with_conversation_id() {
+        // #1780 root-cause — each mined memory carries a distinct
+        // `source_uri` derived from the source conversation's stable id,
+        // so two conversations that truncate to the same 100-char title
+        // remain distinguishable (and the version default suffixes the
+        // title collision rather than clobbering).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_path = write_minimal_claude_export(tmp.path());
+        let args = MineArgs {
+            path: claude_path,
+            format: "claude".to_string(),
+            namespace: Some("uri-ns".to_string()),
+            tier: Tier::Mid.as_str().to_string(),
+            min_messages: 3,
+            dry_run: false,
+            on_conflict: OnConflict::Version,
+        };
+        {
+            let mut out = env.output();
+            mine(&db, args, false, &cfg, Some("miner"), &mut out).unwrap();
+        }
+        let conn = db::open(&db).unwrap();
+        let all = db::export_all(&conn).unwrap();
+        let mined: Vec<&_> = all.iter().filter(|m| m.namespace == "uri-ns").collect();
+        assert_eq!(mined.len(), 1, "expected exactly one mined memory");
+        // conv-1 is the >=3-message conversation in the fixture; the
+        // source_uri is `<source-tag>:<conv-id>`.
+        assert_eq!(
+            mined[0].source_uri.as_deref(),
+            Some("mine-claude:conv-1"),
+            "source_uri must carry the source-tag + conversation id"
+        );
     }
 
     // ---------------- mine --------------------------------------------
@@ -684,6 +917,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -715,6 +949,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -742,6 +977,7 @@ mod tests {
             tier: Tier::Long.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -784,6 +1020,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -810,6 +1047,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -834,6 +1072,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         let mut out = env.output();
         let res = mine(&db, args, false, &cfg, Some("miner"), &mut out);
@@ -856,6 +1095,7 @@ mod tests {
             tier: "permanent".to_string(), // not short/mid/long
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         let mut out = env.output();
         let res = mine(&db, args, false, &cfg, Some("miner"), &mut out);
@@ -899,7 +1139,10 @@ mod tests {
             "exported_at": "2026-01-01T00:00:00+00:00"
         })
         .to_string();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = env.output();
             import_from_str(&payload, &db, &args, false, Some("caller"), &mut out).unwrap();
@@ -940,7 +1183,10 @@ mod tests {
             "exported_at": "2026-01-01T00:00:00+00:00"
         })
         .to_string();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = env.output();
             import_from_str(&payload, &db, &args, false, Some("caller"), &mut out).unwrap();
@@ -974,7 +1220,10 @@ mod tests {
             "exported_at": "2026-01-01T00:00:00+00:00"
         })
         .to_string();
-        let args = ImportArgs { trust_source: true };
+        let args = ImportArgs {
+            trust_source: true,
+            on_conflict: OnConflict::Version,
+        };
         {
             let mut out = env.output();
             import_from_str(&payload, &db, &args, true, Some("caller"), &mut out).unwrap();
@@ -1018,6 +1267,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1061,6 +1311,7 @@ mod tests {
         .to_string();
         let args = ImportArgs {
             trust_source: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1123,6 +1374,7 @@ mod tests {
             tier: Tier::Short.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1150,6 +1402,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1176,6 +1429,7 @@ mod tests {
             tier: Tier::Mid.as_str().to_string(),
             min_messages: 1,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1200,6 +1454,7 @@ mod tests {
             tier: Tier::Long.as_str().to_string(),
             min_messages: 3,
             dry_run: false,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();
@@ -1225,6 +1480,7 @@ mod tests {
             tier: Tier::Short.as_str().to_string(),
             min_messages: 3,
             dry_run: true,
+            on_conflict: OnConflict::Version,
         };
         {
             let mut out = env.output();

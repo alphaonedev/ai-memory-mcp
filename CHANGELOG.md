@@ -21,6 +21,23 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Breaking / secure-default changes
 
+- **[#1780](https://github.com/alphaonedev/ai-memory-mcp/issues/1780) — `import` / `mine` no longer
+  silently clobber a distinct same-title memory.** Both CLI write paths previously inserted via the
+  legacy silent-merge upsert (`ConflictMode::Merge`), so a `(title, namespace)` collision with a
+  DISTINCT existing memory silently overwrote it — a data-loss footgun (e.g. two mined conversations
+  that truncate to the same 100-char title would clobber each other). **Behavior change:** the new
+  `--on-conflict {error|merge|version}` flag governs the collision disposition on both `ai-memory
+  import` and `ai-memory mine`, **defaulting to `version`** — a colliding row is auto-suffixed
+  (`title (2)`, `title (3)`, …) until a free slot is found, so the import completes losslessly and
+  both rows persist (never a clobber). `--on-conflict merge` restores the prior idempotent-upsert
+  behavior (re-import a trusted backup without creating suffixed duplicates); `--on-conflict error`
+  refuses each colliding row with a typed `CONFLICT` diagnostic, leaves the existing memory untouched,
+  and continues the import (the error is collected per-row, never an abort). Root cause also fixed:
+  `mine` now populates `source_uri` with `<source-tag>:<conversation-id>` so distinct conversations
+  that share a truncated title remain distinguishable by provenance. Wires the existing
+  `db::insert_with_conflict(conn, mem, ConflictMode)` primitive. Design fixed by the 5-agent
+  adversarial vote (memory `4d3ea1c5`). Code anchor: `src/cli/io.rs`.
+
 - **[#1789](https://github.com/alphaonedev/ai-memory-mcp/issues/1789) — federation now requires peer enrollment by default.**
   `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` flipped its default OFF → **ON** (env-table row #43):
   inbound `/sync/push` and `/sync/since` now refuse an `X-Peer-Id` that has no enrolled Ed25519
