@@ -110,6 +110,10 @@ pub mod msg {
     pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";
     pub const CONSENSUS_NOT_REACHED: &str = "consensus threshold not yet reached";
     pub const DECISION_WRITE_FAILED: &str = "decision write failed";
+    /// #1787 — the requester of a Human-gated pending action may not approve
+    /// it themselves (enforced only under the multi-tenant opt-in).
+    pub const SELF_APPROVAL_REFUSED: &str =
+        "self-approval refused: the requester cannot approve their own Human-gated pending action";
 
     // ---- ownership / identity ---------------------------------------------------
     pub const CALLER_NOT_SOURCE_MEMORY_OWNER: &str = "caller does not own this source memory";

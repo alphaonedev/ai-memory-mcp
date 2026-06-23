@@ -229,7 +229,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // additive owner-scoped `forget_*_for_caller` fns (owner-clause twins of
     // the existing public forget/forget_count/forget_matches for the
     // multi-tenant `AI_MEMORY_AGENT_ID` opt-in) landed it at 19_883.
-    ("src/storage/mod.rs", 19_900),
+    // 2026-06-23 (#1787) — bumped 19_900 → 20_050 (lockstep): the
+    // `ApproverType::Human` opt-in self-approval + is_registered_agent gate in
+    // `approve_with_approver_type` + the `human_arm_self_approval_gated_under_opt_in_1787`
+    // regression test landed it at 19_991.
+    ("src/storage/mod.rs", 20_050),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
