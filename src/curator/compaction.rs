@@ -5,9 +5,11 @@
 //!
 //! A SAL-trait (`MemoryStore`) consolidator. Its clustering is **reconciled
 //! to** `crate::autonomy::find_consolidation_clusters` (#1741/#1743): a
-//! candidate pair merges iff it passes a **Jaccard pre-filter AND a cosine
-//! gate** — both when stored embeddings are available, Jaccard-only per-pair
-//! when a row has no stored embedding. The cosine gate reads each candidate's
+//! candidate pair merges iff it passes **BOTH a Jaccard pre-filter AND a
+//! cosine gate** — and the cosine gate requires a stored embedding on each
+//! side. Per #1774 (5-agent vote 4d3ea1c5) a row with no stored embedding does
+//! NOT merge: a destructive consolidation merge is never decided on Jaccard
+//! lexical overlap alone. The cosine gate reads each candidate's
 //! **stored** vector via `MemoryStore::get_embedding` (NOT a live re-embed),
 //! matching autonomy's `db::get_embedding` source exactly (#1743). Clustering
 //! lives in [`ConsolidationClustering`](super::cluster::ConsolidationClustering);
@@ -188,15 +190,17 @@ impl<'a> ConsolidationPass<'a> {
     /// matching `crate::autonomy::find_consolidation_clusters`. Reads each
     /// candidate's **stored** embedding via `MemoryStore::get_embedding`
     /// (#1743) — NOT a live re-embed — so the cosine gate uses the exact same
-    /// vectors autonomy reads; a row with no stored embedding falls back to
-    /// Jaccard-only for its pairs.
+    /// vectors autonomy reads; per #1774 a row with no stored embedding does
+    /// NOT merge (the cosine safety gate is mandatory for the destructive
+    /// merge — no Jaccard-only fallback).
     ///
     /// Each cluster element is a `MemoryId` (the memory's `id` field).
     async fn cluster(&self, memories: &[Memory]) -> Vec<Vec<MemoryId>> {
         let mut embeddings: Vec<Option<Vec<f32>>> = Vec::with_capacity(memories.len());
         for m in memories {
             // Best-effort: a fetch error degrades that row to "no embedding"
-            // (Jaccard-only), never aborts the sweep.
+            // (which, per #1774, blocks the merge for its pairs), never aborts
+            // the sweep.
             let emb = self
                 .store
                 .get_embedding(&self.ctx, &m.id)
@@ -803,9 +807,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cluster_via_jaccard_fallback_returns_clusters() {
-            // Candidates not stored → get_embedding returns None → Jaccard-only;
-            // the identical-content pair passes the Jaccard pre-filter → 1 cluster.
+        async fn cluster_without_stored_embeddings_does_not_merge_1774() {
+            // #1774 — candidates not stored → get_embedding returns None on
+            // both sides → no cosine value → NO merge, even for identical
+            // (high-Jaccard) content. A destructive merge is never decided on
+            // Jaccard lexical overlap alone.
             let (store, _dir) = open_db();
             let llm = StubLlm::new("S");
             let pass = ConsolidationPass::new(&store, &llm, false);
@@ -826,8 +832,10 @@ mod tests {
                 5,
             );
             let clusters = pass.cluster(&[m1, m2]).await;
-            assert_eq!(clusters.len(), 1);
-            assert_eq!(clusters[0].len(), 2);
+            assert!(
+                clusters.is_empty(),
+                "un-embedded pairs must not merge on Jaccard alone; got {clusters:?}"
+            );
         }
 
         #[tokio::test]
@@ -1109,6 +1117,11 @@ mod tests {
             );
             crate::db::insert(conn, &m1).unwrap();
             crate::db::insert(conn, &m2).unwrap();
+            // #1774 — both sides need a stored embedding to clear the cosine
+            // gate; attach aligned vectors (cosine = 1.0) so the dup pair
+            // clusters (the un-embedded path no longer merges).
+            crate::db::set_embedding(conn, &m1.id, &[1.0, 0.0]).unwrap();
+            crate::db::set_embedding(conn, &m2.id, &[1.0, 0.0]).unwrap();
             vec![m1, m2]
         }
 

@@ -54,14 +54,14 @@ pub(crate) const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
 /// loosely — actual merge decision is still gated by an LLM pass.
 ///
-/// v0.7.0 R3-S2 — Jaccard is now a *cheap pre-filter* (O(N) per pair)
-/// when embeddings are available; cosine on the 384d MiniLM
-/// embeddings is the primary signal at
-/// [`CONSOLIDATE_COSINE_THRESHOLD`]. The Jaccard threshold is
-/// retained as the keyword-tier fall-back when no embeddings are
-/// present (so consolidation still works on a keyword-only
-/// deployment) and as a pre-filter to skip the embedding lookup on
-/// obviously-unrelated pairs.
+/// v0.7.0 R3-S2 — Jaccard is a *cheap pre-filter* (O(N) per pair);
+/// cosine on the 384d MiniLM embeddings is the primary signal at
+/// [`CONSOLIDATE_COSINE_THRESHOLD`]. Both must hold for a pair to
+/// cluster. Per #1774 (5-agent vote 4d3ea1c5) the Jaccard pre-filter
+/// is NOT a stand-alone fall-back: when a stored embedding is absent
+/// on either side the pair does not merge — a destructive merge always
+/// requires the cosine safety gate. The pre-filter's only role is to
+/// skip the embedding lookup on obviously-unrelated pairs.
 pub const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.55;
 
 /// v0.7.0 R3-S2 — cosine similarity threshold (on 384d L2-normalised
@@ -70,11 +70,11 @@ pub const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.55;
 /// it captures rephrasings and semantically near-equivalent content
 /// without merging merely topically-adjacent memories.
 ///
-/// Applied as the primary signal whenever both memories carry an
-/// embedding row in the DB (`db::get_embedding` returns `Some`).
-/// Jaccard is the cheap pre-filter (skips the embedding lookup) and
-/// the fall-back signal when embeddings are missing
-/// (keyword-tier deployments).
+/// Applied as a MANDATORY gate whenever a pair is considered: both
+/// memories must carry an embedding row in the DB (`db::get_embedding`
+/// returns `Some`) and clear this threshold. Per #1774 a pair lacking a
+/// stored embedding on either side does not merge — there is no
+/// Jaccard-only fall-back for the destructive consolidation merge.
 pub const CONSOLIDATE_COSINE_THRESHOLD: f64 = 0.75;
 
 /// Cap on the number of memories in a single consolidation cluster —
@@ -306,13 +306,18 @@ pub fn run_autonomy_passes(
 ///      pairs join the cluster.
 ///
 /// When *either* memory in a pair has no embedding row (e.g.,
-/// keyword-tier deployment that never ran the embedder), the cosine
-/// stage is skipped for that pair and the Jaccard signal alone
-/// decides — preserving v0.6.x behaviour on keyword deployments
-/// while making cosine the primary signal anywhere the embedder is
-/// available. The function never errors on a DB read miss; it
-/// silently degrades to Jaccard so a partial-coverage corpus (some
-/// embedded, some not) still clusters productively.
+/// keyword-tier deployment that never ran the embedder, or an
+/// oversize / never-embedded row), the pair does **NOT** cluster
+/// (#1774, 5-agent vote 4d3ea1c5): a destructive consolidation merge
+/// requires the cosine safety gate on both sides and is never decided
+/// on Jaccard lexical overlap alone. Two distinct memories can share
+/// high Jaccard (templated content), so lexical overlap is not a safe
+/// basis for a merge-and-delete. This mirrors the substrate's
+/// skip-on-missing-embedding posture for the other destructive path
+/// (`proactive_conflict_check` filters `embedding IS NOT NULL`).
+/// Un-embedded corpora no longer auto-consolidate (documented behaviour
+/// change). The function never errors on a DB read miss; a missing
+/// embedding simply blocks the merge for that pair.
 pub(crate) fn find_consolidation_clusters(
     conn: &Connection,
     candidates: &[Memory],
@@ -337,8 +342,8 @@ pub(crate) fn find_consolidation_clusters(
             used[i] = true;
             // Cache the seed memory's embedding (looked up once per
             // outer-loop iteration). `None` means "embedding missing
-            // for this memory" — we fall back to Jaccard-only on the
-            // inner pairs.
+            // for this memory" — per #1774 a missing embedding on
+            // either side blocks the merge for that pair.
             let seed_emb = db::get_embedding(conn, &group[i].id).ok().flatten();
             for j in (i + 1)..group.len() {
                 if used[j] {
@@ -360,10 +365,11 @@ pub(crate) fn find_consolidation_clusters(
                         let cos = f64::from(crate::embeddings::Embedder::cosine_similarity(a, b));
                         cos >= CONSOLIDATE_COSINE_THRESHOLD
                     }
-                    // At least one side has no embedding — fall back
-                    // to Jaccard-only (already passed the pre-filter
-                    // above so the pair clusters).
-                    _ => true,
+                    // #1774 (5-agent vote 4d3ea1c5) — at least one side
+                    // has no embedding, so there is no cosine value. A
+                    // destructive merge is never decided on Jaccard
+                    // lexical overlap alone: the pair does NOT cluster.
+                    _ => false,
                 };
                 if matches_cluster {
                     cluster.push(group[j].clone());
@@ -1051,6 +1057,13 @@ mod tests {
             Tier::Mid,
         );
         let (_tmp, conn) = setup_conn();
+        // #1774 — both sides need a stored embedding to merge; this test's
+        // subject is namespace grouping, so attach aligned vectors (cosine
+        // ≈ 1.0) to the in-ns pair.
+        for m in [&a, &b, &c] {
+            db::insert(&conn, m).unwrap();
+            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let clusters = find_consolidation_clusters(&conn, &[a, b, c]);
         // ns1 should cluster a+b; ns2 has only one memory so no cluster.
         assert_eq!(clusters.len(), 1);
@@ -1152,12 +1165,13 @@ mod tests {
         assert_eq!(clusters2[0].len(), 2);
     }
 
-    /// `test_consolidation_falls_back_to_jaccard_no_embeddings` —
-    /// keyword-tier corpus (no embeddings persisted) still clusters
-    /// via Jaccard alone. This preserves v0.6.x consolidation
-    /// behaviour on deployments that never run the embedder.
+    /// `test_consolidation_no_embeddings_does_not_merge_1774` —
+    /// keyword-tier corpus (no embeddings persisted) does NOT cluster.
+    /// Per #1774 (5-agent vote 4d3ea1c5) a destructive consolidation
+    /// merge requires the cosine safety gate on both sides; un-embedded
+    /// pairs never merge on Jaccard lexical overlap alone.
     #[test]
-    fn test_consolidation_falls_back_to_jaccard_no_embeddings() {
+    fn test_consolidation_no_embeddings_does_not_merge_1774() {
         let (_tmp, conn) = setup_conn();
         let a = sample_mem(
             "a",
@@ -1174,17 +1188,16 @@ mod tests {
             Tier::Long,
         );
         // Insert WITHOUT attaching embeddings — get_embedding returns
-        // None, the cosine stage is skipped, Jaccard alone decides.
+        // None on both sides, so there is no cosine value and the pair
+        // does NOT merge (#1774).
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
 
         let clusters = find_consolidation_clusters(&conn, &[a, b]);
-        assert_eq!(
-            clusters.len(),
-            1,
-            "keyword-tier corpus (no embeddings) must still cluster via Jaccard"
+        assert!(
+            clusters.is_empty(),
+            "un-embedded corpus must NOT cluster on Jaccard alone; got {clusters:?}"
         );
-        assert_eq!(clusters[0].len(), 2);
     }
 
     #[test]
@@ -1479,6 +1492,12 @@ mod tests {
         for m in [&m_a, &m_b, &m_chat, &m_old, &m_new] {
             db::insert(&conn, m).unwrap();
         }
+        // #1774 — the deploy near-duplicates need stored embeddings on both
+        // sides to clear the cosine gate; attach aligned vectors (cosine
+        // ≈ 1.0) so the deploy cluster forms.
+        for id in ["ma", "mb"] {
+            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
 
         let candidates = vec![
             m_a.clone(),
@@ -1566,6 +1585,10 @@ mod tests {
         );
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
+        // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
+        // gate is cleared and the pair clusters.
+        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
 
         let llm = StubLlm::new("LLM-generated consolidated summary");
         let candidates = vec![a, b];
@@ -1597,6 +1620,10 @@ mod tests {
         );
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
+        // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
+        // gate is cleared and consolidation produces a rollback entry.
+        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
 
         let llm = StubLlm::new("mock summary result");
         let candidates = vec![a, b];
@@ -2011,6 +2038,12 @@ mod tests {
         for m in [&m_a, &m_b, &m_old, &m_new, &m_hot] {
             db::insert(&conn, m).unwrap();
         }
+        // #1774 — the deploy near-duplicates need stored embeddings on both
+        // sides to clear the cosine gate; attach aligned vectors (cosine ≈ 1.0)
+        // so the deploy cluster forms in the dry-run report.
+        for id in ["ma", "mb"] {
+            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let candidates = vec![
             m_a.clone(),
             m_b.clone(),
@@ -2074,6 +2107,13 @@ mod tests {
             ));
         }
         let (_tmp, conn) = setup_conn();
+        // #1774 — both sides need a stored embedding to merge; this test's
+        // subject is the cluster-size cap, so attach aligned vectors
+        // (cosine ≈ 1.0) so every near-duplicate pair clears the cosine gate.
+        for m in &candidates {
+            db::insert(&conn, m).unwrap();
+            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let clusters = find_consolidation_clusters(&conn, &candidates);
         assert!(!clusters.is_empty());
         for c in &clusters {
