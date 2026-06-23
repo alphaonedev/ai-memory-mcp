@@ -7841,6 +7841,17 @@ pub fn list_archived(
         .map_err(Into::into)
 }
 
+/// Restore an archived memory ROW back into the live `memories` table.
+///
+/// **Recovery scope (#1771).** This restores the memory row (with full
+/// v0.7.0 column carry per #1025), but NOT its relationship graph: when
+/// the memory was originally archived-then-deleted, its `memory_links`
+/// edges + other `ON DELETE CASCADE` provenance (`recall_observations`,
+/// confidence-calibration rows, `memory_transcript_links`) were
+/// cascade-reaped in the same transaction and were never copied into the
+/// archive. So a restored memory comes back with an EMPTY edge graph.
+/// Edge preservation (an `archived_memory_links` snapshot taken before
+/// the delete, re-inserted here) is the #1771 structural follow-up.
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
@@ -14146,6 +14157,51 @@ mod tests {
             got.expires_at,
             Some(original_expiry),
             "G5: restore must preserve the original expires_at"
+        );
+    }
+
+    /// #1771 — DOCUMENTS the current archive->restore edge-loss: a restored
+    /// memory comes back WITHOUT its `memory_links` (cascade-reaped at delete
+    /// time, never copied into the archive). This pins the KNOWN-LOSS behaviour
+    /// as the honesty floor of #1771 (5-agent vote 4d3ea1c5); when the
+    /// `archived_memory_links` structural fix lands, the final assertion flips
+    /// to expect edge SURVIVAL (1), and this test becomes the regression guard.
+    #[test]
+    fn restore_does_not_recover_links_documented_loss_1771() {
+        let conn = test_db();
+        // A is a gc-eligible short-tier row (past expiry); B is permanent.
+        let mut a = make_memory("link-loss-A", "ns1771", Tier::Short, 5);
+        a.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("link-loss-B", "ns1771", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "precondition: A has one outbound link"
+        );
+
+        // Archive + delete A (the same-tx cascade reaps the A->B link).
+        let removed = gc(&conn, true).unwrap();
+        assert!(
+            removed >= 1,
+            "gc must archive+delete the expired short-tier A"
+        );
+        assert!(
+            get(&conn, &a_id).unwrap().is_none(),
+            "A is deleted from live memories"
+        );
+
+        // Restore A: the ROW returns, the edge graph does NOT (#1771).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert!(get(&conn, &a_id).unwrap().is_some(), "A is live again");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            0,
+            "#1771 DOCUMENTED LOSS: a restored memory's memory_links are NOT \
+             recovered (cascade-reaped at delete time, not archived). Flip this \
+             to expect 1 when archived_memory_links preservation lands."
         );
     }
 

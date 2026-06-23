@@ -36,6 +36,14 @@
 //!   unverifiable summary (#664); on the verified happy path an
 //!   operator-reversible `RollbackEntry::Consolidate` is persisted (#1745).
 //!
+//! **Rollback recovery scope (#1771).** "Operator-reversible" here means
+//! the pre-merge memory ROWS are restored — NOT the merged sources'
+//! `memory_links` edges or other `ON DELETE CASCADE` provenance, which
+//! were cascade-reaped when the sources were deleted and are not captured
+//! in `RollbackEntry::Consolidate`. A rollback therefore returns the text
+//! but leaves the merged sources' relationship graph destroyed, until the
+//! #1771 archive-link-preservation structural fix lands.
+//!
 //! ## Visibility contract (R7)
 //!
 //! All items are at most `pub(crate)`.  No bare `pub` items.

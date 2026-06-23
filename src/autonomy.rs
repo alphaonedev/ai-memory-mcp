@@ -154,12 +154,24 @@ impl AutonomyLlm for OllamaClient {
 /// The `Consolidate` variant is deliberately large (carries full
 /// pre-merge memory snapshots) compared to `PriorityAdjust`. That's the
 /// cost of being able to reverse a merge without network round-trips.
+///
+/// **Recovery scope (#1771).** A rollback restores the pre-merge memory
+/// ROWS only. It does NOT restore the merged sources' `memory_links`
+/// edges or other `ON DELETE CASCADE` provenance (`recall_observations`,
+/// confidence-calibration rows, `memory_transcript_links`): those were
+/// cascade-reaped when the sources were deleted at merge time and are not
+/// captured in `originals`. So a reversed merge returns the text but
+/// leaves the relationship graph of the merged sources destroyed, until
+/// archive-link preservation lands (#1771 structural fix).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RollbackEntry {
     /// A consolidation was applied. `originals` are the full Memory
     /// snapshots pre-merge; `result_id` is the consolidated memory id.
+    /// NOTE (#1771): `originals` carries the memory ROWS only — NOT the
+    /// merged sources' cascade-deleted `memory_links` / provenance edges,
+    /// which a rollback therefore cannot restore yet.
     Consolidate {
         originals: Vec<Memory>,
         result_id: String,
