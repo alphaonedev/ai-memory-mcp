@@ -2286,6 +2286,9 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
 async fn sync_since_rejects_garbage_timestamp_with_400() {
     // Red-team #247 — `since=garbage` previously returned 200 with all
     // memories. Now must return 400 with a clear error.
+    // #1789 — this asserts downstream timestamp validation, not enrollment;
+    // opt back to permissive so the flipped secure default doesn't 401 first.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum_get(sync_since))
