@@ -3850,7 +3850,7 @@ mod tests {
         let ctx = CallerContext::for_agent("alice");
         let pid = {
             let conn = store.state.lock().await;
-            db::queue_pending_action(
+            let pid = db::queue_pending_action(
                 &conn,
                 GovernedAction::Store,
                 "ns-approve-alias",
@@ -3858,7 +3858,13 @@ mod tests {
                 "alice",
                 &serde_json::json!({"title":"t","content":"c"}),
             )
-            .expect("queue")
+            .expect("queue");
+            // #1787 — the Human arm now gates under the multi-tenant opt-in
+            // (reject self-approval + require a registered approver). Register
+            // the (non-requester) approver so this test is deterministic
+            // regardless of a leaked AI_MEMORY_AGENT_ID from a concurrent test.
+            db::register_agent(&conn, "approver", "ai:generic", &[]).ok();
+            pid
         };
         let outcome = store
             .approve_with_approver_type(&ctx, &pid, "approver")
@@ -3888,7 +3894,12 @@ mod tests {
                 &memory_payload,
             )
             .expect("queue");
-            db::approve_with_approver_type(&conn, &pid, "alice").expect("approve");
+            // #1787 — register a non-requester approver ("alice" is the
+            // requester here) so the Human-arm opt-in gate (reject self-approval
+            // + require a registered approver) cannot reject this approval under
+            // a leaked AI_MEMORY_AGENT_ID from a concurrent test.
+            db::register_agent(&conn, "approver", "ai:generic", &[]).ok();
+            db::approve_with_approver_type(&conn, &pid, "approver").expect("approve");
             pid
         };
         let executed = store

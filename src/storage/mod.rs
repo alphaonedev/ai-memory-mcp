@@ -11697,6 +11697,36 @@ pub fn approve_with_approver_type(
 
     match approver {
         ApproverType::Human => {
+            // #1787 (5-agent vote 4d3ea1c5 → C) — the Human arm (the DEFAULT
+            // when a namespace has no/loose standard) otherwise accepts ANY
+            // claimed `approver_agent_id`, so an agent whose action was routed
+            // to a Human-gated `pending` queue could self-approve it, defeating
+            // the human-in-the-loop gate. Harden it ONLY under the multi-tenant
+            // opt-in (`resolve_read_visibility_caller()` Some = AI_MEMORY_AGENT_ID
+            // set), mirroring the #1786/#1772 owner-gate posture: in the
+            // single-operator trust-all default the requester and the approver
+            // both resolve to the same durable `host:<hostname>` id (#1720 B1),
+            // so an unconditional reject-self would self-lock the operator out of
+            // approving their own queued actions — and there is no adversary (one
+            // caller). Under the opt-in: (1) the requester may not approve their
+            // own action, and (2) the approver must be a REGISTERED agent —
+            // raising the bar from "claim any string" to "operator pre-registered
+            // this id", the same hardening #216 applied to the Consensus arm.
+            // (Full operator-pubkey SIGNATURE attestation would require threading
+            // a signature through the MCP request -> handler -> this storage fn,
+            // a public-contract change tracked as a separate follow-up.)
+            if crate::identity::resolve_read_visibility_caller().is_some() {
+                if approver_agent_id == pa.requested_by {
+                    return Ok(ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
+                    ));
+                }
+                if !is_registered_agent(conn, approver_agent_id) {
+                    return Ok(ApproveOutcome::Rejected(format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
+            }
             let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
             if ok {
                 Ok(ApproveOutcome::Approved)
@@ -18900,6 +18930,84 @@ mod tests {
         );
         // No approve audit emitted on refused path.
         assert_eq!(count_signed_events(&conn, "pending_action.approved"), 0);
+    }
+
+    /// #1787 (5-agent vote 4d3ea1c5 → C) — under the multi-tenant opt-in
+    /// (`AI_MEMORY_AGENT_ID` set), the `ApproverType::Human` arm refuses
+    /// self-approval (approver == requester) AND refuses an unregistered
+    /// approver, while a registered non-requester approves. With the opt-in
+    /// OFF (single-operator trust-all default), any approval is accepted
+    /// (byte-unchanged — the requester and approver share one durable id, so
+    /// reject-self would self-lock the sole operator).
+    #[test]
+    fn human_arm_self_approval_gated_under_opt_in_1787() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = test_db();
+        let payload = serde_json::json!({"title": "x", "namespace": "ns/h1787"});
+        let ns = "ns/h1787"; // no standard → approver defaults to Human
+
+        // (no-regression) opt-in OFF: self-approval accepted (single-operator).
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let pid_unset = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid_unset, "ai:alice").unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "single-operator default: self-approval must be accepted (no opt-in)"
+        );
+
+        // opt-in ON.
+        let pid = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // (1) self-approval refused.
+        match approve_with_approver_type(&conn, &pid, "ai:alice").unwrap() {
+            ApproveOutcome::Rejected(m) => {
+                assert!(
+                    m.contains("self-approval"),
+                    "want self-approval refusal, got: {m}"
+                );
+            }
+            other => panic!("expected self-approval rejection, got {other:?}"),
+        }
+        // (2) different but UNREGISTERED approver refused.
+        match approve_with_approver_type(&conn, &pid, "ai:bob").unwrap() {
+            ApproveOutcome::Rejected(m) => {
+                assert!(
+                    m.contains("not a registered agent"),
+                    "want unregistered refusal, got: {m}"
+                );
+            }
+            other => panic!("expected unregistered rejection, got {other:?}"),
+        }
+        // (3) different REGISTERED approver → approved.
+        register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid, "ai:bob").unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "a registered non-requester must be able to approve under the opt-in"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 
     /// S5-M1 — a successful approve+execute MUST append a
