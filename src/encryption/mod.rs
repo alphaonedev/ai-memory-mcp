@@ -261,37 +261,45 @@ fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
 fn load_keypair_from_disk(agent_id: &str, dir: &Path) -> Result<Option<Keypair>> {
     let (_pub_path, priv_path) = x25519_key_paths(agent_id, dir);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match fs::metadata(&priv_path) {
-            Ok(meta) => {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode & 0o077 != 0 {
-                    return Err(anyhow!(
-                        "x25519 private key {} has insecure mode {mode:o}; refusing to load. \
-                         Restore with: chmod 0600 {}",
-                        priv_path.display(),
-                        priv_path.display()
-                    ));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(anyhow!(e))
-                    .with_context(|| format!("stat x25519 private key {}", priv_path.display()));
-            }
-        }
-    }
-
-    let mut priv_bytes = match fs::read(&priv_path) {
-        Ok(b) => b,
+    // #1790 finding 2 — open the file ONCE, fstat the handle for the
+    // perms check, then read from the SAME handle. The pre-#1790 form did
+    // `fs::metadata(path)` then `fs::read(path)` — two path lookups, so the
+    // key file could be swapped in the window between the check and the
+    // read (TOCTOU). Opening once closes that re-open window; behaviour is
+    // otherwise unchanged (a missing `.priv` is still `Ok(None)`, an
+    // insecure mode is still refused).
+    let mut f = match fs::File::open(&priv_path) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(anyhow!(e))
                 .with_context(|| format!("reading x25519 private key {}", priv_path.display()));
         }
     };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat x25519 private key {}", priv_path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "x25519 private key {} has insecure mode {mode:o}; refusing to load. \
+                 Restore with: chmod 0600 {}",
+                priv_path.display(),
+                priv_path.display()
+            ));
+        }
+    }
+
+    let mut priv_bytes = Vec::new();
+    {
+        use std::io::Read;
+        f.read_to_end(&mut priv_bytes)
+            .with_context(|| format!("reading x25519 private key {}", priv_path.display()))?;
+    }
     if priv_bytes.len() != X25519_KEY_LEN {
         let actual = priv_bytes.len();
         priv_bytes.zeroize();

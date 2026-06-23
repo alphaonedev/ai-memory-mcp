@@ -3194,6 +3194,11 @@ pub fn run_mcp_server(
 
     let mut conn = db::open(db_path)?;
 
+    // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
+    // sweep + memory_forget become permanent hard-delete with no archive
+    // and no rollback). One-shot via an internal `std::sync::Once`.
+    app_config.warn_if_archive_on_gc_disabled();
+
     // #1720 B3 — boot-time operator self-lockout guard. When the operator
     // has set AI_MEMORY_AGENT_ID (read-path ownership filtering scopes
     // private rows to that caller), warn — or, under

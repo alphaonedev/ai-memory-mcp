@@ -447,14 +447,23 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
     // v0.7.0 S4-LOW1 — refuse to load a `.priv` whose Unix mode bits
     // grant any group/other access. Only fire when the file exists;
     // a missing `.priv` is a valid public-only load and the mode
-    // check is irrelevant there. Done as a pre-flight before
-    // `fs::read` so we never even map the bytes into memory for a
-    // world-readable key.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match fs::metadata(&priv_path) {
-            Ok(meta) => {
+    // check is irrelevant there.
+    //
+    // #1790 finding 2 — open the file ONCE and perform the perms check on
+    // that handle (`f.metadata()` = fstat), then read the bytes from the
+    // SAME handle. The pre-#1790 form did `fs::metadata(path)` then
+    // `fs::read(path)` — two path lookups, so a key file could be swapped
+    // (perms-OK decoy → real key, or vice versa) in the window between the
+    // check and the read (TOCTOU). Opening once closes that re-open window;
+    // behaviour is otherwise unchanged.
+    let private = match fs::File::open(&priv_path) {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = f
+                    .metadata()
+                    .with_context(|| format!("stat private key {}", priv_path.display()))?;
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
                     bail!(
@@ -466,19 +475,10 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
                     );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Public-only load — fall through; the inner match
-                // below will surface the same NotFound path.
-            }
-            Err(e) => {
-                return Err(anyhow!(e))
-                    .with_context(|| format!("stat private key {}", priv_path.display()));
-            }
-        }
-    }
-
-    let private = match fs::read(&priv_path) {
-        Ok(mut priv_bytes) => {
+            use std::io::Read;
+            let mut priv_bytes = Vec::new();
+            f.read_to_end(&mut priv_bytes)
+                .with_context(|| format!("reading private key {}", priv_path.display()))?;
             if priv_bytes.len() != SECRET_KEY_LEN {
                 let actual_len = priv_bytes.len();
                 // #1258 — zeroize the (wrong-length) buffer before the
