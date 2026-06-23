@@ -8825,6 +8825,14 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
 /// Bubbles up serde encode errors for the JSON-shaped columns and any
 /// rusqlite error from the UPDATE.
 fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
+    // #1773 (MEDIUM) — snapshot the pre-merge row before this peer-driven
+    // LWW content overwrite, mirroring the #1725 in_place_edit snapshot, so a
+    // federation merge where the remote wins the tiebreak leaves a recoverable
+    // copy instead of permanently discarding prior local content. INSERT OR
+    // REPLACE so a repeated merge of the same id is idempotent; archives the
+    // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
+    archive_memory_insert_only(conn, &mem.id, "federation_merge")?;
+
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
     let citations_json = serde_json::to_string(&mem.citations)?;
@@ -8840,6 +8848,27 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
     // the `insert` / `insert_if_newer` write chokepoints so the indexed
     // column stays consistent with the row's own metadata/title.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #1773 (HIGH, encryption-on) — seal the merged content + set
+    // `encrypted_envelope` as a MATCHED PAIR (mirrors
+    // `update_with_expected_version` ~1851). The prior UPDATE wrote plaintext
+    // into `content` but omitted `encrypted_envelope`, so under at-rest
+    // encryption the row kept its STALE non-NULL envelope: the next read
+    // decrypted the OLD content and silently discarded the merged value. With
+    // encryption off, `seal_content` returns None → we store the plaintext
+    // verbatim and clear the envelope to NULL (byte-identical to the
+    // pre-wiring path). agent_id is the merged row's NHI marker — the same key
+    // `insert`/`update_with_expected_version` use for this row.
+    let merge_agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let merge_sealed = crate::encryption::seal_content(&mem.content, merge_agent_id)?;
+    let merge_content_to_store = merge_sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let merge_encrypted_envelope: Option<&[u8]> =
+        merge_sealed.as_ref().map(|(env, _)| env.as_slice());
     conn.execute(
         "UPDATE memories SET
             tier = ?1,
@@ -8868,13 +8897,14 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             confidence_decayed_at = ?24,
             mentioned_entity_id = ?25,
             version = ?26,
-            lifecycle_state = ?27
-         WHERE id = ?28",
+            lifecycle_state = ?27,
+            encrypted_envelope = ?28
+         WHERE id = ?29",
         params![
             mem.tier.as_str(),
             mem.namespace,
             mem.title,
-            mem.content,
+            merge_content_to_store,
             tags_json,
             mem.priority,
             mem.confidence,
@@ -8898,6 +8928,7 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             mentioned_entity_id,
             mem.version,
             mem.lifecycle_state.as_str(),
+            merge_encrypted_envelope,
             mem.id,
         ],
     )?;
@@ -9223,18 +9254,15 @@ pub fn get_unembedded_ids_batch(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
+    // #1779 — pull encrypted_envelope + metadata so encrypted rows are
+    // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     let mut stmt = conn.prepare_cached(
-        "SELECT id, title, content FROM memories WHERE embedding IS NULL LIMIT ?1",
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
+         WHERE embedding IS NULL LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![limit], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(resolve_embeddable_rows(raw))
 }
 
 /// #1595 — keyset-paginated variant of [`get_unembedded_ids_batch`].
@@ -9261,29 +9289,94 @@ pub fn get_unembedded_ids_batch_after(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
-    let map_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    };
-    let rows = if let Some(after) = after_id {
+    // #1779 — pull encrypted_envelope + metadata so encrypted rows are
+    // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
+    let raw = if let Some(after) = after_id {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content FROM memories \
+            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
              WHERE embedding IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![after, limit], map_row)?;
+        let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content FROM memories \
+            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
              WHERE embedding IS NULL ORDER BY id LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit], map_row)?;
+        let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(rows)
+    Ok(resolve_embeddable_rows(raw))
+}
+
+/// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
+/// also pull `encrypted_envelope` + `metadata`:
+/// `(id, title, content, envelope, metadata_json)`.
+type EmbeddableRawRow = (String, String, String, Option<Vec<u8>>, String);
+fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddableRawRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<Vec<u8>>>(3)?,
+        row.get::<_, String>(4)?,
+    ))
+}
+
+/// #1779 — map raw embedding-fetch rows to `(id, title, content)`, decrypting
+/// encrypted-at-rest rows and SKIPPING (omitting) any whose envelope won't
+/// decrypt. See [`resolve_embeddable_content`].
+fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    for (id, title, content, envelope, metadata_json) in raw {
+        if let Some(resolved) = resolve_embeddable_content(&id, content, envelope, &metadata_json) {
+            out.push((id, title, resolved));
+        }
+    }
+    out
+}
+
+/// #1779 — resolve the embeddable plaintext for a backfill / reembed row.
+/// At-rest-encrypted rows store the empty placeholder in `content` (the
+/// plaintext lives in `encrypted_envelope`); embedding the placeholder would
+/// yield a title-only vector and — under `set_embeddings_batch*` REPLACE
+/// semantics — overwrite a good store-time embedding corpus-wide. Returns
+/// `Some(plaintext)` for unencrypted rows (verbatim) and encrypted rows that
+/// decrypt; returns `None` (caller SKIPS — no embedding write) when an
+/// envelope is present but won't decrypt (e.g. key absent), failing loud
+/// rather than degrading the vector (mirrors the #1593 fail-loud-skip
+/// embedder posture). agent_id is read from the row's `metadata.agent_id`.
+fn resolve_embeddable_content(
+    id: &str,
+    content: String,
+    envelope: Option<Vec<u8>>,
+    metadata_json: &str,
+) -> Option<String> {
+    match envelope {
+        None => Some(content),
+        Some(env) => {
+            let agent_id = serde_json::from_str::<serde_json::Value>(metadata_json)
+                .ok()
+                .as_ref()
+                .and_then(|m| m.get("agent_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match crate::encryption::open_content(&env, &agent_id) {
+                Ok(plaintext) => Some(plaintext),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %id,
+                        error = %e,
+                        "embed: skipping encrypted row whose envelope failed to decrypt — \
+                         embedding its empty placeholder would overwrite a good store-time \
+                         embedding (#1779)"
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// #1598 — keyset-paginated scan over ALL live memories (embedded or
@@ -9303,46 +9396,49 @@ pub fn get_memory_texts_batch(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
-    let map_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    };
-    let rows = match (namespace, after_id) {
+    // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
+    // rows (where `content` holds the empty placeholder and the plaintext lives
+    // in the envelope) are DECRYPTED before embedding. Embedding the
+    // placeholder yields a title-only vector, and `set_embeddings_batch_reembed`
+    // REPLACE semantics would then overwrite the good store-time embedding
+    // corpus-wide. A row whose envelope fails to decrypt (e.g. key absent) is
+    // SKIPPED with a WARN rather than embedded as a degraded placeholder —
+    // mirrors the #1593 fail-loud-skip embedder posture.
+    let raw = match (namespace, after_id) {
         (Some(ns), Some(after)) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE namespace = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![ns, after, limit], map_row)?;
+            let rows = stmt.query_map(params![ns, after, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (Some(ns), None) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE namespace = ?1 ORDER BY id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![ns, limit], map_row)?;
+            let rows = stmt.query_map(params![ns, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (None, Some(after)) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE id > ?1 ORDER BY id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![after, limit], map_row)?;
+            let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (None, None) => {
-            let mut stmt = conn
-                .prepare_cached("SELECT id, title, content FROM memories ORDER BY id LIMIT ?1")?;
-            let rows = stmt.query_map(params![limit], map_row)?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
+                 ORDER BY id LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
     };
-    Ok(rows)
+    Ok(resolve_embeddable_rows(raw))
 }
 
 /// #1598 — REPLACE-semantics sibling of [`set_embeddings_batch`] for

@@ -530,3 +530,121 @@ fn commit_b_toggle_off_still_reads_encrypted_rows() {
         "toggle-off: encrypted rows stay readable (decrypt gated on envelope presence)"
     );
 }
+
+#[test]
+fn get_memory_texts_batch_decrypts_encrypted_rows_1779() {
+    // #1779 — reembed/backfill must embed the DECRYPTED content of an
+    // at-rest-encrypted row, NOT the empty placeholder. Embedding the
+    // placeholder yields a title-only vector and `set_embeddings_batch_reembed`
+    // REPLACE semantics would burn it over the good store-time embedding
+    // corpus-wide. A row whose envelope won't decrypt must be SKIPPED (omitted)
+    // rather than embedded as a placeholder. Hermetic: builds envelopes
+    // manually + holds the gate OFF so a concurrent on-path env write can't
+    // make db::insert re-seal.
+    let _gate = EncryptGate::off();
+    let conn = fresh_conn();
+
+    let agent = "reembed-1779-agent";
+    let plaintext = "secret content that must be embedded, not the placeholder";
+    let kp = get_or_create_keypair(agent).expect("keypair");
+    let envelope_bytes = encrypt(plaintext, &kp.public).expect("encrypt").to_bytes();
+
+    // Encrypted row: empty placeholder content + envelope + matching agent_id.
+    let mut enc = make_mem("enc-1779", "", "global");
+    enc.metadata = serde_json::json!({ "agent_id": agent });
+    let enc_id = db::insert(&conn, &enc).expect("insert enc");
+    conn.execute(
+        "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+        params![envelope_bytes, &enc_id],
+    )
+    .expect("persist envelope");
+
+    // Plain (unencrypted) row — content passes through verbatim.
+    let plain = make_mem("plain-1779", "plain content here", "global");
+    let plain_id = db::insert(&conn, &plain).expect("insert plain");
+
+    // Undecryptable row: envelope present, but metadata.agent_id points at a
+    // different agent whose key can't open it → must be SKIPPED.
+    let mut orphan = make_mem("orphan-1779", "", "global");
+    orphan.metadata = serde_json::json!({ "agent_id": "orphan-1779-no-key-match" });
+    let orphan_id = db::insert(&conn, &orphan).expect("insert orphan");
+    conn.execute(
+        "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+        params![envelope_bytes, &orphan_id],
+    )
+    .expect("persist orphan envelope");
+
+    let rows = db::get_memory_texts_batch(&conn, None, None, 100).expect("texts batch");
+    let by_id: std::collections::HashMap<String, String> =
+        rows.into_iter().map(|(id, _t, c)| (id, c)).collect();
+
+    assert_eq!(
+        by_id.get(&enc_id).map(String::as_str),
+        Some(plaintext),
+        "#1779: encrypted row must surface DECRYPTED content for embedding"
+    );
+    assert_eq!(
+        by_id.get(&plain_id).map(String::as_str),
+        Some("plain content here"),
+        "plain row passes through verbatim"
+    );
+    assert!(
+        !by_id.contains_key(&orphan_id),
+        "#1779: undecryptable encrypted row must be SKIPPED, not embedded as placeholder"
+    );
+}
+
+#[test]
+fn federation_merge_seals_content_and_snapshots_1773() {
+    // #1773 — a same-id federation merge (LWW remote-wins) must re-seal the
+    // merged content + set encrypted_envelope as a MATCHED PAIR. Pre-fix the
+    // overwrite wrote plaintext into `content` but left the STALE envelope, so
+    // the next read decrypted the OLD content (silent merge loss). It must also
+    // take a pre-merge snapshot (recoverable copy). Encryption ON via the gate.
+    let _gate = EncryptGate::on();
+    let conn = fresh_conn();
+    let agent = "merge-1773-agent";
+
+    // Existing local row — under the gate, db::insert seals "original".
+    let mut existing = make_mem("merge-1773", "original local content", "global");
+    existing.metadata = serde_json::json!({ "agent_id": agent });
+    existing.updated_at = "2026-01-01T00:00:00+00:00".to_string();
+    let id = db::insert(&conn, &existing).expect("insert existing");
+
+    // Inbound federated row: SAME id, NEWER updated_at → remote content wins.
+    let mut inbound = existing.clone();
+    inbound.content = "merged via federation".to_string();
+    inbound.updated_at = "2026-06-01T00:00:00+00:00".to_string();
+    db::merge_inbound(&conn, &inbound).expect("merge_inbound");
+
+    // HIGH: read must return the MERGED content (re-sealed), not stale.
+    let fetched = db::get(&conn, &id).expect("get").expect("exists");
+    assert_eq!(
+        fetched.content, "merged via federation",
+        "#1773: federation merge must re-seal content (no stale-envelope desync)"
+    );
+    // The merged row carries a (fresh) non-NULL envelope under encryption.
+    let env: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM memories WHERE id = ?1",
+            params![&id],
+            |r| r.get(0),
+        )
+        .expect("env query");
+    assert!(
+        env.is_some(),
+        "#1773: merged encrypted row must carry a fresh envelope"
+    );
+    // MEDIUM: a pre-merge snapshot was archived (recoverable copy).
+    let snap_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1 AND archive_reason = 'federation_merge'",
+            params![&id],
+            |r| r.get(0),
+        )
+        .expect("snap count");
+    assert_eq!(
+        snap_count, 1,
+        "#1773: federation merge must snapshot the pre-merge row"
+    );
+}
