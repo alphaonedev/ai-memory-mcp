@@ -217,7 +217,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // memory+dedup transaction) landed the file at 19_417.
     // #1580 — bumped 19_510 → 19_520 for the touch_many `PRAGMA query_only`
     // read-only no-op guard (the WAL read-pool enabler).
-    ("src/storage/mod.rs", 19_520),
+    // 2026-06-22 (#1776) — bumped 19_520 → 19_600: the `forget` archive+delete
+    // BEGIN IMMEDIATE transaction wrapper (atomicity fix porting #1026) + the
+    // `forget_archive_and_delete_are_atomic_1776` regression test landed the
+    // file at 19_567.
+    ("src/storage/mod.rs", 19_600),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

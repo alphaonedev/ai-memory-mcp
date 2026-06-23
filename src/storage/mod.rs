@@ -2511,100 +2511,115 @@ pub fn forget(
         }));
     }
 
-    if archive {
-        // Archive matching memories before deletion
-        let now = Utc::now().to_rfc3339();
+    // #1776 — archive + delete MUST be ONE atomic transaction. Pre-fix the
+    // archive INSERT and the DELETE ran as two separate autocommit statements,
+    // so a crash / SIGKILL between them left every matched row BOTH archived
+    // AND live (duplicate), and the DELETE re-evaluated the match independently
+    // of the archive SELECT (a concurrent write between them could diverge the
+    // two row sets → a row deleted that was never archived). Wrapping both in
+    // one `BEGIN IMMEDIATE` (mirroring `gc` / the #1026 `run_gc` fix) makes them
+    // atomic AND pins them to the identical row set: the write lock is held for
+    // the whole transaction, so no concurrent writer can change the match set
+    // between the archive and the delete.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let result = (|| -> Result<usize> {
+        if archive {
+            // Archive matching memories before deletion.
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on
+                // forget-archive. v0.7.0 issue #861 — also project `metadata`
+                // into the archive row (mirrors the gc + explicit-archive
+                // paths that already preserve metadata).
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?4, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE rowid IN (
+                        SELECT m.rowid FROM memories_fts fts
+                        JOIN memories m ON m.rowid = fts.rowid
+                        WHERE memories_fts MATCH ?1
+                          AND (?2 IS NULL OR m.namespace = ?2)
+                          AND (?3 IS NULL OR m.tier = ?3)
+                     )",
+                    params![fts_query, namespace, tier_str, now],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?3, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
+                    params![namespace, tier_str, now],
+                )?;
+            }
+        }
+
+        // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
             let fts_query = forget_fts_query(pat);
             let tier_str = tier.map(|t| t.as_str().to_string());
-            // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on forget-archive.
-            // v0.7.0 issue #861 — also project `metadata` into the
-            // archive row. The pre-fix INSERT omitted both the column
-            // and the SELECT expression, so the column defaulted to
-            // `'{}'` and `memory_archive_list` returned an empty object
-            // for every forget-archived row (silently stripping
-            // `agent_id`, `imported_from_*`, and every other operator-
-            // visible attribution key). Mirrors the gc + explicit-
-            // archive paths that already preserve metadata.
             conn.execute(
-                "INSERT OR REPLACE INTO archived_memories
-                 (id, tier, namespace, title, content, tags, priority, confidence,
-                  source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at,
-                  reflection_depth, atomised_into, atom_of, memory_kind,
-                  entity_id, persona_version, citations, source_uri, source_span,
-                  confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?4, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
-                 FROM memories WHERE rowid IN (
+                "DELETE FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
                     WHERE memories_fts MATCH ?1
                       AND (?2 IS NULL OR m.namespace = ?2)
                       AND (?3 IS NULL OR m.tier = ?3)
-                 )",
-                params![fts_query, namespace, tier_str, now],
-            )?;
+                )",
+                params![fts_query, namespace, tier_str],
+            )
         } else {
             let tier_str = tier.map(|t| t.as_str().to_string());
-            // v0.7.0 issue #861 — same metadata-projection fix as the
-            // patterned branch above. Forget without a pattern still
-            // archives whole namespaces/tiers, so the same bug applied.
             conn.execute(
-                "INSERT OR REPLACE INTO archived_memories
-                 (id, tier, namespace, title, content, tags, priority, confidence,
-                  source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at,
-                  reflection_depth, atomised_into, atom_of, memory_kind,
-                  entity_id, persona_version, citations, source_uri, source_span,
-                  confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?3, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
-                 FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
-                params![namespace, tier_str, now],
-            )?;
+                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
+                params![namespace, tier_str],
+            )
+        }
+        .map_err(anyhow::Error::from)
+    })();
+
+    match result {
+        Ok(deleted) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(deleted)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
         }
     }
-
-    // If pattern provided, use FTS to find matching IDs
-    if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
-        let tier_str = tier.map(|t| t.as_str().to_string());
-        let deleted = conn.execute(
-            "DELETE FROM memories WHERE rowid IN (
-                SELECT m.rowid FROM memories_fts fts
-                JOIN memories m ON m.rowid = fts.rowid
-                WHERE memories_fts MATCH ?1
-                  AND (?2 IS NULL OR m.namespace = ?2)
-                  AND (?3 IS NULL OR m.tier = ?3)
-            )",
-            params![fts_query, namespace, tier_str],
-        )?;
-        return Ok(deleted);
-    }
-
-    let tier_str = tier.map(|t| t.as_str().to_string());
-    let deleted = conn.execute(
-        "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
-        params![namespace, tier_str],
-    )?;
-    Ok(deleted)
 }
 
 /// #1602 — one row of a forget preview / deletion audit listing.
@@ -14330,6 +14345,43 @@ mod tests {
         assert_eq!(deleted, 2);
         let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
         assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn forget_archive_and_delete_are_atomic_1776() {
+        // #1776 — forget(archive=true) must archive AND delete the SAME matched
+        // set inside ONE transaction: every deleted row lands in
+        // archived_memories (none deleted-but-not-archived), and none is left
+        // both live and archived. The `BEGIN IMMEDIATE` wrapper guarantees this;
+        // this test pins the contract so a regression to two autocommit
+        // statements (the pre-#1776 shape) fails here.
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "forget-ns", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "forget-ns", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "keep-ns", Tier::Long, 5)).unwrap();
+
+        let deleted = forget(&conn, Some("forget-ns"), None, None, true).unwrap();
+        assert_eq!(deleted, 2, "both forget-ns rows deleted");
+
+        // Deleted from live `memories` (only keep-ns remains).
+        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].namespace, "keep-ns");
+
+        // Every deleted row was archived (archive set == delete set, both
+        // committed) — no row deleted-but-not-archived, no divergence.
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories \
+                 WHERE namespace = ?1 AND archive_reason = 'forget'",
+                params!["forget-ns"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archived, 2,
+            "#1776: every deleted row must be archived (archive set must equal delete set)"
+        );
     }
 
     #[test]
