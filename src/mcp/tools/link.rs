@@ -247,14 +247,15 @@ pub(super) fn handle_link(
     );
     // #1786 — owner gate: refuse forging a link ROOTED at a source memory owned
     // by a DIFFERENT agent (the MCP link path bypasses the HTTP source-owner
-    // gate, leaving a graph-forge primitive). Only gates when the source
-    // resolves and is owned by a named other agent; lenient + single-tenant-safe.
-    if let Some(ref src) = link_owner {
-        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), None)
-            .map_err(|e| e.to_string())?;
-        if !crate::visibility::caller_owns_for_mutation(src, &caller, false) {
-            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
-        }
+    // gate, leaving a graph-forge primitive). Keyed on the ENFORCED-read caller
+    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
+    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
+    // trust-all default byte-unchanged.
+    if let Some(src) = link_owner.as_ref()
+        && let Some(caller) = crate::identity::resolve_read_visibility_caller()
+        && !crate::visibility::caller_owns_for_mutation(src, &caller, false)
+    {
+        return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
     }
     // H12 (#628 blocker): combine the link quota check + counter
     // increment in a single atomic transaction. The check + record

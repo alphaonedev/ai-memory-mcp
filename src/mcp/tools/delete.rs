@@ -196,13 +196,15 @@ pub(super) fn handle_delete(
 
     // #1786 — owner gate: refuse a cross-owner delete. The MCP surface calls
     // raw `db::delete` directly (bypassing the SAL trait + the HTTP handler's
-    // `require_caller_owns_memory`), so without this a multi-tenant / shared-DB
-    // caller could delete another agent's private memory by id. Lenient +
-    // single-tenant-safe (unstamped / self-owned / daemon / inbox-target pass);
-    // mirrors the HTTP delete-side gate (`allow_inbox = true`).
-    {
-        let caller = crate::identity::resolve_agent_id(params["agent_id"].as_str(), mcp_client)
-            .map_err(|e| e.to_string())?;
+    // `require_caller_owns_memory`), so without this a multi-tenant caller could
+    // delete another agent's private memory by id. The gate is keyed on the
+    // ENFORCED-read caller (`resolve_read_visibility_caller`, env-only): it
+    // fires ONLY when `AI_MEMORY_AGENT_ID` is set (the multi-tenant opt-in),
+    // matching the read-path ownership posture (#1468/#1720 B1) so the
+    // single-operator trust-all default is byte-unchanged. Lenient (unstamped /
+    // self-owned / daemon / inbox-target pass); `allow_inbox = true` mirrors the
+    // HTTP delete-side gate.
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
         if !crate::visibility::caller_owns_for_mutation(&target, &caller, true) {
             return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
         }
@@ -662,12 +664,22 @@ mod tests {
         crate::config::clear_permissions_mode_override_for_test();
     }
 
+    fn agent_id_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn cross_owner_delete_refused_1786() {
-        // #1786 — on a DEFAULT deployment (no governance policy, permissions
-        // off) a delete of another owner's row by id must be REFUSED by the
-        // owner gate, and the owner themselves can still delete it.
-        let _gate = crate::config::lock_permissions_mode_for_test();
+        // #1786 — when AI_MEMORY_AGENT_ID is SET (the multi-tenant opt-in), the
+        // MCP delete owner gate refuses a cross-owner delete and still lets the
+        // owner delete. (Unset = trust-all single-tenant default, no gate — that
+        // path is covered by every other handle_delete test, which run without
+        // the env set and still pass.)
+        let _envg = agent_id_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _pm = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Off,
         );
@@ -676,34 +688,26 @@ mod tests {
         let id = db::insert(&conn, &mem).expect("insert");
         let db_path = db_path();
 
-        // ai:bob (≠ owner) is refused; the row stays live.
-        let err = handle_delete(
-            &conn,
-            &db_path,
-            &json!({"id": id, "agent_id": "ai:bob"}),
-            None,
-            None,
-        )
-        .expect_err("cross-owner delete must be refused");
+        // Caller ai:bob (≠ owner) → refused; the row stays live.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let err = handle_delete(&conn, &db_path, &json!({"id": id}), None, None)
+            .expect_err("cross-owner delete must be refused");
         assert!(err.contains("does not own"), "got: {err}");
         assert!(
             db::get(&conn, &id).unwrap().is_some(),
             "row must remain live after a refused cross-owner delete"
         );
 
-        // The owner ai:alice CAN delete it.
-        let ok = handle_delete(
-            &conn,
-            &db_path,
-            &json!({"id": id, "agent_id": "ai:alice"}),
-            None,
-            None,
-        );
+        // Caller ai:alice (owner) → allowed.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        let ok = handle_delete(&conn, &db_path, &json!({"id": id}), None, None);
         assert!(ok.is_ok(), "owner delete must succeed: {ok:?}");
         assert!(
             db::get(&conn, &id).unwrap().is_none(),
             "owner delete removes the row"
         );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
         crate::config::clear_permissions_mode_override_for_test();
     }
 }
