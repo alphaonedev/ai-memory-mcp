@@ -7004,6 +7004,12 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
+    // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
+    // would `process::exit(2)` and abort the whole test binary. Only the sal
+    // build takes the Ok(0) path — and Per-Module Coverage runs with `sal`, so
+    // the daemon_runtime.rs floor cushion is preserved.
+    #[cfg(feature = "sal")]
     #[tokio::test]
     async fn test_run_dispatch_undo_edit_command() {
         // #1727/#1800 — cover the `Command::UndoEdit` dispatch arm. Seed a
