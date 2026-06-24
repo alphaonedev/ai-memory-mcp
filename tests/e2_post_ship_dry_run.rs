@@ -202,7 +202,7 @@ fn e2_dry_run_supports_brew_install_method() {
     let out = Command::new(bin)
         .arg("--dry-run")
         .arg("--version")
-        .arg("0.7.1")
+        .arg("0.8.0")
         .arg("--method")
         .arg("brew")
         .output()
@@ -212,7 +212,7 @@ fn e2_dry_run_supports_brew_install_method() {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout JSON envelope");
     assert_eq!(json["install_method"], "brew");
-    assert_eq!(json["version"], "0.7.1");
+    assert_eq!(json["version"], "0.8.0");
     assert_eq!(json["verdict"], "DRY_RUN");
 }
 
