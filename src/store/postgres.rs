@@ -1056,7 +1056,13 @@ impl PostgresStore {
                      with configured embedder dim ({target_i32}); converting in place. \
                      Existing embeddings will be NULLed — re-embed required after this completes."
                 );
-                store.migrate_embedding_dim(dim).await?;
+                // #1781 — force = true here: the #877 daemon auto-migrate
+                // is the operator's explicit opt-in (they configured the
+                // mismatched embedder dim + chose the auto-migrate boot
+                // path), so it must NOT refuse like the CLI default does.
+                // The CLI `schema-init` path defaults to refuse (force =
+                // args.force_reembed); auto-migrate preserves #877.
+                store.migrate_embedding_dim(dim, true).await?;
                 Ok(store)
             }
         }
@@ -4498,13 +4504,27 @@ impl PostgresStore {
     /// The whole operation runs in a single transaction so a mid-way
     /// failure leaves the schema untouched.
     ///
+    /// # Refuse-destructive-by-default (#1781)
+    ///
+    /// When the conversion is real (the live column dim differs from
+    /// `target_dim`) AND the corpus already holds stored embeddings,
+    /// the call REFUSES with `StoreError::InvalidInput` unless `force`
+    /// is set — re-running `ai-memory schema-init --embedding-dim` with
+    /// the wrong/default dim against a populated corpus would otherwise
+    /// silently NULL every embedding (semantic recall degrades to
+    /// keyword until a full re-embed). `force = true` is the explicit
+    /// `--force-reembed` escape hatch (CLI) or the operator-opted-in
+    /// #877 daemon auto-migrate path. Precedent: #1785 DROP-confirm.
+    ///
     /// # Errors
     ///
     /// - `StoreError::InvalidInput` when `target_dim` is not one of the
     ///   supported values (`SUPPORTED_EMBEDDING_DIMS`).
+    /// - `StoreError::InvalidInput` when stored embeddings exist and
+    ///   `force` is `false` (#1781 destructive-conversion refusal).
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
-    pub async fn migrate_embedding_dim(&self, target_dim: u32) -> StoreResult<bool> {
+    pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
         })?;
@@ -4528,11 +4548,39 @@ impl PostgresStore {
             return Ok(false);
         }
 
+        // #1781 — refuse-destructive-by-default. The conversion below
+        // NULLs every stored embedding (cross-dim reprojection isn't
+        // well-defined). Probe how many rows would lose their vector
+        // BEFORE touching anything; if any exist and the caller didn't
+        // opt in via `force`, refuse without mutating a single row.
+        let embeddings_at_risk: i64 = {
+            let live: i64 = sqlx::query_scalar(crate::SQL_COUNT_EMBEDDED_MEMORIES)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| to_store_err("count memories.embedding non-null", e))?;
+            let archived: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM archived_memories WHERE embedding IS NOT NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("count archived_memories.embedding non-null", e))?;
+            live + archived
+        };
+
+        if embeddings_at_risk > 0 && !force {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "refusing destructive embedding-dim conversion vector({current:?})→vector({target_dim}): {embeddings_at_risk} stored embeddings would be NULLed (semantic recall degrades to keyword until a full re-embed). Re-run `ai-memory schema-init --embedding-dim {target_dim} --force-reembed` to proceed."
+                ),
+            });
+        }
+
         tracing::warn!(
             target: TRACE_TARGET,
             current = ?current,
             target = target_i32,
-            "v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; existing embeddings will be NULLed — operators MUST re-run embeddings after this conversion completes"
+            embeddings_nulled = embeddings_at_risk,
+            "{embeddings_at_risk} embeddings NULLed by vector({target_i32}) conversion — re-embed required (v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; operators MUST re-run embeddings after this conversion completes)"
         );
 
         let mut tx = self

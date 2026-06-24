@@ -305,3 +305,111 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
         "issue-877 row must persist through the postgres write path post-auto-migrate"
     );
 }
+
+/// Issue #1781 — refuse-destructive-by-default guard on
+/// `migrate_embedding_dim`. With stored embeddings present, a real
+/// dim conversion REFUSES (typed `InvalidInput`) without `force` and
+/// leaves the embedding intact; with `force = true` it proceeds and
+/// NULLs the embedding. Precedent: the #1785 DROP-confirm pattern.
+#[tokio::test]
+async fn migrate_embedding_dim_refuses_when_embeddings_exist_without_force() {
+    use ai_memory::models::Memory;
+    use ai_memory::store::{CallerContext, MemoryStore, StoreError};
+    use chrono::Utc;
+
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _public_lock = PublicSchemaLock::acquire()
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    // Bootstrap at 384 and insert a memory WITH a 384-dim embedding so
+    // the corpus is populated — the exact state the guard protects.
+    let store = PostgresStore::connect_with_dim(&url, 384)
+        .await
+        .expect("connect at dim=384");
+    assert_eq!(current_dim(&inspect).await, Some(384), "bootstrap at 384");
+
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: "issue-1781-guard".to_string(),
+        namespace: "ai-memory-mcp".to_string(),
+        title: "issue #1781 guard".to_string(),
+        content: "this embedding must survive a refused conversion".to_string(),
+        tags: vec!["issue-1781".to_string()],
+        source: "test".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({"agent_id":"issue-1781-test"}),
+        ..Default::default()
+    };
+    let ctx = CallerContext::for_agent("issue-1781-test");
+    let embedding: Vec<f32> = vec![0.25_f32; 384];
+    store
+        .store_with_embedding(&ctx, &mem, Some(&embedding))
+        .await
+        .expect("seed 384-dim embedding");
+
+    // 1) A real conversion (384 -> 768) with stored embeddings present
+    //    and force = false MUST refuse with a typed InvalidInput and
+    //    MUST NOT mutate anything.
+    let refusal = store
+        .migrate_embedding_dim(768, false)
+        .await
+        .expect_err("must refuse a destructive conversion of a populated corpus");
+    match &refusal {
+        StoreError::InvalidInput { detail } => {
+            assert!(
+                detail.contains("refusing destructive embedding-dim conversion")
+                    && detail.contains("--force-reembed"),
+                "refusal message must name the guard + the escape hatch; got: {detail}"
+            );
+        }
+        other => panic!("expected StoreError::InvalidInput, got {other:?}"),
+    }
+
+    // Nothing destroyed: the column dim is unchanged AND the embedding
+    // is still non-NULL.
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(384),
+        "refusal must leave the column dim untouched"
+    );
+    let still_present: Option<(bool,)> =
+        sqlx::query_as("SELECT embedding IS NOT NULL FROM memories WHERE id = 'issue-1781-guard'")
+            .fetch_optional(&inspect)
+            .await
+            .expect("inspect embedding nullability");
+    assert_eq!(
+        still_present,
+        Some((true,)),
+        "refusal must leave the stored embedding non-NULL (nothing destroyed)"
+    );
+
+    // 2) With force = true the same conversion proceeds: Ok(true), the
+    //    column flips to vector(768), and the embedding is NULLed.
+    let did_convert = store
+        .migrate_embedding_dim(768, true)
+        .await
+        .expect("force = true must proceed with the destructive conversion");
+    assert!(did_convert, "a real conversion returns Ok(true)");
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "forced conversion must flip the column to vector(768)"
+    );
+    let nulled: Option<(bool,)> =
+        sqlx::query_as("SELECT embedding IS NULL FROM memories WHERE id = 'issue-1781-guard'")
+            .fetch_optional(&inspect)
+            .await
+            .expect("inspect post-conversion embedding nullability");
+    assert_eq!(
+        nulled,
+        Some((true,)),
+        "forced conversion must NULL the stored embedding (re-embed required)"
+    );
+}

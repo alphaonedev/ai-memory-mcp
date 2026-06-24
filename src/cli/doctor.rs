@@ -656,11 +656,7 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     // HNSW size proxy: count of memories with an embedding (the in-memory
     // index is rebuilt from this on startup).
     let hnsw_size: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
+        .query_row(crate::SQL_COUNT_EMBEDDED_MEMORIES, [], |r| r.get(0))
         .unwrap_or(0);
     facts.push(("hnsw_size_estimate".into(), hnsw_size.to_string()));
 

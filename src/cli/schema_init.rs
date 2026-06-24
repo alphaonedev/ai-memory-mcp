@@ -117,6 +117,15 @@ pub struct SchemaInitArgs {
     /// embeddings as opaque BLOBs without a column-level dim).
     #[arg(long, default_value_t = 384)]
     pub embedding_dim: u32,
+    /// Force a destructive embedding-dim conversion (#1781). Required
+    /// to proceed when `--embedding-dim` differs from the live
+    /// `memories.embedding` column dim AND the corpus already holds
+    /// stored embeddings: the conversion NULLs every embedding
+    /// (cross-dim reprojection isn't well-defined), so by default the
+    /// verb REFUSES and prints how many embeddings would be lost. Pass
+    /// this flag only when you accept a full re-embed afterwards.
+    #[arg(long, default_value_t = false)]
+    pub force_reembed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +233,8 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
     } else if is_postgres_url(&args.store_url) {
         #[cfg(feature = "sal-postgres")]
         {
-            init_and_enumerate_postgres(&args.store_url, args.embedding_dim).await?
+            init_and_enumerate_postgres(&args.store_url, args.embedding_dim, args.force_reembed)
+                .await?
         }
         #[cfg(not(feature = "sal-postgres"))]
         {
@@ -388,7 +398,11 @@ fn read_schema_version_sqlite(conn: &rusqlite::Connection) -> Result<i64> {
 /// destructive conversion runs only via the explicit
 /// `migrate_embedding_dim` call below.
 #[cfg(feature = "sal-postgres")]
-async fn init_and_enumerate_postgres(url: &str, dim: u32) -> Result<SchemaInitReport> {
+async fn init_and_enumerate_postgres(
+    url: &str,
+    dim: u32,
+    force_reembed: bool,
+) -> Result<SchemaInitReport> {
     use crate::store::postgres::PostgresStore;
 
     // Bootstrap at the requested dim. CREATE TABLE IF NOT EXISTS in
@@ -410,8 +424,13 @@ async fn init_and_enumerate_postgres(url: &str, dim: u32) -> Result<SchemaInitRe
     // what the caller requested. Returns `true` if a real conversion
     // happened (destructive — embeddings NULLed); `false` if the
     // schema was already at the right dim (idempotent no-op).
+    // #1781 — `force_reembed` threads the operator's `--force-reembed`
+    // opt-in. Default (false) makes a destructive conversion of a
+    // populated corpus REFUSE with a typed InvalidInput; the `?` below
+    // propagates that refusal cleanly to the operator (no panic) via the
+    // `run` dispatcher's anyhow chain.
     let migrated = store
-        .migrate_embedding_dim(dim)
+        .migrate_embedding_dim(dim, force_reembed)
         .await
         .with_context(|| format!("migrate embedding dim to {dim}"))?;
 
@@ -702,6 +721,7 @@ mod tests {
             store_url: url.clone(),
             json: true,
             embedding_dim: 384,
+            force_reembed: false,
         };
         run(&args, &mut out).await.expect("schema-init sqlite");
 
@@ -760,6 +780,7 @@ mod tests {
             store_url: url.clone(),
             json: true,
             embedding_dim: 768,
+            force_reembed: false,
         };
         run(&args, &mut out).await.expect("schema-init sqlite 768");
 
@@ -784,6 +805,7 @@ mod tests {
             store_url: url,
             json: false,
             embedding_dim: 384,
+            force_reembed: false,
         };
         run(&args, &mut out)
             .await
@@ -806,6 +828,7 @@ mod tests {
             store_url: "mysql://user:secret@host/db".to_string(),
             json: false,
             embedding_dim: 384,
+            force_reembed: false,
         };
         let err = run(&args, &mut out).await.expect_err("must reject");
         let msg = err.to_string();
@@ -849,6 +872,7 @@ mod tests {
             store_url: url.clone(),
             json: true,
             embedding_dim: 384,
+            force_reembed: false,
         };
         run(&args, &mut out).await.expect("schema-init 384");
         let raw = String::from_utf8(stdout).unwrap();
@@ -863,6 +887,7 @@ mod tests {
             store_url: url.clone(),
             json: true,
             embedding_dim: 768,
+            force_reembed: false,
         };
         run(&args, &mut out).await.expect("schema-init 768");
         let raw = String::from_utf8(stdout).unwrap();
@@ -885,6 +910,7 @@ mod tests {
             store_url: url,
             json: true,
             embedding_dim: 768,
+            force_reembed: false,
         };
         run(&args, &mut out)
             .await
@@ -912,6 +938,7 @@ mod tests {
             store_url: url.clone(),
             json: false,
             embedding_dim: 384,
+            force_reembed: false,
         };
         run(&args, &mut out)
             .await
@@ -943,6 +970,7 @@ mod tests {
             store_url: "nosql://nope".to_string(),
             json: false,
             embedding_dim: 384,
+            force_reembed: false,
         };
         let err = run(&args, &mut out).await.expect_err("should reject");
         let msg = format!("{err:#}");
@@ -977,6 +1005,7 @@ mod tests {
             store_url: "postgres://nobody:nope@127.0.0.1:1/no_db".to_string(),
             json: true,
             embedding_dim: 384,
+            force_reembed: false,
         };
         let err = run(&args, &mut out)
             .await
@@ -1001,6 +1030,7 @@ mod tests {
             store_url: "postgresql://nobody:nope@127.0.0.1:1/x".to_string(),
             json: false,
             embedding_dim: 384,
+            force_reembed: false,
         };
         assert!(run(&args, &mut out).await.is_err());
     }
@@ -1095,7 +1125,7 @@ mod tests {
     async fn init_and_enumerate_postgres_unreachable_returns_open_error() {
         // Drives `init_and_enumerate_postgres`'s connect call (380-382)
         // — same early-return semantics.
-        let err = init_and_enumerate_postgres("postgres://x:y@127.0.0.1:1/no_db", 384)
+        let err = init_and_enumerate_postgres("postgres://x:y@127.0.0.1:1/no_db", 384, false)
             .await
             .expect_err("must fail");
         let msg = format!("{err:#}");
