@@ -767,6 +767,7 @@ async fn schema_init_run_postgres_enumerates_live_catalog() {
         store_url: url.clone(),
         json: true,
         embedding_dim: 384,
+        force_reembed: false,
     };
     // Drives run → init_and_enumerate_postgres → connect_with_dim →
     // migrate_embedding_dim → enumerate_postgres (+ bootstrap_memory_graph
@@ -813,6 +814,7 @@ async fn schema_init_run_postgres_human_render() {
         store_url: url,
         json: false,
         embedding_dim: 384,
+        force_reembed: false,
     };
     ai_memory::cli::schema_init::run(&args, &mut out)
         .await
