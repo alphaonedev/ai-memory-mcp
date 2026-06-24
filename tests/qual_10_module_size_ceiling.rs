@@ -789,7 +789,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-24 (#1800) — bumped 8_960 → 9_050 for the dispatch-arm coverage
     // cushions (`test_run_dispatch_{undo_edit,reown,replay}_command`) that hold
     // daemon_runtime.rs comfortably above its Per-Module Coverage 86% floor.
-    ("src/daemon_runtime.rs", 9_050),
+    // 2026-06-24 (#1798 R-04/R-12) — bumped 9_050 → 9_200 for the
+    // `boot_security_posture_warnings` helper + `host_is_loopback` + the
+    // bootstrap_serve call site + 6 `boot_posture_*` unit tests (loud
+    // non-loopback boot security-posture WARNs). Ceiling is aspirational, not
+    // a ratchet — see `qual_10_ceiling_table_is_aspirational_not_ratcheting_up`.
+    ("src/daemon_runtime.rs", 9_200),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

@@ -3707,12 +3707,7 @@ fn api_key_bind_guard(
              AI_MEMORY_REQUIRE_API_KEY to fall back to the loopback-only default. (#1458)"
         ));
     }
-    let is_loopback = host == "127.0.0.1"
-        || host == "::1"
-        || host == "localhost"
-        || host == "0:0:0:0:0:0:0:1"
-        || host == "[::1]";
-    if !is_loopback {
+    if !host_is_loopback(host) {
         return Err(format!(
             "refusing to bind to non-loopback address {host:?} without an API key: \
              the daemon's api_key is unset (default-off auth would expose every \
@@ -3733,6 +3728,61 @@ fn api_key_bind_guard(
          for any deployment that is not strictly single-tenant on this host. \
          /approve and /reject remain HMAC-gated regardless."
     )))
+}
+
+/// Same loopback host set [`api_key_bind_guard`] recognises. Factored so the
+/// posture-warning matrix below shares one definition with the bind guard.
+fn host_is_loopback(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "[::1]"
+}
+
+/// R-04 / R-12 (#1798 full-spectrum review) — boot-time security-posture
+/// warnings for a NON-LOOPBACK bind. Mirrors the [`api_key_bind_guard`]
+/// precedent: pure + unit-testable, returning the warning strings (the caller
+/// emits each via `tracing::warn!`). Loopback binds (the single-tenant default
+/// posture) return an empty vec — these are off-host-reachability concerns.
+///
+/// - **R-04** — permissions mode resolves to `Enforce` but ZERO permission
+///   rules are configured: the operator opted into enforcement, yet with no
+///   rules the pipeline gates nothing (allow-on-silence default), so writes
+///   are effectively ungated. Surfacing this prevents a false sense of
+///   protection.
+/// - **R-12** — agent attestation is permissive (the default): writes land
+///   `attest_level = claimed` with unverified caller identity — a notable
+///   posture for an off-host / multi-tenant listener.
+fn boot_security_posture_warnings(
+    host: &str,
+    permissions_mode: crate::config::PermissionsMode,
+    permission_rule_count: usize,
+    attestation_required: bool,
+) -> Vec<String> {
+    if host_is_loopback(host) {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if permissions_mode == crate::config::PermissionsMode::Enforce && permission_rule_count == 0 {
+        warnings.push(format!(
+            "SECURITY POSTURE (#1798 R-04): daemon bound to non-loopback {host:?} with \
+             permissions mode=enforce but ZERO permission rules configured — the permissions \
+             pipeline then gates nothing (allow-on-silence default), so privileged writes are \
+             effectively UNGATED despite enforce mode. Add `[[permissions.rules]]` (or attach a \
+             namespace standard) to actually gate writes; otherwise enforce mode is a false \
+             sense of protection."
+        ));
+    }
+    if !attestation_required {
+        warnings.push(format!(
+            "SECURITY POSTURE (#1798 R-12): daemon bound to non-loopback {host:?} with agent \
+             attestation PERMISSIVE (the default) — writes from any reachable caller land \
+             attest_level=claimed with unverified identity. For off-host / multi-tenant \
+             deployments set AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 to reject unsigned writes."
+        ));
+    }
+    warnings
 }
 
 /// Build all daemon state and spawn background tasks. Returns the
@@ -3770,6 +3820,25 @@ pub async fn bootstrap_serve(
         Ok(None) => {}
         Ok(Some(warning)) => tracing::warn!("{warning}"),
         Err(reason) => anyhow::bail!("{reason}"),
+    }
+
+    // R-04 / R-12 (#1798 full-spectrum review) — loud non-loopback
+    // security-posture WARNs. Resolved from `app_config` (ordering-safe) so
+    // the matrix reflects the operator's configured posture, not a process
+    // global that bootstrap may not have populated yet.
+    {
+        let (effective_mode, _) = crate::governance::resolve_v07_default_mode(
+            app_config.permissions.as_ref().and_then(|p| p.mode),
+        );
+        let permission_rule_count = app_config.permissions.as_ref().map_or(0, |p| p.rules.len());
+        for warning in boot_security_posture_warnings(
+            args.host.as_str(),
+            effective_mode,
+            permission_rule_count,
+            crate::identity::attest::require_agent_attestation_enabled(),
+        ) {
+            tracing::warn!("{warning}");
+        }
     }
 
     let resolved_ttl = app_config.effective_ttl();
@@ -5754,6 +5823,87 @@ mod tests {
         let err = api_key_bind_guard(false, "0.0.0.0", false)
             .expect_err("keyless non-loopback bind MUST be refused");
         assert!(err.contains("refusing to bind to non-loopback"), "{err}");
+    }
+
+    // ----- R-04 / R-12 boot security-posture warnings (#1798) ------------
+
+    use crate::config::PermissionsMode;
+
+    /// A loopback bind never emits posture warnings, even with the worst
+    /// posture (enforce + 0 rules + permissive attestation).
+    #[test]
+    fn boot_posture_loopback_emits_nothing_r04_r12() {
+        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let w = boot_security_posture_warnings(host, PermissionsMode::Enforce, 0, false);
+            assert!(
+                w.is_empty(),
+                "loopback {host} must emit no posture warnings, got {w:?}"
+            );
+        }
+    }
+
+    /// Non-loopback + enforce + ZERO permission rules → the R-04 false-sense
+    /// warning fires.
+    #[test]
+    fn boot_posture_enforce_zero_rules_warns_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, true);
+        assert_eq!(
+            w.len(),
+            1,
+            "only R-04 expected (attestation required), got {w:?}"
+        );
+        assert!(
+            w[0].contains("R-04") && w[0].contains("UNGATED"),
+            "{}",
+            w[0]
+        );
+    }
+
+    /// Enforce WITH at least one rule → no R-04.
+    #[test]
+    fn boot_posture_enforce_with_rules_no_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 1, true);
+        assert!(
+            w.is_empty(),
+            "enforce + rules + attestation required → no warnings, got {w:?}"
+        );
+    }
+
+    /// A non-enforce mode (advisory/off) does not trip R-04 (R-04 is
+    /// specifically the enforce-but-no-rules false-sense trap).
+    #[test]
+    fn boot_posture_advisory_mode_no_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 0, true);
+        assert!(w.is_empty(), "advisory mode does not trip R-04, got {w:?}");
+    }
+
+    /// Non-loopback + permissive attestation (the default) → the R-12 warning
+    /// fires; requiring attestation silences it.
+    #[test]
+    fn boot_posture_permissive_attestation_warns_r12() {
+        let permissive =
+            boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 1, false);
+        assert_eq!(
+            permissive.len(),
+            1,
+            "only R-12 expected, got {permissive:?}"
+        );
+        assert!(permissive[0].contains("R-12") && permissive[0].contains("attestation"));
+
+        let strict = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 1, true);
+        assert!(
+            strict.is_empty(),
+            "required attestation silences R-12, got {strict:?}"
+        );
+    }
+
+    /// Worst posture on a non-loopback bind surfaces BOTH warnings.
+    #[test]
+    fn boot_posture_worst_case_emits_both_r04_r12() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, false);
+        assert_eq!(w.len(), 2, "expected both R-04 and R-12, got {w:?}");
+        assert!(w.iter().any(|s| s.contains("R-04")));
+        assert!(w.iter().any(|s| s.contains("R-12")));
     }
 
     /// The strict opt-in refuses a keyless start even on loopback,
