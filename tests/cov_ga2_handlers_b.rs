@@ -248,6 +248,11 @@ fn seed_pending_row(path: &std::path::Path, namespace: &str, requested_by: &str)
         ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface now enforces the
+    // Human-arm gate UNCONDITIONALLY: the approver must be a REGISTERED agent and
+    // must not be the requester. These tests approve as a distinct "operator-1",
+    // so register it here (the requester "alice" stays the queuer).
+    ai_memory::db::register_agent(&conn, "operator-1", "ai:generic", &[]).ok();
     ai_memory::db::queue_pending_action(
         &conn,
         ai_memory::models::GovernedAction::Delete,

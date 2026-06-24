@@ -1393,8 +1393,18 @@ impl MemoryStore for SqliteStore {
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
-        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
-            .map_err(box_err)?;
+        // #1796 (5-agent vote 4d3ea1c5) — the SAL trait is the store-backed
+        // (multi-tenant daemon) surface; enforce the Human-arm self-approval
+        // gate UNCONDITIONALLY for behavioural parity with the postgres trait
+        // impl (`governance_approve_with_consensus`, #1793). The single-operator
+        // opt-in lives only on the MCP/CLI free-fn direct callers.
+        let outcome = db::approve_with_approver_type(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)?;
         // Translate the db-layer ApproveOutcome → SAL ApproveOutcome.
         let sal_outcome = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
@@ -1983,8 +1993,17 @@ impl MemoryStore for SqliteStore {
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
-        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
-            .map_err(box_err)?;
+        // #1796 (5-agent vote 4d3ea1c5) — store-backed (multi-tenant) surface;
+        // enforce the Human-arm gate UNCONDITIONALLY for parity with the
+        // postgres trait impl (#1793). MCP/CLI single-operator opt-in lives on
+        // the free-fn direct callers only.
+        let outcome = db::approve_with_approver_type(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)?;
         let sal = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
             db::ApproveOutcome::Pending { votes, quorum } => {
@@ -3899,7 +3918,11 @@ mod tests {
             // + require a registered approver) cannot reject this approval under
             // a leaked AI_MEMORY_AGENT_ID from a concurrent test.
             db::register_agent(&conn, "approver", "ai:generic", &[]).ok();
-            db::approve_with_approver_type(&conn, &pid, "approver").expect("approve");
+            // #1796 — Http surface enforces unconditionally; a registered
+            // non-requester approver ("approver" != requester "alice") approves
+            // deterministically regardless of any leaked AI_MEMORY_AGENT_ID.
+            db::approve_with_approver_type(&conn, &pid, "approver", db::ApproveSurface::Http)
+                .expect("approve");
             pid
         };
         let executed = store

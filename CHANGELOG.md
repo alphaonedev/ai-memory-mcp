@@ -560,7 +560,24 @@ lifecycle surface adds only permissive optional fields to the existing
   opt-in gate would never fire) and the per-request `X-Agent-Id` approver is a distinct authenticated
   identity — there is no single-operator self-lock to avoid. No schema change. Code anchor:
   `src/store/postgres.rs`. (Sibling finding: the sqlite-*backed* HTTP daemon has the analogous
-  opt-in-off-on-HTTP gap — tracked separately.)
+  opt-in-off-on-HTTP gap — tracked separately as #1796.)
+
+- **[#1796](https://github.com/alphaonedev/ai-memory-mcp/issues/1796) — the sqlite-backed HTTP daemon
+  now refuses Human-arm self-approval + unregistered approvers (sqlite-side sibling of #1793).** On a
+  sqlite-backed `ai-memory serve` (the default without `--store-url postgres://`) the `ApproverType::Human`
+  self-approval reject + registered-approver gate added by #1787 to `db::approve_with_approver_type` was
+  opt-in-keyed on `resolve_read_visibility_caller().is_some()` (the process `AI_MEMORY_AGENT_ID`). The
+  multi-tenant HTTP daemon uses per-request `X-Agent-Id` and sets no process `AI_MEMORY_AGENT_ID`, so the
+  gate NEVER fired there and a requester could self-approve their own Human-gated pending action — the
+  same human-in-the-loop bypass #1793 closed for postgres. The 5-agent adversarial vote (memory
+  `4d3ea1c5`, decision memory `7016624d`) resolved the mechanism: a new `pub enum ApproveSurface { Http,
+  LocalOperator }` (no `Default`) is threaded into `db::approve_with_approver_type`, keeping enforcement
+  canonical in the storage fn. The `Http` surface (both HTTP approve handlers + the SAL trait delegates,
+  for parity with the postgres trait impl) enforces UNCONDITIONALLY; the `LocalOperator` surface (MCP/stdio
+  + CLI single-operator) keeps the `AI_MEMORY_AGENT_ID` opt-in so the lone operator is never self-locked
+  out of approving their own action. No schema change. Code anchors: `src/storage/mod.rs`,
+  `src/handlers/{governance,approvals}.rs`, `src/store/sqlite.rs`, `src/mcp/tools/pending.rs`,
+  `src/cli/agents.rs`.
 
 - **[#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795) — PostgresStore now ENFORCES the
   per-agent daily memory-count quota (it previously only recorded it).** On a postgres-backed daemon

@@ -244,7 +244,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // helpers (`resolve_embeddable_content` / `resolve_embeddable_rows` /
     // `embeddable_row_mapper`) routing get_memory_texts_batch +
     // get_unembedded_ids_batch[_after] (#1779) landed it at 20_446.
-    ("src/storage/mod.rs", 20_550),
+    // 2026-06-24 (#1796, 5-agent vote 4d3ea1c5) — bumped 20_550 → 20_700 for the
+    // `ApproveSurface { Http, LocalOperator }` enum + the surface-keyed Human-arm
+    // gate in `approve_with_approver_type` + the
+    // `http_surface_rejects_self_approval_without_env_opt_in_1796` regression test.
+    ("src/storage/mod.rs", 20_700),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

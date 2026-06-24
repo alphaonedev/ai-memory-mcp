@@ -12004,12 +12004,45 @@ pub enum ApproveOutcome {
     Approved,
 }
 
+/// #1796 (5-agent vote 4d3ea1c5) — the calling surface for
+/// [`approve_with_approver_type`], selecting the Human-arm self-approval
+/// posture. Deliberately has NO `Default`: every caller MUST name its
+/// surface so a future approve route cannot silently inherit the wrong
+/// (hole-reopening) disposition — the original #1796 bug was exactly an
+/// ambient/implicit gate (process env) that never fired on the
+/// multi-tenant HTTP surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveSurface {
+    /// The multi-tenant HTTP daemon (`POST /api/v1/...` approve routes).
+    /// The requester and approver are distinct per-request `X-Agent-Id`
+    /// principals, so the Human-arm self-approval reject + registered-approver
+    /// requirement is enforced **unconditionally** (matching the #1793
+    /// postgres fix). There is a real adversary here (any tenant), so a
+    /// requester must never be able to self-approve their own Human-gated
+    /// action.
+    Http,
+    /// The single-operator local surfaces (MCP/stdio + CLI). The Human-arm
+    /// gate is enforced only under the multi-agent **opt-in**
+    /// (`resolve_read_visibility_caller()` Some = `AI_MEMORY_AGENT_ID` set).
+    /// In the trust-all default the requester and approver both resolve to
+    /// the same durable `host:<hostname>` id (#1720 B1), so an unconditional
+    /// reject-self would self-lock the lone operator out of approving their
+    /// own queued actions — and there is no adversary (one caller).
+    LocalOperator,
+}
+
 /// Task 1.10 — approver-type aware approve. Enforces the
 /// `metadata.governance.approver` of the pending action's namespace.
+///
+/// `surface` (#1796) selects the Human-arm self-approval posture — see
+/// [`ApproveSurface`]. The multi-tenant HTTP surface enforces
+/// unconditionally; the single-operator MCP/CLI surfaces keep the
+/// `AI_MEMORY_AGENT_ID` opt-in.
 pub fn approve_with_approver_type(
     conn: &Connection,
     pending_id: &str,
     approver_agent_id: &str,
+    surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -12048,7 +12081,22 @@ pub fn approve_with_approver_type(
             // (Full operator-pubkey SIGNATURE attestation would require threading
             // a signature through the MCP request -> handler -> this storage fn,
             // a public-contract change tracked as a separate follow-up.)
-            if crate::identity::resolve_read_visibility_caller().is_some() {
+            //
+            // #1796 (5-agent vote 4d3ea1c5) — the opt-in predicate above was
+            // correct ONLY for the single-operator MCP/CLI surface. The
+            // multi-tenant HTTP daemon does NOT set `AI_MEMORY_AGENT_ID`
+            // (it uses per-request `X-Agent-Id`), so the env-keyed gate never
+            // fired there and a requester could self-approve their own
+            // Human-gated action. The `surface` arg now selects the posture:
+            // HTTP enforces UNCONDITIONALLY (matching the #1793 postgres fix);
+            // the local single-operator surfaces keep the env opt-in.
+            let enforce_human_gate = match surface {
+                ApproveSurface::Http => true,
+                ApproveSurface::LocalOperator => {
+                    crate::identity::resolve_read_visibility_caller().is_some()
+                }
+            };
+            if enforce_human_gate {
                 if approver_agent_id == pa.requested_by {
                     return Ok(ApproveOutcome::Rejected(
                         crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
@@ -19502,7 +19550,13 @@ mod tests {
         .unwrap();
         assert!(
             matches!(
-                approve_with_approver_type(&conn, &pid_unset, "ai:alice").unwrap(),
+                approve_with_approver_type(
+                    &conn,
+                    &pid_unset,
+                    "ai:alice",
+                    ApproveSurface::LocalOperator
+                )
+                .unwrap(),
                 ApproveOutcome::Approved
             ),
             "single-operator default: self-approval must be accepted (no opt-in)"
@@ -19521,7 +19575,9 @@ mod tests {
         unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
 
         // (1) self-approval refused.
-        match approve_with_approver_type(&conn, &pid, "ai:alice").unwrap() {
+        match approve_with_approver_type(&conn, &pid, "ai:alice", ApproveSurface::LocalOperator)
+            .unwrap()
+        {
             ApproveOutcome::Rejected(m) => {
                 assert!(
                     m.contains("self-approval"),
@@ -19531,7 +19587,9 @@ mod tests {
             other => panic!("expected self-approval rejection, got {other:?}"),
         }
         // (2) different but UNREGISTERED approver refused.
-        match approve_with_approver_type(&conn, &pid, "ai:bob").unwrap() {
+        match approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+            .unwrap()
+        {
             ApproveOutcome::Rejected(m) => {
                 assert!(
                     m.contains("not a registered agent"),
@@ -19544,13 +19602,99 @@ mod tests {
         register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
         assert!(
             matches!(
-                approve_with_approver_type(&conn, &pid, "ai:bob").unwrap(),
+                approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+                    .unwrap(),
                 ApproveOutcome::Approved
             ),
             "a registered non-requester must be able to approve under the opt-in"
         );
 
         unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    /// #1796 (5-agent vote 4d3ea1c5) — the HTTP surface
+    /// (`ApproveSurface::Http`) enforces the Human-arm self-approval reject +
+    /// registered-approver gate UNCONDITIONALLY, even when the
+    /// `AI_MEMORY_AGENT_ID` opt-in is UNSET (the multi-tenant HTTP daemon never
+    /// sets it — that was the #1796 hole: a requester could self-approve their
+    /// own Human-gated action on the sqlite-backed HTTP daemon). The
+    /// `LocalOperator` surface (MCP/CLI) keeps the opt-in, so with the env unset
+    /// it STILL accepts self-approval (no self-lock for the lone operator).
+    #[test]
+    fn http_surface_rejects_self_approval_without_env_opt_in_1796() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        // Env opt-in OFF throughout — this is the multi-tenant HTTP posture.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let conn = test_db();
+        let payload = serde_json::json!({"title": "x", "namespace": "ns/h1796"});
+        let ns = "ns/h1796"; // no standard → approver defaults to Human
+
+        // (A) HTTP surface: self-approval REFUSED even with the env opt-in OFF.
+        let pid_self = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        match approve_with_approver_type(&conn, &pid_self, "ai:alice", ApproveSurface::Http)
+            .unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("self-approval"),
+                "HTTP surface must refuse self-approval with no env opt-in, got: {m}"
+            ),
+            other => panic!("HTTP self-approval must be rejected, got {other:?}"),
+        }
+
+        // (B) HTTP surface: a DIFFERENT but UNREGISTERED approver is also refused.
+        match approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http).unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("not a registered agent"),
+                "HTTP surface must require a registered approver, got: {m}"
+            ),
+            other => panic!("HTTP unregistered approver must be rejected, got {other:?}"),
+        }
+
+        // (C) HTTP surface: a DIFFERENT REGISTERED approver → approved.
+        register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http)
+                    .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "HTTP surface: a registered non-requester must approve"
+        );
+
+        // (D) LocalOperator surface, SAME env-OFF posture, STILL accepts
+        //     self-approval — the single-operator opt-in is preserved (the lone
+        //     operator must not be self-locked out of their own queued action).
+        let pid_local = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:carol",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                approve_with_approver_type(
+                    &conn,
+                    &pid_local,
+                    "ai:carol",
+                    ApproveSurface::LocalOperator
+                )
+                .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "LocalOperator must preserve the single-operator opt-in (self-approval accepted, env unset)"
+        );
     }
 
     /// S5-M1 — a successful approve+execute MUST append a

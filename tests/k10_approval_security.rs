@@ -150,6 +150,10 @@ async fn seed_pending_delete_row(
         ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&lock.0, &mem).expect("insert memory");
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface enforces the
+    // Human-arm gate UNCONDITIONALLY (registered, non-requester approver). These
+    // tests approve as the distinct "operator-1"; register it here.
+    ai_memory::db::register_agent(&lock.0, "operator-1", "ai:generic", &[]).ok();
     let payload = json!({"reason": "k10-security"});
     ai_memory::db::queue_pending_action(
         &lock.0,
