@@ -21694,21 +21694,38 @@ mod tests {
         let unique = uuid::Uuid::new_v4();
         let pid = format!("pending-{unique}");
         let ns = format!("fxc2b5-approve-{unique}");
+        // #1793 — the Human arm now refuses self-approval + unregistered
+        // approvers, so the action's requester and its approver must differ,
+        // and the approver must be a registered agent.
         sqlx::query(
             "INSERT INTO pending_actions \
              (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
-             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-requester', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
         )
         .bind(&pid)
         .bind(&ns)
         .execute(&store.pool)
         .await
         .expect("insert pending");
+        let approver = format!("ai:sal-approver-{unique}");
+        store
+            .register_agent(
+                &ctx,
+                &crate::models::AgentRegistration {
+                    agent_id: approver.clone(),
+                    agent_type: "nhi".to_string(),
+                    capabilities: vec!["read".to_string()],
+                    registered_at: chrono::Utc::now().to_rfc3339(),
+                    last_seen_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await
+            .expect("register approver");
         // approve_with_approver_type alias must produce the same outcome
         // as governance_approve_with_consensus for the Human approver
         // (no namespace policy ⇒ Human default).
         let outcome = store
-            .approve_with_approver_type(&ctx, &pid, "ai:sal-test")
+            .approve_with_approver_type(&ctx, &pid, &approver)
             .await
             .expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
