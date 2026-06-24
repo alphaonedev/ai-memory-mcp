@@ -8602,6 +8602,13 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
             peer_a_cert.to_str().unwrap(),
             "--client-key",
             peer_a_key.to_str().unwrap(),
+            // #1794 — this test's posture IS the mTLS-allowlist compensating
+            // control (the SERVER pins the CLIENT cert); the server presents a
+            // self-signed test cert, so opt into accept-any server-cert
+            // verification explicitly now that CA validation is the secure
+            // default. (Server-cert validation is orthogonal to what this test
+            // asserts — client-cert allowlisting.)
+            "--insecure-skip-server-verify",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
