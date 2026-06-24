@@ -564,7 +564,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `_inner` helpers, the `unproject_memory_ids_best_effort` method, the
     // drainer existence-guard, and the per-id unprojection at all six
     // hard-delete sites) landed it at 21_689. Per-domain split tracked #650.
-    ("src/store/postgres.rs", 21_800),
+    // 2026-06-24 (#1795 + #1793) — bumped 21_800 → 22_000 (lockstep): the
+    // tenant-only `check_memory_quota` enforcement method (#1795) + the
+    // Human-arm self-approval/registration guard + its updated live-PG unit
+    // test (#1793) landed it at 21_813. Per-domain split tracked #650.
+    ("src/store/postgres.rs", 22_000),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
