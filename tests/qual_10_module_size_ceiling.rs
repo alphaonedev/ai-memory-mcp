@@ -786,7 +786,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 8_910 → 8_960 for the
     // `Command::UndoEdit` variant (+ doc) and its dispatch arm building the SAL
     // store like the curator for the CLI-only `ai-memory undo-edit` tool.
-    ("src/daemon_runtime.rs", 8_960),
+    // 2026-06-24 (#1800) — bumped 8_960 → 9_000 for the sal-gated
+    // `test_run_dispatch_undo_edit_command` coverage cushion (covers the
+    // UndoEdit dispatch arm to hold daemon_runtime.rs above its 86% floor).
+    ("src/daemon_runtime.rs", 9_000),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
