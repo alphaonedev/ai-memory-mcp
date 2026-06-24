@@ -21,10 +21,11 @@
 )]
 
 use ai_memory::models::{
-    ConfidenceSource, GovernanceDecision, Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier,
+    AgentRegistration, ConfidenceSource, GovernanceDecision, Memory, MemoryKind, MemoryLink,
+    MemoryLinkRelation, Tier,
 };
 use ai_memory::store::postgres::PostgresStore;
-use ai_memory::store::{CallerContext, GovernedAction, MemoryStore};
+use ai_memory::store::{ApproveOutcome, CallerContext, GovernedAction, MemoryStore};
 
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
@@ -498,6 +499,21 @@ async fn governance_consensus_and_execute_pending() {
     };
 
     let ctx = CallerContext::for_admin(&owner);
+    // #1793 — the Human arm now requires the approver to be a REGISTERED agent
+    // (and a non-requester; owner != requester here). Register the owner so the
+    // approval succeeds and the downstream execute_pending_action has an
+    // approved row to run.
+    let owner_reg = AgentRegistration {
+        agent_id: owner.clone(),
+        agent_type: "nhi".to_string(),
+        capabilities: vec!["read".to_string(), "write".to_string()],
+        registered_at: chrono::Utc::now().to_rfc3339(),
+        last_seen_at: chrono::Utc::now().to_rfc3339(),
+    };
+    store
+        .register_agent(&ctx, &owner_reg)
+        .await
+        .expect("register owner");
     // governance_approve_with_consensus drives the approval state machine.
     let outcome = store
         .governance_approve_with_consensus(&ctx, &pending_id, &owner)
@@ -511,6 +527,96 @@ async fn governance_consensus_and_execute_pending() {
         .execute_pending_action(&ctx, &pending_id)
         .await
         .expect("execute_pending_action");
+}
+
+/// #1793 (5-agent vote 4d3ea1c5) — the postgres Human approval arm must
+/// UNCONDITIONALLY refuse self-approval (approver == requester) and refuse an
+/// unregistered approver, while a registered non-requester approves. Parity
+/// with the sqlite #1787 fix, but unconditional (the postgres SAL is reachable
+/// only via the inherently multi-tenant HTTP daemon).
+#[tokio::test]
+async fn human_arm_refuses_self_approval_and_unregistered_1793() {
+    ai_memory::config::override_active_permissions_mode_for_test(
+        ai_memory::config::PermissionsMode::Enforce,
+    );
+    let Some(store) = connect().await else {
+        return;
+    };
+    let owner = uid("ai:1793-owner");
+    let requester = uid("ai:1793-req");
+    let approver = uid("ai:1793-appr");
+    let ns = uid("cov-1793");
+    seed_approve_standard(&store, &ns, &owner).await;
+    let ctx = CallerContext::for_admin(&owner);
+    let payload = serde_json::json!({"title": "needs approval 1793"});
+
+    // (a) the requester self-approving their own Human-gated action → refused.
+    let pid_self = match store
+        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .await
+        .expect("enforce a")
+    {
+        GovernanceDecision::Pending(id) => id,
+        other => panic!("expected Pending; got {other:?}"),
+    };
+    match store
+        .governance_approve_with_consensus(&ctx, &pid_self, &requester)
+        .await
+        .expect("self-approve")
+    {
+        ApproveOutcome::Rejected(m) => assert!(
+            m.contains("self-approval"),
+            "#1793: want self-approval refusal, got: {m}"
+        ),
+        other => panic!("#1793: expected self-approval rejection, got {other:?}"),
+    }
+
+    // (b) a DIFFERENT but UNREGISTERED approver → refused (not a registered agent).
+    let pid_unreg = match store
+        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .await
+        .expect("enforce b")
+    {
+        GovernanceDecision::Pending(id) => id,
+        other => panic!("expected Pending; got {other:?}"),
+    };
+    match store
+        .governance_approve_with_consensus(&ctx, &pid_unreg, &approver)
+        .await
+        .expect("unregistered approve")
+    {
+        ApproveOutcome::Rejected(m) => assert!(
+            m.contains("not a registered agent"),
+            "#1793: want unregistered refusal, got: {m}"
+        ),
+        other => panic!("#1793: expected unregistered rejection, got {other:?}"),
+    }
+
+    // (c) a REGISTERED non-requester approver → Approved.
+    let reg = AgentRegistration {
+        agent_id: approver.clone(),
+        agent_type: "nhi".to_string(),
+        capabilities: vec!["read".to_string(), "write".to_string()],
+        registered_at: chrono::Utc::now().to_rfc3339(),
+        last_seen_at: chrono::Utc::now().to_rfc3339(),
+    };
+    store.register_agent(&ctx, &reg).await.expect("register");
+    let pid_ok = match store
+        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .await
+        .expect("enforce c")
+    {
+        GovernanceDecision::Pending(id) => id,
+        other => panic!("expected Pending; got {other:?}"),
+    };
+    match store
+        .governance_approve_with_consensus(&ctx, &pid_ok, &approver)
+        .await
+        .expect("registered approve")
+    {
+        ApproveOutcome::Approved => {}
+        other => panic!("#1793: registered non-requester must be Approved, got {other:?}"),
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────

@@ -530,6 +530,22 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
+- **[#1793](https://github.com/alphaonedev/ai-memory-mcp/issues/1793) — PostgresStore Human-arm approval
+  now refuses self-approval + unregistered approvers (HTTP-path parity with #1787).** The
+  `ApproverType::Human` arm of `PostgresStore::governance_approve_with_consensus` (the DEFAULT approver
+  type) accepted ANY `approver_agent_id` with no requester≠approver check and no registration check, so
+  on the HTTP/postgres approval surface the REQUESTER of a Human-gated pending action could self-approve
+  it, defeating human-in-the-loop (the Consensus arm was already hardened per #216; the Human arm was
+  not). The fix UNCONDITIONALLY (a) refuses `approver == pa.requested_by` (`SELF_APPROVAL_REFUSED`) and
+  (b) requires the approver to be a registered agent (mirroring the Consensus arm). Unlike the sqlite
+  #1787 fix this is NOT opt-in-keyed: the 5-agent adversarial vote (memory `4d3ea1c5`) established that
+  the postgres SAL is reachable only via the inherently multi-tenant HTTP daemon (MCP stdio is
+  sqlite-only), where the process-wide `AI_MEMORY_AGENT_ID` the sqlite opt-in keys on is unset (so an
+  opt-in gate would never fire) and the per-request `X-Agent-Id` approver is a distinct authenticated
+  identity — there is no single-operator self-lock to avoid. No schema change. Code anchor:
+  `src/store/postgres.rs`. (Sibling finding: the sqlite-*backed* HTTP daemon has the analogous
+  opt-in-off-on-HTTP gap — tracked separately.)
+
 - **[#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795) — PostgresStore now ENFORCES the
   per-agent daily memory-count quota (it previously only recorded it).** On a postgres-backed daemon
   the per-agent daily write quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was a silent no-op on EVERY tenant

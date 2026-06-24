@@ -55,7 +55,9 @@ use tower::ServiceExt as _;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
-use ai_memory::models::{ConfidenceSource, GovernanceDecision, Memory, MemoryKind, Tier};
+use ai_memory::models::{
+    AgentRegistration, ConfidenceSource, GovernanceDecision, Memory, MemoryKind, Tier,
+};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, GovernedAction, MemoryStore};
 
@@ -744,6 +746,24 @@ pg_test!(pg_approval_decide_approve_postgres_arm, url, {
     let requester = uid("ai:cov-ga2-areq");
     let ns = uid("cov-ga2-approve");
     let pending_id = seed_pending_store(&store, &ns, &owner, &requester).await;
+
+    // #1793 — the postgres Human approval arm now requires the approver
+    // (ADMIN_AGENT, via the signed request's X-Agent-Id) to be a REGISTERED
+    // agent (and a non-requester; ADMIN_AGENT != requester here). Register it
+    // so the approve resolves to Approved.
+    store
+        .register_agent(
+            &CallerContext::for_admin(ADMIN_AGENT),
+            &AgentRegistration {
+                agent_id: ADMIN_AGENT.to_string(),
+                agent_type: "nhi".to_string(),
+                capabilities: vec!["read".to_string(), "write".to_string()],
+                registered_at: chrono::Utc::now().to_rfc3339(),
+                last_seen_at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await
+        .expect("register admin approver");
 
     let body = json!({"decision": "approve", "remember": "once"});
     let req = signed_approval_request(&pending_id, &body);

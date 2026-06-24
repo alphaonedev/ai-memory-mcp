@@ -15865,6 +15865,27 @@ impl MemoryStore for PostgresStore {
 
         match approver {
             crate::models::ApproverType::Human => {
+                // #1793 (5-agent vote 4d3ea1c5) — UNCONDITIONALLY harden the
+                // Human arm (the DEFAULT) on the postgres approval surface: the
+                // requester may not self-approve their own Human-gated action,
+                // and the approver must be a REGISTERED agent (mirroring the
+                // Consensus arm #216). Unlike the sqlite #1787 fix this is NOT
+                // opt-in-keyed: the postgres SAL is reachable only via the
+                // inherently multi-tenant HTTP daemon (MCP stdio is sqlite-only),
+                // where the process-wide AI_MEMORY_AGENT_ID the sqlite opt-in
+                // keys on is unset (so an opt-in gate would never fire) and the
+                // per-request X-Agent-Id approver is a distinct authenticated
+                // identity — there is no single-operator self-lock to avoid.
+                if approver_agent_id == pa.requested_by {
+                    return Ok(super::ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    ));
+                }
+                if !self.is_registered_agent(approver_agent_id).await? {
+                    return Ok(super::ApproveOutcome::Rejected(format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;
