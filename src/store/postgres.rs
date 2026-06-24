@@ -74,6 +74,12 @@ use crate::quotas::{QuotaStatus, quota_defaults};
 // Duplicated literals in this adapter hoisted to named consts per the
 // pm-v3.1 hardcoded-literal lint-gate (scripts/check-hardcoded-literals.sh).
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
+/// Clears an `archived_memories` row by id. Shared by the in-place-edit
+/// snapshot paths (the OPTIMISTIC `update_with_expected_version_once` and,
+/// per #1799, the non-If-Match trait `update` — both DELETE any stale
+/// snapshot before re-INSERTing the prior content) and by `restore_archived`
+/// (removes the archive row after a successful restore).
+const SQL_DELETE_ARCHIVED_MEMORY_BY_ID: &str = "DELETE FROM archived_memories WHERE id = $1";
 /// #1642 — postgres twin of `storage::SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID`
 /// (`src/storage/mod.rs`): deleting a memory that serves as a namespace
 /// standard must also remove the `namespace_meta` row that points at it,
@@ -3713,7 +3719,7 @@ impl PostgresStore {
         // archive_reason's record. Runs inside the tx; a 0-row UPDATE
         // below rolls it back.
         if content_changed {
-            sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
@@ -11536,6 +11542,100 @@ impl MemoryStore for PostgresStore {
         // through the self-validating helper after the COALESCE UPDATE lands.
         let lifecycle_target = patch.lifecycle_state;
 
+        // #1799 — snapshot the prior content under
+        // archive_reason='in_place_edit' BEFORE this one-shot COALESCE
+        // UPDATE overwrites it, mirroring the OPTIMISTIC path
+        // (`update_with_expected_version_once`, snapshot block ~L3704) and
+        // the sqlite trait `update` (`db::update_with_expected_version`).
+        // Pre-#1799 this non-If-Match trait path did a blind one-shot
+        // UPDATE on `&self.pool` with NO snapshot, so a content edit
+        // routed here (PUT without If-Match / CLI / federation catchup)
+        // was lossy + un-undoable on postgres — a partial-#1725 backend
+        // asymmetry surfaced by the #1798 R-02 adversarial review. The
+        // snapshot + UPDATE now run atomically in one tx: any early
+        // return / drop rolls back BOTH so a row is never half-archived.
+        //
+        // Clone the change-check fields BEFORE the binds below move
+        // `patch.{title,content}` into the UPDATE.
+        let snap_title = patch.title.clone();
+        let snap_content = patch.content.clone();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("update begin tx", e))?;
+
+        // Read the current title+content for the content-change check. A
+        // missing row → NotFound (the tx drops / rolls back). This also
+        // pre-empts the post-UPDATE `rows_affected == 0` NotFound below
+        // (kept as a safety net for a concurrent delete between this read
+        // and the UPDATE inside the same tx).
+        let cur: Option<(String, String)> =
+            sqlx::query_as("SELECT title, content FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("update read current", e))?;
+        let Some((cur_title, cur_content)) = cur else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        // `content_changed` is true when the patch supplies a title OR
+        // content that differs from the stored row. A metadata / tag /
+        // priority-only patch leaves both untouched and archives nothing.
+        //
+        // At-rest-encryption nuance: when encryption is ON the stored
+        // `content` is a sealed placeholder, never the plaintext, so a
+        // plaintext patch always compares "changed" → a harmless
+        // over-snapshot (the snapshot row carries the same sealed
+        // placeholder + its `encrypted_envelope`, so undo still round-
+        // trips). The default build is plaintext, so the common case is
+        // an exact title/content comparison.
+        let content_changed = snap_title.as_deref().is_some_and(|t| t != cur_title)
+            || snap_content.as_deref().is_some_and(|c| c != cur_content);
+
+        // #1799 — DELETE+INSERT the prior content into `archived_memories`
+        // under archive_reason='in_place_edit', SAME memory_id (no fork),
+        // copying the exact 37-column list from the optimistic path's
+        // snapshot block (~L3722). The DELETE only ever removes a stale
+        // in_place_edit snapshot of this id (supersede forks a new id +
+        // deletes the old live row; GC deletes the live row; restore
+        // removes the archive row on success — so a live, in-place-
+        // editable row can never collide with a different archive_reason).
+        if content_changed {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+            sqlx::query(
+                "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+        }
+
         // One-shot COALESCE update — each patch field overrides only if
         // Some, otherwise falls through to the existing value.
         //
@@ -11634,14 +11734,27 @@ impl MemoryStore for PostgresStore {
         // patch tier is 'long' the SET clause above ignores $11 and
         // clears the expiry unconditionally.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?
         .rows_affected();
 
+        // Safety net: the pre-UPDATE SELECT already returned NotFound for a
+        // missing row, but a concurrent delete between that read and this
+        // UPDATE (within the same tx isolation) is still caught here. The
+        // early return drops `tx`, rolling back the snapshot above.
         if rows_affected == 0 {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
+
+        // #1799 — commit the atomic snapshot + UPDATE before any
+        // pool-direct follow-up. `apply_lifecycle_patch` below uses
+        // `self.pool` separately (its own statement), so it MUST run after
+        // the tx commits, preserving the pre-#1799 post-update ordering.
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("update commit tx", e))?;
+
         // #1726 — apply an optional lifecycle transition through the
         // self-validating helper (the non-If-Match HTTP PUT path routes here).
         // `lifecycle_target` was captured before the binds moved `patch`.
@@ -15449,7 +15562,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("archive_restore restore links", e))?;
 
-        sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+        sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
             .bind(id)
             .execute(&mut *tx)
             .await

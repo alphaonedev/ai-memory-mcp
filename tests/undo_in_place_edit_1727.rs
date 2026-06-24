@@ -403,9 +403,9 @@ mod postgres_side {
             .expect("seed");
         // Edit via the optimistic in-place path (update_with_expected_version),
         // which is the postgres path that writes the #1725 `in_place_edit`
-        // snapshot. The pg TRAIT `update` (one-shot COALESCE) deliberately does
-        // NOT snapshot, so undoable production edits go through the If-Match
-        // optimistic path exercised here.
+        // snapshot. (#1799 also makes the non-If-Match TRAIT `update` snapshot
+        // — see `pg_trait_update_snapshots_in_place_edit_1799` below — so both
+        // postgres edit paths are now undoable.)
         pg.update_with_expected_version(
             &admin,
             &id,
@@ -483,5 +483,101 @@ mod postgres_side {
             .expect("dry-run");
         assert!(!outcome.applied);
         assert_eq!(pg.get(&admin, &id).await.unwrap().content, "v2");
+    }
+
+    // ── #1799 — the postgres TRAIT `update` (non-If-Match COALESCE path)
+    //     MUST snapshot prior content under archive_reason='in_place_edit'
+    //     so an edit routed here (PUT without If-Match / CLI / federation
+    //     catchup) is undoable, closing the partial-#1725 backend asymmetry
+    //     (#1798 R-02). Pre-#1799 the trait `update` did a blind one-shot
+    //     UPDATE with NO snapshot → undo found nothing. ─────────────────────
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_trait_update_snapshots_in_place_edit_1799() {
+        let Some(pg) = live_pg().await else { return };
+        let admin = CallerContext::for_admin(OWNER);
+        let id = format!("pg-trait-1799-{}", uuid::Uuid::new_v4());
+        pg.store(&admin, &mem(&id, OWNER, &id, "v1", Tier::Long))
+            .await
+            .expect("seed");
+
+        // Edit via the TRAIT `update` (NOT update_with_expected_version) —
+        // the exact non-If-Match path the defect lived on.
+        pg.update(
+            &admin,
+            &id,
+            UpdatePatch {
+                content: Some("v2".to_string()),
+                ..UpdatePatch::default()
+            },
+        )
+        .await
+        .expect("trait update edit");
+        assert_eq!(
+            pg.get(&admin, &id).await.unwrap().content,
+            "v2",
+            "live row now holds the edited content"
+        );
+
+        // Proof the snapshot was created BY THE TRAIT UPDATE PATH: undo
+        // reverts content back to "v1". `applied == true` + the reverted
+        // content together prove the `in_place_edit` archive row exists with
+        // the pre-edit content "v1".
+        let outcome = pg
+            .undo_in_place_edit(&admin, &id, false)
+            .await
+            .expect("undo after trait update");
+        assert!(
+            outcome.applied,
+            "undo applied — proves the trait update wrote an in_place_edit snapshot"
+        );
+        assert_eq!(
+            outcome.after_content, "v1",
+            "undo reverts to the snapshotted pre-edit content"
+        );
+        assert_eq!(
+            pg.get(&admin, &id).await.unwrap().content,
+            "v1",
+            "live row reverted to v1 — the snapshot the trait update created round-trips"
+        );
+    }
+
+    // ── #1799 — a no-content-change trait update (priority only) must NOT
+    //     create an in_place_edit snapshot (undo finds nothing). ────────────
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_trait_update_no_content_change_no_snapshot_1799() {
+        let Some(pg) = live_pg().await else { return };
+        let admin = CallerContext::for_admin(OWNER);
+        let id = format!("pg-trait-1799-nochg-{}", uuid::Uuid::new_v4());
+        pg.store(&admin, &mem(&id, OWNER, &id, "only-content", Tier::Long))
+            .await
+            .expect("seed");
+
+        // Priority-only patch: content + title untouched → no snapshot.
+        pg.update(
+            &admin,
+            &id,
+            UpdatePatch {
+                priority: Some(9),
+                ..UpdatePatch::default()
+            },
+        )
+        .await
+        .expect("priority-only trait update");
+
+        let outcome = pg
+            .undo_in_place_edit(&admin, &id, false)
+            .await
+            .expect("undo with no snapshot");
+        assert!(
+            !outcome.applied,
+            "no content change → no in_place_edit snapshot → undo is a no-op"
+        );
+        assert_eq!(
+            pg.get(&admin, &id).await.unwrap().content,
+            "only-content",
+            "live content unchanged"
+        );
     }
 }
