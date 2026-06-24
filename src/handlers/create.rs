@@ -454,7 +454,7 @@ fn insert_create_with_quota(
                     tracing::error!("quota substrate error: {se}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "quota check failed"})),
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
                     )
                         .into_response()
                 }

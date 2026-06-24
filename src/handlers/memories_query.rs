@@ -835,6 +835,40 @@ pub async fn bulk_create(
                 version: 1,
                 lifecycle_state: crate::models::LifecycleState::Open,
             };
+            // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write
+            // quota PER ROW, mirroring the single-write create handler so the
+            // bulk surface is no longer a quota-bypass amplifier. A row that
+            // would exceed the cap is rejected into `errors[]` and skipped
+            // (partial-fill — consistent with this handler's existing per-row
+            // validation/governance error semantics); it is NOT persisted.
+            // Skip empty principals exactly like the single-write path.
+            let bulk_quota_op = crate::quotas::QuotaOp::Memory {
+                bytes: i64::try_from(
+                    mem.title.len()
+                        + mem.content.len()
+                        + serde_json::to_string(&mem.metadata)
+                            .map(|s| s.len())
+                            .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX),
+            };
+            if !caller.is_empty() {
+                if let Err(e) =
+                    crate::quotas::check_and_record(&lock.0, &caller, &mem.namespace, bulk_quota_op)
+                {
+                    match e {
+                        crate::quotas::QuotaCheckError::Quota(qe) => {
+                            errors
+                                .push(super::sanitize_bulk_row_error(&qe.to_string()).to_string());
+                        }
+                        crate::quotas::QuotaCheckError::Sql(se) => {
+                            tracing::error!("bulk_create: quota substrate error: {se}");
+                            errors.push(crate::errors::msg::QUOTA_CHECK_FAILED.to_string());
+                        }
+                    }
+                    continue;
+                }
+            }
             match db::insert(&lock.0, &mem) {
                 Ok(_) => created_mems.push(mem),
                 Err(e) => {
@@ -842,6 +876,18 @@ pub async fn bulk_create(
                     // text (constraint names, SQL fragments). Sanitize.
                     tracing::warn!("bulk_create: db::insert failed: {e}");
                     errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                    // #1788 — refund the quota charge since the insert failed
+                    // (mirrors the single-write refund_op path). Best-effort.
+                    if !caller.is_empty() {
+                        if let Err(re) = crate::quotas::refund_op(
+                            &lock.0,
+                            &caller,
+                            &mem.namespace,
+                            bulk_quota_op,
+                        ) {
+                            crate::quotas::log_refund_op_failed(&caller, &re);
+                        }
+                    }
                 }
             }
         }
