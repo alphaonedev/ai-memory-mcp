@@ -760,7 +760,13 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
                 store_url: url,
                 json: true,
                 embedding_dim: dim,
-                force_reembed: false,
+                // This test deliberately drives the destructive in-place
+                // dim-conversion arm (384→768→384) on a shared scratch DB
+                // that other suites populate with embedding-bearing rows.
+                // Post-#1781 an UNforced conversion refuses when embeddings
+                // are at risk, so opt into --force-reembed: the conversion
+                // (and the embedding NULLing it documents) is the intent.
+                force_reembed: true,
             };
             ai_memory::cli::schema_init::run(&args, &mut out)
                 .await
