@@ -248,7 +248,7 @@ pub(super) fn handle_update(
         let existing = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
             .map_or_else(|| serde_json::json!({}), |m| m.metadata);
-        Some(crate::identity::preserve_agent_id(&existing, &m))
+        Some(crate::identity::preserve_provenance_keys(&existing, &m))
     } else {
         None
     };

@@ -742,6 +742,91 @@ async fn consolidate_merges_and_hard_deletes_sources() {
     );
 }
 
+/// #1784 — consolidation provenance (metadata.derived_from +
+/// consolidated_from_agents) must survive a later metadata-overwriting
+/// `update`. Pre-#1784 the postgres update CASE preserved only agent_id,
+/// so a patch that re-supplied `metadata` silently dropped the provenance
+/// pointer (which can't be reconstructed — the sources are hard-deleted).
+#[tokio::test]
+async fn consolidate_provenance_survives_metadata_update_pg_1784() {
+    use ai_memory::store::{CallerContext, MemoryStore, UpdatePatch};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-1784");
+    let ns = uid("prov-1784-ns");
+    let a = uid("a");
+    let b = uid("b");
+    store
+        .store(&ctx, &mem(&a, &ns, "p1", "prov src one 1784"))
+        .await
+        .expect("store a");
+    store
+        .store(&ctx, &mem(&b, &ns, "p2", "prov src two 1784"))
+        .await
+        .expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] prov 1784",
+            "merged",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-1784",
+        )
+        .await
+        .expect("consolidate");
+
+    // Provenance recorded on the consolidated row.
+    let got = store.get(&ctx, &new_id).await.expect("consolidated row");
+    let derived = got.metadata["derived_from"]
+        .as_array()
+        .expect("derived_from array");
+    assert!(
+        derived.iter().any(|v| v == &serde_json::json!(a))
+            && derived.iter().any(|v| v == &serde_json::json!(b)),
+        "derived_from carries both source ids: {:?}",
+        got.metadata
+    );
+    assert!(
+        got.metadata["consolidated_from_agents"]
+            .as_array()
+            .is_some_and(|x| !x.is_empty()),
+        "consolidated_from_agents present: {:?}",
+        got.metadata
+    );
+
+    // A metadata UPDATE that OMITS the provenance keys must NOT drop them.
+    let patch = UpdatePatch {
+        metadata: Some(serde_json::json!({ "note": "patched" })),
+        ..UpdatePatch::default()
+    };
+    store.update(&ctx, &new_id, patch).await.expect("update");
+
+    let after = store.get(&ctx, &new_id).await.expect("re-read");
+    assert_eq!(after.metadata["note"], "patched", "the patch key applied");
+    let derived_after = after.metadata["derived_from"]
+        .as_array()
+        .expect("#1784: derived_from must survive the metadata update");
+    assert!(
+        derived_after.iter().any(|v| v == &serde_json::json!(a))
+            && derived_after.iter().any(|v| v == &serde_json::json!(b)),
+        "#1784: derived_from survives the metadata update: {:?}",
+        after.metadata
+    );
+    assert!(
+        after.metadata["consolidated_from_agents"]
+            .as_array()
+            .is_some_and(|x| !x.is_empty()),
+        "#1784: consolidated_from_agents survives the update: {:?}",
+        after.metadata
+    );
+}
+
 // ───────────────────────────────────────────────────────────────────
 // reverse_rollback_entry_store (#1748 slice-3c2) — postgres-backed
 // reversal of a consolidation: the store-backed `curator --rollback`

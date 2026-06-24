@@ -478,7 +478,7 @@ pub async fn update_memory(
             || serde_json::Value::Object(serde_json::Map::new()),
             |m| m.metadata.clone(),
         );
-        crate::identity::preserve_agent_id(&existing_meta, new_meta)
+        crate::identity::preserve_provenance_keys(&existing_meta, new_meta)
     });
     match db::update_with_expected_version(
         &lock.0,

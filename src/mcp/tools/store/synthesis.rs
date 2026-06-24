@@ -303,7 +303,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
             continue;
         };
         let preserved_metadata =
-            crate::identity::preserve_agent_id(&target.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
         let upd = db::update(
             conn,
             cand_id,
@@ -370,7 +370,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         }
         provenance_row.content = merged_content.clone();
         provenance_row.metadata =
-            crate::identity::preserve_agent_id(&target.metadata, &mem.metadata);
+            crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
         // The (title, namespace) UNIQUE constraint on `memories`
         // would otherwise collide with the live target — append a
         // stable per-target suffix so the provenance row claims a
@@ -441,7 +441,8 @@ pub(super) fn apply_synthesis_updates_and_deletes(
 
     // Construct the response from the PRIMARY update's target.
     let target = existing.iter().find(|c| c.id == *primary_id).cloned()?;
-    let preserved_metadata = crate::identity::preserve_agent_id(&target.metadata, &mem.metadata);
+    let preserved_metadata =
+        crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
     let echoed_agent_id = preserved_metadata
         .get(param_names::AGENT_ID)
         .and_then(|v| v.as_str())
