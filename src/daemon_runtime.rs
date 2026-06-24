@@ -7034,6 +7034,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_dispatch_reown_command() {
+        // Cover the `Command::Reown` dispatch arm. `--dry-run` over an empty
+        // namespace matches 0 rows → `cli::reown::run` returns 0 → the arm's
+        // `0 => Ok(())` runs (no process::exit). Default-build subcommand.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "reown",
+            "--namespace",
+            "ns",
+            "--to",
+            "ai:newowner",
+            "--dry-run",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_replay_command() {
+        // Cover the `Command::Replay` dispatch arm. Seed a memory (no recall
+        // history) and replay its id → the substrate returns an empty replay
+        // envelope (Ok); the arm returns the value directly. Default-build.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let id = crate::cli::test_utils::seed_memory(&env.db_path, "ns", "t", "c");
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "replay",
+            "--memory-id",
+            &id,
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_run_dispatch_search_command() {
         let _g = no_config_env();
         let env = TestEnv::fresh();
