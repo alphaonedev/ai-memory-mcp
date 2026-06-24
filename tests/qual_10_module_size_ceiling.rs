@@ -559,7 +559,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // postgres snapshot/restore wiring (forget + archive_by_ids snapshots,
     // archive_restore re-insert) + the `archive_restore_preserves_links_pg_1771`
     // PG-gated parity test landed it at 21_423.
-    ("src/store/postgres.rs", 21_500),
+    // 2026-06-23 (#1783) — bumped 21_500 → 21_800 (lockstep): the AGE
+    // unprojection-on-delete fix (`unproject_memory_from_age` +
+    // `_inner` helpers, the `unproject_memory_ids_best_effort` method, the
+    // drainer existence-guard, and the per-id unprojection at all six
+    // hard-delete sites) landed it at 21_689. Per-domain split tracked #650.
+    ("src/store/postgres.rs", 21_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
