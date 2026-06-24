@@ -756,6 +756,45 @@ pub async fn build_rustls_client_config(
     Ok(config)
 }
 
+/// #1794 (5-agent vote 4d3ea1c5) — the outbound TLS verification mode the CLI
+/// `ai-memory sync` path selects for a peer connection. Precedence mirrors the
+/// production quorum client (`federation/peer.rs`): server-cert PINNING
+/// (`AI_MEMORY_FED_PEER_FINGERPRINTS`) wins; then the explicit
+/// `--insecure-skip-server-verify` accept-any opt-out; otherwise the secure
+/// default — normal CA validation (reqwest's bundled webpki roots, plus any
+/// `--ca-cert` the operator adds for a self-signed peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTlsMode {
+    /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set → per-host server-cert pinning,
+    /// fail-closed for unpinned hosts.
+    Pinning,
+    /// `--insecure-skip-server-verify` → accept ANY server cert (the explicit,
+    /// loud opt-out; gated on an mTLS client cert as the compensating control).
+    AcceptAny,
+    /// Secure default → CA-validate the peer server cert (bundled webpki roots
+    /// + optional `--ca-cert`).
+    CaValidated,
+}
+
+/// #1794 — resolve the CLI sync TLS verification mode. Pinning >
+/// insecure-opt-out > CA-validate (the secure default). `--ca-cert` does NOT
+/// change the mode (still `CaValidated`); it only adds an extra trusted root.
+/// Pure + total so the decision is unit-testable independently of the opaque
+/// rustls/reqwest config it drives.
+#[must_use]
+pub fn select_sync_tls_mode(
+    insecure_skip_server_verify: bool,
+    pinning_active: bool,
+) -> SyncTlsMode {
+    if pinning_active {
+        SyncTlsMode::Pinning
+    } else if insecure_skip_server_verify {
+        SyncTlsMode::AcceptAny
+    } else {
+        SyncTlsMode::CaValidated
+    }
+}
+
 /// `ServerCertVerifier` that accepts any peer certificate. Safe ONLY when
 /// paired with a strong reverse authentication channel — in our case the
 /// peer's `--mtls-allowlist` fingerprint-pins our client cert.
@@ -1494,6 +1533,17 @@ mod tests {
             std::env::remove_var(FED_PEER_FINGERPRINTS_ENV);
         }
         assert!(peer_fingerprint_map_from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn select_sync_tls_mode_precedence_1794() {
+        // Pinning wins over the insecure opt-out.
+        assert_eq!(select_sync_tls_mode(true, true), SyncTlsMode::Pinning);
+        assert_eq!(select_sync_tls_mode(false, true), SyncTlsMode::Pinning);
+        // Explicit insecure opt-out when pinning is off.
+        assert_eq!(select_sync_tls_mode(true, false), SyncTlsMode::AcceptAny);
+        // Secure default — CA validation.
+        assert_eq!(select_sync_tls_mode(false, false), SyncTlsMode::CaValidated);
     }
 
     #[test]

@@ -21,6 +21,22 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Breaking / secure-default changes
 
+- **[#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794) — `ai-memory sync` now CA-validates
+  peer server certificates by default (was accept-ANY).** The CLI sync outbound-HTTPS path previously
+  used `DangerousAnyServerVerifier` — it accepted ANY peer server certificate, relying solely on the
+  peer pinning our mTLS client cert as the compensating control (MITM-able on a hostile network where
+  the peer doesn't pin us). It now mirrors the production quorum client (`federation/peer.rs`): the
+  **secure default is normal CA validation** against the bundled public webpki roots, with precedence
+  `AI_MEMORY_FED_PEER_FINGERPRINTS` pinning (fail-closed for unpinned hosts) > `--insecure-skip-server-verify`
+  (the explicit accept-any opt-out, still gated on an mTLS client cert) > a new `--ca-cert <pem>`
+  (trust a self-signed / private-CA peer, mirroring `--quorum-ca-cert`) > default CA validation.
+  `--insecure-skip-server-verify` and `--ca-cert` are mutually exclusive (clap conflict). **Migration:**
+  an existing `ai-memory sync` against a SELF-SIGNED peer over mTLS with no flag will now fail the TLS
+  handshake — add `--ca-cert <peer-ca.pem>` (recommended) or `--insecure-skip-server-verify` to restore
+  it. Routed through reqwest-native TLS (`use_rustls_tls` + `Identity` + `add_root_certificate`) — zero
+  new dependencies. Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Overturns the
+  prior #1678 CLI-accept-any posture. Code anchors: `src/tls.rs`, `src/cli/sync.rs`.
+
 - **[#1780](https://github.com/alphaonedev/ai-memory-mcp/issues/1780) — `import` / `mine` no longer
   silently clobber a distinct same-title memory.** Both CLI write paths previously inserted via the
   legacy silent-merge upsert (`ConflictMode::Merge`), so a `(title, namespace)` collision with a
