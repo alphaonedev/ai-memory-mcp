@@ -495,6 +495,48 @@ pub fn preserve_agent_id(
     merged
 }
 
+/// #1784 — immutable provenance metadata keys preserved across an
+/// update / dedup metadata whole-object overwrite (existing-wins).
+/// `agent_id` is the author (immutable after first write);
+/// `derived_from` + `consolidated_from_agents` are consolidation
+/// provenance — the set of source memories a `consolidate` merged and
+/// their original authors. A whole-object metadata replace (e.g. a
+/// re-consolidation or a `memory_update` that doesn't re-supply these
+/// keys) would otherwise silently drop them — the #1784 defect, since
+/// the sources are hard-deleted and the pointer cannot be reconstructed.
+pub const IMMUTABLE_PROVENANCE_KEYS: [&str; 3] = [
+    "agent_id",
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::META_KEY_CONSOLIDATED_FROM_AGENTS,
+];
+
+/// Preserve the immutable provenance keys ([`IMMUTABLE_PROVENANCE_KEYS`])
+/// from `existing` through an update/dedup metadata overwrite. Returns
+/// `incoming` with each provenance key that `existing` carries copied
+/// over it (existing-wins) — the superset of the historical
+/// [`preserve_agent_id`] behavior, extended for #1784 consolidation
+/// provenance.
+#[must_use]
+pub fn preserve_provenance_keys(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = if incoming.is_object() {
+        incoming.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    let Some(obj) = merged.as_object_mut() else {
+        return merged;
+    };
+    for key in IMMUTABLE_PROVENANCE_KEYS {
+        if let Some(existing_val) = existing.get(key).cloned() {
+            obj.insert(key.to_string(), existing_val);
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +926,52 @@ mod tests {
         let merged = preserve_agent_id(&existing, &incoming);
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
+    }
+
+    #[test]
+    fn preserve_provenance_keys_keeps_all_three_1784() {
+        // #1784 — agent_id + the consolidation provenance arrays
+        // (derived_from / consolidated_from_agents) survive a metadata
+        // overwrite (existing-wins); non-provenance keys take incoming.
+        let existing = serde_json::json!({
+            "agent_id": "author-a",
+            "derived_from": ["s1", "s2"],
+            "consolidated_from_agents": ["author-a", "author-b"],
+            "other": "old",
+        });
+        let incoming = serde_json::json!({ "other": "new" });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(merged["agent_id"], "author-a");
+        assert_eq!(merged["derived_from"], serde_json::json!(["s1", "s2"]));
+        assert_eq!(
+            merged["consolidated_from_agents"],
+            serde_json::json!(["author-a", "author-b"])
+        );
+        assert_eq!(merged["other"], "new", "non-provenance keys: incoming wins");
+    }
+
+    #[test]
+    fn preserve_provenance_keys_existing_wins_immutable_1784() {
+        // Provenance is immutable: even an incoming that re-supplies a
+        // provenance key is overridden by the existing value.
+        let existing = serde_json::json!({ "derived_from": ["s1"] });
+        let incoming = serde_json::json!({ "derived_from": ["DIFFERENT"] });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(
+            merged["derived_from"],
+            serde_json::json!(["s1"]),
+            "existing provenance wins (immutable)"
+        );
+    }
+
+    #[test]
+    fn preserve_provenance_keys_no_op_when_existing_absent_1784() {
+        // When existing carries no provenance, incoming is untouched.
+        let existing = serde_json::json!({ "foo": "x" });
+        let incoming = serde_json::json!({ "derived_from": ["kept"], "bar": 1 });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(merged["derived_from"], serde_json::json!(["kept"]));
+        assert_eq!(merged["bar"], 1);
     }
 
     // -----------------------------------------------------------------

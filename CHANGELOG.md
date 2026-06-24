@@ -530,6 +530,26 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
+- **[#1784](https://github.com/alphaonedev/ai-memory-mcp/issues/1784) — consolidation provenance
+  (`metadata.derived_from` / `consolidated_from_agents`) is now immutable and survives a metadata
+  overwrite.** `consolidate` records the merged source ids on `metadata.derived_from` (and source
+  authors on `consolidated_from_agents`) rather than navigable `memory_links` edges — deliberately,
+  because a real edge to a source would be FK `ON DELETE CASCADE`-killed the instant `consolidate`
+  hard-deletes that source (the sources are never archived, so the pointer is inherently
+  non-navigable by design — a genuine impossibility, not a gap). The bug was that only `agent_id`
+  was protected across a metadata whole-object overwrite, so a later `memory_update` or a re-store
+  /re-consolidation that didn't re-supply these keys **silently dropped the provenance** (and it
+  cannot be reconstructed — the sources are gone). Both provenance keys are now preserved
+  (existing-wins, exactly like `agent_id`) at every metadata-overwrite site on both backends: the
+  caller-layer `crate::identity::preserve_provenance_keys` helper (the generalized
+  `preserve_agent_id`, used by the MCP/HTTP/CLI update + store-dedup paths), the postgres in-SQL
+  `update` / upsert / federation-merge arms (a `jsonb ||` provenance overlay), and the sqlite in-SQL
+  upsert / newer-wins-merge arms (a `json_patch` overlay that — unlike the prior `json_set` —
+  preserves the nested array values). The stale `consolidate` doc-comment (which claimed it "creates
+  links from new → old") is corrected. No schema change; existing `derived_from` rows keep working
+  and now survive updates. Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Code
+  anchors: `src/identity/mod.rs`, `src/storage/mod.rs`, `src/store/postgres.rs`.
+
 - **[#1783](https://github.com/alphaonedev/ai-memory-mcp/issues/1783) — AGE knowledge-graph
   projection is now cleaned on hard-delete (no more ghost edges).** `project_link_into_age` was
   MERGE-only — it never issued a Cypher DELETE — so when a memory was hard-deleted (`delete` /

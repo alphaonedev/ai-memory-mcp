@@ -3773,10 +3773,15 @@ impl PostgresStore {
                 confidence = COALESCE($8, confidence),
                 metadata = CASE
                     WHEN $9::JSONB IS NULL THEN metadata
-                    WHEN metadata ? 'agent_id' THEN jsonb_set(
-                        $9::JSONB, '{agent_id}', metadata -> 'agent_id'
-                    )
-                    ELSE $9::JSONB
+                    -- #1784 — overlay the existing row's immutable provenance
+                    -- keys (agent_id + consolidation derived_from /
+                    -- consolidated_from_agents) on top of the patch so a
+                    -- whole-object metadata update can't silently drop them.
+                    ELSE ($9::JSONB || (
+                        SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                        FROM jsonb_each(metadata) AS prov(k, v)
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    ))
                 END,
                 source_uri = COALESCE($10, source_uri),
                 -- #1628/#1626 — If-Match PUTs route through this method
@@ -8180,15 +8185,16 @@ impl PostgresStore {
                 priority = EXCLUDED.priority,
                 confidence = EXCLUDED.confidence,
                 updated_at = EXCLUDED.updated_at,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    ELSE EXCLUDED.memory_kind END,
@@ -10328,15 +10334,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
                 -- signal when re-stored at the same (title, namespace).
@@ -10629,15 +10636,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -10851,15 +10859,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -11078,15 +11087,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -11292,15 +11302,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky (reflection AND persona, #1629).
@@ -11568,12 +11579,15 @@ impl MemoryStore for PostgresStore {
                 confidence = COALESCE($8, confidence),
                 metadata = CASE
                     WHEN $9::JSONB IS NULL THEN metadata
-                    WHEN metadata ? 'agent_id' THEN jsonb_set(
-                        $9::JSONB,
-                        '{agent_id}',
-                        metadata -> 'agent_id'
-                    )
-                    ELSE $9::JSONB
+                    -- #1784 — overlay the existing row's immutable provenance
+                    -- keys (agent_id + consolidation derived_from /
+                    -- consolidated_from_agents) on top of the patch so a
+                    -- whole-object metadata update can't silently drop them.
+                    ELSE ($9::JSONB || (
+                        SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                        FROM jsonb_each(metadata) AS prov(k, v)
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    ))
                 END,
                 source_uri = COALESCE($10, source_uri),
                 -- #1626 — tier→long ⇒ expires_at = NULL. A patch that
@@ -12361,15 +12375,15 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.updated_at > memories.updated_at
                          OR (EXCLUDED.updated_at = memories.updated_at
                              AND EXCLUDED.id > memories.id) THEN
-                        CASE
-                            WHEN memories.metadata ? 'agent_id'
-                                THEN jsonb_set(
-                                    EXCLUDED.metadata,
-                                    '{agent_id}',
-                                    memories.metadata -> 'agent_id'
-                                )
-                            ELSE EXCLUDED.metadata
-                        END
+                        -- #1784 — on a newer-wins federation merge, overlay the
+                        -- existing row's immutable provenance keys (agent_id +
+                        -- consolidation derived_from / consolidated_from_agents)
+                        -- on top of EXCLUDED so they survive the merge.
+                        (EXCLUDED.metadata || (
+                            SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                            FROM jsonb_each(memories.metadata) AS prov(k, v)
+                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                        ))
                     ELSE memories.metadata
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
@@ -13850,15 +13864,15 @@ impl MemoryStore for PostgresStore {
                 source = EXCLUDED.source,
                 access_count = EXCLUDED.access_count,
                 updated_at = EXCLUDED.updated_at,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row (existing-wins) so a re-consolidation
+                    -- onto a colliding (title, namespace) can't drop provenance.
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                ))
                 -- reflection_depth intentionally not surfaced here: the
                 -- consolidate path mints a fresh memory and the DB column
                 -- DEFAULT 0 applies. The UPSERT branch preserves the

@@ -809,16 +809,21 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             updated_at = excluded.updated_at,
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
                               ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            -- Preserve metadata.agent_id across upsert (NHI provenance is immutable).
-            metadata = CASE
-                WHEN json_extract(memories.metadata, '$.agent_id') IS NOT NULL
-                THEN json_set(
-                    excluded.metadata,
-                    '$.agent_id',
-                    json_extract(memories.metadata, '$.agent_id')
+            -- #1784 — preserve immutable provenance keys (agent_id + the
+            -- consolidation derived_from / consolidated_from_agents arrays)
+            -- across upsert. json_patch overlays the existing row's
+            -- provenance object on top of excluded (existing-wins) and
+            -- preserves nested array values that the prior agent_id-only
+            -- json_set handled but the array keys would have double-encoded.
+            metadata = json_patch(
+                excluded.metadata,
+                COALESCE(
+                    (SELECT json_group_object(key, value)
+                     FROM json_each(memories.metadata)
+                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                    '{}'
                 )
-                ELSE excluded.metadata
-            END,
+            ),
             -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
             -- so a subsequent reflection at higher depth doesn't lose its
             -- provenance signal when re-stored at the same (title, namespace).
@@ -5119,7 +5124,17 @@ pub fn get_link_for_verify(
 pub const CONSOLIDATION_SOURCE: &str = "consolidation";
 
 /// Consolidate multiple memories into one. Returns the new memory ID.
-/// Deletes the source memories and creates links from new → old (`derived_from`).
+///
+/// Hard-DELETEs the source memories and records their ids on the new
+/// memory's `metadata.derived_from` (plus the source authors on
+/// `metadata.consolidated_from_agents`). Provenance is stored as metadata
+/// — NOT navigable `memory_links` edges — because a real edge to a source
+/// would be FK `ON DELETE CASCADE`-killed the instant the source is
+/// deleted (and the source is never archived, so it can't be pointed at).
+/// Per #1784 these provenance keys are now immutable: a later
+/// `update` / dedup metadata overwrite preserves them (existing-wins,
+/// like `agent_id`) instead of silently dropping them. The pointer is
+/// inherently non-navigable (its targets no longer exist) by design.
 #[allow(clippy::too_many_arguments)]
 pub fn consolidate(
     conn: &Connection,
@@ -8591,22 +8606,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             access_count = MAX(memories.access_count, excluded.access_count),
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
                               ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            -- Preserve metadata.agent_id across newer-wins merge (NHI provenance immutable).
-            metadata = CASE
-                WHEN json_extract(memories.metadata, '$.agent_id') IS NOT NULL
-                THEN json_set(
-                    CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                         THEN excluded.metadata
-                         ELSE memories.metadata END,
-                    '$.agent_id',
-                    json_extract(memories.metadata, '$.agent_id')
+            -- #1784 — preserve immutable provenance keys (agent_id + the
+            -- consolidation derived_from / consolidated_from_agents arrays)
+            -- across a newer-wins merge: json_patch overlays the existing
+            -- row's provenance object (existing-wins, array-safe) on top of
+            -- the newer-wins base (excluded if newer, else the existing row).
+            metadata = json_patch(
+                CASE WHEN excluded.updated_at > memories.updated_at
+                          OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                     THEN excluded.metadata
+                     ELSE memories.metadata END,
+                COALESCE(
+                    (SELECT json_group_object(key, value)
+                     FROM json_each(memories.metadata)
+                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                    '{}'
                 )
-                ELSE CASE WHEN excluded.updated_at > memories.updated_at
-                               OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                          THEN excluded.metadata
-                          ELSE memories.metadata END
-            END,
+            ),
             -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
             -- signal isn't lost on newer-wins federation merges.
             reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
@@ -16352,6 +16368,82 @@ mod tests {
         assert_eq!(got.metadata["agent"], "claude");
         assert_eq!(got.metadata["model"], "opus");
         assert_eq!(got.metadata["shared"], "from_b");
+    }
+
+    #[test]
+    fn consolidate_provenance_preserved_across_upsert_1784() {
+        // #1784 — metadata.derived_from + consolidated_from_agents are
+        // immutable provenance: a later upsert (re-store under the same
+        // title/namespace) that OMITS them must NOT clobber them
+        // (existing-wins, mirroring agent_id; the in-SQL json_patch overlay).
+        let conn = test_db();
+        let mut mem_a = make_memory("Prov A", "test", Tier::Long, 5);
+        mem_a.metadata = serde_json::json!({ "agent_id": "author-a" });
+        let id_a = insert(&conn, &mem_a).unwrap();
+        let mut mem_b = make_memory("Prov B", "test", Tier::Long, 7);
+        mem_b.metadata = serde_json::json!({ "agent_id": "author-b" });
+        let id_b = insert(&conn, &mem_b).unwrap();
+
+        let new_id = consolidate(
+            &conn,
+            &[id_a.clone(), id_b.clone()],
+            "Prov Merged",
+            "summary",
+            "test",
+            &Tier::Long,
+            "consolidation",
+            "consolidator-x",
+        )
+        .unwrap();
+
+        // The consolidated memory records source ids + source authors.
+        let got = get(&conn, &new_id).unwrap().unwrap();
+        let derived = got.metadata["derived_from"]
+            .as_array()
+            .expect("derived_from array");
+        assert!(
+            derived.iter().any(|v| v == &serde_json::json!(id_a))
+                && derived.iter().any(|v| v == &serde_json::json!(id_b)),
+            "derived_from carries both source ids: {:?}",
+            got.metadata
+        );
+        assert!(
+            got.metadata["consolidated_from_agents"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "consolidated_from_agents carries source authors: {:?}",
+            got.metadata
+        );
+
+        // Re-store a DISTINCT memory under the SAME (title, namespace) with
+        // metadata that OMITS the provenance keys → the ON CONFLICT upsert
+        // must PRESERVE them (pre-#1784 it clobbered all but agent_id).
+        let mut clobber = make_memory("Prov Merged", "test", Tier::Long, 6);
+        clobber.metadata = serde_json::json!({ "unrelated": "value" });
+        let upserted_id = insert(&conn, &clobber).unwrap();
+        assert_eq!(
+            upserted_id, new_id,
+            "upsert resolves to the same (title,ns) row"
+        );
+
+        let after = get(&conn, &new_id).unwrap().unwrap();
+        assert_eq!(after.metadata["unrelated"], "value", "the new key applied");
+        let derived_after = after.metadata["derived_from"]
+            .as_array()
+            .expect("#1784: derived_from must survive the overwriting upsert");
+        assert!(
+            derived_after.iter().any(|v| v == &serde_json::json!(id_a))
+                && derived_after.iter().any(|v| v == &serde_json::json!(id_b)),
+            "#1784: derived_from survives the metadata-overwriting upsert: {:?}",
+            after.metadata
+        );
+        assert!(
+            after.metadata["consolidated_from_agents"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "#1784: consolidated_from_agents survives the upsert: {:?}",
+            after.metadata
+        );
     }
 
     #[test]
