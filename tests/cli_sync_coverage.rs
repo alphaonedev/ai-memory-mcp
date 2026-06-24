@@ -708,6 +708,7 @@ async fn run_daemon_clamps_interval_and_batch_size() {
         client_cert: None,
         client_key: None,
         insecure_skip_server_verify: false,
+        ca_cert: None,
     };
     // Ensure rustls provider doesn't double-install across other tests.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -733,6 +734,7 @@ async fn run_daemon_mtls_client_path_runs_through_tls_builder() {
         client_cert: Some(cert),
         client_key: Some(key),
         insecure_skip_server_verify: false,
+        ca_cert: None,
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fut = run_daemon(&db, args, Some("alice"));
@@ -758,6 +760,7 @@ async fn run_daemon_mtls_with_insecure_skip_logs_warning_and_runs() {
         client_cert: Some(cert),
         client_key: Some(key),
         insecure_skip_server_verify: true, // logs warn + sets danger_accept
+        ca_cert: None,
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fut = run_daemon(&db, args, Some("alice"));
@@ -777,10 +780,64 @@ async fn run_daemon_mtls_with_missing_cert_file_errors() {
         client_cert: Some(PathBuf::from("/nonexistent/cert.pem")),
         client_key: Some(PathBuf::from("/nonexistent/key.pem")),
         insecure_skip_server_verify: false,
+        ca_cert: None,
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let res = run_daemon(&db, args, Some("alice")).await;
     assert!(res.is_err(), "missing cert file should error");
+}
+
+#[tokio::test]
+async fn run_daemon_ca_cert_valid_runs_1794() {
+    // #1794 — `--ca-cert` (valid PEM) drives the CaValidated arm: the root is
+    // added to the trust store and the daemon proceeds into its loop.
+    let env = Env::fresh();
+    let db = env.db_path.clone();
+    let ca = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/tls/valid_cert.pem");
+    let args = SyncDaemonArgs {
+        peers: vec!["http://127.0.0.1:1/".to_string()],
+        interval: 1,
+        api_key: None,
+        batch_size: 10,
+        client_cert: None,
+        client_key: None,
+        insecure_skip_server_verify: false,
+        ca_cert: Some(ca),
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let fut = run_daemon(&db, args, Some("alice"));
+    let res = tokio::time::timeout(std::time::Duration::from_millis(900), fut).await;
+    let _ = res;
+}
+
+#[tokio::test]
+async fn run_daemon_ca_cert_malformed_errors_1794() {
+    // #1794 — a `--ca-cert` file with no PEM `-----BEGIN ` marker is rejected
+    // loudly (reqwest would otherwise accept it as an empty chain).
+    let env = Env::fresh();
+    let db = env.db_path.clone();
+    let not_pem = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let args = SyncDaemonArgs {
+        peers: vec!["http://127.0.0.1:1/".to_string()],
+        interval: 1,
+        api_key: None,
+        batch_size: 10,
+        client_cert: None,
+        client_key: None,
+        insecure_skip_server_verify: false,
+        ca_cert: Some(not_pem),
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let res = run_daemon(&db, args, Some("alice")).await;
+    assert!(
+        res.is_err(),
+        "malformed --ca-cert (no PEM marker) must error"
+    );
+    assert!(
+        res.unwrap_err().to_string().contains("--ca-cert"),
+        "error should name --ca-cert"
+    );
 }
 
 #[tokio::test]
@@ -797,6 +854,7 @@ async fn run_daemon_no_mtls_uses_default_client() {
         client_cert: None,
         client_key: None,
         insecure_skip_server_verify: false,
+        ca_cert: None,
     };
     let _ = rustls::crypto::ring::default_provider().install_default();
     let fut = run_daemon(&db, args, Some("alice"));
