@@ -543,7 +543,7 @@ pub async fn create_link(
                     tracing::error!("create_link: quota substrate error: {se}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "quota check failed"})),
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
                     )
                         .into_response()
                 }

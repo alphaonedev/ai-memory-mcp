@@ -530,6 +530,24 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
+- **[#1788](https://github.com/alphaonedev/ai-memory-mcp/issues/1788) — `bulk_create` + `consolidate`
+  now charge the per-agent daily write quota (sqlite).** The per-agent daily write quota
+  (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was enforced on the single-write handlers but ABSENT from the
+  bulk-create surface (`POST /api/v1/memories/bulk`) and the consolidate surfaces (HTTP
+  `POST /api/v1/consolidate` + MCP `memory_consolidate`), so a caller could loop 1000-item bulk POSTs
+  to author unlimited memories. The 5-agent adversarial vote (memory `4d3ea1c5`) confirmed the charge
+  belongs at the **handler layer**, NOT the SAL `store`/`store_batch` trait — that trait is shared
+  with federation-receive (storage-bytes-only per #1544), migration, the CLI (operator-as-actor), and
+  the curator/autonomy `ConsolidationPass`, all of which must stay exempt. `bulk_create` now charges
+  `check_and_record` per row with **partial-fill** semantics (over-cap rows land in `errors[]` and are
+  not persisted, consistent with the handler's existing per-row validation/governance error model;
+  refund on insert failure); `consolidate` charges 1 (it mints a net-new attributable memory) on the
+  tenant HTTP + MCP surfaces, leaving the curator path exempt. Empty/anonymous principals are skipped,
+  mirroring single writes. **Note:** a broader, distinct finding surfaced during this work — PostgresStore
+  never *enforces* the daily memory-count cap on any write path (it only *records*) — is tracked as
+  [#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795). No schema change. Code anchors:
+  `src/handlers/memories_query.rs`, `src/handlers/power_consolidation.rs`, `src/mcp/tools/consolidate.rs`.
+
 - **[#1784](https://github.com/alphaonedev/ai-memory-mcp/issues/1784) — consolidation provenance
   (`metadata.derived_from` / `consolidated_from_agents`) is now immutable and survives a metadata
   overwrite.** `consolidate` records the merged source ids on `metadata.derived_from` (and source

@@ -105,6 +105,13 @@ pub mod msg {
     pub const PENDING_ACTION_NOT_FOUND_OR_DECIDED: &str =
         "pending action not found or already decided";
 
+    // ---- quota -----------------------------------------------------------------
+    /// Sanitized 500 body when the quota substrate read/charge itself fails
+    /// (distinct from a `QUOTA_EXCEEDED` 429). #1788 hoisted this to a const
+    /// after the bulk + consolidate charge sites pushed it past 3 production
+    /// occurrences (the pm-v3.1 hardcoded-literal ratchet).
+    pub const QUOTA_CHECK_FAILED: &str = "quota check failed";
+
     // ---- governance ------------------------------------------------------------
     pub const GOVERNANCE_REQUIRES_APPROVAL: &str = "governance requires approval";
     pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";
