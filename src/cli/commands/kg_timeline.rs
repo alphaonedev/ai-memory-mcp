@@ -66,7 +66,9 @@ pub fn cmd_kg_timeline(
         params["limit"] = json!(l);
     }
 
-    let envelope = crate::mcp::handle_kg_timeline(&conn, &params)
+    // #1800 — CLI is operator-as-actor (single-operator trust-all), so
+    // pass `None` for the visibility caller (no source-owner gate).
+    let envelope = crate::mcp::handle_kg_timeline(&conn, &params, None)
         .map_err(|e| anyhow::anyhow!("kg-timeline: {e}"))?;
 
     if args.json {

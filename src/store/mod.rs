@@ -3623,6 +3623,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_undo_in_place_edit_unsupported() {
+        // #1727 — adapters that don't implement the undo surface (in-memory /
+        // test mocks) return UnsupportedCapability from the default body.
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s.undo_in_place_edit(&ctx, "any", false).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
     async fn default_begin_transaction_returns_unsupported() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");

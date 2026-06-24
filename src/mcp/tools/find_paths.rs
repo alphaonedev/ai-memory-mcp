@@ -66,7 +66,11 @@ impl McpTool for FindPathsTool {
 /// across backends: `paths` is a list of id chains where each chain
 /// has `source_id` first and `target_id` last.
 
-pub fn handle_find_paths(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_find_paths(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
         .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
@@ -75,6 +79,20 @@ pub fn handle_find_paths(conn: &rusqlite::Connection, params: &Value) -> Result<
         .ok_or(crate::errors::msg::TARGET_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
     validate::validate_id(target_id).map_err(|e| e.to_string())?;
+
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate onto the
+    // MCP surface. When a visibility caller is resolved (operator opted
+    // in via AI_MEMORY_AGENT_ID), gate on the SOURCE memory's ownership:
+    // if the source row exists and is not visible to the caller, refuse
+    // rather than leak its id-chain neighborhood. A `None` caller
+    // (single-tenant trust-all) or a missing source row proceeds
+    // unchanged. Gates on source_id only, matching the HTTP twin.
+    if let Some(caller) = caller
+        && let Ok(Some(mem)) = db::get(conn, source_id)
+        && !crate::visibility::is_visible_to_caller(&mem, caller)
+    {
+        return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+    }
 
     let max_depth = params["max_depth"]
         .as_u64()

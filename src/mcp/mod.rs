@@ -1629,7 +1629,10 @@ fn dispatch_memory_entity_get_by_alias(ctx: &ToolDispatchCtx<'_>) -> Result<Valu
 }
 
 fn dispatch_memory_kg_timeline(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_kg_timeline(ctx.conn, ctx.arguments)
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
+    // `dispatch_memory_search`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_kg_timeline(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_kg_invalidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1641,7 +1644,10 @@ fn dispatch_memory_kg_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> 
 }
 
 fn dispatch_memory_find_paths(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_find_paths(ctx.conn, ctx.arguments)
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
+    // `dispatch_memory_search`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_find_paths(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
