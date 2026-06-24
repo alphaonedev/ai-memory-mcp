@@ -530,7 +530,16 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
-- **#1655 — path-form `GET /api/v1/namespaces/{ns}/standard` works on postgres (was HTTP 501).**
+- **#1781 — `schema-init --embedding-dim` refuses a destructive embedding-dim conversion by
+  default.** On a column-dim mismatch the postgres `migrate_embedding_dim` path DROPs the HNSW
+  index, NULLs every `memories` / `archived_memories` embedding, and ALTERs the column —
+  previously with no emptiness check, so re-running `ai-memory schema-init --embedding-dim` with
+  the wrong/default dim against a populated corpus silently NULLed every embedding (semantic
+  recall degraded to keyword-only until a full re-embed). The conversion now REFUSES with a typed
+  error when stored embeddings exist, printing how many would be NULLed, unless `--force-reembed`
+  is passed (the explicit escape hatch; precedent: #1785 DROP-confirm). The #877 daemon
+  auto-migrate path is unchanged — it passes `force = true` because enabling auto-migrate is the
+  operator's explicit opt-in.
   The path-form handler used the sqlite-only `State<Db>` extractor + a raw rusqlite call, so the
   postgres route-gate 501'd it even though the SAL `get_namespace_standard` was implemented. Now
   delegates to the SAL-backed query-string handler (both backends, same response shape) + added to

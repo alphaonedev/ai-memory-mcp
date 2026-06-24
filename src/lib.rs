@@ -104,6 +104,16 @@ pub const RECALL_COSINE_GATE: f64 = 0.2;
 /// `src/llm.rs` keeps its own site per the vendor carve-out.
 pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
 
+/// Canonical "how many memories carry a non-NULL embedding" COUNT query.
+/// Backend-agnostic (the text is identical on sqlite + postgres), so it is
+/// hoisted here and referenced by name at every site: the sqlite HNSW-size
+/// doctor probe (`src/cli/doctor.rs`), `storage::count_embedded_memories`,
+/// and the #1781 postgres destructive-conversion guard
+/// (`PostgresStore::migrate_embedding_dim`). One spelling, per the pm-v3.1
+/// no-hardcoded-literal-duplication discipline.
+pub const SQL_COUNT_EMBEDDED_MEMORIES: &str =
+    "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL";
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
 // canonical HTTP route-path consts. The substrate's HTTP router

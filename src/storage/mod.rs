@@ -9666,12 +9666,8 @@ pub fn distinct_embedding_dims(conn: &Connection, namespace: Option<&str>) -> Re
 ///
 /// Bubbles the rusqlite error from the COUNT query.
 pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    conn.query_row(crate::SQL_COUNT_EMBEDDED_MEMORIES, [], |row| row.get(0))
+        .map_err(Into::into)
 }
 
 /// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.
