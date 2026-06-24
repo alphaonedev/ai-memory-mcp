@@ -8892,6 +8892,9 @@ async fn http_approve_pending_happy_path_executes_store() {
     let now_rfc = Utc::now().to_rfc3339();
     let pending_id = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY: register the distinct "approver-alice".
+        db::register_agent(&lock.0, "approver-alice", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -9063,6 +9066,9 @@ async fn http_approve_pending_executor_records_decided_by() {
     let now_rfc = Utc::now().to_rfc3339();
     let pid = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY: register the distinct "executor-claude".
+        db::register_agent(&lock.0, "executor-claude", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -9120,6 +9126,10 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
     let now_rfc = Utc::now().to_rfc3339();
     let pid = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY (no self-approval; registered approver).
+        // Requester "alice" queues; a distinct registered "approver-store" decides.
+        db::register_agent(&lock.0, "approver-store", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -9156,7 +9166,7 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/pending/{pid}/approve"))
                 .method("POST")
-                .header("x-agent-id", "alice")
+                .header("x-agent-id", "approver-store")
                 .header("x-ai-memory-timestamp", &ts)
                 .header("x-ai-memory-signature", &sig)
                 .body(Body::empty())
