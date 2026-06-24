@@ -725,6 +725,33 @@ pub async fn bulk_create(
                 }
             }
 
+            // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write
+            // quota on the postgres bulk path with PARTIAL-FILL parity to the
+            // sqlite branch (#1788). `check_memory_quota` is a pure read (the
+            // batched `store_batch` records later), so the cumulative count is
+            // `already-allowed + this row`: passing `allowed.len()+1` tests
+            // current+k <= max; once the cap is hit, this + every subsequent row
+            // goes to errors[] and is not persisted. Exempt paths never reach here.
+            let row_quota_bytes = i64::try_from(
+                mem.title.len()
+                    + mem.content.len()
+                    + serde_json::to_string(&mem.metadata)
+                        .map(|s| s.len())
+                        .unwrap_or(0),
+            )
+            .unwrap_or(i64::MAX);
+            let pending_count = i64::try_from(allowed.len())
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+            if let Err(e) = app
+                .store
+                .check_memory_quota(&ctx, &mem.namespace, pending_count, row_quota_bytes)
+                .await
+            {
+                errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                continue;
+            }
+
             allowed.push(mem);
         }
 

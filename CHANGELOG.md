@@ -530,6 +530,24 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
+- **[#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795) — PostgresStore now ENFORCES the
+  per-agent daily memory-count quota (it previously only recorded it).** On a postgres-backed daemon
+  the per-agent daily write quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was a silent no-op on EVERY tenant
+  write path — `store`/`store_batch`/`consolidate` increment the counter but never compared it to the
+  cap or rejected, and `create_memory_postgres` never called any quota check (the sqlite path enforces
+  at the handler via `quotas::check_and_record`, which the postgres data path doesn't use). So an agent
+  could author unlimited memories/day on postgres. This was surfaced by the #1788 5-agent vote as a
+  distinct, broader defect than the bulk/consolidate-only #1788. The 5-agent adversarial vote (memory
+  `4d3ea1c5`) chose a new tenant-only SAL `check_memory_quota(ctx, namespace, additional_count,
+  additional_bytes)` method (day-roll-aware read + compare → `StoreError::QuotaExceeded` → 429), called
+  by exactly the 3 postgres tenant handlers (`create_memory_postgres`, the `bulk_create` postgres branch
+  with partial-fill, the `consolidate_memories` postgres branch) BEFORE their store write — NOT inside
+  `store`/`store_batch` (which are shared with the EXEMPT federation-receive / migrate / CLI / curator
+  paths, plus `consolidate` is a separate method `store`-flag enforcement couldn't reach). The day-roll
+  reuses the same `date_trunc('day', day_started_at)` idiom as `record_memory_quota_in_tx`. A small
+  check-then-record TOCTOU (bounded by pool concurrency) is accepted for a soft daily cap. No schema
+  change. Code anchors: `src/store/mod.rs`, `src/store/postgres.rs`, `src/handlers/{create,power_consolidation,memories_query,postgres_gate}.rs`.
+
 - **[#1788](https://github.com/alphaonedev/ai-memory-mcp/issues/1788) — `bulk_create` + `consolidate`
   now charge the per-agent daily write quota (sqlite).** The per-agent daily write quota
   (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was enforced on the single-write handlers but ABSENT from the

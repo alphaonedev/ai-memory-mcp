@@ -299,6 +299,25 @@ pub enum StoreError {
     #[error("{detail}")]
     InvalidTransition { detail: String },
 
+    /// #1795 — the tenant write would exceed the per-agent daily memory
+    /// quota on the postgres backend (the postgres tenant-handler
+    /// enforcement seam, since `store`/`store_batch`/`consolidate` only
+    /// RECORD usage). Carries the same fields as
+    /// [`crate::quotas::QuotaError`] so the HTTP surface returns the
+    /// byte-identical 429 `QUOTA_EXCEEDED` envelope the sqlite handler path
+    /// produces via `quotas::check_and_record`.
+    #[error("quota exceeded for {agent_id} in {namespace}: {limit} {current}/{max}")]
+    QuotaExceeded {
+        agent_id: String,
+        namespace: String,
+        /// The limit name hit (`crate::quotas::QuotaLimit::as_str`, e.g.
+        /// `memories_per_day` / `storage_bytes`) — surfaced in the 429
+        /// envelope so callers can switch on it (sqlite-path parity).
+        limit: String,
+        current: i64,
+        max: i64,
+    },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -332,6 +351,9 @@ impl StoreError {
             // #1726 — an illegal lifecycle transition is a state-conflict
             // (409), matching the sqlite branch's `InvalidTransition` mapping.
             Self::InvalidTransition { .. } => error_codes::CONFLICT,
+            // #1795 — over-quota tenant write → 429 QUOTA_EXCEEDED, byte-equal
+            // slug with the sqlite handler path's quota breach.
+            Self::QuotaExceeded { .. } => error_codes::QUOTA_EXCEEDED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }
@@ -2391,6 +2413,34 @@ pub trait MemoryStore: Send + Sync {
         Err(StoreError::UnsupportedCapability {
             capability: "QUOTA_STATUS_NS".to_string(),
         })
+    }
+
+    /// #1795 — ENFORCE the per-agent daily memory-count quota for a
+    /// pending tenant write of `additional_count` memories (`additional_bytes`
+    /// total payload). Returns `StoreError::QuotaExceeded` (→ HTTP 429) when
+    /// the day-rolled `current_memories_today + additional_count` would exceed
+    /// `max_memories_per_day`, or the storage cap would be exceeded.
+    ///
+    /// This is the postgres TENANT-handler enforcement seam: `store` /
+    /// `store_batch` / `consolidate` only RECORD usage (they never reject),
+    /// and the sqlite path enforces at the handler via
+    /// `quotas::check_and_record`. The 3 postgres tenant handlers
+    /// (`create_memory_postgres`, the `bulk_create` postgres branch, the
+    /// `consolidate_memories` postgres branch) call this BEFORE their store
+    /// write; the EXEMPT paths (federation-receive, migrate, CLI, curator)
+    /// never call it, so they are uncharged by construction.
+    ///
+    /// Default is a no-op (`Ok(())`) — non-postgres adapters that already
+    /// enforce at the handler layer (sqlite) or do not enforce keep their
+    /// existing behaviour. Only `PostgresStore` overrides it.
+    async fn check_memory_quota(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _additional_count: i64,
+        _additional_bytes: i64,
+    ) -> StoreResult<()> {
+        Ok(())
     }
 
     /// List every quota row in the substrate, sorted ascending by
