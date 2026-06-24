@@ -530,6 +530,25 @@ lifecycle surface adds only permissive optional fields to the existing
 
 ### Fixed
 
+- **[#1783](https://github.com/alphaonedev/ai-memory-mcp/issues/1783) — AGE knowledge-graph
+  projection is now cleaned on hard-delete (no more ghost edges).** `project_link_into_age` was
+  MERGE-only — it never issued a Cypher DELETE — so when a memory was hard-deleted (`delete` /
+  `forget` / `consolidate` / `run_gc` / `size_gc` / `apply_remote_deletion`, all of which
+  cascade-delete `memory_links` relationally via `ON DELETE CASCADE`), the Apache-AGE projection
+  `memory_graph` kept the orphaned `(:Memory)` node + its incident edges, so `kg_query` /
+  `find_paths` over the AGE backend returned ghost edges to a row that no longer existed (a stale
+  SECONDARY index; relational truth + the `find_paths` recursive-CTE fallback were always correct).
+  A new `unproject_memory_from_age` helper issues the mirror `MATCH (n:Memory {id}) DETACH DELETE n`
+  (best-effort under the same `#1542`/`#1640` SAVEPOINT + AGE-runtime-tolerance posture as the link
+  projection; idempotent — a never-projected memory no-ops) at all six hard-delete sites, in the
+  surrounding tx where one exists (atomic) and a short own-tx on the two pool-direct paths. The
+  cold drainer (`drain_kg_projection_outbox`) gains an existence-guard that SKIPs any pending
+  projection whose `memory_links` row was deleted between enqueue and drain — so a deferred-mode
+  ADD can never RESURRECT a node the delete removed, **without a schema migration** (the relational
+  table is the source of truth). Postgres+AGE only; SQLite/CTE backends have no projection to clean.
+  Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Code anchor:
+  `src/store/postgres.rs`; tests: `tests/pillar4_4d_age_unprojection_on_delete_1783.rs`.
+
 - **#1781 — `schema-init --embedding-dim` refuses a destructive embedding-dim conversion by
   default.** On a column-dim mismatch the postgres `migrate_embedding_dim` path DROPs the HNSW
   index, NULLs every `memories` / `archived_memories` embedding, and ALTERs the column —
