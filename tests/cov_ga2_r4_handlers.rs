@@ -1402,10 +1402,15 @@ async fn approval_decide_approve_sqlite_execute_path() {
     // approve + execute + executed:true arm.
     let ns = uid("cov-ga2-r4-approve");
     let requester = uid("ai:cov-ga2-r4-req");
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface enforces the
+    // Human-arm gate UNCONDITIONALLY (no self-approval; registered approver), so
+    // decide as a distinct REGISTERED approver rather than the requester.
+    let approver = uid("ai:cov-ga2-r4-appr");
     let queued = mem(&uid("pa"), &ns, "needs approval", &requester);
     let payload = serde_json::to_value(&queued).expect("serialize payload");
     let pending_id = {
         let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, &approver, "ai:generic", &[]).ok();
         ai_memory::db::queue_pending_action(
             &lock.0,
             ai_memory::models::GovernedAction::Store,
@@ -1416,7 +1421,7 @@ async fn approval_decide_approve_sqlite_execute_path() {
         )
         .expect("queue pending")
     };
-    // Sign+decide as the requester (Human approver accepts any approval).
+    // Sign+decide as the distinct registered approver.
     let body = json!({"decision": "approve", "remember": "session"});
     let body_bytes = serde_json::to_vec(&body).unwrap();
     let body_str = String::from_utf8(body_bytes.clone()).unwrap();
@@ -1427,7 +1432,7 @@ async fn approval_decide_approve_sqlite_execute_path() {
         .method("POST")
         .uri(format!("/api/v1/approvals/{pending_id}"))
         .header("content-type", "application/json")
-        .header("x-agent-id", &requester)
+        .header("x-agent-id", &approver)
         .header("x-ai-memory-signature", format!("sha256={sig}"))
         .header("x-ai-memory-timestamp", ts)
         .body(Body::from(body_bytes))
