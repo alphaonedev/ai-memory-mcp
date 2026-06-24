@@ -66,6 +66,18 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `write_signature` — optional `metadata` key carrying a base64 detached
+/// Ed25519 per-write content signature over the #626 [`SignableWrite`]
+/// envelope (`agent_id + namespace + title + kind + created_at +
+/// sha256(content)`). Read on the federation receive path (#1464) to verify
+/// relayed content against the claimed author's enrolled key and upgrade the
+/// row from `attest_level=claimed` to `agent_attested`. Additive, free-form;
+/// absent on legacy/unsigned peers (sender-side emit is the tracked v0.9
+/// half). `SignableWrite` excludes `metadata`, so the signature is stable
+/// even as this key is added to the map.
+///
+/// [`SignableWrite`]: crate::identity::sign::SignableWrite
+pub const WRITE_SIGNATURE: &str = "write_signature";
 /// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
 /// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
 pub const VERSION_VECTOR: &str = "version_vector";

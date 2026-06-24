@@ -32,8 +32,8 @@ use crate::federation::signing as fed_signing;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::federation_receive::{
-    SyncPushBody, check_sender_clock_skew, extract_peer_id, next_utc_midnight,
-    resolve_inbound_attribution,
+    ATTESTATION_TRACE_TARGET, SyncPushBody, apply_inbound_write_attestation,
+    check_sender_clock_skew, extract_peer_id, next_utc_midnight, resolve_inbound_attribution,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -172,12 +172,52 @@ pub(super) async fn sync_push_via_store(
             &body.sender_agent_id,
             local_cap,
         );
+        // #1464 — capture the originally-claimed author BEFORE attribution
+        // may rewrite it (sqlite-twin parity), so the content-attestation
+        // step can skip rows re-attributed to the sender.
+        let original_claim = to_insert
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let attribute_agent = resolve_inbound_attribution(
             &mut to_insert,
             &body.sender_agent_id,
             &attest_cfg,
             peer_header_owned.as_deref(),
         );
+        // #1464 (v0.8.0) — per-write CONTENT attestation (postgres twin of
+        // the sqlite receive path). Verify any presented
+        // `metadata.write_signature` against the attributed author's enrolled
+        // key → `agent_attested` vs `claimed`; reject forged, or (strict,
+        // opt-in) an unsigned honored third-party claim. The enrolled-key
+        // lookup resolves through the SAL `agent_pubkey` trait method so both
+        // backends behave identically.
+        let bound_pubkey = app
+            .store
+            .agent_pubkey(&attribute_agent)
+            .await
+            .ok()
+            .flatten();
+        if let Err(e) = apply_inbound_write_attestation(
+            &mut to_insert,
+            &attribute_agent,
+            &body.sender_agent_id,
+            original_claim.as_deref(),
+            bound_pubkey.as_deref(),
+            crate::federation::receive_auth::require_write_sig_enabled(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %to_insert.id,
+                attribute_agent = %attribute_agent,
+                sender = %body.sender_agent_id,
+                error = %e,
+                "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
+            );
+            skipped += 1;
+            continue;
+        }
         let bytes_estimate = i64::try_from(
             to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
         )

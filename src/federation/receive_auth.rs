@@ -116,6 +116,37 @@ pub fn require_transition_sig_enabled() -> bool {
         .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
 }
 
+/// Env knob gating the inbound per-write CONTENT-signature requirement on
+/// relayed memories (#1464) — the DATA-lane sibling of
+/// [`REQUIRE_TRANSITION_SIG_ENV`].
+pub const REQUIRE_WRITE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG";
+
+/// Whether HONORED third-party relayed memory writes must carry a valid
+/// per-write content signature.
+///
+/// **Default permissive (`false`)** per the #1464 5-agent vote (`4d3ea1c5`):
+/// a relayed memory is *data* (replication), not an authority-granting write,
+/// so it keeps the documented accept-and-flag posture — an unsigned relayed
+/// write lands `attest_level=claimed` rather than being refused (contrast the
+/// authority lane [`require_transition_sig_enabled`], default fail-closed).
+/// Defaulting this ON would self-DOS a heterogeneous mesh whose authors do
+/// not yet emit per-write signatures.
+///
+/// When the operator opts in (`1`/`true`/`yes`/`on`), a HONORED third-party
+/// relayed claim (`attribute_agent != sender`) without a valid signature is
+/// refused; self-authored relays (`attribute_agent == sender`, already gated
+/// by the #238 envelope attestation + #29 signature + #30 nonce + #43
+/// enrollment) stay faith-based. A *forged* signature is rejected
+/// unconditionally regardless of this knob (the [`crate::identity::verify::attest_write`]
+/// gate). Mirrors the secure-opt-in shape of `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
+/// (#48, the local-write sibling).
+#[must_use]
+pub fn require_write_sig_enabled() -> bool {
+    std::env::var(REQUIRE_WRITE_SIG_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
