@@ -27,7 +27,7 @@ use super::federation_signing_check::verify_signature_or_reject;
 
 /// Tracing target for receive-side peer-attestation checks
 /// (#1558 tracing-target SSOT).
-const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
+pub(super) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
 
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
@@ -240,6 +240,85 @@ pub(super) fn resolve_inbound_attribution(
         );
     }
     sender_agent_id.to_string()
+}
+
+/// #1464 (v0.8.0) — per-write CONTENT attestation on the federation receive
+/// path. The ATTRIBUTION lane ([`resolve_inbound_attribution`]) resolves
+/// WHO a relayed memory is attributed to; this resolves WHETHER the relayed
+/// CONTENT is cryptographically attested to that author.
+///
+/// When the relayed memory carries a base64 detached Ed25519 signature in
+/// `metadata.write_signature`, it is verified — through the same store-path
+/// [`crate::identity::attest::stamp_attestation`] gate (#626), which
+/// recomputes `sha256(content)` over the PERSISTED content bytes (never
+/// trusting a presented digest) and re-derives the canonical `SignableWrite`
+/// envelope — against the attributed author's locally ENROLLED Ed25519 key
+/// (`bound_pubkey_b64`, resolved per-backend by the caller). A valid
+/// signature upgrades the row to `attest_level=agent_attested`; an unsigned
+/// relayed write keeps `attest_level=claimed` (the documented accept-and-flag
+/// data-lane posture). `agent_attested` commits to the six `SignableWrite`
+/// fields ONLY (agent_id, namespace, title, kind, created_at,
+/// sha256(content)) — NOT tags/priority/metadata.
+///
+/// Composition rules (the data-lane security semantics, single-sourced here
+/// so both the sqlite and postgres receive paths behave identically):
+/// - **Re-attributed rows are skipped.** When an unauthorized third-party
+///   claim was already downgraded to `claimed` + re-attributed to the sender
+///   by [`resolve_inbound_attribution`] (`original_claim != attribute_agent`),
+///   a signature minted by the *original* claimant must NOT be checked
+///   against the re-attributed sender (it would spuriously read as forged).
+///   The row already correctly landed `claimed`; leave it.
+/// - **Strict mode is third-party-only.** `require_write_sig_env`
+///   (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`, default off) is honored only for a
+///   HONORED third-party relayed claim (`attribute_agent != sender_agent_id`);
+///   self-authored relays stay faith-based (already gated by the #238
+///   envelope attestation + #29 signature + #30 nonce + #43 enrollment), so a
+///   strict operator never bricks self-authored replication.
+///
+/// On the honored path this re-stamps `attest_level` from WHAT WE VERIFIED,
+/// overriding any peer-asserted `attest_level` in the inbound metadata (a
+/// peer cannot self-assert `agent_attested`).
+///
+/// # Errors
+///
+/// Returns `Err` when a presented signature is forged/malformed, or when
+/// strict mode requires a signature that is absent/unverifiable for a honored
+/// third-party claim. The caller rejects (skips) that single memory without
+/// aborting the batch. 5-agent vote (`4d3ea1c5`).
+pub(super) fn apply_inbound_write_attestation(
+    to_insert: &mut Memory,
+    attribute_agent: &str,
+    sender_agent_id: &str,
+    original_claim: Option<&str>,
+    bound_pubkey_b64: Option<&str>,
+    require_write_sig_env: bool,
+) -> anyhow::Result<()> {
+    // Skip re-attributed rows — the original claimant's signature would not
+    // verify against the re-attributed sender, and the row already correctly
+    // landed `claimed`.
+    if original_claim.is_some_and(|c| c != attribute_agent) {
+        return Ok(());
+    }
+    let presented_sig: Option<Vec<u8>> = to_insert
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.trim())
+                .ok()
+        });
+    // Strict requirement applies only to HONORED third-party relayed claims.
+    let require = require_write_sig_env && attribute_agent != sender_agent_id;
+    crate::identity::attest::stamp_attestation(
+        to_insert,
+        attribute_agent,
+        bound_pubkey_b64,
+        presented_sig.as_deref(),
+        require,
+    )
+    .map(|_| ())
 }
 
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
@@ -839,12 +918,47 @@ pub async fn sync_push(
             &body.sender_agent_id,
             cap_for_namespace,
         );
+        // #1464 — capture the originally-claimed author BEFORE attribution
+        // may rewrite it, so the content-attestation step can skip rows that
+        // get re-attributed to the sender (an unauthorized third-party claim).
+        let original_claim = to_insert
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let attribute_agent = resolve_inbound_attribution(
             &mut to_insert,
             &body.sender_agent_id,
             &attest_cfg,
             peer_header_owned.as_deref(),
         );
+        // #1464 (v0.8.0) — per-write CONTENT attestation. Verify any
+        // presented `metadata.write_signature` against the attributed
+        // author's enrolled key → upgrade to `agent_attested` (vs `claimed`);
+        // reject a forged signature, or (strict, opt-in) an unsigned honored
+        // third-party relayed claim. Skips re-attributed rows internally.
+        if let Err(e) = apply_inbound_write_attestation(
+            &mut to_insert,
+            &attribute_agent,
+            &body.sender_agent_id,
+            original_claim.as_deref(),
+            db::agent_pubkey(&lock.0, &attribute_agent)
+                .ok()
+                .flatten()
+                .as_deref(),
+            crate::federation::receive_auth::require_write_sig_enabled(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %to_insert.id,
+                attribute_agent = %attribute_agent,
+                sender = %body.sender_agent_id,
+                error = %e,
+                "sync_push: per-write content attestation failed; rejecting memory (#1464)"
+            );
+            skipped += 1;
+            continue;
+        }
         let bytes_estimate = i64::try_from(
             to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
         )
@@ -1565,6 +1679,170 @@ pub async fn sync_push(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    // ---- #1464 per-write CONTENT attestation (apply_inbound_write_attestation) ----
+
+    use crate::identity::{attest, keypair};
+    use base64::Engine as _;
+
+    /// A relayed memory authored by `author`, with the identity-bearing
+    /// `SignableWrite` fields populated so a real per-write signature can be
+    /// minted + verified.
+    fn wsig_mem(author: &str) -> Memory {
+        Memory {
+            id: "m-1464-wsig".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "kubernetes deployment guide".to_string(),
+            content: "scale the deployment to three replicas".to_string(),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({ "agent_id": author }),
+            ..Memory::default()
+        }
+    }
+
+    fn pk_b64(kp: &keypair::AgentKeypair) -> String {
+        base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes())
+    }
+
+    fn put_write_sig(mem: &mut Memory, sig: &[u8]) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+        mem.metadata.as_object_mut().unwrap().insert(
+            crate::models::field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(b64),
+        );
+    }
+
+    /// A valid presented per-write signature, verified against the author's
+    /// enrolled key, upgrades a HONORED third-party relayed claim from
+    /// `claimed` to `agent_attested`. (The signature is inserted into
+    /// `metadata` AFTER signing — proving `SignableWrite`'s exclusion of
+    /// `metadata` keeps the signature stable as the key is added.)
+    #[test]
+    fn write_attestation_valid_sig_upgrades_to_agent_attested_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        put_write_sig(&mut mem, &sig);
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        )
+        .expect("valid sig must verify");
+        assert_eq!(mem.metadata["attest_level"], "agent_attested");
+    }
+
+    /// A forged/tampered presented signature is rejected unconditionally
+    /// (even under the permissive default).
+    #[test]
+    fn write_attestation_forged_sig_rejected_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let mut sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        sig[0] ^= 0xFF; // flip a byte
+        put_write_sig(&mut mem, &sig);
+        let err = apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        );
+        assert!(err.is_err(), "forged signature must be rejected");
+    }
+
+    /// An unsigned relayed write keeps `attest_level=claimed` under the
+    /// permissive default — and a peer-asserted `agent_attested` in the
+    /// inbound metadata is overridden to `claimed` (a peer cannot self-assert
+    /// attestation).
+    #[test]
+    fn write_attestation_unsigned_stays_claimed_permissive_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        // Peer lies: claims agent_attested with no signature.
+        mem.metadata.as_object_mut().unwrap().insert(
+            "attest_level".to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        )
+        .expect("unsigned permissive must pass");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// Strict mode (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`) refuses an unsigned
+    /// HONORED third-party relayed claim.
+    #[test]
+    fn write_attestation_strict_third_party_unsigned_rejected_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let err = apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay", // attribute(author) != sender → third-party
+            Some(author),
+            Some(&pk_b64(&kp)),
+            true, // strict
+        );
+        assert!(err.is_err(), "strict third-party unsigned must be rejected");
+    }
+
+    /// Strict mode never bricks a SELF-authored relay (attribute == sender):
+    /// the requirement is third-party-only, so an unsigned self relay still
+    /// lands `claimed`.
+    #[test]
+    fn write_attestation_strict_self_authored_unsigned_passes_1464() {
+        let mut mem = wsig_mem("ai:relay");
+        apply_inbound_write_attestation(
+            &mut mem,
+            "ai:relay",
+            "ai:relay", // attribute == sender → self-authored
+            Some("ai:relay"),
+            None,
+            true, // strict, but does not apply to self
+        )
+        .expect("strict self-authored unsigned must still pass");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// A RE-ATTRIBUTED row (original third-party claim downgraded to the
+    /// sender by `resolve_inbound_attribution`) is skipped: a signature
+    /// minted by the original claimant must NOT be checked against the
+    /// re-attributed sender (it would spuriously read as forged). The row
+    /// keeps its already-stamped `claimed`.
+    #[test]
+    fn write_attestation_reattributed_row_skipped_1464() {
+        // Post-attribution state: an unauthorized "bob" claim was rewritten
+        // to sender "ai:relay" + stamped claimed.
+        let mut mem = wsig_mem("bob");
+        {
+            let obj = mem.metadata.as_object_mut().unwrap();
+            obj.insert("agent_id".to_string(), serde_json::json!("ai:relay"));
+            obj.insert("attest_level".to_string(), serde_json::json!("claimed"));
+        }
+        // A signature bob minted (would be forged against ai:relay).
+        let kp_bob = keypair::generate("bob").unwrap();
+        let sig = attest::sign_memory_write(&kp_bob, &mem, "bob").unwrap();
+        put_write_sig(&mut mem, &sig);
+        // original_claim "bob" != attribute "ai:relay" → re-attributed → skip.
+        apply_inbound_write_attestation(&mut mem, "ai:relay", "ai:relay", Some("bob"), None, true)
+            .expect("re-attributed row must be skipped, not rejected");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
 
     /// #1464 (v0.8.0, P0, security-high) — the per-memory authorship gate
     /// `resolve_inbound_attribution` must close the forge hole: an enrolled
