@@ -264,3 +264,95 @@ async fn consolidate_charges_daily_quota_1788() {
         "#1788: a rejected consolidate must not advance the counter past the cap"
     );
 }
+
+/// A consolidate whose write fails AFTER the quota charge must refund the
+/// charge (mirrors the single-write refund path). A provided `summary` skips
+/// the pre-charge source fetch, and a bogus source id makes `db::consolidate`
+/// fail after the charge — exercising the #1788 refund branch.
+#[tokio::test]
+async fn consolidate_refunds_quota_on_failure_1788() {
+    let (router, db_path, _keep) = build_test_router();
+    let agent_id = "consolidate-refund-1788";
+    let namespace = "consolidate-refund-1788";
+    seed_cap(&db_path, agent_id, namespace, 1000);
+
+    // One real source so the (agent, ns) row has a known count; consolidate
+    // references it plus a bogus id so the write fails post-charge.
+    let (s1, id1) = http_store(&router, agent_id, namespace, "refund source").await;
+    assert_eq!(s1, StatusCode::CREATED);
+    assert_eq!(
+        quota_count(&db_path, agent_id),
+        1,
+        "one source store charged"
+    );
+
+    let body = json!({
+        "ids": [id1.unwrap(), "bogus-nonexistent-1788"],
+        "title": "refund consolidate",
+        "summary": "merged summary that is comfortably longer than twenty chars",
+        "namespace": namespace,
+        "agent_id": agent_id,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/consolidate")
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a consolidate referencing a bogus source id must not succeed"
+    );
+    assert_eq!(
+        quota_count(&db_path, agent_id),
+        1,
+        "#1788: a failed consolidate refunds its quota charge (counter stays at the 1 source store)"
+    );
+}
+
+/// A quota SUBSTRATE failure (not a cap breach) during consolidate surfaces
+/// as a sanitized 500, not a 429 — exercising the #1788 `QuotaCheckError::Sql`
+/// arm. Dropping `agent_quotas` makes `check_and_record`'s row read fail.
+#[tokio::test]
+async fn consolidate_quota_substrate_error_500_1788() {
+    let (router, db_path, _keep) = build_test_router();
+    let agent_id = "consolidate-sqlerr-1788";
+    let namespace = "consolidate-sqlerr-1788";
+
+    // Two real sources stored while the quota table is intact.
+    let (s1, id1) = http_store(&router, agent_id, namespace, "sqlerr source one").await;
+    let (s2, id2) = http_store(&router, agent_id, namespace, "sqlerr source two").await;
+    assert_eq!(s1, StatusCode::CREATED);
+    assert_eq!(s2, StatusCode::CREATED);
+
+    // Corrupt the quota substrate so the consolidate quota charge errors.
+    {
+        let conn = Connection::open(&db_path).expect("open to drop quota table");
+        conn.execute("DROP TABLE agent_quotas", [])
+            .expect("drop agent_quotas");
+    }
+
+    let body = json!({
+        "ids": [id1.unwrap(), id2.unwrap()],
+        "title": "sqlerr consolidate",
+        "summary": "merged summary that is comfortably longer than twenty chars",
+        "namespace": namespace,
+        "agent_id": agent_id,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/consolidate")
+        .header("content-type", "application/json")
+        .header("x-agent-id", agent_id)
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "#1788: a quota substrate read failure surfaces as 500, not a 429 cap breach"
+    );
+}
