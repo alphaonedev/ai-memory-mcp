@@ -17183,6 +17183,246 @@ impl MemoryStore for PostgresStore {
         Ok(true)
     }
 
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit (postgres
+    /// twin of the sqlite [`crate::storage::undo_in_place_edit`]). Reads the
+    /// `archive_reason='in_place_edit'` snapshot (#1725, SAME id) and
+    /// re-applies its restorable fields to the live row through the inherent
+    /// [`Self::update_with_expected_version`] path — DELIBERATELY no raw
+    /// `DELETE` of the live row (a delete would cascade-reap the 15
+    /// `ON DELETE CASCADE` children). The apply auto-snapshots the CURRENT
+    /// content as a fresh `in_place_edit`, so undo is reversible (redo = undo
+    /// again).
+    ///
+    /// Dual-ownership fail-closed: when `ctx` resolves a non-bypass caller,
+    /// BOTH the live row's `metadata.agent_id` AND the snapshot's
+    /// `metadata.agent_id` must strict-equal it. Admin/operator
+    /// (`bypass_visibility`) skips the gate.
+    ///
+    /// `dry_run` returns the before/after diff with `applied=false`, writing
+    /// NOTHING. No `in_place_edit` snapshot → `applied=false`, before ==
+    /// after. DELIBERATELY does NOT restore `lifecycle_state` (the update
+    /// path doesn't set it; transitions are governed by #1726). CLI-ONLY by
+    /// deliberate security design (no MCP tool / HTTP route) — see the trait
+    /// doc.
+    async fn undo_in_place_edit(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        dry_run: bool,
+    ) -> StoreResult<crate::store::UndoOutcome> {
+        let caller: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
+
+        // (a) Load the live row's version + title + content (decrypted) +
+        // owner. NotFound when absent.
+        let live_row: Option<(i64, String, String, serde_json::Value, Option<Vec<u8>>)> =
+            sqlx::query_as(
+                "SELECT version, title, content, metadata, encrypted_envelope \
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("undo: read live row", e))?;
+        let Some((live_version, live_title, live_content_raw, live_meta, live_env)) = live_row
+        else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let live_owner = live_meta
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let live_content = match live_env {
+            None => live_content_raw,
+            Some(bytes) => crate::encryption::open_content(&bytes, live_owner).map_err(|e| {
+                StoreError::IntegrityFailed {
+                    detail: format!("undo: decrypt failed for live memory {id}: {e}"),
+                }
+            })?,
+        };
+
+        // (b) Read the in_place_edit snapshot, if any (content decrypted).
+        let snap_row: Option<(
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            i32,
+            f64,
+            Option<String>,
+            serde_json::Value,
+            Option<String>,
+            Option<Vec<u8>>,
+        )> = sqlx::query_as(
+            "SELECT title, content, tier, namespace, tags, priority, confidence, \
+                    expires_at::text, metadata, source_uri, encrypted_envelope \
+             FROM archived_memories \
+             WHERE id = $1 AND archive_reason = $2",
+        )
+        .bind(id)
+        .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("undo: read in_place_edit snapshot", e))?;
+
+        // (c) Dual-ownership fail-closed (BEFORE any write / diff return).
+        if let Some(caller) = caller {
+            if live_owner != caller {
+                return Err(StoreError::PermissionDenied {
+                    action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                    target: id.to_string(),
+                    reason: format!(
+                        "undo_in_place_edit denied: caller {caller} is not the owner of memory {id}"
+                    ),
+                });
+            }
+            if let Some(snap) = &snap_row {
+                let snap_owner = snap
+                    .8
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if snap_owner != caller {
+                    return Err(StoreError::PermissionDenied {
+                        action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                        target: id.to_string(),
+                        reason: format!(
+                            "undo_in_place_edit denied: caller {caller} is not the owner of the \
+                             in_place_edit snapshot for memory {id}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // (d) No snapshot → nothing to undo. before == after.
+        let Some((
+            snap_title,
+            snap_content_raw,
+            snap_tier,
+            snap_ns,
+            snap_tags_json,
+            snap_priority,
+            snap_confidence,
+            snap_expires_at,
+            snap_meta,
+            snap_source_uri,
+            snap_env,
+        )) = snap_row
+        else {
+            return Ok(crate::store::UndoOutcome {
+                applied: false,
+                id: id.to_string(),
+                before_version: live_version,
+                after_version: None,
+                before_title: live_title.clone(),
+                after_title: live_title,
+                before_content: live_content.clone(),
+                after_content: live_content,
+            });
+        };
+        let snap_owner = snap_meta
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let snap_content = match snap_env {
+            None => snap_content_raw,
+            Some(bytes) => crate::encryption::open_content(&bytes, snap_owner).map_err(|e| {
+                StoreError::IntegrityFailed {
+                    detail: format!("undo: decrypt failed for snapshot of memory {id}: {e}"),
+                }
+            })?,
+        };
+
+        // (e) Dry-run: return the diff, write NOTHING.
+        if dry_run {
+            return Ok(crate::store::UndoOutcome {
+                applied: false,
+                id: id.to_string(),
+                before_version: live_version,
+                after_version: None,
+                before_title: live_title,
+                after_title: snap_title,
+                before_content: live_content,
+                after_content: snap_content,
+            });
+        }
+
+        // (f) Apply via the inherent in-place update path (auto-snapshots the
+        // CURRENT content as a fresh in_place_edit → reversible). Pin
+        // expected_version so a concurrent writer can't be clobbered.
+        // DELIBERATELY does NOT pass lifecycle_state (see method doc).
+        let snap_tags: Vec<String> = serde_json::from_value(snap_tags_json).unwrap_or_default();
+        let patch = UpdatePatch {
+            title: Some(snap_title.clone()),
+            content: Some(snap_content.clone()),
+            tier: Tier::from_str(&snap_tier),
+            namespace: Some(snap_ns),
+            tags: Some(snap_tags),
+            priority: Some(snap_priority),
+            confidence: Some(snap_confidence),
+            metadata: Some(snap_meta),
+            source_uri: snap_source_uri,
+            expires_at: snap_expires_at,
+            lifecycle_state: None,
+        };
+        let after_version = self
+            .update_with_expected_version(ctx, id, patch, Some(live_version))
+            .await?;
+
+        // Append the destructive-update audit row, mirroring the postgres
+        // reclassify signed-event idiom.
+        let now = chrono::Utc::now();
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.undo_in_place_edit|{id}|{live_version}|{after_version}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            caller
+                .unwrap_or(crate::identity::sentinels::AI_OPERATOR)
+                .to_string(),
+            crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
+            now.to_rfc3339(),
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("undo: begin audit tx", e))?;
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("undo: append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("undo: commit audit tx", e))?;
+
+        Ok(crate::store::UndoOutcome {
+            applied: true,
+            id: id.to_string(),
+            before_version: live_version,
+            after_version: Some(after_version),
+            before_title: live_title,
+            after_title: snap_title,
+            before_content: live_content,
+            after_content: snap_content,
+        })
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         // Mirrors the SQLite adapter's `db::stats` shape; postgres has
         // no on-disk file path so `db_size_bytes` reports the size of

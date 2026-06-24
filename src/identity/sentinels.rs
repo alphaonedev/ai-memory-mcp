@@ -78,6 +78,13 @@ pub const AI_HTTP: &str = "ai:http";
 /// Agent id the curator daemon writes with.
 pub const AI_CURATOR: &str = "ai:curator";
 
+/// #1727 (v0.8.0) — principal label for an admin/operator CLI context
+/// (`bypass_visibility`) when the operator did not supply an explicit
+/// `--agent-id`. Used by the CLI-only `ai-memory undo-edit` operator
+/// tool. A label only — the bypass authority comes from
+/// [`crate::store::CallerContext::for_admin`], not from this string.
+pub const AI_OPERATOR: &str = "ai:operator";
+
 /// Prefix for per-request synthesized anonymous HTTP principals
 /// (`anonymous:req-<uuid8>` — see
 /// [`crate::identity::anonymous_request_id`], the one synthesis

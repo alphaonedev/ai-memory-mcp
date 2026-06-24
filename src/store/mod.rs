@@ -814,6 +814,60 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit.
+    ///
+    /// When a memory was edited in place, #1725 snapshotted the PRIOR
+    /// row into `archived_memories` under `archive_reason='in_place_edit'`
+    /// with the SAME id (single slot — at most one snapshot per id). This
+    /// reads that snapshot and re-applies its restorable fields to the
+    /// live row through the EXISTING `update_with_expected_version` path.
+    /// There is DELIBERATELY NO raw `DELETE` of the live row: a delete
+    /// would cascade-reap the 15 `ON DELETE CASCADE` children (links /
+    /// observations / confidence rows) — the exact data-loss class the
+    /// v0.8.0 epic closes. Because the apply goes through the in-place
+    /// update path, the CURRENT content is auto-snapshotted as a fresh
+    /// `in_place_edit`, so undo is itself reversible (a second call is a
+    /// redo).
+    ///
+    /// **CLI-ONLY by deliberate security design.** This capability is
+    /// surfaced ONLY as the `ai-memory undo-edit <id>` operator
+    /// subcommand — there is intentionally NO MCP tool and NO HTTP route.
+    /// A lossy mutating operation gets the smallest possible remote
+    /// attack surface; the absence of a wire surface is a decision
+    /// (5-agent UNANIMOUS vote, memory `ff23ddcd` / `4d3ea1c5`), not an
+    /// oversight.
+    ///
+    /// **Dual-ownership fail-closed.** When `ctx` resolves a non-bypass
+    /// caller, BOTH the live row's `metadata.agent_id` AND the snapshot's
+    /// `metadata.agent_id` must strict-equal that caller, else
+    /// [`StoreError::PermissionDenied`]. An admin / operator context
+    /// (`bypass_visibility`) skips the gate.
+    ///
+    /// **No `lifecycle_state` restore.** The snapshot's `lifecycle_state`
+    /// is DELIBERATELY not re-applied: the in-place update path does not
+    /// set it, and lifecycle transitions are separately governed by
+    /// [`crate::models::LifecycleState::can_transition_to`] (#1726) —
+    /// forcing one backward could violate the state machine.
+    ///
+    /// `dry_run` returns the before/after diff with `applied=false` and
+    /// writes NOTHING. When no `in_place_edit` snapshot exists the
+    /// returned [`UndoOutcome`] has `applied=false` with before == after.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; [`StoreError::UnsupportedCapability`] by default
+    /// (in-memory / test adapters that do not implement it).
+    async fn undo_in_place_edit(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _dry_run: bool,
+    ) -> StoreResult<UndoOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "UNDO_IN_PLACE_EDIT".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`
@@ -3089,6 +3143,49 @@ pub struct UpdatePatch {
     /// a terminal — surfaces as [`StoreError::InvalidTransition`] → HTTP
     /// 409). A request equal to the stored state is an idempotent no-op.
     pub lifecycle_state: Option<crate::models::LifecycleState>,
+}
+
+/// #1727 (v0.8.0) — stable action label for the
+/// [`MemoryStore::undo_in_place_edit`] governance / `PermissionDenied`
+/// envelope. Single SSOT so the sqlite + postgres adapters cannot drift
+/// (and the hardcoded-literal gate stays green).
+pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
+
+/// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
+/// call: enough before/after detail to render a dry-run diff and to
+/// confirm an applied undo.
+///
+/// `applied` is `true` only when the live row was actually re-written
+/// from the `in_place_edit` snapshot. It is `false` for a dry-run
+/// preview (the diff is populated, nothing is written) AND for the
+/// "no snapshot to undo" case (the before/after fields then mirror the
+/// live row unchanged — see [`MemoryStore::undo_in_place_edit`]).
+///
+/// `after_version` is `Some(before_version + 1)` on an applied undo
+/// (the in-place update path bumps `version` monotonically) and `None`
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// `true` iff the live row was re-written from the snapshot.
+    pub applied: bool,
+    /// The memory id the undo targeted.
+    pub id: String,
+    /// `version` of the live row BEFORE the undo (the value the apply
+    /// asserts as `expected_version`).
+    pub before_version: i64,
+    /// `version` of the live row AFTER an applied undo
+    /// (`before_version + 1`), or `None` on a dry-run / no-op.
+    pub after_version: Option<i64>,
+    /// Live row's title BEFORE the undo.
+    pub before_title: String,
+    /// Title the undo restores (from the snapshot); equal to
+    /// `before_title` when there is no snapshot.
+    pub after_title: String,
+    /// Live row's content BEFORE the undo.
+    pub before_content: String,
+    /// Content the undo restores (from the snapshot); equal to
+    /// `before_content` when there is no snapshot.
+    pub after_content: String,
 }
 
 /// Report produced by `verify`.

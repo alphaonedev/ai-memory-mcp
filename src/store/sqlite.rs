@@ -1830,6 +1830,48 @@ impl MemoryStore for SqliteStore {
         Ok(true)
     }
 
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit. Delegates
+    /// to the sqlite reference free fn [`db::undo_in_place_edit`]. The caller
+    /// is resolved from `ctx`: an admin/operator context
+    /// (`bypass_visibility`) passes `None` (dual-ownership gate skipped),
+    /// otherwise the effective principal enforces the strict-equality gate
+    /// on BOTH the live row and the snapshot. CLI-ONLY by deliberate
+    /// security design (no MCP tool / HTTP route) — see the trait doc.
+    async fn undo_in_place_edit(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        dry_run: bool,
+    ) -> StoreResult<crate::store::UndoOutcome> {
+        let caller = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
+        let conn = self.state.lock().await;
+        db::undo_in_place_edit(&conn, id, caller, dry_run).map_err(|e| {
+            // Downcast the storage-layer typed errors to the SAL envelope so
+            // a not-found surfaces as NotFound and an ownership rejection as
+            // PermissionDenied (mirrors the InvalidTransition downcast above).
+            if let Some(se) = e.downcast_ref::<crate::storage::StorageError>() {
+                match se {
+                    crate::storage::StorageError::MemoryNotFound { .. } => {
+                        return StoreError::NotFound { id: id.to_string() };
+                    }
+                    crate::storage::StorageError::LinkPermissionDenied { reason } => {
+                        return StoreError::PermissionDenied {
+                            action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                            target: id.to_string(),
+                            reason: reason.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            box_err(e)
+        })
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         let conn = self.state.lock().await;
         db::stats(&conn, &self.path).map_err(box_err)

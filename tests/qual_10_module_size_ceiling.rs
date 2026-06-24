@@ -248,7 +248,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `ApproveSurface { Http, LocalOperator }` enum + the surface-keyed Human-arm
     // gate in `approve_with_approver_type` + the
     // `http_surface_rejects_self_approval_without_env_opt_in_1796` regression test.
-    ("src/storage/mod.rs", 20_700),
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 20_700 → 21_000 for the
+    // NON-DESTRUCTIVE `undo_in_place_edit` free fn + `read_owner_agent_id` /
+    // `UndoSnapshot` helpers (the sqlite reference behind the CLI-only
+    // `ai-memory undo-edit` operator tool).
+    ("src/storage/mod.rs", 21_000),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -572,7 +576,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // tenant-only `check_memory_quota` enforcement method (#1795) + the
     // Human-arm self-approval/registration guard + its updated live-PG unit
     // test (#1793) landed it at 21_813. Per-domain split tracked #650.
-    ("src/store/postgres.rs", 22_000),
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 22_000 → 22_300 for the
+    // NON-DESTRUCTIVE `undo_in_place_edit` PostgresStore trait method (the
+    // postgres twin behind the CLI-only `ai-memory undo-edit` operator tool).
+    // Per-domain split tracked #650.
+    ("src/store/postgres.rs", 22_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -775,7 +783,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // bypass test opts back to permissive peer-enrollment (shared-lock RAII
     // set/restore of AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS) now that the
     // #1789 secure default 401s the unenrolled arm before the bypass asserts.
-    ("src/daemon_runtime.rs", 8_910),
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 8_910 → 8_960 for the
+    // `Command::UndoEdit` variant (+ doc) and its dispatch arm building the SAL
+    // store like the curator for the CLI-only `ai-memory undo-edit` tool.
+    ("src/daemon_runtime.rs", 8_960),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

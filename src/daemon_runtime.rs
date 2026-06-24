@@ -480,6 +480,20 @@ pub enum Command {
     /// embedder via the same `AppConfig::resolve_embeddings()` +
     /// `Embedder::from_resolved` path as daemon/MCP boot.
     Reembed(crate::cli::commands::reembed::ReembedArgs),
+    /// #1727 (v0.8.0) — `ai-memory undo-edit <id> [--dry-run]`
+    /// subcommand. NON-DESTRUCTIVELY undo the immediately-prior in-place
+    /// edit of a memory: re-apply the `archive_reason='in_place_edit'`
+    /// snapshot (#1725, SAME id) to the live row through the EXISTING
+    /// in-place update path — NO raw DELETE of the live row (which would
+    /// cascade-reap the 15 `ON DELETE CASCADE` children). The apply
+    /// auto-snapshots the CURRENT content, so undo is reversible (re-run =
+    /// redo). `--dry-run` prints the before/after diff without writing.
+    /// CLI-ONLY by deliberate security design — no MCP tool / HTTP route
+    /// (5-agent UNANIMOUS vote, memory `ff23ddcd`); the smallest remote
+    /// attack surface for a lossy mutating op. Routes through the
+    /// backend-blind [`crate::store::MemoryStore::undo_in_place_edit`] so
+    /// SQLite + Postgres behave identically.
+    UndoEdit(crate::cli::commands::undo_edit::UndoEditArgs),
     /// v0.8.0 #1709/#1720 WS-B B2 — `ai-memory reown` subcommand.
     /// Rewrite the `metadata.agent_id` ownership stamp on the memories
     /// in EXACTLY `--namespace` to `--to`, so an operator can establish
@@ -1804,6 +1818,24 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // Non-zero exit codes map configuration outcomes
             // (no-embedder / init-failed) like `ai-memory expand`.
             match cli::commands::reembed::cmd_reembed(&db_path, &a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::UndoEdit(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // #1727 — NON-DESTRUCTIVE undo of an in-place edit. Builds the
+            // SAL store like the curator (--store-url postgres/sqlite, else
+            // the --db sqlite path) and routes through the backend-blind
+            // `MemoryStore::undo_in_place_edit` trait method. CLI-ONLY by
+            // deliberate security design (no MCP tool / HTTP route).
+            match cli::commands::undo_edit::cmd_undo_edit(&db_path, &a, app_config, &mut out)
+                .await?
+            {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
