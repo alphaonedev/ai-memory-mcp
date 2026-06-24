@@ -626,6 +626,30 @@ pub async fn postgres_route_gate(
 #[must_use]
 pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
     use crate::store::StoreError;
+    // #1795 — over-quota tenant write → 429 with the full QUOTA_EXCEEDED
+    // envelope (code/limit/current/max/agent_id), byte-parity with the
+    // sqlite handler path's quota breach (src/handlers/create.rs).
+    if let StoreError::QuotaExceeded {
+        agent_id,
+        namespace: _,
+        limit,
+        current,
+        max,
+    } = &e
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                "error": e.to_string(),
+                "limit": limit,
+                "current": current,
+                "max": max,
+                "agent_id": agent_id,
+            })),
+        )
+            .into_response();
+    }
     let (status, msg) = match &e {
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "not found".to_string()),
         StoreError::Conflict { .. } => (

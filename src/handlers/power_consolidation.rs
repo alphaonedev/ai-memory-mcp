@@ -345,6 +345,20 @@ pub async fn consolidate_memories(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&consolidator_agent_id);
+        // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write
+        // quota for the one net-new consolidated memory on the postgres tenant
+        // path (the SAL `consolidate` only RECORDS). Mirrors the sqlite branch's
+        // `check_and_record` charge; the curator ConsolidationPass (for_admin)
+        // never reaches this handler.
+        let consolidate_quota_bytes =
+            i64::try_from(body.title.len() + summary.len()).unwrap_or(i64::MAX);
+        if let Err(e) = app
+            .store
+            .check_memory_quota(&ctx, &body.namespace, 1, consolidate_quota_bytes)
+            .await
+        {
+            return store_err_to_response(e);
+        }
         let new_id = match app
             .store
             .consolidate(

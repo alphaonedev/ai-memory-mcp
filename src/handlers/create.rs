@@ -863,6 +863,30 @@ async fn create_memory_postgres(
         Err(e) => return store_err_to_response(e),
     }
 
+    // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write quota
+    // on the postgres single-create TENANT path: `store_with_embedding` only
+    // RECORDS usage (never rejects), so without this the postgres backend
+    // never caps the daily count. The sqlite branch enforces via
+    // `quotas::check_and_record`; this is the postgres seam. Federation /
+    // migrate / CLI / curator never reach this handler, so they stay exempt.
+    {
+        let quota_bytes = i64::try_from(
+            mem.title.len()
+                + mem.content.len()
+                + serde_json::to_string(&mem.metadata)
+                    .map(|s| s.len())
+                    .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        if let Err(e) = app
+            .store
+            .check_memory_quota(&ctx, &mem.namespace, 1, quota_bytes)
+            .await
+        {
+            return store_err_to_response(e);
+        }
+    }
+
     // #1480 — pipeline the cross-region peer broadcast with the local
     // durable write. `mem.id` is a caller-generated UUID (assigned
     // above) and `store_with_embedding` RETURNs that same id, so the

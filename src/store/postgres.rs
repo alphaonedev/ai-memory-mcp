@@ -16378,6 +16378,78 @@ impl MemoryStore for PostgresStore {
         row_to_quota_status(&row)
     }
 
+    async fn check_memory_quota(
+        &self,
+        ctx: &CallerContext,
+        namespace: &str,
+        additional_count: i64,
+        additional_bytes: i64,
+    ) -> StoreResult<()> {
+        // #1795 (5-agent vote 4d3ea1c5) — the postgres tenant-handler quota
+        // enforcement seam. store/store_batch/consolidate only RECORD usage;
+        // this READ+compare runs in the 3 tenant handlers BEFORE the write.
+        // The charged principal is the caller's agent_id (the same id the
+        // record path stamps via resolve_quota_agent_id, since the tenant
+        // handlers stamp metadata.agent_id = caller). Empty/anonymous is
+        // uncharged, mirroring the sqlite handler's skip-on-empty.
+        let agent_id = ctx.agent_id.as_str();
+        if agent_id.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        // Day-rolled effective memory count: a stale-day row counts as 0,
+        // reusing the SAME `date_trunc('day', day_started_at) =
+        // date_trunc('day', $now)` idiom as `record_memory_quota_in_tx` (the
+        // single write-path day-roll source of truth). Storage bytes are
+        // cumulative (NOT day-rolled), matching the record fn.
+        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT \
+                 CASE WHEN date_trunc('day', day_started_at) = date_trunc('day', $3) \
+                      THEN current_memories_today ELSE 0 END, \
+                 max_memories_per_day, \
+                 current_storage_bytes, \
+                 max_storage_bytes \
+             FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("check_memory_quota read agent_quotas", e))?;
+
+        // No row yet (first write for this agent+ns) → effective 0 against the
+        // compiled/operator defaults the record path would seed.
+        let (effective_memories, max_memories, current_bytes, max_bytes) = row.unwrap_or((
+            0,
+            quota_defaults().max_memories_per_day,
+            0,
+            quota_defaults().max_storage_bytes,
+        ));
+
+        if effective_memories.saturating_add(additional_count) > max_memories {
+            return Err(StoreError::QuotaExceeded {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: crate::quotas::QuotaLimit::MemoriesPerDay
+                    .as_str()
+                    .to_string(),
+                current: effective_memories,
+                max: max_memories,
+            });
+        }
+        if current_bytes.saturating_add(additional_bytes) > max_bytes {
+            return Err(StoreError::QuotaExceeded {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: crate::quotas::QuotaLimit::StorageBytes.as_str().to_string(),
+                current: current_bytes,
+                max: max_bytes,
+            });
+        }
+        Ok(())
+    }
+
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
         let rows = sqlx::query(
             "SELECT agent_id, namespace,
