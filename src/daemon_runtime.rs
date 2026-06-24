@@ -7005,6 +7005,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_dispatch_undo_edit_command() {
+        // #1727/#1800 — cover the `Command::UndoEdit` dispatch arm. Seed a
+        // memory (no in_place_edit snapshot exists), then `undo-edit --dry-run`:
+        // the sal path returns applied=false / before==after → `cmd_undo_edit`
+        // exits 0 → the arm hits `0 => Ok(())`. Exercises the CLI-only undo
+        // surface dispatch end-to-end without a process::exit.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let id = crate::cli::test_utils::seed_memory(&env.db_path, "ns", "t", "c");
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "undo-edit",
+            &id,
+            "--dry-run",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_run_dispatch_search_command() {
         let _g = no_config_env();
         let env = TestEnv::fresh();
