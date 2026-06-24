@@ -162,6 +162,13 @@ pub mod event_types {
     /// (`src/cli/verify.rs::970`).
     pub const MEMORY_TOUCH: &str = "memory.touch";
 
+    /// #1727 (v0.8.0) — `signed_events.event_type` for the CLI-only
+    /// `ai-memory undo-edit` operator action: a NON-DESTRUCTIVE undo of
+    /// an in-place edit that re-applies the `in_place_edit` snapshot to
+    /// the live row via the in-place update path. The audit row captures
+    /// the before/after version under a destructive-update label.
+    pub const MEMORY_UNDO_IN_PLACE_EDIT: &str = "memory.undo_in_place_edit";
+
     /// `signed_events.event_type` for notification fan-out by the L2-3
     /// reflection-invalidation walker
     /// (`src/notification/invalidation.rs::278`).

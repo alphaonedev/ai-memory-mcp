@@ -1127,7 +1127,7 @@ pub fn validate_consolidate(
 // substrate's wire surface (at v0.7.0:
 // `EXPECTED_PRODUCTION_ROUTES_COUNT=89` HTTP routes +
 // `Profile::full().expected_tool_count()=74` MCP tools +
-// `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=82` / `_SAL=84` CLI subcommands —
+// `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `_SAL=85` CLI subcommands —
 // see SSOT consts in `src/lib.rs`). Refactoring
 // per-call validation chains to a single fluent surface lets all
 // three caller layers (HTTP handlers, MCP tools, CLI subcommands)
@@ -1218,7 +1218,7 @@ impl std::error::Error for ValidationError {}
 /// (`EXPECTED_PRODUCTION_ROUTES_COUNT=89` in `src/lib.rs`), MCP
 /// tools (`Profile::full().expected_tool_count()=74` per
 /// `src/profile.rs`), CLI subcommands
-/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=82` / `_SAL=84` in `src/lib.rs`)
+/// (`EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `_SAL=85` in `src/lib.rs`)
 /// — routes DTO-bundling validation through
 /// `RequestValidator` so adding a new cross-field invariant is one
 /// struct-method edit rather than 3+ audited per-surface edits. The

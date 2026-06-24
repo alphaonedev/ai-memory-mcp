@@ -365,8 +365,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 /// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail` for
 /// the `ai-memory verify-audit-trail` CLI, bumping 80 → 81; v0.8.0
 /// #1709/#1720 WS-B B2 added `Reown` for the `ai-memory reown`
-/// namespace-ownership re-stamp CLI, bumping 81 → 82.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 82;
+/// namespace-ownership re-stamp CLI, bumping 81 → 82; #1727 added
+/// `UndoEdit` for the CLI-ONLY `ai-memory undo-edit` NON-DESTRUCTIVE
+/// in-place-edit undo, bumping 82 → 83.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 83;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -375,8 +377,9 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 82;
 /// `Expand`, bumping 80 → 81; #1598 added `Reembed`, bumping 81 → 82;
 /// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail`,
 /// bumping 82 → 83; v0.8.0 #1709/#1720 WS-B B2 added `Reown`, bumping
-/// 83 → 84.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 84;
+/// 83 → 84; #1727 added `UndoEdit` for the CLI-ONLY `ai-memory
+/// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 85;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification

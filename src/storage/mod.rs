@@ -2424,6 +2424,284 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
     Ok(())
 }
 
+/// #1727 (v0.8.0) — read a column's `metadata.agent_id` from a single
+/// row, returning the empty string when the row has no `agent_id` key
+/// (legacy / unowned rows). `table` is a trusted internal literal
+/// (`memories` | `archived_memories`), never caller input.
+///
+/// `sal`-gated: only the [`undo_in_place_edit`] free fn consumes it, and
+/// that fn returns a `crate::store` type (the `store` module is itself
+/// `#[cfg(feature = "sal")]`).
+#[cfg(feature = "sal")]
+fn read_owner_agent_id(conn: &Connection, table: &str, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    // `table` is an internal trusted literal, so the format! is not an
+    // injection surface; rusqlite cannot bind an identifier.
+    let sql = format!("SELECT metadata FROM {table} WHERE id = ?1");
+    let meta: Option<String> = conn.query_row(&sql, params![id], |r| r.get(0)).optional()?;
+    Ok(meta.map(|m| {
+        serde_json::from_str::<serde_json::Value>(&m)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("agent_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }))
+}
+
+/// #1727 (v0.8.0) — the restorable fields read off an `in_place_edit`
+/// archive snapshot for re-application to the live row.
+#[cfg(feature = "sal")]
+struct UndoSnapshot {
+    title: String,
+    /// Decrypted plaintext content (so the in-place update path re-seals
+    /// it correctly under encryption-at-rest; verbatim when unencrypted).
+    content: String,
+    tier: String,
+    namespace: String,
+    tags: Vec<String>,
+    priority: i32,
+    confidence: f64,
+    expires_at: Option<String>,
+    metadata: serde_json::Value,
+    source_uri: Option<String>,
+}
+
+/// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit (the sqlite
+/// reference implementation behind
+/// [`crate::store::MemoryStore::undo_in_place_edit`]).
+///
+/// When a memory was edited in place, #1725 snapshotted the PRIOR row
+/// into `archived_memories` under `archive_reason='in_place_edit'` with
+/// the SAME id (single slot). This reads that snapshot and re-applies its
+/// restorable fields to the live row through the EXISTING
+/// [`update_with_expected_version`] path. There is DELIBERATELY no raw
+/// `DELETE` of the live row — a delete would cascade-reap the 15
+/// `ON DELETE CASCADE` children (links / observations / confidence). The
+/// apply itself auto-snapshots the CURRENT content as a fresh
+/// `in_place_edit`, so undo is reversible (a second call is a redo).
+///
+/// `caller` is the dual-ownership principal: when `Some`, BOTH the live
+/// row's `metadata.agent_id` AND the snapshot's `metadata.agent_id` must
+/// strict-equal it, else [`StorageError::LinkPermissionDenied`]. When
+/// `None` (admin / operator bypass) the gate is skipped.
+///
+/// `dry_run` returns the before/after diff with `applied=false` and
+/// writes NOTHING. With no `in_place_edit` snapshot the returned
+/// [`crate::store::UndoOutcome`] has `applied=false` and before == after.
+///
+/// **No `lifecycle_state` restore.** The snapshot's `lifecycle_state` is
+/// DELIBERATELY not re-applied: the [`update_with_expected_version`] path
+/// does not set `lifecycle_state`, and lifecycle transitions are
+/// separately governed by
+/// [`crate::models::LifecycleState::can_transition_to`] (#1726) — forcing
+/// one backward could violate the state machine.
+///
+/// # Errors
+///
+/// * [`StorageError::MemoryNotFound`] — no live memory matches `id`.
+/// * [`StorageError::LinkPermissionDenied`] — the dual-ownership gate
+///   rejected a non-bypass caller.
+/// * Other rusqlite / encryption errors bubble up.
+///
+/// `sal`-gated: returns a `crate::store::UndoOutcome` and the `store`
+/// module is itself `#[cfg(feature = "sal")]`.
+#[cfg(feature = "sal")]
+pub fn undo_in_place_edit(
+    conn: &Connection,
+    id: &str,
+    caller: Option<&str>,
+    dry_run: bool,
+) -> Result<crate::store::UndoOutcome> {
+    use rusqlite::OptionalExtension;
+    // (a) Load the live row (fail-closed NotFound when absent). Decrypts
+    // content via row_to_memory's #228 branch when encryption is on.
+    let live = {
+        let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+        let mut rows = stmt.query_map(params![id], row_to_memory)?;
+        match rows.next() {
+            Some(Ok(m)) => m,
+            _ => {
+                return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+                    id: id.to_string(),
+                    role: None,
+                }));
+            }
+        }
+    };
+
+    // (b) Read the in_place_edit snapshot for this id, if any. The
+    // restorable content is decrypted the same way the live read is so
+    // the re-apply hands plaintext to `update_with_expected_version`
+    // (which re-seals under encryption-on).
+    let snapshot: Option<UndoSnapshot> = conn
+        .query_row(
+            "SELECT title, content, tier, namespace, tags, priority, confidence,
+                    expires_at, metadata, source_uri, encrypted_envelope
+             FROM archived_memories
+             WHERE id = ?1 AND archive_reason = ?2",
+            params![id, field_names::ARCHIVE_REASON_IN_PLACE_EDIT],
+            |r| {
+                let tags_json: String = r.get(4)?;
+                let metadata_json: String =
+                    r.get::<_, String>(8).unwrap_or_else(|_| "{}".to_string());
+                let raw_content: String = r.get(1)?;
+                let envelope: Option<Vec<u8>> = r.get::<_, Option<Vec<u8>>>(10).unwrap_or(None);
+                let content =
+                    match resolve_embeddable_content(id, raw_content, envelope, &metadata_json) {
+                        Some(c) => c,
+                        None => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Blob,
+                                Box::new(std::io::Error::other(
+                                    "undo: in_place_edit snapshot envelope failed to decrypt",
+                                )),
+                            ));
+                        }
+                    };
+                Ok(UndoSnapshot {
+                    title: r.get(0)?,
+                    content,
+                    tier: r.get(2)?,
+                    namespace: r.get(3)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    priority: r.get(5)?,
+                    confidence: r.get::<_, f64>(6).unwrap_or(1.0),
+                    expires_at: r.get(7)?,
+                    metadata: serde_json::from_str(&metadata_json)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    source_uri: r.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+
+    // (c) DUAL-OWNERSHIP fail-closed: when `caller` is Some, BOTH the
+    // live row's agent_id AND the snapshot's agent_id (when a snapshot
+    // exists) must strict-equal `caller`. Admin/operator (caller=None)
+    // bypasses. This runs BEFORE any write and BEFORE returning a diff so
+    // a non-owner cannot even observe another owner's content.
+    if let Some(caller) = caller {
+        let live_owner = read_owner_agent_id(conn, "memories", id)?.unwrap_or_default();
+        if live_owner != caller {
+            return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                reason: format!(
+                    "undo_in_place_edit denied: caller {caller} is not the owner of memory {id}"
+                ),
+            }));
+        }
+        if let Some(snap) = &snapshot {
+            let snap_owner = snap
+                .metadata
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if snap_owner != caller {
+                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                    reason: format!(
+                        "undo_in_place_edit denied: caller {caller} is not the owner of the \
+                         in_place_edit snapshot for memory {id}"
+                    ),
+                }));
+            }
+        }
+    }
+
+    // (d) No snapshot → nothing to undo. before == after, applied=false.
+    let Some(snap) = snapshot else {
+        return Ok(crate::store::UndoOutcome {
+            applied: false,
+            id: id.to_string(),
+            before_version: live.version,
+            after_version: None,
+            before_title: live.title.clone(),
+            after_title: live.title.clone(),
+            before_content: live.content.clone(),
+            after_content: live.content,
+        });
+    };
+
+    // (e) Dry-run: return the diff, write NOTHING.
+    if dry_run {
+        return Ok(crate::store::UndoOutcome {
+            applied: false,
+            id: id.to_string(),
+            before_version: live.version,
+            after_version: None,
+            before_title: live.title,
+            after_title: snap.title,
+            before_content: live.content,
+            after_content: snap.content,
+        });
+    }
+
+    // (f) Apply: re-write the live row from the snapshot through the
+    // EXISTING in-place update path (which auto-snapshots the CURRENT
+    // content as a fresh in_place_edit, making undo reversible) with
+    // expected_version pinned so a concurrent writer can't be clobbered.
+    // DELIBERATELY does NOT pass lifecycle_state (see fn doc).
+    let snap_tier = Tier::from_str(&snap.tier);
+    let (found, _content_changed) = update_with_expected_version(
+        conn,
+        id,
+        Some(snap.title.as_str()),
+        Some(snap.content.as_str()),
+        snap_tier.as_ref(),
+        Some(snap.namespace.as_str()),
+        Some(&snap.tags),
+        Some(snap.priority),
+        Some(snap.confidence),
+        snap.expires_at.as_deref(),
+        Some(&snap.metadata),
+        snap.source_uri.as_deref(),
+        Some(live.version),
+    )?;
+    if !found {
+        // Row vanished between our read and the update (or version
+        // drifted, surfaced as VersionConflict above). Treat as NotFound.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: id.to_string(),
+            role: None,
+        }));
+    }
+
+    // Append a signed_events audit row capturing before/after id+version
+    // under a destructive-update label. Mirrors the reclassify path's
+    // with_daemon_signature + append idiom. `update_with_expected_version`
+    // opens + commits its own tx, so we are back in autocommit here; use
+    // the public `append_signed_event` which opens its own tx.
+    let after_version = live.version + 1;
+    let ph = crate::signed_events::payload_hash(
+        format!(
+            "memory.undo_in_place_edit|{id}|{}|{after_version}",
+            live.version
+        )
+        .as_bytes(),
+    );
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        ph,
+        caller
+            .unwrap_or(crate::identity::sentinels::AI_OPERATOR)
+            .to_string(),
+        crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
+        Utc::now().to_rfc3339(),
+    );
+    crate::signed_events::append_signed_event(conn, &event)?;
+
+    Ok(crate::store::UndoOutcome {
+        applied: true,
+        id: id.to_string(),
+        before_version: live.version,
+        after_version: Some(after_version),
+        before_title: live.title,
+        after_title: snap.title,
+        before_content: live.content,
+        after_content: snap.content,
+    })
+}
+
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
 /// Mirrors [`archive_memory`] but constrains the soft-move to rows
 /// in the live `memories` table whose `metadata->'agent_id'` JSON

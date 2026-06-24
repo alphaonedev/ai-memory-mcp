@@ -4,6 +4,7 @@
 # Edit deliberately — every entry should be a reviewed exception.
 # See CLAUDE.md §"Enforceable Orchestrator Safeguards" (C8).
 
+src/cli/commands/undo_edit.rs:AI_OPERATOR
 src/cli/curator.rs:AI_CURATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
 src/curator/decorrelation_probe.rs:agent_id
