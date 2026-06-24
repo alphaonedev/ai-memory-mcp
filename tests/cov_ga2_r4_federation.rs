@@ -760,6 +760,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
                 store_url: url,
                 json: true,
                 embedding_dim: dim,
+                force_reembed: false,
             };
             ai_memory::cli::schema_init::run(&args, &mut out)
                 .await
@@ -821,6 +822,7 @@ async fn schema_init_postgres_reports_age_projection_field() {
         store_url: url,
         json: true,
         embedding_dim: 384,
+        force_reembed: false,
     };
     ai_memory::cli::schema_init::run(&args, &mut out)
         .await
