@@ -7453,6 +7453,36 @@ impl PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("begin kg_projection drain tx", e))?;
+            // #1783 (5-agent vote 4d3ea1c5) — existence guard. The
+            // relational `memory_links` row is the source of truth. If the
+            // link was hard-deleted (its memory cascade-reaped it) between
+            // enqueue and drain, projecting it now would RESURRECT the very
+            // ghost `:Memory` node/edge the delete path's DETACH DELETE
+            // removed. Re-check existence inside this per-row tx and, when
+            // the link is gone, drop the orphaned outbox row WITHOUT
+            // MERGEing — this is what makes deferred mode race-free against a
+            // concurrent delete with no new schema/op column.
+            let (link_still_exists,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 AND relation = $3)",
+            )
+            .bind(&source_id)
+            .bind(&target_id)
+            .bind(&relation)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
+            if !link_still_exists {
+                sqlx::query("UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("drop deleted-link kg_projection_outbox row", e))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
+                continue;
+            }
             match project_link_into_age(&mut tx, &source_id, &target_id, &relation).await {
                 Ok(()) => {
                     sqlx::query(
@@ -7539,6 +7569,51 @@ impl PostgresStore {
         }
 
         Ok(projected)
+    }
+
+    /// #1783 (5-agent vote 4d3ea1c5) — best-effort AGE unprojection for
+    /// hard-deleted memory ids on the POOL-DIRECT delete paths (`delete`,
+    /// `apply_remote_deletion`) that run without a surrounding tx. Opens a
+    /// short own tx, issues the per-id `DETACH DELETE`, and commits; any
+    /// failure is logged and swallowed so the already-committed relational
+    /// delete is never undone. No-op on the CTE backend (nothing is
+    /// projected). The non-atomicity is a crash-only residual — a crash
+    /// between the relational delete and this call re-orphans the node, the
+    /// exact LOW-severity defect this closes for the common path; the
+    /// tx-scoped delete paths (forget/consolidate/run_gc/size_gc) ride
+    /// their existing tx and clean the projection atomically.
+    async fn unproject_memory_ids_best_effort(&self, ids: &[&str]) {
+        if ids.is_empty() || !matches!(self.kg_backend, KgBackend::Age) {
+            return;
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    err = %to_store_err("begin unproject tx", e),
+                    "AGE unprojection skipped (begin tx failed) on hard-delete"
+                );
+                return;
+            }
+        };
+        for id in ids {
+            if let Err(e) = unproject_memory_from_age(&mut tx, id).await {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    memory_id = %id,
+                    err = %e,
+                    "AGE unprojection error on hard-delete (continuing)"
+                );
+            }
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(
+                target: TRACE_TARGET_KG,
+                err = %to_store_err("commit unproject tx", e),
+                "AGE unprojection commit failed on hard-delete"
+            );
+        }
     }
 
     /// #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer.
@@ -9723,6 +9798,106 @@ async fn project_link_into_age(
     Ok(())
 }
 
+/// #1783 (5-agent vote 4d3ea1c5) — remove a hard-deleted memory's AGE
+/// projection so `kg_query`/`find_paths` over the AGE backend don't
+/// return ghost edges to a row that no longer exists relationally.
+///
+/// [`project_link_into_age`] is MERGE-only; without this mirror a
+/// hard-deleted memory leaves an orphan `(:Memory {id})` node plus every
+/// edge incident to it in `memory_graph`. `DETACH DELETE` removes the
+/// node AND its incident edges in one statement; neighbour nodes survive
+/// (only edges touching `id` go away). Idempotent: a `MATCH` that finds
+/// no node — a keyword-tier memory that was never linked, so never
+/// projected — is a clean no-op returning zero rows.
+///
+/// Best-effort, mirroring the #1542/#1640 link-projection posture: the
+/// whole statement rides a SAVEPOINT and a tolerated AGE-runtime failure
+/// (`is_age_runtime_failure` — AGE absent / graph absent / `LOAD 'age'`
+/// refused) ROLLBACKs to the savepoint, warns, and returns `Ok` so the
+/// relational delete still commits. Any non-AGE error rolls the savepoint
+/// back before propagating, keeping the caller's tx healthy.
+///
+/// Callers gate on `KgBackend::Age`; on the CTE backend there is no
+/// projection to clean (the recursive-CTE path reads `memory_links`).
+async fn unproject_memory_from_age(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<()> {
+    sqlx::query("SAVEPOINT unproject_memory_age")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint unproject_memory_age", e))?;
+    match unproject_memory_from_age_inner(tx, id).await {
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint unproject_memory_age", e))?;
+            Ok(())
+        }
+        Err(e) if is_age_runtime_failure(&e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint unproject_memory_age", e2))?;
+            sqlx::query("RELEASE SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("release savepoint unproject_memory_age", e2))?;
+            tracing::warn!(
+                target: TRACE_TARGET_KG,
+                memory_id = %id,
+                err = %e,
+                "AGE unprojection skipped on memory hard-delete — relational \
+                 row already removed. kg_query may surface a ghost edge to this \
+                 id until reconciled; find_paths degrades to the CTE."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Non-AGE error: restore tx health before propagating so the
+            // caller's surrounding delete tx isn't left aborted.
+            sqlx::query("ROLLBACK TO SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| {
+                    to_store_err("rollback savepoint unproject_memory_age (err path)", e2)
+                })?;
+            Err(e)
+        }
+    }
+}
+
+/// #1783 — inner `DETACH DELETE` for [`unproject_memory_from_age`]. Kept
+/// separate so the SAVEPOINT discipline in the caller wraps the whole
+/// `LOAD` + search_path + cypher sequence as one tolerated unit.
+async fn unproject_memory_from_age_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<()> {
+    // #1542/#1640 — shared tolerated-LOAD helper.
+    load_age_tolerated(tx).await?;
+    // SET LOCAL confines the ag_catalog search path to this tx (same as
+    // project_link_into_age) so pooled-connection reuse doesn't inherit it.
+    sqlx::query(SQL_SET_AGE_SEARCH_PATH)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("set search_path (unproject_memory)", e))?;
+    // DETACH DELETE removes the node + all incident edges. AGE 1.5.0
+    // requires both the `AS (col agtype)` column list and a trailing
+    // RETURN even for writes; the id is bound through the params surface
+    // (never interpolated) exactly like the node MERGE above.
+    let sql = "SELECT n FROM cypher('memory_graph', \
+         $$ MATCH (n:Memory {id: $id}) DETACH DELETE n RETURN n $$, $1) AS (n agtype)";
+    let params = age_params_jsonb(&[("id", id)]);
+    sqlx::query(sql)
+        .bind(Agtype(params))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("unproject memory node from AGE", e))?;
+    Ok(())
+}
+
 /// from sqlx; the AGE branch needs this helper to mirror the same
 /// shape so the upper-layer handler stays backend-blind.
 fn agtype_optional_string(s: &str) -> Option<String> {
@@ -11493,6 +11668,11 @@ impl MemoryStore for PostgresStore {
         if rows_affected == 0 {
             Err(StoreError::NotFound { id: id.to_string() })
         } else {
+            // #1783 — the relational row + its cascade-deleted memory_links
+            // are gone; remove the now-orphaned AGE :Memory node + edges so
+            // kg_query/find_paths don't return ghost edges. Best-effort,
+            // own-tx (this path is pool-direct, no surrounding tx).
+            self.unproject_memory_ids_best_effort(&[id]).await;
             Ok(())
         }
     }
@@ -12543,6 +12723,11 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?
             .rows_affected();
+        if rows_affected > 0 {
+            // #1783 — federation tombstone-apply hard-deletes the row;
+            // clean its AGE projection too (best-effort, own-tx — pool-direct).
+            self.unproject_memory_ids_best_effort(&[id]).await;
+        }
         Ok(rows_affected > 0)
     }
 
@@ -13442,26 +13627,36 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("forget snapshot links", e))?;
 
-        let res = sqlx::query(
+        // #1783 — RETURNING id so the deleted set is known for AGE
+        // unprojection in THIS tx (the projection commits atomically with
+        // the cascade delete; ghost edges never appear).
+        let deleted: Vec<(String,)> = sqlx::query_as(
             "DELETE FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
                     OR title ILIKE $3
-                    OR content ILIKE $3)",
+                    OR content ILIKE $3)
+             RETURNING id",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
         .bind(pattern_like.as_deref())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget delete", e))?;
+
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (id,) in &deleted {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
+        }
 
         tx.commit()
             .await
             .map_err(|e| to_store_err("forget commit tx", e))?;
 
-        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+        Ok(deleted.len())
     }
 
     async fn consolidate(
@@ -13714,6 +13909,11 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("consolidate delete source", e))?;
+            // #1783 — remove the merged-away source's AGE projection in
+            // this tx so kg_query/find_paths don't keep a ghost edge to it.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
         }
 
         tx.commit()
@@ -14964,12 +15164,25 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("gc archive copy", e))?;
         }
 
-        let res =
-            sqlx::query("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1")
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("gc delete", e))?;
+        // #1783 — RETURNING id so the TTL-evicted set is known for AGE
+        // unprojection in THIS tx. gc is the most common delete path; the
+        // v70 "don't snapshot auto-eviction" restore-rationale does NOT
+        // transfer to a SECONDARY query index — a gc-evicted memory still
+        // leaves a ghost :Memory node/edges that kg_query would return.
+        let evicted: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
+             RETURNING id",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("gc delete", e))?;
+
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (id,) in &evicted {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
+        }
 
         tx.commit()
             .await
@@ -14983,7 +15196,7 @@ impl MemoryStore for PostgresStore {
         .execute(&self.pool)
         .await;
 
-        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+        Ok(evicted.len())
     }
 
     async fn size_gc(
@@ -15085,6 +15298,11 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("size_gc delete victim", e))?;
+
+            // #1783 — remove the evicted victim's AGE projection in this tx.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, &id).await?;
+            }
 
             tx.commit()
                 .await
