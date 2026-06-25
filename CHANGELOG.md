@@ -677,6 +677,36 @@ lifecycle surface adds only permissive optional fields to the existing
   `std::env::temp_dir()` → project-local sweep (CLAUDE.md no-`/tmp` hard rule): 73 sites in
   `tests/integration.rs` + ~9 across other test files, behavior-neutral. Commit 522621e8.
 
+### Final pre-tag security review (5-agent, 2-round) + NHI dogfood findings
+
+- **#1804 (HIGH) — `kg_timeline` cross-tenant private-title leak.** Per-target visibility
+  filter added on all three read paths (MCP + HTTP sqlite/postgres): `kg_timeline` now drops
+  any event whose target memory is not visible to the caller, closing a leak where a
+  multi-tenant caller could read a victim's `scope=private` metadata by rooting a link at it.
+  Commit d3b87a2d.
+- **#1805 — federated action-transition replay.** Per-transition nonce recorded so a replayed
+  `/sync/push` action-state transition is refused. Commit c3087e33.
+- **#1806 / #1808 / #1809 — lease TTL bound, `verify_strict`, federation E2E docs.** Commit 2abeac68.
+- **#1807 — coordination create-path quota + payload-size bound.** `memory_action_create` /
+  `memory_signal_send` / `memory_checkpoint_create` now validate metadata size (64 KiB cap) and
+  charge the creator's per-namespace storage quota. Commit aa030f1d.
+- **#1810 — CI ubuntu `Check` disk-exhaustion.** Free `.ghcup` + docker images before the test
+  compile. Commit bcccf1be.
+- **#1811 — Claude Code PreToolUse governance hook could not enforce.** The installer wrote a
+  `type:mcp_tool` hook that (a) errored `kind is required` (no `input`) and (b) structurally
+  cannot block — an mcp_tool hook's `isError`/non-decision response is non-blocking per the
+  Claude Code hooks contract. Replaced with a `type:command` wrapper
+  (`ai-memory governance check-action --from-pretool-stdin`) that emits
+  `hookSpecificOutput.permissionDecision=deny` so a substrate Refuse actually blocks. Operators
+  upgrade with `ai-memory install claude-code --hook pretool --apply --force`. 5-agent vote
+  `4d3ea1c5`. Commits c7452681 + ef3c17f9.
+- **#1812 — `memory_link` silently dropped off-taxonomy relations.** A well-formed but
+  non-taxonomy relation (e.g. `frobnicate`) passed the permissive `validate_relation` but was
+  silently dropped by the closed-taxonomy `CHECK` under `INSERT OR IGNORE`, while the tool
+  falsely returned `linked:true`. Tightened `validate_relation` to the closed 9-relation set
+  (aligning it with the `CHECK`, the `MemoryLinkRelation` enum, and the HTTP handler). 5-agent
+  vote `4d3ea1c5`. Commit d7d43d55.
+
 ## [0.7.1] — 2026-06-15
 
 Hardening patch line over v0.7.0 (`attested-cortex`). A 26-task,
