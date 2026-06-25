@@ -123,9 +123,9 @@ db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
                                 # field > compiled default).
 
 # ---------------------------------------------------------------------
-# [limits] — operator-tunable resource caps (#1156 follow-up).
-# All four fall back to the compiled default when absent, non-positive,
-# or unparseable. Precedence per field:
+# [limits] — operator-tunable resource caps (#1156 follow-up; #1733
+# added max_inflight_requests at v0.8.0). All fall back to the compiled
+# default when absent, non-positive, or unparseable. Precedence per field:
 #   AI_MEMORY_MAX_* env > [limits] section > compiled default.
 # ---------------------------------------------------------------------
 [limits]
@@ -133,6 +133,10 @@ max_memories_per_day = 1000        # per-agent daily memory-write quota
 max_storage_bytes    = 104857600   # per-agent storage cap (bytes; 100 MiB)
 max_links_per_day    = 5000        # per-agent daily link-write quota
 max_page_size        = 1000        # list/bulk/sync page-size cap (OOM guard)
+max_inflight_requests = 0          # #1733 HTTP admission cap; 0 = disabled
+                                   # (opt-in). Positive n sheds >n concurrent
+                                   # in-flight requests with a typed 503.
+                                   # Env: AI_MEMORY_MAX_INFLIGHT_REQUESTS.
 
 # ---------------------------------------------------------------------
 # Existing sections at v0.7.x — see env-var table in CLAUDE.md.
@@ -159,7 +163,7 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v57** | `EXPECTED_SCHEMA=57`; postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 57` (`src/storage/migrations.rs`) |
+| ai-memory postgres schema | **v70** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 70` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461/provision/lib.sh` `EXPECTED_SCHEMA` default still reads `57` and is stale relative to the v0.8.0 code tip (deploy-side bump tracked separately). |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
@@ -389,7 +393,8 @@ methods:
 - `AppConfig::resolve_storage()`
 - `AppConfig::resolve_limits()` — resource caps; produces `ResolvedLimits`
   (`max_memories_per_day` / `max_storage_bytes` / `max_links_per_day`
-  as `i64`, `max_page_size` as `usize`). The three quota fields seed the
+  as `i64`, `max_page_size` and the #1733 `max_inflight_requests` as
+  `usize`). The three quota fields seed the
   process-wide `crate::quotas::QuotaDefaults` OnceLock once at boot (the
   `agent_quotas`-row SQL binds have no `AppConfig` in scope);
   `max_page_size` lands on `AppState.max_page_size`, read by every Axum

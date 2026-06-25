@@ -374,15 +374,15 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <!-- ============ HERO ============ -->
 <header class="hero">
   <div class="container">
-    <span class="badge">v0.7.1 &middot; attested-cortex &middot; Apache-2.0</span>
+    <span class="badge">v0.8.0 &middot; distributed-coordination &middot; Apache-2.0</span>
     <h1>Persistent memory, a knowledge graph, and governance for <span class="accent">AI agents</span>.</h1>
     <p class="subtitle">
       ai-memory is the autonomous-tier substrate for AI Non-Human Identity (NHI) agents. <strong>Typed memory.</strong> A <strong>knowledge graph</strong> with temporal validity. <strong>Signed reflections</strong> on an append-only audit chain. One Rust binary &mdash; runs on a laptop, a server rack, a region, or a <strong>cellphone</strong>.
     </p>
     <div class="meta">
-      <span>74 MCP tools</span>
-      <span>89 HTTP routes (75 unique paths)</span>
-      <span>80 CLI subcommands</span>
+      <span>100 MCP tools</span>
+      <span>91 HTTP routes (77 unique paths)</span>
+      <span>83 CLI subcommands</span>
       <span>Ed25519 attested</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
@@ -493,7 +493,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <div class="feat cyan">
         <span class="tag">Knowledge graph</span>
         <h3>Typed links, temporal validity</h3>
-        <p>Six relation kinds (<code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>) with <code>valid_from</code> / <code>valid_until</code>. Apache AGE acceleration on Postgres.</p>
+        <p>Nine relation kinds (<code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>, plus the v0.8.0 typed-cognition trio <code>decomposes_into</code>, <code>depends_on</code>, <code>advances</code>) with <code>valid_from</code> / <code>valid_until</code>. Apache AGE acceleration on Postgres.</p>
       </div>
       <div class="feat amber">
         <span class="tag amber">Attestation</span>
@@ -534,6 +534,16 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <span class="tag violet">Recursive learning</span>
         <h3>Reflect, atomise, consolidate</h3>
         <p><code>memory_reflect</code> with a hard depth cap, atomisation into linked atom rows, consolidation, persona generation, and a skills registry. Agents that improve their own memory &mdash; under governance.</p>
+      </div>
+      <div class="feat amber">
+        <span class="tag amber">Coordination</span>
+        <h3>Distributed-coordination primitives</h3>
+        <p>v0.8.0 Pillar-1: a typed action DAG with state machine, leases + heartbeats, Ed25519-signed inter-agent signals, attested checkpoints, and scheduled routines &mdash; the substrate for multi-agent orchestration.</p>
+      </div>
+      <div class="feat violet">
+        <span class="tag violet">Typed cognition</span>
+        <h3>Goal / Plan / Step lifecycle</h3>
+        <p>v0.8.0 Pillar-2: a typed-cognition vocabulary (Goal/Plan/Step + <code>lifecycle_state</code>) wired into the knowledge graph via the <code>decomposes_into</code> / <code>depends_on</code> / <code>advances</code> relations &mdash; plan trees agents can reason over.</p>
       </div>
       <div class="feat cyan">
         <span class="tag">Observability</span>
@@ -731,13 +741,13 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.md">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>89 routes (75 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>91 routes (77 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.md">
         <div class="label">CLI</div>
         <h4>Command line</h4>
-        <p>80 subcommands (82 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <p>83 subcommands (85 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
         <span class="arrow">CLI reference &rarr;</span>
       </a>
     </div>
@@ -932,8 +942,8 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 final baseline.</span></a>
       <a class="lk" href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">89 routes (75 unique paths)</span></a>
-      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">80 subcommands</span></a>
+      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">91 routes (77 unique paths)</span></a>
+      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">83 subcommands</span></a>
       <a class="lk" href="GLOSSARY.md"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
       <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>
