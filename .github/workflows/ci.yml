@@ -298,7 +298,16 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
           sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
           sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
+          sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
           sudo apt-get clean
+          # #1810 — bring the Check job's pre-test disk cleanup up to parity
+          # with the (passing, heavier-llvm-cov) Coverage job, which already
+          # frees `.ghcup` + docker images. The full `cargo test` compile of
+          # all integration bins under DEV_DEBUG=1 (full debug symbols)
+          # exhausted the ubuntu runner disk on c3087e33 with
+          # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
+          # restores headroom. macOS/Windows Check + Coverage were unaffected.
           # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
           # heavy lib-test link step has headroom above the ~7 GB RAM
           # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
