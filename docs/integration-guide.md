@@ -1,4 +1,4 @@
-# ai-memory v0.7.0 — integration guide
+# ai-memory v0.8.0 — integration guide
 
 How to wire ai-memory to **any AI** — Claude, Cursor, ChatGPT,
 Continue.dev, generic MCP clients, and even AIs that don't speak MCP
@@ -19,13 +19,13 @@ server is how every modern AI client connects, because MCP — the
 Model Context Protocol — is the industry-standard plug for AI
 agents to talk to local tools. Any MCP-compatible client points at
 the binary, ai-memory boots a per-session process, and the AI now
-has 7 to 73 memory tools at its disposal (depending on the
+has 7 to 99 memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(89 route registrations / 75 unique URL paths at v0.7.0).
+(91 route registrations / 77 unique URL paths at v0.8.0).
 
 Every recipe below assumes the binary is on your `PATH`. If
-`ai-memory --version` doesn't print `0.7.0`, go back to
+`ai-memory --version` doesn't print `0.8.0`, go back to
 [`docs/install-quickstart.md`](install-quickstart.md) §3.
 
 ## 2. Claude Code (Anthropic)
@@ -117,7 +117,7 @@ env-block recipe for smart / autonomous tiers:
 
 ## 4. ChatGPT Desktop
 
-**State of the world (v0.7.0):** ChatGPT Desktop does not currently
+**State of the world (v0.8.0):** ChatGPT Desktop does not currently
 ship native MCP-client support. The integration paths are (in order
 of operational simplicity):
 
@@ -237,11 +237,11 @@ command: ai-memory
 args:    ["mcp"]
 # optionally:
 #   ["--db", "/path/to/ai-memory.db", "mcp", "--tier", "semantic"]
-#   ["mcp", "--profile", "full"]  # advertise all 74 tools
+#   ["mcp", "--profile", "full"]  # advertise all 100 tools
 ```
 
 That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7
-tools by default and up to 73 with `--profile full`. Per-harness
+tools by default and up to 99 with `--profile full`. Per-harness
 copy-paste recipes live in [`docs/integrations/`](integrations/):
 **aider**, **claude-agent-sdk**, **cline**, **codex-cli**, **cody**,
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,
@@ -252,7 +252,7 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **89 route registrations / 75 unique URL paths at v0.7.0**
+ai-memory ships an HTTP/REST daemon with **91 route registrations / 77 unique URL paths at v0.8.0**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.
@@ -354,7 +354,7 @@ approval flow, and the recommended deployment topologies — see
 
 ## 10. Security defaults
 
-ai-memory v0.7.0 ships with secure defaults already on. **You do
+ai-memory v0.8.0 ships with secure defaults already on. **You do
 not have to configure these to get them.** Worth knowing about:
 
 - **Permissions enforced by default.** `permissions.mode = "enforce"`

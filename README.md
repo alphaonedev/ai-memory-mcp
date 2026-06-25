@@ -688,6 +688,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (91 route registrations 
 - **100 MCP tools** at full profile (7 default at v0.8.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
+- **Distributed coordination (v0.8.0 Pillar-1 + Pillar-2)** -- action DAG (`memory_action_*`), single-holder leases (`memory_lease_*`), Ed25519-signed signals (`memory_signal_*`), attested checkpoints (`memory_checkpoint_*`), parameterised routines (`memory_routine_*`), and the Goal/Plan/Step typed-cognition lifecycle. See [`docs/coordination.md`](docs/coordination.md).
 
 ### Operations
 - **Multi-node sync** -- pull, push, or bidirectional merge between database files
