@@ -277,12 +277,18 @@ footer a{color:var(--text-muted)}
         <p class="client-desc">Anthropic's official CLI. ai-memory runs as a stdio MCP subprocess; the <code>memory_session_start</code> hook fires every conversation start, returning recent-context-aware memories.</p>
         <pre class="client-config"><span class="cmt"># claude mcp add</span>
 <span class="key">claude mcp add</span> ai-memory <span class="str">--scope user</span> <span class="str">--transport stdio</span> <span class="str">-- ai-memory mcp --tier autonomous</span></pre>
+        <pre class="client-config"><span class="cmt"># SessionStart boot hook — inject relevant memory into the system prompt each session</span>
+<span class="key">ai-memory install claude-code</span> <span class="str">--apply</span></pre>
+        <p class="client-desc"><strong>Two installable hooks.</strong> The SessionStart boot hook (above) makes every session memory-aware. The optional <strong>PreToolUse governance hook</strong> routes every Bash / Edit / Write through the substrate rules engine and actually <strong>blocks</strong> refused actions — e.g. <code>rm -rf /</code>, writes to <code>/tmp</code>, or anything an operator-signed rule refuses. At v0.8.0 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1811" style="color:var(--p1)">#1811</a>) it is an enforcing <code>type:command</code> wrapper (<code>ai-memory governance check-action --from-pretool-stdin</code>) that emits the Claude Code <code>permissionDecision=deny</code> on a Refuse, so the tool dispatch is genuinely halted (the older <code>type:mcp_tool</code> form could not block).</p>
+        <pre class="client-config"><span class="cmt"># PreToolUse governance hook — enforce operator-signed action rules (v0.8.0 #1811)</span>
+<span class="key">ai-memory install claude-code</span> <span class="str">--hook pretool</span> <span class="str">--apply</span></pre>
         <div class="client-meta-row">
           <span><span class="ok">✓</span> stdio</span>
           <span><span class="ok">✓</span> session_start hook</span>
+          <span><span class="ok">✓</span> PreToolUse governance hook (blocks refused actions)</span>
           <span><span class="ok">✓</span> all 100 tools (<code>--profile full</code>)</span>
         </div>
-        <a class="client-link" href="./#claude-integration">Setup guide →</a>
+        <a class="client-link" href="integrations/claude-code.md">Setup guide →</a>
       </div>
 
       <div class="client tier1">

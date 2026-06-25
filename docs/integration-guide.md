@@ -75,6 +75,61 @@ memory on every conversation start), see
 
 > **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.md).
 
+### 2a. PreToolUse governance hook (gate every Bash / Edit / Write)
+
+The `--apply` recipe above installs the **SessionStart** hook (memory
+on every session boot). Claude Code also supports a **PreToolUse** hook
+that fires *before* a tool dispatches and can BLOCK it. ai-memory ships
+a second, independent installer verb that wires this up so every
+`Bash` / `Edit` / `Write` the model proposes is routed through the
+substrate rules engine first — refused actions never run:
+
+```bash
+# Preview (dry-run is the default — writes nothing):
+ai-memory install claude-code --hook pretool
+
+# Commit:
+ai-memory install claude-code --hook pretool --apply
+```
+
+This is **opt-in** and orthogonal to the SessionStart hook — install,
+uninstall, or skip either one independently. The managed entry is
+scoped with `matcher: "Bash|Edit|Write"` (the regex also covers
+`MultiEdit` / `NotebookEdit`); `Read`, `WebFetch`, and `mcp__*` tools
+are not gated.
+
+> **v0.8.0 form ([#1811](https://github.com/alphaonedev/ai-memory-mcp/issues/1811)) — `type:command`, not `type:mcp_tool`.**
+> The installed entry is a **`type:command`** hook that runs
+> `ai-memory governance check-action --from-pretool-stdin`. The wrapper
+> reads the PreToolUse event off stdin, maps the proposed tool to a
+> substrate action (`Bash` → `bash`, `Edit`/`Write` →
+> `filesystem_write`), evaluates the rules engine, and emits the Claude
+> Code decision contract (`hookSpecificOutput.permissionDecision`) so a
+> Refuse becomes `deny` and the tool is actually BLOCKED. The earlier
+> `type:mcp_tool` form *could not enforce* — per the hooks contract an
+> mcp_tool error is non-blocking and a non-decision tool response is
+> shown as plain text, so the refusal never blocked the call.
+
+> **Upgrading from a pre-#1811 install?** Re-run with `--force` to
+> replace the old (non-enforcing) managed entry:
+>
+> ```bash
+> ai-memory install claude-code --hook pretool --apply --force
+> ```
+>
+> `--force` is also required if you previously hand-scoped a
+> `PreToolUse` entry pointing at `memory_check_agent_action` to a
+> different matcher — the installer refuses to clobber it otherwise.
+
+The rules engine consults the operator-signed substrate rules
+(`ai-memory rules list` / `... enable <id> --sign`), which ship inert
+by design — nothing is refused until you sign and enable a rule. To
+remove the hook: `ai-memory install claude-code --hook pretool
+--uninstall --apply`. Full reference, the allow/warn/refuse decision
+table, and the operator keygen → sign → enable → smoke-test workflow:
+[`docs/integrations/claude-code.md`](integrations/claude-code.md)
+§"Substrate rules enforcement on every tool call".
+
 ## 3. Cursor
 
 ```bash
