@@ -173,10 +173,12 @@ upserts. Canonical truth in `src/models/memory.rs`. See
 
 ## Memory link
 
-A typed relationship between two memories. **Six kinds at v0.7.0** (was
-four at v0.6.x): `related_to`, `supersedes`, `contradicts`,
+A typed relationship between two memories. **Nine kinds at v0.8.0** (six
+at v0.7.0, was four at v0.6.x): `related_to`, `supersedes`, `contradicts`,
 `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from`
-(WT-1-A atomisation). Used by consolidate (to
+(WT-1-A atomisation), and the v0.8.0 Pillar-2 typed-cognition trio
+`decomposes_into` / `depends_on` / `advances` (#1709, closed-taxonomy
+CHECK extended 6→9 at schema v63). Used by consolidate (to
 track provenance) and the curator (to mark contradictions).
 
 ## Namespace

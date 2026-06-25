@@ -463,7 +463,7 @@ Immediate garbage collection. Empty body. **Admin-gated**. Returns
 { "source_id": "abc", "target_id": "def", "relation": "supersedes" }
 ```
 
-Relations (six at v0.7.0; was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory). Canonical enum in `src/models/link.rs::MemoryLinkRelation`.
+Relations (nine at v0.8.0; was six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation — atom row → parent memory), `decomposes_into`, `depends_on`, `advances` (the last three are the v0.8.0 Pillar-2 typed-cognition Goal/Plan/Step relations, #1709). Canonical enum in `src/models/link.rs::MemoryLinkRelation` (`COUNT = 9`).
 
 ### `GET /api/v1/links/{id}`
 
@@ -937,13 +937,26 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (100 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> Total HTTP surface at v0.7.0: **77 unique URL paths** / 89 production
+> Total HTTP surface at v0.8.0: **77 unique URL paths** / 91 production
 > route registrations on the sqlite-backed daemon (and the
 > postgres-backed daemon under `--features sal-postgres`).
 > Authoritative count:
-> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 74
-> (73 `/api/v1/*` paths + the bare `/metrics`), pinned by
-> `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` in `src/lib.rs`.
+> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 77
+> (76 `/api/v1/*` paths + the bare `/metrics`), pinned by
+> `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` in `src/lib.rs`. The two
+> v0.8.0 net-new paths are the #1718 coordination write surfaces below.
+
+### v0.8.0 net-new endpoints
+
+The #1718 Pillar-1 distributed-coordination write surfaces. Only these
+two coordination paths are exposed over HTTP; the rest of the
+coordination toolset (action CRUD, leases, checkpoints, routines) is
+MCP-only.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/actions/{id}/transition` | Coordination action-state transition (`handlers::transition_action`) — local CAS write + W-of-N federation fanout. MCP: `memory_action_transition`. |
+| `POST` | `/api/v1/signals` | Signed inter-agent signal send (`handlers::send_signal`) — local write + W-of-N fanout. MCP: `memory_signal_send`. |
 
 ### v0.7.0 net-new MCP tools
 
@@ -960,7 +973,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_verify` | `POST /api/v1/links/verify` | H4. |
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 
-For the canonical 74-entry full inventory: `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 74 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth.
+For the canonical full inventory (100 entries advertised at `--profile full` at v0.8.0 — 99 callable + the always-on `memory_capabilities`): `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 100 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth. The v0.8.0 net-new tools are the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
 
 ## See also
 
