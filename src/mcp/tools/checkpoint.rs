@@ -79,6 +79,23 @@ pub fn handle_checkpoint_create(
         metadata,
     };
 
+    // #1807 — validate supplied metadata size + charge the creator's
+    // per-namespace storage quota for the condition + metadata payload
+    // (storage_only). An unspecified-creator checkpoint (empty `created_by`)
+    // is not charged. Metadata defaults to an empty object, but an explicit
+    // JSON null is not a validatable object, so validation only runs when a
+    // metadata object was supplied. T-exempt precedent-copy; 5-agent review
+    // (memory `4d3ea1c5`) deemed #1807 legitimate.
+    if !cp.metadata.is_null() {
+        crate::validate::validate_metadata(&cp.metadata).map_err(|e| e.to_string())?;
+    }
+    if !cp.created_by.is_empty() {
+        let bytes =
+            crate::quotas::coordination_payload_bytes(&[&cp.title], &[&cp.condition, &cp.metadata]);
+        crate::quotas::check_and_record_storage_only(conn, &cp.created_by, &cp.namespace, bytes)
+            .map_err(|e| e.to_string())?;
+    }
+
     crate::checkpoints::insert(conn, &cp).map_err(|e| e.to_string())?;
 
     // #1722 — coordination observability: best-effort audit row for the

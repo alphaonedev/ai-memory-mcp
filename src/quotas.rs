@@ -737,6 +737,25 @@ pub fn check_and_record_storage_only(
     }
 }
 
+/// #1807 — byte estimate for a coordination create (action / signal /
+/// checkpoint). Sums the UTF-8 lengths of the string fields plus the
+/// serialized lengths of the JSON payload fields, saturating to `i64::MAX`.
+/// Mirrors the `(title + content + serialized-metadata)` accounting the
+/// memory write path uses so the same per-namespace storage cap applies
+/// uniformly to coordination objects (which were previously unquota'd +
+/// payload-unbounded). 5-agent review (memory `4d3ea1c5`) deemed #1807
+/// legitimate; this is the precedent-copy of the federation-receive
+/// `check_and_record_storage_only` accounting.
+#[must_use]
+pub fn coordination_payload_bytes(strs: &[&str], jsons: &[&serde_json::Value]) -> i64 {
+    let total: usize = strs.iter().map(|s| s.len()).sum::<usize>()
+        + jsons
+            .iter()
+            .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum::<usize>();
+    i64::try_from(total).unwrap_or(i64::MAX)
+}
+
 /// #1544 — refund a storage-only charge made by
 /// [`check_and_record_storage_only`]: decrements `current_storage_bytes`
 /// only (the daily write-count is never incremented on the receive
