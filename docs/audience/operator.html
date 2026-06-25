@@ -100,7 +100,7 @@ sudo dnf install ai-memory</code></pre>
 
   <p>Full matrix (Windows, .deb manual install, Docker, source) is in <a href="../INSTALL.md">INSTALL.md</a>.</p>
 
-  <h3>Supported platforms (v0.7.0)</h3>
+  <h3>Supported platforms (v0.8.0)</h3>
   <p>Build + test gates run on:</p>
   <ul>
     <li><strong>Linux</strong> x86_64, aarch64 (Ubuntu LTS, RHEL/Fedora, Debian)</li>
@@ -173,7 +173,7 @@ max_page_size        = 1000              # list/bulk/sync page-size cap (OOM gua
     <dt>stdio MCP</dt>
     <dd><code>ai-memory mcp</code> &mdash; long-lived stdio subprocess, launched by the AI client. Best for single-developer local use.</dd>
     <dt>HTTP daemon</dt>
-    <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 89 route registrations / 75 unique URL paths. Best for shared org deployments with mTLS or API-key gating.</dd>
+    <dd><code>ai-memory serve</code> &mdash; Axum REST on port 9077, 91 route registrations / 77 unique URL paths. Best for shared org deployments with mTLS or API-key gating.</dd>
     <dt>autonomous curator</dt>
     <dd><code>ai-memory curator</code> &mdash; long-running consolidation + reflection loop. Provider-agnostic (#1067): backs onto Ollama (local) or any OpenAI-compatible vendor via <code>AI_MEMORY_LLM_BACKEND</code> &mdash; xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp-server. Best as a sidecar to the HTTP daemon.</dd>
     <dt>quorum sync</dt>
@@ -249,7 +249,7 @@ WantedBy=multi-user.target</code></pre>
 <section class="wrap-mid">
   <div class="eyebrow-h2">7. Upgrade</div>
   <h2>Schema-versioned, migration-tested.</h2>
-  <p>The SQLite store carries an integer schema version (<strong>currently v57 at v0.7.0</strong>; was v33 at v0.6.4). v55 made the <code>list_memories_updated_since</code> federation-catchup query sargable and added <code>idx_memories_updated_at</code> per #1476 so peer catch-up scans get a true index range instead of a seq scan. v54 backfilled tier-default <code>expires_at</code> onto legacy NULL-expiry mid/short rows per #1466, closing the TTL-leak immortal-rows class. v53 scoped the <code>memories_au</code> FTS5 sync trigger to <code>(title, content, tags)</code> only per #1418 so non-FTS column updates no longer fire a needless sync. v52 added the <code>transcript_line_dedup</code> table per #1389 L4, backing the sha256-keyed idempotency layer for turn-capture. v51 added the <code>federation_nonces</code> table per #1255 / PR #1296 so peer-replay-prevention nonces persist across daemon restarts. v50 extended <code>agent_quotas</code> PRIMARY KEY from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> per #1156 so per-namespace K8 quota allotments hold even when a single agent operates across many namespaces (pre-v50 rows backfill to the <code>_global</code> sentinel namespace). Migrations run on first open of the new binary; the migration set is dry-run-tested against the operator's own DB by the project's dogfood script before a release ships.</p>
+  <p>The SQLite store carries an integer schema version (<strong>currently v70 at v0.8.0</strong>; was v33 at v0.6.4). v55 made the <code>list_memories_updated_since</code> federation-catchup query sargable and added <code>idx_memories_updated_at</code> per #1476 so peer catch-up scans get a true index range instead of a seq scan. v54 backfilled tier-default <code>expires_at</code> onto legacy NULL-expiry mid/short rows per #1466, closing the TTL-leak immortal-rows class. v53 scoped the <code>memories_au</code> FTS5 sync trigger to <code>(title, content, tags)</code> only per #1418 so non-FTS column updates no longer fire a needless sync. v52 added the <code>transcript_line_dedup</code> table per #1389 L4, backing the sha256-keyed idempotency layer for turn-capture. v51 added the <code>federation_nonces</code> table per #1255 / PR #1296 so peer-replay-prevention nonces persist across daemon restarts. v50 extended <code>agent_quotas</code> PRIMARY KEY from <code>(agent_id)</code> to <code>(agent_id, namespace)</code> per #1156 so per-namespace K8 quota allotments hold even when a single agent operates across many namespaces (pre-v50 rows backfill to the <code>_global</code> sentinel namespace). Migrations run on first open of the new binary; the migration set is dry-run-tested against the operator's own DB by the project's dogfood script before a release ships.</p>
   <ul>
     <li>Backup the DB before upgrade: <code>cp ai-memory.db ai-memory.db.bak</code>. The binary additionally takes its own automatic pre-migration snapshot (#1576): before any schema-mutating migration it writes a transactionally-consistent <code>VACUUM INTO</code> sibling named <code>&lt;db&gt;.pre-migration-v&lt;FROM&gt;-to-v&lt;TO&gt;-&lt;token&gt;.bak</code>, and refuses to mutate the schema if that snapshot fails.</li>
     <li>Stop the daemon, install the new binary, restart. Migrations run automatically.</li>

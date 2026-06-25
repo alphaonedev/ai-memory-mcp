@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Types — every public struct and enum</title>
-<meta name="description" content="ai-memory v0.7.0 type reference. Every public Rust struct and enum exposed at the API/MCP/CLI boundaries. Tier, Memory, MemoryLink, GovernancePolicy, ApproverType, VectorClock, and 21 more.">
+<meta name="description" content="ai-memory v0.8.0 type reference. Every public Rust struct and enum exposed at the API/MCP/CLI boundaries. Tier, Memory, MemoryLink, GovernancePolicy, ApproverType, VectorClock, and 21 more.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/types.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -258,7 +258,7 @@ footer a{color:var(--text-muted)}
     <span class="pill">5 enums</span>
     <span class="pill">22 structs</span>
     <span class="pill">5 consts</span>
-    <span class="pill">v0.7.0 — Memory 26 fields / MemoryLink 6 relations</span>
+    <span class="pill">v0.8.0 — Memory 27 fields / MemoryLink 9 relations</span>
   </div>
 </section>
 
@@ -350,17 +350,18 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
         <tr><td class="fname">confidence_signals</td><td class="ftype">Option&lt;ConfidenceSignals&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: JSON snapshot of the signals that produced an auto-derived or calibrated confidence. NULL on legacy rows and on <code>CallerProvided</code> writes.</td></tr>
         <tr><td class="fname">confidence_decayed_at</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.7.0 Form 5</strong>: RFC3339 stamp of the last decay-sweep touch. NULL on legacy / never-decayed rows.</td></tr>
         <tr><td class="fname">version</td><td class="ftype">i64</td><td class="fnote"><span class="flag def">DEF</span><strong>v0.7.0 Provenance Gap 1 (#884, schema v45 sqlite)</strong>: optimistic-concurrency counter. Bumped on every <code>storage::update</code>; two writers against the same <code>expected_version</code> race; loser receives a typed <code>CONFLICT</code> envelope. Legacy rows land at <code>version = 1</code> via SQL <code>DEFAULT</code> + serde <code>default_memory_version</code>.</td></tr>
+        <tr><td class="fname">lifecycle_state</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span><strong>v0.8.0 Pillar-2 (#1709, schema v64)</strong>: typed-cognition state-machine state for Goal/Plan/Step memories. Additive permissive optional field on the <code>memory_store</code> / <code>memory_update</code> request structs; NULL on legacy / non-typed-cognition rows.</td></tr>
       </tbody></table>
     </div>
 
     <div class="ty k-struct" id="memorylink">
-      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · 6 relations at v0.7.0</span></div>
+      <div class="ty-head"><span class="ty-name">MemoryLink</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · 9 relations at v0.8.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>. <strong>6 <code>MemoryLinkRelation</code> variants at v0.7.0</strong> (was 4 at v0.6.x); canonical enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
+      <div class="ty-desc">A directed edge between two memories. The KG primitive — every typed-cognition / supersession relationship is one row in <code>memory_links</code>. <strong>9 <code>MemoryLinkRelation</code> variants at v0.8.0</strong> (was 4 at v0.6.x, 6 at v0.7.0); canonical enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">source_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
         <tr><td class="fname">target_id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>FK to <code>memories.id</code>.</td></tr>
-        <tr><td class="fname">relation</td><td class="ftype">MemoryLinkRelation</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres).</td></tr>
+        <tr><td class="fname">relation</td><td class="ftype">MemoryLinkRelation</td><td class="fnote"><span class="flag req">REQ</span>One of: <code>related_to</code> · <code>supersedes</code> · <code>contradicts</code> · <code>derived_from</code> · <code>reflects_on</code> (v0.7.0 Task 1/8 recursive learning) · <code>derives_from</code> (v0.7.0 WT-1-A atomisation atom→parent, schema v36 sqlite / v35 postgres) · <code>decomposes_into</code> · <code>depends_on</code> · <code>advances</code> (v0.8.0 Pillar-2 typed cognition #1709; SQL CHECK extended 6→9 at schema v63).</td></tr>
         <tr><td class="fname">created_at</td><td class="ftype">String</td><td class="fnote">RFC3339; server-stamped.</td></tr>
         <tr><td class="fname">valid_from / valid_until</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>v0.6.3 temporal validity window; <code>valid_until = None</code> means still valid.</td></tr>
         <tr><td class="fname">observed_by</td><td class="ftype">Option&lt;String&gt;</td><td class="fnote"><span class="flag opt">OPT</span>agent_id of the observer; powers per-agent visibility.</td></tr>
@@ -772,7 +773,7 @@ namespace_depth("alphaone/engineering/platform")    // 3</div>
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · src/<a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models/mod.rs">models.rs</a> is the source of truth · this page is a generated reference for AI clients integrating against the type contract</p>
+  <p>ai-memory v0.8.0 · Apache 2.0 · src/<a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/src/models/mod.rs">models.rs</a> is the source of truth · this page is a generated reference for AI clients integrating against the type contract</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="schema.html">Schema</a> · <a href="validators.html">Validators</a></p>
 </footer>
 
