@@ -264,6 +264,27 @@ pub fn handle_signal_send_with_hooks(
         _ => crate::models::AttestLevel::Unsigned.as_str(),
     };
 
+    // #1807 — charge the sender's per-namespace storage quota for the signal
+    // payload (storage_only; a signal carries no metadata object — the byte
+    // cap IS the payload-size limit). Charged AFTER the PreSignalSend hook
+    // (which may `Modify` the body) so the final bytes are accounted, and
+    // BEFORE insert so an over-cap signal is never persisted. Unowned sends
+    // (empty `from_agent`) are not charged. T-exempt precedent-copy; 5-agent
+    // review (memory `4d3ea1c5`) deemed #1807 legitimate.
+    if !signal.from_agent.is_empty() {
+        let bytes = crate::quotas::coordination_payload_bytes(
+            &[&signal.subject],
+            &[&signal.body, &signal.reference_ids],
+        );
+        crate::quotas::check_and_record_storage_only(
+            conn,
+            &signal.from_agent,
+            &signal.namespace,
+            bytes,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     crate::signals::insert(conn, &signal).map_err(|e| e.to_string())?;
 
     // #1714 / #1722 — coordination observability: append a tamper-evident

@@ -68,6 +68,28 @@ pub fn handle_action_create(conn: &rusqlite::Connection, params: &Value) -> Resu
         updated_at: now,
     };
 
+    // #1807 — bound the coordination create-path: validate supplied metadata
+    // size (same limit as memory writes) and charge the owning agent's
+    // per-namespace storage quota (storage_only — a coordination object is
+    // storage, not an authored memory; mirrors the federation-receive signal
+    // precedent). An unowned action (empty `agent_id`) is not charged
+    // (operator-as-actor, same exemption as the memory write path). Absent
+    // metadata defaults to JSON null, which is not a validatable object, so
+    // validation only runs when metadata was actually supplied. T-exempt
+    // precedent-copy; 5-agent review (memory `4d3ea1c5`) deemed #1807 legitimate.
+    if !action.metadata.is_null() {
+        crate::validate::validate_metadata(&action.metadata).map_err(|e| e.to_string())?;
+    }
+    let quota_actor = action.agent_id.as_deref().unwrap_or_default();
+    if !quota_actor.is_empty() {
+        let bytes = crate::quotas::coordination_payload_bytes(
+            &[&action.title, &action.kind],
+            &[&action.payload, &action.metadata],
+        );
+        crate::quotas::check_and_record_storage_only(conn, quota_actor, &action.namespace, bytes)
+            .map_err(|e| e.to_string())?;
+    }
+
     let id = crate::actions::create(conn, &action).map_err(|e| e.to_string())?;
 
     // #1722 — coordination observability: best-effort audit row for the
@@ -1081,6 +1103,65 @@ mod handler_tests {
                 "#1806: renew ttl_secs={bad} must be rejected, got {rn:?}"
             );
         }
+    }
+
+    /// #1807 (SECURITY) — coordination create-paths must be quota'd + payload-
+    /// bounded. (a) An action whose metadata exceeds the memory-write metadata
+    /// size limit is refused. (b) Once the owning agent's per-namespace storage
+    /// cap is reached, a further create is refused with the quota error — while
+    /// a fresh-namespace create under the default 100 MiB cap still succeeds
+    /// (the gate rejects ONLY at the cap, so normal coordination is unaffected).
+    #[test]
+    fn action_create_enforces_metadata_size_and_storage_quota_1807() {
+        let conn = fresh();
+
+        // (a) oversized metadata is refused (>65_536 serialized bytes).
+        let huge = "x".repeat(70_000);
+        let r = handle_action_create(
+            &conn,
+            &json!({
+                "namespace": "_act", "kind": "k", "title": "t", "agent_id": "a",
+                "metadata": { "big": huge },
+            }),
+        );
+        assert!(
+            r.is_err(),
+            "#1807: oversized metadata must be rejected, got {r:?}"
+        );
+
+        // Blast-radius: a normal create on a fresh DB (default cap) succeeds.
+        handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "a",
+                     "payload": {"x": 1} }),
+        )
+        .expect("#1807: normal create under default cap must succeed");
+
+        // (b) drop the agent's per-namespace cap to its current usage, then the
+        // next non-empty create exceeds it and is refused by the storage quota.
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = current_storage_bytes
+             WHERE agent_id = 'a' AND namespace = '_act'",
+            [],
+        )
+        .expect("pin cap to current usage");
+        let over = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "a",
+                     "payload": {"more": "data-past-the-cap"} }),
+        );
+        assert!(
+            over.is_err(),
+            "#1807: over-cap create must be refused, got {over:?}"
+        );
+
+        // Unowned action (no agent_id) is never charged — still creates fine
+        // even with the (different) default-keyed quota row.
+        handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t" }),
+        )
+        .expect("#1807: unowned create is uncharged and succeeds");
     }
 
     #[test]

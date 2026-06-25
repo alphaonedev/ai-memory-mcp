@@ -253,6 +253,53 @@ pub async fn send_signal(
             }
         }
     }
+    // #1807 — charge the sender's per-namespace storage quota for the signal
+    // payload BEFORE insert (storage_only; a signal carries no metadata object,
+    // so the byte cap IS the payload-size limit). The quota accounting row
+    // always lives on the sqlite `app.db` connection regardless of the storage
+    // backend — same as the federation-receive postgres path — so this charge
+    // is backend-uniform. A quota breach returns 429 QUOTA_EXCEEDED, mirroring
+    // the memory create path. T-exempt precedent-copy; 5-agent review
+    // (memory `4d3ea1c5`) deemed #1807 legitimate.
+    if !signal.from_agent.is_empty() {
+        let bytes = crate::quotas::coordination_payload_bytes(
+            &[&signal.subject],
+            &[&signal.body, &signal.reference_ids],
+        );
+        let charge = {
+            let conn = app.db.lock().await;
+            crate::quotas::check_and_record_storage_only(
+                &conn.0,
+                &signal.from_agent,
+                &signal.namespace,
+                bytes,
+            )
+        };
+        if let Err(e) = charge {
+            return match e {
+                crate::quotas::QuotaCheckError::Quota(qe) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                        "error": qe.to_string(),
+                        "limit": qe.limit.as_str(),
+                        "current": qe.current,
+                        "max": qe.max,
+                        "agent_id": qe.agent_id,
+                    })),
+                )
+                    .into_response(),
+                crate::quotas::QuotaCheckError::Sql(se) => {
+                    tracing::error!("signal quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
     // Local insert (dual-path: postgres via SAL under --features sal, else sqlite).
     let insert_res: Result<(), Response> = {
         #[cfg(feature = "sal")]
