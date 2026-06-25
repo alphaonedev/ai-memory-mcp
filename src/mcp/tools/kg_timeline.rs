@@ -96,8 +96,25 @@ pub fn handle_kg_timeline(
         .as_u64()
         .and_then(|n| usize::try_from(n).ok());
 
-    let events =
+    let mut events =
         db::kg_timeline(conn, source_id, since, until, limit).map_err(|e| e.to_string())?;
+
+    // #1804 (SECURITY) — per-TARGET visibility filter. The source-owner gate
+    // above guards WHO can query a timeline, but the events disclose each
+    // linked TARGET's title + namespace; without this a caller could leak a
+    // victim's `scope=private` memory metadata by rooting a link at it and
+    // reading the timeline. Drop any event whose target memory is not visible
+    // to the caller (mirrors `get_links` / postgres `find_paths` per-row
+    // filtering). `None` caller = single-tenant trust-all (unchanged); a
+    // missing target row has no metadata to leak so it is retained.
+    if let Some(caller) = caller {
+        events.retain(|e| {
+            db::get(conn, &e.target_id)
+                .ok()
+                .flatten()
+                .is_none_or(|m| crate::visibility::is_visible_to_caller(&m, caller))
+        });
+    }
 
     let events_json: Vec<Value> = events
         .iter()
