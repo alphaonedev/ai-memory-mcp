@@ -687,24 +687,27 @@ pub fn validate_relation(relation: &str) -> Result<()> {
     if relation.len() > MAX_RELATION_LEN {
         bail!("relation exceeds max length of {MAX_RELATION_LEN} bytes");
     }
-    // v0.7.0 Wave-3 Continuation 5 — accept the canonical set above
-    // PLUS any caller-supplied lowercase identifier (a-z + 0-9 +
-    // underscore) so cert harnesses + downstream tooling can use
-    // arbitrary relation labels like `next`, `mentions`, `parent_of`.
-    // Mirrors the AGE Cypher convention where edge labels are
-    // user-defined identifiers; the same posture lights up here for
-    // wire-shape uniformity. Rejects whitespace / control chars /
-    // shell metacharacters defensively.
-    if VALID_RELATIONS.contains(&relation) {
-        return Ok(());
-    }
-    let ok = !relation.is_empty()
-        && relation
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !ok {
+    // #1812 — `relation` is a CLOSED taxonomy. It is enforced end-to-end by
+    // the `memory_links` `CHECK (relation IN (...))` constraint (sqlite
+    // bootstrap + migration v63 + postgres), the closed `MemoryLinkRelation`
+    // enum (whose `from_str` returns `None` off-taxonomy, so a stored
+    // non-canonical label cannot even round-trip on read), and the HTTP link
+    // handler (`src/handlers/links.rs` pre-flights `from_str(...).is_none()`
+    // → 400 `invalid_relation`). Validation MUST agree with that contract.
+    //
+    // The prior v0.7.0 Wave-3 affordance accepted any `[a-z0-9_]+` label, but
+    // such a label NEVER persisted on any backend — the DB CHECK rejected it,
+    // silently under sqlite `INSERT OR IGNORE` (0 rows, no error) while the
+    // MCP tool still reported `linked:true`: a false success + silent
+    // link-write loss (#1812). Reject off-taxonomy relations LOUDLY here, at
+    // the earliest layer, so every write path (MCP / CLI sync / federation
+    // receive / transcript replay) fails honestly instead of dropping data.
+    // 5-agent vote `4d3ea1c5` (UNANIMOUS): align validation down to the
+    // already-closed storage contract; re-opening the taxonomy would be a
+    // separate, migration-gated product change.
+    if !VALID_RELATIONS.contains(&relation) {
         bail!(
-            "invalid relation '{}' — must match [a-z0-9_]+ or be one of: {}",
+            "invalid relation '{}' — must be one of: {}",
             relation,
             VALID_RELATIONS.join(", ")
         );
@@ -1912,27 +1915,19 @@ mod tests {
 
     #[test]
     fn test_valid_relation() {
-        // v0.7.0 Wave-3 Cont 5 (commit cb92998): `validate_relation`
-        // accepts any `[a-z0-9_]+` identifier in addition to the
-        // canonical `VALID_RELATIONS` set so S82/S65 chain markers and
-        // arbitrary AGE-style edge labels round-trip through the wire.
-        // The pre-cb92998 expectation that "invented_relation" must be
-        // rejected is therefore obsolete — do not re-introduce it
-        // unless production validation is tightened back to a
-        // closed-set check. Coverage here splits into:
+        // #1812 (5-agent vote `4d3ea1c5`): `relation` is a CLOSED taxonomy.
+        // The prior cb92998 permissive `[a-z0-9_]+` arm was reverted because a
+        // non-taxonomy label never persisted on any backend (the `memory_links`
+        // CHECK rejected it — silently under sqlite `INSERT OR IGNORE` while the
+        // MCP tool falsely returned `linked:true`). Validation now agrees with
+        // the DB CHECK + the `MemoryLinkRelation` enum + the HTTP link handler.
+        // Coverage splits into:
         //
-        //   * canonical names — must always pass
-        //   * caller-supplied lowercase identifiers — must pass
-        //     post-cb92998
+        //   * canonical names — must pass (the whole closed set)
+        //   * well-formed-but-off-taxonomy labels — must now FAIL (the #1812 fix)
         //   * structurally malformed input — must still fail
-        //     (uppercase, whitespace, slashes, empty)
-        //
-        // The malformed cases below are the surviving "negative"
-        // coverage the dropped `invented_relation` assertion used to
-        // anchor.
 
-        // Canonical relation names — accepted via the VALID_RELATIONS
-        // fast path.
+        // Canonical relation names — accepted via the VALID_RELATIONS set.
         assert!(validate_relation("related_to").is_ok());
         assert!(validate_relation("derived_from").is_ok());
         assert!(validate_relation("contradicts").is_ok());
@@ -1941,12 +1936,18 @@ mod tests {
         // canonical set as the relation a reflection memory writes back
         // to each source it reflects on. See VALID_RELATIONS docstring.
         assert!(validate_relation("reflects_on").is_ok());
+        // v0.8.0 Pillar-2 typed-cognition relations (#1709) must also pass.
+        assert!(validate_relation("decomposes_into").is_ok());
+        assert!(validate_relation("depends_on").is_ok());
+        assert!(validate_relation("advances").is_ok());
 
-        // Caller-supplied lowercase identifier — accepted by the
-        // post-cb92998 permissive arm. Previously rejected.
-        assert!(validate_relation("s82_chain_marker").is_ok());
-        assert!(validate_relation("invented_relation").is_ok());
-        assert!(validate_relation("mentions").is_ok());
+        // #1812 — well-formed lowercase identifiers that are NOT in the
+        // closed taxonomy must now be REJECTED (previously falsely accepted +
+        // silently dropped at the DB CHECK). This is the regression anchor.
+        assert!(validate_relation("s82_chain_marker").is_err());
+        assert!(validate_relation("invented_relation").is_err());
+        assert!(validate_relation("mentions").is_err());
+        assert!(validate_relation("frobnicate").is_err());
 
         // Structurally malformed input — still rejected.
         assert!(validate_relation("").is_err());

@@ -594,14 +594,24 @@ mod tests {
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
+        // #1812 — use a well-formed-but-off-taxonomy label (plain lowercase
+        // letters, NOT a hyphen). The pre-fix test used "weird-relation",
+        // which was rejected only by the `[a-z0-9_]+` charset check, so it
+        // passed for the WRONG reason and masked the bug where a label like
+        // `frobnicate` slipped past validation and was then silently dropped
+        // by the DB CHECK under `INSERT OR IGNORE` (false `linked:true`).
+        // The relation taxonomy is closed; this must error loudly.
         let err = handle_link(
             &conn,
             &db_path,
-            &json!({"source_id": a, "target_id": b, "relation": "weird-relation"}),
+            &json!({"source_id": a, "target_id": b, "relation": "frobnicate"}),
             None,
         )
         .unwrap_err();
-        assert!(!err.is_empty());
+        assert!(
+            err.contains("invalid relation"),
+            "#1812: off-taxonomy relation must be rejected at validation, got: {err}"
+        );
     }
 
     // D. state-dependent — source missing → storage rejects (FK violation)
