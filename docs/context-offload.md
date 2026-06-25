@@ -5,8 +5,10 @@ that v0.8.0 short-term-context-compression will build on. The **full
 pattern** (Mermaid canvas, auto-cadence trigger from the recall
 pipeline, `node_id` cross-link into `memories`) targets v0.8.0; this
 release lands the SQLite/Postgres substrate, the engine in
-`src/offload/mod.rs`, and the audit-event wiring so v0.8.0 has the
-plumbing to call.
+`src/offload/mod.rs`, the `memory_offload` / `memory_deref` MCP tools
+(Family::Power, #986 D1.5) that expose the engine, and the audit-event
+wiring. The deeper v0.8.0 short-term-context-compression layer builds
+on this plumbing.
 
 ## Why it exists
 
@@ -33,6 +35,19 @@ with a signer, the Ed25519 signature over the canonical bundle
 `{ ref_id, content_sha256, stored_at, namespace }` is verified
 before decompression — same encoder family as `identity::sign::
 canonical_cbor` (the H2 link signer).
+
+### MCP tools
+
+The engine is reachable over MCP via two `Family::Power` tools
+(v0.7.0 #986 D1.5, [`src/mcp/tools/offload.rs`](../src/mcp/tools/offload.rs)):
+
+- `memory_offload(content, namespace?, ttl_seconds?)` — stores
+  verbatim content and returns `{ ref_id, content_sha256, stored_at }`.
+  The storing `agent_id` is resolved from the caller context, not a
+  wire parameter.
+- `memory_deref(ref_id)` — returns `{ ref_id, content, stored_at,
+  sha256 }` after the SHA-256 re-verification described above; tampered
+  rows are refused.
 
 ## Storage
 

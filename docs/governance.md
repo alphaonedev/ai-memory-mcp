@@ -167,8 +167,11 @@ ai-memory install claude-code --hook pretool --apply
   PreToolUse hook installer, and `memory_check_agent_action` is the
   harness-consulted read surface — see
   [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point
-  audit. Residual v0.8.0 scope (subprocess chains, mandatory-hook
-  attestation, `AgentAction::Read`) is tracked under
+  audit. **v0.8.0 update:** `AgentAction::Read` (wire `read_action`)
+  shipped (#1730) and the mandatory-hook **presence** check shipped
+  (#1734, `AI_MEMORY_HOOKS_ENFORCE_MODE` + `[hooks].required_events`);
+  residual scope (subprocess-chain visibility, procurement-tier
+  refuse-to-serve attestation / TPM binary integrity) is tracked under
   [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697).
   Capabilities advertises the four wire kinds verbatim under
   `governance.enforced_actions`
