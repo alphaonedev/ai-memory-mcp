@@ -125,7 +125,8 @@ zero-touch additions:
 | `AI_MEMORY_FED_CRED_PATH` | unset → boot-once keyfile | P2 | Path to this node's issued leaf credential (the outbound credential it presents). |
 | `AI_MEMORY_FED_CRED_CHAIN_PATH` | unset → direct (depth-1) | P4 | Path to the anchor-first intermediate chain this node attaches to outbound requests (hierarchical trust). |
 | `AI_MEMORY_FED_INVENTORY_PATH` | unset | P3 | Path to the declarative inventory YAML (GitOps source of truth, §6). |
-| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | unset (off) | P2 | **Fail-closed gate.** When `=1`, a receiver rejects any peer with no verifiable signing identity — neither an enrolled per-peer Ed25519 key nor a valid CA-signed credential for the configured trust domain — with `401 peer_not_enrolled` (`handlers/federation_signing_check.rs`). This is the switch that turns the trust bundle from advisory into mandatory enrollment. v0.8 flips the secure default. |
+| `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` | **`true`** (v0.8.0 secure default; falsy reverts) | P2 | **Fail-closed gate.** A receiver rejects any peer with no verifiable signing identity — neither an enrolled per-peer Ed25519 key nor a valid CA-signed credential for the configured trust domain — with `401 peer_not_enrolled` (`handlers/federation_signing_check.rs::require_peer_enrollment_enabled`). **v0.8.0 (#1789) flipped the secure default ON:** UNSET — or any non-falsy value — is now strict; an explicit falsy value (`0`/`false`/`no`/`off`, case-insensitive, trimmed) reverts to the v0.7.x permissive posture. (At v0.7.0 (#1088) the default was off and only `1`/`true` opted in.) This is the switch that turns the trust bundle from advisory into mandatory enrollment. Companion rollout opt-out: `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS`. |
+| `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` | `false` (escape hatch closed) | P2 | **Rollout opt-out, wired at v0.8.0 (#1789).** When truthy (`1`/`true`/`yes`/`on`), a receiver accepts unenrolled-peer attribution on the same federation arm even though enrollment is required by the secure default — the combined gate is `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()` (`handlers/federation_signing_check.rs::allow_unenrolled_peers_enabled`). Treat as a temporary rollout flag; flip back once every peer has enrolled. |
 | `AI_MEMORY_KEY_DIR` | boot-once keyfile dir | P2 | Directory holding **this node's** Ed25519 signing keypair at `<key_dir>/<federation-identity>.{pub,priv}`. The outbound signer loads the private half by the resolved federation identity, so the file MUST be keyed by that (slashed) identity. Not in the `AI_MEMORY_FED_*` family because it is the generic node-key location shared with the rest of the identity layer. |
 
 ### Identity resolution precedence (P1)
@@ -147,9 +148,13 @@ This is a **pure de-hardcode**: a node that sets nothing presents the
 | Env var | Effect |
 |---|---|
 | `AI_MEMORY_FED_REQUIRE_SIG` | Receivers reject unsigned posts. Default-on. The credential path does not change this gate. |
-| `AI_MEMORY_FED_REQUIRE_NONCE` | Require a replay nonce on inbound federation requests. |
+| `AI_MEMORY_FED_REQUIRE_NONCE` | Require a replay nonce on inbound federation requests. Default-on. |
 | `AI_MEMORY_FED_PEER_ATTESTATION` | Per-peer `PeerScope` allowlist JSON (legacy identity layer). |
 | `AI_MEMORY_FED_SYNC_TRUST_PEER` / `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` | Legacy attestation bypass flags — leave unset under default-deny. |
+| `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | **v0.8.0 (#1718), default `1` fail-closed.** Inner per-transition Ed25519 signature gate on inbound federated action-state transitions (an authority-granting write). A forged signature is rejected unconditionally regardless of this knob. See `docs/federation.md`. |
+| `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | **v0.8.0 (#1464), default `0` permissive.** Per-write CONTENT attestation on inbound relayed memories (data, not authority): a valid `metadata.write_signature` over the #626 `SignableWrite` envelope upgrades the row to `attest_level=agent_attested`; truthy refuses an unsigned honored third-party claim. See `docs/federation.md`. |
+| `AI_MEMORY_FED_PEER_FINGERPRINTS` | **v0.8.0 (#1678), unset = pinning off.** Outbound peer SERVER-cert SHA-256 pinning (`known_hosts` model); daemon quorum client fail-closed on an unpinned host, `ai-memory sync` CLI accept-any. See `docs/federation.md`. |
+| `AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD` | **v0.8.0 (#1544), default `1000`.** Edge-triggered push-DLQ-depth WARN. See `docs/federation.md`. |
 
 ---
 

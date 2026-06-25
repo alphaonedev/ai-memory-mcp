@@ -59,7 +59,8 @@ that consults `check_agent_action_no_audit` against the live
 
 ### Decision verbs honored at the wire boundary
 
-The substrate rules engine returns one of three primary verdicts; the
+The substrate rules engine returns one of four primary verdicts
+(`Allow` / `Refuse` / `Warn` / `Escalate`); the
 wire boundary honors each as follows:
 
 | Verdict     | Wire-boundary behavior                                                                                  |
@@ -67,6 +68,7 @@ wire boundary honors each as follows:
 | **Allow**   | `wire_check::check` returns `Ok(())`; the action proceeds.                                              |
 | **Refuse**  | Returns `Err(GovernanceRefusal { reason })`; caller short-circuits with HTTP `403 / GOVERNANCE_REFUSED`. |
 | **Warn**    | Logged via the audit chain; returns `Ok(())`. The action proceeds; the warning is operator-observable.  |
+| **Escalate** | v0.8.0 (#1727 / §22 PE-5, schema v66). **Fails closed:** an unresolved `Decision::Escalate` blocks exactly like `Refuse` (`Decision::is_block`) pending human review — the wire boundary returns `Err(GovernanceRefusal { reason })`. |
 | **Modify**  | Rules engine pre-rewrites the action's args; the wire boundary sees the modified payload and Allows it. |
 | **Ask**     | Future K10 surface — operator-approval queueing. Today reduces to Refuse (action does not proceed).      |
 
@@ -89,6 +91,14 @@ CREATE TABLE governance_rules (
     attest_level  TEXT NOT NULL DEFAULT 'unsigned'
 );
 ```
+
+> **Schema update (v0.8.0).** The `severity` CHECK above is the original
+> migration 0024 (v0.7.0) form. **Schema v66 (#1727 / §22 PE-5,
+> `migrations/sqlite/0055_v66_governance_rules_escalate_severity.sql`)
+> extended it to `CHECK (severity IN ('refuse','warn','log','escalate'))`**
+> — the `escalate` severity produces the fail-closed `Decision::Escalate`
+> verdict (postgres ships no `governance_rules` table, so the postgres v66
+> arm is a version-stamp no-op).
 
 ## Per-kind matcher shapes
 
@@ -167,8 +177,12 @@ state means:
 The wiring guarantee does NOT extend to harness-side Bash invocations
 unless the operator has installed the Claude Code PreToolUse hook
 documented in `docs/integrations/claude-code.md`. That hook is a
-SEPARATE operator-installable surface; it consults the same substrate
-rules table via the MCP `memory_check_agent_action` tool.
+SEPARATE operator-installable surface. Since #1811 it is installed as a
+`type: command` wrapper (`ai-memory governance check-action
+--from-pretool-stdin`) that consults the same substrate rules table —
+**not** a `type: mcp_tool` hook, because an `mcp_tool` hook cannot block
+the proposed tool call (an `isError`/non-decision response is
+non-blocking under the Claude Code hooks contract).
 
 `--sign` requires the operator's Ed25519 keypair at `${AI_MEMORY_KEY_DIR:-~/.config/ai-memory/keys}/operator.priv` (mode 0600). Without it the CLI refuses with `governance.no_operator_key`.
 
@@ -200,7 +214,7 @@ This split is per design revision 2026-05-13 (issue #691 comment). The rationale
 ## What is *not* in this commit (deliberate)
 
 - **`storage::insert` does NOT consult `check_agent_action`.** The wiring lands in a follow-up PR after the operator runs the test-fleet audit. This commit ships the engine and the audit chain; the substrate write paths still flow through K9 only.
-- **`~/.claude/settings.json` PreToolUse hook is NOT installed.** The operator installs the hook (`{"type":"mcp_tool","tool":"memory_check_agent_action"}`) after reviewing the new MCP tools — that's a Restricted action.
+- **`~/.claude/settings.json` PreToolUse hook is NOT installed** *(in this original #691 commit)*. The operator installs the hook after reviewing the new MCP tools — a Restricted action. (The PE-2 installer that wires this shipped later; since #1811 the installed hook is a `type: command` wrapper — `{"type":"command","command":"ai-memory governance check-action --from-pretool-stdin"}` — **not** the originally-envisioned `{"type":"mcp_tool","tool":"memory_check_agent_action"}`, because an `mcp_tool` hook cannot block.)
 - **No GitHub issue closure, no priority-10 verdict memory.** Operator does these after diff review.
 
 ## Audit chain

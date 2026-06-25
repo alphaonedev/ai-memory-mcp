@@ -133,6 +133,93 @@ operator sees the typo immediately
 Refusing to start on a malformed allowlist would be a self-DOS hazard
 during config rollouts.
 
+## v0.8.0 hardening additions
+
+v0.8.0 extends the v0.7.0 transport/identity layer above with five
+inbound-write and one outbound-transport security mechanisms. The
+v0.7.0 envelope gates (`AI_MEMORY_FED_REQUIRE_SIG`, default `1`, #791;
+`AI_MEMORY_FED_REQUIRE_NONCE`, default `1`, #922) still gate every push
+independently — these are layered on top.
+
+- **Peer-enrollment secure default flipped ON
+  ([#1789](https://github.com/alphaonedev/ai-memory-mcp/issues/1789)).**
+  `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` now defaults to **strict** at
+  v0.8.0: UNSET — or any non-falsy value — refuses an `X-Peer-Id`
+  without an enrolled Ed25519 key (`401 peer_not_enrolled`) on both
+  `/sync/push` and `/sync/since`. An explicit falsy value
+  (`0`/`false`/`no`/`off`, case-insensitive, trimmed) reverts to the
+  v0.7.x permissive posture. At v0.7.0 (#1088) this defaulted OFF and
+  only `1`/`true` opted in. The companion rollout opt-out
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (default `false`) is now
+  **wired**: when truthy (`1`/`true`/`yes`/`on`) it accepts unenrolled
+  peers on the same arm even though enrollment is required — the
+  combined gate is `require_peer_enrollment_enabled() &&
+  !allow_unenrolled_peers_enabled()`
+  ([`src/handlers/federation_signing_check.rs`](../src/handlers/federation_signing_check.rs)).
+
+- **Inbound action-transition signature gate
+  ([#1718](https://github.com/alphaonedev/ai-memory-mcp/issues/1718)).**
+  `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` (default `1`, **fail-closed**)
+  gates the `action_transitions` subcollection on `/sync/push`. A
+  coordination-action transition is an *authority-granting* write
+  (complete/abandon an action, claim/release a lease), so an inbound
+  transition is applied only when its Ed25519 signature verifies
+  against the attested actor's (`claimed_by`) locally-**enrolled** key
+  AND a best-effort local lease-holder check does not conflict.
+  Unsigned / non-enrolled transitions are refused; a **forged**
+  signature is rejected **unconditionally** regardless of this knob.
+  Set falsy (`0`/`false`/`no`/`off`) for a heterogeneous-rollout
+  window. Decision function:
+  [`src/federation/receive_auth.rs::authorize_remote_transition`](../src/federation/receive_auth.rs).
+
+- **Per-transition replay nonce
+  ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
+  The signed transition nonce is recorded in the per-peer
+  `federation_nonce_cache` and a replay is refused, closing the gap
+  where a captured signed op re-wrapped in a fresh envelope could
+  replay through the CAS on a cyclic/ABA edge. Empty nonce (unsigned
+  op) is not gated. Wired on both the sqlite inline and postgres
+  `/sync/push` paths.
+
+- **Per-write content attestation
+  ([#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)).**
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` (default `0`, **permissive**) gates
+  the *data* lane — relayed memories. A relayed memory is replication,
+  not authority, so it keeps the accept-and-flag posture by default: an
+  unsigned write lands `attest_level=claimed`. When a memory carries a
+  base64 detached Ed25519 signature in `metadata.write_signature` over
+  the #626 `SignableWrite` envelope
+  (`agent_id + namespace + title + kind + created_at + sha256(content)`),
+  the receive path verifies it against the attributed author's
+  locally-**enrolled** key and upgrades the row to
+  `attest_level=agent_attested`. A **forged** signature is rejected
+  unconditionally. When truthy (`1`/`true`/`yes`/`on`), a HONORED
+  third-party relayed claim (`attribute_agent != sender`) without a
+  valid signature is refused; self-authored relays stay faith-based.
+  Gate: [`src/federation/receive_auth.rs::require_write_sig_enabled`](../src/federation/receive_auth.rs)
+  + `src/handlers/federation_receive.rs::apply_inbound_write_attestation`.
+
+- **Outbound peer server-cert pinning
+  ([#1678](https://github.com/alphaonedev/ai-memory-mcp/issues/1678)).**
+  `AI_MEMORY_FED_PEER_FINGERPRINTS` (path; unset ⇒ pinning OFF) is the
+  OUTBOUND mirror of the inbound `--mtls-allowlist`: one
+  `<host> <sha256-hex>` per line (optional `sha256:` marker, `:`
+  separators, `#` comments; a host may repeat for rotation). Pinned
+  hosts are verified PIN-ONLY by SHA-256(DER) keyed per SNI host (the
+  SSH `known_hosts` model), layered on top of the real rustls
+  handshake-signature check. The daemon quorum client is
+  **fail-closed** on an unpinned host (`UnpinnedHostPolicy::Reject` —
+  once you opt in, every peer must be pinned, and `--quorum-ca-cert` is
+  bypassed); the `ai-memory sync` CLI keeps **accept-any**
+  (`UnpinnedHostPolicy::AcceptAny`). An empty-but-present file is a
+  fail-closed parse error.
+  [`src/tls.rs`](../src/tls.rs) (`FED_PEER_FINGERPRINTS_ENV`,
+  `FingerprintPinServerVerifier`).
+
+- **Push-DLQ depth alert + receive-quota narrowing
+  ([#1544](https://github.com/alphaonedev/ai-memory-mcp/issues/1544)).**
+  See the DLQ paragraph in the runbook below.
+
 ## Quorum + vector clocks
 
 v0.6.x quorum semantics are unchanged: W-of-N writes (default majority),
@@ -250,7 +337,22 @@ TLS handshake per peer, not one per row. Retries are bounded: after
 so it cannot wedge the queue or amplify against a dead peer, and the
 `ai_memory_federation_push_dlq_quarantined_total` counter plus the
 `ai_memory_federation_push_dlq_depth` gauge are the operator alert
-surface. Quarantined rows are never silently dropped; no CLI drain
+surface. **v0.8.0 [#1544](https://github.com/alphaonedev/ai-memory-mcp/issues/1544)**
+adds an edge-triggered depth WARN: `AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD`
+(default `1000`) fires one `WARN` when the pending-DLQ backlog crosses
+UP through the threshold and one `INFO` on recovery below it (never
+per-tick), naming the depth, likely quota cause, and remediation; the
+pre-#1544 stall was silent. The cause-labeled
+`ai_memory_federation_push_dlq_quarantined_by_cause_total{cause}`
+counter (closed label set
+`quota`|`unenrolled_peer`|`id_drift`|`permanent`|`peer_removed`|`other`)
+is the companion. #1544 also narrows the federation RECEIVE quota: the
+receive path now charges the per-agent **storage-bytes** ceiling ONLY,
+not the daily memory write-count (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) —
+replication is not net-new authorship, so corpus-scale federation under
+one author no longer 429-stalls into the DLQ (the daily write-count
+quota remains the control on the AUTHORING node's write path).
+Quarantined rows are never silently dropped; no CLI drain
 surface ships at v0.7.0 — the data-layer drain procedure lives in
 [`docs/TROUBLESHOOTING.md` §federation-push-DLQ](TROUBLESHOOTING.md).
 
