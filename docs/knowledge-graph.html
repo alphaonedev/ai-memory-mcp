@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Knowledge Graph — links, entities, temporal validity</title>
-<meta name="description" content="ai-memory v0.7.0 knowledge graph. memory_links with 6 relations (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from), entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate + memory_find_paths. The structured-cognition layer that v0.6.3 Streams B+C unlocked and v0.7.0 extended with recursive-learning + atomisation provenance.">
+<meta name="description" content="ai-memory v0.8.0 knowledge graph. memory_links with 9 relations (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into, depends_on, advances), entity registry, temporal validity columns, memory_kg_query + memory_kg_timeline + memory_kg_invalidate + memory_find_paths. The structured-cognition layer that v0.6.3 Streams B+C unlocked, v0.7.0 extended with recursive-learning + atomisation provenance, and v0.8.0 completed with the Pillar-2 typed-cognition relations.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/knowledge-graph.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -250,9 +250,9 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Knowledge Graph — structured cognition.</h1>
-  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>6 relation variants at v0.7.0</strong> (related_to, supersedes, contradicts, derived_from, plus the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and an <strong>11-tool <code>graph</code> MCP family at v0.7.0</strong> headlined by the four dedicated KG query tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>; the family also carries <code>memory_link</code>, <code>memory_entity_register</code>, <code>memory_entity_get_by_alias</code>, <code>memory_get_taxonomy</code>, <code>memory_load_family</code>, <code>memory_replay</code>, <code>memory_verify</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
+  <p class="tagline">Memories aren't a flat blob — they're a graph. <strong>9 relation variants at v0.8.0</strong> (related_to, supersedes, contradicts, derived_from, the v0.7 additions <code>reflects_on</code> for recursive-learning + <code>derives_from</code> for atomisation atom→parent links, and the v0.8.0 Pillar-2 typed-cognition additions <code>decomposes_into</code> / <code>depends_on</code> / <code>advances</code>), an entity registry that resolves alias-to-canonical-name, <strong>temporal validity</strong> on every edge so the past stays queryable + Ed25519 per-link attestation populated, and an <strong>11-tool <code>graph</code> MCP family at v0.7.0</strong> headlined by the four dedicated KG query tools (<code>memory_kg_query</code>, <code>memory_kg_timeline</code>, <code>memory_kg_invalidate</code>, <code>memory_find_paths</code>; the family also carries <code>memory_link</code>, <code>memory_entity_register</code>, <code>memory_entity_get_by_alias</code>, <code>memory_get_taxonomy</code>, <code>memory_load_family</code>, <code>memory_replay</code>, <code>memory_verify</code>). v0.6.3 Streams B + C laid the foundation; <strong>v0.7.0 ships the Apache AGE Cypher backend</strong> (auto-detected when the AGE Postgres extension is installed) — what was "planned" in v0.6.x is now a feature gate.</p>
   <div class="pills">
-    <span class="pill">6 relations (v0.7.0)</span>
+    <span class="pill">9 relations (v0.8.0)</span>
     <span class="pill">entity registry (Stream C)</span>
     <span class="pill">temporal validity (Stream B)</span>
     <span class="pill">Ed25519 attestation (v0.7.0)</span>
@@ -352,9 +352,9 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">The six relations (v0.7.0)</span>
+    <span class="eyebrow">The nine relations (v0.8.0)</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Closed set — wire-format stable.</h2>
-    <p class="lede">Every <code>memory_link</code> row carries one of these six relation tags at v0.7.0 (was four at v0.6.x; <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation). The six canonical names always pass; since v0.7.0 Wave-3 Continuation 5, <code>validate_relation</code> additionally accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirroring the AGE Cypher edge-label convention) — whitespace, control chars, and shell metacharacters are still rejected.</p>
+    <p class="lede">Every <code>memory_link</code> row carries one of these nine relation tags at v0.8.0 (was four at v0.6.x; six at v0.7.0 — <code>reflects_on</code> joined the set with recursive-learning Task 1/8 and <code>derives_from</code> joined with WT-1-A atomisation; the v0.8.0 Pillar-2 typed-cognition trio <code>decomposes_into</code> / <code>depends_on</code> / <code>advances</code> completed the set, with the SQL-side CHECK extended 6→9 at schema v63). The nine canonical names always pass; since v0.7.0 Wave-3 Continuation 5, <code>validate_relation</code> additionally accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirroring the AGE Cypher edge-label convention) — whitespace, control chars, and shell metacharacters are still rejected.</p>
     <div class="rel-grid">
       <div class="rel r1">
         <div class="nm">related_to</div>
@@ -385,6 +385,21 @@ footer a{color:var(--text-muted)}
         <div class="nm">derives_from (v0.7.0)</div>
         <p>Atomisation provenance (WT-1-A). Distinct from <code>derived_from</code> — atomisation is a finer-grained, recoverable split that emits one <code>derives_from</code> edge per atom, while consolidation merges several memories into one and emits <code>derived_from</code> edges.</p>
         <div class="ex">e.g. each atomic proposition <code>derives_from</code> its parent long-form memory</div>
+      </div>
+      <div class="rel r4">
+        <div class="nm">decomposes_into (v0.8.0)</div>
+        <p>Pillar-2 typed-cognition structure (#1709). A parent breaks down into children — a <code>Goal</code> decomposes_into <code>Plan</code>s; a <code>Plan</code> decomposes_into <code>Step</code>s. Directionality is <strong>parent → child</strong>: the structural decomposition spine of a plan tree.</p>
+        <div class="ex">e.g. "Ship v0.8.0" <code>decomposes_into</code> "Cut release branch"</div>
+      </div>
+      <div class="rel r2">
+        <div class="nm">depends_on (v0.8.0)</div>
+        <p>Pillar-2 typed-cognition ordering (#1709). A prerequisite edge between SIBLINGS — a <code>Step</code> depends_on another <code>Step</code> that must complete first. Directionality is <strong>dependent → prerequisite</strong>. The memory-graph analogue of the action-DAG ordering concept (NOT the executable <code>EdgeType::Requires</code>).</p>
+        <div class="ex">e.g. "Publish crate" <code>depends_on</code> "Run CI gates"</div>
+      </div>
+      <div class="rel r3">
+        <div class="nm">advances (v0.8.0)</div>
+        <p>Pillar-2 typed-cognition progress rollup (#1709). A child contributes progress toward an ANCESTOR — a <code>Step</code> advances a <code>Plan</code> or <code>Goal</code>. Directionality is <strong>child → ancestor</strong>: the progress-rollup counterpart of <code>decomposes_into</code>.</p>
+        <div class="ex">e.g. "Cut release branch" <code>advances</code> "Ship v0.8.0"</div>
       </div>
     </div>
   </div>
@@ -539,7 +554,7 @@ RETURN target, r;</div>
 </section>
 
 <footer>
-  <p>ai-memory v0.7.0 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · query layer in <code>src/kg/</code> + <code>src/handlers/kg.rs</code> · Apache AGE wrapper SHIPPED at v0.7.0 (auto-detected via pg_extension; <code>--features sal-postgres</code>)</p>
+  <p>ai-memory v0.8.0 · Apache 2.0 · KG schema in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/migrations/sqlite/0010_v063_hierarchy_kg.sql">migrations/sqlite/0010</a> · relation closed-set extended 6→9 at schema v63 · query layer in <code>src/kg/</code> + <code>src/handlers/kg.rs</code> · Apache AGE wrapper SHIPPED at v0.7.0 (auto-detected via pg_extension; <code>--features sal-postgres</code>)</p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="schema.html">Schema</a> · <a href="hierarchies.html">Hierarchies</a></p>
 </footer>
 
