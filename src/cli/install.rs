@@ -3276,8 +3276,14 @@ mod tests {
         assert_eq!(arr.len(), 1);
         let entry = &arr[0];
         assert_eq!(entry["matcher"], PRETOOL_HOOK_MATCHER);
-        assert_eq!(entry["hooks"][0]["type"], "mcp_tool");
-        assert_eq!(entry["hooks"][0]["tool"], "memory_check_agent_action");
+        // #1811 — `type:command` wrapper (mcp_tool cannot block). Vote 4d3ea1c5.
+        assert_eq!(entry["hooks"][0]["type"], "command");
+        assert!(
+            entry["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("governance check-action --from-pretool-stdin")
+        );
         assert!(env.stdout_str().contains("installed PreToolUse hook ->"));
     }
 
@@ -3313,7 +3319,13 @@ mod tests {
         assert_eq!(arr[0]["matcher"], "Bash");
         assert_eq!(arr[0]["hooks"][0]["command"], "echo hi");
         assert_eq!(arr[1]["matcher"], PRETOOL_HOOK_MATCHER);
-        assert_eq!(arr[1]["hooks"][0]["tool"], "memory_check_agent_action");
+        assert_eq!(arr[1]["hooks"][0]["type"], "command");
+        assert!(
+            arr[1]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("governance check-action --from-pretool-stdin")
+        );
     }
 
     #[test]
@@ -3378,7 +3390,13 @@ mod tests {
         // Conflicting entry replaced with ours (scoped matcher, #1667).
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["matcher"], PRETOOL_HOOK_MATCHER);
-        assert_eq!(arr[0]["hooks"][0]["tool"], "memory_check_agent_action");
+        assert_eq!(arr[0]["hooks"][0]["type"], "command");
+        assert!(
+            arr[0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("governance check-action --from-pretool-stdin")
+        );
         assert!(arr[0][MARKER_START_KEY].is_string());
     }
 
@@ -3426,7 +3444,8 @@ mod tests {
         let stdout = env.stdout_str();
         assert!(stdout.contains("dry-run"));
         assert!(stdout.contains("PreToolUse"));
-        assert!(stdout.contains("memory_check_agent_action"));
+        // #1811 — the dry-run preview now shows the `type:command` wrapper.
+        assert!(stdout.contains("governance check-action"));
     }
 
     #[test]
