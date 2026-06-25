@@ -323,7 +323,14 @@ pub fn run(args: &InstallArgs, out: &mut CliOutput<'_>) -> Result<()> {
         if t_args.uninstall {
             remove_hook_block(target, hook_kind, before_value.clone())?
         } else {
-            apply_hook_block(target, hook_kind, before_value.clone(), t_args.force, out)?
+            apply_hook_block(
+                target,
+                hook_kind,
+                before_value.clone(),
+                &binary,
+                t_args.force,
+                out,
+            )?
         }
     } else if t_args.uninstall {
         remove_managed_block(target, before_value.clone(), config_format)?
@@ -1104,19 +1111,37 @@ const PRETOOL_HOOK_TOOL_NAME: &str = crate::mcp::registry::tool_names::MEMORY_CH
 /// memory MCP call. See issue #1667.
 const PRETOOL_HOOK_MATCHER: &str = "Bash|Edit|Write";
 
-/// Build the PreToolUse entry the installer writes. Uses the
-/// type=`mcp_tool` form (vs `type=command`) so Claude Code dispatches
-/// over the MCP channel directly — no shell, no fork, no PATH
-/// dependence. The marker keys live alongside the operator-visible
-/// fields so the entry round-trips through Claude Code's reader
-/// unchanged.
-fn claude_code_pretool_entry() -> Value {
+/// Shell command stored in claude-code's PreToolUse `type:command` hook.
+/// Routes the proposed Bash / Edit / Write through the substrate rules
+/// engine via the `--from-pretool-stdin` wrapper, which reads the
+/// PreToolUse event off stdin and emits the Claude Code decision.
+fn claude_code_pretool_command(binary: &str) -> String {
+    format!("{binary} governance check-action --from-pretool-stdin")
+}
+
+/// Build the PreToolUse entry the installer writes.
+///
+/// #1811 — uses the `type=command` form (NOT `type=mcp_tool`). A
+/// `type=mcp_tool` hook CANNOT enforce: per the Claude Code hooks
+/// contract an mcp_tool hook whose tool returns `isError:true` (the old
+/// "kind is required" failure) "produces a non-blocking error and
+/// execution continues", and a tool response that is not the CC decision
+/// JSON is "shown as plain text" — so `memory_check_agent_action`'s
+/// `{"decision":{"decision":"refuse"}}` never blocked the tool. The
+/// `--from-pretool-stdin` wrapper (`src/cli/governance_check_action.rs`)
+/// owns the harness contract in-binary and emits
+/// `hookSpecificOutput.permissionDecision=deny` on a Refuse, so the gate
+/// actually blocks. One entry suffices because the wrapper self-maps the
+/// tool name to the action kind (Bash→bash, Edit/Write→filesystem_write).
+/// Trade-off accepted (5-agent vote `4d3ea1c5`): a shell fork + PATH
+/// dependence on `ai-memory`, in exchange for an enforcing, testable gate.
+fn claude_code_pretool_entry(binary: &str) -> Value {
     serde_json::json!({
         MARKER_START_KEY: MARKER_PAYLOAD,
         MANAGED_KEYS_PROPERTY: ["matcher", "hooks"],
         "matcher": PRETOOL_HOOK_MATCHER,
         "hooks": [
-            { "type": "mcp_tool", "tool": PRETOOL_HOOK_TOOL_NAME }
+            { "type": "command", "command": claude_code_pretool_command(binary) }
         ],
         MARKER_END_KEY: MARKER_PAYLOAD,
     })
@@ -1148,10 +1173,11 @@ fn pretool_conflict_matcher(v: &Value) -> Option<String> {
 /// the list still run. Returns `bail!` on a conflict-without-force.
 fn apply_claude_code_pretool(
     obj: &mut Map<String, Value>,
+    binary: &str,
     force: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    let entry = claude_code_pretool_entry();
+    let entry = claude_code_pretool_entry(binary);
 
     let hooks = obj
         .entry("hooks".to_string())
@@ -1234,13 +1260,14 @@ fn apply_hook_block(
     target: Target,
     kind: HookKind,
     mut cfg: Value,
+    binary: &str,
     force: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<Value> {
     let obj = ensure_object(&mut cfg)?;
     match (target, kind) {
         (Target::ClaudeCode, HookKind::Pretool) => {
-            apply_claude_code_pretool(obj, force, out)?;
+            apply_claude_code_pretool(obj, binary, force, out)?;
         }
         // Other (target, kind) pairs are rejected upstream in `run` so
         // this match is exhaustive in practice. Keep the explicit
@@ -3188,13 +3215,22 @@ mod tests {
 
     #[test]
     fn pretool_entry_shape_matches_documented_form() {
-        let v = claude_code_pretool_entry();
+        // #1811 — the entry is now a `type:command` wrapper (mcp_tool
+        // hooks cannot block on Refuse). 5-agent vote `4d3ea1c5`.
+        let v = claude_code_pretool_entry("ai-memory");
         // Scoped to the modeled action surface, NOT "*" (issue #1667).
         assert_eq!(PRETOOL_HOOK_MATCHER, "Bash|Edit|Write");
         assert_eq!(v["matcher"], PRETOOL_HOOK_MATCHER);
-        assert_eq!(v["hooks"][0]["type"], "mcp_tool");
-        assert_eq!(v["hooks"][0]["tool"], PRETOOL_HOOK_TOOL_NAME);
-        assert_eq!(v["hooks"][0]["tool"], "memory_check_agent_action");
+        assert_eq!(v["hooks"][0]["type"], "command");
+        let cmd = v["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("governance check-action --from-pretool-stdin"),
+            "the hook must invoke the enforcing stdin wrapper, got: {cmd}"
+        );
+        assert!(
+            cmd.starts_with("ai-memory "),
+            "uses the resolved binary, got: {cmd}"
+        );
         assert!(v[MARKER_START_KEY].is_string());
         assert!(v[MARKER_END_KEY].is_string());
     }
@@ -3212,7 +3248,7 @@ mod tests {
 
     #[test]
     fn pretool_conflict_detector_ignores_managed_blocks() {
-        let v = claude_code_pretool_entry();
+        let v = claude_code_pretool_entry("ai-memory");
         assert!(pretool_conflict_matcher(&v).is_none());
     }
 
