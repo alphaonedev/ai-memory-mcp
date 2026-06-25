@@ -1,13 +1,19 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.7.0 (issue #228) — E2E memory content encryption at rest.
+//! v0.7.0 (issue #228) — per-node at-rest memory content encryption.
 //!
-//! This module is the substrate primitive for end-to-end encryption of
-//! memory `content` columns at rest. It pairs a per-agent X25519 ECDH
-//! keypair with ChaCha20-Poly1305 AEAD encryption so a single recipient
-//! (an agent identified by `agent_id`) can decrypt content encrypted to
-//! its public key.
+//! This module is the substrate primitive for **per-node at-rest** encryption
+//! of memory `content` columns. It pairs a per-agent X25519 ECDH keypair with
+//! ChaCha20-Poly1305 AEAD encryption so a single recipient (an agent
+//! identified by `agent_id`) can decrypt content encrypted to its public key.
+//!
+//! **NOT end-to-end across federation (#1809):** the at-rest envelope is not a
+//! wire field — federation catch-up (`memories_updated_since`) decrypts
+//! `content` and the receiving peer re-seals under its own per-node key, so a
+//! federated peer holds plaintext transiently at apply time (the wire itself is
+//! TLS/mTLS-protected + enrolled-peer-gated). True cross-peer end-to-end
+//! encryption is a separate (v0.9) design — this primitive is per-node at-rest.
 //!
 //! ## Wire shape
 //!

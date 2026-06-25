@@ -38,7 +38,7 @@
 
 use std::path::Path;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::identity::keypair;
 use crate::identity::sign::{
@@ -132,8 +132,10 @@ pub fn verify(
     // re-derive the bytes the peer signed, so we cannot trust this link".
     let payload = canonical_cbor(link).map_err(|_| VerifyError::Tampered)?;
 
+    // #1808 — strict verification rejects malleable / non-canonical Ed25519
+    // signatures, matching the v0.8.0 Pillar-1 verifiers + `forensic/bundle.rs`.
     public
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| VerifyError::Tampered)
 }
 
@@ -265,8 +267,10 @@ pub fn verify_write(
     let sig = Signature::from_bytes(&sig_arr);
 
     let payload = canonical_cbor_write(write).map_err(|_| VerifyError::Tampered)?;
+    // #1808 — strict verification (see `verify`); the #1464 content-attestation
+    // lane must reject non-canonical signatures like the Pillar-1 verifiers.
     public
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| VerifyError::Tampered)
 }
 

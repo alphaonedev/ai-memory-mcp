@@ -335,8 +335,15 @@ pub fn handle_lease_acquire(conn: &rusqlite::Connection, params: &Value) -> Resu
         .and_then(Value::as_i64)
         .unwrap_or(60);
 
+    // #1806 — clamp the caller-supplied TTL (reject <=0 / >1yr) + checked add,
+    // mirroring the memory-write path (validate::validate_ttl_secs). Without it
+    // an unbounded ttl_secs mints a never-reclaimed lease (coordination
+    // starvation) and `now + ttl_secs` overflow-panics on i64::MAX.
+    crate::validate::validate_ttl_secs(Some(ttl_secs)).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
-    let expires_at = now + ttl_secs;
+    let expires_at = now
+        .checked_add(ttl_secs)
+        .ok_or_else(|| "ttl_secs overflow".to_string())?;
     match crate::actions::lease_acquire(conn, action_id, holder, now, expires_at)
         .map_err(|e| e.to_string())?
     {
@@ -381,8 +388,12 @@ pub fn handle_lease_renew(conn: &rusqlite::Connection, params: &Value) -> Result
         .and_then(Value::as_i64)
         .unwrap_or(60);
 
+    // #1806 — clamp + checked add (see lease_acquire).
+    crate::validate::validate_ttl_secs(Some(ttl_secs)).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now().timestamp();
-    let expires_at = now + ttl_secs;
+    let expires_at = now
+        .checked_add(ttl_secs)
+        .ok_or_else(|| "ttl_secs overflow".to_string())?;
     match crate::actions::lease_renew(conn, action_id, holder, now, expires_at)
         .map_err(|e| e.to_string())?
     {
@@ -1037,6 +1048,39 @@ mod handler_tests {
         let conn = fresh();
         let got = handle_action_get(&conn, &json!({ "id": "missing" })).expect("get ok");
         assert!(got["action"].is_null());
+    }
+
+    /// #1806 (SECURITY) — lease TTL must be clamped: an unbounded / negative /
+    /// over-1-year ttl_secs is refused (no overflow panic, no never-reclaimed
+    /// forever-lease starvation), mirroring the memory-write validate path.
+    #[test]
+    fn lease_acquire_rejects_unbounded_and_negative_ttl_1806() {
+        let conn = fresh();
+        let created = handle_action_create(
+            &conn,
+            &json!({ "namespace": "_act", "kind": "k", "title": "t", "agent_id": "a" }),
+        )
+        .expect("create ok");
+        let id = created[param_names::ID].as_str().expect("id").to_string();
+
+        for bad in [i64::MAX, -1, 400i64 * 24 * 3600] {
+            let r = handle_lease_acquire(
+                &conn,
+                &json!({ "action_id": id, "holder": "h", "ttl_secs": bad }),
+            );
+            assert!(
+                r.is_err(),
+                "#1806: ttl_secs={bad} must be rejected, got {r:?}"
+            );
+            let rn = handle_lease_renew(
+                &conn,
+                &json!({ "action_id": id, "holder": "h", "ttl_secs": bad }),
+            );
+            assert!(
+                rn.is_err(),
+                "#1806: renew ttl_secs={bad} must be rejected, got {rn:?}"
+            );
+        }
     }
 
     #[test]
