@@ -465,6 +465,124 @@ async fn sync_push_applies_action_transition_sqlite() {
     assert_eq!(unsigned_got.state, ai_memory::models::ActionState::Pending);
 }
 
+/// #1805 — a captured signed action-transition re-wrapped in a fresh push
+/// envelope must be REFUSED on the second delivery via the per-peer nonce
+/// cache, BEFORE it reaches the CAS. The transition signature alone is not
+/// anti-replay (CAS is causal ordering, not freshness); without the #1805
+/// nonce record the replay would reach `transition_cas` and count as a `noop`
+/// (CAS miss), so the discriminating signal is `skipped` rising on the second
+/// push while `action_transitions_applied` stays 0 and `noop` stays 0.
+#[tokio::test]
+async fn sync_push_replayed_action_transition_refused_1805() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let keydir = tempfile::tempdir().expect("keydir");
+    let actor = "ai:cov-ga2-replayactor";
+    let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
+    ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+        std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, keydir.path());
+    }
+    let (r, t) = sqlite_router();
+    let ns = "covga2replay";
+    {
+        let conn = ai_memory::db::open(t.path()).expect("seed conn");
+        let action = ai_memory::models::Action {
+            id: "cov-ga2-act-replay".to_string(),
+            namespace: ns.to_string(),
+            kind: "test".to_string(),
+            state: ai_memory::models::ActionState::Pending,
+            title: "tx".to_string(),
+            payload: json!({}),
+            priority: 5,
+            agent_id: Some(actor.to_string()),
+            claimed_by: None,
+            vector_clock: json!({}),
+            metadata: json!({}),
+            created_at: 1_700_009_000,
+            updated_at: 1_700_009_000,
+        };
+        ai_memory::actions::create(&conn, &action).expect("seed action");
+    }
+    let nonce = b"cov-ga2-replay-nonce".to_vec();
+    let signable = ai_memory::identity::sign::SignableTransition {
+        action_id: "cov-ga2-act-replay",
+        namespace: ns,
+        from_state: "pending",
+        to_state: "claimed",
+        claimed_by: Some(actor),
+        nonce: &nonce,
+        created_at: 1_700_009_100,
+    };
+    let sig = ai_memory::identity::sign::sign_transition(&kp, &signable).expect("sign tx");
+    let signed_op = ai_memory::federation::sync::ActionTransitionOp {
+        action_id: "cov-ga2-act-replay".to_string(),
+        from_state: ai_memory::models::ActionState::Pending,
+        to_state: ai_memory::models::ActionState::Claimed,
+        claimed_by: Some(actor.to_string()),
+        vector_clock: json!({}),
+        updated_at: 1_700_009_100,
+        signature: sig,
+        signer_pubkey: kp.public.to_bytes().to_vec(),
+        nonce,
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let make_body = || {
+        serde_json::to_vec(&json!({
+            "sender_agent_id": actor,
+            "sender_clock": {"entries": {}},
+            "sender_wall_clock": now,
+            "memories": [],
+            "action_transitions": [serde_json::to_value(&signed_op).unwrap()],
+        }))
+        .unwrap()
+    };
+    // First delivery: fresh nonce → applies.
+    let (s1, b1) = decode(&r, push_req(&make_body(), &[])).await;
+    assert!(s1.is_success(), "first push acks; status={s1} body={b1}");
+    assert_eq!(
+        b1["action_transitions_applied"].as_i64().unwrap_or(-1),
+        1,
+        "first signed tx applies; body={b1}"
+    );
+    // Second delivery: byte-identical signed op, fresh outer envelope →
+    // the (peer, base64(nonce)) is already recorded → refused PRE-CAS.
+    let (s2, b2) = decode(&r, push_req(&make_body(), &[])).await;
+    unsafe {
+        std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
+        std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::identity::keypair::KEY_DIR_ENV);
+    }
+    assert!(
+        s2.is_success(),
+        "replay push still acks; status={s2} body={b2}"
+    );
+    assert_eq!(
+        b2["action_transitions_applied"].as_i64().unwrap_or(-1),
+        0,
+        "replayed tx must NOT re-apply; body={b2}"
+    );
+    assert!(
+        b2["skipped"].as_i64().unwrap_or(0) >= 1,
+        "#1805: replayed nonce is refused (skipped), not a CAS noop; body={b2}"
+    );
+    assert_eq!(
+        b2["noop"].as_i64().unwrap_or(-1),
+        0,
+        "#1805: replay never reaches the CAS, so noop stays 0; body={b2}"
+    );
+    // The action is claimed exactly once.
+    let conn = ai_memory::db::open(t.path()).expect("verify conn");
+    let got = ai_memory::actions::get(&conn, "cov-ga2-act-replay")
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.state, ai_memory::models::ActionState::Claimed);
+}
+
 /// #1718 Commit C — the action-transition HTTP write surface
 /// (POST /api/v1/actions/{id}/transition) on the single-node fast path
 /// (no federation): applies the local CAS transition + returns the new state;

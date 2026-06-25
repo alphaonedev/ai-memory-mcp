@@ -619,6 +619,29 @@ pub(super) async fn sync_push_via_store(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
+                // #1805 — per-transition nonce anti-replay (postgres twin of the
+                // sqlite federation_receive path). The signed transition nonce
+                // was never recorded; record it in the per-peer nonce cache and
+                // refuse a replay (a captured signed op re-wrapped in a fresh
+                // envelope replays through CAS on a cyclic/ABA edge). Empty
+                // nonce = unsigned op → not gated. Rides #1718 / 4d3ea1c5.
+                if !op.nonce.is_empty() {
+                    use base64::Engine as _;
+                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
+                    if matches!(
+                        app.federation_nonce_cache
+                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                        crate::identity::replay::ReplayDecision::Replay
+                    ) {
+                        tracing::warn!(
+                            target: crate::federation::SIGNING_TRACE_TARGET,
+                            action_id = %op.action_id,
+                            "sync_push(store): replayed action-transition nonce refused (#1805)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
                 match app
                     .store
                     .action_transition_cas(

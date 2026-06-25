@@ -1507,6 +1507,31 @@ pub async fn sync_push(
             require_tx_sig,
         ) {
             crate::federation::receive_auth::TransitionAuthz::Accept => {
+                // #1805 — per-transition nonce anti-replay. The transition
+                // nonce is signed (tamper-evident) but was never recorded, so a
+                // captured signed transition re-wrapped in a FRESH outer
+                // envelope replays through CAS on a cyclic/ABA edge (CAS is
+                // causal ordering, not anti-replay). Record it in the per-peer
+                // nonce cache (the #30 envelope-nonce store) and refuse a
+                // repeat. Rides the #1718 / 4d3ea1c5 fail-closed posture; an
+                // empty nonce = unsigned op (heterogeneous rollout) → not gated.
+                if !op.nonce.is_empty() {
+                    use base64::Engine as _;
+                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
+                    if matches!(
+                        app.federation_nonce_cache
+                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                        crate::identity::replay::ReplayDecision::Replay
+                    ) {
+                        tracing::warn!(
+                            target: crate::federation::SIGNING_TRACE_TARGET,
+                            action_id = %op.action_id,
+                            "sync_push: replayed action-transition nonce refused (#1805)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
                 match crate::actions::transition_cas(
                     &lock.0,
                     &op.action_id,
