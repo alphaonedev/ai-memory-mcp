@@ -36,7 +36,7 @@ layout: doc
 >
 > The audit body below is preserved verbatim as the historical record
 > that drove the wave. For the canonical post-wave feature inventory,
-> see [`docs/internal/v070-feature-inventory.md`](v070-feature-inventory.md).
+> see [`docs/internal/v070-feature-inventory.md`](v070-feature-inventory.html).
 
 ---
 
@@ -569,10 +569,10 @@ ship-readiness wave actually closed every gap the audit flagged
 rather than rephrasing the public claim.
 
 The canonical post-wave feature inventory remains
-[`docs/internal/v070-feature-inventory.md`](v070-feature-inventory.md).
+[`docs/internal/v070-feature-inventory.md`](v070-feature-inventory.html).
 The full review-and-fix campaign rollup lives in
-[`docs/internal/v070-review-synthesis.md`](v070-review-synthesis.md)
-and [`docs/internal/v070-ship-readiness-final.md`](v070-ship-readiness-final.md).
+[`docs/internal/v070-review-synthesis.md`](v070-review-synthesis.html)
+and [`docs/internal/v070-ship-readiness-final.md`](v070-ship-readiness-final.html).
 
 — Cold mountain.
 

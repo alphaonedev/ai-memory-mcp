@@ -68,7 +68,7 @@ Notes:
 - Restart Goose after editing the config so the MCP server is picked
   up. `goose info` should list `ai-memory` under available extensions.
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — single source of truth across MCP / HTTP daemon / CLI / boot banner / doctor probe. Example: `backend = "xai"`, `model = "grok-4.3"`, `api_key_env = "XAI_API_KEY"` (the env-var name, not the literal key — inline keys are rejected at parse time). Export the named env var in your shell rc; the Goose config can stay minimal. **Override** path: extend the `envs:` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL` — shell exports don't reach Goose's MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Full schema + per-vendor recipes: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) + [`llm-backends.md`](llm-backends.md).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — single source of truth across MCP / HTTP daemon / CLI / boot banner / doctor probe. Example: `backend = "xai"`, `model = "grok-4.3"`, `api_key_env = "XAI_API_KEY"` (the env-var name, not the literal key — inline keys are rejected at parse time). Export the named env var in your shell rc; the Goose config can stay minimal. **Override** path: extend the `envs:` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL` — shell exports don't reach Goose's MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Full schema + per-vendor recipes: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html) + [`llm-backends.md`](llm-backends.html).
 
 ## Part 2 — system-instructions directive (best-effort fallback)
 
@@ -100,7 +100,7 @@ fires you will see `memory_session_start` in the tool-call log on the
 first turn. If you don't, the directive isn't firing — usually means
 the system instructions aren't being applied to the active profile.
 The `ai-memory boot` status-header diagnostic (see
-[`README.md`](README.md)) does not apply here because Goose's
+[`README.md`](README.html)) does not apply here because Goose's
 integration is MCP-only, not boot-shellout-based.
 
 ## Limitations
@@ -129,8 +129,8 @@ This recipe will be updated in place once the hook lands.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the universal
+- [`README.md`](README.html) — integration matrix and the universal
   primitive.
-- [`cline.md`](cline.md), [`continue.md`](continue.md) — same
+- [`cline.md`](cline.html), [`continue.md`](continue.html) — same
   category-2 pattern for VS Code MCP hosts.
 - Issue #487 — RCA + cross-files for category-2 native-hook requests.

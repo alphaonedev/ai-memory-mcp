@@ -15,7 +15,7 @@ xAI consumer apps. The integration depends on the surface.
    start (this is what most of this doc covers — Category 3 programmatic
    integration via the xAI SDK).
 2. **Grok via Cursor.** Cursor's Grok model picker plus the standard
-   Cursor MCP integration — see [`cursor.md`](cursor.md).
+   Cursor MCP integration — see [`cursor.md`](cursor.html).
 3. **Grok-as-ai-memory's-LLM-backend.** ai-memory's smart / autonomous
    tiers call out to an LLM for query expansion, auto-tagging,
    contradiction detection, atomisation, reflection. As of v0.7.0
@@ -30,7 +30,7 @@ xAI consumer apps. The integration depends on the surface.
 ## Use Grok as ai-memory's LLM backend
 
 ai-memory's `smart` and `autonomous` tiers need an LLM. xAI Grok is one
-of 16+ supported backends (see [`llm-backends.md`](llm-backends.md) for
+of 16+ supported backends (see [`llm-backends.md`](llm-backends.html) for
 the full vendor matrix — OpenAI, Anthropic, Gemini, DeepSeek, Kimi,
 Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks,
 LMStudio, vLLM, llama.cpp server, local Ollama all work identically).
@@ -72,7 +72,7 @@ ai-memory boot --quiet --limit 1   # banner should report llm=xai:grok-4.3
 ai-memory doctor                    # LLM Reachability (#1146) — DNS + TLS + auth round-trip
 ```
 
-**Inline keys in `config.toml` are rejected at parse time** — use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced). Canonical schema reference: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md).
+**Inline keys in `config.toml` are rejected at parse time** — use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced). Canonical schema reference: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html).
 
 ### Override path — `env:` block in the MCP config
 
@@ -97,7 +97,7 @@ If you'd rather not edit `config.toml`, an `env:` block on the MCP server entry 
 Place this block in your AI client's MCP config file (Claude Code:
 `~/.claude.json`; Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json`
 on macOS; Cursor: `~/.cursor/mcp.json`; Codex: `~/.codex/config.toml`
-in TOML shape — see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.md#codex-cli-toml-shape)).
+in TOML shape — see [`llm-backends.md` § Codex CLI TOML shape](llm-backends.html#codex-cli-toml-shape)).
 
 **Critical — MCP clients do not inherit your interactive shell.**
 Setting `export AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` works for the
@@ -131,7 +131,7 @@ honoured if `AI_MEMORY_LLM_API_KEY` is unset.
 
 **Going further:** for the full per-backend matrix, multi-agent / fleet
 considerations, and storage-vs-LLM-backend independence, see
-[`llm-backends.md`](llm-backends.md).
+[`llm-backends.md`](llm-backends.html).
 
 ## Or for the simple wrapper case — `ai-memory wrap`
 
@@ -186,7 +186,7 @@ response = client.chat.completions.create(
 
 ## Via Cursor (Grok Code Fast 1, etc.)
 
-Use the [`cursor.md`](cursor.md) recipe — Grok runs inside Cursor's MCP
+Use the [`cursor.md`](cursor.html) recipe — Grok runs inside Cursor's MCP
 host, so the memory wiring is identical to any other Cursor model.
 Category 2 (best-effort directive in `.cursorrules` until Cursor lands a
 session-start hook).
@@ -198,6 +198,6 @@ No recipe yet — track for when xAI adds developer hooks.
 
 ## Related
 
-- [`README.md`](README.md), Issue #487
-- [`openai-apps-sdk.md`](openai-apps-sdk.md) — same pattern for any
+- [`README.md`](README.html), Issue #487
+- [`openai-apps-sdk.md`](openai-apps-sdk.html) — same pattern for any
   OpenAI-compatible API.

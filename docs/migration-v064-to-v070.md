@@ -9,12 +9,12 @@ layout: doc
 > single-tenant team deployments on sqlite.
 >
 > **For the deep technical companion** (every per-form note, every env var,
-> every schema-ladder bump) see [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md). This
+> every schema-ladder bump) see [`MIGRATION_v0.7.md`](MIGRATION_v0.7.html). This
 > document is the calm, walk-me-through-it sibling. It does NOT replace the
 > technical guide — it sits in front of it.
 >
 > **For postgres-backed deployments** see
-> [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). The §5 summary
+> [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html). The §5 summary
 > below points you there.
 
 ---
@@ -114,7 +114,7 @@ one you're in until it's too late.
 - You're running a custom `hooks.toml` that depends on v0.6.4 lifecycle event
   names. v0.7.0 ships 25 events (20 baseline + 5 grand-slam additions) — all
   v0.6.4 event names continue to fire, but you should skim
-  [`hook-pipeline.md`](hook-pipeline.md) for the new ones before relying on
+  [`hook-pipeline.md`](hook-pipeline.html) for the new ones before relying on
   them.
 
 ---
@@ -325,7 +325,7 @@ first-boot ladder. Note `schema-init`/`migrate` exist only in
 `--features sal` / `sal,sal-postgres` builds — the pre-built release
 binaries are default-feature builds without them.
 
-**Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) for the
+**Read [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) for the
 full runbook.** It covers schema-init upgrades, the postgres upgrade ladder,
 the AGE projection prime, and the cutover dance.
 
@@ -377,7 +377,7 @@ the SAL boundary is byte-stable across both backends at schema v57.
 This section walks the 11 new columns on the `memories` table and the WHY
 behind each. The detailed call-out paragraphs follow the summary table.
 Schema-deep readers, see
-[`MIGRATION_v0.7.md` §"Per-bump narrative"](MIGRATION_v0.7.md) for the v34 →
+[`MIGRATION_v0.7.md` §"Per-bump narrative"](MIGRATION_v0.7.html) for the v34 →
 v55 ladder.
 
 ### Summary table
@@ -429,7 +429,7 @@ And new tables (opt-in / empty if you never use the feature): `signed_events` (V
 **6.11 `version`** (v45, Provenance Gap 1 / #884). Optimistic-concurrency counter. Bumped on every `memory_update`. Two callers writing against the same `expected_version` race one winner; the loser receives a typed CONFLICT envelope naming the current version. v0.6.4 was last-writer-wins and quietly destroyed concurrent edits.
 
 The bump-by-bump v34 → v57 narrative lives in
-[`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.md).
+[`MIGRATION_v0.7.md` §"Upgrade steps"](MIGRATION_v0.7.html).
 
 ---
 
@@ -816,7 +816,7 @@ If you relied on the v0.6.4 default-permissive posture, opt back in via
 --from sqlite:///… --to postgres://…`). The recommended order is: upgrade
 the sqlite-backed daemon to v0.7.0 first (so both sides converge on schema
 v55), then run the cross-backend migration. The postgres guide has the
-full runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md).
+full runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html).
 
 ### Q8. The first boot is taking forever. Is it stuck?
 
@@ -834,19 +834,19 @@ bump is atomic.
 
 ## See also
 
-- [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) — the deep technical migration
+- [`MIGRATION_v0.7.md`](MIGRATION_v0.7.html) — the deep technical migration
   guide (per-form notes, every env var, the v34→v55 ladder narrative).
-- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — the
+- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) — the
   sqlite → postgres + Apache AGE runbook.
-- [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md) — full release notes
+- [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html) — full release notes
   by area (capabilities v3, Batman forms 1–6 + 7th-form foundation,
   recursive-learning primitive, Agent Skills, federation hardening,
   provider-agnostic LLM, mobile target CI).
-- [`internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md)
+- [`internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html)
   — canonical feature-by-feature inventory of every net-new surface in
   v0.7.0 vs v0.6.4 (453 commits, 545 files, +233,589 / −23,541 lines).
 - [`CHANGELOG.md`](../CHANGELOG.md) — the full v0.7.0 changelog entry.
-- [`signed-events-v4.md`](signed-events-v4.md) — the V-4 cross-row
+- [`signed-events-v4.md`](signed-events-v4.html) — the V-4 cross-row
   audit-chain spec, in case §9.7 sent you here.
-- [`governance.md`](governance.md) — the permissions / governance system,
+- [`governance.md`](governance.html) — the permissions / governance system,
   in case §9.4 / §9.5 sent you here.

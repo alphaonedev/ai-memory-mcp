@@ -241,7 +241,7 @@ ai-memory bench --json &gt; baseline-$(git rev-parse --short HEAD).json
 ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</pre>
 
     <h3>The committed-baseline precedent</h3>
-    <p><a href="BASELINE-v0.6.3.1.md"><code>docs/BASELINE-v0.6.3.1.md</code></a> is the project's committed-baseline precedent: a canonical, code-derived snapshot of what release <code>v0.6.3.1</code> actually <em>was</em> (workspace, features, surfaces, budgets — every number with a traceable <code>file:line</code> source, zero aspirational claims). It is the reference document the long-running drift audit (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/512">#512</a>) measures published surfaces against. The same discipline carries into v0.7.0: baselines are committed artifacts with provenance, not screenshots.</p>
+    <p><a href="BASELINE-v0.6.3.1.html"><code>docs/BASELINE-v0.6.3.1.md</code></a> is the project's committed-baseline precedent: a canonical, code-derived snapshot of what release <code>v0.6.3.1</code> actually <em>was</em> (workspace, features, surfaces, budgets — every number with a traceable <code>file:line</code> source, zero aspirational claims). It is the reference document the long-running drift audit (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/512">#512</a>) measures published surfaces against. The same discipline carries into v0.7.0: baselines are committed artifacts with provenance, not screenshots.</p>
   </div>
 </section>
 
@@ -250,7 +250,7 @@ ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</
   <div class="container">
     <span class="section-eyebrow">▸ Contract 3 · Test suite</span>
     <h2>The release-gate full-suite reproducibility contract.</h2>
-    <p class="lede">The final v0.7.0 release-gate campaign (<a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.md">2026-05-22 dossier</a>) closed with a full-suite verdict of <strong>7,321 passed / 0 failed / 0 skipped</strong> — and published the six-point contract that lets anyone re-derive that verdict rather than take it on faith:</p>
+    <p class="lede">The final v0.7.0 release-gate campaign (<a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.html">2026-05-22 dossier</a>) closed with a full-suite verdict of <strong>7,321 passed / 0 failed / 0 skipped</strong> — and published the six-point contract that lets anyone re-derive that verdict rather than take it on faith:</p>
 
     <div class="scroll-x">
     <table>
@@ -287,12 +287,12 @@ ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</
         <tr>
           <td class="col-name">Bench</td>
           <td>"Is this build still inside its published latency contract, and has it drifted against a known-good run?"</td>
-          <td><code>PERFORMANCE.md</code>, <code>src/bench.rs</code> (<code>P95_TOLERANCE</code>, <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code>), <code>Bench · bench</code> CI job, <a href="BASELINE-v0.6.3.1.md">BASELINE-v0.6.3.1.md</a></td>
+          <td><code>PERFORMANCE.md</code>, <code>src/bench.rs</code> (<code>P95_TOLERANCE</code>, <code>DEFAULT_REGRESSION_THRESHOLD_PCT</code>), <code>Bench · bench</code> CI job, <a href="BASELINE-v0.6.3.1.html">BASELINE-v0.6.3.1.md</a></td>
         </tr>
         <tr>
           <td class="col-name">Full suite</td>
           <td>"Can a third party re-derive the release-gate test verdict from pinned inputs?"</td>
-          <td><a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.md">Release-gate dossier §Reproducibility contract</a></td>
+          <td><a href="v0.7.0/test-campaign-2026-05-22-release-gate-final/README.html">Release-gate dossier §Reproducibility contract</a></td>
         </tr>
       </tbody>
     </table>

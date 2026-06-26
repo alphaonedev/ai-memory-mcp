@@ -11,7 +11,7 @@ layout: doc
 >
 > For the older transport/identity hardening (mTLS allowlist, X-API-Key,
 > per-peer attestation JSON) that still applies underneath, see
-> [`docs/federation.md`](federation.md). The two layers compose: mTLS is
+> [`docs/federation.md`](federation.html). The two layers compose: mTLS is
 > the transport boundary, zero-touch credentials are the application
 > identity carried *inside* it.
 
@@ -378,7 +378,7 @@ Credential renewals are also recorded on the existing
 issuance happens issuer-side and revocation is "stop renewing", so
 the renewal event is the in-tree lifecycle record). Verify with
 `ai-memory verify-signed-events-chain`; see
-[`docs/signed-events-v4.md`](signed-events-v4.md).
+[`docs/signed-events-v4.md`](signed-events-v4.html).
 
 ---
 
@@ -508,8 +508,8 @@ mechanism) differs, and each has a supported path above.
 ## 11. Cross-references
 
 - ADR-001 — Federation identity at scale (design-cycle artifact; the shipped decisions are mirrored in the [`src/federation/identity/`](../src/federation/identity/) module docs).
-- [Federation hardening (mTLS + X-API-Key + peer attestation)](federation.md) — the transport/identity layer beneath this one.
-- [Signed-events V-4 audit chain](signed-events-v4.md) — records issue/renew/revoke + verification outcomes.
+- [Federation hardening (mTLS + X-API-Key + peer attestation)](federation.html) — the transport/identity layer beneath this one.
+- [Signed-events V-4 audit chain](signed-events-v4.html) — records issue/renew/revoke + verification outcomes.
 - [`tests/federation_identity_e2e.rs`](../tests/federation_identity_e2e.rs) — the public-API capstone exercising every path above.
 - Source: [`src/federation/identity/`](../src/federation/identity/) —
   `resolver.rs`, `credential.rs`, `issuer.rs`, `trust_bundle.rs`,

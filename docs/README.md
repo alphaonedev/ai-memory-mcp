@@ -12,7 +12,7 @@ layout: doc
 [![Ship Gate](https://img.shields.io/badge/ship_gate-green-brightgreen)](https://alphaonedev.github.io/ai-memory-ship-gate/)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
-**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
+**v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 
 **📦 [Release v0.8.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.8.0)** ·
 **📊 [A2A gate (umbrella spec)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)** ·
@@ -29,56 +29,56 @@ authoritative for its topic; this page is just the map.
 
 ## Start here
 
-- **[QUICKSTART.md](QUICKSTART.md)** — first memory stored + recalled
+- **[QUICKSTART.md](QUICKSTART.html)** — first memory stored + recalled
   in under 5 minutes (CLI, MCP, HTTP paths).
-- **[GLOSSARY.md](GLOSSARY.md)** — every concept (agent, tier, scope,
+- **[GLOSSARY.md](GLOSSARY.html)** — every concept (agent, tier, scope,
   curator, quorum, SAL, …) with one-paragraph definitions and links.
 
 ## For end users
 
-- **[USER_GUIDE.md](USER_GUIDE.md)** — MCP tool reference (every
+- **[USER_GUIDE.md](USER_GUIDE.html)** — MCP tool reference (every
   `memory_*` tool), agent identity, worked examples.
-- **[CLI_REFERENCE.md](CLI_REFERENCE.md)** — every subcommand, flag,
+- **[CLI_REFERENCE.md](CLI_REFERENCE.html)** — every subcommand, flag,
   env var. Synced to the clap defs in `src/daemon_runtime.rs` (+ `src/cli/`).
-- **[API_REFERENCE.md](API_REFERENCE.md)** — every HTTP endpoint,
+- **[API_REFERENCE.md](API_REFERENCE.html)** — every HTTP endpoint,
   payload, status code, `curl` example.
-- **[INSTALL.md](INSTALL.md)** — install recipes per platform +
+- **[INSTALL.md](INSTALL.html)** — install recipes per platform +
   every major MCP-capable IDE.
-- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** — common errors, root
+- **[TROUBLESHOOTING.md](TROUBLESHOOTING.html)** — common errors, root
   causes, fixes.
 
 ## For admins
 
-- **[ADMIN_GUIDE.md](ADMIN_GUIDE.md)** — deployment, feature tiers,
+- **[ADMIN_GUIDE.md](ADMIN_GUIDE.html)** — deployment, feature tiers,
   clustering, webhooks, governance, schema migration.
-- **[SECURITY.md](SECURITY.md)** — threat model, API key, mTLS,
+- **[SECURITY.md](SECURITY.html)** — threat model, API key, mTLS,
   SQLCipher at rest, attested identity, SSRF hardening.
-- **[ARCHITECTURAL_LIMITS.md](ARCHITECTURAL_LIMITS.md)** — performance
+- **[ARCHITECTURAL_LIMITS.md](ARCHITECTURAL_LIMITS.html)** — performance
   bounds and constraints under the current design.
-- **[RUNBOOK-ollama-kv-tuning.md](RUNBOOK-ollama-kv-tuning.md)** —
+- **[RUNBOOK-ollama-kv-tuning.md](RUNBOOK-ollama-kv-tuning.html)** —
   `OLLAMA_KV_CACHE_TYPE=q4_0` for 2–4× LLM memory reduction. Zero
   ai-memory code change.
-- **[RUNBOOK-chaos-campaign.md](RUNBOOK-chaos-campaign.md)** —
+- **[RUNBOOK-chaos-campaign.md](RUNBOOK-chaos-campaign.html)** —
   200-cycle-per-fault-class federation chaos procedure (requires
   real 3-host infra).
-- **[RUNBOOK-curator-soak.md](RUNBOOK-curator-soak.md)** — 168-hour
+- **[RUNBOOK-curator-soak.md](RUNBOOK-curator-soak.html)** — 168-hour
   curator soak procedure against a production corpus. Defines
   reversal rate `R` as the honest autonomy metric.
-- **[RUNBOOK-adapter-selection.md](RUNBOOK-adapter-selection.md)** —
+- **[RUNBOOK-adapter-selection.md](RUNBOOK-adapter-selection.html)** —
   design history for the `serve --store-url postgres://…` adapter
   selection (originally scoped to v0.7.1; **shipped in v0.7.0**).
 
 ## For developers
 
-- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** — architecture, module
+- **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.html)** — architecture, module
   roles, recall pipeline, data model, environment variables.
-- **[ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.md)** — code,
+- **[ENGINEERING_STANDARDS.md](ENGINEERING_STANDARDS.html)** — code,
   test, security, and release standards. The four gates every PR
   must pass.
-- **[AI_DEVELOPER_WORKFLOW.md](AI_DEVELOPER_WORKFLOW.md)** — the
+- **[AI_DEVELOPER_WORKFLOW.md](AI_DEVELOPER_WORKFLOW.html)** — the
   eight-phase workflow AI agents must follow (recall → plan →
   branch → implement → gates → self-review → PR → handoff).
-- **[AI_DEVELOPER_GOVERNANCE.md](AI_DEVELOPER_GOVERNANCE.md)** —
+- **[AI_DEVELOPER_GOVERNANCE.md](AI_DEVELOPER_GOVERNANCE.html)** —
   authority classes, attribution rules, memory governance, hard
   prohibitions.
 - **[CONTRIBUTING.md](../CONTRIBUTING.md)** (repo root) —
@@ -86,11 +86,11 @@ authoritative for its topic; this page is just the map.
 
 ## Design decisions
 
-- **[ADR-0001-quorum-replication.md](ADR-0001-quorum-replication.md)** —
+- **[ADR-0001-quorum-replication.md](ADR-0001-quorum-replication.html)** —
   W-of-N quorum write model + chaos-testing methodology.
-- **[ADR-0002-kg-schema-v15-backward-incompat.md](ADR-0002-kg-schema-v15-backward-incompat.md)** —
+- **[ADR-0002-kg-schema-v15-backward-incompat.md](ADR-0002-kg-schema-v15-backward-incompat.html)** —
   KG schema v15 wire-level backward incompatibility.
-- **[ADR-0003-kg-invalidation-eventual-consistency.md](ADR-0003-kg-invalidation-eventual-consistency.md)** —
+- **[ADR-0003-kg-invalidation-eventual-consistency.md](ADR-0003-kg-invalidation-eventual-consistency.html)** —
   why KG link invalidation replicates eventually (not quorum-broadcast).
 
 ## SDKs
@@ -107,7 +107,7 @@ authoritative for its topic; this page is just the map.
 
 ## Getting help
 
-1. Check the [Troubleshooting guide](TROUBLESHOOTING.md) first.
+1. Check the [Troubleshooting guide](TROUBLESHOOTING.html) first.
 2. Search existing issues on GitHub.
 3. Open a new issue at
    <https://github.com/alphaonedev/ai-memory-mcp/issues> with:

@@ -11,7 +11,7 @@ layout: doc
 
 If you are bootstrapping a fresh agent (human or NHI) for this epic, hand them **one file**:
 
-> [`V0.6.4-EPIC.md`](V0.6.4-EPIC.md)
+> [`V0.6.4-EPIC.md`](V0.6.4-EPIC.html)
 
 That document contains:
 - v0.6.3.1 source-anchored ground truth (so the agent does not redo shipped work)
@@ -41,10 +41,10 @@ Default profile flips from **43 tools** → **5 tools** (`memory_store`, `memory
 
 | File | Purpose |
 |---|---|
-| [`V0.6.4-EPIC.md`](V0.6.4-EPIC.md) | **Master framework. Single self-contained doc to feed an agent for cold-start bootstrap.** |
-| [`rfc-default-tool-surface-collapse.md`](rfc-default-tool-surface-collapse.md) | Design RFC. Profiles, discovery dance, NHI guardrails, tier applicability matrix (T1–T6). |
-| [`v0.6.4-roadmap.md`](v0.6.4-roadmap.md) | 17-issue sprint plan, 5-day schedule, test/cert/release plan, risk register, success metrics. |
-| [`v0.6.4-nhi-prompts.md`](v0.6.4-nhi-prompts.md) | Self-contained AI NHI starter prompts for the dev cycle (Day 0 kickoff + Mon–Fri tracks + emergency-break recovery prompt). |
+| [`V0.6.4-EPIC.md`](V0.6.4-EPIC.html) | **Master framework. Single self-contained doc to feed an agent for cold-start bootstrap.** |
+| [`rfc-default-tool-surface-collapse.md`](rfc-default-tool-surface-collapse.html) | Design RFC. Profiles, discovery dance, NHI guardrails, tier applicability matrix (T1–T6). |
+| [`v0.6.4-roadmap.md`](v0.6.4-roadmap.html) | 17-issue sprint plan, 5-day schedule, test/cert/release plan, risk register, success metrics. |
+| [`v0.6.4-nhi-prompts.md`](v0.6.4-nhi-prompts.html) | Self-contained AI NHI starter prompts for the dev cycle (Day 0 kickoff + Mon–Fri tracks + emergency-break recovery prompt). |
 
 ## Reading order
 

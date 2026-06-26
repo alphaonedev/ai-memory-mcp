@@ -224,7 +224,7 @@ Windows).
 - **Operational logs are not the audit trail.** The tamper-evident signed
   audit chain (`[audit]`, `AI_MEMORY_AUDIT_DIR`) remains the source of truth for
   security/forensic events; OS-tier sinks carry *operational* info/warn/error
-  only. See [`docs/security/audit-trail.md`](../security/audit-trail.md).
+  only. See [`docs/security/audit-trail.md`](../security/audit-trail.html).
 - **Use `structured = true` for any OS/SIEM ingestion** so fields are parsed,
   not regex-scraped.
 - **Performance:** the stdout sink shares the file sink's non-blocking,

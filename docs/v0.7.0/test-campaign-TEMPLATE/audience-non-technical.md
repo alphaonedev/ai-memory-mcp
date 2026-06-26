@@ -61,9 +61,9 @@ If you're going to use <feature/system> for real work, the <release> is/isn't a 
 ## For the curious
 
 - Engineering writeup: [`track-*-results.md`](track-*-results.md)
-- Campaign index: [`README.md`](README.md)
-- C-level / decision-maker view: [`audience-c-level.md`](audience-c-level.md)
-- Deep-dive engineering view: [`audience-sme-engineer.md`](audience-sme-engineer.md)
+- Campaign index: [`README.md`](README.html)
+- C-level / decision-maker view: [`audience-c-level.md`](audience-c-level.html)
+- Deep-dive engineering view: [`audience-sme-engineer.md`](audience-sme-engineer.html)
 
 ---
 

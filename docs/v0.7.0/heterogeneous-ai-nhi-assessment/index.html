@@ -128,24 +128,24 @@ footer a{color:var(--muted)}
       <h3>Claude Opus 4.7</h3>
       <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>claude-opus-4-7[1m]</code> (1M-context variant). Probe execution: 2026-05-24, refined 2026-05-25.</p>
       <span class="status live">Phase 1 complete</span><br>
-      <a class="report-link" href="report-claude-opus-4-7.md">Read full Opus 4.7 report &rarr;</a>
+      <a class="report-link" href="report-claude-opus-4-7.html">Read full Opus 4.7 report &rarr;</a>
     </div>
     <div class="eval-card openai">
       <div class="vendor">OpenAI</div>
       <h3>GPT 5.5</h3>
       <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>gpt-5</code> (canonical alias <code>openai</code> backend). Awaiting independent Phase-1 execution.</p>
       <span class="status pending">Phase 1 awaiting</span><br>
-      <a class="report-link" href="report-gpt-5-5.md">Report file (placeholder) &rarr;</a>
+      <a class="report-link" href="report-gpt-5-5.html">Report file (placeholder) &rarr;</a>
     </div>
     <div class="eval-card xai">
       <div class="vendor">xAI</div>
       <h3>Grok 4.3</h3>
       <p style="color:var(--muted);font-size:.88rem;margin-bottom:.5rem">Model: <code>grok-4.3</code> (canonical alias <code>xai</code> backend, <code>https://api.x.ai/v1</code>). Awaiting independent Phase-1 execution.</p>
       <span class="status pending">Phase 1 awaiting</span><br>
-      <a class="report-link" href="report-grok-4-3.md">Report file (placeholder) &rarr;</a>
+      <a class="report-link" href="report-grok-4-3.html">Report file (placeholder) &rarr;</a>
     </div>
   </div>
-  <p>After all three Phase-1 reports land, an orchestrator pass (Claude Opus 4.7 in synthesizer-role, against all three reports as input) produces the cross-evaluator synthesis at <a href="synthesis.md"><code>synthesis.md</code></a> with three load-bearing outputs:</p>
+  <p>After all three Phase-1 reports land, an orchestrator pass (Claude Opus 4.7 in synthesizer-role, against all three reports as input) produces the cross-evaluator synthesis at <a href="synthesis.html"><code>synthesis.md</code></a> with three load-bearing outputs:</p>
   <ul>
     <li><strong>Points of agreement</strong> &mdash; high-confidence claims about v0.7.0 the three evaluators converged on independently.</li>
     <li><strong>Points of principled disagreement</strong> &mdash; organised by axis (latency tolerance, surface-size opinion, magic-vs-feature framing, reference-architecture grading, what counts as a step-change primitive).</li>
@@ -169,7 +169,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">The 22-probe matrix</div>
   <h2>Five tiers, code-path anchored.</h2>
-  <p>The assessment prompt (<a href="prompt.md"><code>prompt.md</code></a>) defines a 22-probe matrix across five tiers. Each probe names a concrete file path in <code>release/v0.7.0 @ 1cb95bbe7</code> and a question the evaluator must answer from direct examination, not training-prior recall.</p>
+  <p>The assessment prompt (<a href="prompt.html"><code>prompt.md</code></a>) defines a 22-probe matrix across five tiers. Each probe names a concrete file path in <code>release/v0.7.0 @ 1cb95bbe7</code> and a question the evaluator must answer from direct examination, not training-prior recall.</p>
   <table>
     <thead><tr><th>Tier</th><th>Probes</th><th>Focus</th></tr></thead>
     <tbody>
@@ -186,7 +186,7 @@ footer a{color:var(--muted)}
 <section class="wrap-mid">
   <div class="eyebrow-h2">Phase-1 Opus 4.7 verdict (preview)</div>
   <h2>SHIP-WITH-CAVEATS, refinement-pass shortened.</h2>
-  <p>The Phase-1 Opus 4.7 report (<a href="report-claude-opus-4-7.md">full text &rarr;</a>) returned <strong>SHIP-WITH-CAVEATS</strong> on 2026-05-24 morning, refined the same day with two of the caveats closed by filed PRs and three new follow-up issues opened. Surface findings:</p>
+  <p>The Phase-1 Opus 4.7 report (<a href="report-claude-opus-4-7.html">full text &rarr;</a>) returned <strong>SHIP-WITH-CAVEATS</strong> on 2026-05-24 morning, refined the same day with two of the caveats closed by filed PRs and three new follow-up issues opened. Surface findings:</p>
   <ul>
     <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1172">#1172</a> &mdash; <code>memory_reflect</code> MCP tool strips caller-supplied <code>metadata.entity_id</code>. Closure PR <a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1177">#1177</a> with 5-invariant regression suite.</li>
     <li><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1169">#1169</a> &mdash; <code>memory_capabilities.models.embedding_dim</code> sources from tier preset instead of canonical <code>KNOWN_EMBEDDING_DIMS</code> table. Closure PR <a href="https://github.com/alphaonedev/ai-memory-mcp/pull/1178">#1178</a> with 13-invariant regression suite covering known / unknown / tier-disabled / legacy-alias paths.</li>
@@ -201,14 +201,14 @@ footer a{color:var(--muted)}
   <div class="eyebrow-h2">Files in this directory</div>
   <h2>Direct links.</h2>
   <div class="next">
-    <a href="README.md"><strong>README.md</strong><span class="desc">Assessment context, evaluator pool, three-phase protocol</span></a>
-    <a href="prompt.md"><strong>prompt.md</strong><span class="desc">Verbatim assessment prompt &mdash; anchor for all three reports</span></a>
-    <a href="report-claude-opus-4-7.md"><strong>report-claude-opus-4-7.md</strong><span class="desc">Phase-1 Opus 4.7 evaluator report &mdash; SHIP-WITH-CAVEATS</span></a>
-    <a href="report-claude-opus-4-7-v2.md"><strong>report-claude-opus-4-7-v2.md</strong><span class="desc">Opus 4.7 v2 re-run (2026-05-25 fresh dispatch, isolated worktree + greenfield DB)</span></a>
-    <a href="report-claude-opus-4-7-v3.md"><strong>report-claude-opus-4-7-v3.md</strong><span class="desc">Opus 4.7 v3 re-run (2026-05-28 ship campaign, post-FX-12/FX-C3/ARCH-2 state)</span></a>
-    <a href="report-gpt-5-5.md"><strong>report-gpt-5-5.md</strong><span class="desc">Awaiting Phase-1 independent execution by GPT 5.5</span></a>
-    <a href="report-grok-4-3.md"><strong>report-grok-4-3.md</strong><span class="desc">Awaiting Phase-1 independent execution by Grok 4.3</span></a>
-    <a href="synthesis.md"><strong>synthesis.md</strong><span class="desc">Awaiting Phase-2 orchestrator pass after all three reports land</span></a>
+    <a href="README.html"><strong>README.md</strong><span class="desc">Assessment context, evaluator pool, three-phase protocol</span></a>
+    <a href="prompt.html"><strong>prompt.md</strong><span class="desc">Verbatim assessment prompt &mdash; anchor for all three reports</span></a>
+    <a href="report-claude-opus-4-7.html"><strong>report-claude-opus-4-7.md</strong><span class="desc">Phase-1 Opus 4.7 evaluator report &mdash; SHIP-WITH-CAVEATS</span></a>
+    <a href="report-claude-opus-4-7-v2.html"><strong>report-claude-opus-4-7-v2.md</strong><span class="desc">Opus 4.7 v2 re-run (2026-05-25 fresh dispatch, isolated worktree + greenfield DB)</span></a>
+    <a href="report-claude-opus-4-7-v3.html"><strong>report-claude-opus-4-7-v3.md</strong><span class="desc">Opus 4.7 v3 re-run (2026-05-28 ship campaign, post-FX-12/FX-C3/ARCH-2 state)</span></a>
+    <a href="report-gpt-5-5.html"><strong>report-gpt-5-5.md</strong><span class="desc">Awaiting Phase-1 independent execution by GPT 5.5</span></a>
+    <a href="report-grok-4-3.html"><strong>report-grok-4-3.md</strong><span class="desc">Awaiting Phase-1 independent execution by Grok 4.3</span></a>
+    <a href="synthesis.html"><strong>synthesis.md</strong><span class="desc">Awaiting Phase-2 orchestrator pass after all three reports land</span></a>
   </div>
 </section>
 
@@ -219,7 +219,7 @@ footer a{color:var(--muted)}
     <a href="../../essays/brass-tacks-1-what.html"><strong>Brass tacks 1 &mdash; What</strong><span class="desc">60-second essay on what ai-memory actually is</span></a>
     <a href="../../essays/brass-tacks-2-how.html"><strong>Brass tacks 2 &mdash; How</strong><span class="desc">How an NHI uses the substrate</span></a>
     <a href="../../essays/brass-tacks-3-why.html"><strong>Brass tacks 3 &mdash; Why</strong><span class="desc">Why a substrate beats vector-DB-only</span></a>
-    <a href="../release-notes.md"><strong>v0.7.0 release notes</strong><span class="desc">Full per-PR changelog for attested-cortex</span></a>
+    <a href="../release-notes.html"><strong>v0.7.0 release notes</strong><span class="desc">Full per-PR changelog for attested-cortex</span></a>
     <a href="../test-campaign-2026-05-22-release-gate-final/"><strong>2026-05-22 release-gate-final campaign</strong><span class="desc">SHIP-RECOMMENDED &middot; 7,321 PASS / 0 FAIL across 269 binaries</span></a>
     <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1171"><strong>Issue #1171</strong><span class="desc">Tracking issue &mdash; stays OPEN until all three reports + synthesis land</span></a>
   </div>

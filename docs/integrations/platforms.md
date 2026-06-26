@@ -8,7 +8,7 @@ layout: doc
 mainstream agent host. Each platform has its own conventions for binary
 paths, config locations, and shell semantics. This doc captures
 platform-specific differences for the
-[session-boot integration recipes](README.md).
+[session-boot integration recipes](README.html).
 
 ## Platform support matrix
 
@@ -25,7 +25,7 @@ platform-specific differences for the
 | **Commercial Unix** (AIX, Solaris, HP-UX) | Best-effort — no project CI, "issues welcome but won't gate releases", see "Commercial Unix" below | varies (`/usr/local/bin/ai-memory` typical) | `${HOME}/.claude/ai-memory.db` | `sh`/`ksh` (POSIX) |
 | **Embedded Linux** (OpenWRT, Yocto, Buildroot) | Best-effort — static-linked musl build, see "Embedded Linux" below | `/usr/bin/ai-memory` (per-package convention) | `/etc/ai-memory.db` or `/var/lib/ai-memory.db` (flash storage) | `sh`/`ash` (BusyBox POSIX) |
 | **BSD** (FreeBSD, OpenBSD, NetBSD) | Best-effort — should build cleanly via `cargo build --release` but not regularly tested | `/usr/local/bin/ai-memory` (manual install) | `${HOME}/.claude/ai-memory.db` | `sh` |
-| **iOS / Android** | Linkable mobile artifacts ship at v0.7.0 (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`); CLI use via Termux on Android — see [`../mobile-iot-deployment.md`](../mobile-iot-deployment.md) | n/a (embedded) | app-sandbox path | n/a |
+| **iOS / Android** | Linkable mobile artifacts ship at v0.7.0 (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`); CLI use via Termux on Android — see [`../mobile-iot-deployment.md`](../mobile-iot-deployment.html) | n/a (embedded) | app-sandbox path | n/a |
 
 > CI gap callout: the GitHub Actions matrix covers `ubuntu-latest`,
 > `macos-latest`, and `windows-latest` only. Every other row above —
@@ -51,7 +51,7 @@ through the v0.6.3.1 dogfood workflow. No special notes — the recipes
 - `~/.claude/` is the convention regardless of the agent host (same
   directory works for Claude Code on Linux, Cursor, Cline, etc.).
 - For systemd-managed agents (running ai-memory as a daemon under a
-  service unit), see [`docs/INSTALL.md`](../INSTALL.md). For session-boot
+  service unit), see [`docs/INSTALL.md`](../INSTALL.html). For session-boot
   integration the daemon mode is irrelevant — boot calls are stdio
   one-shots.
 
@@ -107,8 +107,8 @@ Or use the binary name alone if it's on `%PATH%`:
 ### 3. No PowerShell wrapper needed — use `ai-memory wrap`
 
 Earlier PRs in issue #487 shipped both bash and PowerShell wrapper
-snippets in [`codex-cli.md`](codex-cli.md),
-[`claude-agent-sdk.md`](claude-agent-sdk.md), etc. **PR-6 lands
+snippets in [`codex-cli.md`](codex-cli.html),
+[`claude-agent-sdk.md`](claude-agent-sdk.html), etc. **PR-6 lands
 `ai-memory wrap` as a cross-platform replacement** for those shell
 wrappers: a single Rust subcommand that runs the same code path on
 Windows, Linux, macOS, Docker, and Kubernetes. No bash, no
@@ -425,7 +425,7 @@ shared shell. Two equivalents:
    ```
 
    Wire it into your agent the same way the
-   [Codex CLI recipe](codex-cli.md) wires the local `ai-memory boot`
+   [Codex CLI recipe](codex-cli.html) wires the local `ai-memory boot`
    CLI (which remains the stdio-side equivalent).
 
 2. **`kubectl exec` (dev only).** For interactive debugging, you can
@@ -512,7 +512,7 @@ volumeMounts:
 ```
 
 The file-based flag avoids the passphrase appearing in process listings
-or `env` output. See [`docs/INSTALL.md`](../INSTALL.md) for SQLCipher
+or `env` output. See [`docs/INSTALL.md`](../INSTALL.html) for SQLCipher
 setup details.
 
 ## ARM Linux (Raspberry Pi, AWS Graviton, others)
@@ -742,8 +742,8 @@ referencing #487.
 
 ## Related
 
-- [`README.md`](README.md) — agent matrix and the universal `ai-memory boot` primitive.
-- [`../INSTALL.md`](../INSTALL.md) — full install instructions per platform.
+- [`README.md`](README.html) — agent matrix and the universal `ai-memory boot` primitive.
+- [`../INSTALL.md`](../INSTALL.html) — full install instructions per platform.
 - Issue #487 — RCA + lifetime suite + cross-files.
 - Cross-section navigation: [Kubernetes](#kubernetes) ·
   [ARM Linux](#arm-linux-raspberry-pi-aws-graviton-others) ·

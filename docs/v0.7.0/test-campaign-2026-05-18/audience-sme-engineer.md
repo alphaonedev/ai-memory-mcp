@@ -3,7 +3,7 @@ layout: doc
 ---
 # Track A NHI re-run — for SME engineers + architects (2026-05-18)
 
-This is the deep-dive page. For a one-screen summary go to [audience-c-level.md](audience-c-level.md). For the raw test grid go to [track-a-nhi-results.md](track-a-nhi-results.md). For the plain-English version go to [audience-non-technical.md](audience-non-technical.md).
+This is the deep-dive page. For a one-screen summary go to [audience-c-level.md](audience-c-level.html). For the raw test grid go to [track-a-nhi-results.md](track-a-nhi-results.html). For the plain-English version go to [audience-non-technical.md](audience-non-technical.html).
 
 ---
 

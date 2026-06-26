@@ -114,7 +114,7 @@ footer a:hover{color:var(--accent)}
       <a href="architectures.html">Tiers T1&rarr;T5</a>
       <a href="whats-new-v08.html" class="active">v0.8.0</a>
       <a href="whats-new-v07.html">v0.7.0 (prior release)</a>
-      <a href="coordination.md" style="color:#c8a2ff">Coordination</a>
+      <a href="coordination.html" style="color:#c8a2ff">Coordination</a>
       <a href="https://alphaonedev.github.io/ai-memory-discovery-gate/" style="color:#2ea043">Discovery Gate</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
@@ -135,9 +135,9 @@ footer a:hover{color:var(--accent)}
       <span>SQLite + Postgres/AGE</span>
     </div>
     <div class="cta-row">
-      <a class="solid" href="v0.8.0/release-notes.md">📓 Release notes</a>
-      <a class="violet" href="coordination.md">🧩 Coordination guide</a>
-      <a class="amber" href="federation.md">🔐 Federation hardening</a>
+      <a class="solid" href="v0.8.0/release-notes.html">📓 Release notes</a>
+      <a class="violet" href="coordination.html">🧩 Coordination guide</a>
+      <a class="amber" href="federation.html">🔐 Federation hardening</a>
       <a class="green" href="governance.html">🛡️ Governance L1&ndash;L6</a>
     </div>
   </div>
@@ -261,7 +261,7 @@ ai-memory doctor</pre>
         Federation peer-enrollment is now <strong>on by default</strong> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), and several federation paths fail closed: <code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code> is now strict unless explicitly disabled, per-transition signatures are required by default (<code>AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1</code>, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), and a forged signature is rejected unconditionally regardless of any knob.
       </p>
       <p>
-        <strong>Mitigation:</strong> enroll every peer's Ed25519 key before upgrading a fleet, or set the documented escape-hatch flags (<code>AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS</code>, a falsy <code>AI_MEMORY_FED_REQUIRE_TRANSITION_SIG</code>) for a heterogeneous-rollout window, then flip back. See <a href="federation.md">federation.md</a> and <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md">SECURITY.md &sect;v0.8.0 secure-default changes</a>.
+        <strong>Mitigation:</strong> enroll every peer's Ed25519 key before upgrading a fleet, or set the documented escape-hatch flags (<code>AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS</code>, a falsy <code>AI_MEMORY_FED_REQUIRE_TRANSITION_SIG</code>) for a heterogeneous-rollout window, then flip back. See <a href="federation.html">federation.md</a> and <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md">SECURITY.md &sect;v0.8.0 secure-default changes</a>.
       </p>
     </div>
 
@@ -288,7 +288,7 @@ ai-memory doctor</pre>
     <span class="eyebrow">The coordination primitives</span>
     <h2>Headline features in v0.8.0</h2>
     <p class="lede">
-      Every card below is anchored to the <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1709">distributed-coordination epic (#1709)</a> and a section in <a href="coordination.md">docs/coordination.md</a>. Every tool is verified against the registry (<code>src/mcp/registry.rs</code>).
+      Every card below is anchored to the <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1709">distributed-coordination epic (#1709)</a> and a section in <a href="coordination.html">docs/coordination.md</a>. Every tool is verified against the registry (<code>src/mcp/registry.rs</code>).
     </p>
 
     <div class="grid-2">
@@ -296,42 +296,42 @@ ai-memory doctor</pre>
         <span class="tag">Pillar-1 &middot; Actions</span>
         <h3>The dependency DAG</h3>
         <p>An <strong>action</strong> is one node of work &mdash; created, claimed, worked, finished &mdash; wired into a typed directed dependency DAG via <code>requires</code>/<code>unlocks</code>/<code>blocks</code>/<code>gated_by</code>/<code>sibling</code> edges. A real state machine (<code>pending</code>&rarr;<code>claimed</code>&rarr;<code>in_progress</code>&rarr;<code>done</code>/<code>failed</code>/<code>abandoned</code>) rejects every illegal transition. The <code>frontier</code> / <code>next</code> surfaces let an agent pull the next runnable node, ranked by priority. Schema <strong>v59</strong> (<code>actions</code> + <code>action_edges</code>).</p>
-        <p><a href="coordination.md">Actions &rarr;</a></p>
+        <p><a href="coordination.html">Actions &rarr;</a></p>
       </div>
 
       <div class="card violet">
         <span class="tag">Pillar-1 &middot; Leases</span>
         <h3>Single-holder, TTL-bounded claims</h3>
         <p>A lease is a heartbeat-renewed, expiry-swept claim on an action so two agents don't both work the same node. Acquisition is <strong>compare-and-swap</strong>: the second acquirer of a still-live lease loses. <code>PRIMARY KEY</code> on <code>action_id</code> enforces one holder at a time. Renew to heartbeat; only the recorded holder may release. Schema <strong>v59</strong> (<code>leases</code>).</p>
-        <p><a href="coordination.md">Leases &rarr;</a></p>
+        <p><a href="coordination.html">Leases &rarr;</a></p>
       </div>
 
       <div class="card amber">
         <span class="tag">Pillar-1 &middot; Signals</span>
         <h3>Typed, Ed25519-signed inter-agent messages</h3>
         <p>The typed messaging lane between agents. Each signal carries an Ed25519 <code>signature</code> + sender <code>signer_pubkey</code> and threads via <code>correlation_id</code> + <code>in_reply_to</code>. Types: <code>authorize</code>, <code>notify</code> (default), <code>request</code>, <code>response</code>, <code>broadcast</code>; a NULL <code>to_agent</code> broadcasts. Send / read / inbox / thread-walk / ack. Schema <strong>v60</strong> (<code>signals</code>).</p>
-        <p><a href="coordination.md">Signals &rarr;</a></p>
+        <p><a href="coordination.html">Signals &rarr;</a></p>
       </div>
 
       <div class="card green">
         <span class="tag">Pillar-1 &middot; Checkpoints</span>
         <h3>Attested conditional gates</h3>
         <p>A checkpoint blocks until a condition is resolved. Resolution is <strong>self-signed in place</strong> with the dispatch context's active Ed25519 keypair when present (landing <code>attest_level = self_signed</code>, else <code>unsigned</code>); verification re-checks that attested-resolution signature. Condition types: <code>approval</code> (default), <code>external_signal</code>, <code>condition_predicate</code>, <code>deadline</code>. Schema <strong>v61</strong> (<code>checkpoints</code>).</p>
-        <p><a href="coordination.md">Checkpoints &rarr;</a></p>
+        <p><a href="coordination.html">Checkpoints &rarr;</a></p>
       </div>
 
       <div class="card cyan">
         <span class="tag">Pillar-1 &middot; Routines</span>
         <h3>Parameterised, frozen, replayable plans</h3>
         <p>A reusable coordination template authored as a <code>draft</code>, then <strong>frozen</strong> (immutable, self-signed with an Ed25519 FREEZE-ATTESTATION over its immutable fields). <code>run</code> materialises a concrete set of actions + edges from the <code>{{param}}</code> template into a <code>routine_runs</code> record. Create / freeze / run / status / list. Schema <strong>v62</strong> (<code>routines</code> + <code>routine_runs</code>).</p>
-        <p><a href="coordination.md">Routines &rarr;</a></p>
+        <p><a href="coordination.html">Routines &rarr;</a></p>
       </div>
 
       <div class="card violet">
         <span class="tag">Pillar-2 &middot; Typed cognition</span>
         <h3>Goal / Plan / Step &mdash; a plan lives in the store</h3>
         <p>Ordinary memories gain the shape of a plan so the coordination DAG has a cognitive counterpart. New <code>memory_kind</code> values <code>goal</code> / <code>plan</code> / <code>step</code>; a first-class <code>lifecycle_state</code> column (schema <strong>v64</strong>: <code>open</code>&rarr;<code>active</code>&rarr;<code>blocked</code>/<code>done</code>/<code>abandoned</code>, enforced at the <code>memory_update</code> boundary); and three new typed link relations (schema <strong>v63</strong>): <code>decomposes_into</code>, <code>depends_on</code>, <code>advances</code> &mdash; extending the closed taxonomy from 6 &rarr; 9. Additive, permissive options &mdash; no new tool.</p>
-        <p><a href="coordination.md">Typed cognition &rarr;</a></p>
+        <p><a href="coordination.html">Typed cognition &rarr;</a></p>
       </div>
 
       <div class="card green">
@@ -345,7 +345,7 @@ ai-memory doctor</pre>
         <span class="tag">Federation &middot; secure by default</span>
         <h3>Fleets that don't have to trust each other</h3>
         <p>Peer enrollment on by default (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), per-transition signatures on authority-granting writes (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), per-write content attestation on relayed memories (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>), 16-byte CSPRNG transition-replay nonces (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1805">#1805</a>), and outbound peer server-cert pinning (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1678">#1678</a>). The trust is in the Ed25519 signatures, not in good behavior.</p>
-        <p><a href="federation.md">Federation &rarr;</a></p>
+        <p><a href="federation.html">Federation &rarr;</a></p>
       </div>
     </div>
   </div>
@@ -422,7 +422,7 @@ ai-memory doctor</pre>
     <span class="eyebrow">Surface area</span>
     <h2>New coordination tool families in v0.8.0</h2>
     <p class="lede">
-      Pillar-1 adds <strong>26</strong> coordination tools across five families (the MCP surface grows to <strong>100</strong> advertised entries at <code>--profile full</code> &mdash; 99 callable + the always-on <code>memory_capabilities</code> bootstrap). Pillar-2 adds <strong>no</strong> new tool &mdash; its Goal/Plan/Step shape rides on additive, permissive fields of <code>memory_store</code>/<code>memory_update</code>. Each tool is verified against <code>src/mcp/registry.rs</code> and documented in <a href="coordination.md"><code>docs/coordination.md</code></a>.
+      Pillar-1 adds <strong>26</strong> coordination tools across five families (the MCP surface grows to <strong>100</strong> advertised entries at <code>--profile full</code> &mdash; 99 callable + the always-on <code>memory_capabilities</code> bootstrap). Pillar-2 adds <strong>no</strong> new tool &mdash; its Goal/Plan/Step shape rides on additive, permissive fields of <code>memory_store</code>/<code>memory_update</code>. Each tool is verified against <code>src/mcp/registry.rs</code> and documented in <a href="coordination.html"><code>docs/coordination.md</code></a>.
     </p>
 
     <table>
@@ -459,21 +459,21 @@ ai-memory doctor</pre>
         <span class="tag">Coordination guide</span>
         <h3>docs/coordination.md</h3>
         <p>The canonical write-up of Pillar-1 + Pillar-2: actions, leases, signals, checkpoints, routines, the HTTP write surfaces, and the typed-cognition kinds + <code>lifecycle_state</code> machine + new link relations. Every tool is verified against <code>src/mcp/registry.rs</code>; every schema number is cited.</p>
-        <p><a href="coordination.md" style="color:var(--p3)">Read the coordination guide &rarr;</a></p>
+        <p><a href="coordination.html" style="color:var(--p3)">Read the coordination guide &rarr;</a></p>
       </div>
 
       <div class="card cyan">
         <span class="tag">Release notes</span>
         <h3>v0.8.0 release notes</h3>
         <p>Full track-by-track ship status, the schema v57 &rarr; v70 migration ladder (v58&ndash;v70), the secure-default flips, and the upgrade / compatibility section. The operator's source of truth for what changed since v0.7.0.</p>
-        <p><a href="v0.8.0/release-notes.md" style="color:var(--p1)">Open the release notes &rarr;</a></p>
+        <p><a href="v0.8.0/release-notes.html" style="color:var(--p1)">Open the release notes &rarr;</a></p>
       </div>
 
       <div class="card amber">
         <span class="tag">Federation &amp; security posture</span>
         <h3>Hardened, secure by default</h3>
         <p>The federation hardening surface &mdash; enrollment, per-transition signatures, per-write content attestation, replay nonces, peer-cert pinning &mdash; with the exact env-var knobs, fail-closed defaults, and rollout escape-hatches. Read this before upgrading a fleet.</p>
-        <p><a href="federation.md" style="color:var(--p2)">Open federation.md &rarr;</a></p>
+        <p><a href="federation.html" style="color:var(--p2)">Open federation.md &rarr;</a></p>
       </div>
 
       <div class="card green">
@@ -535,9 +535,9 @@ sudo dnf install ai-memory</pre>
   <div class="container">
     <div class="footer-links">
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
-      <a href="v0.8.0/release-notes.md">Release notes</a>
-      <a href="coordination.md">Coordination guide</a>
-      <a href="federation.md">Federation</a>
+      <a href="v0.8.0/release-notes.html">Release notes</a>
+      <a href="coordination.html">Coordination guide</a>
+      <a href="federation.html">Federation</a>
       <a href="governance.html">Governance</a>
       <a href="whats-new-v07.html">v0.7.0 (prior release)</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/INSTALL.md">Install Guide</a>

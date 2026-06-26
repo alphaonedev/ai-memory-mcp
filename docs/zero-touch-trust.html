@@ -242,7 +242,7 @@ blockquote strong{color:var(--p1)}
       <strong>Adding a node reconfigures nobody.</strong> A node proves who it is via attestation, a CA mints it a short-lived credential, and receivers verify that credential against a small trust bundle holding only the CA's key. No peer-to-peer <code>.pub</code> copy. No restart fan-out. The trust domain grows by trusting the CA — not by introducing every node to every other node.
     </blockquote>
     <p>This is the <strong>shape</strong> of SPIFFE/SPIRE (CA-rooted, attestation-issued, short-lived, auto-rotating) but <strong>first-party</strong>: it composes the Ed25519 sign/verify and canonical-CBOR primitives already in <code>ai-memory</code>. <strong>No new dependency</strong> — no rcgen, no openssl, no X.509.</p>
-    <p>Full operator + configuration reference: <a href="federation-identity.md" style="color:var(--p1)">docs/federation-identity.md</a>. Transport hardening beneath it (mTLS, X-API-Key, peer attestation): <a href="federation.md" style="color:var(--p1)">docs/federation.md</a>.</p>
+    <p>Full operator + configuration reference: <a href="federation-identity.html" style="color:var(--p1)">docs/federation-identity.md</a>. Transport hardening beneath it (mTLS, X-API-Key, peer attestation): <a href="federation.html" style="color:var(--p1)">docs/federation.md</a>.</p>
   </div>
 </section>
 
@@ -401,7 +401,7 @@ $env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"</code></pre>
     <blockquote>
       <strong>One footgun:</strong> <code>issuer-id</code> MUST be slash-free. <code>TrustBundle::from_dir</code> is non-recursive, so a slashed id would nest the published <code>&lt;issuer-id&gt;.pub</code> in a skipped sub-dir → empty bundle → <code>UnknownIssuer</code>. The tool's <code>validate_issuer_id</code> rejects it at the boundary; node <code>subject-agent-id</code>s, by contrast, may be slashed.
     </blockquote>
-    <p>The push-based <code>deploy/hive-1461/provision/45_zero_touch.sh</code> drives these four verbs per peer: mint the CA once, then per peer generate a keypair, issue a credential, fan out <code>keys/</code> + <code>trust/</code> + <code>credential</code> to <code>/etc/ai-memory</code> (private key <code>0400</code>, public <code>0444</code>), and append the five daemon env vars. Agents and <code>ctrl</code> are pure mTLS API clients, not mesh members, and are skipped. Step-by-step: <a href="zero-touch-quickstart.md" style="color:var(--p1)">docs/zero-touch-quickstart.md</a>.</p>
+    <p>The push-based <code>deploy/hive-1461/provision/45_zero_touch.sh</code> drives these four verbs per peer: mint the CA once, then per peer generate a keypair, issue a credential, fan out <code>keys/</code> + <code>trust/</code> + <code>credential</code> to <code>/etc/ai-memory</code> (private key <code>0400</code>, public <code>0444</code>), and append the five daemon env vars. Agents and <code>ctrl</code> are pure mTLS API clients, not mesh members, and are skipped. Step-by-step: <a href="zero-touch-quickstart.html" style="color:var(--p1)">docs/zero-touch-quickstart.md</a>.</p>
   </div>
 </section>
 
@@ -428,9 +428,9 @@ $env:AI_MEMORY_FED_IDENTITY     = "region/nyc/node-1"</code></pre>
     <span class="eyebrow">Next</span>
     <h2>Where to go.</h2>
     <ul>
-      <li>→ <a href="zero-touch-quickstart.md" style="color:var(--p1)">Zero-touch quickstart</a> — the concrete operator how-to: the <code>fed_issue</code> verbs, on-disk layout, and the push-based enrollment flow.</li>
-      <li>→ <a href="federation-identity.md" style="color:var(--p1)">Federation identity at scale</a> — the full configuration + admin reference (every env var, the inventory schema, the rollout playbook).</li>
-      <li>→ <a href="federation.md" style="color:var(--p1)">Federation hardening</a> — the mTLS / X-API-Key / peer-attestation transport layer beneath this.</li>
+      <li>→ <a href="zero-touch-quickstart.html" style="color:var(--p1)">Zero-touch quickstart</a> — the concrete operator how-to: the <code>fed_issue</code> verbs, on-disk layout, and the push-based enrollment flow.</li>
+      <li>→ <a href="federation-identity.html" style="color:var(--p1)">Federation identity at scale</a> — the full configuration + admin reference (every env var, the inventory schema, the rollout playbook).</li>
+      <li>→ <a href="federation.html" style="color:var(--p1)">Federation hardening</a> — the mTLS / X-API-Key / peer-attestation transport layer beneath this.</li>
       <li>→ <a href="agent-identity.html" style="color:var(--p1)">Agent identity (NHI)</a> — the per-memory provenance this trust domain authenticates.</li>
       <li>→ <a href="architectures-t5.html" style="color:var(--p1)">Architectures · T5 — Global Hive</a> — zero-touch trust at fleet scale.</li>
     </ul>

@@ -3,7 +3,7 @@ layout: doc
 ---
 # AI NHI dogfood test — for SME engineers + architects (2026-05-18)
 
-This is the deep-dive page. For a one-screen summary go to [audience-c-level.md](audience-c-level.md). For the flat finding list go to [findings.md](findings.md). For the plain-English version go to [audience-non-technical.md](audience-non-technical.md).
+This is the deep-dive page. For a one-screen summary go to [audience-c-level.md](audience-c-level.html). For the flat finding list go to [findings.md](findings.html). For the plain-English version go to [audience-non-technical.md](audience-non-technical.html).
 
 ---
 
@@ -241,7 +241,7 @@ The Phase B v1 run was the run that surfaced the four findings. Its captured out
 
 The v2 retest is structurally important: it is the "all five Gap probes pass on a single fresh DB against a single binary build" evidence. Prior to v2, the fix-and-retest cycle was per-gap; the v2 run proves the fixes do not interfere with each other and that the schema sequence is stable on a cold DB.
 
-The single residual quirk in the v2 log is the `LINK check (supersedes)` block returning an SQL error: `Error: in prepare, no such table: archive`. This is a typo in the retest script (`phase_b_revalidate.sh` line 59) — the actual table is `archived_memories`, not `archive`. The script's intent was to verify the OLD row was archived; the typo means the script silently failed to verify, but the Gap 5 response itself contains both `superseded_id` and `metadata.superseded_id`, which are the load-bearing verification artifacts. The typo is documented under [findings.md](findings.md) item 5 as a test-script defect (not a product defect).
+The single residual quirk in the v2 log is the `LINK check (supersedes)` block returning an SQL error: `Error: in prepare, no such table: archive`. This is a typo in the retest script (`phase_b_revalidate.sh` line 59) — the actual table is `archived_memories`, not `archive`. The script's intent was to verify the OLD row was archived; the typo means the script silently failed to verify, but the Gap 5 response itself contains both `superseded_id` and `metadata.superseded_id`, which are the load-bearing verification artifacts. The typo is documented under [findings.md](findings.html) item 5 as a test-script defect (not a product defect).
 
 ---
 

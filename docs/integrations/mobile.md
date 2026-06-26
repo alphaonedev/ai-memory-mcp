@@ -13,7 +13,7 @@ layout: doc
 > [#1247](https://github.com/alphaonedev/ai-memory-mcp/issues/1247).
 
 For the broader mobile / IoT operator guide, see
-[`docs/mobile-iot-deployment.md`](../mobile-iot-deployment.md). For the
+[`docs/mobile-iot-deployment.md`](../mobile-iot-deployment.html). For the
 release pipeline jobs that produce the artifacts, see
 [`.github/workflows/release.yml`](../../.github/workflows/release.yml)
 (`mobile-ios` + `mobile-android` jobs).
@@ -184,4 +184,4 @@ verify artifact integrity TODAY using:
 - Build pipeline source: [`.github/workflows/release.yml`](../../.github/workflows/release.yml)
   (`mobile-ios` + `mobile-android` jobs).
 - Operator guide for running ai-memory on a phone / IoT device:
-  [`docs/mobile-iot-deployment.md`](../mobile-iot-deployment.md).
+  [`docs/mobile-iot-deployment.md`](../mobile-iot-deployment.html).

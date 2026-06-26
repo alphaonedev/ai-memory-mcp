@@ -237,9 +237,9 @@ architecture every node satisfies the policy by construction.</p>
 <a href="enterprise-cpu-memory.html">Enterprise Reference Architecture: CPU + Memory Federated Nodes</a>
 (API embeddings, no Ollama anywhere). The visual catalog of all
 deployment topologies is
-<a href="../reference-architectures.md"><code>docs/reference-architectures.md</code></a>;
+<a href="../reference-architectures.html"><code>docs/reference-architectures.md</code></a>;
 capacity / cost / SLA planning is
-<a href="../enterprise-deployment.md"><code>docs/enterprise-deployment.md</code></a>.</p>
+<a href="../enterprise-deployment.html"><code>docs/enterprise-deployment.md</code></a>.</p>
 <h2 id="topology">Topology</h2>
 <pre><code>                      federated mesh (N nodes, W-of-N quorum)
    ┌────────────────────────────────────────────────────────────────────┐
@@ -304,7 +304,7 @@ batch; per-row fallback + skip-with-WARN applies on this backend the
 same as on API backends.</p>
 <h2 id="federation-skeleton">Federation skeleton</h2>
 <p>Identical to the CPU-only sibling — the embedder leg is the only
-difference. Per <a href="../federation.md"><code>docs/federation.md</code></a>: TLS + mTLS
+difference. Per <a href="../federation.html"><code>docs/federation.md</code></a>: TLS + mTLS
 fingerprint allowlist at the transport layer, <code>--api-key</code> at the
 application layer, per-message Ed25519 signed sync (<code>X-Memory-Sig</code> +
 <code>X-Memory-Nonce</code>, secure-by-default at v0.7.0) with peer enrollment
@@ -398,11 +398,11 @@ the serving tier.</p>
 <ul>
 <li><a href="enterprise-cpu-memory.html">CPU + Memory sibling architecture</a> —
   cloud + airgapped API-embedding shapes, sizing and security posture.</li>
-<li><a href="../v0.7.0/release-notes.md"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
+<li><a href="../v0.7.0/release-notes.html"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
   — the #1598 change inventory.</li>
-<li><a href="../RUNBOOK-ollama-kv-tuning.md"><code>docs/RUNBOOK-ollama-kv-tuning.md</code></a>
+<li><a href="../RUNBOOK-ollama-kv-tuning.html"><code>docs/RUNBOOK-ollama-kv-tuning.md</code></a>
   — Ollama serving tunables on GPU nodes.</li>
-<li><a href="../federation.md"><code>docs/federation.md</code></a> — hardening + quorum
+<li><a href="../federation.html"><code>docs/federation.md</code></a> — hardening + quorum
   tuning.</li>
 </ul>
 </main>

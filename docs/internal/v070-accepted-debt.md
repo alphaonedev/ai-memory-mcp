@@ -3,10 +3,10 @@ layout: doc
 ---
 # v0.7.0 Accepted Debt Register
 
-> Companion to [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.md)
+> Companion to [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.html)
 > and the per-cluster fix PRs. This document triages every Cluster L /
 > INFO finding from the 6-reviewer synthesis
-> ([`v070-review-synthesis.md`](v070-review-synthesis.md)) into one of
+> ([`v070-review-synthesis.md`](v070-review-synthesis.html)) into one of
 > three buckets:
 >
 > 1. **Already-fixed-by-sibling-cluster** — the finding was absorbed

@@ -11,7 +11,7 @@ talks to ai-memory.
 This is the **operator** doc: how to turn it on, what it does, how to
 ship the lines into your SIEM, and how the regulatory mappings line
 up. The **developer** schema reference lives in
-[`audit-schema.md`](./audit-schema.md).
+[`audit-schema.md`](./audit-schema.html).
 
 ---
 

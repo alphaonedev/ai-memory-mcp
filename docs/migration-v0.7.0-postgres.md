@@ -8,7 +8,7 @@ layout: doc
 > direction (postgres → sqlite) is also supported and uses the same
 > tool.
 >
-> See also: [`postgres-age-guide.md`](postgres-age-guide.md) for the
+> See also: [`postgres-age-guide.md`](postgres-age-guide.html) for the
 > postgres+AGE install and configuration prerequisites; this guide
 > assumes those steps are already done.
 
@@ -352,9 +352,9 @@ credential and a password-less URL where your postgres setup allows it.
 
 ## References
 
-- v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md)
-- Postgres+AGE operator guide: [`postgres-age-guide.md`](postgres-age-guide.md)
-- Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.md)
+- v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
+- Postgres+AGE operator guide: [`postgres-age-guide.md`](postgres-age-guide.html)
+- Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.html)
 - Schema parity gap (pre-Wave-2 reference): the table in
   `ai-memory-a2a-v0.7.0/docs/coverage.md` "Schema parity gap"
   section (now closed in v0.7.0).

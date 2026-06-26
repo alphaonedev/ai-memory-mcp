@@ -5,7 +5,7 @@ layout: doc
 
 ASCII topology diagrams + sizing notes for every deployment shape
 ai-memory ships against. The narrative companion to this file is
-[`docs/enterprise-deployment.md`](enterprise-deployment.md) — that
+[`docs/enterprise-deployment.md`](enterprise-deployment.html) — that
 document describes capacity / cost / SLA / staffing per tier. This
 file is the **visual catalog**: each topology gets one ASCII art
 block, a short explanation, a "when to choose this" callout, and a
@@ -78,7 +78,7 @@ that agent. You do not need cross-machine sync, multi-agent
 coordination, or multi-user separation. This is the install-and-go
 default — every `ai-memory install claude-code` lands you here.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-1)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-1)
 "Tier 1 — Personal substrate"
 
 ---
@@ -130,7 +130,7 @@ WAL level.
 clients, or a single-server dev environment where multiple
 agents collaborate. No cross-machine sync needed yet.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-2)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-2)
 "Tier 2 — Team-shared substrate"
 
 ---
@@ -182,7 +182,7 @@ deployment where you want HA across servers but everything fits
 in one rack. The quorum guarantee survives any single-peer
 failure. Cross-rack / cross-DC sync not yet needed.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-3)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-3)
 "Tier 3 — Rack-scale HA cluster"
 
 ---
@@ -250,7 +250,7 @@ fault tolerance requirements, where any single rack can fail
 is high enough that you want recall to stay sub-5ms even when
 the local peer cache misses.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-4)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-4)
 "Tier 4 — Datacenter-scale fleet"
 
 ---
@@ -320,7 +320,7 @@ isolation requirements (financial, healthcare, public sector).
 Single-region durability + tolerable cross-DC write latency
 (commit budget ≥5 ms is fine for most agent workloads).
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-5)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-5)
 "Tier 5 — Multi-DC regional"
 
 ---
@@ -377,7 +377,7 @@ agents are distributed across continents. The latency budget
 forbids synchronous cross-region replication, but durability
 demands cross-region presence.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-6)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-6)
 "Tier 6 — Global federated"
 
 ---
@@ -436,7 +436,7 @@ graceful degradation, not catastrophic loss. The cost: O(n²)
 connections, which caps practical mesh size around 50–100 peers
 before gossip overhead dominates.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-7)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-7)
 "Tier 7 — Open swarm / federated cooperative"
 
 ---
@@ -507,7 +507,7 @@ hardware footprint of a major cloud provider, a major
 telecom, or a sovereign government — millions of agents,
 billions of memories, multi-decade forensic retention.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-8)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-8)
 "Tier 8 — Global hive / hyperscale"
 
 ---
@@ -590,7 +590,7 @@ critical design points:
   holds the cross-device + cross-account memory.
 - **LLM-heavy operations defer to the hub.** The mobile-friendly
   MCP subset (see
-  [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.md#10-sync-patterns--edge-device-to-regional-hub))
+  [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html#10-sync-patterns--edge-device-to-regional-hub))
   excludes `memory_consolidate`, `memory_reflect`,
   `memory_atomise`, and `memory_kg_query` from on-device use.
   Those tools forward to the hub via the AI agent, which is
@@ -604,7 +604,7 @@ cannot host the full substrate. Phones with on-device
 assistants, IoT sensor networks, drone surveys, automotive
 fleets, wearable-paired assistants.
 
-→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.md#topology-9)
+→ matches [`docs/enterprise-deployment.md`](enterprise-deployment.html#topology-9)
 "Tier 9 — Mobile-edge fleet"
 
 ---
@@ -692,7 +692,7 @@ them know why they are off the supported list:
   / `memory_find_paths`) fall back automatically to the
   recursive-CTE walk over `memory_links` on vanilla Postgres — the
   answers are equivalence-tested against AGE
-  (see [`docs/kg-backend-fallback.md`](kg-backend-fallback.md)).
+  (see [`docs/kg-backend-fallback.md`](kg-backend-fallback.html)).
   What you lose without AGE is the cypher-path speedup, not the
   feature. Deploy AGE alongside Postgres when KG traversal volume
   is high.
@@ -701,18 +701,18 @@ them know why they are off the supported list:
 
 ## See also
 
-- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.md) —
+- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) —
   the deployment-guide companion to topology 9; resource
   envelopes for phones / IoT / drones; supported targets matrix;
   battery + sync recommendations.
-- [`docs/enterprise-deployment.md`](enterprise-deployment.md) —
+- [`docs/enterprise-deployment.md`](enterprise-deployment.html) —
   capacity / cost / SLA / staffing for every tier; the textual
   companion to this file.
 - [`docs/architectures.html`](architectures.html) — the website
   tier overview (interactive).
-- [`docs/federation.md`](federation.md) — the federation
+- [`docs/federation.md`](federation.html) — the federation
   protocol details (HMAC, nonce, quorum, DLQ).
-- [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
+- [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html)
   — how to migrate from sqlite to Postgres+AGE for the
   archive-tier of topologies 4–8.
 - [`.github/workflows/mobile-runtime.yml`](../.github/workflows/mobile-runtime.yml)

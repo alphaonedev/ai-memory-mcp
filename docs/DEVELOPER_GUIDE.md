@@ -268,7 +268,7 @@ Defines the `AutonomyLlm` trait so the curator can be unit-tested without a live
 
 ### `src/replication.rs`
 
-W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the contract described in [`ADR-0001-quorum-replication.md`](ADR-0001-quorum-replication.md). The `QuorumWriter` sits ABOVE the existing sync-daemon — deployments without `--quorum-writes` keep the v0.6.0 one-way push behaviour byte-for-byte. Public API: `QuorumPolicy`, `QuorumWriter::commit`, `AckTracker`. Emits metrics: `replication_quorum_ack_total{result}`, `replication_quorum_failures_total{reason}`, `replication_clock_skew_seconds`.
+W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the contract described in [`ADR-0001-quorum-replication.md`](ADR-0001-quorum-replication.html). The `QuorumWriter` sits ABOVE the existing sync-daemon — deployments without `--quorum-writes` keep the v0.6.0 one-way push behaviour byte-for-byte. Public API: `QuorumPolicy`, `QuorumWriter::commit`, `AckTracker`. Emits metrics: `replication_quorum_ack_total{result}`, `replication_quorum_failures_total{reason}`, `replication_clock_skew_seconds`.
 
 ### `src/federation/`
 
@@ -1196,7 +1196,7 @@ When this repository is being driven by the `campaign` Python harness
 (at `alphaonedev/agentic-mem-labs/tools/campaign/`, Apache 2.0 ©
 AlphaOne LLC), the development workflow is the same workflow described
 above plus the constraints in
-[`ENGINEERING_STANDARDS.md` §7](ENGINEERING_STANDARDS.md#7-autonomous-campaign-workflow).
+[`ENGINEERING_STANDARDS.md` §7](ENGINEERING_STANDARDS.html#7-autonomous-campaign-workflow).
 
 ### Concurrent operation
 

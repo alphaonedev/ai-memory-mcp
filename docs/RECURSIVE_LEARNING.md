@@ -48,11 +48,11 @@ MCP deployments are enumerated in the National Security Agency's
 Cybersecurity Information document on Model Context Protocol
 security (`U/OO/6030316-26`, May 2026). Substrate compliance with
 those requirements is documented at
-[`docs/compliance/nsa-csi-mcp-security-mapping.md`](compliance/nsa-csi-mcp-security-mapping.md)
+[`docs/compliance/nsa-csi-mcp-security-mapping.md`](compliance/nsa-csi-mcp-security-mapping.html)
 (10 of 10 NSA concerns + 7 of 7 NSA recommendations structurally
 addressed at v0.7.0); the honest-limitations framing for what the
 substrate does NOT defend against is at
-[`docs/compliance/honest-limitations.md`](compliance/honest-limitations.md).
+[`docs/compliance/honest-limitations.md`](compliance/honest-limitations.html).
 
 ---
 
@@ -77,11 +77,11 @@ fine-tuning loops, no unbounded recursion — the substrate refuses
 runaway recursion before any write opens.
 
 This page is the engineering-precise primer. The procurement-level
-introduction lives in [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
+introduction lives in [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html).
 The CHANGELOG block sits under v0.7.0 in [`../CHANGELOG.md`](../CHANGELOG.md).
 The category-level comparison against other agent-memory projects
 (mem0, Letta, Tencent TencentDB Agent Memory, etc.) lives in
-[`positioning.md`](positioning.md).
+[`positioning.md`](positioning.html).
 
 ## Conceptual model
 
@@ -375,7 +375,7 @@ Key contracts ([`src/curator/reflection_pass.rs`](../src/curator/reflection_pass
 
 Operator-facing surface lives in `ai-memory curator --reflect`
 ([`src/cli/curator.rs`](../src/cli/curator.rs)). Operational runbook
-sits at [`docs/RUNBOOK-curator-soak.md`](RUNBOOK-curator-soak.md).
+sits at [`docs/RUNBOOK-curator-soak.md`](RUNBOOK-curator-soak.html).
 
 ## Federation behavior (L2-2)
 
@@ -492,14 +492,14 @@ promote) and refuses depths below
 produces the IDENTICAL SHA-256 digest as the in-DB row — the lineage
 is preserved cryptographically across promotion and re-registration.
 
-Full surface is documented in [`docs/agent-skills.md`](agent-skills.md);
+Full surface is documented in [`docs/agent-skills.md`](agent-skills.html);
 this section pins the substrate-side contract for the reflection ↔
 skill bridge.
 
 ## Forensic export
 
 The forensic-bundle and `verify-reflection-chain` surfaces are
-documented in [`docs/forensic-export.md`](forensic-export.md). Both
+documented in [`docs/forensic-export.md`](forensic-export.html). Both
 are the procurement-grade audit path for reflection chains: a
 single tar an external auditor can re-verify with no daemon state,
 just the public keys of the signing agents.
@@ -638,7 +638,7 @@ that elides the wiring gap as inaccurate.
   depth-bounded primitive for codifying agent learnings into
   reusable, signed, machine-checkable assets. The v0.7.0
   `composes_with_reflections` SKILL.md frontmatter field
-  ([`docs/agent-skills.md` §SKILL.md format](agent-skills.md#skillmd-format--frontmatter))
+  ([`docs/agent-skills.md` §SKILL.md format](agent-skills.html#skillmd-format--frontmatter))
   is the wire-compatible precursor: the field name, type, and
   semantics carry forward; the v0.9 epic promotes it from
   declaration to enforceable manifest with cross-skill linkage
@@ -648,10 +648,10 @@ that elides the wiring gap as inaccurate.
 
 - CHANGELOG entry: [`../CHANGELOG.md`](../CHANGELOG.md) §v0.7.0
   ("v0.7.0 recursive-learning add-on")
-- Release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md)
+- Release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
   §"Substrate-Native Recursive Learning Grand-Slam"
-- Agent Skills primer: [`agent-skills.md`](agent-skills.md)
-- Forensic export primer: [`forensic-export.md`](forensic-export.md)
+- Agent Skills primer: [`agent-skills.md`](agent-skills.html)
+- Forensic export primer: [`forensic-export.md`](forensic-export.html)
 - Tracker issue: [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)
 - L2 wave tracker issues: [#666](https://github.com/alphaonedev/ai-memory-mcp/issues/666) (curator), [#667](https://github.com/alphaonedev/ai-memory-mcp/issues/667) (federation), [#668](https://github.com/alphaonedev/ai-memory-mcp/issues/668) (invalidation), [#669](https://github.com/alphaonedev/ai-memory-mcp/issues/669) (transcript-union replay), [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670) (forensic bundle), [#671](https://github.com/alphaonedev/ai-memory-mcp/issues/671) (reflection-as-skill), [#672](https://github.com/alphaonedev/ai-memory-mcp/issues/672) (skill composition), [#673](https://github.com/alphaonedev/ai-memory-mcp/issues/673) (reranker boost)
 - Substrate-authority issues: [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691) (rules engine, L1-6 Deliverable E), [#693](https://github.com/alphaonedev/ai-memory-mcp/issues/693) (rules engine v2 / Option B), [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) (v0.8.0 100% coverage epic)
@@ -662,7 +662,7 @@ that elides the wiring gap as inaccurate.
 - Task 5 commit: [`c61a05b`](https://github.com/alphaonedev/ai-memory-mcp/commit/c61a05b)
 - Task 6 commit: [`fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit/fbf093c)
 - L2 merge commits: [`c3f6e82`](https://github.com/alphaonedev/ai-memory-mcp/commit/c3f6e82) (L2-1), [`0b1c9cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b1c9cc) (L2-2), [`3f419be`](https://github.com/alphaonedev/ai-memory-mcp/commit/3f419be) (L2-3), [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c) (L2-4), [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3) (L2-5), [`505c538`](https://github.com/alphaonedev/ai-memory-mcp/commit/505c538) (L2-6), [`0966b57`](https://github.com/alphaonedev/ai-memory-mcp/commit/0966b57) (L2-7), [`90291c0`](https://github.com/alphaonedev/ai-memory-mcp/commit/90291c0) (L2-8)
-- v0.7.0 epic scope: [`v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md)
+- v0.7.0 epic scope: [`v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.html)
 - ROADMAP context: [`../ROADMAP.md`](../ROADMAP.md) §7.4 (recursive
   learning) and §Pillar 2.5 (reflection-pass curator + cascade rollback)
 - Reproducibility script: [`../scripts/reproduce-recursive-learning.sh`](../scripts/reproduce-recursive-learning.sh)

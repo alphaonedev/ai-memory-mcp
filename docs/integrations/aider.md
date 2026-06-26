@@ -16,7 +16,7 @@ file to `aider --message-file`. The Rust-native cross-platform
 equivalent is `ai-memory wrap aider` (PR-6 of issue #487) — same
 semantics, no shell required.
 
-> **Note on ai-memory's own LLM backend.** This doc covers Aider AS the AI client (reading ai-memory boot output). If you also want ai-memory's smart/autonomous-tier features (query expansion, auto-tag, contradiction detection — which call out to an LLM internally), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` — every surface (CLI, MCP, HTTP daemon, boot banner) reads the same file. See [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md). Shell-export overrides (`export AI_MEMORY_LLM_BACKEND=...` in `.zshrc`) still work for the CLI subprocess Aider launches. For the MCP-server posture (where shell exports do NOT reach the spawned subprocess), see [`llm-backends.md`](llm-backends.md).
+> **Note on ai-memory's own LLM backend.** This doc covers Aider AS the AI client (reading ai-memory boot output). If you also want ai-memory's smart/autonomous-tier features (query expansion, auto-tag, contradiction detection — which call out to an LLM internally), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` — every surface (CLI, MCP, HTTP daemon, boot banner) reads the same file. See [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html). Shell-export overrides (`export AI_MEMORY_LLM_BACKEND=...` in `.zshrc`) still work for the CLI subprocess Aider launches. For the MCP-server posture (where shell exports do NOT reach the spawned subprocess), see [`llm-backends.md`](llm-backends.html).
 
 ## Wrapper script
 
@@ -84,7 +84,7 @@ installer issue for one-line bootstrap.
 
 Aider streams the `--message-file` contents into the chat as the first
 turn, so the `ai-memory boot` status header is visible in the
-transcript. The four headers documented in [`README.md`](README.md)
+transcript. The four headers documented in [`README.md`](README.html)
 tell `ok` / `info-empty` / `info-greenfield` / `warn-db` apart. If you
 see neither header nor body, the wrapper didn't run — check `which
 aider` resolves to the wrapper.
@@ -117,7 +117,7 @@ This recipe will be updated in place once the hook lands.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the universal
+- [`README.md`](README.html) — integration matrix and the universal
   primitive.
-- [`codex-cli.md`](codex-cli.md) — same wrapper-script pattern.
+- [`codex-cli.md`](codex-cli.html) — same wrapper-script pattern.
 - Issue #487 — RCA + cross-files for the Aider hook request.

@@ -81,7 +81,7 @@ Refuse actually BLOCKS the tool** (see §"Claude Code integration").
 ## Pillar-1 — distributed coordination substrate ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
 The coordination machinery, all on both the sqlite and postgres SAL
-adapters. Full tool reference: [`docs/coordination.md`](../coordination.md).
+adapters. Full tool reference: [`docs/coordination.md`](../coordination.html).
 
 - **Actions — the dependency DAG (schema v59).** A typed action node
   with a state machine (`pending` → `claimed` → `in_progress` →
@@ -352,7 +352,7 @@ cognitive counterpart in the memory store itself.
 ## Claude Code integration
 
 ai-memory ships two managed Claude Code integration surfaces. Full
-reference: [`docs/integrations/claude-code.md`](../integrations/claude-code.md).
+reference: [`docs/integrations/claude-code.md`](../integrations/claude-code.html).
 
 ### SessionStart boot hook + MCP server (`--apply`)
 

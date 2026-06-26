@@ -126,9 +126,9 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       <span>updated 2026-06-10</span>
     </div>
     <div class="cta-row">
-      <a class="solid" href="V0.7-EPIC.md">📐 V0.7 EPIC</a>
-      <a class="amber" href="../MIGRATION_v0.7.md">📖 Migration v0.7</a>
-      <a class="violet" href="rfc-attested-cortex.md">📑 RFC: attested-cortex</a>
+      <a class="solid" href="V0.7-EPIC.html">📐 V0.7 EPIC</a>
+      <a class="amber" href="../MIGRATION_v0.7.html">📖 Migration v0.7</a>
+      <a class="violet" href="rfc-attested-cortex.html">📑 RFC: attested-cortex</a>
       <a class="green" href="https://alphaonedev.github.io/ai-memory-discovery-gate/">🟢 Discovery Gate</a>
     </div>
   </div>
@@ -296,7 +296,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
     <span class="eyebrow">What each column means</span>
     <h2>Feature glossary</h2>
     <p class="lede">Each v0.7 feature column maps to one or more tracks in
-      <a href="V0.7-EPIC.md">V0.7-EPIC.md</a>. The references below tie each cell&rsquo;s status back
+      <a href="V0.7-EPIC.html">V0.7-EPIC.md</a>. The references below tie each cell&rsquo;s status back
       to a specific PR / RFC section / migration paragraph.</p>
 
     <div class="grid-2">
@@ -310,8 +310,8 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         all of v0.7.x. <em>Universal support</em>: any harness that already speaks
         <code>memory_capabilities</code> receives v3 transparently.</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="canonical-phrasings.md">canonical-phrasings.md</a> &middot;
-        <a href="rfc-attested-cortex.md#compatibility-matrix">RFC §Compatibility matrix</a></p>
+        <a href="canonical-phrasings.html">canonical-phrasings.md</a> &middot;
+        <a href="rfc-attested-cortex.html#compatibility-matrix">RFC §Compatibility matrix</a></p>
       </div>
 
       <div class="card amber">
@@ -323,7 +323,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         <code>memory_capabilities(family=&hellip;, include_schema=true)</code> as the canonical
         runtime-expansion path. Ships in the default <code>core</code> profile at v0.7.0.</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track B</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track B</a></p>
       </div>
 
       <div class="card violet">
@@ -335,7 +335,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         C. This is the cortex-fluent answer to the v0.6.4 fancy-notebook framing &mdash;
         the agent describes what it wants, not which tools to load.</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track B</a> &middot;
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track B</a> &middot;
         <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/546">#546</a></p>
       </div>
 
@@ -349,8 +349,8 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         <code>AskUser</code>), per-event-class hard timeouts, and SIGHUP hot reload. Server-side
         feature; transparent to the harness. <strong>✅ universal.</strong></p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track G</a> &middot;
-        <a href="rfc-attested-cortex.md">RFC §Hook pipeline</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track G</a> &middot;
+        <a href="rfc-attested-cortex.html">RFC §Hook pipeline</a></p>
       </div>
 
       <div class="card cyan">
@@ -362,8 +362,8 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         / <code>peer_attested</code>) returned in every link record. Server-side &mdash; harness
         sees only the new field. <strong>✅ universal.</strong></p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track H</a> &middot;
-        <a href="rfc-attested-cortex.md">RFC §Ed25519 attestation</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track H</a> &middot;
+        <a href="rfc-attested-cortex.html">RFC §Ed25519 attestation</a></p>
       </div>
 
       <div class="card amber">
@@ -375,7 +375,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         Lets agents store full reasoning traces alongside the conclusions. Server-side.
         <strong>✅ universal.</strong></p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track I</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track I</a></p>
       </div>
 
       <div class="card violet">
@@ -388,8 +388,8 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         AGE-mode p95 must be &ge;30% faster than CTE-mode at depth=5.
         <strong>N/A on the SQLite default install</strong>; opt-in via Postgres adapter.</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track J</a> &middot;
-        <a href="../ADR-0002-kg-schema-v15-backward-incompat.md">ADR-0002</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track J</a> &middot;
+        <a href="../ADR-0002-kg-schema-v15-backward-incompat.html">ADR-0002</a></p>
       </div>
 
       <div class="card green">
@@ -402,7 +402,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
         Harness UX integration remains per-harness work
         (the API is universal but the UX shell varies).</p>
         <p style="font-size:.82rem"><strong>Refs:</strong>
-        <a href="V0.7-EPIC.md">V0.7-EPIC.md §Track K10</a></p>
+        <a href="V0.7-EPIC.html">V0.7-EPIC.md §Track K10</a></p>
       </div>
     </div>
   </div>
@@ -457,7 +457,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       Not every track lands in the v0.7.0 cut. The items below are explicitly deferred to
       v0.7.1 or later, with a published rationale. This section is the operator&rsquo;s
       counterpart to the &ldquo;deferred&rdquo; section in
-      <a href="rfc-attested-cortex.md#out-of-scope--explicitly-deferred">rfc-attested-cortex.md §Out of scope</a>.
+      <a href="rfc-attested-cortex.html#out-of-scope--explicitly-deferred">rfc-attested-cortex.md §Out of scope</a>.
     </p>
 
     <div class="grid-2">
@@ -515,7 +515,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       curated skill marketplace operations, and hosted multi-tenant federation hubs all live
       in the AgenticMem commercial layer. The OSS provides the abstractions and protocols;
       the certified-managed deployments are commercial. See
-      <a href="rfc-attested-cortex.md#out-of-scope--explicitly-deferred">RFC §Out of scope</a>
+      <a href="rfc-attested-cortex.html#out-of-scope--explicitly-deferred">RFC §Out of scope</a>
       for the full rationale.</p>
     </div>
   </div>
@@ -528,7 +528,7 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
     <h2>SDK compatibility quick table</h2>
     <p class="lede">
       The companion table for harness authors. Lifted directly from
-      <a href="rfc-attested-cortex.md#serversdk-compatibility">rfc-attested-cortex.md §Server / SDK compatibility</a>.
+      <a href="rfc-attested-cortex.html#serversdk-compatibility">rfc-attested-cortex.md §Server / SDK compatibility</a>.
     </p>
 
     <table class="simple">
@@ -593,10 +593,10 @@ footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.
       authoritative documents the matrix is lifted from.
     </p>
     <div class="cta-row">
-      <a class="solid" href="V0.7-EPIC.md">📐 V0.7-EPIC.md (workstreams)</a>
-      <a class="amber" href="rfc-attested-cortex.md">📑 rfc-attested-cortex.md (design)</a>
-      <a class="violet" href="../MIGRATION_v0.7.md">📖 MIGRATION_v0.7.md (upgrade)</a>
-      <a class="green" href="canonical-phrasings.md">🗣️ canonical-phrasings.md</a>
+      <a class="solid" href="V0.7-EPIC.html">📐 V0.7-EPIC.md (workstreams)</a>
+      <a class="amber" href="rfc-attested-cortex.html">📑 rfc-attested-cortex.md (design)</a>
+      <a class="violet" href="../MIGRATION_v0.7.html">📖 MIGRATION_v0.7.md (upgrade)</a>
+      <a class="green" href="canonical-phrasings.html">🗣️ canonical-phrasings.md</a>
     </div>
     <p style="margin-top:1.5rem;font-size:.85rem">
       <strong style="color:#fff">Refresh cadence:</strong> this page is updated after each track lands

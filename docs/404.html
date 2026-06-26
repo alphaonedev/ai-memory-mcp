@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Redirecting… · ai-memory docs</title>
+<script>
+// The Markdown docs are rendered to .html by Jekyll. Any request for the
+// legacy .md URL (old links, bookmarks) is transparently sent to the
+// rendered .html page so nothing 404s.
+(function () {
+  var p = location.pathname;
+  if (/\.md$/i.test(p)) {
+    location.replace(p.replace(/\.md$/i, ".html") + location.search + location.hash);
+  }
+})();
+</script>
+<style>
+:root{--bg:#000;--text:#e9e9e9;--muted:#9a9a9a;--p3:#c8a2ff;--border:#262626;
+--mono:"SF Mono","Cascadia Code",Consolas,monospace;
+--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
+display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}
+.box{max-width:520px;padding:2rem 1.5rem}
+.code{font-family:var(--mono);font-size:3.4rem;color:var(--p3);letter-spacing:-.03em;margin:0}
+h1{font-size:1.4rem;margin:.6rem 0 .4rem;color:#fff}
+p{color:var(--muted);line-height:1.7}
+.actions{margin-top:1.6rem;display:flex;gap:.8rem;justify-content:center;flex-wrap:wrap}
+a.btn{font-size:.92rem;text-decoration:none;border:1px solid var(--border);border-radius:9px;
+padding:.55rem 1rem;color:var(--text)}
+a.btn.primary{background:var(--p3);color:#000;border-color:var(--p3);font-weight:600}
+a.btn:hover{border-color:var(--p3)}
+.note{margin-top:1.4rem;font-family:var(--mono);font-size:.78rem;color:#666}
+</style>
+</head>
+<body>
+<div class="box" id="fallback" style="display:none">
+  <p class="code">404</p>
+  <h1>Page not found</h1>
+  <p>That page doesn’t exist here. If you followed a <code>.md</code> link it should have redirected automatically — otherwise try the documentation home.</p>
+  <div class="actions">
+    <a class="btn primary" href="/ai-memory-mcp/">Documentation home</a>
+    <a class="btn" href="/ai-memory-mcp/at-a-glance.html">Atlas</a>
+    <a class="btn" href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+  </div>
+  <div class="note">ai-memory™ · v0.8.0 · Apache-2.0</div>
+</div>
+<script>
+// Only reveal the 404 UI when we are NOT mid-redirect (genuine miss).
+if (!/\.md$/i.test(location.pathname)) {
+  document.getElementById("fallback").style.display = "block";
+}
+</script>
+</body>
+</html>

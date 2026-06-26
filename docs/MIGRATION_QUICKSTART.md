@@ -41,7 +41,7 @@ action required for the database itself.
 | Area | v0.6.4 | v0.7.0 |
 |---|---|---|
 | **LLM backends** | Local Ollama only | **15 vendor aliases** + generic OpenAI-compatible (#1067): ollama, openai, xai, anthropic, gemini, deepseek, kimi, qwen, mistral, groq, together, cerebras, openrouter, fireworks, lmstudio, openai-compatible |
-| **Config schema** | Flat fields (`llm_model`, `ollama_url`, ...) | **Sectioned v2** (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`) — see [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Legacy v1 continues to work with deprecation WARN; removed in v0.8.0. |
+| **Config schema** | Flat fields (`llm_model`, `ollama_url`, ...) | **Sectioned v2** (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`) — see [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html). Legacy v1 continues to work with deprecation WARN; removed in v0.8.0. |
 | **Secret handling** | Inline `api_key = "..."` accepted | **REJECTED at parse time** (#1146). Use `api_key_env` (env var reference) or `api_key_file` (mode 0400 enforced). |
 | **DB schema** | v20 | v57 (37 version bumps bridge the gap, auto-applied on first open) |
 | **Memory struct** | 15 fields | 26 fields (added reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, version) |
@@ -102,7 +102,7 @@ ai-memory doctor
 The `LLM Reachability (#1146)` section reports the resolved
 `backend`, `model`, `base_url`, `config_source`, `key_source` +
 HTTP status. If you see WARN or CRIT there, see
-[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) §"no LLM client configured".
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.html) §"no LLM client configured".
 
 **That's it.** The DB schema walks v20 → v57 automatically when
 the v0.7.0 binary opens the DB. Your legacy config.toml's flat
@@ -220,7 +220,7 @@ ladder as a side effect (there is no `--upgrade` flag). Apache AGE
 extension is installed. Note the pre-built release binaries are
 default-feature builds without `migrate`/`schema-init` — use a
 `--features sal,sal-postgres` build for the postgres path.
-See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
+See [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html)
 for the postgres-specific recipe.
 
 ### Operator-visible behavior changes (Tier 2 callouts)
@@ -339,12 +339,12 @@ restored similarly.
 
 ## Related docs
 
-- [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) — canonical v2 schema reference
-- [`CLI_REFERENCE.md`](CLI_REFERENCE.md) — full CLI surface incl. `config migrate` + `doctor`
-- [`integrations/llm-backends.md`](integrations/llm-backends.md) — per-backend MCP env-block recipes
-- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — Postgres + AGE + pgvector specifics
-- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) — when `ai-memory doctor` reports WARN/CRIT
-- [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) — security posture rationale
+- [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) — canonical v2 schema reference
+- [`CLI_REFERENCE.md`](CLI_REFERENCE.html) — full CLI surface incl. `config migrate` + `doctor`
+- [`integrations/llm-backends.md`](integrations/llm-backends.html) — per-backend MCP env-block recipes
+- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) — Postgres + AGE + pgvector specifics
+- [`TROUBLESHOOTING.md`](TROUBLESHOOTING.html) — when `ai-memory doctor` reports WARN/CRIT
+- [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) — security posture rationale
 - [`CHANGELOG.md`](../CHANGELOG.md) — full v0.7.0 release entry
 
 ---

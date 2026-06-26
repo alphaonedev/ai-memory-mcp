@@ -230,7 +230,7 @@ T") but operators should know that:
   the write and the read).
 
 (Update: v0.7.0 deliberately kept KG invalidation eventually consistent
-— see [`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.md);
+— see [`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.html);
 quorum-broadcast invalidation did not ship.)
 
 ---

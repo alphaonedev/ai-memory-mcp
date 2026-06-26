@@ -10,12 +10,12 @@ on how you want to use it.
 > **Looking for a friendlier walkthrough?** This page is the
 > single-developer / single-laptop CLI + MCP + HTTP comparison. For a
 > super-simple, copy-paste install + config walkthrough with zero
-> jargon, see [`install-quickstart.md`](install-quickstart.md).
+> jargon, see [`install-quickstart.md`](install-quickstart.html).
 >
 > **Standing up a fleet / multi-DC / postgres+AGE deployment?** This
 > page is the wrong starting point — see
-> [`production-deployment.md`](production-deployment.md) and
-> [`enterprise-deployment.md`](enterprise-deployment.md).
+> [`production-deployment.md`](production-deployment.html) and
+> [`enterprise-deployment.md`](enterprise-deployment.html).
 
 ## Install
 
@@ -128,14 +128,14 @@ AI client's parent process inherits it. The MCP config stays minimal:
 
 Verify: `ai-memory boot --quiet --limit 1` should report
 `llm=xai:grok-4.3`. Full canonical schema:
-[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
 
 > **Override path — `env:` block.** Adding an `env:` block to the MCP
 > config (with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL`) still
 > works and takes precedence over `config.toml`. Useful for CI /
 > per-session tweaks. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
 > (the env-block paper-cut, retired by #1146 above). Full per-backend
-> recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> recipes: [`integrations/llm-backends.md`](integrations/llm-backends.html).
 >
 > **Inline API keys in `config.toml` are rejected at parse time** — use
 > `api_key_env` (process-env reference) or `api_key_file` (file path;

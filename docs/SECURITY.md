@@ -26,7 +26,7 @@ capabilities:
    layer re-stamps inbound rows with the authenticated peer identity, and
    a `body.sender_agent_id` claim not on that peer's operator-configured
    allowlist is refused with `sender_agent_id_mismatch` (see
-   [`docs/federation.md`](federation.md) Layer 3). v0.8.0 (#1464) extends
+   [`docs/federation.md`](federation.html) Layer 3). v0.8.0 (#1464) extends
    this from the body sender to **per-memory** granularity: each synced
    row's claimed `metadata.agent_id` is checked against the peer's
    authorship allowlist, and an unauthorized relayed claim is rewritten to
@@ -110,7 +110,7 @@ Every HTTP endpoint except `/api/v1/health` enforces the key (when
 the mTLS allowlist is enforced, the `/api/v1/sync/*` federation
 endpoints additionally bypass the key check — they have already
 cleared a stronger transport gate; see #702 and
-[`docs/federation.md`](federation.md)). Accepts either:
+[`docs/federation.md`](federation.html)). Accepts either:
 
 - Header: `X-API-Key: <key>` — the supported channel.
 - Query parameter: `?api_key=<key>` — **DEPRECATED** at v0.7.0
@@ -283,7 +283,7 @@ Policies are set per-namespace via `memory_namespace_set_standard`
 (`crate::models::GovernanceLevel`) are:
 
 - `any` — ungated (the allow-on-silence default for `write` /
-  `promote`; see [`docs/governance.md`](governance.md)).
+  `promote`; see [`docs/governance.md`](governance.html)).
 - `registered` — any registered agent.
 - `owner` — only the row's authoring agent (the default for
   `delete`).

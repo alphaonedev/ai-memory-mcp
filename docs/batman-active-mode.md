@@ -5,7 +5,7 @@ layout: doc
 
 > v0.7.0 ships **6 of 6 of Batman's write-time-investment forms + the 7th**
 > (substrate-authority at write) — all `IMPLEMENTED` per the post-closeout
-> state in [`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.md).
+> state in [`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.html).
 > A default install is **Batman-capable, not Batman-active**: opt-ins are
 > off, the operator key doesn't exist, R001–R004 seed rules are unsigned
 > and disabled, the curator daemon isn't running, and per-namespace
@@ -629,13 +629,13 @@ precedence (#822). No `mv` workaround is needed.
 
 ## Related documentation
 
-- [`docs/governance.md`](governance.md) — operator-facing governance index (modes, where to read what)
-- [`docs/policy-engine.md`](policy-engine.md) — 7th-form policy engine deep-dive (substrate-authoritative rules)
-- [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.md) — agent-action rule catalogue
-- [`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.md) — adversarial audit that drove the Forms 1–6 + 7th-form closeout wave (PR #753)
-- [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md) — canonical post-wave feature inventory
-- [`docs/atomisation.md`](atomisation.md) — Form 2 internals
-- [`docs/multistep-ingest.md`](multistep-ingest.md) — Form 3 internals
-- [`docs/provenance.md`](provenance.md) — Form 4 internals
-- [`docs/confidence-calibration.md`](confidence-calibration.md) — Form 5 internals
-- [`docs/memory-kind-vocab.md`](memory-kind-vocab.md) — Form 6 internals
+- [`docs/governance.md`](governance.html) — operator-facing governance index (modes, where to read what)
+- [`docs/policy-engine.md`](policy-engine.html) — 7th-form policy engine deep-dive (substrate-authoritative rules)
+- [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.html) — agent-action rule catalogue
+- [`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.html) — adversarial audit that drove the Forms 1–6 + 7th-form closeout wave (PR #753)
+- [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html) — canonical post-wave feature inventory
+- [`docs/atomisation.md`](atomisation.html) — Form 2 internals
+- [`docs/multistep-ingest.md`](multistep-ingest.html) — Form 3 internals
+- [`docs/provenance.md`](provenance.html) — Form 4 internals
+- [`docs/confidence-calibration.md`](confidence-calibration.html) — Form 5 internals
+- [`docs/memory-kind-vocab.md`](memory-kind-vocab.html) — Form 6 internals

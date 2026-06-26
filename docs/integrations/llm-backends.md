@@ -52,7 +52,7 @@ ai-memory boot --quiet --limit 1   # banner should report llm=<backend>:<model>
 ai-memory doctor                    # LLM Reachability (#1146) — DNS + TLS + auth round-trip
 ```
 
-Canonical schema reference: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md). Operator runbook: [`../ADMIN_GUIDE.md` § "LLM Backend Setup"](../ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers).
+Canonical schema reference: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html). Operator runbook: [`../ADMIN_GUIDE.md` § "LLM Backend Setup"](../ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers).
 
 ## Override path — env vars in the MCP `env:` block
 
@@ -89,7 +89,7 @@ The second line confirms the embedder built against the **independently-resolved
 
 ## The canonical recipe shape
 
-Every example below is the **`memory` MCP server entry** in your AI client's config file. The file path differs per client (Claude Code: `~/.claude.json`; Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows; Cursor: `~/.cursor/mcp.json`; Codex: `~/.codex/config.toml`; etc. — see [`platforms.md`](platforms.md) for the full path table). The **server block shape** is identical across clients (Codex uses TOML, every other client uses JSON — Codex shape shown at the end of this page).
+Every example below is the **`memory` MCP server entry** in your AI client's config file. The file path differs per client (Claude Code: `~/.claude.json`; Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows; Cursor: `~/.cursor/mcp.json`; Codex: `~/.codex/config.toml`; etc. — see [`platforms.md`](platforms.html) for the full path table). The **server block shape** is identical across clients (Codex uses TOML, every other client uses JSON — Codex shape shown at the end of this page).
 
 > **Replace the API key** in every example below with your own — do not paste examples verbatim into your config file.
 
@@ -549,7 +549,7 @@ ai-memory: atomisation engine ready (curator=LlmCurator)
 ai-memory MCP server started (stdio, tier=autonomous)
 ```
 
-If you see `llm=gemma3:4b` or another local Ollama tag when you intended a non-Ollama backend, the `env:` block isn't being picked up — re-check the path of the config file your AI client actually reads (see [`platforms.md`](platforms.md) for the per-client path table).
+If you see `llm=gemma3:4b` or another local Ollama tag when you intended a non-Ollama backend, the `env:` block isn't being picked up — re-check the path of the config file your AI client actually reads (see [`platforms.md`](platforms.html) for the per-client path table).
 
 ## Multi-agent / fleet / multi-DC considerations
 
@@ -575,7 +575,7 @@ is **independent** of the LLM backend (selected via
 
 Switching storage backends does **not** require touching the LLM env
 block, and vice versa. The cross-product is fully supported.
-Storage-side setup: [`postgres-age-guide.md`](../postgres-age-guide.md).
+Storage-side setup: [`postgres-age-guide.md`](../postgres-age-guide.html).
 
 ### Multiple agents on one node — shared vs. per-agent backend
 
@@ -632,7 +632,7 @@ premium model for the reflection / curator daemon).
 
 For the multi-agent coordination layer itself (A2A wire shape, ranges
 of memory each agent can see, identity attestation across agents on
-one node), see [`batman-active-mode.md`](../batman-active-mode.md).
+one node), see [`batman-active-mode.md`](../batman-active-mode.html).
 
 ### Multi-server in one DC — env-block strategy
 
@@ -647,7 +647,7 @@ Three rollout patterns:
 2. **Container image baked.** The MCP config is baked into a custom
    image alongside the `ai-memory` binary. Operator rolls a new image
    on key rotation. Works well with Kubernetes / Plan-C deployments
-   (see [`plan-c-deployment.md`](../plan-c-deployment.md)).
+   (see [`plan-c-deployment.md`](../plan-c-deployment.html)).
 3. **Secret-manager sidecar.** A secrets-fetch sidecar (Vault Agent,
    AWS Secrets Manager CSI driver, etc.) writes the MCP config to a
    local file on container start, pulling secrets from the secret
@@ -685,7 +685,7 @@ speaks the OpenAI wire shape.
 
 ai-memory's federation layer (`/sync/push`, mTLS allowlist,
 `X-Memory-Sig` + nonce freshness, signed-events V-4 chain — see
-[`federation.md`](../federation.md)) is **independent** of the LLM
+[`federation.md`](../federation.html)) is **independent** of the LLM
 backend choice. Federated peers can each use a different LLM backend;
 the memory rows that cross the wire are LLM-agnostic.
 
@@ -714,7 +714,7 @@ checked into version control. Use one of:
   `AI_MEMORY_AGENT_ID` is provisioned alongside its own LLM API key
   during agent enrolment; rotation is per-agent. Works well with the
   Ed25519 identity-keypair-per-agent pattern from
-  [`production-deployment.md`](../production-deployment.md) §2.
+  [`production-deployment.md`](../production-deployment.html) §2.
 
 ### Postgres + Apache AGE deployments — same env block, different daemon launch
 
@@ -722,7 +722,7 @@ Postgres-backed deployments launch the daemon with `--store-url
 postgres://…`. The MCP `env:` block for LLM-backend selection is
 identical to the sqlite case — neither the storage nor the LLM care
 about each other's choice. The full storage-side setup:
-[`postgres-age-guide.md`](../postgres-age-guide.md).
+[`postgres-age-guide.md`](../postgres-age-guide.html).
 
 For multi-writer postgres deployments, the LLM backend is typically
 **not** per-agent at the env-block level. Instead, every agent's MCP
@@ -738,25 +738,25 @@ For swarm / hive deployments, the LLM-backend selection is the *unit
 configuration* — every agent in the swarm needs one. The
 coordination layer (which agent talks to which, when to fan-out,
 when to converge) lives above: see
-[`batman-active-mode.md`](../batman-active-mode.md) and
-[`enterprise-deployment.md`](../enterprise-deployment.md) topologies
+[`batman-active-mode.md`](../batman-active-mode.html) and
+[`enterprise-deployment.md`](../enterprise-deployment.html) topologies
 6–8. Choice of LLM backend per agent is a swarm-design decision (do
 you want premium models on the critical-path agents and cheap-and-
 fast on the perimeter? do you want every agent identical for
 behavioural reproducibility?) — see
-[`enterprise-deployment.md`](../enterprise-deployment.md) §6 for the
+[`enterprise-deployment.md`](../enterprise-deployment.html) §6 for the
 LLM-cost / behaviour tradeoffs at fleet scale.
 
 ## Related
 
-- [`ADMIN_GUIDE.md` § LLM Backend Setup](../ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — the standalone-CLI / HTTP-daemon flavour of the same setup (shell-side `export`).
-- [`INSTALL.md`](../INSTALL.md) — the broader install path, including the MCP config base examples this page extends.
-- [`install-quickstart.md`](../install-quickstart.md) — Path-A super-simple singleton install.
-- [`production-deployment.md`](../production-deployment.md) — single-node hardening, hub-spoke, W-of-N topologies.
-- [`enterprise-deployment.md`](../enterprise-deployment.md) — 8-topology continuum: singleton → multi-region swarm.
-- [`postgres-age-guide.md`](../postgres-age-guide.md) — PostgreSQL + Apache AGE storage backend.
-- [`batman-active-mode.md`](../batman-active-mode.md) — multi-agent on one node (A2A coordination).
-- [`federation.md`](../federation.md) — peer-federation wire shape, mTLS, signing.
-- [`grok-and-xai.md`](grok-and-xai.md) — using ai-memory to feed memory INTO Grok (the inverse direction). Cross-links back here for the Grok-as-backend case.
-- [`platforms.md`](platforms.md) — per-AI-client MCP config-file path table.
+- [`ADMIN_GUIDE.md` § LLM Backend Setup](../ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers) — the standalone-CLI / HTTP-daemon flavour of the same setup (shell-side `export`).
+- [`INSTALL.md`](../INSTALL.html) — the broader install path, including the MCP config base examples this page extends.
+- [`install-quickstart.md`](../install-quickstart.html) — Path-A super-simple singleton install.
+- [`production-deployment.md`](../production-deployment.html) — single-node hardening, hub-spoke, W-of-N topologies.
+- [`enterprise-deployment.md`](../enterprise-deployment.html) — 8-topology continuum: singleton → multi-region swarm.
+- [`postgres-age-guide.md`](../postgres-age-guide.html) — PostgreSQL + Apache AGE storage backend.
+- [`batman-active-mode.md`](../batman-active-mode.html) — multi-agent on one node (A2A coordination).
+- [`federation.md`](../federation.html) — peer-federation wire shape, mTLS, signing.
+- [`grok-and-xai.md`](grok-and-xai.html) — using ai-memory to feed memory INTO Grok (the inverse direction). Cross-links back here for the Grok-as-backend case.
+- [`platforms.md`](platforms.html) — per-AI-client MCP config-file path table.
 - Issues [#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067), [#1142](https://github.com/alphaonedev/ai-memory-mcp/issues/1142), [#1143](https://github.com/alphaonedev/ai-memory-mcp/issues/1143), [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) — the backend-resolver and docs-gap history that produced this page.

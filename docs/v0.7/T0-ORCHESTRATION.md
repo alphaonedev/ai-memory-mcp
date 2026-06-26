@@ -168,8 +168,8 @@ API budget on a question you already know the answer to.
 
 ## Refs
 
-- [v0.7.0 epic](./V0.7-EPIC.md) — track E
-- [`docs/v0.7/canonical-phrasings.md`](./canonical-phrasings.md) — the
+- [v0.7.0 epic](./V0.7-EPIC.html) — track E
+- [`docs/v0.7/canonical-phrasings.md`](./canonical-phrasings.html) — the
   A1/A2 strings the orchestrator validates against
 - [`tests/calibration_t0.rs`](../../tests/calibration_t0.rs) — the
   CI-side T0 cells the orchestrator wraps

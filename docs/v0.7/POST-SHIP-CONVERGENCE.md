@@ -207,8 +207,8 @@ P0 production incident.
 
 ## Refs
 
-- [v0.7.0 epic](./V0.7-EPIC.md) — track E, tasks E1–E3
-- [Canonical phrasings](./canonical-phrasings.md) — the source of truth
+- [v0.7.0 epic](./V0.7-EPIC.html) — track E, tasks E1–E3
+- [Canonical phrasings](./canonical-phrasings.html) — the source of truth
   the published binary is being compared against
 - [`tests/calibration_t0.rs`](../../tests/calibration_t0.rs) — the
   in-tree T0 cells this script mirrors

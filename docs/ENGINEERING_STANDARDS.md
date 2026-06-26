@@ -7,8 +7,8 @@ layout: doc
 > Maintained by AlphaOne LLC. All contributors and AI agents must follow these standards.
 > In case of conflict with CONTRIBUTING.md, this document takes precedence.
 >
-> **AI agents** must additionally follow [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.md)
-> (operational steps) and [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md)
+> **AI agents** must additionally follow [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.html)
+> (operational steps) and [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html)
 > (policy boundaries). The Governance standard takes precedence over this document
 > only on matters of AI participation; this document remains authoritative for
 > code, test, security, and release.

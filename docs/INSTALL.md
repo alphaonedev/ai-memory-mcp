@@ -8,13 +8,13 @@ layout: doc
 >
 > | I am… | My deployment is… | Start here |
 > |---|---|---|
-> | **A single developer** | One AI client (Claude Code / Cursor / ChatGPT / etc.) on one laptop | [`install-quickstart.md`](install-quickstart.md) — 5-minute super-simple install + LLM-backend wired in one config block. Skip the rest of this file. |
-> | **An engineer / architect** | Multi-agent on one node, or any single-node production deployment | This file (full singleton reference) → [`production-deployment.md`](production-deployment.md) — 10-min hardening checklist. |
-> | **An engineer / architect** | Multi-server, multi-rack, multi-DC, multi-region, swarm, or hive | [`enterprise-deployment.md`](enterprise-deployment.md) — 60–90 min planning artefact covering 8 topologies, federation, identity material at fleet scale, disaster recovery. |
-> | **An engineer / architect** | PostgreSQL + Apache AGE storage backend (multi-tenant, multi-writer, 10M+ memories, KG-heavy workloads) | [`postgres-age-guide.md`](postgres-age-guide.md) — first-class postgres operator guide. |
+> | **A single developer** | One AI client (Claude Code / Cursor / ChatGPT / etc.) on one laptop | [`install-quickstart.md`](install-quickstart.html) — 5-minute super-simple install + LLM-backend wired in one config block. Skip the rest of this file. |
+> | **An engineer / architect** | Multi-agent on one node, or any single-node production deployment | This file (full singleton reference) → [`production-deployment.md`](production-deployment.html) — 10-min hardening checklist. |
+> | **An engineer / architect** | Multi-server, multi-rack, multi-DC, multi-region, swarm, or hive | [`enterprise-deployment.md`](enterprise-deployment.html) — 60–90 min planning artefact covering 8 topologies, federation, identity material at fleet scale, disaster recovery. |
+> | **An engineer / architect** | PostgreSQL + Apache AGE storage backend (multi-tenant, multi-writer, 10M+ memories, KG-heavy workloads) | [`postgres-age-guide.md`](postgres-age-guide.html) — first-class postgres operator guide. |
 > | **A decision-maker** | Evaluating ai-memory for adoption | [`audience/decision-maker.html`](audience/decision-maker.html) — security posture, threat model, deployment cost envelope. |
 >
-> This file (`INSTALL.md`) is the **SME singleton + single-node reference.** Path-A non-technical readers should use [`install-quickstart.md`](install-quickstart.md) instead — it covers configuration end-to-end without exposing every flag.
+> This file (`INSTALL.md`) is the **SME singleton + single-node reference.** Path-A non-technical readers should use [`install-quickstart.md`](install-quickstart.html) instead — it covers configuration end-to-end without exposing every flag.
 
 > **BLUF (Bottom Line Up Front):** `ai-memory` is an AI-agnostic memory management system that works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, OpenClaw, and others. Install the binary, configure your AI client's MCP settings, and you get **7 MCP memory tools at the default `--profile core`** (or 100 advertised entries at `--profile full` — 99 callable memory tools + the always-on `memory_capabilities` bootstrap) at v0.8.0. The default `semantic` tier includes embedding-based hybrid recall out of the box. Total time: ~60 seconds (pre-built binary + fast internet; first semantic-tier run also downloads a ~100MB embedding model).
 
@@ -174,9 +174,9 @@ layout: doc
 
    Export `XAI_API_KEY` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) so the parent process inherits it; the MCP-spawned subprocess inherits from the AI client which inherits from your login shell. **Inline keys in `config.toml` are rejected at parse time** — use `api_key_env` (process-env reference) or `api_key_file` (file path; mode 0400 enforced).
 
-   > **Service-manager daemons don't inherit shell-rc exports.** The above works for an MCP server spawned by your AI client. A `serve` or `curator --daemon` started by **launchd (macOS) or systemd (Linux)** does NOT see a key you `export` from `.zshrc`/`.bashrc` — its env comes only from the unit/plist. For those, prefer `api_key_file` (env-independent across platforms) or declare the key inside the unit's `Environment=` / plist `EnvironmentVariables` dict. See [`production-deployment.md` § 7b](production-deployment.md#7b-llm-backend-wiring-smart--autonomous-tier).
+   > **Service-manager daemons don't inherit shell-rc exports.** The above works for an MCP server spawned by your AI client. A `serve` or `curator --daemon` started by **launchd (macOS) or systemd (Linux)** does NOT see a key you `export` from `.zshrc`/`.bashrc` — its env comes only from the unit/plist. For those, prefer `api_key_file` (env-independent across platforms) or declare the key inside the unit's `Environment=` / plist `EnvironmentVariables` dict. See [`production-deployment.md` § 7b](production-deployment.html#7b-llm-backend-wiring-smart--autonomous-tier).
 
-   Full canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+   Full canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
 
    ### Override path — `env:` block in the MCP config
 
@@ -198,20 +198,20 @@ layout: doc
    }
    ```
 
-   > **Important — MCP clients do NOT inherit your interactive shell.** Setting `export AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` / `.bashrc` is sufficient for the standalone `ai-memory` CLI and the HTTP daemon, but is **NOT** sufficient for Claude Code / Cursor / Codex / Cline / Continue / Zed / Windsurf / etc. — they spawn the MCP server as a fresh subprocess with only the `env:` keys from the MCP config. The recommended path above (a `[llm]` section in `config.toml` with `api_key_env`) avoids this paper-cut by letting every surface read the same file. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) (env-block paper-cut) and [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (single source of truth). Full per-backend recipes (every supported provider with copy-pasteable snippets): [`integrations/llm-backends.md`](integrations/llm-backends.md).
+   > **Important — MCP clients do NOT inherit your interactive shell.** Setting `export AI_MEMORY_LLM_BACKEND=xai` in `.zshrc` / `.bashrc` is sufficient for the standalone `ai-memory` CLI and the HTTP daemon, but is **NOT** sufficient for Claude Code / Cursor / Codex / Cline / Continue / Zed / Windsurf / etc. — they spawn the MCP server as a fresh subprocess with only the `env:` keys from the MCP config. The recommended path above (a `[llm]` section in `config.toml` with `api_key_env`) avoids this paper-cut by letting every surface read the same file. Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) (env-block paper-cut) and [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (single source of truth). Full per-backend recipes (every supported provider with copy-pasteable snippets): [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
    > **Note:** `~/.claude.json` likely already exists with other settings. Merge the `mcpServers` key into the existing JSON — do not overwrite the file. See [Claude Code MCP Scopes](#claude-code-mcp-configuration-scopes) below for project-level and team-shared alternatives.
 
    > **`~` in `--db` args.** The binary uses a CLI `--db` value verbatim — tilde expansion happens in your shell (or in some MCP hosts), NOT inside ai-memory. Only a `db = "~/..."` line in `config.toml` is tilde-expanded by ai-memory itself (#507). If memories land in a literal `./~` directory, replace `~/.claude/ai-memory.db` in the args with the absolute path (e.g. `/Users/you/.claude/ai-memory.db`) or move the path into `config.toml`.
 
-   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. Full env-var matrix in [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers); MCP-config recipes in [`integrations/llm-backends.md`](integrations/llm-backends.md).
+   > The `--tier` flag selects the feature tier: `keyword`, `semantic` (default), `smart`, or `autonomous`. **Important:** The `--tier` flag must be passed in the MCP args — the `config.toml` `tier` setting is not used when the server is launched by an AI client. Smart and autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), any of: local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible vendor (xAI Grok, OpenAI, Anthropic, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selected via `AI_MEMORY_LLM_BACKEND` env var. Full env-var matrix in [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers); MCP-config recipes in [`integrations/llm-backends.md`](integrations/llm-backends.html).
    > **Other AI platforms** (OpenAI ChatGPT, xAI Grok, META Llama, etc.) have their own MCP configuration locations. Consult your platform's documentation for where to add MCP server entries. The server command and args are the same — only the config file location differs.
 
 3. **Restart your AI client.**
 
-   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>, …)` matching what you put in the `env:` block, plus an `embedder loaded (…)` line reflecting the independently-resolved `[embeddings]` configuration (#1598 — the embedder can be local Ollama or any API backend; the historical `(#1143)` dedicated-Ollama embed-client banner was superseded at this boot site). If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.md#llm-backend-silently-fell-back-to-ollama).
+   > **Verify the LLM backend wired through (smart/autonomous tier only).** After restart, check the ai-memory boot banner that prints on first MCP session-start (or the AI client's MCP server stderr log). You should see `LLM ready (backend=<vendor>, model=<name>, …)` matching what you put in the `env:` block, plus an `embedder loaded (…)` line reflecting the independently-resolved `[embeddings]` configuration (#1598 — the embedder can be local Ollama or any API backend; the historical `(#1143)` dedicated-Ollama embed-client banner was superseded at this boot site). If you see `llm=gemma3:4b` or another local Ollama tag when you intended a cloud backend, the `env:` block didn't land — re-check the MCP config path you edited matches the AI client's actual scope. Full troubleshooting: [`TROUBLESHOOTING.md` § LLM backend silently fell back](TROUBLESHOOTING.html#llm-backend-silently-fell-back-to-ollama).
 
-4. **Verify** — at the default `--profile core` (v0.7.0) you should see **7 new tools** registered plus the always-on `memory_capabilities` bootstrap (8 total): `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`. To eagerly load the full v0.8.0 surface (100 advertised entries — 99 callable memory tools + the always-on `memory_capabilities` bootstrap), launch with `ai-memory mcp --profile full`. The full-profile surface includes (highlights): `memory_update`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, the 4 archive tools, `memory_check_duplicate`, the 2 entity tools, the 3 KG tools (`memory_kg_query`/`memory_kg_timeline`/`memory_kg_invalidate`), `memory_get_taxonomy`, the 3 namespace-standard tools, the 3 pending-action tools, the 2 agent tools, `memory_notify`/`memory_inbox`, the 3 subscription tools, `memory_session_start`, `memory_gc`, and the v0.7 additions: `memory_reflect`, `memory_atomise`, `memory_ingest_multistep`, `memory_persona`, `memory_persona_generate`, `memory_offload`, `memory_deref`, `memory_calibrate_confidence`, the 7 L1-5 Agent Skills tools, `memory_check_agent_action`, `memory_rule_list`, `memory_export_reflection`, `memory_reflection_origin`, `memory_dependents_of_invalidated`, `memory_find_paths`, `memory_verify`, `memory_quota_status`, the archive-list metadata helpers (#860), and more. Full per-tool reference: [API_REFERENCE.md](API_REFERENCE.md). Run `memory_capabilities` from the agent loop to get the live family list.
+4. **Verify** — at the default `--profile core` (v0.7.0) you should see **7 new tools** registered plus the always-on `memory_capabilities` bootstrap (8 total): `memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`. To eagerly load the full v0.8.0 surface (100 advertised entries — 99 callable memory tools + the always-on `memory_capabilities` bootstrap), launch with `ai-memory mcp --profile full`. The full-profile surface includes (highlights): `memory_update`, `memory_delete`, `memory_promote`, `memory_forget`, `memory_stats`, `memory_link`, `memory_get_links`, `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, the 4 archive tools, `memory_check_duplicate`, the 2 entity tools, the 3 KG tools (`memory_kg_query`/`memory_kg_timeline`/`memory_kg_invalidate`), `memory_get_taxonomy`, the 3 namespace-standard tools, the 3 pending-action tools, the 2 agent tools, `memory_notify`/`memory_inbox`, the 3 subscription tools, `memory_session_start`, `memory_gc`, and the v0.7 additions: `memory_reflect`, `memory_atomise`, `memory_ingest_multistep`, `memory_persona`, `memory_persona_generate`, `memory_offload`, `memory_deref`, `memory_calibrate_confidence`, the 7 L1-5 Agent Skills tools, `memory_check_agent_action`, `memory_rule_list`, `memory_export_reflection`, `memory_reflection_origin`, `memory_dependents_of_invalidated`, `memory_find_paths`, `memory_verify`, `memory_quota_status`, the archive-list metadata helpers (#860), and more. Full per-tool reference: [API_REFERENCE.md](API_REFERENCE.html). Run `memory_capabilities` from the agent loop to get the live family list.
 
 5. **Test** -- ask your AI assistant to store a memory. It should use `memory_store` automatically.
 
@@ -385,7 +385,7 @@ File: `%USERPROFILE%\.claude.json`
 
 > **Note:** `~/.claude.json` likely already exists with other Claude Code settings (tips, projects, etc.). Add the `mcpServers` key at the top level of the existing JSON object — do not overwrite the file.
 
-> **Adding an LLM backend (smart/autonomous tiers).** Extend the `memory` server block with an `env` map containing `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment (see [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider live in [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> **Adding an LLM backend (smart/autonomous tiers).** Extend the `memory` server block with an `env` map containing `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment (see [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider live in [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 **Project scope (shared with your team via git):**
 
@@ -867,7 +867,7 @@ No operator action required.
 
 For a comprehensive walkthrough (security-posture defaults that
 changed, tiered admin / DevOps recipes, NFS-shared config fleets),
-see [`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md).
+see [`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.html).
 
 ## Man Page
 
@@ -933,11 +933,11 @@ ai-memory boot --quiet --limit 1   # banner should report llm=xai:grok-4.3
 ai-memory doctor                    # LLM Reachability (#1146) — DNS + TLS + auth round-trip
 ```
 
-Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md). Full operator runbook (per-vendor recipes, precedence ladder, secret-handling discipline): [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers).
+Canonical schema reference: [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html). Full operator runbook (per-vendor recipes, precedence ladder, secret-handling discipline): [`ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers).
 
 ### Override path — env vars
 
-`AI_MEMORY_LLM_BACKEND` / `_MODEL` / `_BASE_URL` / `_API_KEY` env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-session tweaks, and the only path that doesn't require editing a file. Per-vendor recipes: [`integrations/llm-backends.md`](integrations/llm-backends.md).
+`AI_MEMORY_LLM_BACKEND` / `_MODEL` / `_BASE_URL` / `_API_KEY` env vars take precedence over `[llm]` in `config.toml`. Useful for CI / per-session tweaks, and the only path that doesn't require editing a file. Per-vendor recipes: [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 ### Ollama (local LLM — v0.6.4 default, still supported)
 
@@ -1015,7 +1015,7 @@ ollama run gemma3:4b "Hello, world"
 }
 ```
 
-> ai-memory connects to Ollama at `http://localhost:11434` automatically. No additional configuration needed. If Ollama is not running, LLM-backed features degrade gracefully (the semantic-tier embedder + keyword recall keep working). Post-#1598 the embedder itself can also be pointed at an API backend instead of Ollama — see `[embeddings]` in [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+> ai-memory connects to Ollama at `http://localhost:11434` automatically. No additional configuration needed. If Ollama is not running, LLM-backed features degrade gracefully (the semantic-tier embedder + keyword recall keep working). Post-#1598 the embedder itself can also be pointed at an API backend instead of Ollama — see `[embeddings]` in [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
 
 > **Note:** The `semantic` tier (default) downloads a HuggingFace embedding model (~100 MB) on first startup. No account or API key is required. The model is cached in `~/.cache/huggingface/`.
 
@@ -1067,7 +1067,7 @@ rm -f ai-memory.db ai-memory.db-wal ai-memory.db-shm
 
 ### TTL and Archive Configuration
 
-Memory TTLs (time-to-live) can be customized per tier via `config.toml`. When garbage collection runs, expired memories can optionally be archived instead of permanently deleted by setting `archive_on_gc = true`. Archived memories can be listed, restored, or purged using the 4 archive tools (`memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`). See the [Admin Guide](ADMIN_GUIDE.md) for full configuration details.
+Memory TTLs (time-to-live) can be customized per tier via `config.toml`. When garbage collection runs, expired memories can optionally be archived instead of permanently deleted by setting `archive_on_gc = true`. Archived memories can be listed, restored, or purged using the 4 archive tools (`memory_archive_list`, `memory_archive_restore`, `memory_archive_purge`, `memory_archive_stats`). See the [Admin Guide](ADMIN_GUIDE.html) for full configuration details.
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 

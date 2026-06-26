@@ -219,7 +219,7 @@ footer a{color:var(--text-muted)}
         <li><a href="#control-feature-matrix">Control → Feature matrix</a></li>
         <li><a href="nsa-control-test-matrix.html">Control → Test matrix (companion page)</a></li>
         <li><a href="#boundaries">Honest boundaries</a></li>
-        <li><a href="honest-limitations.md">Honest-limitations companion</a></li>
+        <li><a href="honest-limitations.html">Honest-limitations companion</a></li>
         <li><a href="_inventory/v0.7.0-capabilities.json">Capability inventory JSON</a></li>
       </ul>
     </div>
@@ -607,7 +607,7 @@ footer a{color:var(--text-muted)}
         <h3>a · Choose supported MCP projects when possible</h3>
         <div class="meta"><span class="status ok">implemented</span></div>
       </div>
-      <p>ai-memory v0.7.0 is maintained by AlphaOne LLC under Apache 2.0. Public release cadence visible in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/CHANGELOG.md">CHANGELOG.md</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/RELEASE_NOTES_v0.7.0.md">release notes</a>, and the GitHub repository. Security-advisory channel via GitHub Security Advisory + email <code>security@alpha-one.mobi</code> per <a href="../SECURITY.md">SECURITY.md</a>. MCP Registry submission tracked under Task H of audit issue #1153.</p>
+      <p>ai-memory v0.7.0 is maintained by AlphaOne LLC under Apache 2.0. Public release cadence visible in <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/CHANGELOG.md">CHANGELOG.md</a>, <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/release/v0.7.0/RELEASE_NOTES_v0.7.0.md">release notes</a>, and the GitHub repository. Security-advisory channel via GitHub Security Advisory + email <code>security@alpha-one.mobi</code> per <a href="../SECURITY.html">SECURITY.md</a>. MCP Registry submission tracked under Task H of audit issue #1153.</p>
     </div>
 
     <div class="recommendation" id="rec-b">
@@ -789,7 +789,7 @@ grep -n 'DefaultBodyLimit' src/lib.rs
 <span class="com"># Each grep returns the line number cited on this page.</span></pre>
 
     <h3>9. Re-derive the inventory at any future commit</h3>
-    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v0.7.0-summary.md">_inventory/v0.7.0-summary.md §5 Reproducibility</a>.</p>
+    <p>The inventory artefact carries a <code>verification_commit_sha</code> field. To re-derive at a future commit, follow the codegraph methodology documented in <a href="_inventory/v0.7.0-summary.html">_inventory/v0.7.0-summary.md §5 Reproducibility</a>.</p>
   </div>
 </section>
 
@@ -797,18 +797,18 @@ grep -n 'DefaultBodyLimit' src/lib.rs
   <div class="container">
     <span class="section-eyebrow">▸ Honest boundaries</span>
     <h2>What ai-memory does NOT defend against.</h2>
-    <p class="lede">Substrate honesty is the procurement asset, not aspirational coverage. The companion document <a href="honest-limitations.md">honest-limitations.md</a> documents the genuine boundaries the substrate cannot reach — operating-system layer vulnerabilities, hardware attestation (an AgenticMem commercial-layer concern), LLM hallucination above the substrate, operator policy authoring errors, prompt injection at the LLM input layer, and more. These are NOT NSA CSI gaps (we address every NSA CSI concern). They are substrate boundaries that exist regardless of any compliance framework.</p>
+    <p class="lede">Substrate honesty is the procurement asset, not aspirational coverage. The companion document <a href="honest-limitations.html">honest-limitations.md</a> documents the genuine boundaries the substrate cannot reach — operating-system layer vulnerabilities, hardware attestation (an AgenticMem commercial-layer concern), LLM hallucination above the substrate, operator policy authoring errors, prompt injection at the LLM input layer, and more. These are NOT NSA CSI gaps (we address every NSA CSI concern). They are substrate boundaries that exist regardless of any compliance framework.</p>
 
     <p>The pair of documents (this NSA CSI mapping + the honest-limitations companion) is the procurement-grade evidence pair. Read in sequence to form a complete picture of substrate coverage.</p>
 
-    <p><a href="honest-limitations.md">→ Read the honest-limitations companion document</a></p>
+    <p><a href="honest-limitations.html">→ Read the honest-limitations companion document</a></p>
   </div>
 </section>
 
 <footer>
   <div class="container">
     <p style="margin-bottom:.5rem"><strong>ai-memory v0.7.0</strong> · NSA CSI MCP Security Compliance · public-facing procurement-grade evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
-    <p style="margin-bottom:.5rem">Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Summary: <a href="_inventory/v0.7.0-summary.md">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.md">honest-limitations.md</a></p>
+    <p style="margin-bottom:.5rem">Verification commit: <code>4add7a8528d4c16d696b391ec6e2890269669a84</code> on <code>release/v0.7.0</code> · Inventory: <a href="_inventory/v0.7.0-capabilities.json">v0.7.0-capabilities.json</a> · Summary: <a href="_inventory/v0.7.0-summary.html">v0.7.0-summary.md</a> · Companion: <a href="honest-limitations.html">honest-limitations.md</a></p>
     <p style="margin-bottom:.5rem">Reference: National Security Agency, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. The mapping above is one-directional: ai-memory's posture relative to NSA-issued guidance. NSA, DoD, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</p>
     <p>Audit issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · Follow-up issues: #1154 (daemon serverInfo signing), #1155 (Accept-Provenance), #1156 (per-namespace K8 quota dimension, shipped at schema v50 — defense-in-depth blast-radius control under recommendation c).</p>
   </div>

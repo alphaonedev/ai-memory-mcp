@@ -106,13 +106,13 @@ footer a{color:var(--muted)}
     <li><strong>auto-tag</strong> &mdash; assigns tags on store so subsequent recall can filter by topic</li>
     <li><strong>reflection</strong> &mdash; bounded recursive synthesis over a memory scope, signed and stored as kind <code>reflection</code></li>
   </ul>
-  <p>Measured note: on <code>gemma4:e4b</code> Q4_K_M on an M4 Mac Mini, the curator's auto-tag + contradiction passes hit a p50 wall of ~2.9 s for an 80-token completion at 31 tok/sec. Speculative-decoding (MTP) gating on the same host is currently a no-op pending a GGUF-converted drafter; details and reproduction in <a href="../v0.7.0/mtp-bench-2026-05-17.md">docs/v0.7.0/mtp-bench-2026-05-17.md</a>.</p>
+  <p>Measured note: on <code>gemma4:e4b</code> Q4_K_M on an M4 Mac Mini, the curator's auto-tag + contradiction passes hit a p50 wall of ~2.9 s for an 80-token completion at 31 tok/sec. Speculative-decoding (MTP) gating on the same host is currently a no-op pending a GGUF-converted drafter; details and reproduction in <a href="../v0.7.0/mtp-bench-2026-05-17.html">docs/v0.7.0/mtp-bench-2026-05-17.md</a>.</p>
 
   <h2><span class="num">07.</span> NHI <code>agent_id</code> semantics</h2>
   <p>Every memory carries <code>metadata.agent_id</code>. Resolution ladder, preservation invariants, validation regex, special-key reservations &mdash; all documented in the developer audience page and in <code>docs/agent-identity.html</code>. The substrate <em>preserves</em> <code>agent_id</code> across update, dedup, MCP <code>memory_update</code>, HTTP <code>PUT</code>, import, sync, and consolidate &mdash; enforced at the caller layer and again at the SQL layer (<code>json_set</code> CASE clauses in <code>db::insert</code> and <code>db::insert_if_newer</code>) so a single-layer bug cannot leak.</p>
 
   <h2><span class="num">08.</span> Append-only signed audit chain</h2>
-  <p>Every store, update, link, reflection, consolidation, promotion writes a signed event into an append-only chain. The chain replays deterministically; the verifier catches tampering; the operator can audit who did what at any prior point in time. v0.7.0 names this <em>signed-events v4</em>; the spec is <a href="../signed-events-v4.md">docs/signed-events-v4.md</a>.</p>
+  <p>Every store, update, link, reflection, consolidation, promotion writes a signed event into an append-only chain. The chain replays deterministically; the verifier catches tampering; the operator can audit who did what at any prior point in time. v0.7.0 names this <em>signed-events v4</em>; the spec is <a href="../signed-events-v4.html">docs/signed-events-v4.md</a>.</p>
 
   <hr>
 
@@ -136,9 +136,9 @@ footer a{color:var(--muted)}
 
   <h2>Reproducing the claims</h2>
   <ul>
-    <li>Tool counts (100 MCP entries (99 callable), 91 HTTP routes (77 unique paths), 83 CLI subcommands (default build) / 85 with <code>--features sal</code> or <code>--features sal-postgres</code>): asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code> and by the HTTP route registry in <code>src/lib.rs</code>; full surface lists in <a href="../USER_GUIDE.md">USER_GUIDE</a>, <a href="../API_REFERENCE.md">API_REFERENCE</a>, <a href="../CLI_REFERENCE.md">CLI_REFERENCE</a>.</li>
+    <li>Tool counts (100 MCP entries (99 callable), 91 HTTP routes (77 unique paths), 83 CLI subcommands (default build) / 85 with <code>--features sal</code> or <code>--features sal-postgres</code>): asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code> and by the HTTP route registry in <code>src/lib.rs</code>; full surface lists in <a href="../USER_GUIDE.html">USER_GUIDE</a>, <a href="../API_REFERENCE.html">API_REFERENCE</a>, <a href="../CLI_REFERENCE.html">CLI_REFERENCE</a>.</li>
     <li>Schema version v70, 27-field Memory struct, 9 link variants: <code>src/models/memory.rs</code>, <code>src/models/link.rs</code>, <code>src/storage/migrations.rs</code>.</li>
-    <li>Autonomous-tier latency p50 ~2.9 s on <code>gemma4:e4b</code>: <a href="../v0.7.0/mtp-bench-2026-05-17.md">mtp-bench-2026-05-17.md</a>.</li>
+    <li>Autonomous-tier latency p50 ~2.9 s on <code>gemma4:e4b</code>: <a href="../v0.7.0/mtp-bench-2026-05-17.html">mtp-bench-2026-05-17.md</a>.</li>
     <li>Test campaign SHIP-RECOMMENDED verdict, 7,321 PASS / 0 FAIL across 269 test binaries (22 issues #1120-#1141 fixed in-campaign, no v0.8.0 deferrals): <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/">2026-05-22 release-gate-final campaign</a>.</li>
   </ul>
 

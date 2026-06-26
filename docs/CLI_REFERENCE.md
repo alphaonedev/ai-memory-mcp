@@ -602,7 +602,7 @@ failure, 429 rate-limited, 5xx vendor outage; CRIT = 4xx-other
 (likely wrong `base_url`), network/DNS/TLS error. Surfaces the
 resolved provenance facts (`backend`, `model`, `base_url`,
 `config_source`, `key_source`). See
-[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the full resolver
+[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the full resolver
 contract.
 
 **`Embeddings Reachability (#1598)` section.** The embeddings sibling
@@ -655,7 +655,7 @@ The migrator never lowers security posture or removes secrets.
 Inline `[llm].api_key = "<literal>"` in the source file is REJECTED
 at v0.7.x parse time — operators must use `api_key_env` or
 `api_key_file` instead. See
-[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the secret-handling
+[`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the secret-handling
 discipline.
 
 ## v0.7 feature-gated commands
@@ -689,7 +689,7 @@ for the WT-1/QW/Form additions).
 ### `atomise` — Form 2 / WT-1-C decomposition
 
 Decomposes a long memory into 2-10 atomic propositions. Backs the
-`memory_atomise` MCP tool. See [`docs/atomisation.md`](atomisation.md).
+`memory_atomise` MCP tool. See [`docs/atomisation.md`](atomisation.html).
 
 ### `calibrate confidence` — Form 5 sweep (#758)
 
@@ -697,7 +697,7 @@ Per-source baseline calibration:
 `ai-memory calibrate confidence --from-shadow` reads
 `confidence_shadow_observations` and emits per-`(namespace, source)`
 baselines. Backs `memory_calibrate_confidence`.
-See [`docs/confidence-calibration.md`](confidence-calibration.md).
+See [`docs/confidence-calibration.md`](confidence-calibration.html).
 
 ### `export-reflections` — QW-1 file-backed export
 
@@ -830,7 +830,7 @@ Global flag: `--key-dir <PATH>` overrides the key storage directory
 
 Walks the `signed_events` cross-row hash chain end-to-end. Supports
 `--since N` (skip the first N rows) and `--format text|json`. See
-[`docs/signed-events-v4.md`](signed-events-v4.md).
+[`docs/signed-events-v4.md`](signed-events-v4.html).
 
 ### `schema-init` — postgres + AGE bootstrap (`--features sal`)
 
@@ -840,7 +840,7 @@ Enumerates the resulting catalog (tables, views, functions, indices,
 extensions, schema_version); on Postgres with Apache AGE installed it
 also bootstraps the `memory_graph` projection — without AGE the
 recursive-CTE fallback stays in place automatically. See
-[`docs/postgres-age-guide.md`](postgres-age-guide.md).
+[`docs/postgres-age-guide.md`](postgres-age-guide.html).
 
 ### `governance` subcommands
 
@@ -872,7 +872,7 @@ unprivileged. Global flag: `--key-dir <PATH>`.
 
 Deterministic in-process POSIX-ustar tar with byte-identical mod
 timestamps. Operator-signed when an operator keypair is present. See
-[`docs/forensic-export.md`](forensic-export.md).
+[`docs/forensic-export.md`](forensic-export.html).
 
 ### FX-12 / FX-C3 MCP↔CLI parity subcommands (v0.7.0)
 

@@ -13,7 +13,7 @@ SPDX-License-Identifier: Apache-2.0
 > and wire the daemon to fail closed on unenrolled peers. For the
 > *concept* reference (why O(1) "trust the CA" replaces O(N²) `.pub`
 > exchange, the credential wire format, the GitOps inventory model) read
-> [`federation-identity.md`](federation-identity.md) first — this page is
+> [`federation-identity.md`](federation-identity.html) first — this page is
 > the operational companion to it.
 >
 > This is exactly what the `hive-1461` reproducible baseline runs as
@@ -182,7 +182,7 @@ is **`TOTAL=26 PASS=26 FAIL=0`**, including the four `zerotouch` checks:
 
 ## 8. Cross-references
 
-- [`federation-identity.md`](federation-identity.md) — concept + full
+- [`federation-identity.md`](federation-identity.html) — concept + full
   config reference (credential wire format, GitOps inventory, hierarchical
   trust, rollout playbook).
 - [`zero-touch-trust.html`](zero-touch-trust.html) — the GitHub Pages

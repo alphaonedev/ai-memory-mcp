@@ -76,7 +76,7 @@ memory context as part of its system prompt.
 >
 > Export `XAI_API_KEY` in your shell rc; restart Claude Code. The SessionStart hook's boot banner should now report `llm=xai:grok-4.3`.
 >
-> The **override** path is an `env:` block in the MCP server entry in `~/.claude.json` with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL` — still works and takes precedence over `config.toml`. Shell exports do not reach Claude Code's MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)). Full recipes: [`llm-backends.md`](llm-backends.md).
+> The **override** path is an `env:` block in the MCP server entry in `~/.claude.json` with `AI_MEMORY_LLM_BACKEND` / `_API_KEY` / `_MODEL` — still works and takes precedence over `config.toml`. Shell exports do not reach Claude Code's MCP-spawned subprocess ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)). Full recipes: [`llm-backends.md`](llm-backends.html).
 
 ## Why these flags
 
@@ -296,7 +296,7 @@ rejection on every such call (fixed in
 [#1667](https://github.com/alphaonedev/ai-memory-mcp/issues/1667)). An
 operator who wants to gate additional tools can widen the matcher by hand;
 the action-kind translation is documented in
-[`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
+[`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.html).
 
 ### How to install
 
@@ -358,7 +358,7 @@ ai-memory rules add ...   --sign              # author a new rule
 
 Mutation over MCP is **explicitly disabled** — a compromised agent
 must not be able to weaken its own constraints. See
-[`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md)
+[`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.html)
 §"Operator-mutation gating".
 
 ### Operator workflow (end-to-end)
@@ -407,7 +407,7 @@ entries (under different markers) are left untouched.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the `ai-memory boot` primitive.
+- [`README.md`](README.html) — integration matrix and the `ai-memory boot` primitive.
 - Issue #487 — the RCA and full remediation plan.
 - Issue F (cross-filed at `anthropics/claude-code`) — request that MCP
   servers can mark tools as boot-priority so deferred-tool round-trips

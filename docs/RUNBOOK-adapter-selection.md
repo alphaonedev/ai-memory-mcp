@@ -7,7 +7,7 @@ layout: doc
 > certification window, the adapter-selection refactor previously deferred
 > to v0.7.1 **lands in v0.7.0** as Wave 3 of the v0.7.0 A2A campaign expanded
 > scope. See `docs/v0.7.0/release-notes.md` for the full Wave 1-4 plan and
-> [`docs/postgres-age-guide.md`](postgres-age-guide.md) for the operator
+> [`docs/postgres-age-guide.md`](postgres-age-guide.html) for the operator
 > how-to. The body of this runbook is preserved as design context — the
 > "deferred" framing is historical; treat the roadmap below as the v0.7.0
 > implementation plan.

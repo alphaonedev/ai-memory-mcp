@@ -13,7 +13,7 @@ integration is at the application boundary: shell out to `ai-memory boot`
 and prepend the result to the system instruction (or the first message
 of the conversation when no system slot exists).
 
-> **Cross-reference — using Gemini as ai-memory's own LLM backend?** That's the inverse direction (ai-memory's smart/autonomous tiers calling out to Gemini for query expansion / auto-tag / contradiction detection). Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the recommended path is a `[llm]` section in `~/.config/ai-memory/config.toml` (`backend = "gemini"`, `model = "gemini-2.0-flash"`, `api_key_env = "GEMINI_API_KEY"`); see [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) for the canonical schema and [`llm-backends.md` § Google Gemini](llm-backends.md#google-gemini) for the override env-block recipe. The shell-out pattern below uses Gemini as the AI client; that's a separate concern.
+> **Cross-reference — using Gemini as ai-memory's own LLM backend?** That's the inverse direction (ai-memory's smart/autonomous tiers calling out to Gemini for query expansion / auto-tag / contradiction detection). Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the recommended path is a `[llm]` section in `~/.config/ai-memory/config.toml` (`backend = "gemini"`, `model = "gemini-2.0-flash"`, `api_key_env = "GEMINI_API_KEY"`); see [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html) for the canonical schema and [`llm-backends.md` § Google Gemini](llm-backends.html#google-gemini) for the override env-block recipe. The shell-out pattern below uses Gemini as the AI client; that's a separate concern.
 
 The canonical Rust-native cross-platform replacement for the wrapper
 script below is `ai-memory wrap gemini` (PR-6 of issue #487) — same
@@ -97,7 +97,7 @@ installer issue for one-line bootstrap.
 
 Every wrapper invocation emits `ai-memory boot`'s status header on
 stdout (when `--no-header` is omitted). The four headers documented in
-[`README.md`](README.md) tell `ok` / `info-empty` / `info-greenfield`
+[`README.md`](README.html) tell `ok` / `info-empty` / `info-greenfield`
 / `warn-db` apart. If you see no header at all, the wrapper itself
 isn't firing — check `which gemini` resolves to the wrapper and not the
 upstream binary.
@@ -131,9 +131,9 @@ This recipe will be updated in place once the hook lands.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the universal
+- [`README.md`](README.html) — integration matrix and the universal
   primitive.
-- [`codex-cli.md`](codex-cli.md) — same wrapper pattern, OpenAI variant.
-- [`openai-apps-sdk.md`](openai-apps-sdk.md) — same prepend pattern for
+- [`codex-cli.md`](codex-cli.html) — same wrapper pattern, OpenAI variant.
+- [`openai-apps-sdk.md`](openai-apps-sdk.html) — same prepend pattern for
   any OpenAI-compatible API.
 - Issue #487 — RCA + cross-files for the Gemini CLI hook request.

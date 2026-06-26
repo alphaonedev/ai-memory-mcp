@@ -10,7 +10,7 @@ release: "v0.7.0 (`attested-cortex`)"
 
 > **One sentence:** measure every one of the 43 MCP tool definitions today, sort by total `cl100k_base` token cost, flag the verbosity hotspots, and hand the list to C2-C5 so each follow-on chip lands in a known place in the budget.
 
-**Companion to** [`V0.7-EPIC.md`](V0.7-EPIC.md) and [`v0.7-nhi-prompts.md`](v0.7-nhi-prompts.md) (Track C).
+**Companion to** [`V0.7-EPIC.md`](V0.7-EPIC.html) and [`v0.7-nhi-prompts.md`](v0.7-nhi-prompts.html) (Track C).
 **Status:** PLANNED — this document is the *input* artifact. The compaction itself is C2-C5.
 **Date:** 2026-05-05.
 **Issue:** [#546](https://github.com/alphaonedev/ai-memory-mcp/issues/546) (partial — audit only).
@@ -192,7 +192,7 @@ The 244-token `inputSchema` carries `valid_at`, `allowed_agents`, `target_namesp
 
 ## Forward references — how C2-C5 chip at the budget
 
-The Track-C plan in [`v0.7-nhi-prompts.md`](v0.7-nhi-prompts.md) lays out four follow-on tasks. Each one targets a different *kind* of verbosity from the analysis above:
+The Track-C plan in [`v0.7-nhi-prompts.md`](v0.7-nhi-prompts.html) lays out four follow-on tasks. Each one targets a different *kind* of verbosity from the analysis above:
 
 | Task | Targets | Per the prompt | Estimated reduction |
 |---|---|---|---:|

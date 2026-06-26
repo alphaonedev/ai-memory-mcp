@@ -8,11 +8,11 @@ layout: doc
 > client) contributing to `alphaonedev/ai-memory-mcp`.
 >
 > Maintained by AlphaOne LLC. All AI agents and the humans driving them must follow this
-> workflow. Companion document: [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md)
+> workflow. Companion document: [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html)
 > defines the policy boundaries that constrain the steps below.
 >
-> **Precedence:** [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) >
-> [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) > this document >
+> **Precedence:** [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) >
+> [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) > this document >
 > [`CONTRIBUTING.md`](../CONTRIBUTING.md). When this document conflicts with a higher
 > document, the higher document wins.
 
@@ -44,9 +44,9 @@ Load these files into context before proposing any change:
   what, what would break"; ai-memory answers "what did prior sessions learn". All three
   should be loaded for cross-cutting work.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — contributor procedures
-- [`docs/ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) — code, test, security,
+- [`docs/ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) — code, test, security,
   release standards
-- [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) — what you may and may
+- [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) — what you may and may
   not do without human approval
 - This document
 
@@ -139,7 +139,7 @@ git checkout -b <type>/<short-slug> origin/develop
 ```
 
 `main` is production-only. AI agents must never branch from `main` and must never push
-to `main` (see [Governance §3](AI_DEVELOPER_GOVERNANCE.md)).
+to `main` (see [Governance §3](AI_DEVELOPER_GOVERNANCE.html)).
 
 ### 4.2 Naming conventions
 
@@ -163,12 +163,12 @@ Slugs are kebab-case, ASCII, ≤ 40 characters.
 
 Prefer multiple small commits to one large commit. Each commit should leave the tree in
 a buildable state. Use the conventional `<type>: <summary>` format
-(see [`ENGINEERING_STANDARDS.md` §1.5](ENGINEERING_STANDARDS.md)).
+(see [`ENGINEERING_STANDARDS.md` §1.5](ENGINEERING_STANDARDS.html)).
 
 ### 5.2 Co-authorship trailer (mandatory for AI-authored commits)
 
 Every commit you author must end with the agent attribution trailer (see
-[Governance §4](AI_DEVELOPER_GOVERNANCE.md)):
+[Governance §4](AI_DEVELOPER_GOVERNANCE.html)):
 
 ```
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
@@ -178,7 +178,7 @@ Use the trailer that matches the actual model/agent producing the commit.
 
 ### 5.3 Code style (Rust)
 
-The rules in [`ENGINEERING_STANDARDS.md` §1.4](ENGINEERING_STANDARDS.md) are binding for
+The rules in [`ENGINEERING_STANDARDS.md` §1.4](ENGINEERING_STANDARDS.html) are binding for
 this repo. Highlights:
 
 - Rust 1.87+ MSRV
@@ -194,7 +194,7 @@ this repo. Highlights:
 
 - New code requires new tests in the same PR.
 - Bug fixes require a regression test that fails on the old code and passes on the new.
-- See [`ENGINEERING_STANDARDS.md` §2](ENGINEERING_STANDARDS.md) for the full test
+- See [`ENGINEERING_STANDARDS.md` §2](ENGINEERING_STANDARDS.html) for the full test
   protocol (cargo test, full-spectrum functional test, memory & TTL test protocol).
 
 ### 5.5 Don't sprawl
@@ -244,7 +244,7 @@ Every store must set `--source` accurately:
 
 User corrections take precedence over agent-authored memories on the same topic. When
 they conflict, write the user version with priority 9–10 and link the prior agent
-memory with `supersedes` (see [Governance §7](AI_DEVELOPER_GOVERNANCE.md)).
+memory with `supersedes` (see [Governance §7](AI_DEVELOPER_GOVERNANCE.html)).
 
 ### 6.4 Contradiction handling
 
@@ -286,7 +286,7 @@ in the PR description. Both script gates are wired into
 `.github/workflows/c8-precheck.yml` and will block any PR that fails them.
 
 In addition, walk the **manual security checklist** in
-[`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.md) and confirm zero new
+[`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.html) and confirm zero new
 findings in the 10 areas (SQL injection, `validate_id()` coverage, command injection,
 path traversal, `unwrap()`, error message leakage, race conditions, auth/authz, data in
 logs, CORS).
@@ -347,7 +347,7 @@ Closes #<n>  (or "Refs #<n>")
 **AI-authored PRs to `develop` always merge via the §3.4 NHI Merge SOP.** There is
 no alternate review path for AI-authored PRs in this project.
 
-Why: per [`AI_DEVELOPER_GOVERNANCE.md` §5.4](AI_DEVELOPER_GOVERNANCE.md), only
+Why: per [`AI_DEVELOPER_GOVERNANCE.md` §5.4](AI_DEVELOPER_GOVERNANCE.html), only
 `@alphaonedev` may approve PRs whose commits carry the AI `Co-Authored-By:`
 trailer. Combined with GitHub's hardcoded rule that a PR's author cannot
 self-approve, every AI-authored PR satisfies §3.4.1 pre-condition (3) by
@@ -365,7 +365,7 @@ The §3.4 SOP is the standard, codified procedure — not an exception. It does 
 weaken any quality gate: signatures, status checks, code-owner rules, and
 last-push-approval all remain active throughout the window. Only the
 admin-enforcement bit is transiently toggled. See
-[`AI_DEVELOPER_GOVERNANCE.md` §3.4](AI_DEVELOPER_GOVERNANCE.md) for full
+[`AI_DEVELOPER_GOVERNANCE.md` §3.4](AI_DEVELOPER_GOVERNANCE.html) for full
 pre-conditions, procedure, window discipline, and audit-memory template.
 
 If you, as the agent, cannot verify that all §3.4.1 pre-conditions are met, do
@@ -376,7 +376,7 @@ If you, as the agent, cannot verify that all §3.4.1 pre-conditions are met, do
 When more than one agent is active against this repository (e.g., 3 humans in
 Claude Code CLI sessions plus a supervised off-host OpenClaw instance), the
 §3.4 SOP must be **serialized** via the §3.4.3.1 concurrency lock. See
-[`AI_DEVELOPER_GOVERNANCE.md` §3.5](AI_DEVELOPER_GOVERNANCE.md) for the full
+[`AI_DEVELOPER_GOVERNANCE.md` §3.5](AI_DEVELOPER_GOVERNANCE.html) for the full
 multi-agent coordination rules:
 
 - §3.5.1 — Branch ownership (memory-recorded)
@@ -466,8 +466,8 @@ an unwanted destructive action.
 
 | Topic | Document |
 |-------|----------|
-| Authority and policy boundaries | [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) |
-| Code, test, release, security standards | [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) |
+| Authority and policy boundaries | [`AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) |
+| Code, test, release, security standards | [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) |
 | Contributor procedures | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | Claude Code integration | [`../CLAUDE.md`](../CLAUDE.md) |
 | Conduct | [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) |

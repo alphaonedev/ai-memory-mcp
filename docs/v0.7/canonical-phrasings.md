@@ -125,8 +125,8 @@ The returned document carries both fields at the top level alongside `schema_ver
 
 ## Refs
 
-- [v0.7.0 epic](./V0.7-EPIC.md) — track A, tasks A1–A5
-- [v0.7.0 NHI prompts](./v0.7-nhi-prompts.md) — tasks A1, A2 (per-task NHI starters)
+- [v0.7.0 epic](./V0.7-EPIC.html) — track A, tasks A1–A5
+- [v0.7.0 NHI prompts](./v0.7-nhi-prompts.html) — tasks A1, A2 (per-task NHI starters)
 - `src/mcp.rs::build_capabilities_summary` — A1 builder
 - `src/mcp.rs::build_capabilities_describe_to_user` — A2 builder
 - `tests/capabilities_v3.rs` — A1+A2 contract pins

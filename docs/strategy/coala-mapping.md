@@ -7,7 +7,7 @@ layout: doc
 >
 > **Date:** 2026-05-27.
 >
-> **Status:** Reference material. Not a constraint. The moonshot synthesis ([`docs/strategy/moonshot-synthesis.md`](moonshot-synthesis.md)) and the seven §2 properties in [`ROADMAP.md`](../../ROADMAP.md) remain the authoritative anchors. Where CoALA and the moonshot disagree, the moonshot wins.
+> **Status:** Reference material. Not a constraint. The moonshot synthesis ([`docs/strategy/moonshot-synthesis.md`](moonshot-synthesis.html)) and the seven §2 properties in [`ROADMAP.md`](../../ROADMAP.md) remain the authoritative anchors. Where CoALA and the moonshot disagree, the moonshot wins.
 >
 > **Purpose.** Map ai-memory's substrate primitives to the Cognitive Architectures for Language Agents framework (Sumers, Yao, Narasimhan, Griffiths, *TMLR* 02/2024, arXiv:2309.02427) for readers familiar with the academic literature on language-agent design. This document does not derive the substrate's properties from CoALA — those derive from the moonshot. CoALA serves as a retrospective organizing lens.
 

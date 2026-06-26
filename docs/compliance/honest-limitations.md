@@ -6,12 +6,12 @@ layout: doc
 **Document classification:** Public-facing, procurement-grade.
 **Date:** 2026-05-23.
 **ai-memory version:** v0.7.0 (sqlite + postgres schema **v57**, lockstep).
-**Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.md) — the NSA CSI concern + recommendation mapping that Task E ships.
+**Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) — the NSA CSI concern + recommendation mapping that Task E ships.
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json).
 
 ## Statement of intent — what this document is and is not
 
-The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.md) claims ai-memory v0.7.x addresses every one of the ten NSA-enumerated MCP security concerns and every one of the seven NSA recommendations structurally at the substrate layer. That claim is grep-verifiable against the codegraph-derived [capability inventory](_inventory/v0.7.0-capabilities.json).
+The [NSA CSI MCP Security mapping](nsa-csi-mcp-security-mapping.html) claims ai-memory v0.7.x addresses every one of the ten NSA-enumerated MCP security concerns and every one of the seven NSA recommendations structurally at the substrate layer. That claim is grep-verifiable against the codegraph-derived [capability inventory](_inventory/v0.7.0-capabilities.json).
 
 **This document is NOT a list of NSA CSI gaps.** There are none — concern j (tool invocation path confusion) was the last partial-coverage edge at v0.7.0 and is now closed via #1154 (daemon-Ed25519-signed `ai_memory_identity` block at MCP initialize handshake, shipped in `src/mcp/server_identity.rs` with 47 dedicated regression tests).
 
@@ -134,7 +134,7 @@ An operator deploys ai-memory but does not enable the governance rules engine �
 
 **Reference framework citations:**
 
-- National Security Agency, *Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation*, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. *Substrate coverage of this framework is mapped in [`nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.md). This honest-limitations document is the substrate-boundaries companion that pairs with that mapping.*
+- National Security Agency, *Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation*, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026. *Substrate coverage of this framework is mapped in [`nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html). This honest-limitations document is the substrate-boundaries companion that pairs with that mapping.*
 - Microsoft Corporation, *Agent Governance Toolkit `LIMITATIONS.md`*, public documentation, 2025. *Honest-limitations discipline model adopted by ai-memory.*
 - Ortega, P. A., and de Freitas, N. *On Hallucinations in Large Language Models*, 2026. *Consumer-side hallucination framing.*
 
@@ -144,4 +144,4 @@ An operator deploys ai-memory but does not enable the governance rules engine �
 
 ---
 
-*Procurement-grade compliance evidence. Public-facing. Reviewed against the v0.6.3.1 capabilities-v2 honesty discipline floor. Pairs with [`nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.md) for federal procurement evaluation.*
+*Procurement-grade compliance evidence. Public-facing. Reviewed against the v0.6.3.1 capabilities-v2 honesty discipline floor. Pairs with [`nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) for federal procurement evaluation.*

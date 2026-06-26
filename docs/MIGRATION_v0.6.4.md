@@ -5,7 +5,7 @@ layout: doc
 
 **v0.6.4 — `quiet-tools`** ships with a **collapsed default tool surface**. This document is the operator's guide to the change and the opt-out path for power users.
 
-> **Forward note (v0.7.0):** the numbers in this historical migration doc (5 core / 43 full / 38 unloaded) reflect the v0.6.4 surface. **At v0.7.0 the equivalents are 7 core / 74 full / 66 unloaded** — the original 5 grew to 7 with the always-on `memory_load_family` + `memory_smart_load` loaders, and the full surface grew to 73 with the v0.7 additions (recursive-learning, Agent Skills, Batman Forms 1-7, QW-1/2/3, enterprise-config #1146, etc.). See [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) for the v0.6.4 → v0.7.0 path and [`MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md) for tiered (non-technical / SME / DevOps) recipes.
+> **Forward note (v0.7.0):** the numbers in this historical migration doc (5 core / 43 full / 38 unloaded) reflect the v0.6.4 surface. **At v0.7.0 the equivalents are 7 core / 74 full / 66 unloaded** — the original 5 grew to 7 with the always-on `memory_load_family` + `memory_smart_load` loaders, and the full surface grew to 73 with the v0.7 additions (recursive-learning, Agent Skills, Batman Forms 1-7, QW-1/2/3, enterprise-config #1146, etc.). See [`MIGRATION_v0.7.md`](MIGRATION_v0.7.html) for the v0.6.4 → v0.7.0 path and [`MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.html) for tiered (non-technical / SME / DevOps) recipes.
 
 ---
 
@@ -135,8 +135,8 @@ Every `memory_capabilities --include-schema` call (grant or deny) is recorded in
 
 ## Related
 
-- [`docs/v0.6.4/V0.6.4-EPIC.md`](v0.6.4/V0.6.4-EPIC.md) — single-doc framework for the sprint
-- [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](v0.6.4/rfc-default-tool-surface-collapse.md) — design RFC
+- [`docs/v0.6.4/V0.6.4-EPIC.md`](v0.6.4/V0.6.4-EPIC.html) — single-doc framework for the sprint
+- [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](v0.6.4/rfc-default-tool-surface-collapse.html) — design RFC
 - [`benchmarks/v0.6.4-cross-harness.md`](../benchmarks/v0.6.4-cross-harness.md) — token-cost measurement
 - [`CHANGELOG.md`](../CHANGELOG.md) — full v0.6.4 entry
 - v0.6.4 cert campaign in [`alphaonedev/ai-memory-test-hub`](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
