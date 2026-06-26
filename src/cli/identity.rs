@@ -177,23 +177,44 @@ fn generate(
             pub_path.display()
         );
     }
-    let kp = keypair::generate(&id)?;
-    keypair::save(&kp, dir)?;
-    if json_out {
-        writeln!(
-            out.stdout,
-            "{}",
-            serde_json::json!({
-                "generated": true,
-                "agent_id": id,
-                "key_dir": dir,
-                (PUBLIC_KEY_B64_FIELD): kp.public_base64(),
-            })
-        )?;
+    // #1679 — a `--force` rotation over an EXISTING key goes through
+    // `keypair::rotate`, which archives the prior PUBLIC key to a
+    // timestamped sibling BEFORE overwriting (so the verification anchor
+    // for historical signed_events is not silently destroyed; the old
+    // PRIVATE key is destroyed by the overwrite = forward security). A
+    // first-time create (no existing key) is the plain generate+save.
+    let (kp, archived_pub) = if force && pub_path.exists() {
+        let outcome = keypair::rotate(&id, dir)?;
+        (keypair::load(&id, dir)?, Some(outcome.archived_pub))
     } else {
-        writeln!(out.stdout, "generated keypair for {id}")?;
+        let kp = keypair::generate(&id)?;
+        keypair::save(&kp, dir)?;
+        (kp, None)
+    };
+    if json_out {
+        let mut obj = serde_json::json!({
+            "generated": true,
+            "rotated": archived_pub.is_some(),
+            "agent_id": id,
+            "key_dir": dir,
+            (PUBLIC_KEY_B64_FIELD): kp.public_base64(),
+        });
+        if let Some(ref ap) = archived_pub {
+            obj["archived_pub"] = serde_json::json!(ap.display().to_string());
+        }
+        writeln!(out.stdout, "{obj}")?;
+    } else {
+        let verb = if archived_pub.is_some() {
+            "rotated"
+        } else {
+            "generated"
+        };
+        writeln!(out.stdout, "{verb} keypair for {id}")?;
         writeln!(out.stdout, "  key_dir = {}", dir.display())?;
         writeln!(out.stdout, "  pub_b64 = {}", kp.public_base64())?;
+        if let Some(ref ap) = archived_pub {
+            writeln!(out.stdout, "  archived_prior_pub = {}", ap.display())?;
+        }
     }
     Ok(())
 }
@@ -468,9 +489,33 @@ mod tests {
             .unwrap();
         }
         let stdout = env.stdout_str().to_string();
+        // #1679 — a --force rotation over an existing key reports
+        // "rotated" (not "generated") and surfaces the archived prior
+        // public key (the verification anchor preserved before overwrite).
         assert!(
-            stdout.contains("generated keypair for alice"),
-            "rotation with --force did not succeed: {stdout}"
+            stdout.contains("rotated keypair for alice"),
+            "rotation with --force should report rotation: {stdout}"
+        );
+        assert!(
+            stdout.contains("archived_prior_pub"),
+            "rotation should surface the archived prior public key: {stdout}"
+        );
+        // A timestamped `alice.pub.<ts>` archive sibling exists on disk;
+        // no private-key copy was made.
+        let entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("alice.pub.") && n != "alice.pub"),
+            "rotation must leave an archived alice.pub.<ts> sibling; got {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|n| n.contains(".priv.")),
+            "rotation must NOT copy private-key material; got {entries:?}"
         );
     }
 

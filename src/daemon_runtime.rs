@@ -384,6 +384,13 @@ pub enum Command {
     /// JSONL audit log). Exit 0 if the chain holds; 1 on chain
     /// break.
     VerifySignedEventsChain(VerifySignedEventsChainArgs),
+    /// v0.8.0 §22 Policy-Engine PE-8 (#697 / EPIC #1709) — verify the
+    /// append-only `signed_events` V-4 cross-row hash chain end-to-end
+    /// and surface any gaps for operator review. `--since <RFC3339>`
+    /// scopes by timestamp (chain still verified across the boundary);
+    /// `--json` emits the structured report. Exit 0 if intact + no
+    /// gaps, 1 on any break/gap.
+    VerifyAuditTrail(crate::cli::verify_audit_trail::VerifyAuditTrailArgs),
     /// v0.7.0 L2-5 (issue #670) — export a procurement-grade forensic
     /// evidence bundle (signed tarball) for a memory and its
     /// reflection chain. The OSS surface for the `AgenticMem Attest`
@@ -473,6 +480,33 @@ pub enum Command {
     /// embedder via the same `AppConfig::resolve_embeddings()` +
     /// `Embedder::from_resolved` path as daemon/MCP boot.
     Reembed(crate::cli::commands::reembed::ReembedArgs),
+    /// #1727 (v0.8.0) — `ai-memory undo-edit <id> [--dry-run]`
+    /// subcommand. NON-DESTRUCTIVELY undo the immediately-prior in-place
+    /// edit of a memory: re-apply the `archive_reason='in_place_edit'`
+    /// snapshot (#1725, SAME id) to the live row through the EXISTING
+    /// in-place update path — NO raw DELETE of the live row (which would
+    /// cascade-reap the 15 `ON DELETE CASCADE` children). The apply
+    /// auto-snapshots the CURRENT content, so undo is reversible (re-run =
+    /// redo). `--dry-run` prints the before/after diff without writing.
+    /// CLI-ONLY by deliberate security design — no MCP tool / HTTP route
+    /// (5-agent UNANIMOUS vote, memory `ff23ddcd`); the smallest remote
+    /// attack surface for a lossy mutating op. Routes through the
+    /// backend-blind [`crate::store::MemoryStore::undo_in_place_edit`] so
+    /// SQLite + Postgres behave identically.
+    UndoEdit(crate::cli::commands::undo_edit::UndoEditArgs),
+    /// v0.8.0 #1709/#1720 WS-B B2 — `ai-memory reown` subcommand.
+    /// Rewrite the `metadata.agent_id` ownership stamp on the memories
+    /// in EXACTLY `--namespace` to `--to`, so an operator can establish
+    /// durable ownership over a namespace BEFORE enabling `scope=private`
+    /// visibility filtering (avoiding a self-lockout from legacy /
+    /// foreign-owned rows). Default rewrites every owned row;
+    /// `--claim-unowned` also covers absent/empty-`agent_id` rows;
+    /// `--dry-run` counts without writing. Only the single `agent_id`
+    /// metadata key is rewritten (the `agent_id_idx` generated column
+    /// re-projects the new owner); `--to` is validated. Additive admin
+    /// tool — no schema change, no visibility-behaviour change, no
+    /// MCP/HTTP surface (like `reembed`).
+    Reown(crate::cli::reown::ReownArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
     /// Reconstruct the conversation transcript chain that produced a
     /// memory. CLI parity for `memory_replay`.
@@ -800,6 +834,70 @@ pub struct CompletionsArgs {
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+/// #1389 / #1693 — dispatch the `recover-previous-session` subcommand.
+///
+/// Graceful by design: the SessionStart-hook chain MUST NOT wedge the agent
+/// boot, so per-line parse errors surface in the report rather than as `Err`.
+///
+/// A `--store-url postgres://…` routes L2 recovery through the SAL
+/// `recover_turn_idempotent` path so a postgres-backed daemon rehydrates from
+/// transcripts (parity with the sqlite `--db` path); the async store build
+/// runs BEFORE the stdout lock is taken so no `!Send` lock is held across an
+/// `.await`. In the default (non-`sal`) build the postgres path is unavailable,
+/// so it WARNs and falls back to the local sqlite `--db` path rather than
+/// hard-failing on an unsupported flag.
+///
+/// Extracted from the `Command::RecoverPreviousSession` match arm so the
+/// sqlite routing is unit-testable (coverage of the lock/emit wrapper).
+async fn dispatch_recover_previous_session(
+    a: &cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
+    db_path: &std::path::Path,
+    app_config: &AppConfig,
+) -> Result<i32> {
+    // `app_config` only feeds the postgres store build, which is `sal`-only.
+    #[cfg(not(feature = "sal"))]
+    let _ = app_config;
+    match a.store_url.as_deref().filter(|u| u.starts_with("postgres")) {
+        Some(url) => {
+            #[cfg(feature = "sal")]
+            let c = {
+                let store = build_curator_store(Some(url), db_path, app_config).await?;
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::commands::recover_previous_session::run_store(store.as_ref(), a, &mut out)
+                    .await?
+            };
+            #[cfg(not(feature = "sal"))]
+            let c = {
+                tracing::warn!(
+                    store_url = %url,
+                    "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
+                );
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::commands::recover_previous_session::run(db_path, a, &mut out)?
+            };
+            Ok(c)
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            Ok(cli::commands::recover_previous_session::run(
+                db_path, a, &mut out,
+            )?)
+        }
+    }
+}
+
 /// Top-level CLI dispatch. Called from `main()` after `Cli::parse()`.
 ///
 /// Handles:
@@ -833,6 +931,13 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             max_storage_bytes: limits.max_storage_bytes,
             max_links_per_day: limits.max_links_per_day,
         });
+        // #1733 (Pillar-4 4.A) — seed the process-wide HTTP admission-control
+        // in-flight cap from the resolved `[limits]` config (env
+        // `AI_MEMORY_MAX_INFLIGHT_REQUESTS` > `[limits].max_inflight_requests`
+        // > compiled default `0` = disabled). `build_router_with_timeout`
+        // reads it at router-build time. Idempotent; harmless on the mcp/CLI
+        // paths that never build the HTTP router.
+        crate::set_max_inflight_requests(limits.max_inflight_requests);
     }
     // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
     // the resolved `[storage]` config (env `AI_MEMORY_DB_MMAP_SIZE` >
@@ -842,6 +947,12 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // quota seeding above.
     let resolved_storage = app_config.resolve_storage();
     crate::storage::set_db_mmap_size(resolved_storage.db_mmap_size_bytes);
+    // #1735 (Pillar-4 4.C) — seed the process-wide AGE-projection mode from
+    // the resolved `[storage]` config (env `AI_MEMORY_AGE_PROJECTION_MODE` >
+    // `[storage].age_projection_mode` > compiled default `sync`).
+    // `PostgresStore::link_internal` reads it at write time. Default sync =
+    // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
+    crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent
@@ -1514,6 +1625,17 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 code => std::process::exit(code),
             }
         }
+        Command::VerifyAuditTrail(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            match cli::verify_audit_trail::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         Command::ExportForensicBundle(a) => {
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
@@ -1548,16 +1670,8 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             }
         }
         Command::RecoverPreviousSession(a) => {
-            // Issue #1389 — fail-safe recovery from host transcripts.
-            // Graceful by design: the SessionStart-hook chain MUST
-            // NOT wedge the agent boot, so per-line parse errors
-            // surface in the report rather than as Err.
-            let stdout = std::io::stdout();
-            let stderr = std::io::stderr();
-            let mut so = stdout.lock();
-            let mut se = stderr.lock();
-            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::commands::recover_previous_session::run(&db_path, &a, &mut out)? {
+            let code = dispatch_recover_previous_session(&a, &db_path, app_config).await?;
+            match code {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -1704,6 +1818,36 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             // Non-zero exit codes map configuration outcomes
             // (no-embedder / init-failed) like `ai-memory expand`.
             match cli::commands::reembed::cmd_reembed(&db_path, &a, app_config, &mut out).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::UndoEdit(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // #1727 — NON-DESTRUCTIVE undo of an in-place edit. Builds the
+            // SAL store like the curator (--store-url postgres/sqlite, else
+            // the --db sqlite path) and routes through the backend-blind
+            // `MemoryStore::undo_in_place_edit` trait method. CLI-ONLY by
+            // deliberate security design (no MCP tool / HTTP route).
+            match cli::commands::undo_edit::cmd_undo_edit(&db_path, &a, app_config, &mut out)
+                .await?
+            {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Reown(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
+            match cli::reown::run(&db_path, &a, &mut out)? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -3105,7 +3249,11 @@ async fn build_store_handle(
 /// Actor/queue label for wire-action governance consultations.
 const WIRE_ACTION_ACTOR: &str = "daemon:wire_action";
 
-fn governance_fail_open_on_error() -> bool {
+// #1730 (PE-2) — `pub` so the read-action gate
+// (`governance::agent_action::gate_read`) honors the SAME fail-open knob as
+// the write pre-hook below, keeping the read + write governance-error posture
+// identical cross-surface.
+pub fn governance_fail_open_on_error() -> bool {
     std::env::var(ENV_GOVERNANCE_FAIL_OPEN)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -3213,6 +3361,24 @@ pub(crate) fn install_governance_pre_write_hook(
                     tracing::info!(
                         "L1-6 governance pre-write refused namespace={:?} rule_id={} \
                              reason={} (chain-logged via deferred audit queue)",
+                        mem.namespace,
+                        rule_id,
+                        reason
+                    );
+                    Err(reason)
+                }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — an `escalate` verdict FAILS CLOSED:
+                    // it blocks the write exactly like a refusal
+                    // (`Err`). The deferred audit queue chain-logs it
+                    // (the verdict is blocking, so `submit_refusal`
+                    // enqueues it). Queue persistence + the human
+                    // review queue + timeout-sweep are the #697 PE-5
+                    // follow-on, NOT this primitive — so for now the
+                    // action is paused-as-blocked.
+                    tracing::info!(
+                        "L1-6 governance pre-write escalated namespace={:?} rule_id={} \
+                             reason={} (blocked pending human review; chain-logged)",
                         mem.namespace,
                         rule_id,
                         reason
@@ -3357,6 +3523,21 @@ pub(crate) fn install_governance_pre_action_hook(
                     tracing::info!(
                         "wire_check refused action kind={} rule_id={} reason={} \
                          (chain-logged via deferred audit queue)",
+                        action.kind(),
+                        rule_id,
+                        reason,
+                    );
+                    Err(reason)
+                }
+                Ok(RuleDecision::Escalate { rule_id, reason }) => {
+                    // §22 PE-5 — `escalate` FAILS CLOSED: block the
+                    // action like a refusal (`Err`). Chain-logged via
+                    // the deferred queue (blocking verdict). Queue
+                    // persistence / human-review routing / timeout are
+                    // the #697 PE-5 follow-on, not this primitive.
+                    tracing::info!(
+                        "wire_check escalated action kind={} rule_id={} reason={} \
+                         (blocked pending human review; chain-logged)",
                         action.kind(),
                         rule_id,
                         reason,
@@ -3526,12 +3707,7 @@ fn api_key_bind_guard(
              AI_MEMORY_REQUIRE_API_KEY to fall back to the loopback-only default. (#1458)"
         ));
     }
-    let is_loopback = host == "127.0.0.1"
-        || host == "::1"
-        || host == "localhost"
-        || host == "0:0:0:0:0:0:0:1"
-        || host == "[::1]";
-    if !is_loopback {
+    if !host_is_loopback(host) {
         return Err(format!(
             "refusing to bind to non-loopback address {host:?} without an API key: \
              the daemon's api_key is unset (default-off auth would expose every \
@@ -3552,6 +3728,61 @@ fn api_key_bind_guard(
          for any deployment that is not strictly single-tenant on this host. \
          /approve and /reject remain HMAC-gated regardless."
     )))
+}
+
+/// Same loopback host set [`api_key_bind_guard`] recognises. Factored so the
+/// posture-warning matrix below shares one definition with the bind guard.
+fn host_is_loopback(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host == "0:0:0:0:0:0:0:1"
+        || host == "[::1]"
+}
+
+/// R-04 / R-12 (#1798 full-spectrum review) — boot-time security-posture
+/// warnings for a NON-LOOPBACK bind. Mirrors the [`api_key_bind_guard`]
+/// precedent: pure + unit-testable, returning the warning strings (the caller
+/// emits each via `tracing::warn!`). Loopback binds (the single-tenant default
+/// posture) return an empty vec — these are off-host-reachability concerns.
+///
+/// - **R-04** — permissions mode resolves to `Enforce` but ZERO permission
+///   rules are configured: the operator opted into enforcement, yet with no
+///   rules the pipeline gates nothing (allow-on-silence default), so writes
+///   are effectively ungated. Surfacing this prevents a false sense of
+///   protection.
+/// - **R-12** — agent attestation is permissive (the default): writes land
+///   `attest_level = claimed` with unverified caller identity — a notable
+///   posture for an off-host / multi-tenant listener.
+fn boot_security_posture_warnings(
+    host: &str,
+    permissions_mode: crate::config::PermissionsMode,
+    permission_rule_count: usize,
+    attestation_required: bool,
+) -> Vec<String> {
+    if host_is_loopback(host) {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+    if permissions_mode == crate::config::PermissionsMode::Enforce && permission_rule_count == 0 {
+        warnings.push(format!(
+            "SECURITY POSTURE (#1798 R-04): daemon bound to non-loopback {host:?} with \
+             permissions mode=enforce but ZERO permission rules configured — the permissions \
+             pipeline then gates nothing (allow-on-silence default), so privileged writes are \
+             effectively UNGATED despite enforce mode. Add `[[permissions.rules]]` (or attach a \
+             namespace standard) to actually gate writes; otherwise enforce mode is a false \
+             sense of protection."
+        ));
+    }
+    if !attestation_required {
+        warnings.push(format!(
+            "SECURITY POSTURE (#1798 R-12): daemon bound to non-loopback {host:?} with agent \
+             attestation PERMISSIVE (the default) — writes from any reachable caller land \
+             attest_level=claimed with unverified identity. For off-host / multi-tenant \
+             deployments set AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 to reject unsigned writes."
+        ));
+    }
+    warnings
 }
 
 /// Build all daemon state and spawn background tasks. Returns the
@@ -3589,6 +3820,25 @@ pub async fn bootstrap_serve(
         Ok(None) => {}
         Ok(Some(warning)) => tracing::warn!("{warning}"),
         Err(reason) => anyhow::bail!("{reason}"),
+    }
+
+    // R-04 / R-12 (#1798 full-spectrum review) — loud non-loopback
+    // security-posture WARNs. Resolved from `app_config` (ordering-safe) so
+    // the matrix reflects the operator's configured posture, not a process
+    // global that bootstrap may not have populated yet.
+    {
+        let (effective_mode, _) = crate::governance::resolve_v07_default_mode(
+            app_config.permissions.as_ref().and_then(|p| p.mode),
+        );
+        let permission_rule_count = app_config.permissions.as_ref().map_or(0, |p| p.rules.len());
+        for warning in boot_security_posture_warnings(
+            args.host.as_str(),
+            effective_mode,
+            permission_rule_count,
+            crate::identity::attest::require_agent_attestation_enabled(),
+        ) {
+            tracing::warn!("{warning}");
+        }
     }
 
     let resolved_ttl = app_config.effective_ttl();
@@ -3667,8 +3917,13 @@ pub async fn bootstrap_serve(
     // chain-logged; the deadlock-avoidance came at the cost of
     // breaking the bypass-impossibility audit story for storage
     // writes).
+    // v0.8.0 PE-4 (#1732) — crash-durable journal variant: boot recovery
+    // (replay pre-crash refusals into signed_events) runs first, then the
+    // queue is built with the journal so every submit is durable before
+    // the mpsc send. Runs BEFORE the governance hooks install below
+    // (replay-all-then-go-live).
     let (deferred_audit_queue, deferred_audit_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
     // Capture the shared atomic metrics handle BEFORE the queue is cloned
     // into the governance hooks + moved onto `AppState`. `serve` polls
     // these on shutdown to drain the queue before the WAL checkpoint.
@@ -4112,10 +4367,21 @@ pub async fn bootstrap_serve(
                              falling back to sqlite sink (DLQ writes WILL error \
                              on postgres-backed daemons until the cast is restored)"
                     );
-                    std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone()))
+                    std::sync::Arc::new(
+                        federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                    )
                 }
             }
-            _ => std::sync::Arc::new(federation::push_dlq::SqliteDlqSink::new(db_state.clone())),
+            // #1580 / F5.11 — the sqlite DLQ sink opens its OWN dedicated
+            // connection (learned from `db_state`'s path) so the replay
+            // worker never contends the shared HTTP writer mutex.
+            _ => std::sync::Arc::new(
+                federation::push_dlq::SqliteDlqSink::new(db_state.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?,
+            ),
         };
         fed.dlq_sink = Some(sink);
     }
@@ -4129,18 +4395,38 @@ pub async fn bootstrap_serve(
         && args.catchup_interval_secs > 0
     {
         let interval = std::time::Duration::from_secs(args.catchup_interval_secs);
+        // #1580 — dedicated connection for the catchup/replication loop so
+        // its sync-state reads (`sync_state_load`) and writes
+        // (`sync_state_observe`, the legacy `insert_if_newer` fallback)
+        // never contend the shared HTTP writer mutex. The loop only ever
+        // reads tuple field `.0` (the connection), so the resolved-TTL /
+        // archive flag carried alongside are inert here but kept so the
+        // `Db` tuple shape matches.
+        let catchup_db: Db = {
+            let conn = db::open(db_path)?;
+            let (resolved_ttl, archive_on_gc) = {
+                let guard = db_state.lock().await;
+                (guard.2.clone(), guard.3)
+            };
+            Arc::new(Mutex::new((
+                conn,
+                db_path.to_path_buf(),
+                resolved_ttl,
+                archive_on_gc,
+            )))
+        };
         #[cfg(feature = "sal")]
         {
             federation::spawn_catchup_loop_with_store(
                 fed.clone(),
-                db_state.clone(),
+                catchup_db,
                 Some(store_handle.clone()),
                 interval,
             );
         }
         #[cfg(not(feature = "sal"))]
         {
-            federation::spawn_catchup_loop(fed.clone(), db_state.clone(), interval);
+            federation::spawn_catchup_loop(fed.clone(), catchup_db, interval);
         }
 
         // v0.7.0 Track D #933 — federation push DLQ replay worker.
@@ -4155,6 +4441,41 @@ pub async fn bootstrap_serve(
             tracing::info!(
                 "federation push DLQ replay worker enabled: polling every {}s",
                 args.catchup_interval_secs,
+            );
+        }
+    }
+
+    // #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer when
+    // deferred mode is active on a postgres+AGE backend. Independent of
+    // federation: deferred link writes enqueue to `kg_projection_outbox` in
+    // the same tx as the relational row, and this worker projects them into
+    // `memory_graph` out-of-band (drain-once boot-recovery + periodic tick,
+    // supervised). Default `sync` mode never enqueues, so this is not spawned.
+    #[cfg(feature = "sal-postgres")]
+    if matches!(
+        crate::config::age_projection_mode(),
+        crate::config::AgeProjectionMode::Deferred
+    ) {
+        if let Some(pg) = store_handle
+            .as_any()
+            .downcast_ref::<crate::store::postgres::PostgresStore>()
+        {
+            let interval = std::time::Duration::from_secs(if args.catchup_interval_secs > 0 {
+                args.catchup_interval_secs
+            } else {
+                30
+            });
+            task_handles.push(std::sync::Arc::new(pg.clone()).spawn_drainer(interval));
+            tracing::info!(
+                "kg_projection drainer enabled (AI_MEMORY_AGE_PROJECTION_MODE=deferred): \
+                 draining kg_projection_outbox every {}s",
+                interval.as_secs()
+            );
+        } else {
+            tracing::warn!(
+                "AI_MEMORY_AGE_PROJECTION_MODE=deferred but store is not PostgresStore; \
+                 deferred AGE projection has no drainer — falling back to inline-equivalent \
+                 (links still commit; AGE graph will lag). Use sync mode on non-postgres."
             );
         }
     }
@@ -4367,6 +4688,12 @@ pub async fn bootstrap_serve(
         crate::background::offload_ttl_sweep::DEFAULT_INTERVAL,
     ));
 
+    // #1709 Pillar-1 — reclaim expired action leases.
+    task_handles.push(crate::background::lease_sweep::spawn(
+        db_state.clone(),
+        crate::background::lease_sweep::DEFAULT_INTERVAL,
+    ));
+
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
     // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
     // default) — which is inconsistent timing and can leave the file at
@@ -4464,6 +4791,11 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
+    // sweep + memory_forget become permanent hard-delete). One-shot via
+    // an internal `std::sync::Once`; safe to call on both serve + mcp boot.
+    app_config.warn_if_archive_on_gc_disabled();
+
     Ok(ServeBootstrap {
         app_state,
         api_key_state,
@@ -4532,6 +4864,16 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
             tracing::info!("{}", line.message());
         }
     }
+
+    // #1734 PE-1 — surface the mandatory-hook enforcement posture at boot, in
+    // the same unconditional one-line style as the `permissions: <mode>` line
+    // above. The per-required-event pre-flight ("PreStore: REQUIRED but NO
+    // enabled hook → WILL DENY") lives in `ai-memory doctor --hooks`.
+    tracing::info!(
+        "hooks enforcement: {} ({} required event(s))",
+        app_config.resolve_hooks_enforce_mode().as_str(),
+        app_config.resolve_required_events().len()
+    );
 
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
@@ -5156,6 +5498,9 @@ pub async fn run_curator_daemon_with_primitives(
     dry_run: bool,
     include_namespaces: Vec<String>,
     exclude_namespaces: Vec<String>,
+    // #1749 — Pillar-2.5 consolidation gate, resolved by the caller (which has
+    // the `AppConfig` this daemon body lacks). Default-false at every caller.
+    compaction_enabled: bool,
     llm: Option<Arc<crate::llm::OllamaClient>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
@@ -5165,7 +5510,10 @@ pub async fn run_curator_daemon_with_primitives(
         dry_run,
         include_namespaces,
         exclude_namespaces,
-        compaction: crate::curator::CompactionConfig::default(),
+        compaction: crate::curator::CompactionConfig {
+            enabled: compaction_enabled,
+            ..Default::default()
+        },
     };
 
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -5309,6 +5657,37 @@ mod tests {
         );
     }
 
+    /// #1693 — `dispatch_recover_previous_session` routes a `None` /
+    /// non-postgres store-url through the local sqlite `--db` path and returns
+    /// exit 0 on a clean (empty-transcript) recovery. Covers the stdout-lock +
+    /// report-emit wrapper that the postgres branch shares, so the routing
+    /// extraction does not regress `daemon_runtime.rs` line coverage.
+    #[tokio::test]
+    async fn dispatch_recover_previous_session_sqlite_path_1693() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("mem.db");
+        // Explicit empty-transcript override → resolver bypassed, deterministic
+        // (no dependency on host transcript dirs in the test environment).
+        let transcript = dir.path().join("empty.jsonl");
+        std::fs::write(&transcript, b"").expect("write empty transcript");
+        let args = cli::commands::recover_previous_session::RecoverPreviousSessionArgs {
+            host: "auto".to_string(),
+            transcript: Some(transcript),
+            since: None,
+            namespace: None,
+            limit: 100,
+            dry_run: false,
+            quiet: true,
+            json: false,
+            store_url: None,
+        };
+        let cfg = AppConfig::default();
+        let code = dispatch_recover_previous_session(&args, &db, &cfg)
+            .await
+            .expect("dispatch ok");
+        assert_eq!(code, 0, "empty-transcript recover exits 0 via sqlite path");
+    }
+
     /// #1455 (SEC, MED) — when a governance hook's rule-consultation
     /// connection could not be opened at install time, the gate MUST
     /// fail CLOSED by default (return `Err`), and only degrade to ALLOW
@@ -5360,6 +5739,41 @@ mod tests {
         );
     }
 
+    /// #1455 — exercise the env-reading wrapper `governance_consultation_unavailable`
+    /// itself (it resolves `governance_fail_open_on_error()` and delegates to
+    /// the pure `_inner`). The fail-open/fail-closed SEMANTICS are pinned by
+    /// the `_inner` test above and the env-parse test below; this pins the
+    /// wrapper's delegation path. The verdict depends on the ambient
+    /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR`, so accept either arm (no env
+    /// mutation here → no cross-test env race).
+    #[test]
+    fn governance_consultation_unavailable_wrapper_delegates_1455() {
+        use crate::governance::agent_action::AgentAction;
+        use crate::governance::deferred_audit::DeferredAuditQueue;
+
+        let (queue, _rx) = DeferredAuditQueue::new();
+        let action = AgentAction::Custom {
+            custom_kind: "memory_write".to_string(),
+            payload: serde_json::json!({ "namespace": "ns", "tier": "long" }),
+        };
+        let path = Path::new("/nonexistent/rules.db");
+        match governance_consultation_unavailable(
+            &queue,
+            "agent:test",
+            &action,
+            path,
+            "wrap-surface",
+        ) {
+            // fail-open override (operator opted in) → permissive ALLOW.
+            Ok(()) => {}
+            // secure default → fail CLOSED, naming the cause.
+            Err(reason) => assert!(
+                reason.contains("consultation_unavailable"),
+                "fail-closed reason must name the cause: {reason}"
+            ),
+        }
+    }
+
     /// #1455 — the env-reading wrapper honours the documented
     /// `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` truthy values and
     /// defaults to `false` (fail-closed) when unset.
@@ -5409,6 +5823,87 @@ mod tests {
         let err = api_key_bind_guard(false, "0.0.0.0", false)
             .expect_err("keyless non-loopback bind MUST be refused");
         assert!(err.contains("refusing to bind to non-loopback"), "{err}");
+    }
+
+    // ----- R-04 / R-12 boot security-posture warnings (#1798) ------------
+
+    use crate::config::PermissionsMode;
+
+    /// A loopback bind never emits posture warnings, even with the worst
+    /// posture (enforce + 0 rules + permissive attestation).
+    #[test]
+    fn boot_posture_loopback_emits_nothing_r04_r12() {
+        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let w = boot_security_posture_warnings(host, PermissionsMode::Enforce, 0, false);
+            assert!(
+                w.is_empty(),
+                "loopback {host} must emit no posture warnings, got {w:?}"
+            );
+        }
+    }
+
+    /// Non-loopback + enforce + ZERO permission rules → the R-04 false-sense
+    /// warning fires.
+    #[test]
+    fn boot_posture_enforce_zero_rules_warns_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, true);
+        assert_eq!(
+            w.len(),
+            1,
+            "only R-04 expected (attestation required), got {w:?}"
+        );
+        assert!(
+            w[0].contains("R-04") && w[0].contains("UNGATED"),
+            "{}",
+            w[0]
+        );
+    }
+
+    /// Enforce WITH at least one rule → no R-04.
+    #[test]
+    fn boot_posture_enforce_with_rules_no_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 1, true);
+        assert!(
+            w.is_empty(),
+            "enforce + rules + attestation required → no warnings, got {w:?}"
+        );
+    }
+
+    /// A non-enforce mode (advisory/off) does not trip R-04 (R-04 is
+    /// specifically the enforce-but-no-rules false-sense trap).
+    #[test]
+    fn boot_posture_advisory_mode_no_r04() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 0, true);
+        assert!(w.is_empty(), "advisory mode does not trip R-04, got {w:?}");
+    }
+
+    /// Non-loopback + permissive attestation (the default) → the R-12 warning
+    /// fires; requiring attestation silences it.
+    #[test]
+    fn boot_posture_permissive_attestation_warns_r12() {
+        let permissive =
+            boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 1, false);
+        assert_eq!(
+            permissive.len(),
+            1,
+            "only R-12 expected, got {permissive:?}"
+        );
+        assert!(permissive[0].contains("R-12") && permissive[0].contains("attestation"));
+
+        let strict = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Advisory, 1, true);
+        assert!(
+            strict.is_empty(),
+            "required attestation silences R-12, got {strict:?}"
+        );
+    }
+
+    /// Worst posture on a non-loopback bind surfaces BOTH warnings.
+    #[test]
+    fn boot_posture_worst_case_emits_both_r04_r12() {
+        let w = boot_security_posture_warnings("0.0.0.0", PermissionsMode::Enforce, 0, false);
+        assert_eq!(w.len(), 2, "expected both R-04 and R-12, got {w:?}");
+        assert!(w.iter().any(|s| s.contains("R-04")));
+        assert!(w.iter().any(|s| s.contains("R-12")));
     }
 
     /// The strict opt-in refuses a keyless start even on loopback,
@@ -6222,18 +6717,19 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // Six task handles spawned (v0.7 policy-engine item 3 added
+        // Eight task handles spawned (v0.7 policy-engine item 3 added
         // the deferred-audit supervisor + gc + wal_checkpoint +
         // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
-        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep).
+        // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep +
+        // #1709 Pillar-1 expired-lease reclaim sweep).
         // v0.7 B3-fix2 gates the family-descriptor embedding precompute
         // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
         // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to seven when the
+        // for the rationale. The task count reverts to eight when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 7);
+        assert_eq!(bs.task_handles.len(), 8);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();
@@ -6385,6 +6881,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         db::set_embedding(&conn, &id, &[1.0, 0.0, 0.0]).unwrap();
@@ -6437,6 +6934,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             let id = db::insert(&conn, &mem).unwrap();
             let mut v = [0.0_f32; 3];
@@ -6523,6 +7021,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -6652,6 +7151,79 @@ mod tests {
         let cfg = AppConfig::default();
         let cli = Cli::try_parse_from(["ai-memory", "--db", env.db_path.to_str().unwrap(), "list"])
             .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
+    // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
+    // would `process::exit(2)` and abort the whole test binary. Only the sal
+    // build takes the Ok(0) path — and Per-Module Coverage runs with `sal`, so
+    // the daemon_runtime.rs floor cushion is preserved.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_undo_edit_command() {
+        // #1727/#1800 — cover the `Command::UndoEdit` dispatch arm. Seed a
+        // memory (no in_place_edit snapshot exists), then `undo-edit --dry-run`:
+        // the sal path returns applied=false / before==after → `cmd_undo_edit`
+        // exits 0 → the arm hits `0 => Ok(())`. Exercises the CLI-only undo
+        // surface dispatch end-to-end without a process::exit.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let id = crate::cli::test_utils::seed_memory(&env.db_path, "ns", "t", "c");
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "undo-edit",
+            &id,
+            "--dry-run",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_reown_command() {
+        // Cover the `Command::Reown` dispatch arm. `--dry-run` over an empty
+        // namespace matches 0 rows → `cli::reown::run` returns 0 → the arm's
+        // `0 => Ok(())` runs (no process::exit). Default-build subcommand.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "reown",
+            "--namespace",
+            "ns",
+            "--to",
+            "ai:newowner",
+            "--dry-run",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_replay_command() {
+        // Cover the `Command::Replay` dispatch arm. Seed a memory (no recall
+        // history) and replay its id → the substrate returns an empty replay
+        // envelope (Ok); the arm returns the value directly. Default-build.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let id = crate::cli::test_utils::seed_memory(&env.db_path, "ns", "t", "c");
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "replay",
+            "--memory-id",
+            &id,
+        ])
+        .unwrap();
         run(cli, &cfg).await.unwrap();
     }
 
@@ -7346,6 +7918,18 @@ decision = "allow"
 
     #[tokio::test]
     async fn test_build_router_with_mtls_enforced_allows_sync_without_api_key() {
+        // #1789 — this test asserts the api_key_auth `/sync/*` BYPASS
+        // (response != 401 proves the bypass fired), NOT the peer-enrollment
+        // gate. Commit 6672312b flipped `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`
+        // default-ON, so the unenrolled `(None,None)` arm now 401s deeper in
+        // the handler and masks the bypass. Opt back to permissive via the
+        // wired escape hatch, serialised on the SAME shared lock the strict
+        // enrollment tests hold so a parallel run can't leak the env.
+        let _fed_guard = crate::handlers::fed_env_test_lock();
+        let _fed_prev = std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS").ok();
+        // SAFETY: env mutation under the shared test-scoped lock; restored
+        // below before the lock is released.
+        unsafe { std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1") };
         let env = TestEnv::fresh();
         let app_state = keyword_app_state(&env.db_path);
         let api_key_state = ApiKeyState {
@@ -7373,6 +7957,14 @@ decision = "allow"
             StatusCode::UNAUTHORIZED,
             "expected /sync/* to bypass api-key with mtls_enforced=true, got 401"
         );
+        // Restore the prior env while still holding the shared lock.
+        // SAFETY: lock held; no concurrent writer of this var.
+        unsafe {
+            match &_fed_prev {
+                Some(v) => std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", v),
+                None => std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS"),
+            }
+        }
     }
 
     #[tokio::test]
@@ -7577,7 +8169,7 @@ decision = "allow"
                  id TEXT PRIMARY KEY,
                  kind TEXT NOT NULL,
                  matcher TEXT NOT NULL,
-                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log')),
+                 severity TEXT NOT NULL CHECK (severity IN ('refuse','warn','log','escalate')),
                  reason TEXT NOT NULL,
                  namespace TEXT NOT NULL DEFAULT '_global',
                  created_by TEXT NOT NULL,
@@ -7685,6 +8277,7 @@ decision = "allow"
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let inserted_id = db::insert(&conn, &mem).unwrap();
         // Write a real-length embedding (384 dims of f32).

@@ -153,7 +153,6 @@ pub async fn list_memories(
         };
     }
 
-    let lock = app.db.lock().await;
     // v0.6.2 (S40): raise ceiling from 200 → the operator-resolved
     // `app.max_page_size` (compiled default `MAX_BULK_SIZE` = 1000) so bulk
     // fanout scenarios that POST 500+ rows to a leader can verify full
@@ -162,18 +161,27 @@ pub async fn list_memories(
     // Default remains 20 — only explicit `?limit=` callers see the
     // higher ceiling.
     let limit = p.limit.unwrap_or(20).min(app.max_page_size);
-    match db::list(
-        &lock.0,
-        p.namespace.as_deref(),
-        p.tier.as_ref(),
-        limit,
-        p.offset.unwrap_or(0),
-        p.min_priority,
-        p.since.as_deref(),
-        p.until.as_deref(),
-        p.tags.as_deref(),
-        p.agent_id.as_deref(),
-    ) {
+    // #1580 — `db::list` is a pure SELECT, so dispatch through the WAL
+    // read-pool instead of the single writer mutex. `p` is moved into
+    // the closure (its fields are only read by `db::list`); the
+    // visibility post-filter is pure CPU on the owned rows and stays
+    // outside the pool connection.
+    let listed = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+        db::list(
+            conn,
+            p.namespace.as_deref(),
+            p.tier.as_ref(),
+            limit,
+            p.offset.unwrap_or(0),
+            p.min_priority,
+            p.since.as_deref(),
+            p.until.as_deref(),
+            p.tags.as_deref(),
+            p.agent_id.as_deref(),
+        )
+    })
+    .await;
+    match listed {
         Ok(mems) => {
             // #910 — see postgres branch comment above. `db::list` does
             // NOT apply the visibility-prefix filter that `db::search`
@@ -315,7 +323,16 @@ pub async fn search_memories(
         .clone()
         .or_else(|| crate::identity::resolve_http_agent_id(None, header_agent_id).ok());
 
-    let lock = app.db.lock().await;
+    // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller for
+    // the sqlite `db::search` / `db::list_by_source_uri` paths. This is
+    // the agent's `metadata.agent_id` (the header-resolved principal),
+    // DISTINCT from `effective_as_agent` (the namespace driving the
+    // team/unit/org subtree arms). Threaded to the owner-keyed
+    // `visibility_clause` private arm. `None` would be fail-closed, but
+    // the header resolver always synthesizes a principal here.
+    let visibility_caller: Option<String> =
+        crate::identity::resolve_http_agent_id(None, header_agent_id).ok();
+
     // v0.6.2 (S40): mirror the `list_memories` ceiling raise so search
     // over a bulk-populated namespace isn't also capped at 200.
     let limit = p.limit.unwrap_or(20).min(app.max_page_size);
@@ -329,6 +346,12 @@ pub async fn search_memories(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // #1580 — `db::search_with_source_uri` / `db::list_by_source_uri` are
+    // pure SELECTs, so both read paths dispatch through the WAL read-pool
+    // (`db_read_op`) instead of the single writer mutex. Each closure
+    // captures owned copies of the query params it needs (it runs on the
+    // blocking pool with a `'static` bound); response serialization stays
+    // outside the pool connection. Validation is done before any DB work.
     if let Some(uri) = source_uri {
         if let Err(e) = validate::validate_source_uri(uri) {
             return (
@@ -343,13 +366,22 @@ pub async fn search_memories(
             // scope=private gate as the q+source_uri compose path.
             // Pre-fix the reciprocal path bypassed visibility entirely;
             // anonymous callers could read every row in every doc.
-            return match db::list_by_source_uri(
-                &lock.0,
-                uri,
-                p.namespace.as_deref(),
-                Some(limit),
-                effective_as_agent.as_deref(),
-            ) {
+            let uri_owned = uri.to_string();
+            let ns = p.namespace.clone();
+            let eaa = effective_as_agent.clone();
+            let vc = visibility_caller.clone();
+            let listed = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+                db::list_by_source_uri(
+                    conn,
+                    &uri_owned,
+                    ns.as_deref(),
+                    Some(limit),
+                    eaa.as_deref(),
+                    vc.as_deref(),
+                )
+            })
+            .await;
+            return match listed {
                 // #1579 B4 — serialize per the negotiated format.
                 Ok(r) => crate::handlers::wire_format::search_response(
                     format,
@@ -359,21 +391,37 @@ pub async fn search_memories(
             };
         }
     }
-    match db::search_with_source_uri(
-        &lock.0,
-        &p.q,
-        p.namespace.as_deref(),
-        p.tier.as_ref(),
-        limit,
-        p.min_priority,
-        p.since.as_deref(),
-        p.until.as_deref(),
-        p.tags.as_deref(),
-        p.agent_id.as_deref(),
-        effective_as_agent.as_deref(),
-        false,
-        source_uri,
-    ) {
+    let q = p.q.clone();
+    let ns = p.namespace.clone();
+    let tier = p.tier.clone();
+    let min_priority = p.min_priority;
+    let since = p.since.clone();
+    let until = p.until.clone();
+    let tags = p.tags.clone();
+    let agent_id = p.agent_id.clone();
+    let eaa = effective_as_agent.clone();
+    let su_owned: Option<String> = source_uri.map(str::to_string);
+    let vc = visibility_caller.clone();
+    let searched = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+        db::search_with_source_uri(
+            conn,
+            &q,
+            ns.as_deref(),
+            tier.as_ref(),
+            limit,
+            min_priority,
+            since.as_deref(),
+            until.as_deref(),
+            tags.as_deref(),
+            agent_id.as_deref(),
+            eaa.as_deref(),
+            false,
+            su_owned.as_deref(),
+            vc.as_deref(),
+        )
+    })
+    .await;
+    match searched {
         // #1579 B4 — serialize per the negotiated format.
         Ok(r) => crate::handlers::wire_format::search_response(
             format,
@@ -621,6 +669,7 @@ pub async fn bulk_create(
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
 
             // F-A2A1.5 (#705) — governance enforcement on the postgres
@@ -674,6 +723,33 @@ pub async fn bulk_create(
                     errors.push(format!("{}: governance error: {e}", mem.title));
                     continue;
                 }
+            }
+
+            // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write
+            // quota on the postgres bulk path with PARTIAL-FILL parity to the
+            // sqlite branch (#1788). `check_memory_quota` is a pure read (the
+            // batched `store_batch` records later), so the cumulative count is
+            // `already-allowed + this row`: passing `allowed.len()+1` tests
+            // current+k <= max; once the cap is hit, this + every subsequent row
+            // goes to errors[] and is not persisted. Exempt paths never reach here.
+            let row_quota_bytes = i64::try_from(
+                mem.title.len()
+                    + mem.content.len()
+                    + serde_json::to_string(&mem.metadata)
+                        .map(|s| s.len())
+                        .unwrap_or(0),
+            )
+            .unwrap_or(i64::MAX);
+            let pending_count = i64::try_from(allowed.len())
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+            if let Err(e) = app
+                .store
+                .check_memory_quota(&ctx, &mem.namespace, pending_count, row_quota_bytes)
+                .await
+            {
+                errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                continue;
             }
 
             allowed.push(mem);
@@ -784,7 +860,42 @@ pub async fn bulk_create(
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
+            // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write
+            // quota PER ROW, mirroring the single-write create handler so the
+            // bulk surface is no longer a quota-bypass amplifier. A row that
+            // would exceed the cap is rejected into `errors[]` and skipped
+            // (partial-fill — consistent with this handler's existing per-row
+            // validation/governance error semantics); it is NOT persisted.
+            // Skip empty principals exactly like the single-write path.
+            let bulk_quota_op = crate::quotas::QuotaOp::Memory {
+                bytes: i64::try_from(
+                    mem.title.len()
+                        + mem.content.len()
+                        + serde_json::to_string(&mem.metadata)
+                            .map(|s| s.len())
+                            .unwrap_or(0),
+                )
+                .unwrap_or(i64::MAX),
+            };
+            if !caller.is_empty() {
+                if let Err(e) =
+                    crate::quotas::check_and_record(&lock.0, &caller, &mem.namespace, bulk_quota_op)
+                {
+                    match e {
+                        crate::quotas::QuotaCheckError::Quota(qe) => {
+                            errors
+                                .push(super::sanitize_bulk_row_error(&qe.to_string()).to_string());
+                        }
+                        crate::quotas::QuotaCheckError::Sql(se) => {
+                            tracing::error!("bulk_create: quota substrate error: {se}");
+                            errors.push(crate::errors::msg::QUOTA_CHECK_FAILED.to_string());
+                        }
+                    }
+                    continue;
+                }
+            }
             match db::insert(&lock.0, &mem) {
                 Ok(_) => created_mems.push(mem),
                 Err(e) => {
@@ -792,6 +903,18 @@ pub async fn bulk_create(
                     // text (constraint names, SQL fragments). Sanitize.
                     tracing::warn!("bulk_create: db::insert failed: {e}");
                     errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                    // #1788 — refund the quota charge since the insert failed
+                    // (mirrors the single-write refund_op path). Best-effort.
+                    if !caller.is_empty() {
+                        if let Err(re) = crate::quotas::refund_op(
+                            &lock.0,
+                            &caller,
+                            &mem.namespace,
+                            bulk_quota_op,
+                        ) {
+                            crate::quotas::log_refund_op_failed(&caller, &re);
+                        }
+                    }
                 }
             }
         }

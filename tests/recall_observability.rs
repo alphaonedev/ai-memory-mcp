@@ -33,8 +33,13 @@ use serde_json::json;
 /// Returns `(connection, temp-path)`. The path is held by the caller so
 /// the file outlives the connection.
 fn fresh_db() -> (rusqlite::Connection, std::path::PathBuf) {
-    let dir = std::env::temp_dir();
-    let path = dir.join(format!("ai-memory-recall-obs-{}.db", uuid::Uuid::new_v4()));
+    // #1721 — project-local scratch DB (no /tmp writes; CLAUDE.md hard rule).
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("recall-observability");
+    std::fs::create_dir_all(&root).ok();
+    let path = root.join(format!("ai-memory-recall-obs-{}.db", uuid::Uuid::new_v4()));
     let conn = db::open(&path).expect("open fresh test db");
     (conn, path)
 }
@@ -203,6 +208,7 @@ fn recall_telemetry_reports_embedding_dimension_mismatch() {
         &scoring,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("recall_hybrid_with_telemetry");
 
@@ -248,6 +254,7 @@ fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
         &scoring,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("recall_hybrid_with_telemetry");
 

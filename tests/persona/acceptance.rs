@@ -126,6 +126,7 @@ fn install_namespace_policy(
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         persona: PersonaPolicy {
             auto_persona_trigger_every_n_memories: cadence,

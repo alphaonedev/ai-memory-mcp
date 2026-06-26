@@ -22,3 +22,10 @@ mod compaction_test;
 #[cfg(feature = "sal")]
 #[path = "curator/reflection_pass_test.rs"]
 mod reflection_pass_test;
+
+// #1393 sub-unit 2 — transcript-classify pass acceptance suite. `sal`-gated
+// for the same reason as the reflection suite: it drives the pass over the
+// SAL `MemoryStore` trait (`SqliteStore`).
+#[cfg(feature = "sal")]
+#[path = "curator/transcript_classify_pass_test.rs"]
+mod transcript_classify_pass_test;

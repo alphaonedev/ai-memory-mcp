@@ -100,6 +100,14 @@ pub struct RecoverPreviousSessionArgs {
     /// stable).
     #[arg(long, default_value_t = false)]
     pub json: bool,
+
+    /// #1693 — when set to a `postgres://…` URL, L2 recovery runs against
+    /// that store through the SAL `recover_turn_idempotent` path so a
+    /// postgres-backed daemon rehydrates from host transcripts (the sqlite
+    /// `--db` path is the default). Other schemes / omitted → the local
+    /// rusqlite path.
+    #[arg(long, value_name = "URL")]
+    pub store_url: Option<String>,
 }
 
 /// Dispatch entry-point called from `daemon_runtime::run`. The
@@ -118,24 +126,7 @@ pub fn run(
     args: &RecoverPreviousSessionArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    let host = parse_host_kind(&args.host).unwrap_or(HostKind::Auto);
-    // agent_id resolution lives in the dispatch caller for now —
-    // the slice C1 work threads the resolved agent_id through here.
-    // Until that lands, we use a placeholder that the stub respects.
-    let agent_id = std::env::var("AI_MEMORY_AGENT_ID")
-        .unwrap_or_else(|_| "ai:recover-cli:placeholder".to_string());
-
-    let opts = RecoverOpts {
-        host,
-        transcript_override: args.transcript.clone(),
-        since_iso: args.since.clone(),
-        namespace: args.namespace.clone(),
-        limit: args.limit,
-        dry_run: args.dry_run,
-        quiet: args.quiet,
-        agent_id,
-    };
-
+    let opts = build_opts(args);
     let report = match recover_from_transcript(db_path, &opts) {
         Ok(r) => r,
         Err(e) => {
@@ -147,14 +138,70 @@ pub fn run(
             return Ok(if args.quiet { 0 } else { 2 });
         }
     };
+    emit_report(&report, args, out)
+}
 
+/// #1693 — postgres-store variant of [`run`]. Runs L2 recovery through the
+/// SAL [`crate::recover::recover_from_transcript_store`] (the
+/// `recover_turn_idempotent` trait path) so a postgres-backed daemon
+/// rehydrates from host transcripts identically to the sqlite `--db` path.
+/// Same Args→Opts mapping + report emit + graceful failure semantics.
+///
+/// # Errors
+///
+/// Propagates report-serialization failures; store/parse failures fold into
+/// `RecoverReport.errors` (the SessionStart-hook chain must not be wedged).
+#[cfg(feature = "sal")]
+pub async fn run_store(
+    store: &dyn crate::store::MemoryStore,
+    args: &RecoverPreviousSessionArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let opts = build_opts(args);
+    let report = match crate::recover::recover_from_transcript_store(store, &opts).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = writeln!(out.stderr, "ai-memory recover-previous-session: {e}");
+            return Ok(if args.quiet { 0 } else { 2 });
+        }
+    };
+    emit_report(&report, args, out)
+}
+
+/// Map CLI args → [`RecoverOpts`]. Shared by the sqlite [`run`] and the
+/// postgres [`run_store`] paths.
+fn build_opts(args: &RecoverPreviousSessionArgs) -> RecoverOpts {
+    let host = parse_host_kind(&args.host).unwrap_or(HostKind::Auto);
+    // agent_id resolution lives in the dispatch caller for now —
+    // the slice C1 work threads the resolved agent_id through here.
+    // Until that lands, we use a placeholder that the stub respects.
+    let agent_id = std::env::var("AI_MEMORY_AGENT_ID")
+        .unwrap_or_else(|_| "ai:recover-cli:placeholder".to_string());
+    RecoverOpts {
+        host,
+        transcript_override: args.transcript.clone(),
+        since_iso: args.since.clone(),
+        namespace: args.namespace.clone(),
+        limit: args.limit,
+        dry_run: args.dry_run,
+        quiet: args.quiet,
+        agent_id,
+    }
+}
+
+/// Serialize a [`crate::recover::RecoverReport`] to the CLI surface (JSON or
+/// human). Shared by [`run`] + [`run_store`].
+fn emit_report(
+    report: &crate::recover::RecoverReport,
+    args: &RecoverPreviousSessionArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
     if args.json {
-        let json = serde_json::to_string_pretty(&report)?;
+        let json = serde_json::to_string_pretty(report)?;
         writeln!(out.stdout, "{json}")?;
     } else {
-        emit_human(&report, args.quiet, out)?;
+        emit_human(report, args.quiet, out)?;
     }
-
     Ok(0)
 }
 

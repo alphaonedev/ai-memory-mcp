@@ -42,6 +42,15 @@ pub const MILLIS_PER_SEC: u64 = 1_000;
 /// decimal places via `(score * FACTOR).round() / FACTOR`.
 pub const SCORE_DISPLAY_ROUND_FACTOR: f64 = 1000.0;
 
+/// Default ceiling for reflection recursion depth — the single source of
+/// truth for BOTH the governance-enforced max
+/// ([`models::namespace::GovernancePolicy::effective_max_reflection_depth`])
+/// AND the reflection-aware reranker boost cap
+/// ([`reranker::DEFAULT_REFLECTION_MAX_DEPTH_CAP`], a re-export of this).
+/// #1680 — these were previously two independent literal `3`s; hoisted
+/// here so the advertised cap and the governance default can never drift.
+pub const DEFAULT_REFLECTION_MAX_DEPTH_CAP: u32 = 3;
+
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner B finding F-B7) — byte-unit
 // consts so substrate-wide size math is grep-able and refactor-safe.
@@ -94,6 +103,16 @@ pub const RECALL_COSINE_GATE: f64 = 0.2;
 /// `RuntimeContext.hooks_hmac_secret`). One spelling, hoist-only;
 /// `src/llm.rs` keeps its own site per the vendor carve-out.
 pub const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Canonical "how many memories carry a non-NULL embedding" COUNT query.
+/// Backend-agnostic (the text is identical on sqlite + postgres), so it is
+/// hoisted here and referenced by name at every site: the sqlite HNSW-size
+/// doctor probe (`src/cli/doctor.rs`), `storage::count_embedded_memories`,
+/// and the #1781 postgres destructive-conversion guard
+/// (`PostgresStore::migrate_embedding_dim`). One spelling, per the pm-v3.1
+/// no-hardcoded-literal-duplication discipline.
+pub const SQL_COUNT_EMBEDDED_MEMORIES: &str =
+    "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL";
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner F finding F-F-ROUTE-1) —
@@ -289,13 +308,26 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // addition / removal of a route surface requires bumping this
 // constant in lockstep with the test failing.
 //
-// The 90th `.route(` at the bottom of `build_router_with_timeout` is
-// the `/slow` slowloris-test route gated by `#[cfg(test)]` — that is
-// counted by `EXPECTED_TEST_ROUTES_COUNT` below.
+// The `/slow` slowloris-test route in `h7_timeout_tests` is gated by
+// `#[cfg(test)]` — that, plus the `/slow` + `/health` routes in the
+// `admission_control_1733_tests` helper router (#1733 Pillar-4 4.A), are
+// counted by `EXPECTED_TEST_ROUTES_COUNT` below. The ARCH-14 scan counts
+// `.route(` lines from the FIRST `#[cfg(test)] mod` after
+// `build_router_with_timeout` to EOF, so every inline test-router route
+// contributes regardless of which test module declares it.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 89;
-pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 91;
+// 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
+// action-transition write surface `POST /api/v1/actions/{id}/transition`
+// (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
+// 2026-06-22 (#1718 Commit C2) — bumped 90 → 91: the signal send write surface
+// `POST /api/v1/signals` (`handlers::send_signal`) — local write + W-of-N fanout.
+// 2026-06-18 (#1733 Pillar-4 4.A) — bumped 1 → 3: the
+// `admission_control_1733_tests` helper router adds a `/slow` (blocking
+// handler for the concurrency test) + a `/health` (exemption assertion)
+// test-only route alongside the pre-existing `h7_timeout_tests` `/slow`.
+pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 
 /// Number of distinct URL paths (multi-line-aware) registered by the
 /// production router. Derived via
@@ -305,7 +337,11 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 1;
 /// cannot drift silently. v0.7.0 multi-agent literal-sweep (scanner
 /// A, finding F-A4.1) — previously the `73 unique URL paths` count
 /// was cited in 30+ doc sites with no const.
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 75;
+// 2026-06-22 (#1718 Commit C) — bumped 75 → 76: the new unique path
+// `/api/v1/actions/{id}/transition` (coordination action-transition write).
+// 2026-06-22 (#1718 Commit C2) — bumped 76 → 77: the new unique path
+// `/api/v1/signals` (signal send write surface).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -320,20 +356,30 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 75;
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 82
+/// COMPILE under the default build. The source file declares 84
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 80.
+/// "sal")]`-gated and excluded from default builds, leaving 82.
 /// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
 /// surface, bumping 78 → 79; #1598 added `Reembed` for the
-/// `ai-memory reembed` vector-space migration, bumping 79 → 80.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 80;
+/// `ai-memory reembed` vector-space migration, bumping 79 → 80;
+/// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail` for
+/// the `ai-memory verify-audit-trail` CLI, bumping 80 → 81; v0.8.0
+/// #1709/#1720 WS-B B2 added `Reown` for the `ai-memory reown`
+/// namespace-ownership re-stamp CLI, bumping 81 → 82; #1727 added
+/// `UndoEdit` for the CLI-ONLY `ai-memory undo-edit` NON-DESTRUCTIVE
+/// in-place-edit undo, bumping 82 → 83.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 83;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
 /// awk-canonical source-file count: every variant declared in the
 /// enum body (including `Migrate` + `SchemaInit`). v0.7.0 #1443 added
-/// `Expand`, bumping 80 → 81; #1598 added `Reembed`, bumping 81 → 82.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 82;
+/// `Expand`, bumping 80 → 81; #1598 added `Reembed`, bumping 81 → 82;
+/// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail`,
+/// bumping 82 → 83; v0.8.0 #1709/#1720 WS-B B2 added `Reown`, bumping
+/// 83 → 84; #1727 added `UndoEdit` for the CLI-ONLY `ai-memory
+/// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 85;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -450,6 +496,7 @@ pub mod approvals;
 // long-form memories into atomic propositions with full provenance
 // (atom_of FK, derives_from edge, signed_events trail). The first
 // downstream consumer landing on the WT-1-A schema v36 foundation.
+pub mod actions;
 pub mod atomisation;
 pub mod audit;
 pub mod autonomy;
@@ -458,6 +505,10 @@ pub mod bench;
 // loop for `offloaded_blobs`; future v0.8.0 substrate tasks land
 // here without churning `daemon_runtime`.
 pub mod background;
+// v0.8.0 Pillar 1 (#1709) — attested-checkpoint sqlite free-functions
+// (mirrors `crate::signals`); backs the SAL `checkpoint_*` surface + the
+// future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
+pub mod checkpoints;
 pub mod cli;
 pub mod color;
 /// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +
@@ -468,6 +519,12 @@ pub mod color;
 /// caller-provided `confidence` field.
 pub mod confidence;
 pub mod config;
+/// v0.8.0 Pillar 1 (#1722) — coordination-substrate `signed_events`
+/// observability. The single shared writer that appends a
+/// tamper-evident `coordination.<op>` audit row to the append-only chain
+/// after every coordination state-mutation (signal / action / lease /
+/// checkpoint / routine).
+pub mod coordination_audit;
 pub mod curator;
 pub mod daemon_runtime;
 // v0.7.0 L0.5-3 — module renamed from `db` → `storage` as part of
@@ -612,6 +669,7 @@ pub mod quotas;
 pub mod recover;
 pub mod replication;
 pub mod reranker;
+pub mod sequencer;
 // v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
 // substrate state (HMAC override, decompression cap, audit chain,
 // session-recall tracker, keypair cache). Held as `Arc<RuntimeContext>`
@@ -621,6 +679,14 @@ pub mod reranker;
 // `reranker::global_session_recall_tracker`, …) delegates here so the
 // wire / chain / cache semantics stay byte-equivalent.
 pub mod runtime_context;
+// v0.8.0 Pillar 1 (#1709) — routine + routine-run sqlite free-functions
+// (mirrors `crate::checkpoints`); backs the SAL `routine_*` surface + the
+// future MCP `memory_routine_*` handlers over a bare rusqlite Connection.
+pub mod routines;
+// v0.8.0 Pillar 1 (#1709) — signed-signal sqlite free-functions (mirrors
+// `crate::actions`); backs the SAL `signal_*` surface + the future MCP
+// `memory_signal_*` handlers over a bare rusqlite Connection.
+pub mod signals;
 pub mod signed_events;
 pub mod sizes;
 pub mod subscriptions;
@@ -666,6 +732,43 @@ pub mod store;
 /// constructs inline so the production binary and the test harness
 /// share a single route map.
 ///
+/// #1733 (Pillar-4 4.A) — process-wide HTTP admission-control concurrency
+/// cap, seeded once at daemon boot from the resolved `[limits]`
+/// configuration (`AI_MEMORY_MAX_INFLIGHT_REQUESTS` > `[limits]` >
+/// compiled default). `0` = disabled. Read by [`build_router_with_timeout`]
+/// at router-build time to decide whether to compose the inflight layer.
+///
+/// This mirrors the existing process-wide seeded-knob precedent
+/// (`crate::reranker::set_rerank_max_seq`, `crate::storage::set_db_mmap_size`,
+/// `crate::quotas::set_quota_defaults`): the cap is needed deep in
+/// `build_router_with_timeout` where no `AppConfig` is threaded, and the
+/// daemon has many serve entry points (TLS, plaintext, test-shutdown), so a
+/// seeded global is lower-churn and more uniform than threading a parameter
+/// through every path. Backed by an `AtomicUsize` (not a `OnceLock`) so the
+/// per-binary integration tests can set it before building a router.
+static MAX_INFLIGHT_REQUESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(config::DEFAULT_MAX_INFLIGHT_REQUESTS);
+
+/// Seed the process-wide HTTP admission-control in-flight cap (#1733).
+/// Called once at daemon boot from the resolved `[limits]` config. `0`
+/// disables admission control (no layer composed).
+pub fn set_max_inflight_requests(cap: usize) {
+    MAX_INFLIGHT_REQUESTS.store(cap, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide HTTP admission-control in-flight cap (#1733).
+/// `0` means disabled. Consumed by [`build_router_with_timeout`].
+#[must_use]
+pub fn max_inflight_requests() -> usize {
+    MAX_INFLIGHT_REQUESTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// #1733 (Pillar-4 4.A) — sample rate for the admission-shed `WARN` log.
+/// The Prometheus `ai_memory_admission_shed_total` counter records every
+/// shed; the log line is sampled (1st, then every Nth) so sustained
+/// overload cannot flood the log while still leaving periodic breadcrumbs.
+const ADMISSION_WARN_SAMPLE: u64 = 256;
+
 /// DOC-5 (med/low review batch) — promoted from the pre-existing `//`
 /// banner so the doc-comment attaches to the symbol (cargo-doc + IDE
 /// surfaces) and is symmetric with the sibling
@@ -734,7 +837,7 @@ pub fn build_router_with_timeout(
         },
     );
 
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(handlers::routes::HEALTH, get(handlers::health))
         // v0.6.0.0: Prometheus scrape endpoint. Exposed at both /metrics
         // (the community convention) and /api/v1/metrics (consistent with
@@ -746,6 +849,15 @@ pub fn build_router_with_timeout(
         .route(handlers::routes::METRICS, get(handlers::prometheus_metrics))
         .route(handlers::routes::MEMORIES, get(handlers::list_memories))
         .route(handlers::routes::MEMORIES, post(handlers::create_memory))
+        // #1718 v0.8.0 Pillar-1 — coordination action-transition write surface
+        // (local CAS write + W-of-N federation fanout).
+        .route(
+            handlers::routes::ACTIONS_ID_TRANSITION,
+            post(handlers::transition_action),
+        )
+        // #1718 v0.8.0 Pillar-1 — signal send write surface (local write +
+        // W-of-N federation fanout).
+        .route(handlers::routes::SIGNALS, post(handlers::send_signal))
         .route(handlers::routes::MEMORIES_BULK, post(handlers::bulk_create))
         .route(handlers::routes::MEMORIES_ID, get(handlers::get_memory))
         .route(handlers::routes::MEMORIES_ID, put(handlers::update_memory))
@@ -1078,7 +1190,87 @@ pub fn build_router_with_timeout(
         // window. Default 60 s; configurable via
         // `AppConfig::request_timeout_secs`.
         .layer(timeout_layer)
-        .with_state(app_state)
+        .with_state(app_state);
+
+    // #1733 (Pillar-4 4.A) — HTTP admission control, applied OUTERMOST
+    // (after `.with_state`, so it is the very first layer a request hits).
+    // Reads the process-wide cap seeded at boot; `0` = disabled (no layer
+    // composed, byte-identical to a build without admission control).
+    compose_admission_control(router, max_inflight_requests())
+}
+
+/// #1733 (Pillar-4 4.A) — wrap `router` with the HTTP admission-control
+/// layer when `cap > 0`; otherwise return it unchanged.
+///
+/// When enabled, the daemon admits at most `cap` concurrent in-flight
+/// requests and sheds the rest with a typed `503` (`{"error":
+/// "server_overloaded", "code": "OVERLOADED", "max_inflight": cap}` +
+/// `Retry-After: 1`). The layer is applied OUTERMOST so rejection happens
+/// before the timeout future / body decode / handler work is allocated.
+/// The liveness/readiness (`/health`) + Prometheus-scrape (`/metrics`,
+/// `/api/v1/metrics`) endpoints are EXEMPT so an overloaded node's health
+/// checks survive — otherwise the orchestrator's probe gets shed, the node
+/// is killed, and graceful load-shedding becomes a crash-loop. The owned
+/// semaphore permit is held across `next.run(req)` and released by RAII on
+/// every exit path (normal return, handler panic, client disconnect, or the
+/// inner timeout firing). Mechanism + posture resolved by the mandatory
+/// 5-agent crossroads vote (memory 4d3ea1c5).
+///
+/// Extracted as a named fn (rather than inlined in
+/// [`build_router_with_timeout`]) so the behavioural test can drive the
+/// real layer against a controllable blocking handler.
+fn compose_admission_control(router: axum::Router, cap: usize) -> axum::Router {
+    if cap == 0 {
+        return router;
+    }
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cap));
+    let warn_sampler = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let semaphore = std::sync::Arc::clone(&semaphore);
+            let warn_sampler = std::sync::Arc::clone(&warn_sampler);
+            async move {
+                use axum::response::IntoResponse;
+                // Liveness/readiness + metrics scrape bypass the cap so an
+                // overloaded node still answers its orchestrator + scraper.
+                let path = req.uri().path();
+                if path == handlers::routes::HEALTH
+                    || path == handlers::routes::METRICS
+                    || path == handlers::routes::METRICS_BARE
+                {
+                    return next.run(req).await;
+                }
+                match semaphore.try_acquire_owned() {
+                    // `_permit` is held for the whole downstream call and
+                    // RAII-released the instant `next.run(req)` resolves
+                    // (including the timeout-fires and panic-unwind paths).
+                    Ok(_permit) => next.run(req).await,
+                    Err(_) => {
+                        crate::metrics::registry().admission_shed_total.inc();
+                        let n = warn_sampler
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n % ADMISSION_WARN_SAMPLE == 0 {
+                            tracing::warn!(
+                                max_inflight = cap,
+                                "admission control: in-flight request cap reached \
+                                 — shedding request with 503 (log sampled 1/{ADMISSION_WARN_SAMPLE})"
+                            );
+                        }
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("Retry-After", "1")],
+                            axum::Json(serde_json::json!({
+                                "error": "server_overloaded",
+                                "code": "OVERLOADED",
+                                "max_inflight": cap,
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        },
+    ))
 }
 
 /// v0.7.0 Wave-3 Continuation — adapter that picks up the appropriate
@@ -1101,6 +1293,156 @@ async fn postgres_route_gate_layer(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// #1733 (Pillar-4 4.A) — HTTP admission-control tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod admission_control_1733_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        Router,
+        body::Body,
+        extract::State,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt as _;
+
+    // Two counting semaphores used as ordering gates. `Semaphore` (unlike
+    // `Notify`) accumulates permits reliably regardless of waiter timing, so
+    // the handshake is race-free even with multiple concurrent requests:
+    //   - `entered`: handler `add_permits(1)` once it holds the admission
+    //     permit; test `acquire().forget()` to await a confirmed in-flight.
+    //   - `release`: handler `acquire().forget()` to park; test
+    //     `add_permits(n)` to let parked handlers complete.
+    type Gate = (Arc<Semaphore>, Arc<Semaphore>);
+
+    /// A router whose `/slow` handler signals `entered` once it holds the
+    /// admission permit, then parks on `release` — giving the test a
+    /// deterministic in-flight request (no sleeps/timing races). `/health`
+    /// mirrors the production exempt path. Wrapped with the real
+    /// `compose_admission_control` layer at `cap`.
+    fn admission_router(cap: usize, entered: Arc<Semaphore>, release: Arc<Semaphore>) -> Router {
+        async fn slow(State((entered, release)): State<Gate>) -> StatusCode {
+            entered.add_permits(1);
+            release
+                .acquire()
+                .await
+                .expect("release sem closed")
+                .forget();
+            StatusCode::OK
+        }
+        async fn health() -> StatusCode {
+            StatusCode::OK
+        }
+        let inner = Router::new()
+            .route("/slow", get(slow))
+            .route(crate::handlers::routes::HEALTH, get(health))
+            .with_state((entered, release));
+        super::compose_admission_control(inner, cap)
+    }
+
+    fn get_req(path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("build request")
+    }
+
+    async fn await_entered(entered: &Arc<Semaphore>) {
+        entered
+            .acquire()
+            .await
+            .expect("entered sem closed")
+            .forget();
+    }
+
+    #[tokio::test]
+    async fn second_request_over_cap_is_shed_with_typed_503() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let app = admission_router(1, entered.clone(), release.clone());
+
+        // Request 1 acquires the only permit and parks inside the handler.
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // permit is now held
+
+        // Request 2 must be shed: 503 + Retry-After + the typed envelope.
+        let resp2 = app.clone().oneshot(get_req("/slow")).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp2.headers().get("Retry-After").unwrap(),
+            "1",
+            "shed response must carry Retry-After",
+        );
+        let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "server_overloaded");
+        assert_eq!(v["code"], "OVERLOADED");
+        assert_eq!(v["max_inflight"], 1);
+
+        // Release request 1; it completes normally and frees the permit.
+        release.add_permits(1);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_is_exempt_even_when_cap_is_saturated() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let app = admission_router(1, entered.clone(), release.clone());
+
+        // Saturate the cap with a parked /slow request.
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await;
+
+        // /health bypasses the (saturated) cap so liveness probes survive.
+        let health = app
+            .clone()
+            .oneshot(get_req(crate::handlers::routes::HEALTH))
+            .await
+            .unwrap();
+        assert_eq!(
+            health.status(),
+            StatusCode::OK,
+            "/health must be exempt from admission control",
+        );
+
+        release.add_permits(1);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cap_zero_disables_admission_control() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        // cap == 0 → layer not composed; a parked request does NOT block a
+        // second one with a 503 (the second also enters the handler).
+        let app = admission_router(0, entered.clone(), release.clone());
+
+        let app1 = app.clone();
+        let h1 = tokio::spawn(async move { app1.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // request 1 in the handler
+
+        // Request 2 also reaches the handler (no shed); prove it by observing
+        // a second `entered` signal rather than a 503.
+        let app2 = app.clone();
+        let h2 = tokio::spawn(async move { app2.oneshot(get_req("/slow")).await.unwrap() });
+        await_entered(&entered).await; // request 2 ALSO entered → not shed
+
+        release.add_permits(2);
+        assert_eq!(h1.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(h2.await.unwrap().status(), StatusCode::OK);
+    }
 }
 
 // ---------------------------------------------------------------------------

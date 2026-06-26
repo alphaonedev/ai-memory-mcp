@@ -323,7 +323,12 @@ pub fn handle_pending_approve(
         json!({ (field_names::PENDING_ID): id }),
     );
 
-    match db::approve_with_approver_type(conn, id, &agent_id).map_err(|e| e.to_string())? {
+    // #1796 (5-agent vote 4d3ea1c5) — MCP/stdio is the single-operator surface;
+    // keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in (an unconditional
+    // reject-self would self-lock the lone operator approving their own action).
+    match db::approve_with_approver_type(conn, id, &agent_id, db::ApproveSurface::LocalOperator)
+        .map_err(|e| e.to_string())?
+    {
         ApproveOutcome::Approved => {
             // Task 1.10: auto-execute the queued action on final approval.
             let executed = db::execute_pending_action(conn, id).map_err(|e| e.to_string())?;

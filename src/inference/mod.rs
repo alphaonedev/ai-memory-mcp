@@ -29,9 +29,14 @@
 //!   (`embeddings::Embedder` + `llm::OllamaClient`). This is what
 //!   v0.7.0 actually uses on the recall hot-path.
 //! - [`GpuBackend`] — stub returning `not implemented`. Lands as a
-//!   trait-conformant placeholder so the v0.8 work (issue #651 Phase 1
-//!   — mistralrs or candle in-process GPU backend) can drop in without
-//!   any caller-side refactor.
+//!   trait-conformant placeholder so the **deferred** in-process GPU
+//!   path (mistralrs / candle, issue #651) can drop in without any
+//!   caller-side refactor. Phase mapping (reconciled per #1677 to
+//!   match ROADMAP §11.4.C): §11.4.C scopes #651's *shipping* surface
+//!   to the **vLLM-HTTP first-class backend** (the OpenAI-compatible
+//!   `vllm` alias — `crate::llm::BACKEND_VLLM`); the in-process
+//!   candle/mistralrs GPU backend this stub anticipates is **deferred
+//!   to v0.8.x** and does NOT ship in §11.4.C.
 //!
 //! ## Attested weights (issue #654)
 //!
@@ -162,10 +167,15 @@ impl InferenceBackend for CpuBackend {
     }
 }
 
-/// GPU backend stub — issue #651 Phase 1 placeholder. Returns
-/// `not implemented` from every call. Lands as a trait-conformant
-/// type so the v0.8 GPU/MTP backend (mistralrs or candle in-process)
-/// can drop in without a single caller-side refactor.
+/// GPU backend stub — issue #651 **v0.8.x-deferred** in-process
+/// placeholder (reconciled per #1677). Returns `not implemented` from
+/// every call. Lands as a trait-conformant type so the in-process
+/// GPU/MTP backend (mistralrs or candle) can drop in without a single
+/// caller-side refactor. Note: #651's *shipping* surface in v0.8.0
+/// §11.4.C is the vLLM-HTTP first-class backend (the `vllm` alias,
+/// `crate::llm::BACKEND_VLLM`), NOT this in-process path — candle /
+/// mistralrs in-process inference is explicitly deferred to v0.8.x per
+/// ROADMAP §11.4.C.
 #[derive(Default)]
 pub struct GpuBackend {
     /// Operator-readable label (e.g. `"distilled-hot-path-v0.8"`).
@@ -188,14 +198,18 @@ impl GpuBackend {
 impl InferenceBackend for GpuBackend {
     fn embed(&self, _text: &str) -> Result<Vec<f32>> {
         Err(anyhow!(
-            "GpuBackend::embed not implemented (v0.8 work — issue #651 Phase 1; \
-             see docs/v0.7.0/inference-attestation.md for the rollout plan)"
+            "GpuBackend::embed not implemented (in-process GPU path — issue \
+             #651, deferred to v0.8.x per ROADMAP §11.4.C; the §11.4.C \
+             shipping surface is the vLLM-HTTP `vllm` alias. See \
+             docs/v0.7.0/inference-attestation.md for the rollout plan)"
         ))
     }
 
     fn chat(&self, _prompt: &str) -> Result<String> {
         Err(anyhow!(
-            "GpuBackend::chat not implemented (v0.8 work — issue #651 Phase 1)"
+            "GpuBackend::chat not implemented (in-process GPU path — issue \
+             #651, deferred to v0.8.x per ROADMAP §11.4.C; the §11.4.C \
+             shipping surface is the vLLM-HTTP `vllm` alias)"
         ))
     }
 }

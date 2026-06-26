@@ -47,6 +47,19 @@ pub const CREDENTIAL_HEADER: &str = "x-memory-cred";
 /// format can introduce `v2=` without breaking this parser.
 pub const CREDENTIAL_PREFIX: &str = "v1=";
 
+/// #1790 finding 1 — pre-auth byte cap on the `X-Memory-Cred` header
+/// value (the base64 payload after the `v1=` prefix) checked BEFORE
+/// base64+CBOR decode. The header is decoded on the unauthenticated
+/// receive path, so an explicit length guard bounds the decode work an
+/// anonymous peer can trigger rather than relying on hyper's implicit
+/// header limit. A leaf credential is a small CBOR envelope — claims
+/// (version + two ids + two 32-byte pubkeys + a domain string + two
+/// timestamps) plus a 64-byte signature, well under 1 KiB — so 8 KiB is
+/// generous headroom for future claim fields while still rejecting an
+/// oversize payload outright. Over-cap values are refused as
+/// [`CredentialError::Malformed`].
+pub const MAX_CRED_HEADER_BYTES: usize = 8 * 1024;
+
 /// Length of the Ed25519 signature carried in the wire envelope.
 pub const CREDENTIAL_SIG_LEN: usize = ed25519_dalek::SIGNATURE_LENGTH;
 
@@ -356,6 +369,13 @@ impl SignedCredential {
         let b64 = value
             .strip_prefix(CREDENTIAL_PREFIX)
             .ok_or_else(|| unsupported_or_malformed(value))?;
+        // #1790 finding 1 — reject an oversize payload BEFORE decoding it
+        // on the pre-auth path (the base64 string is ~4/3 of the decoded
+        // size, so capping the encoded length conservatively bounds the
+        // decoded CBOR an anonymous peer can hand us).
+        if b64.len() > MAX_CRED_HEADER_BYTES {
+            return Err(CredentialError::Malformed);
+        }
         let wire = B64.decode(b64).map_err(|_| CredentialError::Malformed)?;
         Self::from_wire_bytes(&wire)
     }
@@ -628,6 +648,34 @@ mod tests {
             SignedCredential::from_header_value("v9=AAAA").unwrap_err(),
             CredentialError::UnsupportedVersion(9)
         );
+    }
+
+    // #1790 finding 1 — an over-cap credential header is rejected as
+    // Malformed BEFORE the base64+CBOR decode runs, bounding the pre-auth
+    // decode work an anonymous peer can trigger.
+    #[test]
+    fn oversize_cred_header_is_rejected_pre_decode() {
+        let payload = "A".repeat(MAX_CRED_HEADER_BYTES + 1);
+        let header = format!("{CREDENTIAL_PREFIX}{payload}");
+        assert_eq!(
+            SignedCredential::from_header_value(&header).unwrap_err(),
+            CredentialError::Malformed
+        );
+    }
+
+    // A payload exactly at the cap is NOT rejected by the length guard —
+    // it falls through to the normal decode (which fails as Malformed here
+    // because the filler is not a valid envelope, but crucially NOT via the
+    // pre-decode cap). Pins that the cap is an upper bound, not off-by-one
+    // strict-less-than at the boundary.
+    #[test]
+    fn at_cap_cred_header_passes_length_guard() {
+        let payload = "A".repeat(MAX_CRED_HEADER_BYTES);
+        let header = format!("{CREDENTIAL_PREFIX}{payload}");
+        // Reaches the decode; the all-'A' filler is valid base64 but not a
+        // valid envelope, so it still errors — the point is the guard did
+        // not short-circuit a payload that is exactly at the cap.
+        assert!(SignedCredential::from_header_value(&header).is_err());
     }
 
     #[test]

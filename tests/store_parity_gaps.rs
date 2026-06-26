@@ -217,7 +217,7 @@ fn verify_gap_2_source_uri_sqlite() {
     )
     .expect("seed third source_uri row");
 
-    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None, None)
+    let hits = db::list_by_source_uri(&conn, "uri:fixture/a", Some("test"), None, None, None)
         .expect("list_by_source_uri");
     assert_eq!(hits.len(), 2, "two memories under uri:fixture/a");
     for m in &hits {
@@ -340,6 +340,136 @@ fn verify_gap_5_edit_source_sqlite() {
     assert_eq!(new_meta["edit_source"].as_str(), Some("llm"));
 }
 
+/// #1725 (P0.2) — lossless DEFAULT update path. Sqlite reference: a
+/// content edit snapshots the prior content into `archived_memories`
+/// (SAME memory_id, `archive_reason='in_place_edit'`, no fork) BEFORE
+/// the in-place UPDATE; repeated edits keep the MOST-RECENT pre-edit
+/// snapshot (single-snapshot retention); a non-content edit
+/// (priority / metadata only) archives nothing. The postgres twin is
+/// `pg_parity_gap_1725_in_place_archive` below — a 2-edit divergence
+/// (sqlite `INSERT OR REPLACE` keeps v2; a postgres `ON CONFLICT DO
+/// NOTHING` would wrongly keep v1) is exactly what this pins.
+fn verify_gap_1725_in_place_archive_sqlite() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1725-a", "test", "g1725 title", "content-v1");
+
+    // Edit 1: content v1 → v2. Archives v1 under 'in_place_edit'.
+    let (ok, changed) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v2"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("edit 1");
+    assert!(ok && changed, "edit 1 applied with content_changed=true");
+
+    let (a_content, a_reason): (String, String) = conn
+        .query_row(
+            "SELECT content, archive_reason FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("archive row exists after edit 1");
+    assert_eq!(a_content, "content-v1", "archive holds the prior content");
+    assert_eq!(a_reason, "in_place_edit");
+
+    // memory_id UNCHANGED + the live row carries the NEW content.
+    let live_content: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("live row after edit 1");
+    assert_eq!(
+        live_content, "content-v2",
+        "live row has new content under the SAME id"
+    );
+
+    // Edit 2: content v2 → v3. The archive must REPLACE to the
+    // MOST-RECENT pre-edit snapshot (v2), still ONE row, still SAME id.
+    db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v3"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("edit 2");
+    let archive_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("count archive after edit 2");
+    assert_eq!(archive_count, 1, "single-snapshot retention (most-recent)");
+    let a2_content: String = conn
+        .query_row(
+            "SELECT content FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("archive content after edit 2");
+    assert_eq!(
+        a2_content, "content-v2",
+        "keeps the immediately-prior snapshot (v2), not the original (v1)"
+    );
+
+    // Non-content edit (priority only) archives NOTHING.
+    let nid = seed_memory(
+        &conn,
+        "g1725-b",
+        "test",
+        "g1725 prio-only",
+        "stable content",
+    );
+    db::update_with_expected_version(
+        &conn,
+        &nid,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(9),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("priority-only edit");
+    let nonc_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&nid],
+            |r| r.get(0),
+        )
+        .expect("count archive for non-content edit");
+    assert_eq!(
+        nonc_count, 0,
+        "a metadata/priority-only edit archives nothing"
+    );
+}
+
 /// Gap 6 (#889) — `search_with_source_uri` post-filters by URI. Sqlite
 /// reference.
 fn verify_gap_6_search_source_uri_sqlite() {
@@ -368,7 +498,7 @@ fn verify_gap_6_search_source_uri_sqlite() {
 
     // Without the source_uri filter we get both matches.
     let all = db::search_with_source_uri(
-        &conn, "matching", None, None, 10, None, None, None, None, None, None, false, None,
+        &conn, "matching", None, None, 10, None, None, None, None, None, None, false, None, None,
     )
     .expect("search all");
     assert!(all.len() >= 2, "FTS returns at least the two seeded rows");
@@ -388,6 +518,7 @@ fn verify_gap_6_search_source_uri_sqlite() {
         None,
         false,
         Some("uri:doc/a"),
+        None, // #1720 caller
     )
     .expect("search scoped");
     assert_eq!(scoped.len(), 1, "source_uri filter narrows to one match");
@@ -467,6 +598,114 @@ fn sqlite_parity_gap_6_search_source_uri() {
 #[test]
 fn sqlite_parity_gap_7_get_links_columns() {
     verify_gap_7_get_links_columns_sqlite();
+}
+
+#[test]
+fn sqlite_parity_gap_1725_in_place_archive() {
+    verify_gap_1725_in_place_archive_sqlite();
+}
+
+/// #1725 regression — `update_with_expected_version` must work when the
+/// CALLER already holds a transaction. The synthesis merge path
+/// (`src/mcp/tools/store/synthesis.rs`) wraps candidate updates +
+/// provenance rows in one `BEGIN IMMEDIATE`; the #1725 archive-before-
+/// update wrap must NOT open a nested `BEGIN` (sqlite errors "cannot
+/// start a transaction within a transaction"). `is_autocommit()` gates
+/// the inner tx so the archive + UPDATE run inside the caller's tx.
+/// #228 / #1728 Commit A-carry — the archive → restore SQL copy paths
+/// carry the `encrypted_envelope` BLOB column, so archiving an encrypted
+/// memory preserves the ciphertext and restoring round-trips it. Without
+/// the carry the archive INSERT-SELECT would drop the column (DEFAULT
+/// NULL) and the ciphertext would be unrecoverable once Commit B wires
+/// encryption. Exercises archive_memory (→ archive_memory_no_tx) +
+/// restore_archived. (pg twin lives in the postgres_side mod once the pg
+/// carry lands.)
+#[test]
+fn sqlite_archive_restore_carries_encrypted_envelope_1728() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1728-env", "test", "enc title", "placeholder");
+    let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
+    conn.execute(
+        "UPDATE memories SET encrypted_envelope = ?1 WHERE id = ?2",
+        rusqlite::params![&envelope, &id],
+    )
+    .expect("set envelope on live row");
+
+    let archived = db::archive_memory(&conn, &id, Some("manual")).expect("archive");
+    assert!(archived);
+    let arch_env: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("archived row carries envelope");
+    assert_eq!(
+        arch_env, envelope,
+        "archive carries the ciphertext envelope"
+    );
+
+    let restored = db::restore_archived(&conn, &id).expect("restore");
+    assert!(restored);
+    let live_env: Vec<u8> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("restored row carries envelope");
+    assert_eq!(
+        live_env, envelope,
+        "restore round-trips the ciphertext envelope"
+    );
+}
+
+#[test]
+fn sqlite_update_inside_caller_transaction_does_not_nest_1725() {
+    let conn = fresh_sqlite();
+    let id = seed_memory(&conn, "g1725-tx", "test", "tx title", "content-v1");
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .expect("open the caller's outer transaction");
+    let (ok, changed) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        Some("content-v2"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("in-place update inside an open tx must NOT nest-error");
+    assert!(ok && changed, "update applied with content_changed");
+    conn.execute_batch("COMMIT")
+        .expect("commit the caller's tx");
+
+    // The live row carries the new content and the in_place_edit snapshot
+    // of the prior content was archived inside (and committed with) the
+    // caller's transaction.
+    let live: String = conn
+        .query_row(
+            "SELECT content FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("live row");
+    assert_eq!(live, "content-v2");
+    let archived: String = conn
+        .query_row(
+            "SELECT content FROM archived_memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| r.get(0),
+        )
+        .expect("in_place_edit archive committed with the caller tx");
+    assert_eq!(archived, "content-v1");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -587,6 +826,7 @@ mod postgres_side {
         verify_gap_1_version_sqlite, verify_gap_2_source_uri_sqlite,
         verify_gap_3_recall_observations_sqlite, verify_gap_5_edit_source_sqlite,
         verify_gap_6_search_source_uri_sqlite, verify_gap_7_get_links_columns_sqlite,
+        verify_gap_1725_in_place_archive_sqlite,
     };
     use ai_memory::models::Memory;
     use ai_memory::store::postgres::PostgresStore;
@@ -650,6 +890,278 @@ mod postgres_side {
         );
     }
 
+    /// #1725 (P0.2) — postgres twin of
+    /// `verify_gap_1725_in_place_archive_sqlite`. Drives the lossless
+    /// in-place update path through `PostgresStore` and asserts the
+    /// prior content lands in `archived_memories` with
+    /// `archive_reason='in_place_edit'`, the SAME memory_id, single-
+    /// snapshot (most-recent) retention across two edits, and no archive
+    /// on a non-content edit. Catches the `ON CONFLICT DO NOTHING`
+    /// (keep-oldest) parity divergence the sqlite `INSERT OR REPLACE`
+    /// reference does not have.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_parity_gap_1725_in_place_archive() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        // Sqlite reference still runs to pin the contract shape.
+        verify_gap_1725_in_place_archive_sqlite();
+
+        // The fixture carries no metadata.agent_id, so drive the
+        // caller-owns gate via the admin/bypass context (same idiom as
+        // `pg_parity_gap_1_version`).
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test");
+        let mut mem = sample_memory("pg-g1725");
+        mem.content = "content-v1".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem).await;
+
+        // Edit 1: content v1 → v2. Archives v1 under 'in_place_edit'.
+        let p1 = ai_memory::store::UpdatePatch {
+            content: Some("content-v2".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem.id, p1, None)
+            .await
+            .expect("edit 1");
+        let (a_content, a_reason): (String, String) =
+            sqlx::query_as("SELECT content, archive_reason FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("archive row after edit 1");
+        assert_eq!(a_content, "content-v1", "archive holds the prior content");
+        assert_eq!(a_reason, "in_place_edit");
+
+        // memory_id UNCHANGED + live row carries the NEW content.
+        let live: String = sqlx::query_scalar("SELECT content FROM memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("live row after edit 1");
+        assert_eq!(live, "content-v2", "live row has new content, same id");
+
+        // Edit 2: content v2 → v3. Most-recent snapshot (v2), ONE row.
+        let p2 = ai_memory::store::UpdatePatch {
+            content: Some("content-v3".to_string()),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem.id, p2, None)
+            .await
+            .expect("edit 2");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("count archive after edit 2");
+        assert_eq!(count, 1, "single-snapshot retention (most-recent)");
+        let a2: String = sqlx::query_scalar("SELECT content FROM archived_memories WHERE id = $1")
+            .bind(&mem.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("archive content after edit 2");
+        assert_eq!(
+            a2, "content-v2",
+            "keeps immediately-prior snapshot (v2), not original (v1)"
+        );
+
+        // Non-content edit (priority only) archives NOTHING.
+        let mut mem2 = sample_memory("pg-g1725-b");
+        mem2.content = "stable content".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &admin_ctx, &mem2).await;
+        let p3 = ai_memory::store::UpdatePatch {
+            priority: Some(9),
+            ..ai_memory::store::UpdatePatch::default()
+        };
+        pg.update_with_expected_version(&admin_ctx, &mem2.id, p3, None)
+            .await
+            .expect("priority-only edit");
+        let nonc: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archived_memories WHERE id = $1")
+            .bind(&mem2.id)
+            .fetch_one(pg.pool())
+            .await
+            .expect("count archive non-content");
+        assert_eq!(nonc, 0, "metadata/priority-only edit archives nothing");
+    }
+
+    /// #228 / #1728 Commit A-carry — postgres twin of
+    /// `sqlite_archive_restore_carries_encrypted_envelope_1728`. The pg
+    /// archive → restore SQL copy paths must carry the
+    /// `encrypted_envelope` BYTEA column, so archiving an encrypted
+    /// memory preserves the ciphertext and restoring round-trips it.
+    /// Drives `archive_by_ids` (archive INSERT-SELECT carry) +
+    /// `archive_restore` (restore INSERT-SELECT carry) through
+    /// `PostgresStore` against a known envelope written via raw sqlx.
+    /// Without the carry the INSERT-SELECT would drop the column
+    /// (DEFAULT NULL) and the ciphertext would be unrecoverable.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_archive_restore_carries_encrypted_envelope_1728() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        // Sqlite reference pins the contract shape.
+        super::sqlite_archive_restore_carries_encrypted_envelope_1728();
+
+        // The fixture carries no metadata.agent_id, so drive the
+        // archive/restore paths via the admin/bypass context.
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-1728");
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mem = sample_memory(&format!("pg-1728-env-{run}"));
+        let _ = MemoryStore::store(&pg, &admin_ctx, &mem).await;
+
+        // Stamp a known ciphertext envelope onto the live row.
+        let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
+        sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+            .bind(&envelope)
+            .bind(&mem.id)
+            .execute(pg.pool())
+            .await
+            .expect("set envelope on live row");
+
+        // Archive: the INSERT-SELECT must carry the envelope into
+        // archived_memories.
+        let moved = pg
+            .archive_by_ids(&admin_ctx, std::slice::from_ref(&mem.id), Some("manual"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1, "one row archived");
+        let arch_env: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_envelope FROM archived_memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("archived row carries envelope");
+        assert_eq!(
+            arch_env, envelope,
+            "archive carries the ciphertext envelope"
+        );
+
+        // Restore: the INSERT-SELECT must round-trip the envelope back
+        // onto the live memories row.
+        let restored = pg
+            .archive_restore(&admin_ctx, &mem.id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "restore reports success");
+        let live_env: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&mem.id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("restored row carries envelope");
+        assert_eq!(
+            live_env, envelope,
+            "restore round-trips the ciphertext envelope"
+        );
+    }
+
+    /// #228 Commit B — postgres twin of the sqlite ON-path test
+    /// (`commit_b_on_path_seals_content_and_get_decrypts`). With the
+    /// `AI_MEMORY_ENCRYPT_AT_REST` gate on, `PostgresStore::store` seals
+    /// content into `encrypted_envelope` (BYTEA), the `content` column
+    /// holds the empty placeholder, and `MemoryStore::get` transparently
+    /// decrypts. agent_id on the row matches the seal recipient.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_commit_b_on_path_seals_and_get_decrypts_228() {
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: pg tests are #[ignore] and run serially under --ignored.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+
+        let agent = "pg-commit-b-on-agent";
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let plaintext = "pg sensitive content — #228 Commit B ON";
+        let mut mem = sample_memory(&format!("pg-commitb-on-{run}"));
+        mem.content = plaintext.to_string();
+        mem.metadata = serde_json::json!({ "agent_id": agent });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-228");
+        let id = MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("store under encryption");
+
+        // Raw row: content placeholder empty, envelope non-NULL.
+        let (raw_content, envelope): (String, Option<Vec<u8>>) =
+            sqlx::query_as("SELECT content, encrypted_envelope FROM memories WHERE id = $1")
+                .bind(&id)
+                .fetch_one(pg.pool())
+                .await
+                .expect("raw read");
+        assert_eq!(
+            raw_content, "",
+            "content column holds the empty placeholder"
+        );
+        assert!(envelope.is_some(), "encrypted_envelope must be non-NULL");
+
+        // get transparently decrypts.
+        let fetched = MemoryStore::get(&pg, &admin_ctx, &id).await.expect("get");
+        assert_eq!(
+            fetched.content, plaintext,
+            "#228 Commit B (pg): get must recover the plaintext"
+        );
+
+        // SAFETY: restore.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v),
+                None => std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST"),
+            }
+        }
+    }
+
+    /// #228 Commit B — postgres twin of the sqlite fail-closed test. A
+    /// row with a non-NULL envelope whose recipient key cannot decrypt
+    /// (sealed to agent A but the row names agent B) must FAIL the read
+    /// (mapped to a StoreError), never leak the empty placeholder.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_commit_b_missing_key_fails_closed_on_read_228() {
+        use ai_memory::encryption::{encrypt, get_or_create_keypair};
+        use ai_memory::store::MemoryStore;
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let seal_agent = "pg-commit-b-seal";
+        let wrong_agent = "pg-commit-b-wrong";
+        let kp = get_or_create_keypair(seal_agent).expect("keypair");
+        let env_bytes = encrypt("pg secret for seal_agent", &kp.public)
+            .expect("encrypt")
+            .to_bytes();
+
+        let run = uuid::Uuid::new_v4().simple().to_string();
+        let mut mem = sample_memory(&format!("pg-commitb-fc-{run}"));
+        mem.content = String::new();
+        mem.metadata = serde_json::json!({ "agent_id": wrong_agent });
+        let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-228");
+        let id = MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("store");
+
+        // Stamp an envelope sealed to a DIFFERENT agent than the row names.
+        sqlx::query("UPDATE memories SET encrypted_envelope = $1 WHERE id = $2")
+            .bind(&env_bytes)
+            .bind(&id)
+            .execute(pg.pool())
+            .await
+            .expect("stamp mismatched envelope");
+
+        let result = MemoryStore::get(&pg, &admin_ctx, &id).await;
+        assert!(
+            result.is_err(),
+            "fail-closed (pg): an undecryptable envelope must error the read"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("decrypt failed"),
+            "fail-closed (pg) error must name the decrypt failure; got: {msg}"
+        );
+    }
+
     /// Gap 2 (#885) — postgres twin of `verify_gap_2_source_uri_sqlite`.
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
@@ -702,6 +1214,8 @@ mod postgres_side {
                     (m1.id.clone(), "hybrid".to_string(), 1, 0.9),
                     (m2.id.clone(), "hybrid".to_string(), 2, 0.8),
                 ],
+                None,
+                None,
             )
             .await
             .expect("insert observations");
@@ -709,7 +1223,12 @@ mod postgres_side {
 
         // Idempotency: ON CONFLICT DO NOTHING.
         let again = pg
-            .recall_observation_insert("pg-g3-r1", &[(m1.id.clone(), "hybrid".to_string(), 1, 0.9)])
+            .recall_observation_insert(
+                "pg-g3-r1",
+                &[(m1.id.clone(), "hybrid".to_string(), 1, 0.9)],
+                None,
+                None,
+            )
             .await
             .expect("idempotent replay");
         assert_eq!(again, 0);
@@ -1071,5 +1590,201 @@ mod postgres_side {
             "#1026: expired memory MUST be deleted from live `memories` \
              after run_gc commits — get() must return Err(NotFound); got {live:?}"
         );
+    }
+
+    /// #1776 — `forget(archive=true)` must archive AND delete the matched set in
+    /// ONE transaction (the postgres twin of the sqlite
+    /// `forget_archive_and_delete_are_atomic_1776` test, mirroring
+    /// `run_gc_is_transactional_1026`). Pre-fix the archive INSERT and the DELETE
+    /// ran on SEPARATE pooled connections in autocommit, so a concurrent write
+    /// or crash between them could delete a row the archive-SELECT never
+    /// captured = irrecoverable loss. After forget commits, the row MUST be gone
+    /// from live `memories` AND restorable from the archive (proving it was
+    /// archived, not lost). A regression that removed the
+    /// `tx = self.pool.begin()` + `tx.commit()` shape would break this.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn forget_is_transactional_1776() {
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+        let ctx = ai_memory::store::CallerContext::for_agent("parity-test-1776");
+        let mut mem = sample_memory("pg-1776-forget");
+        mem.namespace = "parity-forget-1776".to_string();
+        let _ = ai_memory::store::MemoryStore::store(&pg, &ctx, &mem).await;
+
+        let deleted = ai_memory::store::MemoryStore::forget(
+            &pg,
+            &ctx,
+            Some("parity-forget-1776"),
+            None,
+            None,
+            true,
+        )
+        .await
+        .expect("forget");
+        assert!(
+            deleted >= 1,
+            "#1776: forget(archive=true) MUST delete the fixture; got {deleted}"
+        );
+
+        // Deleted from live `memories`.
+        let live = ai_memory::store::MemoryStore::get(&pg, &ctx, &mem.id).await;
+        assert!(
+            live.is_err(),
+            "#1776: forgotten memory MUST be deleted from live `memories`; got {live:?}"
+        );
+
+        // Archived (recoverable), not lost: restore-by-id succeeds iff the
+        // archive INSERT committed in the same tx as the delete.
+        let restored = ai_memory::store::MemoryStore::archive_restore(&pg, &ctx, &mem.id).await;
+        assert!(
+            matches!(restored, Ok(true)),
+            "#1776: forgotten memory MUST be archived (restorable), proving the \
+             archive committed with the delete; got {restored:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 #1709/#1720 Workstream-A (unit A7) — postgres twin of the
+    // sqlite cross-tenant `scope=private` leak regression
+    // (`tests/visibility_private_leak_1720.rs`) + the bypass-correctness
+    // contract (`tests/sqlite_admin_bypass_visibility_a7_1720.rs`).
+    //
+    // The postgres recall/search/recall_hybrid read paths are ALREADY
+    // owner-keyed at HEAD with the `target_agent_id` carve-out and a
+    // NULL-caller trust-all bypass (src/store/postgres.rs ~10577 / 10771
+    // / 11627):
+    //
+    //   $N::text IS NULL
+    //   OR COALESCE(metadata->>'scope','private') <> 'private'
+    //   OR metadata->>'agent_id' = $N
+    //   OR metadata->>'target_agent_id' = $N
+    //
+    // with `caller = if ctx.bypass_visibility { None } else { Some(..) }`.
+    // So pg has NO leak — A7 is parity verification, not a pg fix. This
+    // test pins the adapter-agnostic contract on the POSTGRES side:
+    //
+    //   * non-admin (no bypass) + as_agent=NS  → MUST NOT see alice's
+    //     private row (owner-keyed; the closed leak),
+    //   * owner alice                          → MUST see her own row,
+    //   * target_agent_id carve-out (inbox)    → recipient sees it,
+    //   * admin bypass (as_agent=Some)         → trust-all, sees private
+    //     (the same contract A7 just restored on sqlite).
+    //
+    // Gated on `AI_MEMORY_TEST_POSTGRES_URL` via `live_pg()` (skip-with-
+    // eprintln when unset, like every sibling pg-parity test) so it
+    // compiles + documents the contract here and runs in CI-with-pg.
+    #[tokio::test]
+    #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — Track C blocker per issue #79"]
+    async fn pg_parity_private_leak_and_bypass_a7_1720() {
+        const NS: &str = "fortitude/X";
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+        const NEEDLE: &str = "needle-a7";
+
+        let Some(pg) = live_pg().await else {
+            return;
+        };
+
+        // Seed alice's scope=private row + a target_agent_id inbox row
+        // (carve-out: alice owns it, bob is the recipient). Use a bypass
+        // ctx to seed so the SAL store path applies no visibility filter
+        // to the writes; the rows carry explicit owner/scope metadata.
+        let seed_ctx = ai_memory::store::CallerContext::for_admin("parity-test-a7");
+        let mut priv_mem = sample_memory("pg-a7-alice-priv");
+        priv_mem.namespace = NS.to_string();
+        priv_mem.content = format!("{NEEDLE} alice private");
+        priv_mem.metadata = serde_json::json!({"agent_id": ALICE, "scope": "private"});
+        let mut inbox_mem = sample_memory("pg-a7-inbox");
+        inbox_mem.namespace = NS.to_string();
+        inbox_mem.content = format!("{NEEDLE} alice inbox for bob");
+        inbox_mem.metadata =
+            serde_json::json!({"agent_id": ALICE, "scope": "private", "target_agent_id": BOB});
+        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &priv_mem).await;
+        let _ = ai_memory::store::MemoryStore::store(&pg, &seed_ctx, &inbox_mem).await;
+
+        let filter = ai_memory::store::Filter {
+            namespace: Some(NS.to_string()),
+            limit: 100,
+            ..ai_memory::store::Filter::default()
+        };
+
+        let has = |rows: &[Memory], id: &str| rows.iter().any(|m| m.id == id);
+        let has_scored = |rows: &[(Memory, f64)], id: &str| rows.iter().any(|(m, _)| m.id == id);
+
+        // --- bob (non-admin, no bypass) impersonating the namespace ---
+        let mut bob_ctx = ai_memory::store::CallerContext::for_agent(BOB);
+        bob_ctx.as_agent = Some(NS.to_string());
+        assert!(!bob_ctx.bypass_visibility, "non-admin ctx never bypasses");
+
+        let bob_search = ai_memory::store::MemoryStore::search(&pg, &bob_ctx, NEEDLE, &filter)
+            .await
+            .expect("bob search");
+        assert!(
+            !has(&bob_search, "pg-a7-alice-priv"),
+            "#1720 pg LEAK: bob (non-admin) MUST NOT see alice's private row via search; got={:?}",
+            bob_search.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        // Inbox carve-out: bob IS the target_agent_id, so bob DOES see it.
+        assert!(
+            has(&bob_search, "pg-a7-inbox"),
+            "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox row via search"
+        );
+
+        let bob_recall =
+            ai_memory::store::MemoryStore::recall_hybrid(&pg, &bob_ctx, NEEDLE, None, &filter)
+                .await
+                .expect("bob recall_hybrid");
+        assert!(
+            !has_scored(&bob_recall, "pg-a7-alice-priv"),
+            "#1720 pg LEAK: bob MUST NOT see alice's private row via recall_hybrid; got={:?}",
+            bob_recall.iter().map(|(m, _)| &m.id).collect::<Vec<_>>()
+        );
+        assert!(
+            has_scored(&bob_recall, "pg-a7-inbox"),
+            "#1720 pg: target_agent_id carve-out MUST let bob read alice's inbox via recall_hybrid"
+        );
+
+        // --- alice (owner) sees her own private row ---
+        let mut alice_ctx = ai_memory::store::CallerContext::for_agent(ALICE);
+        alice_ctx.as_agent = Some(NS.to_string());
+        let alice_search = ai_memory::store::MemoryStore::search(&pg, &alice_ctx, NEEDLE, &filter)
+            .await
+            .expect("alice search");
+        assert!(
+            has(&alice_search, "pg-a7-alice-priv"),
+            "#1720 pg: owner alice MUST see her own private row via search"
+        );
+
+        // --- admin bypass = trust-all, sees private REGARDLESS of as_agent
+        //     (the same contract A7 restored on sqlite). Pin BOTH as_agent
+        //     shapes so the postgres NULL-caller trust-all is unambiguous.
+        for with_as_agent in [false, true] {
+            let mut admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-a7-admin");
+            assert!(admin_ctx.bypass_visibility, "for_admin sets bypass");
+            if with_as_agent {
+                admin_ctx.as_agent = Some(NS.to_string());
+            }
+            let admin_search =
+                ai_memory::store::MemoryStore::search(&pg, &admin_ctx, NEEDLE, &filter)
+                    .await
+                    .expect("admin search");
+            assert!(
+                has(&admin_search, "pg-a7-alice-priv"),
+                "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
+                 alice's private row via search — parity with sqlite + the pg NULL-caller bypass"
+            );
+            let admin_recall = ai_memory::store::MemoryStore::recall_hybrid(
+                &pg, &admin_ctx, NEEDLE, None, &filter,
+            )
+            .await
+            .expect("admin recall_hybrid");
+            assert!(
+                has_scored(&admin_recall, "pg-a7-alice-priv"),
+                "#1720 A7 pg: admin bypass (as_agent={with_as_agent}) MUST trust-all and see \
+                 alice's private row via recall_hybrid"
+            );
+        }
     }
 }

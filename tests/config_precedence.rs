@@ -329,6 +329,193 @@ fn test_require_agent_attestation_env_parsing() {
 }
 
 // ---------------------------------------------------------------------------
+// #1749 — `[curator.compaction].enabled` precedence:
+//   AI_MEMORY_COMPACTION_ENABLED env > [curator.compaction].enabled > false.
+// An explicit truthy/falsy env wins; any other env string falls through to the
+// config field then to the compiled `false` default (opt-in posture).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_compaction_enabled_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, CuratorCompactionSection, CuratorSection};
+
+    let cfg = |enabled: Option<bool>| AppConfig {
+        curator: Some(CuratorSection {
+            transcript_classify_enabled: None,
+            reflection_namespaces: None,
+            confidence_decay_half_life_days: None,
+            compaction: Some(CuratorCompactionSection {
+                enabled,
+                cosine_threshold: None,
+            }),
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- unset env → config field wins; absent config → false ----
+    let g = EnvVarGuard::remove("AI_MEMORY_COMPACTION_ENABLED");
+    assert!(cfg(Some(true)).resolve_compaction_enabled());
+    assert!(!cfg(Some(false)).resolve_compaction_enabled());
+    assert!(
+        !AppConfig::default().resolve_compaction_enabled(),
+        "no env + no config → compiled default false"
+    );
+    drop(g);
+
+    // ---- env=1 overrides [curator.compaction].enabled=false ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "1".to_string());
+    assert!(
+        cfg(Some(false)).resolve_compaction_enabled(),
+        "env=1 MUST beat config=false"
+    );
+    drop(g);
+
+    // ---- env=false overrides config=true (case-insensitive) ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "FALSE".to_string());
+    assert!(
+        !cfg(Some(true)).resolve_compaction_enabled(),
+        "env=FALSE MUST beat config=true"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to the config field ----
+    let _g = EnvVarGuard::set("AI_MEMORY_COMPACTION_ENABLED", "maybe".to_string());
+    assert!(
+        cfg(Some(true)).resolve_compaction_enabled(),
+        "garbage env falls through to config=true"
+    );
+    assert!(
+        !cfg(Some(false)).resolve_compaction_enabled(),
+        "garbage env falls through to config=false"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1734 (PE-1) — `[hooks].enforce_mode` precedence:
+//   AI_MEMORY_HOOKS_ENFORCE_MODE env > [hooks].enforce_mode > off.
+//   A valid off/advisory/enforce env token wins; unparseable falls through
+//   to the config field then the compiled default `off`.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_hooks_enforce_mode_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, HooksConfig};
+    use ai_memory::hooks::HookEnforceMode;
+
+    let cfg = |mode: Option<HookEnforceMode>| AppConfig {
+        hooks: Some(HooksConfig {
+            subscription: None,
+            enforce_mode: mode,
+            required_events: None,
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- unset env → config field wins; absent config → off ----
+    let g = EnvVarGuard::remove("AI_MEMORY_HOOKS_ENFORCE_MODE");
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Enforce)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Enforce
+    );
+    assert_eq!(
+        AppConfig::default().resolve_hooks_enforce_mode(),
+        HookEnforceMode::Off,
+        "no env + no config → compiled default off"
+    );
+    drop(g);
+
+    // ---- env wins over config (case-insensitive) ----
+    let g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "ENFORCE".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Off)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Enforce,
+        "env=ENFORCE MUST beat config=off"
+    );
+    drop(g);
+
+    // ---- env=off beats config=enforce ----
+    let g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "off".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Enforce)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Off,
+        "env=off MUST beat config=enforce"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to the config field ----
+    let _g = EnvVarGuard::set("AI_MEMORY_HOOKS_ENFORCE_MODE", "loud".to_string());
+    assert_eq!(
+        cfg(Some(HookEnforceMode::Advisory)).resolve_hooks_enforce_mode(),
+        HookEnforceMode::Advisory,
+        "garbage env falls through to config=advisory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #1750 — `[curator.compaction].cosine_threshold` precedence:
+//   AI_MEMORY_COMPACTION_COSINE_THRESHOLD env > [curator.compaction] > 0.75.
+//   A parseable f32 in (0.0, 1.0] wins; unparseable / out-of-range falls
+//   through to the config field then the compiled default.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_compaction_cosine_threshold_env_overrides_config_and_default() {
+    use ai_memory::config::{AppConfig, CuratorCompactionSection, CuratorSection};
+
+    let cfg = |ct: Option<f32>| AppConfig {
+        curator: Some(CuratorSection {
+            transcript_classify_enabled: None,
+            reflection_namespaces: None,
+            confidence_decay_half_life_days: None,
+            compaction: Some(CuratorCompactionSection {
+                enabled: None,
+                cosine_threshold: ct,
+            }),
+        }),
+        ..AppConfig::default()
+    };
+    // The compiled default is DEFAULT_COSINE_THRESHOLD (pub(crate), so not
+    // visible from this external test crate); pinned literal 0.75.
+    let default = 0.75_f32;
+    let close = |a: f32, b: f32| (a - b).abs() < f32::EPSILON;
+
+    // ---- unset env → config field wins; absent config → 0.75 ----
+    let g = EnvVarGuard::remove("AI_MEMORY_COMPACTION_COSINE_THRESHOLD");
+    assert!(close(
+        cfg(Some(0.9)).resolve_compaction_cosine_threshold(),
+        0.9
+    ));
+    assert!(
+        close(
+            AppConfig::default().resolve_compaction_cosine_threshold(),
+            default
+        ),
+        "no env + no config → compiled default 0.75"
+    );
+    drop(g);
+
+    // ---- env wins over config ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "0.6".to_string());
+    assert!(
+        close(cfg(Some(0.9)).resolve_compaction_cosine_threshold(), 0.6),
+        "env=0.6 MUST beat config=0.9"
+    );
+    drop(g);
+
+    // ---- out-of-range env → falls through to config ----
+    let g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "1.5".to_string());
+    assert!(
+        close(cfg(Some(0.8)).resolve_compaction_cosine_threshold(), 0.8),
+        "out-of-range env falls through to config=0.8"
+    );
+    drop(g);
+
+    // ---- garbage env → falls through to config ----
+    let _g = EnvVarGuard::set("AI_MEMORY_COMPACTION_COSINE_THRESHOLD", "high".to_string());
+    assert!(
+        close(cfg(Some(0.7)).resolve_compaction_cosine_threshold(), 0.7),
+        "garbage env falls through to config=0.7"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 5. [limits] knobs — AI_MEMORY_MAX_* env vars override the `[limits]`
 //    config section, which overrides the compiled defaults.
 // ---------------------------------------------------------------------------
@@ -345,12 +532,14 @@ fn test_limits_env_overrides_config_and_default() {
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            // #1733 (Pillar-4 4.A) — admission-control inflight cap.
+            max_inflight_requests: Some(64),
         }),
         ..AppConfig::default()
     };
 
     // ---- Branch A: env unset → config wins over compiled default ----
-    // All four guards must share ONE `ENV_LOCK` acquisition; stacking
+    // All guards must share ONE `ENV_LOCK` acquisition; stacking
     // single-key `EnvVarGuard`s on one thread self-deadlocks the
     // non-reentrant lock (see `MultiEnvVarGuard` docs).
     let guard_a = MultiEnvVarGuard::apply(&[
@@ -358,17 +547,23 @@ fn test_limits_env_overrides_config_and_default() {
         ("AI_MEMORY_MAX_STORAGE_BYTES", None),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
         ("AI_MEMORY_MAX_PAGE_SIZE", None),
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", None),
     ]);
     let r_cfg = cfg.resolve_limits();
     assert_eq!(r_cfg.max_memories_per_day, 5_000_000);
     assert_eq!(r_cfg.max_page_size, 250_000);
+    assert_eq!(
+        r_cfg.max_inflight_requests, 64,
+        "[limits].max_inflight_requests config MUST beat the compiled default",
+    );
     drop(guard_a);
 
-    // ---- Branch B: env overrides the two it sets; config fills the
+    // ---- Branch B: env overrides the ones it sets; config fills the
     //               rest; the resolved source becomes Env ----
     let _guard_b = MultiEnvVarGuard::apply(&[
         ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("7000000")),
         ("AI_MEMORY_MAX_PAGE_SIZE", Some("1000000")),
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", Some("128")),
         ("AI_MEMORY_MAX_STORAGE_BYTES", None),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
     ]);
@@ -380,6 +575,10 @@ fn test_limits_env_overrides_config_and_default() {
     assert_eq!(
         r_env.max_page_size, 1_000_000,
         "AI_MEMORY_MAX_PAGE_SIZE env MUST beat [limits] config",
+    );
+    assert_eq!(
+        r_env.max_inflight_requests, 128,
+        "AI_MEMORY_MAX_INFLIGHT_REQUESTS env MUST beat [limits] config",
     );
     assert_eq!(
         r_env.max_storage_bytes, 9_000_000_000,
@@ -395,12 +594,16 @@ fn test_limits_env_overrides_config_and_default() {
 fn test_limits_garbage_env_falls_through_to_default() {
     let cfg = AppConfig::default();
 
-    // One lock acquisition for all three mutations (see `MultiEnvVarGuard`).
+    // One lock acquisition for all mutations (see `MultiEnvVarGuard`).
     let _guard = MultiEnvVarGuard::apply(&[
         ("AI_MEMORY_MAX_MEMORIES_PER_DAY", Some("0")),
         ("AI_MEMORY_MAX_PAGE_SIZE", Some("-9")),
         ("AI_MEMORY_MAX_STORAGE_BYTES", Some("lots")),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
+        // #1733 — garbage inflight env must fall through to the compiled
+        // default (`0` = admission control DISABLED), never panic or enable
+        // a bogus cap.
+        ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", Some("nope")),
     ]);
 
     let r = cfg.resolve_limits();
@@ -416,6 +619,11 @@ fn test_limits_garbage_env_falls_through_to_default() {
         "non-positive page-size env must be ignored"
     );
     assert!(r.max_storage_bytes > 0, "unparseable env must be ignored");
+    assert_eq!(
+        r.max_inflight_requests,
+        ai_memory::config::DEFAULT_MAX_INFLIGHT_REQUESTS,
+        "garbage inflight env must fall through to the disabled default",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +801,61 @@ fn test_db_mmap_size_env_overrides_config_and_default() {
         r_zero.db_mmap_size_bytes, 0,
         "explicit 0 disables mmap and must NOT fall through",
     );
+}
+
+// ---------------------------------------------------------------------------
+// 8a-bis. #1735 (Pillar-4 4.C) — AI_MEMORY_AGE_PROJECTION_MODE env var
+//     overrides [storage].age_projection_mode through
+//     AppConfig::resolve_storage(); unparseable / unset falls through to the
+//     compiled default `Sync` (byte-identical pre-4.C link-write behaviour).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_age_projection_mode_env_overrides_config_and_default() {
+    use ai_memory::config::{AgeProjectionMode, ENV_AGE_PROJECTION_MODE, StorageSection};
+
+    let cfg = AppConfig {
+        storage: Some(StorageSection {
+            age_projection_mode: Some("deferred".to_string()),
+            ..StorageSection::default()
+        }),
+        ..AppConfig::default()
+    };
+
+    // ---- Branch A: env unset → [storage] config wins over compiled default ----
+    let guard_a = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, None)]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Deferred,
+        "[storage].age_projection_mode must beat the compiled default",
+    );
+    drop(guard_a);
+
+    // ---- Branch B: env beats config (env sync overrides config deferred) ----
+    let guard_b = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, Some("sync"))]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Sync,
+        "AI_MEMORY_AGE_PROJECTION_MODE env MUST beat [storage] config",
+    );
+    drop(guard_b);
+
+    // ---- Branch C: garbage env falls through to config ----
+    let guard_c = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, Some("nonsense"))]);
+    assert_eq!(
+        cfg.resolve_storage().age_projection_mode,
+        AgeProjectionMode::Deferred,
+        "unparseable env must fall through to the [storage] section",
+    );
+    drop(guard_c);
+
+    // ---- Branch D: no usable layer bottoms out on the compiled default Sync ----
+    let guard_d = MultiEnvVarGuard::apply(&[(ENV_AGE_PROJECTION_MODE, None)]);
+    assert_eq!(
+        AppConfig::default().resolve_storage().age_projection_mode,
+        AgeProjectionMode::Sync,
+        "no env/config layer must bottom out on the compiled default Sync",
+    );
+    drop(guard_d);
 }
 
 // ---------------------------------------------------------------------------

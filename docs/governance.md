@@ -87,6 +87,32 @@ in scope for the
 [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)
 v0.8 work.
 
+### `required_scope` — pin a namespace's memory scope ([#1720](https://github.com/alphaonedev/ai-memory-mcp/issues/1720) C)
+
+An optional per-namespace `CorePolicy.required_scope`
+(`private` | `team` | `unit` | `org` | `collective`) lets a namespace
+standard pin the scope every stored memory must carry. When set, a
+`Store` whose **effective scope** (`metadata.scope`; absent ⇒
+`private`) does not match the pinned value is **REFUSED** at the
+governance gate — **fail-closed, refuse-only**: the gate never
+coerces the write to the required scope, it rejects it. The refusal
+honors `permissions.mode` exactly like the other `CorePolicy` knobs —
+`advisory` warns and lets the write through, `enforce` blocks it.
+
+`required_scope` rides in the existing `metadata.governance` blob, so
+there is **no schema migration** — set it alongside the other knobs:
+
+```json
+{"write": "registered", "promote": "owner", "required_scope": "collective"}
+```
+
+A `collective`-pinned namespace, for instance, refuses any
+default-private write so nothing lands invisible to the rest of the
+team. Enforced on **both** backends (sqlite `storage::enforce_governance`
++ postgres `PostgresStore::enforce_governance_action`). SDK parity: the
+Python SDK `GovernancePolicy` gains a `required_scope: str | None`
+field.
+
 ### Governance reach: memories writes only ([#1652](https://github.com/alphaonedev/ai-memory-mcp/issues/1652))
 
 The L1-6 pre-write rule engine and the namespace `CorePolicy` govern
@@ -141,8 +167,11 @@ ai-memory install claude-code --hook pretool --apply
   PreToolUse hook installer, and `memory_check_agent_action` is the
   harness-consulted read surface — see
   [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point
-  audit. Residual v0.8.0 scope (subprocess chains, mandatory-hook
-  attestation, `AgentAction::Read`) is tracked under
+  audit. **v0.8.0 update:** `AgentAction::Read` (wire `read_action`)
+  shipped (#1730) and the mandatory-hook **presence** check shipped
+  (#1734, `AI_MEMORY_HOOKS_ENFORCE_MODE` + `[hooks].required_events`);
+  residual scope (subprocess-chain visibility, procurement-tier
+  refuse-to-serve attestation / TPM binary integrity) is tracked under
   [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697).
   Capabilities advertises the four wire kinds verbatim under
   `governance.enforced_actions`

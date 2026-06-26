@@ -215,7 +215,7 @@ impl FederationInventory {
     /// of the semantic variants from [`validate`](Self::validate).
     pub fn from_yaml_str(yaml: &str) -> Result<Self, InventoryError> {
         let inventory: Self =
-            serde_yaml::from_str(yaml).map_err(|e| InventoryError::Parse(e.to_string()))?;
+            serde_yaml_ng::from_str(yaml).map_err(|e| InventoryError::Parse(e.to_string()))?;
         inventory.validate()?;
         Ok(inventory)
     }

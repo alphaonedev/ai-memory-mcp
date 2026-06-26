@@ -51,6 +51,7 @@ pub mod peer_attestation;
 pub mod push_dlq;
 pub mod quorum;
 pub mod receive;
+pub mod receive_auth;
 pub mod reflection_bookkeeping;
 // v0.7.0 #791 — per-message Ed25519 signing of federation POSTs.
 // Outbound POSTs (`broadcast_*_quorum`) attach an `X-Memory-Sig`
@@ -361,6 +362,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -369,6 +371,10 @@ mod tests {
         Ack,
         Fail,
         Hang,
+        /// Sleep briefly then return HTTP 500 — a straggler that resolves to a
+        /// failure AFTER quorum is met, so the post-quorum detach task
+        /// processes a `Fail` outcome (#1718 inner-detach coverage).
+        SlowFail,
         /// Return HTTP 500 on the first `fail_until` calls, then 200.
         /// Used to exercise the S40 retry-once path.
         FailThenAck {
@@ -399,6 +405,13 @@ mod tests {
             MockBehaviour::Hang => {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 (StatusCode::OK, AxumJson(serde_json::json!({"applied":1})))
+            }
+            MockBehaviour::SlowFail => {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(serde_json::json!({"error":"stub slow failure"})),
+                )
             }
             MockBehaviour::FailThenAck { fail_until } => {
                 if call <= fail_until {
@@ -1043,6 +1056,174 @@ mod tests {
             .unwrap();
         let err = finalise_quorum(&tracker).unwrap_err();
         assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- #1718 Commit B: broadcast_action_transition_quorum tests ---
+
+    fn sample_action_transition() -> ActionTransitionOp {
+        ActionTransitionOp {
+            action_id: "act-1".to_string(),
+            from_state: crate::models::action::ActionState::Pending,
+            to_state: crate::models::action::ActionState::Claimed,
+            claimed_by: Some("ai:worker".to_string()),
+            vector_clock: serde_json::json!({}),
+            updated_at: 0,
+            signature: Vec::new(),
+            signer_pubkey: Vec::new(),
+            nonce: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn action_transition_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn action_transition_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    // --- #1718 Commit B: broadcast_signal_create_quorum tests ---
+
+    fn sample_signal() -> crate::models::signal::Signal {
+        crate::models::signal::Signal {
+            id: "sig-1".to_string(),
+            namespace: "app".to_string(),
+            from_agent: "ai:sender".to_string(),
+            to_agent: None,
+            subject: "s".to_string(),
+            body: serde_json::json!({}),
+            signal_type: crate::models::signal::SignalType::Notify,
+            in_reply_to: None,
+            correlation_id: None,
+            reference_ids: serde_json::json!([]),
+            created_at: 0,
+            expires_at: None,
+            delivered_at: None,
+            read_at: None,
+            acknowledged_at: None,
+            signature: vec![],
+            sender_pubkey: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_create_quorum_two_peers_ack_meets_quorum() {
+        let (url1, count1) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url2, count2) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let cfg = build_config(vec![url1, url2], 2, 2000);
+        let tracker = broadcast_signal_create_quorum(&cfg, &sample_signal())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        for _ in 0..20 {
+            if count1.load(Ordering::Relaxed) == 1 && count2.load(Ordering::Relaxed) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count1.load(Ordering::Relaxed), 1);
+        assert_eq!(count2.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn signal_create_quorum_partition_minority_fails() {
+        let (url1, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let (url2, _) = spawn_mock_peer(MockBehaviour::Fail).await;
+        let cfg = build_config(vec![url1, url2], 3, 500);
+        let tracker = broadcast_signal_create_quorum(&cfg, &sample_signal())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { .. }));
+    }
+
+    /// #1718 — id-drift on `broadcast_action_transition_quorum` exercises the
+    /// `IdDrift => record_id_drift` arm (coverage parity with the memory-op
+    /// broadcasts).
+    #[tokio::test]
+    async fn action_transition_quorum_id_drift_peer_records_drift_not_ack() {
+        let url1 = spawn_id_drift_peer().await;
+        let url2 = spawn_id_drift_peer().await;
+        let cfg = build_config(vec![url1, url2], 2, 1000);
+        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { got: 1, .. }));
+        assert_eq!(tracker.id_drift_count(), 2);
+    }
+
+    /// #1718 — id-drift on `broadcast_signal_create_quorum` exercises the
+    /// `IdDrift` arm.
+    #[tokio::test]
+    async fn signal_create_quorum_id_drift_peer_records_drift_not_ack() {
+        let url1 = spawn_id_drift_peer().await;
+        let cfg = build_config(vec![url1], 2, 1000);
+        let tracker = broadcast_signal_create_quorum(&cfg, &sample_signal())
+            .await
+            .unwrap();
+        let err = finalise_quorum(&tracker).unwrap_err();
+        assert!(matches!(err, QuorumError::QuorumNotMet { got: 1, .. }));
+        assert_eq!(tracker.id_drift_count(), 1);
+    }
+
+    /// #1718 — quorum met (W=1) by the fast peer while a slow-failing peer is
+    /// still in-flight exercises the post-quorum DETACH-stragglers block of
+    /// `broadcast_action_transition_quorum` END-TO-END: the outer `if
+    /// !joins.is_empty() { tokio::spawn(...) }` AND the detached task's
+    /// `while`-loop processing the straggler's eventual `Fail` outcome. The
+    /// post-broadcast sleep gives the detached task time to drain the
+    /// `SlowFail` peer. Keeps `federation/sync.rs` above its coverage floor as
+    /// the broadcast family grows.
+    #[tokio::test]
+    async fn action_transition_quorum_met_with_straggler_detaches() {
+        let (url_fast, _) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url_slow, _) = spawn_mock_peer(MockBehaviour::SlowFail).await;
+        let cfg = build_config(vec![url_fast, url_slow], 1, 2000);
+        let tracker = broadcast_action_transition_quorum(&cfg, &sample_action_transition())
+            .await
+            .unwrap();
+        // local + the fast peer's ack meet W=1; the slow-fail peer is detached.
+        assert!(finalise_quorum(&tracker).is_ok());
+        // Let the detached task drain the SlowFail peer (covers the inner arm).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    /// #1718 — same end-to-end detach-stragglers coverage for
+    /// `broadcast_signal_create_quorum`.
+    #[tokio::test]
+    async fn signal_create_quorum_met_with_straggler_detaches() {
+        let (url_fast, _) = spawn_mock_peer(MockBehaviour::Ack).await;
+        let (url_slow, _) = spawn_mock_peer(MockBehaviour::SlowFail).await;
+        let cfg = build_config(vec![url_fast, url_slow], 1, 2000);
+        let tracker = broadcast_signal_create_quorum(&cfg, &sample_signal())
+            .await
+            .unwrap();
+        assert!(finalise_quorum(&tracker).is_ok());
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     // --- broadcast_pending_decision_quorum tests (Wave 3) ---
@@ -1691,6 +1872,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

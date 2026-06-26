@@ -290,6 +290,34 @@ pub enum StoreError {
     #[error("integrity check failed: {detail}")]
     IntegrityFailed { detail: String },
 
+    /// #1726 (Pillar-2 typed cognition) — a `lifecycle_state` patch
+    /// requested an illegal transition per
+    /// [`crate::models::LifecycleState::can_transition_to`] (e.g. `open →
+    /// done`, or a move out of a terminal state). `detail` carries the
+    /// [`crate::storage::InvalidTransition`] Display so the trait-routed
+    /// HTTP surface returns the same 409 CONFLICT body on both backends.
+    #[error("{detail}")]
+    InvalidTransition { detail: String },
+
+    /// #1795 — the tenant write would exceed the per-agent daily memory
+    /// quota on the postgres backend (the postgres tenant-handler
+    /// enforcement seam, since `store`/`store_batch`/`consolidate` only
+    /// RECORD usage). Carries the same fields as
+    /// [`crate::quotas::QuotaError`] so the HTTP surface returns the
+    /// byte-identical 429 `QUOTA_EXCEEDED` envelope the sqlite handler path
+    /// produces via `quotas::check_and_record`.
+    #[error("quota exceeded for {agent_id} in {namespace}: {limit} {current}/{max}")]
+    QuotaExceeded {
+        agent_id: String,
+        namespace: String,
+        /// The limit name hit (`crate::quotas::QuotaLimit::as_str`, e.g.
+        /// `memories_per_day` / `storage_bytes`) — surfaced in the 429
+        /// envelope so callers can switch on it (sqlite-path parity).
+        limit: String,
+        current: i64,
+        max: i64,
+    },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -320,6 +348,12 @@ impl StoreError {
             Self::LinkRefused { .. } => error_codes::CONFLICT,
             Self::UnsupportedCapability { .. } => error_codes::STORE_UNSUPPORTED_CAPABILITY,
             Self::IntegrityFailed { .. } => error_codes::STORE_OPERATION_FAILED,
+            // #1726 — an illegal lifecycle transition is a state-conflict
+            // (409), matching the sqlite branch's `InvalidTransition` mapping.
+            Self::InvalidTransition { .. } => error_codes::CONFLICT,
+            // #1795 — over-quota tenant write → 429 QUOTA_EXCEEDED, byte-equal
+            // slug with the sqlite handler path's quota breach.
+            Self::QuotaExceeded { .. } => error_codes::QUOTA_EXCEEDED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }
@@ -342,6 +376,13 @@ impl BoxBackendError {
 
 /// Convenience alias — every trait method returns this.
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// #1709 Pillar 1 — capability tag returned by the default (unsupported)
+/// `checkpoint_*` trait methods. One named const referenced at every default
+/// arm (the sibling `"SIGNALS"` / `"ACTIONS"` / `"LEASES"` tags stay bare
+/// literals because they are under the 10-char no-hardcoded-literal gate
+/// threshold; `"CHECKPOINTS"` is 11 chars and must be a named const).
+const CAP_CHECKPOINTS: &str = "CHECKPOINTS";
 
 /// #1624 — shared integrity finding-checks for [`MemoryStore::verify`]
 /// so both adapters report IDENTICAL findings for identical rows.
@@ -710,6 +751,123 @@ pub trait MemoryStore: Send + Sync {
         Ok(written)
     }
 
+    /// v0.8.0 #1709/#1720 WS-B B2 — rewrite `metadata.agent_id` (the
+    /// NHI ownership stamp) on the memories in EXACTLY `namespace` to
+    /// `to_id`, so an operator can establish durable ownership over a
+    /// namespace BEFORE enabling `scope=private` visibility filtering
+    /// (avoiding a self-lockout from legacy / foreign-owned rows).
+    ///
+    /// Default rewrites every OWNED row (any present `agent_id`);
+    /// `claim_unowned` additionally covers rows with a NULL/empty
+    /// `agent_id`. `dry_run` counts the matched rows and writes nothing.
+    /// Only the single `agent_id` metadata key is rewritten — every
+    /// other key is preserved and the `agent_id_idx` generated column
+    /// re-projects the new owner (no schema change). `to_id` is
+    /// validated; a malformed owner is rejected before any write.
+    ///
+    /// Mirrors [`crate::storage::reown`] on the SQLite path. Default
+    /// returns `UnsupportedCapability` so an in-memory/test adapter
+    /// round-trips cleanly.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default.
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _to_id: &str,
+        _claim_unowned: bool,
+        _dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REOWN".to_string(),
+        })
+    }
+
+    /// #1393 sub-unit 2 — reclassify a memory's `memory_kind` (the curator
+    /// transcript-classify pass: a recovered `Observation` → an
+    /// LLM-classified kind). This is a DEDICATED, audited path, NOT a field
+    /// on the general [`UpdatePatch`], so kind-mutation is not exposed on the
+    /// general update / HTTP-PUT / MCP-update surface (resolved by the 5-agent
+    /// vote, memory `4d3ea1c5`). Adapters MUST, atomically in ONE transaction:
+    /// (1) refuse to clobber `reflection` / `persona` kinds (mirroring the
+    /// upsert-CASE protection in `crate::storage`), (2) `UPDATE memory_kind`
+    /// + bump `version`, and (3) emit a `memory.reclassified` `signed_event`
+    /// in the SAME transaction so the audit can never lag the write (the
+    /// #1552 SAL-port-fanout failure mode). Returns `true` when a row was
+    /// reclassified, `false` on not-found / protected-kind / no-op (already
+    /// the target kind).
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; `UnsupportedCapability` by default (in-memory / test
+    /// adapters round-trip cleanly).
+    async fn reclassify_memory_kind(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECLASSIFY_MEMORY_KIND".to_string(),
+        })
+    }
+
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit.
+    ///
+    /// When a memory was edited in place, #1725 snapshotted the PRIOR
+    /// row into `archived_memories` under `archive_reason='in_place_edit'`
+    /// with the SAME id (single slot — at most one snapshot per id). This
+    /// reads that snapshot and re-applies its restorable fields to the
+    /// live row through the EXISTING `update_with_expected_version` path.
+    /// There is DELIBERATELY NO raw `DELETE` of the live row: a delete
+    /// would cascade-reap the 15 `ON DELETE CASCADE` children (links /
+    /// observations / confidence rows) — the exact data-loss class the
+    /// v0.8.0 epic closes. Because the apply goes through the in-place
+    /// update path, the CURRENT content is auto-snapshotted as a fresh
+    /// `in_place_edit`, so undo is itself reversible (a second call is a
+    /// redo).
+    ///
+    /// **CLI-ONLY by deliberate security design.** This capability is
+    /// surfaced ONLY as the `ai-memory undo-edit <id>` operator
+    /// subcommand — there is intentionally NO MCP tool and NO HTTP route.
+    /// A lossy mutating operation gets the smallest possible remote
+    /// attack surface; the absence of a wire surface is a decision
+    /// (5-agent UNANIMOUS vote, memory `ff23ddcd` / `4d3ea1c5`), not an
+    /// oversight.
+    ///
+    /// **Dual-ownership fail-closed.** When `ctx` resolves a non-bypass
+    /// caller, BOTH the live row's `metadata.agent_id` AND the snapshot's
+    /// `metadata.agent_id` must strict-equal that caller, else
+    /// [`StoreError::PermissionDenied`]. An admin / operator context
+    /// (`bypass_visibility`) skips the gate.
+    ///
+    /// **No `lifecycle_state` restore.** The snapshot's `lifecycle_state`
+    /// is DELIBERATELY not re-applied: the in-place update path does not
+    /// set it, and lifecycle transitions are separately governed by
+    /// [`crate::models::LifecycleState::can_transition_to`] (#1726) —
+    /// forcing one backward could violate the state machine.
+    ///
+    /// `dry_run` returns the before/after diff with `applied=false` and
+    /// writes NOTHING. When no `in_place_edit` snapshot exists the
+    /// returned [`UndoOutcome`] has `applied=false` with before == after.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific; [`StoreError::UnsupportedCapability`] by default
+    /// (in-memory / test adapters that do not implement it).
+    async fn undo_in_place_edit(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _dry_run: bool,
+    ) -> StoreResult<UndoOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "UNDO_IN_PLACE_EDIT".to_string(),
+        })
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`
@@ -752,6 +910,39 @@ pub trait MemoryStore: Send + Sync {
         Err(StoreError::UnsupportedCapability {
             capability: "L4_CAPTURE_TURN".to_string(),
         })
+    }
+
+    /// #1693 — L2 transcript-recovery idempotent write (the L2 sibling of
+    /// [`Self::capture_turn_idempotent`]). Given a prepared
+    /// [`crate::models::RecoverTurnWrite`]: dedup-probe on the canonical
+    /// `(host_session_id, host_turn_index)` AND the content sha (normalized +
+    /// raw-line); on hit return `{memory_id, dedup_hit: true}` with NO write;
+    /// on miss INSERT the memory + the `transcript_line_dedup` row in ONE
+    /// transaction — NO `signed_events` row (L2 is an unsigned backstop). This
+    /// routes the L2 recovery transaction through the SAL so postgres-backed
+    /// daemons gain a callable L2 surface (#1693); the sqlite
+    /// `recover_from_transcript` reaches the same logic via
+    /// [`crate::storage::recover_turn_idempotent`]. Default returns
+    /// `UnsupportedCapability` so a test/in-memory adapter round-trips cleanly.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        _write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "L2_RECOVER_TURN".to_string(),
+        })
+    }
+
+    /// #1693 — the L2 recovery fast-path watermark: the most recent
+    /// `created_at` across all memories owned by `agent_id` (the indexed
+    /// `MAX(created_at) WHERE agent_id` query), or `None` when the agent has
+    /// written none. Lets the recover path skip the parse + write phases when
+    /// the transcript has not changed since the agent's last write. Default
+    /// returns `Ok(None)` (no watermark → never short-circuit; always
+    /// correct, just skips the optimisation).
+    async fn agent_max_created_at(&self, _agent_id: &str) -> StoreResult<Option<String>> {
+        Ok(None)
     }
 
     /// Fetch a memory by id. Returns `NotFound` when the memory does
@@ -1091,6 +1282,38 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry
+    /// that field-merges a divergent same-`id` inbound row via the
+    /// CRDT-lite [`crate::models::merge_memory`] reconciler instead of the
+    /// coarse scalar last-write-wins clobber [`apply_remote_memory`] /
+    /// `insert_if_newer` apply.
+    ///
+    /// Atomic read-merge-write. Returns the resolved row id.
+    ///
+    /// Semantics:
+    /// 1. If a row already exists BY `inbound.id`, persist
+    ///    `merge_memory(&existing, inbound)` — the SAME pure #224 Rust
+    ///    reconciler on every adapter, so there is no per-backend merge
+    ///    drift (only the read/write SQL differs).
+    /// 2. Otherwise fall through to the unchanged insert-if-newer path
+    ///    (fresh INSERT + `(title, namespace)` dedup-upsert LWW).
+    ///
+    /// The #224 invariants — `agent_id` immutable (local wins), governance
+    /// owner-only (local kept), metadata deep-merge — are preserved
+    /// automatically by `merge_memory`.
+    ///
+    /// Default implementation: `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when `inbound` fails validation. Returns
+    /// `Backend` for storage errors.
+    async fn merge_inbound(&self, _ctx: &CallerContext, _inbound: &Memory) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FEDERATION_MERGE_INBOUND".to_string(),
+        })
+    }
+
     /// Apply a remote-origin link via the same idempotent posture as
     /// [`MemoryStore::apply_remote_memory`]. The unique
     /// `(source_id, target_id, relation)` index makes duplicate
@@ -1125,6 +1348,47 @@ pub trait MemoryStore: Send + Sync {
             Err(StoreError::NotFound { .. }) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// #1718 — apply a remote-origin signal via the accept-and-flag-unsigned
+    /// posture (a signal is a *message*, not an authority grant — same as
+    /// [`apply_remote_memory`](MemoryStore::apply_remote_memory) /
+    /// [`apply_remote_link`](MemoryStore::apply_remote_link); the
+    /// authority-granting action-transition sibling is fail-closed instead, see
+    /// `crate::federation::receive_auth`). Default impl composes
+    /// [`signal_get`](MemoryStore::signal_get) + [`crate::signals::verify`] +
+    /// [`signal_send`](MemoryStore::signal_send) so both adapters get it with no
+    /// per-backend SQL (mirrors [`apply_remote_deletion`](MemoryStore::apply_remote_deletion)).
+    ///
+    /// Idempotent on the signal UUID (a replay no-ops, returning the
+    /// `unsigned` label). The signal is persisted verbatim with its embedded
+    /// signature / `sender_pubkey` (never re-signed). Returns `self_signed`
+    /// when that embedded signature verifies, else `unsigned`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidInput` when the signal carries a present-but-invalid
+    /// signature (forged), or `Backend` on a storage error.
+    async fn apply_remote_signal(
+        &self,
+        ctx: &CallerContext,
+        signal: &crate::models::Signal,
+    ) -> StoreResult<&'static str> {
+        if self.signal_get(ctx, &signal.id).await?.is_some() {
+            return Ok(crate::models::AttestLevel::Unsigned.as_str());
+        }
+        let signed_ok = !signal.signature.is_empty() && crate::signals::verify(signal);
+        if !signal.signature.is_empty() && !signed_ok {
+            return Err(StoreError::InvalidInput {
+                detail: format!("signal {} has an invalid signature", signal.id),
+            });
+        }
+        self.signal_send(ctx, signal, None).await?;
+        Ok(if signed_ok {
+            crate::models::AttestLevel::SelfSigned.as_str()
+        } else {
+            crate::models::AttestLevel::Unsigned.as_str()
+        })
     }
 
     // ==================================================================
@@ -1404,6 +1668,538 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1705 (v0.8.0) — recall-observation ledger WRITE, promoted to the
+    /// SAL so postgres-backed daemons populate the ledger (pre-#1705 the
+    /// write side was sqlite-only free-fns, so a postgres daemon never
+    /// recorded recalls). `candidates` = `(memory_id, retriever, rank,
+    /// score)`. Returns rows inserted. Default `Ok(0)` so a non-ledger /
+    /// in-memory adapter round-trips cleanly.
+    /// `agent_id` + `namespace` (v58) stamp the recalling identity so the
+    /// consume flip can reject cross-agent `recall_id` replay.
+    async fn record_recall_observation(
+        &self,
+        _recall_id: &str,
+        _candidates: &[(String, String, i64, f64)],
+        _agent_id: Option<&str>,
+        _namespace: Option<&str>,
+    ) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// #1705 — flip the `consumed` flag for every cited memory under a
+    /// recall id (the downstream-usage signal). Idempotent (only flips
+    /// rows still `consumed = 0`). `consuming_agent` enforces the
+    /// cross-agent replay guard: a row only flips when its stored
+    /// `agent_id` is NULL or equals `consuming_agent`. Returns rows
+    /// flipped. Default `Ok(0)`.
+    async fn mark_recall_consumed(
+        &self,
+        _recall_id: &str,
+        _cited_memory_ids: &[String],
+        _consumed_by: &str,
+        _consuming_agent: Option<&str>,
+    ) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// #1705 — TTL prune of the `recall_observations` ledger (postgres
+    /// twin of `crate::observations::gc::prune`). Deletes rows older than
+    /// `ttl_days`. Returns rows pruned. Default `Ok(0)`.
+    async fn recall_observation_gc(&self, _ttl_days: i64) -> StoreResult<usize> {
+        Ok(0)
+    }
+
+    /// #1709 Pillar 1 — create a coordination action (the v59 `actions`
+    /// table). Returns the action id. Default `UnsupportedCapability` so a
+    /// non-coordination adapter signals the gap rather than silently no-op.
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        _action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a coordination action by id. `Ok(None)` when
+    /// the action does not exist. Default `UnsupportedCapability`.
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — transition an action's state, enforcing the
+    /// coordination state machine ([`crate::models::ActionState::can_transition_to`]).
+    /// Sets `claimed_by` to the supplied value and bumps `updated_at` to
+    /// `now` (epoch seconds). Returns the updated action. `NotFound` when the
+    /// action does not exist; `InvalidInput` on an illegal transition edge.
+    /// Default `UnsupportedCapability`.
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _to: crate::models::ActionState,
+        _claimed_by: Option<&str>,
+        _now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1718 Pillar-1 federation — **compare-and-swap** transition: apply
+    /// `from → to` only when the action is still in `from`, atomically (the
+    /// state guard is in the write predicate, not a separate read). The
+    /// federation receive path uses this — not [`MemoryStore::action_transition`] —
+    /// because the action state machine is non-monotonic (`Claimed → Pending`
+    /// release is legal), so the target state alone is not a safe idempotency
+    /// key for a replayed/out-of-order remote transition; the *expected source*
+    /// state is the guard (#1718 H1). A CAS miss is a non-error
+    /// [`crate::actions::CasOutcome::StateMismatch`] (safe no-op), not a failure.
+    /// Default `UnsupportedCapability`.
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _from: crate::models::ActionState,
+        _to: crate::models::ActionState,
+        _claimed_by: Option<&str>,
+        _now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list actions, optionally filtered by `namespace`
+    /// and/or `state`, newest-`updated_at` first, capped at `limit`. Default
+    /// `UnsupportedCapability`.
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: Option<&str>,
+        _state: Option<crate::models::ActionState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — add a typed dependency-DAG edge between two actions.
+    /// Idempotent: the `(from, to, edge_type)` primary key dedups a repeated
+    /// declaration. Default `UnsupportedCapability`.
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        _from_action: &str,
+        _to_action: &str,
+        _edge_type: crate::models::EdgeType,
+        _now: i64,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — every edge touching `action_id` (inbound + outbound
+    /// union), for the per-node DAG view. Default `UnsupportedCapability`.
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 §11.4 Pillar-1 FRONTIER — the ranked UNBLOCKED frontier: every
+    /// pending action in `namespace` whose `requires` / `gated_by`
+    /// prerequisites are all `done` and that no still-active `blocks` edge
+    /// holds, ordered `priority DESC, created_at ASC` and capped at `limit`.
+    /// Default `UnsupportedCapability`.
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 §11.4 Pillar-1 FRONTIER — the single highest-ranked UNBLOCKED
+    /// action a caller should pick up next (the top of the frontier query).
+    /// When `agent_id` is `Some`, the candidate set is narrowed to actions
+    /// with no owner OR owned by the caller. `Ok(None)` when the frontier is
+    /// empty. Default `UnsupportedCapability`.
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ACTIONS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — acquire a lease on an action. `Conflict` when a
+    /// non-expired lease is held by a DIFFERENT holder; an expired lease (or
+    /// the caller's own) is reclaimed. Sets `acquired_at` + `heartbeat_at` to
+    /// `now`; `expires_at` is the caller-computed deadline. Default
+    /// `UnsupportedCapability`.
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+        _now: i64,
+        _expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — renew a lease the caller holds (extend `expires_at`,
+    /// bump `heartbeat_at` to `now`). `NotFound` when no lease held by
+    /// `holder` exists. Default `UnsupportedCapability`.
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+        _now: i64,
+        _expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — release a lease held by `holder`. Returns `true` when
+    /// a row was removed. Default `UnsupportedCapability`.
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+        _holder: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — the current lease on an action, if any. Default
+    /// `UnsupportedCapability`.
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        _action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — reclaim (delete) every lease whose `expires_at <= now`,
+    /// releasing the action for a fresh holder. Returns the count reclaimed.
+    /// Driven by the [`crate::background::lease_sweep`] background loop. Default
+    /// `UnsupportedCapability`.
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let _ = now;
+        Err(StoreError::UnsupportedCapability {
+            capability: "LEASES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — send a signal, optionally Ed25519-signed (the v60
+    /// `signals` table). Returns the resolved attestation level — mirrors the
+    /// [`MemoryStore::link_signed`] contract: when `keypair` is `Some(kp)` AND
+    /// `kp.can_sign()`, the signal's immutable content is CBOR-canonicalised
+    /// and signed, the 64-byte signature + 32-byte public key are persisted,
+    /// and `"self_signed"` is returned. Otherwise the signal lands verbatim
+    /// (`signature` / `sender_pubkey` as supplied — empty for an unsigned
+    /// send) and `"unsigned"` is returned.
+    ///
+    /// Default `UnsupportedCapability`.
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        _signal: &crate::models::Signal,
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a signal by id. `Ok(None)` when the signal does
+    /// not exist. Default `UnsupportedCapability`.
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — a namespace inbox, newest-first, capped at `limit`.
+    /// When `to_agent` is `Some`, returns both direct messages and broadcasts
+    /// (`to_agent IS NULL`); when `None`, returns every signal in the
+    /// namespace. Default `UnsupportedCapability`.
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _to_agent: Option<&str>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — every signal sharing `correlation_id`, oldest-first
+    /// (thread order). Default `UnsupportedCapability`.
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        _correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — stamp `acknowledged_at` on a signal once. Returns
+    /// `true` when this call set the timestamp, `false` when it was already
+    /// acknowledged (or no row matched). Default `UnsupportedCapability`.
+    async fn signal_ack(&self, _ctx: &CallerContext, _id: &str, _now: i64) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIGNALS".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — create a checkpoint (the v61 `checkpoints` table,
+    /// conditional coordination gates whose resolution is Ed25519-attested).
+    /// The `signature` / `resolver_pubkey` byte vectors on `cp` are persisted
+    /// verbatim — empty for an unattested (pre-resolution) checkpoint. Returns
+    /// the checkpoint id. Default `UnsupportedCapability`.
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        _cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a checkpoint by id. `Ok(None)` when the
+    /// checkpoint does not exist. Default `UnsupportedCapability`.
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a namespace's checkpoints, newest-first, capped
+    /// at `limit`. When `state` is `Some`, narrows to that lifecycle state;
+    /// when `None`, returns every checkpoint in the namespace. Default
+    /// `UnsupportedCapability`.
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _state: Option<crate::models::CheckpointState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — resolve a checkpoint: set state + `resolved_by` +
+    /// `resolution` + `resolution_note` + `resolved_at`. Returns the resolved
+    /// row, or `None` when the id does not exist.
+    ///
+    /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the resolved row's
+    /// canonical RESOLUTION (the separation-of-duties attestation) is
+    /// Ed25519-signed and the 64-byte signature + 32-byte resolver public key
+    /// are persisted into the `signature` / `resolver_pubkey` columns in the
+    /// same write — mirroring the [`MemoryStore::signal_send`] signed path. A
+    /// `None` (or public-only) keypair leaves the attestation columns empty
+    /// (unattested), so [`crate::checkpoints::verify`] returns `false` for that
+    /// row. Default `UnsupportedCapability`.
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _state: crate::models::CheckpointState,
+        _resolved_by: &str,
+        _resolution: Option<&str>,
+        _resolution_note: Option<&str>,
+        _resolved_at: i64,
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — query a namespace's checkpoints narrowed by an
+    /// optional `condition_type` AND an optional `state`, newest-first, capped
+    /// at `limit`. Default `UnsupportedCapability`.
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _condition_type: Option<crate::models::ConditionType>,
+        _state: Option<crate::models::CheckpointState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: CAP_CHECKPOINTS.to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — create a routine (the v62 `routines` table,
+    /// parameterised action+edge templates that can be frozen into an
+    /// immutable, regulatory-hold form). The `signature` / `signer_pubkey`
+    /// byte vectors on `r` are persisted verbatim — empty for an unfrozen
+    /// (Draft) routine. Returns the routine id. Default `UnsupportedCapability`.
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        _r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a routine by id. `Ok(None)` when the routine
+    /// does not exist. Default `UnsupportedCapability`.
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a namespace's routines, newest-first, capped at
+    /// `limit`. When `state` is `Some`, narrows to that lifecycle state; when
+    /// `None`, returns every routine in the namespace. Default
+    /// `UnsupportedCapability`.
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _state: Option<crate::models::RoutineState>,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — freeze a routine (Draft → Frozen, sets `frozen_at`).
+    /// Idempotent on an already-frozen routine (the `frozen_at` is left
+    /// as-is). Returns the routine, or `None` when the id does not exist.
+    ///
+    /// When `keypair` is `Some(kp)` AND `kp.can_sign()`, the frozen routine's
+    /// Ed25519 FREEZE-ATTESTATION (over the immutable frozen template) is signed
+    /// and the `signature` + `signer_pubkey` columns are persisted. A `None`
+    /// (or public-only) keypair leaves the attestation columns empty
+    /// (unattested), so [`crate::routines::verify`] returns `false` for that
+    /// row. Default `UnsupportedCapability`.
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+        _frozen_at: i64,
+        _keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — create a routine run (the v62 `routine_runs` table,
+    /// one materialisation of a routine under a concrete argument binding).
+    /// Returns the run id. Default `UnsupportedCapability`.
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        _run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — fetch a routine run by id. `Ok(None)` when the run
+    /// does not exist. Default `UnsupportedCapability`.
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — list a routine's runs, newest-first (by `started_at`),
+    /// capped at `limit`. Default `UnsupportedCapability`.
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        _routine_id: &str,
+        _limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
+    /// #1709 Pillar 1 — advance a run's lifecycle: set `state` plus, when
+    /// `Some`, `finished_at` / `created_action_ids` / `error` (a `None`
+    /// argument leaves that column untouched). Returns the updated run, or
+    /// `None` when the id does not exist. Default `UnsupportedCapability`.
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        _run_id: &str,
+        _state: crate::models::RoutineRunState,
+        _finished_at: Option<i64>,
+        _created_action_ids: Option<&serde_json::Value>,
+        _error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "ROUTINES".to_string(),
+        })
+    }
+
     /// Run a GC cycle: delete (or archive-then-delete) all memories
     /// whose `expires_at` is in the past. Returns the count deleted.
     ///
@@ -1411,6 +2207,30 @@ pub trait MemoryStore: Send + Sync {
     async fn run_gc(&self, _archive: bool) -> StoreResult<usize> {
         Err(StoreError::UnsupportedCapability {
             capability: "GC".to_string(),
+        })
+    }
+
+    /// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction (size-GC).
+    ///
+    /// When `namespace`'s LIVE corpus byte size
+    /// (`SUM(length(title)+length(content)+length(metadata))` over its
+    /// non-archived rows) exceeds `max_corpus_bytes`, evict the
+    /// lowest-value memories — least-durable tier first, then lowest
+    /// priority / access_count / last_accessed_at — one at a time until
+    /// the corpus is at/under the cap. When `archive` is true each victim
+    /// is archived-before-delete (restorable); otherwise it is hard
+    /// deleted. Returns the count evicted. A non-positive cap is a no-op
+    /// (`Ok(0)`). Deterministic + LLM-free (pure SQL ranking).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    async fn size_gc(
+        &self,
+        _namespace: &str,
+        _max_corpus_bytes: i64,
+        _archive: bool,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "SIZE_GC".to_string(),
         })
     }
 
@@ -1647,6 +2467,34 @@ pub trait MemoryStore: Send + Sync {
         Err(StoreError::UnsupportedCapability {
             capability: "QUOTA_STATUS_NS".to_string(),
         })
+    }
+
+    /// #1795 — ENFORCE the per-agent daily memory-count quota for a
+    /// pending tenant write of `additional_count` memories (`additional_bytes`
+    /// total payload). Returns `StoreError::QuotaExceeded` (→ HTTP 429) when
+    /// the day-rolled `current_memories_today + additional_count` would exceed
+    /// `max_memories_per_day`, or the storage cap would be exceeded.
+    ///
+    /// This is the postgres TENANT-handler enforcement seam: `store` /
+    /// `store_batch` / `consolidate` only RECORD usage (they never reject),
+    /// and the sqlite path enforces at the handler via
+    /// `quotas::check_and_record`. The 3 postgres tenant handlers
+    /// (`create_memory_postgres`, the `bulk_create` postgres branch, the
+    /// `consolidate_memories` postgres branch) call this BEFORE their store
+    /// write; the EXEMPT paths (federation-receive, migrate, CLI, curator)
+    /// never call it, so they are uncharged by construction.
+    ///
+    /// Default is a no-op (`Ok(())`) — non-postgres adapters that already
+    /// enforce at the handler layer (sqlite) or do not enforce keep their
+    /// existing behaviour. Only `PostgresStore` overrides it.
+    async fn check_memory_quota(
+        &self,
+        _ctx: &CallerContext,
+        _namespace: &str,
+        _additional_count: i64,
+        _additional_bytes: i64,
+    ) -> StoreResult<()> {
+        Ok(())
     }
 
     /// List every quota row in the substrate, sorted ascending by
@@ -1894,6 +2742,28 @@ pub trait MemoryStore: Send + Sync {
     ) -> StoreResult<Option<String>> {
         Err(StoreError::UnsupportedCapability {
             capability: "FIND_BY_TITLE_NAMESPACE".to_string(),
+        })
+    }
+
+    /// Fetch a memory's stored embedding vector by id, or `None` when the
+    /// row is missing or has no embedding (keyword-tier / never-embedded /
+    /// store-time-skipped). A backend-agnostic read of the *stored* vector —
+    /// the curator's `ConsolidationPass` reads this (NOT a live re-embed) so
+    /// its cosine gate matches the live `autonomy::find_consolidation_clusters`
+    /// embedding source exactly (#1741/#1743). SQLite delegates to
+    /// `crate::db::get_embedding`; Postgres reads its pgvector `embedding`
+    /// column.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` when the underlying store reports an error.
+    async fn get_embedding(
+        &self,
+        _ctx: &CallerContext,
+        _id: &str,
+    ) -> StoreResult<Option<Vec<f32>>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "GET_EMBEDDING".to_string(),
         })
     }
 
@@ -2265,6 +3135,57 @@ pub struct UpdatePatch {
     /// `Some(s)` where `s` is an RFC3339 timestamp string rewrites
     /// it. Validated by the handler / caller before reaching storage.
     pub expires_at: Option<String>,
+    /// v0.8.0 Pillar 2 (#1726) — opt-in lifecycle transition target.
+    /// `None` leaves the stored `lifecycle_state` untouched; `Some(state)`
+    /// requests the transition, enforced against the stored state via
+    /// [`crate::models::LifecycleState::can_transition_to`] in the adapter
+    /// update path (an illegal edge — e.g. `open → done`, or a move out of
+    /// a terminal — surfaces as [`StoreError::InvalidTransition`] → HTTP
+    /// 409). A request equal to the stored state is an idempotent no-op.
+    pub lifecycle_state: Option<crate::models::LifecycleState>,
+}
+
+/// #1727 (v0.8.0) — stable action label for the
+/// [`MemoryStore::undo_in_place_edit`] governance / `PermissionDenied`
+/// envelope. Single SSOT so the sqlite + postgres adapters cannot drift
+/// (and the hardcoded-literal gate stays green).
+pub const UNDO_IN_PLACE_EDIT_ACTION: &str = "undo_in_place_edit";
+
+/// #1727 (v0.8.0) — outcome of an [`MemoryStore::undo_in_place_edit`]
+/// call: enough before/after detail to render a dry-run diff and to
+/// confirm an applied undo.
+///
+/// `applied` is `true` only when the live row was actually re-written
+/// from the `in_place_edit` snapshot. It is `false` for a dry-run
+/// preview (the diff is populated, nothing is written) AND for the
+/// "no snapshot to undo" case (the before/after fields then mirror the
+/// live row unchanged — see [`MemoryStore::undo_in_place_edit`]).
+///
+/// `after_version` is `Some(before_version + 1)` on an applied undo
+/// (the in-place update path bumps `version` monotonically) and `None`
+/// otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoOutcome {
+    /// `true` iff the live row was re-written from the snapshot.
+    pub applied: bool,
+    /// The memory id the undo targeted.
+    pub id: String,
+    /// `version` of the live row BEFORE the undo (the value the apply
+    /// asserts as `expected_version`).
+    pub before_version: i64,
+    /// `version` of the live row AFTER an applied undo
+    /// (`before_version + 1`), or `None` on a dry-run / no-op.
+    pub after_version: Option<i64>,
+    /// Live row's title BEFORE the undo.
+    pub before_title: String,
+    /// Title the undo restores (from the snapshot); equal to
+    /// `before_title` when there is no snapshot.
+    pub after_title: String,
+    /// Live row's content BEFORE the undo.
+    pub before_content: String,
+    /// Content the undo restores (from the snapshot); equal to
+    /// `before_content` when there is no snapshot.
+    pub after_content: String,
 }
 
 /// Report produced by `verify`.
@@ -2601,6 +3522,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -2701,6 +3623,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_undo_in_place_edit_unsupported() {
+        // #1727 — adapters that don't implement the undo surface (in-memory /
+        // test mocks) return UnsupportedCapability from the default body.
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+        let err = s.undo_in_place_edit(&ctx, "any", false).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
     async fn default_begin_transaction_returns_unsupported() {
         let s = MinimalStore;
         let ctx = CallerContext::for_agent("alice");
@@ -2752,6 +3684,62 @@ mod tests {
         let s = MinimalStore;
         let err = s.list_memories_updated_since(None, 10).await.unwrap_err();
         assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
+    async fn default_v07_v08_capability_methods_report_documented_defaults() {
+        // #1709 SHIP-HARDEN — pin the SAL default bodies for the v0.7.x +
+        // v0.8.0 capability methods a minimal in-memory adapter does not
+        // implement: unsupported reads/writes surface `UnsupportedCapability`,
+        // while the recall-ledger writes are permissive no-ops (`Ok(0)` /
+        // `Ok(None)`) so a non-ledger adapter round-trips cleanly.
+        let s = MinimalStore;
+        let ctx = CallerContext::for_agent("alice");
+
+        // Unsupported-capability read/write defaults.
+        assert!(matches!(
+            s.get_links_for_anchor("anchor").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.get_reflection_origin("rid").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.list_recall_observations(None, None, None, None, 10)
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.revoke_agent_pubkey(&ctx, "agent").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.lease_sweep_expired(0).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+
+        // Permissive defaults.
+        assert_eq!(s.agent_pubkey("agent").await.expect("agent_pubkey"), None);
+        assert_eq!(
+            s.record_recall_observation("rid", &[], None, None)
+                .await
+                .expect("record_recall_observation default"),
+            0
+        );
+        assert_eq!(
+            s.mark_recall_consumed("rid", &[], "alice", None)
+                .await
+                .expect("mark_recall_consumed default"),
+            0
+        );
+        assert_eq!(
+            s.recall_observation_gc(7)
+                .await
+                .expect("recall_observation_gc default"),
+            0
+        );
     }
 
     #[tokio::test]

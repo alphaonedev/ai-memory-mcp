@@ -57,12 +57,33 @@ pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
 /// `federation_signing_check`.
 pub(crate) const QUOTA_REFUSED_FIELD: &str = "quota_refused";
 
+/// #1789 — ONE shared test lock serialising every test that mutates the
+/// federation peer-enrollment env vars
+/// (`AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT`,
+/// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS`). Both the strict enrollment
+/// tests in [`federation_signing_check`] and the permissive-opt-back
+/// guard used by the `tests` module's `http_sync_*` handler tests
+/// acquire THIS lock, so a parallel Check-matrix run can never leak the
+/// flipped secure-default (#1789 default-ON enrollment) across the two
+/// test sets. Promoted to `pub(crate)` from the former module-private
+/// `federation_signing_check::verify_arm_tests::env_lock()` so there is
+/// a single serialisation point, not two independent locks.
+#[cfg(test)]
+pub(crate) fn fed_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub mod accept_provenance;
 pub mod admin;
 pub mod admin_role;
 pub mod approvals;
 pub mod archive;
 pub mod capture_turn;
+pub mod coordination;
 pub mod create;
 pub mod errors;
 pub mod federation_receive;
@@ -79,6 +100,8 @@ pub mod parity;
 pub mod postgres_gate;
 pub mod power;
 pub mod power_consolidation;
+/// #1580 — WAL read-pool for the HTTP SQLite read path.
+pub mod read_pool;
 pub mod recall;
 /// v0.7.0 #1111 — 14 missing HTTP routes for the MCP-only tools the
 /// SR-4 three-surface-parity audit flagged. Each handler is a thin
@@ -107,6 +130,7 @@ pub use admin_role::*;
 pub use approvals::*;
 pub use archive::*;
 pub use capture_turn::*;
+pub use coordination::*;
 pub use create::*;
 pub use errors::*;
 pub use federation_receive::*;

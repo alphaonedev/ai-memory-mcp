@@ -54,6 +54,45 @@ pub fn require_agent_attestation_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// #1464 — `true` when an unsigned write landed `claimed` under the permissive
+/// default: exactly the writes the v0.9 store-path flip (#1751) will start
+/// rejecting, so exactly when the one-cycle deprecation WARN is relevant. A
+/// signed write (→ `AgentAttested`) is unaffected by the flip and stays quiet;
+/// strict mode (`require == true`) has nothing to deprecate.
+fn should_warn_permissive_default(require: bool, level: AttestLevel) -> bool {
+    !require && level == AttestLevel::Claimed
+}
+
+/// #1464 (v0.8.0, P0) — one-shot deprecation WARN for the permissive
+/// agent-attestation default. Emitted at most once per process the first time
+/// an UNSIGNED direct-store write lands `attest_level = "claimed"` under the
+/// default-permissive posture (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset).
+///
+/// Announces the v0.9 STORE-path default flip (tracked: #1751), giving
+/// operators a one-cycle runway to start signing writes (`store --sign` + a
+/// bound key) or opt in early via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
+///
+/// SCOPE: store/direct-write path ONLY. The federation receive boundary
+/// attests via the per-peer authorship allowlist (`resolve_inbound_attribution`,
+/// #1464) — NOT this flag — so the message deliberately does not imply the
+/// flip hardens the network boundary. Chosen by the #1464 5-agent vote
+/// (UNANIMOUS Option A, memory `45a27602`).
+fn warn_permissive_attestation_default_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "identity::attest",
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION is unset (permissive default): \
+             unsigned direct-store writes land attest_level=claimed. v0.9 will flip \
+             this store-path default to REQUIRE attestation (#1751) — sign writes now \
+             (`ai-memory store --sign` with a bound key, or set \
+             AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1) to opt in early. NOTE: this gate \
+             covers direct CLI/MCP/HTTP writes only; the federation receive path \
+             attests via the peer-authorship allowlist, not this flag."
+        );
+    });
+}
+
 /// Validate the transport fields of a *signed* remote store (#626
 /// Layer-3, C7) — shared by every write surface that accepts a
 /// caller-presented signature (MCP `memory_store`, HTTP
@@ -196,13 +235,14 @@ pub fn stamp_attestation_sync(
     signature: Option<&[u8]>,
 ) -> Result<AttestLevel> {
     let bound = crate::db::agent_pubkey(conn, agent_id)?;
-    stamp_attestation(
-        mem,
-        agent_id,
-        bound.as_deref(),
-        signature,
-        require_agent_attestation_enabled(),
-    )
+    let require = require_agent_attestation_enabled();
+    let level = stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)?;
+    // #1464 — warn (once) when an unsigned write lands claimed under the
+    // permissive default, announcing the v0.9 flip (#1751).
+    if should_warn_permissive_default(require, level) {
+        warn_permissive_attestation_default_once();
+    }
+    Ok(level)
 }
 
 /// MCP / HTTP wrapper: resolve the bound key via
@@ -226,13 +266,14 @@ pub async fn stamp_attestation_async(
         .agent_pubkey(agent_id)
         .await
         .map_err(|e| anyhow::anyhow!("resolve bound agent pubkey: {e}"))?;
-    stamp_attestation(
-        mem,
-        agent_id,
-        bound.as_deref(),
-        signature,
-        require_agent_attestation_enabled(),
-    )
+    let require = require_agent_attestation_enabled();
+    let level = stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)?;
+    // #1464 — warn (once) when an unsigned write lands claimed under the
+    // permissive default, announcing the v0.9 flip (#1751).
+    if should_warn_permissive_default(require, level) {
+        warn_permissive_attestation_default_once();
+    }
+    Ok(level)
 }
 
 #[cfg(test)]
@@ -270,7 +311,30 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
+    }
+
+    /// #1464 — the deprecation-WARN trigger predicate fires for exactly the
+    /// writes the v0.9 store-path flip (#1751) will reject: unsigned-→claimed
+    /// under the permissive default. Signed (AgentAttested) and strict-mode
+    /// writes stay quiet.
+    #[test]
+    fn should_warn_permissive_default_only_for_unsigned_claimed() {
+        assert!(should_warn_permissive_default(false, AttestLevel::Claimed));
+        assert!(!should_warn_permissive_default(
+            false,
+            AttestLevel::AgentAttested
+        ));
+        assert!(!should_warn_permissive_default(true, AttestLevel::Claimed));
+        assert!(!should_warn_permissive_default(
+            true,
+            AttestLevel::AgentAttested
+        ));
+        // The one-shot emitter is best-effort and idempotent — calling it
+        // never panics regardless of prior calls.
+        warn_permissive_attestation_default_once();
+        warn_permissive_attestation_default_once();
     }
 
     /// Build a SignableWrite matching `make_memory`'s fields so a test can

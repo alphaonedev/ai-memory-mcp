@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 pub(crate) const REL_CONTRADICTS: &str = "contradicts";
 pub(crate) const REL_REFLECTS_ON: &str = "reflects_on";
 pub(crate) const REL_DERIVES_FROM: &str = "derives_from";
+// v0.8.0 Pillar-2 (Typed Cognition, #1709) — the Goal/Plan/Step wiring
+// relations. Each spelling is ≥ 10 chars and is referenced from both
+// `from_str` and `as_str` (plus the SQL CHECK mirror in
+// `crate::validate::VALID_RELATIONS`), so it follows the named-const
+// pattern of the long relations above rather than a bare literal.
+pub(crate) const REL_DECOMPOSES_INTO: &str = "decomposes_into";
+pub(crate) const REL_DEPENDS_ON: &str = "depends_on";
+pub(crate) const REL_ADVANCES: &str = "advances";
 
 /// v0.7 Track H — attestation level for a `memory_links` row.
 ///
@@ -141,6 +149,36 @@ pub enum MemoryLinkRelation {
     /// memories into one and emits `derived_from` edges from the
     /// consolidated memory back to each source.
     DerivesFrom,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — a parent breaks down
+    /// into children: a `Goal` decomposes_into `Plan`s; a `Plan`
+    /// decomposes_into `Step`s (the [`crate::models::MemoryKind`]
+    /// Goal/Plan/Step vocabulary). Directionality is **parent → child**
+    /// (`source_id` = the parent, `target_id` = the child) — the
+    /// structural inverse of the provenance relations `DerivedFrom` /
+    /// `ReflectsOn` / `DerivesFrom`, which all point newer/derived →
+    /// older/source. This is the structural decomposition spine of a
+    /// typed-cognition plan tree.
+    DecomposesInto,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — an ordering /
+    /// prerequisite edge between SIBLINGS: a `Step` depends_on another
+    /// `Step` that must complete first. Directionality is **dependent →
+    /// prerequisite** (`source_id` = the step that waits, `target_id` =
+    /// the step it waits on). This is the memory-link-vocab analogue of
+    /// the action-DAG `EdgeType::Requires` ordering concept, but it is
+    /// the typed `memory_links` RELATION — deliberately distinct from
+    /// and NOT a duplicate of `crate::models::action::EdgeType`, which
+    /// models the executable action graph rather than the memory graph.
+    DependsOn,
+    /// v0.8.0 Pillar-2 (Typed Cognition, #1709) — a child contributes
+    /// progress toward an ANCESTOR: a `Step` advances a `Plan` or
+    /// `Goal`. Directionality is **child → ancestor** (`source_id` =
+    /// the contributing child, `target_id` = the ancestor it advances).
+    /// It is the progress-rollup counterpart of `DecomposesInto`: where
+    /// `DecomposesInto` runs parent → child to describe structure,
+    /// `advances` runs child → ancestor to describe contribution, so a
+    /// traversal can roll Step completion up into Plan / Goal progress
+    /// without re-walking the decomposition spine in reverse.
+    Advances,
 }
 
 impl MemoryLinkRelation {
@@ -159,6 +197,9 @@ impl MemoryLinkRelation {
             "derived_from" => Some(Self::DerivedFrom),
             REL_REFLECTS_ON => Some(Self::ReflectsOn),
             REL_DERIVES_FROM => Some(Self::DerivesFrom),
+            REL_DECOMPOSES_INTO => Some(Self::DecomposesInto),
+            REL_DEPENDS_ON => Some(Self::DependsOn),
+            REL_ADVANCES => Some(Self::Advances),
             _ => None,
         }
     }
@@ -175,6 +216,9 @@ impl MemoryLinkRelation {
             Self::DerivedFrom => "derived_from",
             Self::ReflectsOn => REL_REFLECTS_ON,
             Self::DerivesFrom => REL_DERIVES_FROM,
+            Self::DecomposesInto => REL_DECOMPOSES_INTO,
+            Self::DependsOn => REL_DEPENDS_ON,
+            Self::Advances => REL_ADVANCES,
         }
     }
 
@@ -192,14 +236,15 @@ impl MemoryLinkRelation {
     /// a new variant requires bumping this const AND the [`all()`]
     /// slice in the same commit, or the parity test pin in
     /// `tests/memory_link_relation_count_invariant.rs` fails the build.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 9;
 
     /// Canonical enumeration of every variant in declaration order
     /// (`related_to`, `supersedes`, `contradicts`, `derived_from`,
-    /// `reflects_on`, `derives_from`). Use this anywhere external code
-    /// would otherwise hand-roll the list — kg traversal, federation
-    /// peer-handshake, capability advertisement, parity tests. The
-    /// `length == COUNT` invariant is pinned by
+    /// `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`,
+    /// `advances`). Use this anywhere external code would otherwise
+    /// hand-roll the list — kg traversal, federation peer-handshake,
+    /// capability advertisement, parity tests. The `length == COUNT`
+    /// invariant is pinned by
     /// `tests/memory_link_relation_count_invariant.rs`.
     #[must_use]
     pub const fn all() -> &'static [Self; Self::COUNT] {
@@ -210,6 +255,9 @@ impl MemoryLinkRelation {
             Self::DerivedFrom,
             Self::ReflectsOn,
             Self::DerivesFrom,
+            Self::DecomposesInto,
+            Self::DependsOn,
+            Self::Advances,
         ]
     }
 }
@@ -233,7 +281,8 @@ impl std::str::FromStr for MemoryLinkRelation {
         Self::from_str(s).ok_or_else(|| {
             format!(
                 "invalid memory_link relation '{s}' (expected one of: related_to, \
-                 supersedes, contradicts, derived_from, reflects_on, derives_from)"
+                 supersedes, contradicts, derived_from, reflects_on, derives_from, \
+                 decomposes_into, depends_on, advances)"
             )
         })
     }
@@ -501,10 +550,35 @@ pub struct VectorClock {
     pub entries: std::collections::BTreeMap<String, String>,
 }
 
+/// The causal relationship between two [`VectorClock`]s, as returned by
+/// [`VectorClock::causality`].
+///
+/// v0.8.0 Pillar-3 (CRDT/consensus, #1709) / #224 Task 3a.1 CRDT-lite
+/// merge. This is the canonical comparator for the sync-state vector
+/// clock: every higher-level predicate
+/// ([`VectorClock::happens_before`], [`VectorClock::concurrent_with`])
+/// is derived from it, so there is exactly one source of truth for the
+/// causality decision.
+///
+/// `HappensBefore` means `self` is causally dominated by `other`
+/// (`other` has seen everything `self` has, strictly more). `Concurrent`
+/// means the two clocks have diverged — each has observed a peer
+/// timestamp the other has not caught up on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Causality {
+    /// The two clocks carry identical per-peer timestamps.
+    Equal,
+    /// `self` is strictly causally dominated by `other`.
+    HappensBefore,
+    /// `self` strictly causally dominates `other`.
+    HappensAfter,
+    /// The clocks have diverged; neither dominates the other.
+    Concurrent,
+}
+
 impl VectorClock {
     /// Advance this clock to include `peer_id`'s latest seen timestamp.
     /// Monotonic — an older timestamp never overwrites a newer one.
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
     pub fn observe(&mut self, peer_id: &str, at: &str) {
         self.entries
             .entry(peer_id.to_string())
@@ -518,9 +592,97 @@ impl VectorClock {
 
     /// Look up the latest timestamp this clock has from `peer_id`.
     #[must_use]
-    #[allow(dead_code)] // Consumed by Task 3a.1 CRDT-lite merge (issue #224).
     pub fn latest_from(&self, peer_id: &str) -> Option<&str> {
         self.entries.get(peer_id).map(String::as_str)
+    }
+
+    /// The timestamp this clock carries for `peer_id`, treating a peer
+    /// ABSENT from `entries` as the minimal timestamp (`""` — the empty
+    /// string sorts before every RFC3339 value, i.e. "never seen").
+    ///
+    /// Comparison is lexical, mirroring [`VectorClock::observe`] exactly
+    /// (the existing string-`max` convention; timestamps are NOT parsed
+    /// to `DateTime`). Callers therefore rely on the same zero-padded,
+    /// same-offset RFC3339 encoding the rest of the substrate emits.
+    #[must_use]
+    fn at(&self, peer_id: &str) -> &str {
+        self.entries.get(peer_id).map_or("", String::as_str)
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — pointwise-max merge.
+    ///
+    /// For every peer present in `other`, set
+    /// `self[peer] = max(self[peer], other[peer])` by lexical RFC3339
+    /// comparison (the [`VectorClock::observe`] rule). Peers only in
+    /// `self` are retained; the result is the union of both peer sets
+    /// with each entry advanced to the later timestamp. An older
+    /// `other` timestamp never regresses a newer `self` entry.
+    ///
+    /// This is the load-bearing reconciliation primitive: it is
+    /// idempotent (`merge(x, x) == x`), commutative (the merged clock is
+    /// independent of order), and associative.
+    pub fn merge(&mut self, other: &VectorClock) {
+        for (peer, at) in &other.entries {
+            self.observe(peer, at);
+        }
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — the canonical
+    /// causality comparator. Every other predicate on this type is
+    /// derived from this one method so the logic cannot diverge.
+    ///
+    /// Returns [`Causality::Equal`] when the two clocks carry identical
+    /// per-peer timestamps; [`Causality::HappensBefore`] when `other`
+    /// strictly dominates `self` (`self[p] <= other[p]` for every peer
+    /// in either clock, and they are not equal);
+    /// [`Causality::HappensAfter`] for the mirror; and
+    /// [`Causality::Concurrent`] when neither dominates the other (each
+    /// is ahead on some peer). Absent peers are treated as the minimal
+    /// timestamp, so an empty clock happens-before any non-empty clock.
+    #[must_use]
+    pub fn causality(&self, other: &VectorClock) -> Causality {
+        if self == other {
+            return Causality::Equal;
+        }
+        // `self` is dominated by `other` iff no peer (in either clock)
+        // has a strictly-greater timestamp in `self` than in `other`.
+        let mut self_le_other = true; // self <= other pointwise
+        let mut other_le_self = true; // other <= self pointwise
+        for peer in self.entries.keys().chain(other.entries.keys()) {
+            let s = self.at(peer);
+            let o = other.at(peer);
+            if s > o {
+                self_le_other = false;
+            }
+            if o > s {
+                other_le_self = false;
+            }
+        }
+        match (self_le_other, other_le_self) {
+            // Equality is handled above, so both-true is unreachable
+            // here; fold it into Equal defensively rather than panic.
+            (true, true) => Causality::Equal,
+            (true, false) => Causality::HappensBefore,
+            (false, true) => Causality::HappensAfter,
+            (false, false) => Causality::Concurrent,
+        }
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — strict causal
+    /// dominance: true iff `other` strictly dominates `self` (for every
+    /// peer `p`, `self[p] <= other[p]`, and `self != other`). Derived
+    /// from [`VectorClock::causality`] (single source of truth).
+    #[must_use]
+    pub fn happens_before(&self, other: &VectorClock) -> bool {
+        self.causality(other) == Causality::HappensBefore
+    }
+
+    /// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — concurrency: true iff
+    /// the two clocks have diverged (neither happens-before the other
+    /// and they are not equal). Derived from [`VectorClock::causality`].
+    #[must_use]
+    pub fn concurrent_with(&self, other: &VectorClock) -> bool {
+        self.causality(other) == Causality::Concurrent
     }
 }
 
@@ -661,6 +823,188 @@ mod tests {
         );
     }
 
+    // ---- v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — VectorClock
+    // causality algebra + merge. Pure, deterministic truth table. ----
+
+    /// Build a clock from `(peer, timestamp)` pairs for the algebra tests.
+    fn vc(pairs: &[(&str, &str)]) -> VectorClock {
+        let mut c = VectorClock::default();
+        for (p, at) in pairs {
+            c.observe(p, at);
+        }
+        c
+    }
+
+    #[test]
+    fn vector_clock_causality_identical_clocks_are_equal() {
+        let a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        let b = a.clone();
+        assert_eq!(a.causality(&b), Causality::Equal);
+        assert!(!a.happens_before(&b));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_causality_strict_superset_happens_after() {
+        // `b` has seen everything `a` has, plus more → a < b, b > a.
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        assert_eq!(a.causality(&b), Causality::HappensBefore);
+        assert_eq!(b.causality(&a), Causality::HappensAfter);
+        assert!(a.happens_before(&b));
+        assert!(!b.happens_before(&a));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_causality_newer_timestamp_same_peer_happens_after() {
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[("p1", "2026-02-01T00:00:00Z")]);
+        assert_eq!(a.causality(&b), Causality::HappensBefore);
+        assert_eq!(b.causality(&a), Causality::HappensAfter);
+    }
+
+    #[test]
+    fn vector_clock_causality_divergent_clocks_are_concurrent() {
+        // Each clock is ahead on a peer the other has not caught up on.
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        assert_eq!(a.causality(&b), Causality::Concurrent);
+        assert_eq!(b.causality(&a), Causality::Concurrent);
+        assert!(a.concurrent_with(&b));
+        assert!(b.concurrent_with(&a));
+        assert!(!a.happens_before(&b));
+        assert!(!b.happens_before(&a));
+    }
+
+    #[test]
+    fn vector_clock_causality_empty_vs_nonempty() {
+        let empty = VectorClock::default();
+        let some = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        // Absent peer is the minimal timestamp → empty happens-before.
+        assert_eq!(empty.causality(&some), Causality::HappensBefore);
+        assert_eq!(some.causality(&empty), Causality::HappensAfter);
+        assert!(empty.happens_before(&some));
+        // Two empty clocks are equal, never concurrent.
+        let empty2 = VectorClock::default();
+        assert_eq!(empty.causality(&empty2), Causality::Equal);
+        assert!(!empty.concurrent_with(&empty2));
+    }
+
+    #[test]
+    fn vector_clock_absent_peer_is_minimal_not_concurrent() {
+        // p2 absent in `a` is treated as minimal, so `a` < `b` rather
+        // than concurrent (b only advances on the absent peer).
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        assert!(a.happens_before(&b));
+        assert!(!a.concurrent_with(&b));
+    }
+
+    #[test]
+    fn vector_clock_merge_is_pointwise_max() {
+        let mut a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-03-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"), // newer on p1 → wins
+            ("p2", "2026-01-01T00:00:00Z"), // older on p2 → must NOT regress
+            ("p3", "2026-01-01T00:00:00Z"), // new peer → added
+        ]);
+        a.merge(&b);
+        assert_eq!(a.latest_from("p1"), Some("2026-02-01T00:00:00Z"));
+        assert_eq!(a.latest_from("p2"), Some("2026-03-01T00:00:00Z"));
+        assert_eq!(a.latest_from("p3"), Some("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn vector_clock_merge_is_idempotent() {
+        let a = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        let mut once = a.clone();
+        once.merge(&a);
+        assert_eq!(once, a, "merge(x, x) == x");
+    }
+
+    #[test]
+    fn vector_clock_merge_is_commutative() {
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p3", "2026-05-01T00:00:00Z"),
+        ]);
+        let mut ab = a.clone();
+        ab.merge(&b);
+        let mut ba = b.clone();
+        ba.merge(&a);
+        assert_eq!(ab, ba, "merge order must not change the result");
+    }
+
+    #[test]
+    fn vector_clock_merge_is_associative() {
+        let a = vc(&[("p1", "2026-01-01T00:00:00Z")]);
+        let b = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let c = vc(&[
+            ("p2", "2026-03-01T00:00:00Z"),
+            ("p3", "2026-01-01T00:00:00Z"),
+        ]);
+        // (a ∪ b) ∪ c
+        let mut left = a.clone();
+        left.merge(&b);
+        left.merge(&c);
+        // a ∪ (b ∪ c)
+        let mut bc = b.clone();
+        bc.merge(&c);
+        let mut right = a.clone();
+        right.merge(&bc);
+        assert_eq!(left, right, "merge must be associative");
+    }
+
+    #[test]
+    fn vector_clock_merge_result_dominates_both_inputs() {
+        // The merged clock causally dominates (or equals) each input —
+        // the algebra and merge agree.
+        let a = vc(&[
+            ("p1", "2026-02-01T00:00:00Z"),
+            ("p2", "2026-01-01T00:00:00Z"),
+        ]);
+        let b = vc(&[
+            ("p1", "2026-01-01T00:00:00Z"),
+            ("p2", "2026-02-01T00:00:00Z"),
+        ]);
+        // a and b are concurrent, but their merge is after both.
+        assert!(a.concurrent_with(&b));
+        let mut m = a.clone();
+        m.merge(&b);
+        assert_eq!(a.causality(&m), Causality::HappensBefore);
+        assert_eq!(b.causality(&m), Causality::HappensBefore);
+        assert_eq!(m.causality(&m), Causality::Equal);
+    }
+
     // ---- C-5 (#699): lift coverage on MemoryLinkRelation parsing/defaults.
     // Targets uncovered: `MemoryLinkRelation::from_str` unknown branch,
     // `default_relation`, `Default::default`, `FromStr` wrapper. ----
@@ -698,6 +1042,9 @@ mod tests {
             ("derived_from", MemoryLinkRelation::DerivedFrom),
             ("reflects_on", MemoryLinkRelation::ReflectsOn),
             ("derives_from", MemoryLinkRelation::DerivesFrom),
+            ("decomposes_into", MemoryLinkRelation::DecomposesInto),
+            ("depends_on", MemoryLinkRelation::DependsOn),
+            ("advances", MemoryLinkRelation::Advances),
         ] {
             // Disambiguate against the inherent `from_str` (which returns
             // Option) by going through the `FromStr` trait fully qualified.
@@ -707,6 +1054,32 @@ mod tests {
             // Display impl round-trip.
             assert_eq!(format!("{v}"), s);
         }
+    }
+
+    #[test]
+    fn memory_link_relation_typed_cognition_relations_round_trip() {
+        // v0.8.0 Pillar-2 (#1709) — the Goal/Plan/Step wiring relations
+        // round-trip through as_str/from_str, are enumerated by all(),
+        // and never displace the RelatedTo default.
+        for (s, v) in [
+            ("decomposes_into", MemoryLinkRelation::DecomposesInto),
+            ("depends_on", MemoryLinkRelation::DependsOn),
+            ("advances", MemoryLinkRelation::Advances),
+        ] {
+            assert_eq!(MemoryLinkRelation::from_str(s), Some(v));
+            assert_eq!(v.as_str(), s);
+            assert_eq!(format!("{v}"), s);
+            assert!(
+                MemoryLinkRelation::all().contains(&v),
+                "all() must enumerate the typed-cognition variant {v:?}"
+            );
+        }
+        // Unknown still returns None and the default is unchanged.
+        assert_eq!(MemoryLinkRelation::from_str("decomposes"), None);
+        assert_eq!(MemoryLinkRelation::from_str("advance"), None);
+        assert_eq!(MemoryLinkRelation::default(), MemoryLinkRelation::RelatedTo);
+        assert_eq!(MemoryLinkRelation::all().len(), MemoryLinkRelation::COUNT);
+        assert_eq!(MemoryLinkRelation::COUNT, 9);
     }
 
     #[test]

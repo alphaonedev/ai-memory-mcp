@@ -59,7 +59,13 @@ fn build_detector_once() -> PathBuf {
     // sibling-crate build cache. Scope the temp dir by current
     // PID so two concurrent `cargo test` driver processes (e.g.
     // CI sharding) cannot stomp each other's target/.
-    let target_dir = std::env::temp_dir().join(format!(
+    // #1721 — project-local scratch (no /tmp writes; CLAUDE.md hard rule).
+    let scratch_root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("g11-auto-link-detector");
+    std::fs::create_dir_all(&scratch_root).ok();
+    let target_dir = scratch_root.join(format!(
         "ai-memory-auto-link-detector-target-{}",
         std::process::id()
     ));

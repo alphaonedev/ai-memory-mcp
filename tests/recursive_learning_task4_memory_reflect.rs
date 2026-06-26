@@ -315,6 +315,7 @@ fn explicit_cap_one_refuses_depth_two_reflection() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(1),
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -359,6 +360,7 @@ fn cap_zero_disables_every_reflection() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(0),
+            required_scope: None,
         },
         ..Default::default()
     };

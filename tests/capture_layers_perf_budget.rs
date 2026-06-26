@@ -302,6 +302,7 @@ fn seed_watermark_in_future(db_path: &std::path::Path, agent_id: &str) {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     };
     ai_memory::storage::insert(&conn, &mem).expect("insert watermark seed");
 }

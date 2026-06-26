@@ -38,7 +38,7 @@ use serde_json::Value;
 /// transport failure the caller gets a clear message naming the
 /// forward URL so operators can distinguish "fanout daemon down"
 /// from "quorum not met".
-pub(super) fn forward_to_http(
+pub(crate) fn forward_to_http(
     method: reqwest::Method,
     url: &str,
     body: Option<&Value>,
@@ -104,4 +104,108 @@ pub(super) fn forward_store_to_http(
     let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
 
     forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+}
+
+/// #1718 — MCP `memory_action_transition` → HTTP
+/// `POST {forward_url}/api/v1/actions/{id}/transition`, so an MCP-stdio
+/// transition participates in the HTTP daemon's W-of-N federation fanout
+/// (`handlers::transition_action`). The same generic-bridge pattern as
+/// [`forward_store_to_http`]: pass the MCP params through as the body (the HTTP
+/// handler reads `to` + `claimed_by` and ignores extras) and surface the
+/// resolved agent id as `X-Agent-Id`.
+///
+/// # Errors
+///
+/// Returns a structured error when the `id` param is missing/empty, agent-id
+/// resolution fails, or the forward transport / daemon returns non-2xx.
+pub(crate) fn forward_action_transition_to_http(
+    forward_url: &str,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let id = params[crate::mcp::param_names::ID]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "memory_action_transition: missing action id".to_string())?;
+    let url = format!(
+        "{}/api/v1/actions/{}/transition",
+        forward_url.trim_end_matches('/'),
+        id
+    );
+    let agent_id =
+        crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    let body = params.clone();
+    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
+    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+}
+
+/// #1718 — MCP `memory_signal_send` → HTTP `POST {forward_url}/api/v1/signals`,
+/// so an MCP-stdio signal participates in the HTTP daemon's W-of-N federation
+/// fanout (`handlers::send_signal`). Params pass through as the body (the HTTP
+/// handler stamps `from_agent` from the authenticated caller and ignores any
+/// body-supplied one); the resolved agent id rides as `X-Agent-Id`.
+///
+/// # Errors
+///
+/// Returns a structured error when agent-id resolution fails or the forward
+/// transport / daemon returns non-2xx.
+pub(crate) fn forward_signal_send_to_http(
+    forward_url: &str,
+    params: &Value,
+    mcp_client: Option<&str>,
+) -> Result<Value, String> {
+    let url = format!("{}/api/v1/signals", forward_url.trim_end_matches('/'));
+    let explicit = params[crate::mcp::param_names::FROM_AGENT].as_str();
+    let agent_id =
+        crate::identity::resolve_agent_id(explicit, mcp_client).map_err(|e| e.to_string())?;
+    let body = params.clone();
+    let headers: &[(&str, String)] = &[(crate::HEADER_AGENT_ID, agent_id)];
+    forward_to_http(reqwest::Method::POST, &url, Some(&body), headers)
+}
+
+#[cfg(test)]
+mod coordination_forward_tests {
+    use super::*;
+    use serde_json::json;
+
+    // A loopback port nothing binds — `send()` fails fast (same pattern as
+    // the store-forward connection-failure test), exercising URL construction
+    // + the id guard + the structured-error envelope without a mock server.
+    const DEAD_URL: &str = "http://127.0.0.1:1";
+
+    #[test]
+    fn action_transition_forward_missing_id_errors() {
+        let err =
+            forward_action_transition_to_http(DEAD_URL, &json!({"to": "claimed"}), Some("ai:test"))
+                .expect_err("missing id must error");
+        assert!(err.contains("missing action id"), "got: {err}");
+    }
+
+    #[test]
+    fn action_transition_forward_builds_path_and_surfaces_transport_error() {
+        let err = forward_action_transition_to_http(
+            DEAD_URL,
+            &json!({"id": "act-1", "to": "claimed"}),
+            Some("ai:test"),
+        )
+        .expect_err("dead URL must error");
+        assert!(err.contains("federation_forward"), "got: {err}");
+        assert!(
+            err.contains("/api/v1/actions/act-1/transition"),
+            "URL carries the action id in the path; got: {err}"
+        );
+    }
+
+    #[test]
+    fn signal_send_forward_builds_path_and_surfaces_transport_error() {
+        let err = forward_signal_send_to_http(
+            DEAD_URL,
+            &json!({"namespace": "ns", "subject": "s"}),
+            Some("ai:test"),
+        )
+        .expect_err("dead URL must error");
+        assert!(err.contains("federation_forward"), "got: {err}");
+        assert!(err.contains("/api/v1/signals"), "got: {err}");
+    }
 }

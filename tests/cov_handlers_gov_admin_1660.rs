@@ -190,7 +190,15 @@ async fn approve_pending_executes_delete_and_returns_200() {
     let _guard = HMAC_LOCK.lock().unwrap();
     ai_memory::config::set_active_hooks_hmac_secret(Some(TEST_SECRET.to_string()));
     let (router, _f, db) = build_router(StorageBackend::Sqlite);
-    let pending_id = seed_delete_pending(&db, "cov-gov-approve", "approver").await;
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface enforces the
+    // Human-arm gate UNCONDITIONALLY: the approver must be a REGISTERED agent and
+    // must NOT be the requester. Queue as a distinct "requester-1660" and
+    // register the "approver" id the signed POST decides as.
+    let pending_id = seed_delete_pending(&db, "cov-gov-approve", "requester-1660").await;
+    {
+        let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, "approver", "ai:generic", &[]).ok();
+    }
     let (status, v) = signed_post(
         &router,
         &format!("/api/v1/pending/{pending_id}/approve"),

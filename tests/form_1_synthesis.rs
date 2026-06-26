@@ -520,6 +520,7 @@ fn install_synthesis_policy(
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         synthesis: SynthesisPolicy {
             legacy_per_pair_classifier: None,

@@ -125,6 +125,11 @@ fn seed_pending_row_in_store(store_path: &std::path::Path, requested_by: &str) -
         ..ai_memory::models::Memory::default()
     };
     let mem_id = ai_memory::db::insert(&conn, &mem).expect("insert memory");
+    // #1796 (5-agent vote 4d3ea1c5) — the SAL trait approve path (this fake-pg
+    // harness routes through it) enforces the Human-arm gate UNCONDITIONALLY:
+    // the approver must be a REGISTERED, non-requester agent. The dispatch test
+    // approves as the distinct "operator-1"; register it in the store file.
+    ai_memory::db::register_agent(&conn, "operator-1", "ai:generic", &[]).ok();
     ai_memory::db::queue_pending_action(
         &conn,
         ai_memory::models::GovernedAction::Delete,

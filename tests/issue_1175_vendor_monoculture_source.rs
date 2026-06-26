@@ -141,6 +141,7 @@ fn seed_observation(conn: &Connection, namespace: &str, title: &str) -> String {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     };
     db::insert(conn, &mem).expect("insert observation")
 }
@@ -399,6 +400,7 @@ fn caller_can_still_pass_legacy_claude_source_for_back_compat() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     };
     let id = db::insert(&conn, &mem).expect("insert with legacy source");
     let stored_source = read_source(&conn, &id);

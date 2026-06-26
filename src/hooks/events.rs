@@ -75,9 +75,10 @@ use crate::models::{Memory, MemoryLink, Tier};
 /// and implementation of **NSA recommendation (d) Constrain and
 /// sandbox tool execution** + **(f) Filter and monitor output
 /// pipelines and chained execution** per U/OO/6030316-26 (May 2026
-/// v1.0). 25 lifecycle events (20 baseline + 5 v0.7.0 additions:
+/// v1.0). 27 lifecycle events (20 baseline + 5 v0.7.0 additions:
 /// `PreRecallExpand`, `PreReflect`, `PostReflect`, `PreCompaction`,
-/// `OnCompactionRollback`) give operators a substrate-side hook for
+/// `OnCompactionRollback`; + 2 v0.8.0 #1709 signal events:
+/// `PreSignalSend`, `PostSignalAck`) give operators a substrate-side hook for
 /// every memory operation, with the four-way decision contract
 /// (`Allow` / `Modify` / `Deny` / `AskUser`) and chain ordering
 /// (priority-desc, first-Deny short-circuits). Default-off — a v0.7
@@ -230,6 +231,28 @@ pub enum HookEvent {
     ///
     /// Classified as [`crate::hooks::EventClass::Write`].
     OnCompactionRollback,
+    /// v0.8.0 Pillar-1 #1709 — fires before a signed coordination
+    /// signal is persisted. Payload: `SignalDelta` (writable — a
+    /// hook may rewrite the proposed signal's fields before it is
+    /// committed to the append-only signal log). Mirrors the
+    /// pre-write decision contract of [`HookEvent::PreStore`] /
+    /// [`HookEvent::PreLink`]: handlers may Allow (default), Modify
+    /// (rewrite the delta), Deny (refuse the signal), or AskUser.
+    ///
+    /// Classified as [`crate::hooks::EventClass::Write`].
+    PreSignalSend,
+    /// v0.8.0 Pillar-1 #1709 — fires after a coordination signal has
+    /// been acknowledged by its recipient. Payload: `SignalAck`
+    /// (read-only). **Notify-class** hook: like
+    /// [`HookEvent::PostStore`] / [`HookEvent::PostConsolidate`],
+    /// handlers cannot veto and their return value is ignored beyond
+    /// logging.
+    ///
+    /// Classified as [`crate::hooks::EventClass::Write`] — the
+    /// `EventClass` enum has no dedicated notify class, so notify-only
+    /// post-events share the write-class deadline budget (same as
+    /// [`HookEvent::PostReflect`] / [`HookEvent::OnCompactionRollback`]).
+    PostSignalAck,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +728,53 @@ impl From<&crate::transcripts::Transcript> for Transcript {
 }
 
 // ---------------------------------------------------------------------------
+// Signal payloads (v0.8.0 Pillar-1 #1709 / #1729)
+// ---------------------------------------------------------------------------
+
+/// Writable delta for [`HookEvent::PreSignalSend`]. Carries the
+/// rewritable fields of an in-flight coordination signal so a
+/// `pre_signal_send` hook can inspect it and, via
+/// `HookDecision::Modify`, rewrite any of them before the signal is
+/// signed + persisted to the append-only signal log.
+///
+/// `from_agent` and `id` are intentionally absent — rewriting the
+/// sender identity would silently change the signal's audit
+/// provenance (and invalidate the Ed25519 signature binding), which
+/// is the wrong shape for a hook contract. Mirrors the
+/// `source_ids`/`agent_id` omission on [`ReflectDelta`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalDelta {
+    pub namespace: String,
+    /// Recipient agent; `None` = namespace broadcast.
+    pub to_agent: Option<String>,
+    pub subject: String,
+    /// JSON-typed payload.
+    pub body: Value,
+    pub signal_type: crate::models::SignalType,
+    pub in_reply_to: Option<String>,
+    pub correlation_id: Option<String>,
+    /// JSON array of related signal/memory ids.
+    pub reference_ids: Value,
+}
+
+/// Read-only payload for [`HookEvent::PostSignalAck`]. A snapshot of
+/// the signal at acknowledgement time — enough for an observability
+/// hook to log / page / correlate without re-querying. **Notify-class**:
+/// the `post_signal_ack` hook's return value is ignored (the ack has
+/// already committed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalAck {
+    pub id: String,
+    pub namespace: String,
+    pub from_agent: String,
+    pub to_agent: Option<String>,
+    pub subject: String,
+    pub signal_type: crate::models::SignalType,
+    /// Epoch seconds the ack was stamped.
+    pub acknowledged_at: i64,
+}
+
+// ---------------------------------------------------------------------------
 // Tests — JSON round-trip per representative variant
 // ---------------------------------------------------------------------------
 //
@@ -759,18 +829,23 @@ mod tests {
                 HookEvent::OnCompactionRollback,
                 "\"on_compaction_rollback\"",
             ),
+            // v0.8.0 Pillar-1 #1709: signed-signal events (26th + 27th).
+            (HookEvent::PreSignalSend, "\"pre_signal_send\""),
+            (HookEvent::PostSignalAck, "\"post_signal_ack\""),
         ];
 
-        // Pin the count at the type boundary so adding a 26th
+        // Pin the count at the type boundary so adding a 28th
         // variant without updating the table fails this test. G2
         // shipped 20; G10 added the 21st (`pre_recall_expand`);
         // v0.7.0 recursive-learning Task 6/8 added the 22nd +
-        // 23rd (`pre_reflect`, `post_reflect`); L1-7 adds the
-        // 24th + 25th (`pre_compaction`, `on_compaction_rollback`).
+        // 23rd (`pre_reflect`, `post_reflect`); L1-7 added the
+        // 24th + 25th (`pre_compaction`, `on_compaction_rollback`);
+        // v0.8.0 #1709 adds the 26th + 27th (`pre_signal_send`,
+        // `post_signal_ack`).
         assert_eq!(
             table.len(),
-            25,
-            "L1-7 raises the count from 23 to 25 (adds pre_compaction + on_compaction_rollback)"
+            27,
+            "v0.8.0 #1709 raises the count from 25 to 27 (adds pre_signal_send + post_signal_ack)"
         );
 
         for (variant, expected_json) in table {
@@ -1119,5 +1194,41 @@ mod tests {
         assert_eq!(back.compressed_size, 42);
         assert_eq!(back.original_size, 256);
         assert!(back.expires_at.is_none());
+    }
+
+    #[test]
+    fn signal_payloads_round_trip() {
+        // v0.8.0 Pillar-1 #1729 — SignalDelta (pre) + SignalAck (post) wire shapes.
+        let delta = SignalDelta {
+            namespace: "_sig".into(),
+            to_agent: Some("agent-to".into()),
+            subject: "subj".into(),
+            body: serde_json::json!({"k": "v"}),
+            signal_type: crate::models::SignalType::Request,
+            in_reply_to: None,
+            correlation_id: Some("corr-1".into()),
+            reference_ids: serde_json::json!(["m-1"]),
+        };
+        let v = serde_json::to_value(&delta).expect("encode delta");
+        assert_eq!(v["signal_type"], serde_json::json!("request"));
+        let back: SignalDelta = serde_json::from_value(v).expect("decode delta");
+        assert_eq!(back.subject, "subj");
+        assert_eq!(back.to_agent.as_deref(), Some("agent-to"));
+        assert_eq!(back.signal_type, crate::models::SignalType::Request);
+
+        let ack = SignalAck {
+            id: "s-1".into(),
+            namespace: "_sig".into(),
+            from_agent: "agent-from".into(),
+            to_agent: None,
+            subject: "subj".into(),
+            signal_type: crate::models::SignalType::Notify,
+            acknowledged_at: 1_700_000_000,
+        };
+        let av = serde_json::to_value(&ack).expect("encode ack");
+        let ackback: SignalAck = serde_json::from_value(av).expect("decode ack");
+        assert_eq!(ackback.id, "s-1");
+        assert!(ackback.to_agent.is_none());
+        assert_eq!(ackback.acknowledged_at, 1_700_000_000);
     }
 }

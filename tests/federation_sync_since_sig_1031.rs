@@ -281,6 +281,10 @@ async fn sync_since_unenrolled_peer_without_signature_is_permitted_1031() {
     unsafe {
         std::env::set_var(REQUIRE_SIG_ENV, "1");
         std::env::set_var(REQUIRE_NONCE_ENV, "0");
+        // #1789 — peer enrollment is the v0.8 secure default (strict). This
+        // test pins the PERMISSIVE (None,None) allow-with-WARN arm, so opt
+        // back to permissive to preserve its original intent.
+        std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
     }
     let host = setup();
     // No X-Peer-Id at all — the "neither side enrolled" allow-with-WARN
@@ -288,6 +292,9 @@ async fn sync_since_unenrolled_peer_without_signature_is_permitted_1031() {
     // peer-rollout window (operators flip AI_MEMORY_FED_REQUIRE_SIG=1
     // only after every peer has a keypair on disk).
     let (status, body) = sync_since_get(&host.router, "limit=10", None, None, None).await;
+    unsafe {
+        std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+    }
     assert_eq!(
         status,
         StatusCode::OK,

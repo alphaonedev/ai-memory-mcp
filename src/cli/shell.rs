@@ -70,6 +70,10 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 None,
                 false,
                 None,
+                // v0.8.0 #1720 A3 — local single-tenant shell: caller
+                // `None` keeps the trust-all read posture (same as the
+                // all-`None` as_agent above).
+                None,
             ) {
                 Ok((results, _outcome)) => {
                     for (mem, score) in &results {
@@ -98,7 +102,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 return ShellAction::Continue;
             }
             match db::search(
-                conn, &q, None, None, 20, None, None, None, None, None, None, false,
+                conn, &q, None, None, 20, None, None, None, None, None, None, false, None,
             ) {
                 Ok(results) => {
                     for mem in &results {

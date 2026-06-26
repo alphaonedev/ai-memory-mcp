@@ -401,6 +401,8 @@ fn prompt_content(name: &str, params: &Value) -> Result<Value, String> {
 // Registry is already declared above (pub(super) mod registry;).
 // tools/ directory: each file = one tool module under mcp.
 
+#[path = "tools/action.rs"]
+mod action;
 #[path = "tools/agent.rs"]
 mod agent;
 #[path = "tools/archive.rs"]
@@ -409,6 +411,16 @@ mod archive;
 mod auto_tag;
 #[path = "tools/capabilities.rs"]
 mod capabilities;
+#[path = "tools/signal.rs"]
+mod signal;
+// v0.8.0 Pillar 1 (#1709) — `memory_checkpoint_*` MCP tools over the
+// `crate::checkpoints` attested-checkpoint coordination substrate.
+#[path = "tools/checkpoint.rs"]
+mod checkpoint;
+// v0.8.0 Pillar 1 (#1709) — `memory_routine_*` MCP tools over the
+// `crate::routines` parameterised action+edge template substrate.
+#[path = "tools/routine.rs"]
+mod routine;
 // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001
 // (`docs/rfc/RFC-0001-mcp-turn-capture.md`). Substrate-side handler
 // for the protocol-level fix that closes the #1388 substrate failure
@@ -963,6 +975,27 @@ pub fn skill_compositional_context_for_tests(
 // L1-5 / L2-6 regression suites and the CLI/HTTP surfaces can drive
 // them directly without going through the stdio JSON-RPC layer.
 use store::handle_store;
+// v0.8.0 Pillar 1 (#1709) — coordination-action create/get handlers.
+use action::{
+    handle_action_add_edge, handle_action_create, handle_action_edges, handle_action_frontier,
+    handle_action_get, handle_action_list, handle_action_next, handle_action_transition,
+    handle_lease_acquire, handle_lease_get, handle_lease_release, handle_lease_renew,
+};
+// v0.8.0 Pillar 1 (#1709) — signed-signal coordination handlers.
+use signal::{
+    handle_signal_ack, handle_signal_ack_with_hooks, handle_signal_inbox, handle_signal_read,
+    handle_signal_send, handle_signal_send_with_hooks, handle_signal_thread,
+};
+// v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination handlers.
+use checkpoint::{
+    handle_checkpoint_create, handle_checkpoint_query, handle_checkpoint_resolve,
+    handle_checkpoint_verify,
+};
+// v0.8.0 Pillar 1 (#1709) — routine coordination handlers.
+use routine::{
+    handle_routine_create, handle_routine_freeze, handle_routine_list, handle_routine_run,
+    handle_routine_status,
+};
 // v0.7.0 #1111 — `handle_subscription_replay` is `pub use`-exported above.
 // v0.7.0 ARCH-3 / FX-C3 (#batch2) — `handle_subscribe` and
 // `handle_list_subscriptions` are also `pub use`-exported above; the
@@ -1224,6 +1257,337 @@ fn dispatch_memory_recall_observations(ctx: &ToolDispatchCtx<'_>) -> Result<Valu
     handle_recall_observations(ctx.conn, ctx.arguments)
 }
 
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_create`.
+fn dispatch_memory_action_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_get`.
+fn dispatch_memory_action_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_get(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_transition`.
+fn dispatch_memory_action_transition(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1718 — when a federation forward URL is configured, an MCP-stdio
+    // transition forwards to the HTTP daemon so its W-of-N fanout takes over
+    // (mirrors `dispatch_memory_store`; vote c2fa96aa). MCP stdio is sqlite-only
+    // and cannot reach `app.federation` directly.
+    if let Some(url) = ctx.federation_forward_url {
+        return store::transport::forward_action_transition_to_http(
+            url,
+            ctx.arguments,
+            ctx.mcp_client,
+        );
+    }
+    handle_action_transition(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_list`.
+fn dispatch_memory_action_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_list(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_add_edge`.
+fn dispatch_memory_action_add_edge(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_add_edge(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_action_edges`.
+fn dispatch_memory_action_edges(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_edges(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — dispatch for `memory_action_frontier`.
+fn dispatch_memory_action_frontier(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_frontier(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709 §11.4) — dispatch for `memory_action_next`.
+fn dispatch_memory_action_next(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_action_next(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_acquire`.
+fn dispatch_memory_lease_acquire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_acquire(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_renew`.
+fn dispatch_memory_lease_renew(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_renew(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_release`.
+fn dispatch_memory_lease_release(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_release(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_lease_get`.
+fn dispatch_memory_lease_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_lease_get(ctx.conn, ctx.arguments)
+}
+
+// ---------------------------------------------------------------------------
+// #1714 (v0.8.0, P1) — MCP signal-ack → PostSignalAck hook bridge.
+//
+// The synchronous MCP stdio dispatch holds no `HookChain` handle, so no
+// `HookEvent` fired from MCP operations. This wires the highest-value POST
+// coordination event (`PostSignalAck`) through the existing #1729 `SignalHooks`
+// plumbing to the async hook chain via a best-effort observer.
+//
+// INERT BY DEFAULT: the sink is installed by `run_mcp_server` ONLY when the
+// operator has configured a `post_signal_ack` `[[hook]]`. Unset (the default)
+// → `dispatch_memory_signal_ack` fires nothing, byte-identical to pre-#1714.
+// POST-only: `PostSignalAck` is notify-class (the snapshot is read-only); a
+// pre-event's deny/modify cannot ride an async observer (the op already
+// returned) — `pre_signal_send` enforcement over MCP needs a synchronous
+// in-dispatch chain and is tracked separately. Mirrors the serve-init-set /
+// dispatch-read process-global pattern of `COLOR_ENABLED` + `AGE_PROJECTION_MODE`.
+// ---------------------------------------------------------------------------
+
+/// Process-global send-half of the `PostSignalAck` observer bridge (#1714).
+/// `None` until [`run_mcp_server`] installs it for an operator-configured hook.
+static POST_SIGNAL_ACK_SINK: std::sync::OnceLock<
+    tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+> = std::sync::OnceLock::new();
+
+/// #1714 — install the process `PostSignalAck` hook sink (first-writer-wins).
+/// Called once by [`run_mcp_server`] when a `post_signal_ack` hook is configured.
+pub(crate) fn set_post_signal_ack_sink(tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>) {
+    let _ = POST_SIGNAL_ACK_SINK.set(tx);
+}
+
+// ---------------------------------------------------------------------------
+// #1752 (v0.8.0, P1) — MCP memory_signal_send → PreSignalSend ENFORCEMENT gate.
+//
+// Unlike the #1714 PostSignalAck observer (async, notify-only — a post-event
+// `Deny` is unactionable because the op already returned), PreSignalSend is a
+// PRE/deny-capable event: its decision MUST be honored synchronously, before
+// the signal is signed + inserted. The MCP stdio dispatch is synchronous (a
+// `spawn_blocking` thread), so the gate fires the async `HookChain` inline via
+// `crate::llm::block_on_local` (the multi-thread arm reuses the outer runtime
+// via `block_in_place`; never a panicking `Handle::current().block_on`).
+//
+// INERT BY DEFAULT: installed by `run_mcp_server` ONLY when an operator
+// `pre_signal_send` `[[hook]]` is configured; unset → `dispatch_memory_signal_send`
+// takes the thin `handle_signal_send`, byte-identical to pre-#1752 (zero added
+// cost on the send hot path). Design: 5-agent vote (memory `4d3ea1c5`).
+// ---------------------------------------------------------------------------
+
+/// #1752 — the process-global PreSignalSend enforcement gate: the configured
+/// chain + its executor registry. `fire` needs `&mut` the registry, so it is
+/// held behind a `Mutex` (the sync stdio loop is single-threaded, so the lock
+/// is uncontended). `None` until [`run_mcp_server`] installs it.
+struct PreSignalSendGate {
+    chain: std::sync::Arc<crate::hooks::HookChain>,
+    registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
+}
+
+static PRE_SIGNAL_SEND_GATE: std::sync::OnceLock<PreSignalSendGate> = std::sync::OnceLock::new();
+
+/// #1752 — install the process PreSignalSend gate (first-writer-wins). Called
+/// once by [`run_mcp_server`] when a `pre_signal_send` hook is configured.
+fn set_pre_signal_send_gate(
+    chain: std::sync::Arc<crate::hooks::HookChain>,
+    registry: crate::hooks::ExecutorRegistry,
+) {
+    let _ = PRE_SIGNAL_SEND_GATE.set(PreSignalSendGate {
+        chain,
+        registry: std::sync::Mutex::new(registry),
+    });
+}
+
+/// #1752 — map the async chain's [`crate::hooks::chain::ChainResult`] onto the
+/// synchronous [`signal::SignalHookDecision`] the in-dispatch `pre_signal_send`
+/// callback returns. `Deny` is the core enforcement; `AskUser` carries the
+/// first queued prompt (the existing eval arm fail-closes it to a refusal on
+/// the prompt-less stdio path). `ModifiedAllow` carries a `MemoryDelta`, which
+/// has NO signal-shaped mapping, so the send proceeds unmodified with a WARN —
+/// signal rewriting remains available via an in-process `pre_signal_send`
+/// closure (the #1729 path), not the external memory-shaped chain.
+fn map_chain_result_to_signal_decision(
+    cr: crate::hooks::chain::ChainResult,
+) -> signal::SignalHookDecision {
+    use crate::hooks::chain::ChainResult;
+    match cr {
+        ChainResult::Allow => signal::SignalHookDecision::Allow,
+        ChainResult::Deny { reason, code } => signal::SignalHookDecision::Deny { reason, code },
+        ChainResult::AskUser { queued } => {
+            let (prompt, options, default) = queued.into_iter().next().map_or_else(
+                || ("operator decision required".to_string(), Vec::new(), None),
+                |p| (p.prompt, p.options, p.default),
+            );
+            signal::SignalHookDecision::AskUser {
+                prompt,
+                options,
+                default,
+            }
+        }
+        ChainResult::ModifiedAllow(_delta) => {
+            tracing::warn!(
+                target: "hooks",
+                "PreSignalSend hook returned ModifiedAllow (a MemoryDelta) which has no \
+                 signal-field mapping; proceeding unmodified. Use an in-process \
+                 pre_signal_send hook to rewrite a signal."
+            );
+            signal::SignalHookDecision::Allow
+        }
+    }
+}
+
+/// #1752 — evaluate the installed PreSignalSend gate for one in-flight signal.
+/// Fires the configured async `HookChain` synchronously (via `block_on_local`)
+/// and maps the outcome. The registry `Mutex` is uncontended (single-threaded
+/// stdio loop); a poisoned lock recovers its inner value.
+fn pre_signal_send_decision(
+    gate: &'static PreSignalSendGate,
+    delta: &crate::hooks::events::SignalDelta,
+) -> signal::SignalHookDecision {
+    let payload = serde_json::to_value(delta).unwrap_or(serde_json::Value::Null);
+    let cr = crate::llm::block_on_local(move || async move {
+        let mut reg = gate
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        gate.chain
+            .fire(crate::hooks::HookEvent::PreSignalSend, payload, &mut reg)
+            .await
+    });
+    map_chain_result_to_signal_decision(cr)
+}
+
+/// #1714 — build the [`signal::SignalHooks`] bundle for an MCP signal-ack
+/// dispatch. Pure over `sink` so the wiring is unit-testable without the
+/// process global: `Some` installs a best-effort `post_signal_ack` callback
+/// that serializes the read-only `SignalAck` snapshot and forwards it to the
+/// observer bridge (never blocks the stdio loop); `None` yields an empty,
+/// inert bundle.
+fn build_mcp_signal_hooks(
+    sink: Option<tokio::sync::mpsc::UnboundedSender<serde_json::Value>>,
+) -> signal::SignalHooks<'static> {
+    match sink {
+        Some(tx) => signal::SignalHooks {
+            pre_signal_send: None,
+            post_signal_ack: Some(Box::new(move |ack: &crate::hooks::events::SignalAck| {
+                let payload = serde_json::to_value(ack).unwrap_or(serde_json::Value::Null);
+                // Best-effort: a closed channel (observer thread gone) drops it.
+                let _ = tx.send(payload);
+            })),
+        },
+        None => signal::SignalHooks::empty(),
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_send`. Threads the
+/// active daemon keypair so an outbound signal is `self_signed` when a
+/// signing key is available, `unsigned` otherwise.
+fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1718 — forward to the HTTP daemon for W-of-N federation fanout when a
+    // forward URL is configured (mirrors `dispatch_memory_store`; vote c2fa96aa).
+    if let Some(url) = ctx.federation_forward_url {
+        return store::transport::forward_signal_send_to_http(url, ctx.arguments, ctx.mcp_client);
+    }
+    // #1752 — when an operator PreSignalSend hook is installed, enforce it
+    // synchronously before sign+insert (Deny refuses; the in-process eval arms
+    // in `handle_signal_send_with_hooks` apply the decision). Inert default:
+    // no gate → the thin `handle_signal_send`, byte-identical to pre-#1752.
+    match PRE_SIGNAL_SEND_GATE.get() {
+        Some(gate) => {
+            let hooks = signal::SignalHooks {
+                pre_signal_send: Some(Box::new(
+                    move |delta: &crate::hooks::events::SignalDelta| {
+                        pre_signal_send_decision(gate, delta)
+                    },
+                )),
+                post_signal_ack: None,
+            };
+            handle_signal_send_with_hooks(ctx.conn, ctx.arguments, ctx.active_keypair, &hooks)
+        }
+        None => handle_signal_send(ctx.conn, ctx.arguments, ctx.active_keypair),
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_read`.
+fn dispatch_memory_signal_read(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_read(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_inbox`.
+fn dispatch_memory_signal_inbox(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_inbox(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_thread`.
+fn dispatch_memory_signal_thread(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_signal_thread(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_ack`. #1714 — fires
+/// `PostSignalAck` through the process hook bridge when an operator configured
+/// the hook; inert (empty bundle, identical to `handle_signal_ack`) otherwise.
+fn dispatch_memory_signal_ack(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // Inert path (no operator hook configured) takes the thin `handle_signal_ack`
+    // — byte-identical to pre-#1714. Only when a sink is installed do we build
+    // the hook bundle and route through the `_with_hooks` variant.
+    match POST_SIGNAL_ACK_SINK.get().cloned() {
+        Some(sink) => {
+            let hooks = build_mcp_signal_hooks(Some(sink));
+            handle_signal_ack_with_hooks(ctx.conn, ctx.arguments, &hooks)
+        }
+        None => handle_signal_ack(ctx.conn, ctx.arguments),
+    }
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_create`.
+fn dispatch_memory_checkpoint_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_resolve`. Threads
+/// the active daemon keypair so the resolution is `self_signed` when a signing
+/// key is available, `unsigned` otherwise.
+fn dispatch_memory_checkpoint_resolve(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_resolve(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_query`.
+fn dispatch_memory_checkpoint_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_query(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_checkpoint_verify`.
+fn dispatch_memory_checkpoint_verify(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_checkpoint_verify(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_create`.
+fn dispatch_memory_routine_create(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_create(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_freeze`. Threads the
+/// active daemon keypair so the freeze is `self_signed` when a signing key is
+/// available, `unsigned` otherwise.
+fn dispatch_memory_routine_freeze(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_freeze(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_run`.
+fn dispatch_memory_routine_run(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_run(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_status`.
+fn dispatch_memory_routine_status(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_status(ctx.conn, ctx.arguments)
+}
+
+/// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_routine_list`.
+fn dispatch_memory_routine_list(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_routine_list(ctx.conn, ctx.arguments)
+}
+
 fn dispatch_memory_search(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     // v0.7.0 #1468 — see `dispatch_memory_recall`.
     let caller = crate::identity::resolve_read_visibility_caller();
@@ -1265,7 +1629,10 @@ fn dispatch_memory_entity_get_by_alias(ctx: &ToolDispatchCtx<'_>) -> Result<Valu
 }
 
 fn dispatch_memory_kg_timeline(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_kg_timeline(ctx.conn, ctx.arguments)
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
+    // `dispatch_memory_search`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_kg_timeline(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_kg_invalidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1277,7 +1644,10 @@ fn dispatch_memory_kg_query(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> 
 }
 
 fn dispatch_memory_find_paths(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_find_paths(ctx.conn, ctx.arguments)
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate; see
+    // `dispatch_memory_search`.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_find_paths(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
@@ -1869,6 +2239,92 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(tool_names::MEMORY_AGENT_LIST, dispatch_memory_agent_list),
         register_mcp_tool!(tool_names::MEMORY_NOTIFY, dispatch_memory_notify),
         register_mcp_tool!(tool_names::MEMORY_SHARE, dispatch_memory_share),
+        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get.
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_CREATE,
+            dispatch_memory_action_create
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_GET, dispatch_memory_action_get),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_TRANSITION,
+            dispatch_memory_action_transition
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_LIST, dispatch_memory_action_list),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_ADD_EDGE,
+            dispatch_memory_action_add_edge
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_EDGES,
+            dispatch_memory_action_edges
+        ),
+        // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface.
+        register_mcp_tool!(
+            tool_names::MEMORY_ACTION_FRONTIER,
+            dispatch_memory_action_frontier
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ACTION_NEXT, dispatch_memory_action_next),
+        // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface.
+        register_mcp_tool!(
+            tool_names::MEMORY_LEASE_ACQUIRE,
+            dispatch_memory_lease_acquire
+        ),
+        register_mcp_tool!(tool_names::MEMORY_LEASE_RENEW, dispatch_memory_lease_renew),
+        register_mcp_tool!(
+            tool_names::MEMORY_LEASE_RELEASE,
+            dispatch_memory_lease_release
+        ),
+        register_mcp_tool!(tool_names::MEMORY_LEASE_GET, dispatch_memory_lease_get),
+        // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+        // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_SEND, dispatch_memory_signal_send),
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_READ, dispatch_memory_signal_read),
+        register_mcp_tool!(
+            tool_names::MEMORY_SIGNAL_INBOX,
+            dispatch_memory_signal_inbox
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SIGNAL_THREAD,
+            dispatch_memory_signal_thread
+        ),
+        register_mcp_tool!(tool_names::MEMORY_SIGNAL_ACK, dispatch_memory_signal_ack),
+        // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+        // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_CREATE,
+            dispatch_memory_checkpoint_create
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_RESOLVE,
+            dispatch_memory_checkpoint_resolve
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_QUERY,
+            dispatch_memory_checkpoint_query
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_CHECKPOINT_VERIFY,
+            dispatch_memory_checkpoint_verify
+        ),
+        // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+        // (create/freeze/run/status/list) over the `crate::routines` substrate.
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_CREATE,
+            dispatch_memory_routine_create
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_FREEZE,
+            dispatch_memory_routine_freeze
+        ),
+        register_mcp_tool!(tool_names::MEMORY_ROUTINE_RUN, dispatch_memory_routine_run),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_STATUS,
+            dispatch_memory_routine_status
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_ROUTINE_LIST,
+            dispatch_memory_routine_list
+        ),
         register_mcp_tool!(tool_names::MEMORY_INBOX, dispatch_memory_inbox),
         register_mcp_tool!(tool_names::MEMORY_SUBSCRIBE, dispatch_memory_subscribe),
         register_mcp_tool!(tool_names::MEMORY_UNSUBSCRIBE, dispatch_memory_unsubscribe),
@@ -2744,6 +3200,21 @@ pub fn run_mcp_server(
 
     let mut conn = db::open(db_path)?;
 
+    // #1775 — boot WARN when archive_on_gc is explicitly false (the GC
+    // sweep + memory_forget become permanent hard-delete with no archive
+    // and no rollback). One-shot via an internal `std::sync::Once`.
+    app_config.warn_if_archive_on_gc_disabled();
+
+    // #1720 B3 — boot-time operator self-lockout guard. When the operator
+    // has set AI_MEMORY_AGENT_ID (read-path ownership filtering scopes
+    // private rows to that caller), warn — or, under
+    // AI_MEMORY_REQUIRE_OWNED_ROWS, refuse to boot — if pre-existing
+    // private rows are owned by a different / pid-suffixed / unowned id,
+    // naming `ai-memory reown` as the fix. No-op when the env id is unset
+    // (single-operator trust-all default). The `?` makes the refuse posture
+    // abort MCP startup before the stdio loop opens.
+    crate::identity::enforce_owner_lockout_guard(&conn)?;
+
     // #1583 (SEC, MED) — install the substrate `GOVERNANCE_PRE_WRITE`
     // agent-action gate on the MCP write surface. Pre-#1583 the hook
     // was installed ONLY by the HTTP daemon (`bootstrap_serve`), so an
@@ -2758,8 +3229,13 @@ pub fn run_mcp_server(
     // that open fails the hook fails CLOSED (#1455). The deferred-audit
     // drainer chain-logs refusals; its supervisor thread is detached for
     // the lifetime of the MCP process.
+    // v0.8.0 PE-4 (#1732) — crash-durable journal variant. The MCP stdio
+    // path has NO shutdown drain, so durability + boot recovery is the
+    // only thing standing between a SIGKILL and a lost refusal row on the
+    // NHI-primary interface. Recovery runs synchronously here, before the
+    // governance hooks install below (replay-all-then-go-live).
     let (mcp_governance_queue, _mcp_governance_supervisor) =
-        crate::governance::deferred_audit::install_deferred_audit_drainer(db_path);
+        crate::governance::deferred_audit::install_deferred_audit_drainer_with_journal(db_path);
     let mcp_rule_cache = std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new());
     let mcp_hook_conn: Option<std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>> =
         match db::open(db_path) {
@@ -2789,6 +3265,64 @@ pub fn run_mcp_server(
         &mcp_rule_cache,
         mcp_hook_conn,
     );
+
+    // #1714 (v0.8.0, P1) — wire the MCP `memory_signal_ack` → `PostSignalAck`
+    // hook bridge. The synchronous stdio dispatch can't `.await` a hook chain,
+    // so a best-effort observer thread (self-contained runtime) drains acks and
+    // fires the chain. INERT BY DEFAULT: load the operator's `[[hook]]` config,
+    // build the `PostSignalAck` chain, and install the sink ONLY when that
+    // chain is non-empty — a deployment with no such hook configured is
+    // byte-identical to pre-#1714. `pre_signal_send` enforcement over MCP needs
+    // a synchronous in-dispatch chain and is tracked separately.
+    {
+        use crate::hooks::{HookChain, HookEvent, config::HookConfig, spawn_post_event_observer};
+        let all_hooks = HookConfig::default_path()
+            .filter(|p| p.exists())
+            .and_then(|p| HookConfig::load_from_file(&p).ok())
+            .unwrap_or_default();
+        let chain = HookChain::for_event(&all_hooks, HookEvent::PostSignalAck);
+        if !chain.hooks().is_empty() {
+            let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
+            let sink = spawn_post_event_observer(
+                std::sync::Arc::new(chain),
+                registry,
+                HookEvent::PostSignalAck,
+            );
+            set_post_signal_ack_sink(sink);
+            eprintln!(
+                "ai-memory: #1714 — MCP PostSignalAck hook bridge installed \
+                 ({} post_signal_ack hook(s))",
+                all_hooks
+                    .iter()
+                    .filter(|h| h.event == HookEvent::PostSignalAck)
+                    .count()
+            );
+        }
+    }
+
+    // #1752 — MCP PreSignalSend ENFORCEMENT gate. Same inert-by-default load as
+    // the #1714 PostSignalAck bridge, but PRE/deny-capable: the dispatch fires
+    // the chain synchronously before sign+insert (via `block_on_local`), so a
+    // `Deny` actually refuses the send. Installed only when an operator
+    // `pre_signal_send` `[[hook]]` is configured; otherwise byte-identical to
+    // pre-#1752. Design: 5-agent vote (memory `4d3ea1c5`).
+    {
+        use crate::hooks::{HookChain, HookEvent, config::HookConfig};
+        let all_hooks = HookConfig::default_path()
+            .filter(|p| p.exists())
+            .and_then(|p| HookConfig::load_from_file(&p).ok())
+            .unwrap_or_default();
+        let chain = HookChain::for_event(&all_hooks, HookEvent::PreSignalSend);
+        if !chain.hooks().is_empty() {
+            let registry = crate::hooks::ExecutorRegistry::from_hooks(chain.hooks());
+            let n = chain.hooks().len();
+            set_pre_signal_send_gate(std::sync::Arc::new(chain), registry);
+            eprintln!(
+                "ai-memory: #1752 — MCP PreSignalSend enforcement gate installed \
+                 ({n} pre_signal_send hook(s))"
+            );
+        }
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -3330,6 +3864,103 @@ mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
     use serde_json::json;
+
+    /// #1714 — with no sink configured the MCP signal-ack hook bundle is inert
+    /// (empty), so `dispatch_memory_signal_ack` behaves identically to the
+    /// pre-#1714 `handle_signal_ack`. This is the default for every deployment
+    /// without a `post_signal_ack` `[[hook]]`.
+    #[test]
+    fn build_mcp_signal_hooks_inert_without_sink_1714() {
+        let hooks = build_mcp_signal_hooks(None);
+        assert!(
+            hooks.post_signal_ack.is_none(),
+            "no sink → no post_signal_ack callback (inert)"
+        );
+        assert!(hooks.pre_signal_send.is_none(), "bridge is POST-only");
+    }
+
+    /// #1714 — with a sink, the `post_signal_ack` callback serializes the
+    /// read-only `SignalAck` snapshot and forwards it to the observer channel
+    /// (best-effort, non-blocking). Proves the bridge producer end without
+    /// spinning the observer thread or the full serve loop.
+    #[test]
+    fn build_mcp_signal_hooks_forwards_ack_to_sink_1714() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let hooks = build_mcp_signal_hooks(Some(tx));
+        let post = hooks
+            .post_signal_ack
+            .expect("sink → post_signal_ack callback present");
+        let ack = crate::hooks::events::SignalAck {
+            id: "sig-1714".to_string(),
+            namespace: "coord".to_string(),
+            from_agent: "ai:sender".to_string(),
+            to_agent: Some("ai:recipient".to_string()),
+            subject: "deploy-ready".to_string(),
+            signal_type: crate::models::SignalType::Notify,
+            acknowledged_at: 1_700_000_000,
+        };
+        post(&ack);
+        let payload = rx
+            .try_recv()
+            .expect("ack snapshot forwarded to the observer sink");
+        assert_eq!(payload["id"], "sig-1714");
+        assert_eq!(payload["subject"], "deploy-ready");
+        assert_eq!(payload["signal_type"], "notify");
+    }
+
+    /// #1752 — the ChainResult → SignalHookDecision translation the MCP
+    /// PreSignalSend gate applies. Deny is the core enforcement; AskUser
+    /// carries the first queued prompt (fail-closed downstream); ModifiedAllow
+    /// (a memory-shaped delta) has no signal mapping so it proceeds as Allow.
+    #[test]
+    fn map_chain_result_to_signal_decision_1752() {
+        use crate::hooks::chain::ChainResult;
+        use signal::SignalHookDecision;
+
+        assert!(matches!(
+            map_chain_result_to_signal_decision(ChainResult::Allow),
+            SignalHookDecision::Allow
+        ));
+
+        match map_chain_result_to_signal_decision(ChainResult::Deny {
+            reason: "policy: no cross-namespace signals".to_string(),
+            code: 403,
+        }) {
+            SignalHookDecision::Deny { reason, code } => {
+                assert_eq!(code, 403);
+                assert!(reason.contains("cross-namespace"));
+            }
+            other => panic!("Deny must map to Deny, got {other:?}"),
+        }
+
+        match map_chain_result_to_signal_decision(ChainResult::AskUser {
+            queued: vec![crate::hooks::chain::AskUserPrompt {
+                prompt: "approve this signal?".to_string(),
+                options: vec!["yes".to_string(), "no".to_string()],
+                default: Some("no".to_string()),
+                origin_command: "hook.sh".to_string(),
+            }],
+        }) {
+            SignalHookDecision::AskUser {
+                prompt,
+                options,
+                default,
+            } => {
+                assert_eq!(prompt, "approve this signal?");
+                assert_eq!(options, vec!["yes".to_string(), "no".to_string()]);
+                assert_eq!(default.as_deref(), Some("no"));
+            }
+            other => panic!("AskUser must map to AskUser, got {other:?}"),
+        }
+
+        // ModifiedAllow carries a MemoryDelta (no signal mapping) → Allow.
+        assert!(matches!(
+            map_chain_result_to_signal_decision(ChainResult::ModifiedAllow(
+                crate::hooks::events::MemoryDelta::default()
+            )),
+            SignalHookDecision::Allow
+        ));
+    }
 
     // ----- issue #965 audit: MCP dispatch has NO Arc<Mutex<Connection>> -----
     //
@@ -5254,6 +5885,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -5341,6 +5973,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -5395,6 +6028,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5452,6 +6086,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5566,6 +6201,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             source_ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -5735,6 +6371,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             source_ids.push(db::insert(&conn, &mem).unwrap());
         }
@@ -6446,6 +7083,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
         db::set_namespace_standard(&conn, "m9-parent", &std_id, None).unwrap();
@@ -6477,6 +7115,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(&conn, "repo/team/sub", &child_id, None).unwrap();
@@ -6551,6 +7190,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let parent_id = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "m9-explicit-parent", &parent_id, None).unwrap();
@@ -6582,6 +7222,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let child_id = db::insert(&conn, &child_mem).unwrap();
         db::set_namespace_standard(
@@ -6650,6 +7291,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(conn, &mem).unwrap();
         db::set_namespace_standard(conn, namespace, &id, None).unwrap();
@@ -6943,6 +7585,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -7073,6 +7716,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7296,6 +7940,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(&conn, &mem).unwrap();
 
@@ -7412,6 +8057,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7767,6 +8413,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7810,6 +8457,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7892,6 +8540,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7939,6 +8588,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -7981,6 +8631,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -8275,6 +8926,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let pid = db::insert(&conn, &parent_mem).unwrap();
         db::set_namespace_standard(&conn, "w12-explicit-grand", &pid, None).unwrap();
@@ -8383,6 +9035,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_promote", json!({"id": id}));
@@ -8525,6 +9178,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8581,6 +9235,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -8634,6 +9289,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_get", json!({"id": id}));
@@ -8680,6 +9336,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8735,6 +9392,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8783,6 +9441,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -8843,6 +9502,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let uri = "doc:test-uplift/abc#section-1";
         db::insert(&conn, &mk("kg-uplift", "a", Some(uri))).unwrap();
@@ -8927,6 +9587,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -9354,6 +10015,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut mem_b = mem_a.clone();
         mem_b.id = uuid::Uuid::new_v4().to_string();
@@ -9416,6 +10078,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_update", json!({"id": id, "expires_at": ""}));
@@ -9458,6 +10121,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -9508,6 +10172,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_delete", json!({"id": id}));
@@ -9921,6 +10586,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -9966,6 +10632,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let std_id = db::insert(conn, &standard).unwrap();
         db::set_namespace_standard(conn, namespace, &std_id, None).unwrap();
@@ -10682,6 +11349,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -10840,6 +11508,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&conn, &mk("a")).unwrap();
         let b = db::insert(&conn, &mk("b")).unwrap();
@@ -10948,6 +11617,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).unwrap();
         let req = make_tools_call(
@@ -11149,6 +11819,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11205,6 +11876,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11273,6 +11945,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11354,6 +12027,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11446,6 +12120,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11539,6 +12214,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut tgt = src.clone();
         tgt.id = uuid::Uuid::new_v4().to_string();
@@ -11650,6 +12326,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -11694,6 +12371,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -11805,6 +12483,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -11961,6 +12640,10 @@ mod tests {
     /// State — pattern filter under forget hits the with-pattern branch.
     #[test]
     fn chunkc_forget_pattern_filter_actual_run_deletes() {
+        // #1772 — serialize against the owner-scoped forget tests that mutate
+        // AI_MEMORY_AGENT_ID (these chunkc rows are owned by a different id, so
+        // a leaked env would scope this forget to zero rows and break the count).
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-pat", "abc-xyz", Tier::Mid);
         let _ = chunkc_seed_memory(&conn, "chunkc-pat", "def-xyz", Tier::Mid);
@@ -11983,6 +12666,10 @@ mod tests {
     /// (matches the substrate-level `forget_count` branch).
     #[test]
     fn chunkc_forget_dry_run_pattern_with_tier_filter() {
+        // #1772 — see chunkc_forget_pattern_filter_actual_run_deletes: this
+        // env lock serializes against the AI_MEMORY_AGENT_ID-mutating forget
+        // tests so the env-unset would_delete count assertion is stable.
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-mix", "a-short", Tier::Short);
         let _ = chunkc_seed_memory(&conn, "chunkc-mix", "a-long", Tier::Long);
@@ -12976,6 +13663,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &stale).unwrap();
         let resp = crate::mcp::handle_load_family(
@@ -13284,6 +13972,7 @@ mod tests {
                             approver: ApproverType::Human,
                             inherit: false,
                             max_reflection_depth: None,
+                            required_scope: None,
                         },
                         ..Default::default()
                     }
@@ -13299,6 +13988,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -13353,6 +14043,7 @@ mod tests {
                             approver: ApproverType::Agent("not-me".to_string()),
                             inherit: false,
                             max_reflection_depth: None,
+                            required_scope: None,
                         },
                         ..Default::default()
                     }
@@ -13368,6 +14059,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -13900,6 +14592,9 @@ mod tests {
     /// extraction branch.
     #[test]
     fn chunkc_forget_invalid_tier_string_silently_dropped() {
+        // #1772 — env lock: serialize against the AI_MEMORY_AGENT_ID-mutating
+        // forget tests so this env-unset would_delete assertion is stable.
+        let _envg = crate::identity::agent_id_env_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let _ = chunkc_seed_memory(&conn, "chunkc-forget-tier", "v1", Tier::Mid);
         let req = make_tools_call(
@@ -13995,6 +14690,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": false}));
@@ -14038,6 +14734,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         let req = make_tools_call("memory_gc", json!({"dry_run": true}));
@@ -14219,6 +14916,7 @@ mod backfill_resilience_1595_tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -14420,6 +15118,118 @@ mod backfill_resilience_1595_tests {
             db::get_unembedded_ids(&conn).unwrap().len(),
             2,
             "both rows skipped (left for the next sweep), sweep terminated"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_gate_parity_1730 {
+    //! v0.8.0 PE-2 (§5.5 / #1730) — parity guard: EVERY MCP read surface
+    //! must route through the read-action governance gate
+    //! ([`crate::governance::agent_action::gate_read`]). A single blanket
+    //! `read_action` refuse rule must deny recall / search / list / get /
+    //! session_start; with NO read rules the fast-path lets them through.
+    //! If a 6th read surface is added, gate it + extend this test (mirrors
+    //! the no-silent-coverage discipline of
+    //! `mcp_input_schema_no_false_strict_1052`).
+    use crate::config::{ResolvedScoring, ResolvedTtl};
+    use crate::governance::rules_store::{self, Rule};
+    use serde_json::json;
+
+    fn full_conn() -> rusqlite::Connection {
+        crate::storage::open(std::path::Path::new(":memory:")).expect("open full schema")
+    }
+
+    fn add_blanket_read_deny(conn: &rusqlite::Connection) {
+        rules_store::insert(
+            conn,
+            &Rule {
+                id: "read-deny-all".to_string(),
+                kind: crate::governance::agent_action::action_kinds::READ_ACTION.to_string(),
+                matcher: r#"{"all":true}"#.to_string(),
+                severity: "refuse".to_string(),
+                reason: "parity: deny all reads".to_string(),
+                namespace: "_global".to_string(),
+                created_by: "test".to_string(),
+                created_at: 0,
+                enabled: true,
+                signature: None,
+                attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+            },
+        )
+        .expect("insert read-deny rule");
+    }
+
+    #[test]
+    fn every_read_surface_is_gated_1730() {
+        // forensic-sink lock + no-operator-pubkey so the unsigned test rule
+        // passes the L1-6 signature gate in `list_enabled_by_kind`.
+        let _forensic = crate::governance::audit::forensic_sink_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _np = rules_store::force_no_operator_pubkey_for_test();
+        let conn = full_conn();
+        add_blanket_read_deny(&conn);
+        let ttl = ResolvedTtl::default();
+        let scoring = ResolvedScoring::default();
+
+        let recall = super::recall::handle_recall(
+            &conn,
+            &json!({"context": "x", "namespace": "ns"}),
+            None,
+            None,
+            None,
+            false,
+            &ttl,
+            &scoring,
+            None,
+        );
+        assert!(
+            recall.is_err_and(|e| e.contains("denied by")),
+            "recall must be read-gated"
+        );
+
+        let search = super::search::handle_search(&conn, &json!({"query": "x"}), None);
+        assert!(
+            search.is_err_and(|e| e.contains("denied by")),
+            "search must be read-gated"
+        );
+
+        let list = super::list::handle_list(&conn, &json!({}), None);
+        assert!(
+            list.is_err_and(|e| e.contains("denied by")),
+            "list must be read-gated"
+        );
+
+        let get = super::get::handle_get(
+            &conn,
+            &json!({"id": "11111111-2222-3333-4444-555555555555"}),
+            None,
+        );
+        assert!(
+            get.is_err_and(|e| e.contains("denied by")),
+            "get must be read-gated"
+        );
+
+        let ss = super::session_start::handle_session_start(&conn, &json!({}), None, None);
+        assert!(
+            ss.is_err_and(|e| e.contains("denied by")),
+            "session_start must be read-gated"
+        );
+    }
+
+    #[test]
+    fn reads_pass_when_no_read_rules_1730() {
+        // Zero-config fast-path: with NO read_action rules every surface
+        // proceeds (list/search over an empty corpus succeed, not refuse).
+        let conn = full_conn();
+        assert!(
+            super::list::handle_list(&conn, &json!({}), None).is_ok(),
+            "list must pass the fast-path"
+        );
+        assert!(
+            super::search::handle_search(&conn, &json!({"query": "x"}), None).is_ok(),
+            "search must pass the fast-path"
         );
     }
 }

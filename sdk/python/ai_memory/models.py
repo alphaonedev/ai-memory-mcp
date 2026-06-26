@@ -100,6 +100,12 @@ class GovernancePolicy(_Base):
     promote: GovernanceLevel = GovernanceLevel.ANY
     delete: GovernanceLevel = GovernanceLevel.OWNER
     approver: ApproverType = Field(default_factory=ApproverType.human)
+    # #1720 C — per-namespace required write scope (refuse-only). When set,
+    # a Store whose effective ``metadata.scope`` (absent ⇒ ``"private"``)
+    # does not equal this is refused at the governance gate. One of
+    # ``"private" | "team" | "unit" | "org" | "collective"``; ``None`` ⇒
+    # no scope requirement. Rides in ``metadata.governance``.
+    required_scope: str | None = None
 
 
 class Memory(_Base):

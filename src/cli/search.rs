@@ -62,6 +62,11 @@ pub fn run(
     }
     let conn = db::open(db_path)?;
     let tier = args.tier.as_deref().and_then(Tier::from_str);
+    // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller. CLI is
+    // single-tenant operator-as-actor: `resolve_read_visibility_caller`
+    // returns the agent_id when `AI_MEMORY_AGENT_ID` is set, else `None`
+    // (trust-all). DISTINCT from `--as-agent` (namespace).
+    let vis_caller = crate::identity::resolve_read_visibility_caller();
     let results = db::search(
         &conn,
         &args.query,
@@ -75,6 +80,7 @@ pub fn run(
         args.agent_id.as_deref(),
         args.as_agent.as_deref(),
         args.include_archived,
+        vis_caller.as_deref(),
     )?;
     if json_out {
         writeln!(

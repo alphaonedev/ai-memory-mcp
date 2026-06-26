@@ -102,8 +102,15 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
         if let Some(a) = as_agent {
             validate::validate_namespace(a).map_err(|e| e.to_string())?;
         }
-        let roots = db::list_by_source_uri(conn, uri, namespace, limit, as_agent)
-            .map_err(|e| e.to_string())?;
+        // v0.8.0 #1720 A3 — owner-keyed scope=private gate. Resolve the
+        // read-path visibility caller (the agent's `metadata.agent_id`,
+        // DISTINCT from the `as_agent` namespace) and thread it to the
+        // owner-keyed `visibility_clause` private arm. `None` = fail-
+        // closed (no private rows reach an unidentified caller).
+        let caller = crate::identity::resolve_read_visibility_caller();
+        let roots =
+            db::list_by_source_uri(conn, uri, namespace, limit, as_agent, caller.as_deref())
+                .map_err(|e| e.to_string())?;
         let memories_json: Vec<Value> = roots
             .iter()
             .map(|m| {

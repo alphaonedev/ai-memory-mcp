@@ -54,11 +54,30 @@ impl McpTool for KgTimelineTool {
     }
 }
 
-pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result<Value, String> {
+pub fn handle_kg_timeline(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: Option<&str>,
+) -> Result<Value, String> {
     let source_id = params["source_id"]
         .as_str()
         .ok_or(crate::errors::msg::SOURCE_ID_REQUIRED)?;
     validate::validate_id(source_id).map_err(|e| e.to_string())?;
+
+    // #1800 — mirror the #944 HTTP caller-vs-source-owner gate onto the
+    // MCP surface. When a visibility caller is resolved (operator opted
+    // in via AI_MEMORY_AGENT_ID), gate on the SOURCE memory's ownership:
+    // if the source row exists and is not visible to the caller, refuse
+    // rather than leak its outbound link-event timeline (target title /
+    // namespace / relation / valid_from). A `None` caller (single-tenant
+    // trust-all) or a missing source row proceeds unchanged. Gates on
+    // source_id only, matching the HTTP twin.
+    if let Some(caller) = caller
+        && let Ok(Some(mem)) = db::get(conn, source_id)
+        && !crate::visibility::is_visible_to_caller(&mem, caller)
+    {
+        return Err(crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER.to_string());
+    }
     let since = params["since"]
         .as_str()
         .map(str::trim)
@@ -77,8 +96,25 @@ pub fn handle_kg_timeline(conn: &rusqlite::Connection, params: &Value) -> Result
         .as_u64()
         .and_then(|n| usize::try_from(n).ok());
 
-    let events =
+    let mut events =
         db::kg_timeline(conn, source_id, since, until, limit).map_err(|e| e.to_string())?;
+
+    // #1804 (SECURITY) — per-TARGET visibility filter. The source-owner gate
+    // above guards WHO can query a timeline, but the events disclose each
+    // linked TARGET's title + namespace; without this a caller could leak a
+    // victim's `scope=private` memory metadata by rooting a link at it and
+    // reading the timeline. Drop any event whose target memory is not visible
+    // to the caller (mirrors `get_links` / postgres `find_paths` per-row
+    // filtering). `None` caller = single-tenant trust-all (unchanged); a
+    // missing target row has no metadata to leak so it is retained.
+    if let Some(caller) = caller {
+        events.retain(|e| {
+            db::get(conn, &e.target_id)
+                .ok()
+                .flatten()
+                .is_none_or(|m| crate::visibility::is_visible_to_caller(&m, caller))
+        });
+    }
 
     let events_json: Vec<Value> = events
         .iter()

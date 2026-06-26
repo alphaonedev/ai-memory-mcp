@@ -153,7 +153,106 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (archive-listing full v49 projection), #1631 (insert_if_newer
     // version column). Measured 17_521 + 129 headroom; every addition
     // is a closed audit finding with its own regression test.
-    ("src/storage/mod.rs", 17_650),
+    //
+    // 2026-06-16 — bumped 17_650 → 17_950 by the v0.8.0 Pillar-2.5
+    // (#1709) size-GC unit: the net-new `size_gc` free-fn (corpus
+    // byte-cap eviction) + its `namespace_corpus_bytes` helper + the
+    // two hoisted SQL consts, plus the 8-test in-file `mod tests` block
+    // (over-cap / eviction-order / under-cap-noop / restorable-archive /
+    // hard-delete / disabled-cap / namespace-scoped / cap-exactly-at-
+    // corpus). Measured 17_900 + 50 headroom; pure additive feature +
+    // its deterministic SQL-ranking regression coverage, no LLM on the
+    // eviction path, far under the 1.5x cap.
+    //
+    // 2026-06-16 — bumped 17_950 → 17_990 by the v0.8.0 Pillar-3
+    // (#1709 / #224 Task 3a.1) CRDT-lite merge unit: the net-new
+    // `sync_state_merge` free-fn (folds an incoming peer VectorClock
+    // into the persisted sync-state via pointwise-max, looping the
+    // existing monotonic `sync_state_observe` upsert) + its in-module
+    // `sync_state_merge_applies_pointwise_max_and_never_regresses`
+    // regression test. Pure deterministic clock reconciliation, no
+    // schema change, no I/O beyond the existing per-peer upsert.
+    // Measured 17_959 + 31 headroom; far under the 1.5x cap.
+    // 2026-06-16 (#1709 / #224 Pillar-3 unit 3 — wire merge_memory into
+    // the federation conflict path) — net-new `merge_inbound` free-fn
+    // (atomic read-by-id → `crate::models::merge_memory` → full-row write,
+    // else `insert_if_newer` fall-through) + the `overwrite_full_row_by_id`
+    // full-row writer + four in-module `merge_inbound_*` regression tests.
+    // No schema change; pure reuse of the existing merge primitive + a
+    // full-row UPDATE. Measured 18_288; bump 17_990 → 18_340 in lockstep.
+    // 2026-06-17 (#1720 A2-A5, security lane) — owner-keyed scope=private
+    // visibility: the `visibility_clause` private arm + the `is_visible`
+    // Private arm became owner-keyed (caller threaded through recall /
+    // search / recall_hybrid + their callers), plus the in-module
+    // `visibility_private_owner_keyed_matrix_1720` anti-re-drift test and
+    // the owner-keyed rewrite of `is_visible_scope_matrix_covers_every_arm`.
+    // No schema change. Measured 18_691; bump 18_340 → 18_700 in lockstep.
+    // 2026-06-17 (#1709/#1720 WS-B B2, security lane) — the `reown`
+    // free-fn + `ReownReport` struct (rewrite metadata.agent_id ownership
+    // stamp on a namespace before scope=private filtering) and its 5
+    // in-module storage tests. No schema change. Measured 18_960; bump
+    // 18_700 → 18_985 in lockstep (18_960 + 25 headroom).
+    // 2026-06-18 (#1725, P0.2 lossless in-place update) — the
+    // `archive_memory_insert_only` helper (INSERT-only snapshot of a
+    // still-live row, the #1025 full column carry) + wrapping the
+    // archive + in-place UPDATE in one BEGIN IMMEDIATE tx in
+    // `update_with_expected_version`. No schema change. Measured 19_074;
+    // bump 18_985 → 19_090 in lockstep (19_074 + 16 headroom).
+    // 2026-06-18 (#228 / #1728 Commit A-carry) — bumped 19_090 → 19_110:
+    // appending `encrypted_envelope` to the archive/restore INSERT-SELECT
+    // column lists (the restore SELECT adds it on its own line ×2) landed
+    // the file at 19_091. 19_110 = 19_091 + 19 headroom.
+    // 2026-06-18 (#228 / #1728 Commit B-wiring) — bumped 19_110 → 19_280:
+    // the at-rest content encryption WIRING (seal_content/open_content
+    // threading through `insert` / `insert_with_conflict` / `insert_if_newer`
+    // / `update_with_expected_version` / `row_to_memory` + commented
+    // `encrypted_envelope` columns on the recall/search/list/by-source-uri
+    // SELECTs) landed the file at 19_256. 19_280 = 19_256 + 24 headroom.
+    // 2026-06-18 (#1726 lifecycle gate) — bumped 19_280 → 19_360: the
+    // `InvalidTransition` typed error + the self-validating
+    // `set_lifecycle_state` (SELECT-current → can_transition_to → no-op
+    // short-circuit → typed reject) landed the file at 19_312. +48 headroom.
+    // 2026-06-19 (#1693 L2 SAL parity) — bumped 19_360 → 19_460: the
+    // `recover_turn_idempotent` sqlite SSOT (dual-dedup probe + atomic
+    // memory+dedup transaction) landed the file at 19_417.
+    // #1580 — bumped 19_510 → 19_520 for the touch_many `PRAGMA query_only`
+    // read-only no-op guard (the WAL read-pool enabler).
+    // 2026-06-22 (#1776) — bumped 19_520 → 19_600: the `forget` archive+delete
+    // BEGIN IMMEDIATE transaction wrapper (atomicity fix porting #1026) + the
+    // `forget_archive_and_delete_are_atomic_1776` regression test landed the
+    // file at 19_567.
+    // 2026-06-22 (#1782) — bumped 19_600 → 19_700: the `size_gc` per-victim
+    // BEGIN IMMEDIATE wrapper (same #1026 atomicity fix) + the
+    // `size_gc_archive_eviction_is_atomic_1782` regression test landed it at
+    // 19_620.
+    // 2026-06-23 (#1772) — bumped 19_700 → 19_900 (lockstep): the three
+    // additive owner-scoped `forget_*_for_caller` fns (owner-clause twins of
+    // the existing public forget/forget_count/forget_matches for the
+    // multi-tenant `AI_MEMORY_AGENT_ID` opt-in) landed it at 19_883.
+    // 2026-06-23 (#1787) — bumped 19_900 → 20_050 (lockstep): the
+    // `ApproverType::Human` opt-in self-approval + is_registered_agent gate in
+    // `approve_with_approver_type` + the `human_arm_self_approval_gated_under_opt_in_1787`
+    // regression test landed it at 19_991.
+    // 2026-06-23 (#1771) — bumped 20_050 → 20_400 (lockstep): the
+    // `archived_memory_links` edge-preservation wiring — `archive_links_for_memory`
+    // + `restore_links_for_memory` helpers, the snapshot-before-delete blocks in
+    // `forget` / `forget_for_caller`, the restore re-insert calls, and the three
+    // 1771 regression tests — landed it at 20_350.
+    // 2026-06-23 (#1773 + #1779) — bumped 20_400 → 20_550 (lockstep): the
+    // federation-merge seal+envelope+pre-merge-snapshot fix in
+    // `overwrite_full_row_by_id` (#1773) and the embed-fetch decrypt-or-skip
+    // helpers (`resolve_embeddable_content` / `resolve_embeddable_rows` /
+    // `embeddable_row_mapper`) routing get_memory_texts_batch +
+    // get_unembedded_ids_batch[_after] (#1779) landed it at 20_446.
+    // 2026-06-24 (#1796, 5-agent vote 4d3ea1c5) — bumped 20_550 → 20_700 for the
+    // `ApproveSurface { Http, LocalOperator }` enum + the surface-keyed Human-arm
+    // gate in `approve_with_approver_type` + the
+    // `http_surface_rejects_self_approval_without_env_opt_in_1796` regression test.
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 20_700 → 21_000 for the
+    // NON-DESTRUCTIVE `undo_in_place_edit` free fn + `read_owner_agent_id` /
+    // `UndoSnapshot` helpers (the sqlite reference behind the CLI-only
+    // `ai-memory undo-edit` operator tool).
+    ("src/storage/mod.rs", 21_000),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -172,7 +271,40 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // degraded-aware capabilities posture (#1594), and the
     // chunk-fault → per-row backfill fallback (#1595) landed the file
     // at 14_379. 14_450 = 14_379 + 71 headroom.
-    ("src/mcp/mod.rs", 14_450),
+    // 2026-06-16 (#1709 Pillar 1) — bumped 14_450 → 14_550: the 4 new
+    // coordination-action MCP tools (transition/list/add_edge/edges)
+    // added their dispatch wrappers + table arms + the expanded
+    // `use action::{…}` import, landing the file at 14_481.
+    // 2026-06-16 (#1709 Pillar 1, signed-signal batch) — bumped
+    // 14_550 → 14_620: the 5 new `memory_signal_*` MCP tools
+    // (send/read/inbox/thread/ack) added the `#[path]` mod decl, the
+    // `use signal::{…}` import, 5 dispatch wrappers, and 5 dispatch-table
+    // arms, landing the file at 14_560. 14_620 = 14_560 + 60 headroom.
+    // 2026-06-16 — bumped 14_620 → 14_720 by the v0.8.0 #1709 Pillar-1
+    // routine surface: the `#[path] mod routine;` decl, `use routine::{…}`
+    // import, 5 `memory_routine_*` dispatch wrappers, and 5 dispatch-table
+    // arms, landing the file at 14_664. 14_720 = 14_664 + ~56 headroom.
+    // 2026-06-16 — bumped 14_720 → 14_760 by the v0.8.0 #1709 Pillar-2
+    // lifecycle-state-machine unit: the optional `lifecycle_state` field
+    // threading through the memory_store / memory_update dispatch +
+    // transition-enforcement plumbing, landing the file at 14_734.
+    // 14_760 = 14_734 + ~26 headroom.
+    // 2026-06-18 (#1730 PE-2 read-gating) — bumped 14_760 → 14_900: the
+    // `read_gate_parity_1730` test module (the parity guard asserting every
+    // MCP read surface routes through `gate_read`) landed the file at 14_858.
+    // +42 headroom.
+    // 2026-06-19 (#1714 Pillar-1) — bumped 14_900 → 15_050: the MCP
+    // signal-ack → PostSignalAck hook bridge (POST_SIGNAL_ACK_SINK global +
+    // set_post_signal_ack_sink + build_mcp_signal_hooks + the inert-by-default
+    // run_mcp_server serve-init wiring + two build_mcp_signal_hooks unit
+    // tests) landed the file at 15_011.
+    // 2026-06-22 (#1752) — bumped 15_050 → 15_300: the MCP PreSignalSend
+    // ENFORCEMENT gate (PreSignalSendGate struct + PRE_SIGNAL_SEND_GATE global +
+    // set_pre_signal_send_gate + map_chain_result_to_signal_decision +
+    // pre_signal_send_decision block_on_local bridge + dispatch_memory_signal_send
+    // gate wiring + run_mcp_server inert-by-default install + the
+    // map_chain_result_to_signal_decision_1752 unit test) landed the file at 15_213.
+    ("src/mcp/mod.rs", 15_300),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -322,7 +454,133 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // provenance). Measured 17_666 + 154 headroom; all closed audit
     // findings with regression tests; the module-split follow-on is
     // tracked under #650-class work for v0.8.
-    ("src/store/postgres.rs", 17_820),
+    // 2026-06-15 (v0.8.0 #1705) — bumped 17_820 → 17_960: migrate_v58
+    // (recall_observations agent_id + namespace identity columns) +
+    // inline DDL. NOTE: the base was already 17_899 (v0.7.1 grew this
+    // module past 17_820 without a lockstep bump — pre-existing QUAL-10
+    // drift greened here). The 17.9k-LOC module split is the highest-
+    // priority manageability target tracked under the v0.8.0 EPIC #1709.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 SIGNED-SIGNALS SAL surface) —
+    // bumped 18_540 → 18_750: PG_SIGNAL_SELECT_BY_ID + pg_row_to_signal +
+    // the 5 sqlx-native signal_* trait methods (signal_send / signal_get /
+    // signal_inbox / signal_thread / signal_ack). Measured 18_693 + ~57
+    // headroom; new SAL surface for postgres-backed daemons. The 18.7k-LOC
+    // module split remains the highest-priority manageability target under
+    // EPIC #1709.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 ATTESTED-CHECKPOINTS storage
+    // foundation) — bumped 18_750 → 18_800: the migrate_v61() method
+    // (inline `checkpoints` CREATE TABLE/INDEX DDL + v61 dispatch arm).
+    // Measured 18_762; storage-only, no SAL/MCP surface (those land in
+    // later units). The 18.7k-LOC module split remains the highest-priority
+    // manageability target under EPIC #1709.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 ATTESTED-CHECKPOINTS SAL surface) —
+    // bumped 18_800 → 19_100: PG_CHECKPOINT_SELECT_BY_ID + pg_row_to_checkpoint
+    // + the 5 sqlx-native checkpoint_* trait methods (checkpoint_create /
+    // checkpoint_get / checkpoint_list / checkpoint_resolve / checkpoint_query).
+    // Measured 18_962 + 138 headroom; new SAL surface for postgres-backed
+    // daemons. The 19k-LOC module split remains the highest-priority
+    // manageability target under EPIC #1709.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-1 ROUTINES SAL surface) — bumped
+    // 19_100 → 19_500: PG_ROUTINE_SELECT_BY_ID + pg_row_to_routine +
+    // PG_ROUTINE_RUN_SELECT_BY_ID + pg_row_to_routine_run + the 8 sqlx-native
+    // routine_* trait methods (routine_create / routine_get / routine_list /
+    // routine_freeze / routine_run_create / routine_run_get / routine_runs_for
+    // / routine_run_set_state). Measured 19_367 + 133 headroom; new SAL
+    // surface for postgres-backed daemons. The 19k-LOC module split remains
+    // the highest-priority manageability target under EPIC #1709.
+    // 2026-06-16 — bumped 19_500 → 19_640 by the v0.8.0 #1709 Pillar-2
+    // typed-cognition migration: the `migrate_v63` method (the
+    // memory_links.relation CHECK-extend) + its dispatch arm + the two
+    // literal-version stamps on v61/v62. Measured 19_540 + ~100 headroom.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2.5 size-GC SAL surface) — bumped
+    // 19_640 → 19_820: the sqlx-native `PostgresStore::size_gc` method
+    // (corpus byte-cap eviction — the SUM-bytes select + the
+    // lowest-value-first per-victim archive-INSERT/DELETE loop, mirroring
+    // run_gc's #1026 per-victim transactional atomicity). Measured 19_760
+    // + 60 headroom; new SAL surface so postgres-backed curators evict
+    // under byte pressure too, no LLM on the eviction path. The 19k-LOC
+    // module split remains the highest-priority manageability target.
+    // 2026-06-16 (v0.8.0 #1709 / #224 Pillar-3 unit 3 — federation
+    // conflict-path field-merge) — bumped 19_820 → 19_960: the sqlx-native
+    // `PostgresStore::merge_inbound` method (read-by-id → the SHARED Rust
+    // `crate::models::merge_memory` reconciler → full-row UPDATE in a tx,
+    // else `apply_remote_memory` fall-through) + the hoisted
+    // `SQL_SELECT_MEMORY_ROW_BY_ID` const (pm-v3.1 literal de-dup). No
+    // per-adapter merge SQL — the merge is the same pure Rust fn the sqlite
+    // path uses. Measured 19_926 + ~34 headroom. The 19k-LOC module split
+    // remains the highest-priority manageability target.
+    // 2026-06-17 (#1720 A1) — bumped 19_960 → 20_050: the migrate_v67
+    // STORED-generated target_agent_id_idx column + index arm, its dispatch
+    // wiring, and the v67 doc-comment landed the file at 20_027.
+    // 20_050 = 20_027 + 23 headroom.
+    // 2026-06-17 (#1709/#1720 WS-B B2, security lane) — the sqlx-native
+    // `reown` adapter method (jsonb_set single-key rewrite of
+    // metadata.agent_id + matched/dry_run count, mirroring the sqlite
+    // free-fn) landed the file at 20_090. Bump 20_050 → 20_115 in
+    // lockstep (20_090 + 25 headroom).
+    // 2026-06-18 (#1725, P0.2 lossless in-place update) — bumped
+    // 20_115 → 20_215: `update_with_expected_version_once` now wraps the
+    // prior-content archive + the in-place UPDATE in one tx (begin /
+    // commit / rollback), fetches `content` for the change check, and
+    // carries the DELETE+INSERT in_place_edit archive (the #1025 full
+    // 36-column carry, the irreducible cost). Landed the file at 20_197.
+    // 20_215 = 20_197 + 18 headroom. The postgres/{mod,kg,...}.rs split
+    // remains the tracked manageability target (#650 / #867 / #961).
+    // 2026-06-18 (#228 / #1728 Commit A) — bumped 20_215 → 20_260: the
+    // `migrate_v68` arm (ALTER memories + archived_memories ADD COLUMN
+    // encrypted_envelope BYTEA — postgres parity for the sqlite-only #228
+    // primitive + the archive carry) + its dispatch wiring landed the
+    // file at 20_246. 20_260 = 20_246 + 14 headroom.
+    // 2026-06-18 (#228 / #1728 Commit B-wiring) — bumped 20_260 → 20_380:
+    // the at-rest content encryption WIRING (seal_content threading through
+    // `PostgresStore::store` + `update_with_expected_version_once`, the
+    // encrypted_envelope INSERT column/bind + ON CONFLICT clause, and the
+    // fail-closed decrypt branch in the pg `row_to_memory` mapper) landed
+    // the file at 20_358. 20_380 = 20_358 + 22 headroom. The
+    // postgres/{mod,kg,...}.rs split remains the tracked target (#650).
+    // 2026-06-18 (#1726 lifecycle gate) — bumped 20_380 → 20_460: the
+    // `apply_lifecycle_patch` pg twin (SELECT-current → can_transition_to →
+    // typed InvalidTransition → version-bumping UPDATE) + its wiring into the
+    // trait `update` + `update_with_expected_version` landed the file at
+    // 20_433. +27 headroom.
+    // 2026-06-18 (#1735 Pillar-4 4.C) — bumped 20_460 → 20_800: the staggered
+    // AGE cold-path adds migrate_v69 + the link_internal deferred branch +
+    // drain_kg_projection_outbox + spawn_drainer + the find_paths Deferred
+    // CTE-route (actual 20_722 at the bump).
+    // 2026-06-19 (#1693 L2 SAL parity) — bumped 20_800 → 21_000: the
+    // PostgresStore `recover_turn_idempotent` (dual-dedup probe + atomic
+    // memory+dedup tx, no signed_events) + `agent_max_created_at` watermark
+    // (actual 20_958).
+    // 2026-06-21 (#1718 Commit A-core) — bumped 21_000 → 21_100: the
+    // PostgresStore `action_transition_cas` (atomic federation receive-path
+    // compare-and-swap — `SELECT ... FOR UPDATE` + `state == from` guard
+    // inside the tx) added ~49 LOC (actual 21_049). Per-domain split of this
+    // module is tracked under #650.
+    // 2026-06-22 (#1393 sub-unit 2) — bumped 21_100 → 21_200: the
+    // `PostgresStore::reclassify_memory_kind` override (tx: `SELECT ... FOR
+    // UPDATE` the kind, refuse reflection/persona, `UPDATE` kind + version,
+    // atomic `memory.reclassified` signed_event via
+    // `pg_append_signed_event_with_chain_in_tx`) added ~76 LOC (actual 21_124).
+    // 2026-06-23 (#1771) — bumped 21_200 → 21_300 (lockstep): the
+    // `migrate_v70` arm + `archived_memory_links` DDL landed it at 21_254.
+    // 2026-06-23 (#1771 FINAL) — bumped 21_300 → 21_500 (lockstep): the
+    // postgres snapshot/restore wiring (forget + archive_by_ids snapshots,
+    // archive_restore re-insert) + the `archive_restore_preserves_links_pg_1771`
+    // PG-gated parity test landed it at 21_423.
+    // 2026-06-23 (#1783) — bumped 21_500 → 21_800 (lockstep): the AGE
+    // unprojection-on-delete fix (`unproject_memory_from_age` +
+    // `_inner` helpers, the `unproject_memory_ids_best_effort` method, the
+    // drainer existence-guard, and the per-id unprojection at all six
+    // hard-delete sites) landed it at 21_689. Per-domain split tracked #650.
+    // 2026-06-24 (#1795 + #1793) — bumped 21_800 → 22_000 (lockstep): the
+    // tenant-only `check_memory_quota` enforcement method (#1795) + the
+    // Human-arm self-approval/registration guard + its updated live-PG unit
+    // test (#1793) landed it at 21_813. Per-domain split tracked #650.
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 22_000 → 22_300 for the
+    // NON-DESTRUCTIVE `undo_in_place_edit` PostgresStore trait method (the
+    // postgres twin behind the CLI-only `ai-memory undo-edit` operator tool).
+    // Per-domain split tracked #650.
+    ("src/store/postgres.rs", 22_300),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -363,7 +621,62 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 4,013 ms → 1,206 ms recall regression and the knob follows the
     // mandated uniform resolver ladder; zero speculative surface.
     // Measured post-fix LOC: 10_081. 10_180 = 10_081 + 99 headroom.
-    ("src/config.rs", 10_180),
+    // 2026-06-15 (v0.8.0) — bumped 10_180 → 10_360: pre-existing v0.7.1
+    // drift (config.rs grew to 10_354 via the #1671 curator + #1691
+    // reranker-score-floor knobs without a lockstep bump — NOT touched
+    // by #1705; greened here so the QUAL-10 gate is enforceable again).
+    // Sectioned-config split tracked under v0.8.0 EPIC #1709.
+    // 2026-06-17 (v0.8.0 #1709 §11.4.C) — bumped 10_360 → 10_395: the
+    // vLLM first-class backend alias added the
+    // `resolve_embeddings_1709_vllm_alias_default_base_url` embed-parity
+    // test pinning that AI_MEMORY_EMBED_BACKEND=vllm resolves the shared
+    // http://localhost:8000/v1 default, plus the `vllm` arm of
+    // `default_model_for_alias` referencing the shared
+    // `LOCAL_SERVER_MODEL_PLACEHOLDER` const (hoisted to keep the
+    // `local-model` literal under the hardcoded-literal-gate ratchet).
+    // 2026-06-18 (v0.8.0 #1733 Pillar-4 4.A) — bumped 10_400 → 10_460: the
+    // admission-control env/const (`ENV_MAX_INFLIGHT_REQUESTS`,
+    // `DEFAULT_MAX_INFLIGHT_REQUESTS`), the `LimitsSection` +
+    // `ResolvedLimits` `max_inflight_requests` fields, the `resolve_limits`
+    // arm, and the lockstep test-fixture updates.
+    // 2026-06-18 (#1735 Pillar-4 4.C) — bumped 10_460 → 10_560: the
+    // AgeProjectionMode enum + as_str/from_str_opt + the AGE_PROJECTION_MODE
+    // process-global (set/get) + ENV_AGE_PROJECTION_MODE + the StorageSection /
+    // ResolvedStorage field + resolve_storage ladder arm (actual 10_533).
+    // 2026-06-19 (#1749 Pillar-2.5) — bumped 10_560 → 10_700: the
+    // CuratorCompactionSection { enabled } + ENV_COMPACTION_ENABLED const +
+    // resolve_compaction_enabled ladder arm + the
+    // curator_compaction_enabled_resolver_1749 unit test + the two
+    // CuratorSection fixture updates (compaction: None) (actual 10_651).
+    // 2026-06-19 (#1750 Pillar-2.5) — bumped 10_700 → 10_850: the
+    // CuratorCompactionSection.cosine_threshold field + ENV_COMPACTION_COSINE_THRESHOLD
+    // const + resolve_compaction_cosine_threshold ladder arm + the
+    // curator_compaction_cosine_threshold_resolver_1750 unit test + the three
+    // resolver-test fixture updates (cosine_threshold: None) (actual 10_754).
+    // 2026-06-21 (#1463 Tier 1 — OS-tier logging) — bumped 10_850 → 11_050: the
+    // `LoggingConfig.sink` field + the `LogSink { File, Stdout }` enum
+    // (as_str/from_str_opt) + ENV_LOG_SINK const + the free `resolve_log_sink`
+    // ladder (env > [logging].sink > file) + the five resolver/from_str unit
+    // tests (log_sink_from_str_opt_and_as_str_roundtrip, resolve_log_sink_*).
+    // Sectioned-config split still tracked under v0.8.0 EPIC #1709 (actual 10_986).
+    // 2026-06-22 (#1765 Tier 2 syslog) — +the LogSink::Syslog variant + the
+    // syslog_* LoggingConfig fields + the 3 AI_MEMORY_LOG_SYSLOG_* env consts.
+    // 2026-06-22 (#1393 sub-unit 2) — bumped 11_050 → 11_250: the
+    // `CuratorSection.transcript_classify_enabled` field + ENV_TRANSCRIPT_CLASSIFY_ENABLED
+    // const + the `resolve_transcript_classify_enabled` ladder + the
+    // `transcript_classify_enabled_resolver_1393` config-layer test + the
+    // lockstep `transcript_classify_enabled: None` addition at the 7 in-file
+    // CuratorSection test literals (actual 11_148).
+    // 2026-06-22 (#1764 v0.8.0 slice) — bumped 11_250 → 11_300: the
+    // `ReflectDecorrelationMode` enum + 2 `ENV_REFLECT_DECORRELATION_*` consts +
+    // the `reflect_decorrelation_mode` / `reflect_decorrelation_dominance_threshold`
+    // env-only resolvers for the reflection-corpus decorrelation visibility probe
+    // (actual 11_252).
+    // 2026-06-23 (#1775) — bumped 11_300 → 11_350: the
+    // `warn_if_archive_on_gc_disabled` one-shot boot-WARN helper (emitted at
+    // serve + mcp boot when [storage].archive_on_gc = false) + its two
+    // gate-branch unit tests (actual 11_301).
+    ("src/config.rs", 11_350),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -453,7 +766,35 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // existing daemon-boot / dispatch helpers (zero new production
     // surface; qual_10 counts in-module test LOC), growing the file to
     // 8_497. 8_600 = 8_497 + 103 headroom; far under the 1.5x cap.
-    ("src/daemon_runtime.rs", 8_600),
+    // 2026-06-17 — bumped 8_600 → 8_700 by §22 PE-5 (#697): the two
+    // L1-6 governance pre-write hook sites (storage pre-write +
+    // wire_check) each gained a `Decision::Escalate` block-and-chain-log
+    // arm (the compiler-forced exhaustive-match arm).
+    // 2026-06-18 (v0.8.0 #1733 Pillar-4 4.A) — bumped 8_700 → 8_760: the
+    // boot-time `set_max_inflight_requests` seeding block next to the
+    // existing `set_quota_defaults` seed (admission-control cap resolved
+    // from `[limits]`).
+    // 2026-06-19 (#1734 PE-1) — bumped 8_760 → 8_820: the serve-boot
+    // mandatory-hook enforcement banner (one unconditional `hooks
+    // enforcement: <mode>` line, matching the `permissions:` banner style).
+    // #1580 — bumped 8_850 → 8_890 for the dedicated DLQ-sink + catchup-loop
+    // connections (F5.11: both federation workers off the shared writer).
+    // 2026-06-23 (#1789) — bumped 8_890 → 8_910: the mtls-router `/sync/*`
+    // bypass test opts back to permissive peer-enrollment (shared-lock RAII
+    // set/restore of AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS) now that the
+    // #1789 secure default 401s the unenrolled arm before the bypass asserts.
+    // 2026-06-24 (#1727, 5-agent vote 4d3ea1c5) — bumped 8_910 → 8_960 for the
+    // `Command::UndoEdit` variant (+ doc) and its dispatch arm building the SAL
+    // store like the curator for the CLI-only `ai-memory undo-edit` tool.
+    // 2026-06-24 (#1800) — bumped 8_960 → 9_050 for the dispatch-arm coverage
+    // cushions (`test_run_dispatch_{undo_edit,reown,replay}_command`) that hold
+    // daemon_runtime.rs comfortably above its Per-Module Coverage 86% floor.
+    // 2026-06-24 (#1798 R-04/R-12) — bumped 9_050 → 9_200 for the
+    // `boot_security_posture_warnings` helper + `host_is_loopback` + the
+    // bootstrap_serve call site + 6 `boot_posture_*` unit tests (loud
+    // non-loopback boot security-posture WARNs). Ceiling is aspirational, not
+    // a ratchet — see `qual_10_ceiling_table_is_aspirational_not_ratcheting_up`.
+    ("src/daemon_runtime.rs", 9_200),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -476,7 +817,48 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // idempotent` regression test pushed the file to 3_769. Growth
     // justified: one schema bump + its replay/idempotency coverage.
     // 3_800 = 3_769 + 31 headroom.
-    ("src/storage/migrations.rs", 3_800),
+    // 2026-06-15 (v0.8.0 #1705) — bumped 3_800 → 3_850: the in-code v58
+    // recall_observations identity-column migration arm (probe-guarded
+    // ALTER/CREATE, SQLite has no ADD COLUMN IF NOT EXISTS).
+    // 2026-06-16 (v0.8.0 #1709) — bumped 3_850 → 3_900: the v60
+    // signed-signals migration arm + the MIGRATION_V60_SQLITE include_str
+    // const + the doc-comment bump pushed the file to 3_854. Growth
+    // justified: one additive schema bump (signals storage foundation).
+    // 3_900 = 3_854 + 46 headroom.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2) — bumped 3_900 → 4_120: the v63
+    // typed-cognition relation taxonomy extension — the MIGRATION_V63_SQLITE
+    // include_str const, the v63 ladder arm (rebuild + stale-trigger-drop
+    // probe), the SCHEMA/version-ladder doc-comments, and the
+    // `v63_rebuild_preserves_links_and_accepts_typed_cognition_relations`
+    // row-preservation regression test pushed the file to 4_069. Growth
+    // justified: one schema bump + its load-bearing rebuild coverage.
+    // 4_120 = 4_069 + 51 headroom.
+    // 2026-06-16 (v0.8.0 #1709 Pillar-2) — bumped 4_120 → 4_160: the v64
+    // lifecycle-state-machine unit added the v64 ladder arm (memories +
+    // archived_memories `lifecycle_state` column probe-then-add) and the
+    // `PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES` named const (pm-v3.1 literal
+    // gate), landing the file at 4_121. 4_160 = 4_121 + ~39 headroom.
+    // 2026-06-17 (v0.8.0 §22 PE-5 #697) — bumped 4_160 → 4_360: the
+    // governance_rules.severity escalate-CHECK extension added the
+    // MIGRATION_V66_SQLITE include_str const, the v66 ladder arm (the
+    // table-existence-guarded full-table rebuild), and the
+    // `v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity`
+    // row + signed-column + index preservation regression test, landing
+    // the file at 4_338. 4_360 = 4_338 + 22 headroom.
+    // 2026-06-17 (#1720 A1) — bumped 4_360 → 4_480: the v67 ladder arm
+    // (probe-then-add VIRTUAL generated target_agent_id_idx + index), the
+    // v67 history doc-comment, the historical-replay column/index
+    // assertions, and the v67_target_agent_id_idx_projects_* generated-
+    // column regression test landed the file at 4_455. 4_480 = 4_455 + 25
+    // headroom.
+    // 2026-06-18 (#228 / #1728 Commit A) — bumped 4_480 → 4_500: the v68
+    // migration arm (probe-then-ADD encrypted_envelope on
+    // archived_memories) + the pinned-v67 arm + the v68 history
+    // doc-comment landed the file at 4_487. 4_500 = 4_487 + 13 headroom.
+    // 2026-06-23 (#1771) — bumped 4_500 → 4_600 (lockstep): the v70
+    // `archived_memory_links` migration arm + bootstrap-SCHEMA CREATE landed
+    // it at 4_560.
+    ("src/storage/migrations.rs", 4_600),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
@@ -489,7 +871,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // embeds: `embed_texts`/`embed_texts_async` + the one-request
     // helper + `parse_openai_embeddings_batch` + 2 parse-pin tests
     // grew the file to 5_317; lockstep bump = 5_317 + 33 headroom).
-    ("src/llm.rs", 5_350),
+    // 2026-06-17 (v0.8.0 #1709 §11.4.C) — bumped 5_350 → 5_400: the
+    // vLLM first-class backend alias added the `BACKEND_VLLM` const +
+    // its doc block, the `default_base_url_for_alias` / `alias_api_key_env_vars`
+    // arms, and 2 pinning-test rows (file grew to 5_352); 5_400 = 48 headroom.
+    // 2026-06-22 (v0.8.0 #1393) — bumped 5_400 → 5_500: the decision-detector
+    // `OllamaClient::classify_kind` + `CLASSIFY_KIND_SYSTEM` prompt +
+    // `classify_kind_prompt` / `parse_classified_kind` helpers + 4 parser-pin
+    // tests (file grew to 5_456); 5_500 = 44 headroom.
+    ("src/llm.rs", 5_500),
 ];
 
 #[test]

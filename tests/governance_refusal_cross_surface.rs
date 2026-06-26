@@ -113,6 +113,7 @@ fn owner_write_policy() -> GovernancePolicy {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     }
@@ -264,6 +265,7 @@ fn registered_level_refusal_surfaces_typed_context() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };

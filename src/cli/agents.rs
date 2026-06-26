@@ -233,7 +233,14 @@ pub fn run_pending(
             use db::ApproveOutcome;
             validate::validate_id(&id)?;
             let agent = identity::resolve_agent_id(cli_agent_id, None)?;
-            match db::approve_with_approver_type(&conn, &id, &agent)? {
+            // #1796 (5-agent vote 4d3ea1c5) — CLI is operator-as-actor (single
+            // operator); keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in.
+            match db::approve_with_approver_type(
+                &conn,
+                &id,
+                &agent,
+                db::ApproveSurface::LocalOperator,
+            )? {
                 ApproveOutcome::Approved => {
                     let executed = db::execute_pending_action(&conn, &id)?;
                     if json_out {
@@ -794,6 +801,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = db::insert(&conn, &mem).expect("db::insert standard");
         db::set_namespace_standard(&conn, namespace, &id, None).expect("set_namespace_standard");

@@ -677,6 +677,28 @@ pub async fn kg_timeline(
             .await
         {
             Ok(events) => {
+                // #1804 (SECURITY) — per-TARGET visibility filter. The
+                // source-owner gate above does not cover the target
+                // title/namespace these events disclose; drop any event whose
+                // target memory is not visible to the caller (see the MCP
+                // twin in mcp/tools/kg_timeline.rs). Daemon/admin is exempt
+                // (matches the source-gate exemption above).
+                let events = if caller != sentinels::DAEMON_PRINCIPAL {
+                    let raw_ctx = crate::store::CallerContext::for_admin(caller.clone());
+                    let mut kept = Vec::with_capacity(events.len());
+                    for e in events {
+                        let visible = match app.store.get(&raw_ctx, &e.target_id).await {
+                            Ok(m) => crate::visibility::is_visible_to_caller(&m, &caller),
+                            Err(_) => false,
+                        };
+                        if visible {
+                            kept.push(e);
+                        }
+                    }
+                    kept
+                } else {
+                    events
+                };
                 let events_json: Vec<serde_json::Value> = events
                     .iter()
                     .map(|e| {
@@ -704,7 +726,19 @@ pub async fn kg_timeline(
 
     let lock = app.db.lock().await;
     match db::kg_timeline(&lock.0, &p.source_id, since, until, p.limit) {
-        Ok(events) => {
+        Ok(mut events) => {
+            // #1804 (SECURITY) — per-TARGET visibility filter (see MCP twin +
+            // the postgres branch above). `db::get` is the raw storage read,
+            // so the visibility check is explicit here; a missing target row
+            // has no metadata to leak and is retained.
+            if caller != sentinels::DAEMON_PRINCIPAL {
+                events.retain(|e| {
+                    db::get(&lock.0, &e.target_id)
+                        .ok()
+                        .flatten()
+                        .is_none_or(|m| crate::visibility::is_visible_to_caller(&m, &caller))
+                });
+            }
             let events_json: Vec<serde_json::Value> = events
                 .iter()
                 .map(|e| {

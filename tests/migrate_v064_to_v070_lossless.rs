@@ -256,7 +256,7 @@ fn v064_baseline_data_survives_full_v070_upgrade_lossless_and_idempotent() {
 
     // 3e. FTS still functional after the upgrade — search the body text.
     let hits = db::search(
-        &conn, "quorum", None, None, 10, None, None, None, None, None, None, false,
+        &conn, "quorum", None, None, 10, None, None, None, None, None, None, false, None,
     )
     .expect("FTS search post-upgrade");
     assert!(

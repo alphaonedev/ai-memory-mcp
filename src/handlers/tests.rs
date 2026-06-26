@@ -93,6 +93,57 @@ fn test_state() -> Db {
 /// an in-flight request.
 pub(super) static APPROVE_HMAC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// #1789 — these `http_sync_push_*` / `http_sync_since_*` handler tests
+/// exercise DOWNSTREAM business logic (oversize-batch 400, applies-clock,
+/// skips-invalid-id, dry-run no-apply, …), NOT the peer-enrollment gate.
+/// They send a sync request with NO `X-Peer-Id` header + no signature
+/// (the `(None, None)` unenrolled-peer arm). Commit `6672312b` (#1789)
+/// flipped `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` to default-ON, so that
+/// arm now `401 peer_not_enrolled`s BEFORE the handler reaches the logic
+/// these tests assert. Opt back to permissive via the wired escape hatch
+/// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` so the secure default stays
+/// semantically ON while the test exercises the permissive path.
+///
+/// RAII: sets on `new`, restores the prior value on `Drop`. It acquires
+/// the SAME crate-level lock ([`crate::handlers::fed_env_test_lock`]) the
+/// strict enrollment tests in `federation_signing_check` hold, so the two
+/// test sets are mutually serialised and a parallel Check-matrix run can
+/// never leak the enrollment env across them.
+struct PermissiveFedEnv {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev: Option<String>,
+}
+
+impl PermissiveFedEnv {
+    fn new() -> Self {
+        let guard = crate::handlers::fed_env_test_lock();
+        let key = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+        let prev = std::env::var(key).ok();
+        // SAFETY: env mutation under the shared test-scoped lock; the var
+        // is read by handler code only (no concurrent writer while held).
+        unsafe {
+            std::env::set_var(key, "1");
+        }
+        Self {
+            _guard: guard,
+            prev,
+        }
+    }
+}
+
+impl Drop for PermissiveFedEnv {
+    fn drop(&mut self) {
+        let key = "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS";
+        // SAFETY: still holding the shared lock for the guard's lifetime.
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// S5-C1 fix campaign (2026-05-13): synthesise a K7-style
 /// `(timestamp, signature)` pair for an inbound approve/reject body.
 /// Mirrors the reference helper in `tests/k10_approval_http.rs::sign`
@@ -152,6 +203,7 @@ async fn store_and_retrieve_via_state() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let id = db::insert(&lock.0, &mem).unwrap();
     let got = db::get(&lock.0, &id).unwrap().unwrap();
@@ -190,6 +242,7 @@ async fn recall_via_state() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     db::insert(&lock.0, &mem).unwrap();
     let (results, _outcome) = db::recall(
@@ -206,6 +259,7 @@ async fn recall_via_state() {
         None,
         false,
         None,
+        None, // #1720 caller
     )
     .unwrap();
     assert!(!results.is_empty());
@@ -280,6 +334,7 @@ async fn create_and_update_with_metadata() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let id = db::insert(&lock.0, &mem).unwrap();
 
@@ -618,6 +673,7 @@ async fn http_update_memory_uses_appstate() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -641,10 +697,104 @@ async fn http_update_memory_uses_appstate() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn http_update_memory_enforces_lifecycle_transition_1726() {
+    // #1726 — PUT /api/v1/memories/{id} with a `lifecycle_state` target must
+    // enforce the transition machine. Legal `open → active` → 200 + persists;
+    // illegal `open → done` (skips active) → 409 CONFLICT + row untouched.
+    let state = test_state();
+    let now = Utc::now().to_rfc3339();
+    let mk = |title: &str| Memory {
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-lc-1726".into(),
+        title: title.into(),
+        content: "lifecycle http fixture".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        access_count: 0,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({}),
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Goal,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let (legal_id, illegal_id) = {
+        let lock = state.lock().await;
+        (
+            db::insert(&lock.0, &mk("lc-legal")).unwrap(),
+            db::insert(&lock.0, &mk("lc-illegal")).unwrap(),
+        )
+    };
+
+    let app = Router::new()
+        .route("/api/v1/memories/{id}", axum::routing::put(update_memory))
+        .with_state(test_app_state(state.clone()));
+
+    let put = |id: &str, target: &str| {
+        let body = serde_json::json!({ "lifecycle_state": target });
+        axum::http::Request::builder()
+            .uri(format!("/api/v1/memories/{id}"))
+            .method("PUT")
+            .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+
+    // Legal: open -> active.
+    let resp = app.clone().oneshot(put(&legal_id, "active")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "open->active must be 200");
+    {
+        let lock = state.lock().await;
+        assert_eq!(
+            db::get(&lock.0, &legal_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            crate::models::LifecycleState::Active,
+        );
+    }
+
+    // Illegal: open -> done.
+    let resp = app.oneshot(put(&illegal_id, "done")).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "open->done must be 409 CONFLICT"
+    );
+    {
+        let lock = state.lock().await;
+        assert_eq!(
+            db::get(&lock.0, &illegal_id)
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            crate::models::LifecycleState::Open,
+            "a rejected transition must leave the row untouched"
+        );
+    }
+}
+
 // --- Phase 3 foundation HTTP sync tests (issue #224) ---
 
 #[tokio::test]
 async fn http_sync_push_applies_and_advances_clock() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Smoke test for POST /api/v1/sync/push — memories land in the
     // receiver's DB and the vector clock records the sender's latest
     // `updated_at`. Full CRDT semantics are the v0.8.0 follow-up.
@@ -717,6 +867,8 @@ async fn http_sync_push_applies_and_advances_clock() {
 
 #[tokio::test]
 async fn http_sync_push_links_over_cap_rejected_1556() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // #1556 — `links` was the sole /sync/push subcollection missing the
     // max_page_size cap, leaving an unbounded per-link insert+verify loop under
     // the shared write Mutex (DoS). A body with > max_page_size links must be
@@ -773,6 +925,8 @@ async fn http_sync_push_links_over_cap_rejected_1556() {
 
 #[tokio::test]
 async fn http_sync_push_applies_archives() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // S29 — sync_push must accept an `archives` field and move matching
     // rows from `memories` to `archived_memories` via
     // `db::archive_memory`. Missing ids no-op. The response exposes a
@@ -810,6 +964,7 @@ async fn http_sync_push_applies_archives() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -890,6 +1045,7 @@ async fn http_archive_by_ids_happy_path() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -967,6 +1123,7 @@ async fn http_archive_by_ids_default_reason() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -1208,6 +1365,8 @@ async fn http_bulk_create_fans_out_with_federation() {
 
 #[tokio::test]
 async fn http_sync_push_rejects_oversized_batch_redteam_242() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Red-team #242 — sync_push must cap memories per request, matching
     // bulk-create's MAX_BULK_SIZE. Without this a malicious peer can
     // flood the receiver and bottleneck the SQLite Mutex.
@@ -1314,6 +1473,8 @@ async fn http_bulk_create_honors_operator_resolved_max_page_size() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_applies_nothing() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Phase 3 — dry_run=true must not write.
     let state = test_state();
     let app = Router::new()
@@ -1421,6 +1582,7 @@ async fn http_contradictions_surfaces_same_topic_candidates_and_synth_link() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -1480,6 +1642,8 @@ async fn http_contradictions_requires_topic_or_namespace() {
 
 #[tokio::test]
 async fn http_sync_push_applies_deletions() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // v0.6.0.1 — sync_push's `deletions` field removes the listed ids
     // from the receiver so peer-side tombstone fanout works for
     // scenario-10. (a2a-hermes r14.)
@@ -1515,6 +1679,7 @@ async fn http_sync_push_applies_deletions() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -1559,6 +1724,8 @@ async fn http_sync_push_applies_deletions() {
 
 #[tokio::test]
 async fn http_sync_push_applies_incoming_links() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // v0.6.2 (#325) — sync_push's `links` field applies the listed
     // (source, target, relation) triples via db::create_link on the
     // receiver so peer-side link fanout works for scenario-11.
@@ -1596,6 +1763,7 @@ async fn http_sync_push_applies_incoming_links() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let m1_id = db::insert(&lock.0, &m1).unwrap();
         let m2 = Memory {
@@ -1625,6 +1793,7 @@ async fn http_sync_push_applies_incoming_links() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let m2_id = db::insert(&lock.0, &m2).unwrap();
         (m1_id, m2_id)
@@ -1681,6 +1850,8 @@ async fn http_sync_push_applies_incoming_links() {
 // grant peers the right to corrupt the local reflection DAG.
 #[tokio::test]
 async fn http_sync_push_refuses_reflection_cycle_from_peer() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     use crate::config::{
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
@@ -1721,6 +1892,7 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a_id = db::insert(&lock.0, &a).unwrap();
         let b = Memory {
@@ -1750,6 +1922,7 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let b_id = db::insert(&lock.0, &b).unwrap();
         db::create_link(&lock.0, &a_id, &b_id, "reflects_on").unwrap();
@@ -1811,6 +1984,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
 // MCP-only — A3 closes that with the bypass keyed on attest_level.
 #[tokio::test]
 async fn http_sync_push_governance_bypass_on_peer_attested() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     use crate::config::{
         PermissionsMode, lock_permissions_mode_for_test, override_active_permissions_mode_for_test,
     };
@@ -1854,6 +2029,7 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let s_id = db::insert(&lock.0, &s).unwrap();
         let t = Memory {
@@ -1883,6 +2059,7 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let t_id = db::insert(&lock.0, &t).unwrap();
         (s_id, t_id)
@@ -1925,6 +2102,8 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
 
 #[tokio::test]
 async fn http_sync_since_streams_new_memories_only() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Phase 3 — GET /api/v1/sync/since?since=<ts> returns only memories
     // with updated_at > ts.
     //
@@ -1968,6 +2147,7 @@ async fn http_sync_since_streams_new_memories_only() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -2002,6 +2182,8 @@ async fn http_sync_since_streams_new_memories_only() {
 
 #[tokio::test]
 async fn http_sync_since_includes_s39_diagnostic_fields() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // S39 — the response must echo `updated_since` (parsed `since`)
     // and earliest/latest `updated_at` from the returned set. This
     // lets the scenario pin whether the server saw the expected
@@ -2044,6 +2226,7 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -2103,6 +2286,9 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
 async fn sync_since_rejects_garbage_timestamp_with_400() {
     // Red-team #247 — `since=garbage` previously returned 200 with all
     // memories. Now must return 400 with a clear error.
+    // #1789 — this asserts downstream timestamp validation, not enrollment;
+    // opt back to permissive so the flipped secure default doesn't 401 first.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum_get(sync_since))
@@ -2593,6 +2779,7 @@ async fn update_memory_rejects_oversized_content() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -2650,6 +2837,7 @@ async fn update_memory_rejects_invalid_confidence() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -3286,6 +3474,7 @@ async fn insert_test_memory(state: &Db, namespace: &str, title: &str) -> String 
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     db::insert(&lock.0, &mem).unwrap()
 }
@@ -4184,6 +4373,8 @@ async fn http_recall_post_keyword_mode_returns_mode_field() {
 
 #[tokio::test]
 async fn http_sync_since_empty_db_returns_zero_count() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
@@ -4209,6 +4400,8 @@ async fn http_sync_since_empty_db_returns_zero_count() {
 
 #[tokio::test]
 async fn http_sync_since_clamps_oversized_limit() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/since", axum::routing::get(sync_since))
@@ -4233,6 +4426,8 @@ async fn http_sync_since_clamps_oversized_limit() {
 
 #[tokio::test]
 async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // since="" must NOT be parsed as RFC 3339. The handler short-circuits
     // empty strings to "no since filter" and returns a full snapshot.
     let state = test_state();
@@ -4254,6 +4449,8 @@ async fn http_sync_since_empty_since_string_treated_as_full_snapshot() {
 
 #[tokio::test]
 async fn http_sync_since_records_peer_via_observe() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // Hitting sync_since with a `peer=` param and an X-Agent-Id header
     // exercises the side-effect sync_state_observe write path.
     let state = test_state();
@@ -4718,6 +4915,7 @@ async fn http_entity_register_collision_with_non_entity_returns_409() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap();
     }
@@ -4945,6 +5143,7 @@ async fn http_kg_timeline_returns_empty_for_unlinked_source() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -5085,6 +5284,7 @@ async fn http_kg_invalidate_marks_link_as_invalidated() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&lock.0, &mk("source-a")).unwrap();
         let b = db::insert(&lock.0, &mk("target-b")).unwrap();
@@ -5276,6 +5476,7 @@ async fn http_kg_query_returns_empty_for_unlinked_source() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -5454,6 +5655,7 @@ async fn http_get_links_returns_empty_array_for_unlinked_id() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -5536,6 +5738,7 @@ async fn http_forget_memories_with_namespace_filter_returns_count() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -5793,6 +5996,8 @@ async fn http_get_stats_empty_db() {
 
 #[tokio::test]
 async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // namespace_meta_clears with a malformed namespace must be skipped
     // (not crash, not cleared).
     let state = test_state();
@@ -5820,6 +6025,8 @@ async fn http_sync_push_namespace_meta_clears_garbage_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_pending_decision_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // pending_decisions with an invalid id must be skipped (not crash).
     let state = test_state();
     let app = Router::new()
@@ -5848,6 +6055,8 @@ async fn http_sync_push_pending_decision_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_namespace_meta_invalid_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // namespace_meta with an invalid namespace OR invalid standard_id
     // should be skipped (incremented under skipped, not applied).
     let state = test_state();
@@ -5877,6 +6086,8 @@ async fn http_sync_push_namespace_meta_invalid_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_namespace_meta_no_apply() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     // dry_run: namespace_meta entries are counted as noop, not applied.
     let state = test_state();
     let app = Router::new()
@@ -6674,6 +6885,7 @@ async fn http_forget_memories_pattern_only_deletes_matches() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -6737,6 +6949,7 @@ async fn http_forget_memories_by_tier_only_targets_tier() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -6807,6 +7020,7 @@ async fn http_forget_memories_combined_filters_intersect() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -7764,9 +7978,10 @@ async fn h8b_get_inbox_returns_pending_after_notify() {
     let msg = &v["messages"][0];
     assert_eq!(msg["title"], "ping");
     // `from` is the resolved sender — `handle_notify` calls
-    // `identity::resolve_agent_id(None, mcp_client)` which synthesizes
-    // `ai:<client>@<host>:pid-N` when only `mcp_client` is set. We
-    // accept both the bare and synthesized forms.
+    // `identity::resolve_agent_id(None, mcp_client)` which synthesizes the
+    // durable `ai:<client>@<host>` form when only `mcp_client` is set
+    // (#1720 B1 — pid-free for restart-stable ownership). We accept both the
+    // bare and synthesized forms.
     let from = msg["from"].as_str().unwrap();
     assert!(
         from == "alice" || from.starts_with("ai:alice@"),
@@ -7812,6 +8027,7 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let read = Memory {
             id: Uuid::new_v4().to_string(),
@@ -7840,6 +8056,7 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &unread).unwrap();
         db::insert(&lock.0, &read).unwrap();
@@ -7904,6 +8121,7 @@ async fn h8b_get_inbox_limit_clamps_returned_count() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -8024,6 +8242,7 @@ async fn h8b_session_start_namespace_filter() {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&lock.0, &mem).unwrap();
         }
@@ -8127,6 +8346,7 @@ async fn h8b_session_start_preloads_recent_context() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap();
     }
@@ -8672,6 +8892,9 @@ async fn http_approve_pending_happy_path_executes_store() {
     let now_rfc = Utc::now().to_rfc3339();
     let pending_id = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY: register the distinct "approver-alice".
+        db::register_agent(&lock.0, "approver-alice", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -8843,6 +9066,9 @@ async fn http_approve_pending_executor_records_decided_by() {
     let now_rfc = Utc::now().to_rfc3339();
     let pid = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY: register the distinct "executor-claude".
+        db::register_agent(&lock.0, "executor-claude", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -8900,6 +9126,10 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
     let now_rfc = Utc::now().to_rfc3339();
     let pid = {
         let lock = state.lock().await;
+        // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+        // Human-arm gate UNCONDITIONALLY (no self-approval; registered approver).
+        // Requester "alice" queues; a distinct registered "approver-store" decides.
+        db::register_agent(&lock.0, "approver-store", "ai:generic", &[]).ok();
         db::queue_pending_action(
             &lock.0,
             GovernedAction::Store,
@@ -8936,7 +9166,7 @@ async fn http_approve_pending_returns_memory_id_for_store_payload() {
             axum::http::Request::builder()
                 .uri(format!("/api/v1/pending/{pid}/approve"))
                 .method("POST")
-                .header("x-agent-id", "alice")
+                .header("x-agent-id", "approver-store")
                 .header("x-ai-memory-timestamp", &ts)
                 .header("x-ai-memory-signature", &sig)
                 .body(Body::empty())
@@ -9160,6 +9390,7 @@ async fn http_consolidate_two_into_one_happy_path() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&lock.0, &mk("draft-a")).unwrap();
         let b = db::insert(&lock.0, &mk("draft-b")).unwrap();
@@ -9242,6 +9473,7 @@ async fn http_consolidate_fans_out_to_peer_1552() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&lock.0, &mk("fed-draft-a")).unwrap();
         let b = db::insert(&lock.0, &mk("fed-draft-b")).unwrap();
@@ -9318,6 +9550,7 @@ async fn http_reflect_fans_out_to_peer_1552() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &base).unwrap()
     };
@@ -9560,6 +9793,7 @@ async fn http_contradictions_synthesizes_links_for_same_title() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mk("alice-says", "earth is round")).unwrap();
         db::insert(&lock.0, &mk("bob-says", "earth is flat")).unwrap();
@@ -9624,6 +9858,7 @@ async fn http_contradictions_namespace_filter_isolates_results() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mk("ns-iso-a", "first opinion")).unwrap();
         db::insert(&lock.0, &mk("ns-iso-b", "different opinion")).unwrap();
@@ -10221,6 +10456,7 @@ async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -11453,6 +11689,7 @@ async fn http_promote_target_tier_mid_stops_at_mid_keeps_expiry_1623() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -11530,6 +11767,7 @@ async fn http_promote_memory_happy_path_clears_expires_at() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap()
     };
@@ -12662,6 +12900,8 @@ fn over_max_string_vec(n: usize) -> Vec<String> {
 
 #[tokio::test]
 async fn http_sync_push_oversize_deletions_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12698,6 +12938,8 @@ async fn http_sync_push_oversize_deletions_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_archives_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12728,6 +12970,8 @@ async fn http_sync_push_oversize_archives_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_restores_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12758,6 +13002,8 @@ async fn http_sync_push_oversize_restores_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12793,6 +13039,8 @@ async fn http_sync_push_oversize_namespace_meta_clears_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_invalid_sender_agent_id_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12823,6 +13071,8 @@ async fn http_sync_push_invalid_sender_agent_id_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12850,6 +13100,8 @@ async fn http_sync_push_invalid_x_agent_id_header_returns_400() {
 
 #[tokio::test]
 async fn http_sync_push_pending_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12892,6 +13144,8 @@ async fn http_sync_push_pending_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_links_invalid_id_skipped() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let app = Router::new()
         .route("/api/v1/sync/push", axum_post(sync_push))
@@ -12929,6 +13183,8 @@ async fn http_sync_push_links_invalid_id_skipped() {
 
 #[tokio::test]
 async fn http_sync_push_dry_run_links_no_apply() {
+    // #1789 — downstream-intent test; opt back to permissive enrollment.
+    let _fed = PermissiveFedEnv::new();
     let state = test_state();
     let src = insert_test_memory(&state, "dryrun-links", "src").await;
     let tgt = insert_test_memory(&state, "dryrun-links", "tgt").await;
@@ -13417,6 +13673,7 @@ async fn seed_governance_policy(state: &Db, ns: &str, policy: serde_json::Value)
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let standard_id = db::insert(&lock.0, &standard).unwrap();
     db::set_namespace_standard(&lock.0, ns, &standard_id, None).unwrap();
@@ -14058,6 +14315,7 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(&lock.0, &mk("aom101-0", "first")).unwrap();
         let b = db::insert(&lock.0, &mk("aom101-1", "second")).unwrap();
@@ -14165,6 +14423,7 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let a = db::insert(
             &lock.0,
@@ -14519,6 +14778,7 @@ fn to_value_or_500_serialises_typed_struct() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let value = super::to_value_or_500("test.happy", &mem).expect("Memory must serialise to JSON");
     assert_eq!(value["id"], "m1");
@@ -14807,6 +15067,7 @@ async fn seed_b4_corpus(state: &Db, n: usize) {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&lock.0, &mem).unwrap();
     }

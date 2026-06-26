@@ -13,8 +13,8 @@
 //! 1. Explicit id passed by the caller (`--agent-id`, MCP tool param)
 //! 2. `AI_MEMORY_AGENT_ID` environment variable
 //! 3. (MCP only) `initialize.clientInfo.name` captured at handshake time
-//!    → `ai:<client>@<hostname>:pid-<pid>`
-//! 4. `host:<hostname>:pid-<pid>-<uuid8>` — stable per-process
+//!    → `ai:<client>@<hostname>` (durable; #1720 B1)
+//! 4. `host:<hostname>` — durable host-scoped default (#1720 B1)
 //! 5. `anonymous:pid-<pid>-<uuid8>` — fallback if hostname is unavailable
 //!
 //! # Precedence (HTTP)
@@ -24,6 +24,33 @@
 //! 1. Request body `agent_id` field
 //! 2. `X-Agent-Id` request header
 //! 3. Per-request `anonymous:req-<uuid8>` (emits a `WARN` log line)
+//!
+//! # Owner-stamp durability — Op-0 posture (#1720 B1)
+//!
+//! The owner-stamp fallbacks (steps 3 + 4) are **stable across process
+//! restarts**: they intentionally OMIT the live `pid` discriminator. This
+//! is the Op-0 posture — the substrate's default is **single-operator,
+//! trust-all** reads (`resolve_read_visibility_caller` returns `None` when
+//! `AI_MEMORY_AGENT_ID` is unset, so the read-path ownership filter is
+//! skipped entirely). Under that default the host-scoped owner id need not
+//! be unique-per-process; it needs to be *durable*, so that a memory written
+//! by one process (e.g. `host:laptop`) is still owned by that same id after
+//! a restart. A pid-suffixed stamp would change every boot, which — the
+//! moment an operator opts in to enforced multi-agent reads by setting
+//! `AI_MEMORY_AGENT_ID` — would orphan every pre-existing `scope=private`
+//! row (the row's owner `host:laptop:pid-123` can never again equal a live
+//! caller), locking the operator out of their own private memories (#1720).
+//!
+//! Safe opt-in to enforced-multi-agent therefore rests on three pieces:
+//! durable owner stamps (this B1 change), the `ai-memory reown` tool (B2)
+//! to re-own legacy pid-suffixed rows, and the boot lockout guard (B3) that
+//! warns when `AI_MEMORY_AGENT_ID` is set but live rows are owned by a
+//! different / pid-suffixed id. Per-agent isolation across processes on one
+//! host is achieved by giving each agent a distinct explicit
+//! `AI_MEMORY_AGENT_ID` (step 2), NOT by the process discriminator.
+//! `process_discriminator()` is unchanged and still backs the anonymous
+//! fallback (step 5) + anonymous HTTP request ids, which are deliberately
+//! ephemeral / non-attributable.
 //!
 //! # Trust
 //!
@@ -97,8 +124,13 @@ fn anonymize_default_enabled() -> bool {
 }
 
 /// Returns a stable-for-this-process discriminator of the form
-/// `<pid>-<uuid8>`. Used to make process-level defaults collision-free
-/// when many agents share a host (e.g., 25 MCP clients on one machine).
+/// `pid-<pid>-<uuid8>`. Backs the **ephemeral / non-attributable**
+/// principals only: the `anonymous:` fallback (step 5) and the anonymous
+/// HTTP request id. Since #1720 B1 the durable owner stamps (steps 3 + 4)
+/// no longer use it — they are intentionally pid-free so they survive a
+/// process restart (see the module-level "Op-0 posture" docs). Per-process
+/// uniqueness for attributable identities is the operator's job via an
+/// explicit `AI_MEMORY_AGENT_ID`, not this discriminator.
 pub fn process_discriminator() -> &'static str {
     static DISCRIMINATOR: OnceLock<String> = OnceLock::new();
     DISCRIMINATOR.get_or_init(|| {
@@ -181,29 +213,35 @@ pub fn resolve_agent_id(explicit: Option<&str>, mcp_client: Option<&str>) -> Res
         return Ok(v);
     }
 
-    // 3. MCP clientInfo-synthesized id (only when the MCP server captured it)
+    // 3. MCP clientInfo-synthesized id (only when the MCP server captured it).
+    //    DURABLE: omits the live pid so the same client on the same host
+    //    resolves to the SAME owner id across process restarts (#1720 B1 —
+    //    a pid-suffixed stamp orphans the owner's own private rows the
+    //    moment enforced-multi-agent reads are enabled). Per-agent isolation
+    //    is via an explicit `AI_MEMORY_AGENT_ID` (step 2), not the pid.
     if let Some(client) = mcp_client
         && !client.is_empty()
     {
         let client_s = sanitize_component(client);
         let host_s =
             hostname_opt().map_or_else(|| "unknown".to_string(), |h| sanitize_component(&h));
-        let pid = std::process::id();
-        let id = format!("ai:{client_s}@{host_s}:pid-{pid}");
+        let id = format!("ai:{client_s}@{host_s}");
         if validate::validate_agent_id(&id).is_ok() {
             return Ok(id);
         }
         // Fall through to host: default if the synthesized id is somehow invalid
     }
 
-    // 4. host:<hostname>:<discriminator> — unless operator opted out (#198).
+    // 4. host:<hostname> — durable host-scoped default, unless operator opted
+    //    out (#198). DURABLE: omits the pid/uuid discriminator (#1720 B1) for
+    //    the same reason as step 3 — stability across restarts so an opt-in to
+    //    enforced reads doesn't lock the operator out of pre-existing rows.
     if !anonymize_default_enabled()
         && let Some(host) = hostname_opt()
     {
         let host_s = sanitize_component(&host);
         if !host_s.is_empty() {
-            let discriminator = process_discriminator();
-            let id = format!("host:{host_s}:{discriminator}");
+            let id = format!("host:{host_s}");
             if validate::validate_agent_id(&id).is_ok() {
                 return Ok(id);
             }
@@ -247,6 +285,106 @@ pub fn resolve_read_visibility_caller() -> Option<String> {
     // against a value nothing is owned by.
     validate::validate_agent_id_shape(&v).ok()?;
     Some(v)
+}
+
+/// #1772 — crate-wide, test-only process serialization guard for any test
+/// that mutates `AI_MEMORY_AGENT_ID` (`ENV_AGENT_ID`). `cargo test` runs
+/// test fns in parallel, so a `set_var`/`remove_var` in one test can leak
+/// into a sibling that resolves the same var mid-run (e.g. an owner-scoped
+/// `memory_forget` test setting the var while an env-unset count assertion
+/// reads it). The pre-existing per-module `agent_id_env_lock` helpers
+/// (delete.rs/promote.rs) only serialize WITHIN one module; this single
+/// shared `OnceLock<Mutex>` serializes ACROSS modules so the owner-scoped
+/// forget tests (`src/mcp/tools/forget.rs`) and the env-sensitive forget
+/// count tests (`src/mcp/mod.rs`) can never observe each other's mutation.
+/// Acquire it before any env mutation OR any env-sensitive assertion.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn agent_id_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// #1720 B3 — env flag that turns a detected boot-time owner-lockout into a
+/// hard REFUSAL instead of a WARN. Truthy (`1`/`true`/`yes`/`on`) makes
+/// [`enforce_owner_lockout_guard`] return an error (aborting MCP boot) when
+/// `AI_MEMORY_AGENT_ID` is set but pre-existing private rows are owned by a
+/// different / pid-suffixed / unowned id. Default (unset) = WARN-only.
+pub const ENV_REQUIRE_OWNED_ROWS: &str = "AI_MEMORY_REQUIRE_OWNED_ROWS";
+
+/// Returns true when [`ENV_REQUIRE_OWNED_ROWS`] is truthy.
+#[must_use]
+pub fn require_owned_rows_enabled() -> bool {
+    let Ok(v) = std::env::var(ENV_REQUIRE_OWNED_ROWS) else {
+        return false;
+    };
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// #1720 B3 — boot-time operator self-lockout guard.
+///
+/// The lockout trap: an operator sets `AI_MEMORY_AGENT_ID` (so read-path
+/// ownership filtering scopes private rows to that caller) on a database
+/// whose pre-existing `scope=private` rows were stamped with a DIFFERENT id
+/// — e.g. a legacy pid-suffixed owner from before #1720 B1, or another
+/// agent's id, or no owner at all. Under enforcement those rows are
+/// invisible to the new caller: the operator is locked out of their own
+/// memories without any signal.
+///
+/// This guard runs once at MCP boot (the primary interactive NHI surface,
+/// and the only one that honors `AI_MEMORY_AGENT_ID` for reads — the HTTP
+/// daemon is multi-tenant and ignores the env id). When the env caller is
+/// unset it is a no-op (trust-all; no lockout is possible). Otherwise it
+/// runs a single indexed COUNT
+/// ([`crate::storage::count_private_rows_hidden_from`]); a non-zero result
+/// emits a loud stderr WARN naming `ai-memory reown` as the fix. If
+/// [`require_owned_rows_enabled`] is set, the same condition is a hard
+/// refusal (returns `Err`) so a strict operator cannot silently boot into a
+/// locked-out state.
+///
+/// Filtering itself is NOT changed here — this is purely an advisory probe
+/// over the rows the existing predicate would hide.
+///
+/// # Errors
+///
+/// Returns an error only when a lockout is detected AND
+/// [`require_owned_rows_enabled`] is true (refuse-on-lockout posture), or
+/// when the underlying COUNT query fails.
+pub fn enforce_owner_lockout_guard(conn: &rusqlite::Connection) -> Result<()> {
+    let Some(caller) = resolve_read_visibility_caller() else {
+        return Ok(());
+    };
+    let (hidden, sample) = crate::storage::count_private_rows_hidden_from(conn, &caller)?;
+    if hidden == 0 {
+        return Ok(());
+    }
+    let owned_by = sample.map_or_else(
+        || "(unowned rows)".to_string(),
+        |s| format!("e.g. owned by `{s}`"),
+    );
+    let detail = format!(
+        "AI_MEMORY_AGENT_ID is set to `{caller}`, but {hidden} private \
+         row(s) in this database are NOT owned by it ({owned_by}). With \
+         read-path ownership filtering those rows are HIDDEN from `{caller}` \
+         — the operator self-lockout trap (#1720). Re-own them first:\n    \
+         ai-memory reown --namespace <ns> --to {caller}\n  \
+         (add --claim-unowned to also take rows with no owner; --dry-run to \
+         preview)."
+    );
+    if require_owned_rows_enabled() {
+        anyhow::bail!(
+            "ai-memory: refusing to start ({} set) — {detail}",
+            ENV_REQUIRE_OWNED_ROWS
+        );
+    }
+    eprintln!("ai-memory: WARN (#1720 B3 owner-lockout) — {detail}");
+    Ok(())
 }
 
 /// Resolve `agent_id` for a single HTTP request.
@@ -357,6 +495,48 @@ pub fn preserve_agent_id(
     merged
 }
 
+/// #1784 — immutable provenance metadata keys preserved across an
+/// update / dedup metadata whole-object overwrite (existing-wins).
+/// `agent_id` is the author (immutable after first write);
+/// `derived_from` + `consolidated_from_agents` are consolidation
+/// provenance — the set of source memories a `consolidate` merged and
+/// their original authors. A whole-object metadata replace (e.g. a
+/// re-consolidation or a `memory_update` that doesn't re-supply these
+/// keys) would otherwise silently drop them — the #1784 defect, since
+/// the sources are hard-deleted and the pointer cannot be reconstructed.
+pub const IMMUTABLE_PROVENANCE_KEYS: [&str; 3] = [
+    "agent_id",
+    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+    crate::META_KEY_CONSOLIDATED_FROM_AGENTS,
+];
+
+/// Preserve the immutable provenance keys ([`IMMUTABLE_PROVENANCE_KEYS`])
+/// from `existing` through an update/dedup metadata overwrite. Returns
+/// `incoming` with each provenance key that `existing` carries copied
+/// over it (existing-wins) — the superset of the historical
+/// [`preserve_agent_id`] behavior, extended for #1784 consolidation
+/// provenance.
+#[must_use]
+pub fn preserve_provenance_keys(
+    existing: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = if incoming.is_object() {
+        incoming.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
+    let Some(obj) = merged.as_object_mut() else {
+        return merged;
+    };
+    for key in IMMUTABLE_PROVENANCE_KEYS {
+        if let Some(existing_val) = existing.get(key).cloned() {
+            obj.insert(key.to_string(), existing_val);
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +629,38 @@ mod tests {
         }
         let id = resolve_agent_id(None, Some("claude-code")).unwrap();
         assert!(id.starts_with("ai:claude-code@"));
-        assert!(id.contains(":pid-"));
+        // #1720 B1 — the clientInfo owner stamp is DURABLE: it must NOT embed
+        // the live pid, so it is stable across process restarts and a future
+        // enforced-read opt-in does not orphan the owner's own private rows.
+        assert!(
+            !id.contains(":pid-"),
+            "clientInfo stamp must be pid-free (durable) per #1720 B1; got: {id}"
+        );
+    }
+
+    #[test]
+    fn resolve_default_host_id_is_durable_pid_free() {
+        // #1720 B1 — the host-scoped fallback (step 4) must be stable across
+        // restarts: no pid/uuid discriminator. Skip when the host opts into
+        // the anonymize default (which legitimately yields anonymous:pid-…).
+        // M9 — process-wide serialization via env_var_lock.
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_ANONYMIZE);
+        }
+        let id = resolve_agent_id(None, None).unwrap();
+        if let Some(rest) = id.strip_prefix("host:") {
+            assert!(
+                !rest.contains(":pid-") && !rest.contains("pid-"),
+                "host fallback must be pid-free (durable) per #1720 B1; got: {id}"
+            );
+        } else {
+            // No hostname available → anonymous fallback, which is allowed to
+            // carry the ephemeral discriminator.
+            assert!(id.starts_with("anonymous:"), "got: {id}");
+        }
     }
 
     #[test]
@@ -524,6 +735,96 @@ mod tests {
         assert_eq!(resolve_read_visibility_caller(), None);
         unsafe {
             std::env::remove_var(ENV_AGENT_ID);
+        }
+    }
+
+    // --- #1720 B3 — boot owner-lockout guard -----------------------------
+
+    #[test]
+    fn require_owned_rows_flag_parses() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        assert!(!require_owned_rows_enabled());
+        for truthy in ["1", "true", "YES", "On"] {
+            unsafe {
+                std::env::set_var(ENV_REQUIRE_OWNED_ROWS, truthy);
+            }
+            assert!(require_owned_rows_enabled(), "{truthy} should be truthy");
+        }
+        unsafe {
+            std::env::set_var(ENV_REQUIRE_OWNED_ROWS, "0");
+        }
+        assert!(!require_owned_rows_enabled());
+        unsafe {
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+    }
+
+    /// Insert one `scope=private` row owned by `owner` into a fresh
+    /// in-memory DB (migrations applied by `storage::open`). The VIRTUAL
+    /// generated columns project the metadata at query time, so a raw
+    /// INSERT carrying a metadata JSON is sufficient.
+    fn db_with_private_row(owner: &str) -> rusqlite::Connection {
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).unwrap();
+        conn.execute(
+            "INSERT INTO memories \
+                 (id, tier, namespace, title, content, created_at, updated_at, metadata) \
+             VALUES ('r1','long','ns','t','c','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z', \
+                 json_object('agent_id', ?1, 'scope', 'private'))",
+            [owner],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn lockout_guard_noop_when_env_unset() {
+        let _g = env_var_lock();
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        // A row exists that WOULD be hidden, but with no env caller the guard
+        // never queries — single-operator trust-all default.
+        let conn = db_with_private_row("host:laptop:pid-9");
+        assert!(enforce_owner_lockout_guard(&conn).is_ok());
+    }
+
+    #[test]
+    fn lockout_guard_warns_then_refuses_b3() {
+        let _g = env_var_lock();
+        let conn = db_with_private_row("host:laptop:pid-9");
+        // Caller `bob` does not own the private row.
+        // SAFETY: env mutation serialised by `_g`.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "bob");
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
+        }
+        // WARN-only posture: returns Ok (the warning goes to stderr).
+        assert!(
+            enforce_owner_lockout_guard(&conn).is_ok(),
+            "default posture must WARN, not refuse"
+        );
+        // Refuse posture: hard error naming reown.
+        unsafe {
+            std::env::set_var(ENV_REQUIRE_OWNED_ROWS, "1");
+        }
+        let err = enforce_owner_lockout_guard(&conn).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("reown"), "error must name the fix; got: {msg}");
+        assert!(msg.contains("host:laptop:pid-9"), "got: {msg}");
+        // A caller that DOES own the row clears the guard even under refuse.
+        unsafe {
+            std::env::set_var(ENV_AGENT_ID, "host:laptop:pid-9");
+        }
+        assert!(enforce_owner_lockout_guard(&conn).is_ok());
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ID);
+            std::env::remove_var(ENV_REQUIRE_OWNED_ROWS);
         }
     }
 
@@ -625,6 +926,52 @@ mod tests {
         let merged = preserve_agent_id(&existing, &incoming);
         assert!(merged.is_object());
         assert_eq!(merged["agent_id"], "alice");
+    }
+
+    #[test]
+    fn preserve_provenance_keys_keeps_all_three_1784() {
+        // #1784 — agent_id + the consolidation provenance arrays
+        // (derived_from / consolidated_from_agents) survive a metadata
+        // overwrite (existing-wins); non-provenance keys take incoming.
+        let existing = serde_json::json!({
+            "agent_id": "author-a",
+            "derived_from": ["s1", "s2"],
+            "consolidated_from_agents": ["author-a", "author-b"],
+            "other": "old",
+        });
+        let incoming = serde_json::json!({ "other": "new" });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(merged["agent_id"], "author-a");
+        assert_eq!(merged["derived_from"], serde_json::json!(["s1", "s2"]));
+        assert_eq!(
+            merged["consolidated_from_agents"],
+            serde_json::json!(["author-a", "author-b"])
+        );
+        assert_eq!(merged["other"], "new", "non-provenance keys: incoming wins");
+    }
+
+    #[test]
+    fn preserve_provenance_keys_existing_wins_immutable_1784() {
+        // Provenance is immutable: even an incoming that re-supplies a
+        // provenance key is overridden by the existing value.
+        let existing = serde_json::json!({ "derived_from": ["s1"] });
+        let incoming = serde_json::json!({ "derived_from": ["DIFFERENT"] });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(
+            merged["derived_from"],
+            serde_json::json!(["s1"]),
+            "existing provenance wins (immutable)"
+        );
+    }
+
+    #[test]
+    fn preserve_provenance_keys_no_op_when_existing_absent_1784() {
+        // When existing carries no provenance, incoming is untouched.
+        let existing = serde_json::json!({ "foo": "x" });
+        let incoming = serde_json::json!({ "derived_from": ["kept"], "bar": 1 });
+        let merged = preserve_provenance_keys(&existing, &incoming);
+        assert_eq!(merged["derived_from"], serde_json::json!(["kept"]));
+        assert_eq!(merged["bar"], 1);
     }
 
     // -----------------------------------------------------------------

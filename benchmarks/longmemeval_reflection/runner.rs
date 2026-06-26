@@ -820,6 +820,7 @@ where
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: ai_memory::models::LifecycleState::Open,
         }
     };
     let imported_id = db::insert(&conn, &imported_sibling)?;

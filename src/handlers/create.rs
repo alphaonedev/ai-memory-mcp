@@ -454,7 +454,7 @@ fn insert_create_with_quota(
                     tracing::error!("quota substrate error: {se}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "quota check failed"})),
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
                     )
                         .into_response()
                 }
@@ -751,6 +751,7 @@ async fn create_memory_postgres(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
@@ -860,6 +861,30 @@ async fn create_memory_postgres(
                 .into_response();
         }
         Err(e) => return store_err_to_response(e),
+    }
+
+    // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write quota
+    // on the postgres single-create TENANT path: `store_with_embedding` only
+    // RECORDS usage (never rejects), so without this the postgres backend
+    // never caps the daily count. The sqlite branch enforces via
+    // `quotas::check_and_record`; this is the postgres seam. Federation /
+    // migrate / CLI / curator never reach this handler, so they stay exempt.
+    {
+        let quota_bytes = i64::try_from(
+            mem.title.len()
+                + mem.content.len()
+                + serde_json::to_string(&mem.metadata)
+                    .map(|s| s.len())
+                    .unwrap_or(0),
+        )
+        .unwrap_or(i64::MAX);
+        if let Err(e) = app
+            .store
+            .check_memory_quota(&ctx, &mem.namespace, 1, quota_bytes)
+            .await
+        {
+            return store_err_to_response(e);
+        }
     }
 
     // #1480 — pipeline the cross-region peer broadcast with the local
@@ -1174,6 +1199,7 @@ pub async fn create_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // #626 Layer-3 (C7) — agent-attestation gate on the HTTP store path.

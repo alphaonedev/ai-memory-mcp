@@ -1,6 +1,6 @@
 [package]
 name = "ai-memory"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.96"
 authors = ["AlphaOne LLC"]
@@ -153,10 +153,14 @@ hkdf = "0.12"
 # call sites. Pure Rust, no C deps.
 zeroize = { version = "1", features = ["derive"] }
 # v0.7.0 L1-5 — SKILL.md YAML frontmatter parsing for the Agent Skills
-# substrate. `serde_yaml` is the de-facto `serde`-native YAML backend;
-# version 0.9 compiles to pure Rust (no C libyaml), making it compatible
-# with the rest of the zero-C-dep policy.
-serde_yaml = "0.9"
+# substrate (+ federation inventory). #1791 — migrated off the archived,
+# unmaintained `serde_yaml` (RUSTSEC-2024-0320) to `serde_yaml_ng`, the
+# maintained drop-in serde-native YAML continuation (same `from_str`/`Value`
+# API; pure Rust, no C libyaml — preserves the zero-C-dep policy + the
+# SKILL.md agentskills.io YAML-frontmatter contract). 2-round 5-agent vote
+# (4d3ea1c5): serde_yml was disqualified (maintainer-conduct red flags);
+# drop-to-TOML infeasible (would break the public SKILL.md format).
+serde_yaml_ng = "0.10"
 
 # Semantic embedding support
 candle-core = "0.10"
@@ -257,6 +261,15 @@ test-with-models = []
 # unconditional and load-bearing; this feature is for the optional
 # end-to-end "did Claude actually see the seeded memory?" smoke.
 e2e = []
+# #1765 (v0.8.0) — OS-agnostic remote syslog sink: RFC 5424 over TCP, with
+# optional rustls TLS (RFC 5425), to a collector/SIEM. Pure network I/O so it
+# behaves identically on Linux/macOS/Windows/mobile. OFF by default and
+# zero-cost when off (the `LogSink::Syslog` writer + framer in `src/logging.rs`
+# are entirely `#[cfg(feature = "syslog")]`-gated). Reuses the existing rustls
+# 0.23 + chrono + gethostname deps — NO new dependency (the re-scope dropped the
+# Linux-only journald sink, avoiding the operator-gated dep additions of the
+# original #1765). cfg(feature) consumer: `src/logging.rs` (arch-11 audit).
+syslog = []
 
 [dev-dependencies]
 proptest = "1"

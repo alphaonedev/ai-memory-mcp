@@ -143,6 +143,7 @@ fn fx4_recall_hybrid_precomputed_hits_matches_legacy_with_index() {
         &scoring,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("legacy recall ok");
 
@@ -167,6 +168,7 @@ fn fx4_recall_hybrid_precomputed_hits_matches_legacy_with_index() {
         &scoring,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("precomputed-hnsw recall ok");
 
@@ -228,6 +230,7 @@ fn fx4_recall_hybrid_precomputed_empty_hits_falls_back_to_keyword_results() {
         &scoring,
         false,
         None,
+        None, // #1720 caller
     )
     .expect("recall with empty hits ok");
     // The keyword phase finds "gamma content" via FTS5 even though
@@ -287,6 +290,10 @@ fn fx4_decorate_memory_many_matches_per_row_shape() {
             !obj.contains_key("latest_link_attest_level"),
             "row {i}: verbose=false must NOT carry latest_link_attest_level"
         );
+        assert!(
+            !obj.contains_key("provenance_tier"),
+            "row {i}: verbose=false must NOT carry provenance_tier"
+        );
     }
 
     // verbose=true: full Gap 7 decoration shape. The batched
@@ -304,6 +311,15 @@ fn fx4_decorate_memory_many_matches_per_row_shape() {
         assert!(
             obj.contains_key("freshness_state"),
             "row {i}: verbose=true carries freshness_state"
+        );
+        // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier is part of the
+        // verbose decoration shape. With no links seeded + a default
+        // caller-provided confidence_source these rows map to the
+        // lowest-trust `unsigned_caller` tier.
+        assert_eq!(
+            obj.get("provenance_tier").and_then(|v| v.as_str()),
+            Some("unsigned_caller"),
+            "row {i}: verbose=true carries provenance_tier (unsigned_caller for unlinked caller-provided rows)"
         );
         // No links seeded → no attest_level key, matching the
         // per-row behaviour where `latest_link_attest_level`
@@ -360,6 +376,13 @@ fn fx4_decorate_memory_many_surfaces_link_attestation() {
             Some("peer_attested"),
             "row {i}: batched IN(...) lookup must surface \
              peer_attested attestation on both link endpoints, got {level:?}"
+        );
+        // v0.8.0 #1709 §2.5 T1 (C1a) — a peer-attested incident link
+        // promotes the row to the strongest provenance tier.
+        assert_eq!(
+            obj.get("provenance_tier").and_then(|v| v.as_str()),
+            Some("signed_peer"),
+            "row {i}: peer_attested link ⇒ provenance_tier=signed_peer"
         );
     }
 }

@@ -38,10 +38,15 @@
 
 use std::path::Path;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::identity::keypair;
-use crate::identity::sign::{SignableLink, SignableWrite, canonical_cbor, canonical_cbor_write};
+use crate::identity::sign::{
+    SignableCheckpointResolution, SignableLink, SignableRoutineFreeze, SignableSignal,
+    SignableTransition, SignableWrite, canonical_cbor, canonical_cbor_checkpoint_resolution,
+    canonical_cbor_routine_freeze, canonical_cbor_signal, canonical_cbor_transition,
+    canonical_cbor_write,
+};
 
 /// Length of an Ed25519 signature in bytes. Mirrors the constant
 /// [`ed25519_dalek::SIGNATURE_LENGTH`] but pinned locally so the verify
@@ -127,8 +132,10 @@ pub fn verify(
     // re-derive the bytes the peer signed, so we cannot trust this link".
     let payload = canonical_cbor(link).map_err(|_| VerifyError::Tampered)?;
 
+    // #1808 — strict verification rejects malleable / non-canonical Ed25519
+    // signatures, matching the v0.8.0 Pillar-1 verifiers + `forensic/bundle.rs`.
     public
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| VerifyError::Tampered)
 }
 
@@ -166,6 +173,24 @@ impl AttestLevel {
         match self {
             Self::Claimed => "claimed",
             Self::AgentAttested => "agent_attested",
+        }
+    }
+
+    /// Monotonic trust rank for the #1719 item-3a attested-identity LWW
+    /// tiebreak: a strictly-higher rank wins a same-`updated_at` CRDT
+    /// merge tiebreak ahead of the lexical-`id` fallback. `Claimed` (an
+    /// unsigned bare claim) is the floor; `AgentAttested` (a verified
+    /// signature against the bound key) outranks it.
+    ///
+    /// Resolved via an explicit method rather than a derived `Ord` so the
+    /// wire enum stays non-comparable (the #970 enum-discipline convention
+    /// `Tier` follows) — the rank is a merge-policy concern, not an
+    /// intrinsic ordering of the variants.
+    #[must_use]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Claimed => 0,
+            Self::AgentAttested => 1,
         }
     }
 }
@@ -242,8 +267,10 @@ pub fn verify_write(
     let sig = Signature::from_bytes(&sig_arr);
 
     let payload = canonical_cbor_write(write).map_err(|_| VerifyError::Tampered)?;
+    // #1808 — strict verification (see `verify`); the #1464 content-attestation
+    // lane must reject non-canonical signatures like the Pillar-1 verifiers.
     public
-        .verify(&payload, &sig)
+        .verify_strict(&payload, &sig)
         .map_err(|_| VerifyError::Tampered)
 }
 
@@ -297,6 +324,169 @@ pub fn attest_write(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — signed-signal verification
+// ---------------------------------------------------------------------------
+
+/// Verify `signature` over the canonical CBOR encoding of `signable` using the
+/// raw 32-byte `sender_pubkey`.
+///
+/// Mirror of [`verify`] / [`verify_write`] for the signed-signal path:
+/// rebuilds the [`VerifyingKey`] from the 32-byte `sender_pubkey`, re-derives
+/// the exact bytes [`crate::identity::sign::sign_signal`] signed, and checks
+/// the 64-byte Ed25519 signature. Any divergence between the persisted signal
+/// fields and what the sender signed makes the verify fail.
+///
+/// Returns `false` — never panics — on ANY error: a `sender_pubkey` that is
+/// not exactly 32 bytes or does not decode to a valid point, a `signature`
+/// that is not exactly 64 bytes, a CBOR-encode failure, or a signature that
+/// does not validate. The boolean contract matches the inbound posture
+/// "either it verifies or we treat it as unsigned/untrusted" without leaking
+/// which failure occurred.
+#[must_use]
+pub fn verify_signal(
+    signable: &SignableSignal<'_>,
+    signature: &[u8],
+    sender_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = sender_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_signal(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
+}
+
+/// Verify a federated action-state transition's Ed25519 signature (#1718 H2).
+///
+/// Mirror of [`verify_signal`]: rebuilds the [`VerifyingKey`] from the 32-byte
+/// `signer_pubkey`, re-derives the exact bytes
+/// [`crate::identity::sign::sign_transition`] signed, and checks the 64-byte
+/// signature. Any divergence between the wire transition fields and what the
+/// signer committed to makes the verify fail. The CALLER must additionally
+/// bind `signer_pubkey` to an enrolled identity (the #1718 H2 "attested-not-
+/// claimed" gate) — this function only proves the holder of `signer_pubkey`
+/// signed exactly these transition fields.
+///
+/// Returns `false` — never panics — on ANY error: a `signer_pubkey` not
+/// exactly 32 bytes or not a valid point, a `signature` not exactly 64 bytes,
+/// a CBOR-encode failure, or a signature that does not validate.
+#[must_use]
+pub fn verify_transition(
+    signable: &SignableTransition<'_>,
+    signature: &[u8],
+    signer_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = signer_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_transition(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — attested-checkpoint-resolution verification
+// ---------------------------------------------------------------------------
+
+/// Verify `signature` over the canonical CBOR encoding of `signable` using the
+/// raw 32-byte `resolver_pubkey`.
+///
+/// Mirror of [`verify_signal`] for the attested-checkpoint-resolution path:
+/// rebuilds the [`VerifyingKey`] from the 32-byte `resolver_pubkey`, re-derives
+/// the exact bytes [`crate::identity::sign::sign_checkpoint_resolution`]
+/// signed, and checks the 64-byte Ed25519 signature. Any divergence between
+/// the persisted resolution fields and what the resolver signed makes the
+/// verify fail — the separation-of-duties attestation cannot be replayed onto
+/// a different checkpoint, resolver, verdict, or timestamp.
+///
+/// Returns `false` — never panics — on ANY error: a `resolver_pubkey` that is
+/// not exactly 32 bytes or does not decode to a valid point, a `signature`
+/// that is not exactly 64 bytes, a CBOR-encode failure, or a signature that
+/// does not validate.
+#[must_use]
+pub fn verify_checkpoint_resolution(
+    signable: &SignableCheckpointResolution<'_>,
+    signature: &[u8],
+    resolver_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = resolver_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_checkpoint_resolution(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
+}
+
+/// Verify a routine's Ed25519 FREEZE-ATTESTATION signature against its raw
+/// 32-byte `signer_pubkey`.
+///
+/// Mirror of [`verify_checkpoint_resolution`] for the frozen-routine path:
+/// rebuilds the [`VerifyingKey`] from the 32-byte `signer_pubkey`, re-derives
+/// the exact bytes [`crate::identity::sign::sign_routine_freeze`] signed, and
+/// checks the 64-byte Ed25519 signature. Any divergence between the persisted
+/// frozen fields and what the freezer signed makes the verify fail — the
+/// regulatory-hold attestation cannot be replayed onto a different routine, a
+/// tampered template, or a back-/forward-dated freeze.
+///
+/// Returns `false` — never panics — on ANY error: a `signer_pubkey` that is not
+/// exactly 32 bytes or does not decode to a valid point, a `signature` that is
+/// not exactly 64 bytes, a CBOR-encode failure, or a signature that does not
+/// validate.
+#[must_use]
+pub fn verify_routine_freeze(
+    signable: &SignableRoutineFreeze<'_>,
+    signature: &[u8],
+    signer_pubkey: &[u8],
+) -> bool {
+    let Ok(pk_arr): Result<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH], _> = signer_pubkey.try_into()
+    else {
+        return false;
+    };
+    let Ok(public) = VerifyingKey::from_bytes(&pk_arr) else {
+        return false;
+    };
+    let Ok(sig_arr): Result<[u8; SIGNATURE_LEN], _> = signature.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let Ok(payload) = canonical_cbor_routine_freeze(signable) else {
+        return false;
+    };
+    public.verify_strict(&payload, &sig).is_ok()
 }
 
 /// Look up the public key associated with `observed_by` on this host's
@@ -710,5 +900,350 @@ mod tests {
     fn attest_level_as_str_is_stable() {
         assert_eq!(AttestLevel::Claimed.as_str(), "claimed");
         assert_eq!(AttestLevel::AgentAttested.as_str(), "agent_attested");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — verify_signal
+    // -----------------------------------------------------------------
+
+    fn signal_fixture(body: &[u8; 32]) -> SignableSignal<'_> {
+        SignableSignal {
+            id: "sig-001",
+            namespace: "team/alpha",
+            from_agent: "ai:curator",
+            to_agent: Some("ai:planner"),
+            subject: "deploy approval",
+            body_sha256: body,
+            signal_type: "request",
+            in_reply_to: None,
+            correlation_id: Some("corr-7"),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn verify_signal_accepts_valid_signature() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x31);
+        let signal = signal_fixture(&body);
+        let sig = sign::sign_signal(&kp, &signal).unwrap();
+        assert!(
+            verify_signal(&signal, &sig, &kp.public.to_bytes()),
+            "happy-path signal verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_signal_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x32);
+        let signal = signal_fixture(&body);
+        let mut sig = sign::sign_signal(&kp, &signal).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_signal(&signal, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_signal_rejects_mutated_payload() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x33);
+        let original = signal_fixture(&body);
+        let sig = sign::sign_signal(&kp, &original).unwrap();
+        let mut tampered = original.clone();
+        tampered.subject = "deploy rejection";
+        assert!(!verify_signal(&tampered, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_signal_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let body = body_hash(0x34);
+        let signal = signal_fixture(&body);
+        let sig = sign::sign_signal(&alice, &signal).unwrap();
+        assert!(!verify_signal(&signal, &sig, &bob.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_signal_rejects_malformed_signature_length() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x35);
+        let signal = signal_fixture(&body);
+        // 32 bytes is wrong (Ed25519 wants 64).
+        assert!(!verify_signal(&signal, &[0u8; 32], &kp.public.to_bytes()));
+        // empty signature.
+        assert!(!verify_signal(&signal, &[], &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_signal_rejects_malformed_pubkey_length() {
+        let kp = kp_mod::generate("ai:curator").unwrap();
+        let body = body_hash(0x36);
+        let signal = signal_fixture(&body);
+        let sig = sign::sign_signal(&kp, &signal).unwrap();
+        // 16 bytes is wrong (Ed25519 pubkeys are 32 bytes).
+        assert!(!verify_signal(&signal, &sig, &[0u8; 16]));
+        // empty pubkey.
+        assert!(!verify_signal(&signal, &sig, &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1718) — verify_transition (action-state edges)
+    // -----------------------------------------------------------------
+
+    fn transition_fixture() -> SignableTransition<'static> {
+        SignableTransition {
+            action_id: "act-001",
+            namespace: "team/alpha",
+            from_state: "pending",
+            to_state: "claimed",
+            claimed_by: Some("ai:worker"),
+            nonce: b"nonce-abc",
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn verify_transition_accepts_valid_signature() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&kp, &t).unwrap();
+        assert!(
+            verify_transition(&t, &sig, &kp.public.to_bytes()),
+            "happy-path transition verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_transition_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let mut sig = sign::sign_transition(&kp, &t).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_transition(&t, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_mutated_edge() {
+        // A signature minted for `pending -> claimed` must NOT verify for a
+        // different target state (cross-edge replay guard, #1718 H1/H2).
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let original = transition_fixture();
+        let sig = sign::sign_transition(&kp, &original).unwrap();
+        let mut tampered = original.clone();
+        tampered.to_state = "abandoned";
+        assert!(!verify_transition(&tampered, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_replay_under_fresh_nonce() {
+        // The nonce binds the signature to a single delivery — a captured
+        // (bytes, sig) pair must NOT replay under a different nonce.
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let original = transition_fixture();
+        let sig = sign::sign_transition(&kp, &original).unwrap();
+        let mut replayed = original.clone();
+        replayed.nonce = b"different-nonce";
+        assert!(!verify_transition(&replayed, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&alice, &t).unwrap();
+        assert!(!verify_transition(&t, &sig, &bob.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_transition_rejects_malformed_lengths() {
+        let kp = kp_mod::generate("ai:worker").unwrap();
+        let t = transition_fixture();
+        let sig = sign::sign_transition(&kp, &t).unwrap();
+        assert!(!verify_transition(&t, &[0u8; 32], &kp.public.to_bytes()));
+        assert!(!verify_transition(&t, &[], &kp.public.to_bytes()));
+        assert!(!verify_transition(&t, &sig, &[0u8; 16]));
+        assert!(!verify_transition(&t, &sig, &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — verify_checkpoint_resolution
+    // -----------------------------------------------------------------
+
+    fn resolution_fixture() -> SignableCheckpointResolution<'static> {
+        SignableCheckpointResolution {
+            checkpoint_id: "cp-001",
+            namespace: "team/alpha",
+            state: "resolved",
+            resolved_by: "ai:approver",
+            resolution: Some("approved"),
+            resolved_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn verify_checkpoint_resolution_accepts_valid_signature() {
+        let kp = kp_mod::generate("ai:approver").unwrap();
+        let r = resolution_fixture();
+        let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+        assert!(
+            verify_checkpoint_resolution(&r, &sig, &kp.public.to_bytes()),
+            "happy-path checkpoint-resolution verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_checkpoint_resolution_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("ai:approver").unwrap();
+        let r = resolution_fixture();
+        let mut sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_checkpoint_resolution(
+            &r,
+            &sig,
+            &kp.public.to_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_checkpoint_resolution_rejects_mutated_payload() {
+        let kp = kp_mod::generate("ai:approver").unwrap();
+        let original = resolution_fixture();
+        let sig = sign::sign_checkpoint_resolution(&kp, &original).unwrap();
+        // Flip the verdict after signing — must not verify.
+        let mut tampered = original.clone();
+        tampered.state = "rejected";
+        assert!(!verify_checkpoint_resolution(
+            &tampered,
+            &sig,
+            &kp.public.to_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_checkpoint_resolution_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let r = resolution_fixture();
+        let sig = sign::sign_checkpoint_resolution(&alice, &r).unwrap();
+        assert!(!verify_checkpoint_resolution(
+            &r,
+            &sig,
+            &bob.public.to_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_checkpoint_resolution_rejects_malformed_lengths() {
+        let kp = kp_mod::generate("ai:approver").unwrap();
+        let r = resolution_fixture();
+        let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+        // 32-byte signature is wrong (Ed25519 wants 64); empty too.
+        assert!(!verify_checkpoint_resolution(
+            &r,
+            &[0u8; 32],
+            &kp.public.to_bytes()
+        ));
+        assert!(!verify_checkpoint_resolution(
+            &r,
+            &[],
+            &kp.public.to_bytes()
+        ));
+        // 16-byte pubkey is wrong (Ed25519 pubkeys are 32 bytes); empty too.
+        assert!(!verify_checkpoint_resolution(&r, &sig, &[0u8; 16]));
+        assert!(!verify_checkpoint_resolution(&r, &sig, &[]));
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — verify_routine_freeze
+    // -----------------------------------------------------------------
+
+    fn routine_freeze_fixture<'a>(
+        template: &'a [u8; 32],
+        parameters: &'a [u8; 32],
+    ) -> SignableRoutineFreeze<'a> {
+        SignableRoutineFreeze {
+            routine_id: "rt-001",
+            namespace: "_rt",
+            name: "deploy",
+            template_sha256: template,
+            parameters_sha256: parameters,
+            frozen_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn verify_routine_freeze_accepts_valid_signature() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x40);
+        let parameters = body_hash(0x41);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        assert!(
+            verify_routine_freeze(&r, &sig, &kp.public.to_bytes()),
+            "happy-path routine-freeze verify must succeed"
+        );
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_flipped_signature_byte() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x42);
+        let parameters = body_hash(0x43);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let mut sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        sig[0] ^= 0x01;
+        assert!(!verify_routine_freeze(&r, &sig, &kp.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_mutated_template() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x44);
+        let parameters = body_hash(0x45);
+        let original = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &original).unwrap();
+        // Swap the template hash after signing — must not verify.
+        let other_template = body_hash(0x99);
+        let tampered = SignableRoutineFreeze {
+            template_sha256: &other_template,
+            ..original.clone()
+        };
+        assert!(!verify_routine_freeze(
+            &tampered,
+            &sig,
+            &kp.public.to_bytes()
+        ));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_wrong_pubkey() {
+        let alice = kp_mod::generate("alice").unwrap();
+        let bob = kp_mod::generate("bob").unwrap();
+        let template = body_hash(0x46);
+        let parameters = body_hash(0x47);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&alice, &r).unwrap();
+        assert!(!verify_routine_freeze(&r, &sig, &bob.public.to_bytes()));
+    }
+
+    #[test]
+    fn verify_routine_freeze_rejects_malformed_lengths() {
+        let kp = kp_mod::generate("agent-author").unwrap();
+        let template = body_hash(0x48);
+        let parameters = body_hash(0x49);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig = sign::sign_routine_freeze(&kp, &r).unwrap();
+        // 32-byte signature is wrong (Ed25519 wants 64); empty too.
+        assert!(!verify_routine_freeze(
+            &r,
+            &[0u8; 32],
+            &kp.public.to_bytes()
+        ));
+        assert!(!verify_routine_freeze(&r, &[], &kp.public.to_bytes()));
+        // 16-byte pubkey is wrong (Ed25519 pubkeys are 32 bytes); empty too.
+        assert!(!verify_routine_freeze(&r, &sig, &[0u8; 16]));
+        assert!(!verify_routine_freeze(&r, &sig, &[]));
     }
 }

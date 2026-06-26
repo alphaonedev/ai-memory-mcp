@@ -29,6 +29,21 @@ pub(super) enum AckOutcome {
     Ack,
     IdDrift,
     Fail(String),
+    /// #1544 — the peer refused with a retryable THROTTLE (HTTP 429),
+    /// e.g. a per-agent / federation quota window that resets on its
+    /// own. Distinct from [`AckOutcome::Fail`] so the push-DLQ replayer
+    /// does NOT burn a `MAX_REPLAY_ATTEMPTS` quarantine attempt on a
+    /// transient throttle — the row stays pending and converges once the
+    /// window rolls. For quorum/fanout purposes a throttle is a non-ack,
+    /// handled identically to `Fail` (the row is enqueued to the DLQ).
+    Throttled(String),
+}
+
+/// Canonical `AckOutcome` reason for a non-2xx peer response. One named
+/// helper so the `"http {status}"` shape lives in exactly one place
+/// (pm-v3.1 no-scattered-literals discipline).
+fn http_status_reason(status: reqwest::StatusCode) -> String {
+    format!("http {status}")
 }
 
 /// Single-attempt POST to a peer, classifying the response into an
@@ -196,7 +211,16 @@ pub(super) async fn post_once(
             // already in flight; reading it is microseconds.
             let status = resp.status();
             let _ = resp.bytes().await;
-            AckOutcome::Fail(format!("http {status}"))
+            // #1544 — classify a 429 as a retryable THROTTLE (status-precise,
+            // not a string-match on the reason) so the push-DLQ replayer can
+            // avoid burning a quarantine attempt on a quota window that resets
+            // on its own. Every other non-2xx stays a `Fail`.
+            let reason = http_status_reason(status);
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                AckOutcome::Throttled(reason)
+            } else {
+                AckOutcome::Fail(reason)
+            }
         }
         Err(e) => AckOutcome::Fail(crate::errors::msg::network(e)),
     }
@@ -251,6 +275,11 @@ pub(super) async fn post_and_classify(
     {
         AckOutcome::Ack => AckOutcome::Ack,
         AckOutcome::IdDrift => AckOutcome::IdDrift,
+        // #1544 — a throttle (429) is not a transient network flap; a
+        // 250ms retry won't clear a quota window. Pass it straight
+        // through (like `IdDrift`) so the DLQ replayer handles the
+        // back-off-until-window-rolls semantics instead.
+        AckOutcome::Throttled(reason) => AckOutcome::Throttled(reason),
         AckOutcome::Fail(first_reason) => {
             tokio::time::sleep(FANOUT_RETRY_BACKOFF).await;
             match post_once(
@@ -287,6 +316,16 @@ pub(super) async fn post_and_classify(
                         .with_label_values(&["fail"])
                         .inc();
                     AckOutcome::Fail(format!("first: {first_reason}; retry: {retry_reason}"))
+                }
+                // #1544 — the retry surfaced a throttle (429); propagate it
+                // as `Throttled` so the DLQ replayer applies back-off rather
+                // than burning a quarantine attempt.
+                AckOutcome::Throttled(retry_reason) => {
+                    crate::metrics::registry()
+                        .federation_fanout_retry_total
+                        .with_label_values(&["throttled"])
+                        .inc();
+                    AckOutcome::Throttled(retry_reason)
                 }
             }
         }
@@ -426,7 +465,7 @@ pub async fn broadcast_store_quorum_with_embedding(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: peer {peer_id} failed for {}: {reason}", mem.id);
                 #[cfg(feature = "sal")]
                 explicit_failures.push((peer_id.clone(), reason.clone()));
@@ -484,7 +523,7 @@ pub async fn broadcast_store_quorum_with_embedding(
                             .with_label_values(&["id_drift"])
                             .inc();
                     }
-                    Ok((peer_id, AckOutcome::Fail(reason))) => {
+                    Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) => {
                         tracing::warn!(
                             "federation: post-quorum peer {peer_id} did not ack for {mem_id}: {reason}"
                         );
@@ -660,7 +699,7 @@ pub async fn broadcast_delete_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: delete peer {peer_id} failed for {id}: {reason}");
             }
             Ok(Some(Err(e))) => {
@@ -676,7 +715,8 @@ pub async fn broadcast_delete_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum delete peer {peer_id} did not ack: {reason}"
                     );
@@ -758,7 +798,7 @@ pub async fn broadcast_archive_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: archive peer {peer_id} failed for {id}: {reason}");
             }
             Ok(Some(Err(e))) => {
@@ -774,7 +814,8 @@ pub async fn broadcast_archive_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum archive peer {peer_id} did not ack: {reason}"
                     );
@@ -857,7 +898,7 @@ pub async fn broadcast_restore_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: restore peer {peer_id} failed for {id}: {reason}");
             }
             Ok(Some(Err(e))) => {
@@ -873,7 +914,8 @@ pub async fn broadcast_restore_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum restore peer {peer_id} did not ack: {reason}"
                     );
@@ -951,7 +993,7 @@ pub async fn broadcast_link_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!("federation: link peer {peer_id} failed for {log_id}: {reason}");
             }
             Ok(Some(Err(e))) => {
@@ -967,7 +1009,8 @@ pub async fn broadcast_link_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum link peer {peer_id} did not ack: {reason}"
                     );
@@ -1045,7 +1088,7 @@ pub async fn broadcast_consolidate_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!(
                     "federation: consolidate peer {peer_id} failed for {}: {reason}",
                     new_mem.id
@@ -1064,7 +1107,8 @@ pub async fn broadcast_consolidate_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum consolidate peer {peer_id} did not ack: {reason}"
                     );
@@ -1144,7 +1188,7 @@ pub async fn broadcast_pending_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!(
                     "federation: pending peer {peer_id} failed for {}: {reason}",
                     pending.id
@@ -1163,7 +1207,8 @@ pub async fn broadcast_pending_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum pending peer {peer_id} did not ack: {reason}"
                     );
@@ -1242,7 +1287,7 @@ pub async fn broadcast_pending_decision_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!(
                     "federation: pending-decision peer {peer_id} failed for {}: {reason}",
                     decision.id
@@ -1261,9 +1306,264 @@ pub async fn broadcast_pending_decision_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum pending-decision peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
+/// #1718 — wire element for a federated action-state TRANSITION, carried on
+/// the `/sync/push` envelope's `action_transitions` subcollection. Commit B
+/// (this) broadcasts it; Commit A receives + applies it idempotently.
+///
+/// `from_state` is the CAS guard — the receiver applies the transition only
+/// when the local action is still in `from_state` — and `vector_clock`
+/// carries causal ordering, so a delayed re-broadcast of a stale transition
+/// is dropped rather than re-applied. This is load-bearing because the
+/// action state machine is **not monotonic** (`Claimed → Pending` release is
+/// legal), so the target state alone is not a safe idempotency key (#1718
+/// hazard H1). The end-to-end author-attestation fields (signature / signer
+/// / nonce) are added by Commit A as `#[serde(default)]` extensions (#1052
+/// permissive-deserialize forward-compat), so a peer omitting them decodes
+/// byte-identically.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActionTransitionOp {
+    /// Target action id.
+    pub action_id: String,
+    /// Expected current state (compare-and-swap guard, H1).
+    pub from_state: crate::models::action::ActionState,
+    /// New state to transition into.
+    pub to_state: crate::models::action::ActionState,
+    /// Attested actor that drove the transition (Commit A binds this to an
+    /// enrolled key; carried here so the wire shape is fixed once).
+    #[serde(default)]
+    pub claimed_by: Option<String>,
+    /// Causal-ordering clock for the non-monotonic state machine (H1).
+    #[serde(default)]
+    pub vector_clock: serde_json::Value,
+    /// Epoch seconds of the transition.
+    pub updated_at: i64,
+    /// #1718 H2 — Ed25519 signature over the canonical [`SignableTransition`]
+    /// surface (`action_id`/`namespace`/`from_state`/`to_state`/`claimed_by`/
+    /// `nonce`/`created_at`). Empty for an unsigned op. The receiver
+    /// (`authorize_remote_transition`) verifies this against the *enrolled* key
+    /// of the attested actor (`claimed_by`), not against `signer_pubkey`, so a
+    /// captured signature cannot authorize a transition for an actor whose
+    /// private key the sender does not hold.
+    ///
+    /// [`SignableTransition`]: crate::identity::sign::SignableTransition
+    #[serde(default)]
+    pub signature: Vec<u8>,
+    /// #1718 H2 — the 32-byte Ed25519 public key the producer signed with.
+    /// Carried for diagnostics / non-enrolled verification; the *authoritative*
+    /// verify uses the locally looked-up enrolled key, so a mismatch between
+    /// this and the enrolled key surfaces as a refused (forged) transition.
+    #[serde(default)]
+    pub signer_pubkey: Vec<u8>,
+    /// #1718 H2 — per-delivery anti-replay nonce bound into the signed surface
+    /// so a captured `(transition, signature)` pair cannot be replayed under a
+    /// fresh delivery without the private key.
+    #[serde(default)]
+    pub nonce: Vec<u8>,
+}
+
+/// #1718 Commit B — fan out an action-state transition to peers via the
+/// `/sync/push` envelope's `action_transitions` subcollection and collect
+/// W-of-N acks. Mirrors [`broadcast_pending_quorum`] exactly (reusing
+/// `AckTracker` + `finalise_quorum`); only the subcollection key + target id
+/// differ. Wired into the action-transition write path by Commit C.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on the pathological detach race
+/// where the tracker `Arc` is still referenced after fan-out.
+pub async fn broadcast_action_transition_quorum(
+    config: &FederationConfig,
+    op: &ActionTransitionOp,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "action_transitions": [op],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = op.action_id.clone();
+        let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(
+                &client,
+                &url,
+                &payload,
+                &target_id,
+                Some(&target_id),
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            )
+            .await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
+                tracing::warn!(
+                    "federation: action-transition peer {peer_id} failed for {}: {reason}",
+                    op.action_id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: action-transition peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
+                    tracing::debug!(
+                        "federation: post-quorum action-transition peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
+/// #1718 Commit B — fan out a freshly-created signal to peers via the
+/// `/sync/push` envelope's `signals` subcollection and collect W-of-N acks.
+/// Mirrors [`broadcast_pending_quorum`] exactly. The `Signal` model already
+/// carries its Ed25519 `signature` + `sender_pubkey`, so the receiver
+/// (Commit A) can verify authorship end-to-end; signals dedupe on their
+/// UUID `id` (idempotent `INSERT … ON CONFLICT(id) DO NOTHING`). Wired into
+/// the `signal_send` write path by Commit C.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on the pathological detach race.
+pub async fn broadcast_signal_create_quorum(
+    config: &FederationConfig,
+    signal: &crate::models::signal::Signal,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "signals": [signal],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = signal.id.clone();
+        let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(
+                &client,
+                &url,
+                &payload,
+                &target_id,
+                Some(&target_id),
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            )
+            .await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
+                tracing::warn!(
+                    "federation: signal peer {peer_id} failed for {}: {reason}",
+                    signal.id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: signal peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
+                    tracing::debug!(
+                        "federation: post-quorum signal peer {peer_id} did not ack: {reason}"
                     );
                 }
             }
@@ -1342,7 +1642,7 @@ pub async fn broadcast_namespace_meta_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!(
                     "federation: namespace_meta peer {peer_id} failed for {}: {reason}",
                     entry.namespace
@@ -1361,7 +1661,8 @@ pub async fn broadcast_namespace_meta_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum namespace_meta peer {peer_id} did not ack: {reason}"
                     );
@@ -1446,7 +1747,7 @@ pub async fn broadcast_namespace_meta_clear_quorum(
             Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
                 tracker.lock().await.record_id_drift(peer_id);
             }
-            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason))))) => {
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
                 tracing::warn!(
                     "federation: namespace_meta_clear peer {peer_id} failed for [{}]: {reason}",
                     target_id
@@ -1465,7 +1766,8 @@ pub async fn broadcast_namespace_meta_clear_quorum(
     if !joins.is_empty() {
         tokio::spawn(async move {
             while let Some(res) = joins.join_next().await {
-                if let Ok((peer_id, AckOutcome::Fail(reason))) = res {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
                     tracing::debug!(
                         "federation: post-quorum namespace_meta_clear peer {peer_id} did not ack: {reason}"
                     );

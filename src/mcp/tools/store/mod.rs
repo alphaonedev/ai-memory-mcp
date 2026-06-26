@@ -23,7 +23,7 @@
 mod embed;
 mod legacy_classifier;
 mod synthesis;
-mod transport;
+pub(crate) mod transport;
 mod validation;
 
 use crate::db;
@@ -109,6 +109,12 @@ pub struct StoreRequest {
     /// Form 6 (#759) memory-kind. Default observation.
     #[serde(default)]
     pub kind: Option<String>,
+
+    #[schemars(
+        description = "#1709 Pillar-2 initial lifecycle state (open|active|blocked|done|abandoned). Default open."
+    )]
+    #[serde(default)]
+    pub lifecycle_state: Option<String>,
 
     #[serde(default)]
     #[schemars(description = "#519 bypass proactive contradiction detection.")]
@@ -589,7 +595,8 @@ pub(crate) fn handle_store(
         // Preserve the original agent_id (provenance is immutable) — the
         // existing memory's metadata.agent_id wins over anything in the
         // incoming store.
-        let preserved_metadata = crate::identity::preserve_agent_id(&dup.metadata, &mem.metadata);
+        let preserved_metadata =
+            crate::identity::preserve_provenance_keys(&dup.metadata, &mem.metadata);
         let (_found, content_changed) = db::update(
             conn,
             &dup.id,

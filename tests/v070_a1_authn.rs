@@ -261,6 +261,13 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
     set_active_hooks_hmac_secret(Some("a1-positive-secret".to_string()));
     let (router, db) = build_router_with_db();
     let pid = seed_pending_store(&db, "a1-positive-ns", "alice").await;
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP approve surface enforces the
+    // Human-arm gate UNCONDITIONALLY (no self-approval; registered approver), so
+    // decide as a distinct REGISTERED "a1-approver" (requester is "alice").
+    {
+        let lock = db.lock().await;
+        ai_memory::db::register_agent(&lock.0, "a1-approver", "ai:generic", &[]).ok();
+    }
 
     let body = String::new();
     let ts = chrono::Utc::now().timestamp().to_string();
@@ -269,7 +276,7 @@ async fn s5c1_approve_with_valid_hmac_returns_200() {
     let req = Request::builder()
         .method("POST")
         .uri(format!("/api/v1/pending/{pid}/approve"))
-        .header("x-agent-id", "alice")
+        .header("x-agent-id", "a1-approver")
         .header("x-ai-memory-timestamp", &ts)
         .header("x-ai-memory-signature", &sig)
         .body(Body::from(body))

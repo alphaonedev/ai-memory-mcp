@@ -53,8 +53,11 @@ The property has two enforcement modes — both shipped:
    substrate, `NetworkRequest`, `ProcessSpawn`, `Custom`) are
    **substrate-rule-bound, harness-mediated**: the rule lives in the
    substrate's `governance_rules` table; the harness (Claude Code
-   PreToolUse hook of type `mcp_tool`) consults the substrate via
-   `memory_check_agent_action` and honors the decision. Mechanical at
+   PreToolUse hook of type `command` — the enforcing wrapper
+   `ai-memory governance check-action --from-pretool-stdin`, #1811; a
+   `type: mcp_tool` hook **cannot block**, so the command wrapper is
+   the load-bearing form) consults the substrate and honors the
+   decision. Mechanical at
    the harness-hook boundary (operator-configured), not at the agent
    attention boundary (probabilistic).
 
@@ -112,8 +115,12 @@ vocabulary the harness constructs from a proposed tool call:
 Variant names are the canonical `kind` strings in the
 `governance_rules.kind` column (lower_snake). Adding a new variant is
 wire-compatible — existing rules with unknown kinds are ignored, not
-failed. v0.8.0 V08-PE-2 (**#697**) adds an `AgentAction::Read`
-variant; the wire format is forward-compatible by construction.
+failed. **v0.8.0 (PE-2, #1730) shipped the `AgentAction::Read`
+variant** (wire `kind = read_action`), wired into the recall / search /
+list / get / session_start read tools so reads route through the same
+rule engine + `signed_events` audit chain; the wire format was
+forward-compatible by construction. (Historically this was deferred to
+V08-PE-2 under **#697**.)
 
 ### 2.4 `check_agent_action` — audited path
 
@@ -217,7 +224,7 @@ bypass-prevention property — see §4.2.
 | Surface | Call site | AgentAction constructed | Refusal mapping |
 |---|---|---|---|
 | **Substrate write path** (HTTP `POST /api/v1/memories`, MCP `memory_store`, federation inbound, CLI `ai-memory mine`) | `src/storage/mod.rs::consult_governance_pre_write` (OnceLock-installed closure in `src/daemon_runtime.rs::install_governance_pre_write_hook`, installed by both daemon `serve` AND `ai-memory mcp` since #1583; CLI one-shot ops do NOT install it by design) | `AgentAction::Custom { custom_kind: "memory_write", payload: {namespace, tier, memory_kind, title} }` evaluated by `check_agent_action_no_audit` | HTTP `403 FORBIDDEN` + `GOVERNANCE_REFUSED` code; MCP `GOVERNANCE_REFUSED` error data; typed `MemoryError::RefusedByGovernance` |
-| **MCP** `memory_check_agent_action` (Power family) | `src/mcp/tools/check_agent_action.rs::handle_check_agent_action` → `check_agent_action` (audited) | Caller-supplied — `{kind, ...}` per §2.3 | MCP tool returns `{"decision":"refuse", "rule_id": "...", "reason": "..."}`; harness PreToolUse hook of type `mcp_tool` reads this and blocks |
+| **MCP** `memory_check_agent_action` (Power family) | `src/mcp/tools/check_agent_action.rs::handle_check_agent_action` → `check_agent_action` (audited) | Caller-supplied — `{kind, ...}` per §2.3 | MCP tool returns `{"decision":"refuse", "rule_id": "...", "reason": "..."}` for programmatic callers; the BLOCKING Claude Code PreToolUse hook is a `type: command` wrapper (`ai-memory governance check-action --from-pretool-stdin`, #1811) — a `type: mcp_tool` hook cannot block |
 | **CLI** `ai-memory rules check` | `src/cli/rules.rs::run` (`RulesAction::Check` variant) → `check_agent_action` (audited) | Caller-supplied via `--kind` + `--command`/`--path`/`--host`/`--binary` | Non-zero exit code on refuse; JSON output via `--json` |
 
 All three production wire-points share the **same combinator** and
@@ -390,12 +397,18 @@ Substrate-visible action coverage at HEAD `c359e89`:
   definition. The mitigation is **mandatory-hook profile** (V08-PE-1,
   procurement-tier `--enforce`) and **TPM-bound binary integrity**
   (V08-PE-6) — the operator runs an attested binary that refuses to
-  serve when the hook is uninstalled.
-- **Read-action gating.** No `AgentAction::Read` variant ships at
-  HEAD. Recall / search / list / get are gated through the K9
-  `Permissions::evaluate` pipeline (memory-scoped) but the engine
-  has no top-level "an agent is reading X" surface. V08-PE-2
-  (**#697**) adds the variant.
+  serve when the hook is uninstalled. **The hook-PRESENCE half of
+  V08-PE-1 shipped at v0.8.0 (#1734):** `AI_MEMORY_HOOKS_ENFORCE_MODE`
+  (`off`/`advisory`/`enforce`, default `off`) paired with
+  `[hooks].required_events` returns `Deny { code: 503 }` when a
+  required pre-* event has no enabled hook.
+- **Read-action gating.** No `AgentAction::Read` variant shipped at
+  the v0.7.0 HEAD `c359e89`. Recall / search / list / get were gated
+  only through the K9 `Permissions::evaluate` pipeline (memory-scoped),
+  with no top-level "an agent is reading X" surface. **Closed at
+  v0.8.0 (PE-2, #1730):** the `AgentAction::Read` variant (wire
+  `read_action`) now routes recall / search / list / get /
+  session_start through the rule engine + audit chain.
 - **Subprocess chains.** A `Bash` rule fires against the literal
   argv the harness proposes. A `bash -c "evil_thing"` invocation
   whose `evil_thing` then `fork()`s an unrelated child is invisible
@@ -407,11 +420,14 @@ Substrate-visible action coverage at HEAD `c359e89`:
   write access could replace `ai-memory` with a forked build that
   no-ops the hook. V08-PE-6 (**#697**) closes this with TPM-bound
   attestation.
-- **Severity-based human escalation.** The engine has three verdict
-  shapes — `Allow`, `Refuse`, `Warn`. There is no `Escalate` shape
-  that opens an operator approval slot for ambiguous decisions.
-  V08-PE-5 (**#697**) adds it with an operator dashboard and
-  approval queue.
+- **Severity-based human escalation.** At the v0.7.0 HEAD the engine
+  had three verdict shapes — `Allow`, `Refuse`, `Warn` — with no
+  `Escalate` shape. **Shipped at v0.8.0 (#1727 / §22 PE-5, schema
+  v66):** `governance_rules.severity` now accepts `escalate`, which
+  produces `Decision::Escalate` — a verdict that **fails closed**
+  (blocks the action exactly like `Refuse`, via `Decision::is_block`)
+  pending human review. The operator dashboard + interactive approval
+  queue that resolve an escalation remain V08-PE-5 (**#697**) scope.
 - **Hard-crash drainer loss.** PE-3's deferred queue is process-local.
   A SIGKILL between the refuse verdict and the drainer's `append`
   loses the audit row. V08-PE-4 (**#697**) makes the queue
@@ -473,7 +489,7 @@ other row is `warn!`-logged and skipped.
 | Action class | Wire-point | Coverage at `c359e89` | Gap closed by |
 |---|---|---|---|
 | Substrate-INTERNAL writes (`memory_store`, `memory_link`, `memory_delete`, `memory_archive`, `memory_consolidate`) | `storage::insert*` + handler-emitted `AuditAction::Store` etc. | **100% audited** (handler emits success row; refusal emits a deferred row once PE-3 merges) | PE-3 (**#696**) for the refusal leg |
-| Substrate-INTERNAL reads (`memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_session_boot`) | `AuditAction::Recall` etc. in handler layer | **100% audited at handler layer** for visibility. Engine-level read gating is out of scope at HEAD — no `AgentAction::Read`. | V08-PE-2 (**#697**) |
+| Substrate-INTERNAL reads (`memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_session_boot`) | `AuditAction::Recall` etc. in handler layer | **100% audited at handler layer** for visibility. Engine-level read gating shipped at v0.8.0 (PE-2, #1730) — `AgentAction::Read` (wire `read_action`) routes these surfaces through the rule engine. | ~~V08-PE-2 (**#697**)~~ shipped #1730 |
 | `memory_replay` (transcript cross-tenant read) | K9 `Op::MemoryReplay` gates the read; audit row on every call | **100% audited** | — |
 | Agent-EXTERNAL `Bash` | `memory_check_agent_action` MCP tool consulted by harness PreToolUse | Audited every call via `check_agent_action` audited path. Harness coverage is operator-configured (PE-2 / **#695**) | PE-2 (**#695**) merges harness installer |
 | Agent-EXTERNAL `FilesystemWrite` outside substrate | as above | as above | as above |
@@ -482,7 +498,7 @@ other row is `warn!`-logged and skipped.
 | Subprocess chains (bash spawn → fork → exec) | not visible at HEAD | **out of scope** | V08-PE-3 (**#697**) |
 | Out-of-band agent actions | not visible by definition | **unenforceable** | partial: V08-PE-1 mandatory-hook + V08-PE-6 TPM (**#697**) |
 | Hard-crash recovery of deferred queue | n/a until PE-3 merges; then process-local | gap | V08-PE-4 (**#697**) |
-| Severity-based escalation (Escalate verdict) | absent at HEAD | gap | V08-PE-5 (**#697**) |
+| Severity-based escalation (`Escalate` verdict) | `governance.check` audit row on every escalate decision (fail-closed, blocks like refuse) | absent at v0.7.0 HEAD; **verdict + `escalate` severity shipped at v0.8.0** (#1727 / schema v66) | interactive dashboard/queue resolution remains V08-PE-5 (**#697**) |
 
 The same matrix from the audit-chain side, with row shapes and
 verification examples, lives in
@@ -495,17 +511,23 @@ verification examples, lives in
 The v0.8.0 closeout epic (**#697**) holds eight sub-tasks. Each
 closes one observable gap from §6 / §8:
 
-- **V08-PE-1** — Mandatory-hook profile (`--enforce` for
-  procurement-tier deployments; daemon refuses to serve when the
-  PreToolUse hook is not installed).
+- **V08-PE-1** — Mandatory-hook profile. **Hook-PRESENCE enforcement
+  shipped at v0.8.0 (#1734):** `AI_MEMORY_HOOKS_ENFORCE_MODE`
+  (`off`/`advisory`/`enforce`, default `off`) paired with
+  `[hooks].required_events` returns `Deny { code: 503 }` when a
+  required pre-* event has no enabled hook (and forces those hooks to
+  effective `fail_mode = Closed`). The procurement-tier
+  refuse-to-serve-without-the-PreToolUse-hook attestation remains open.
 - **V08-PE-2** — Read-action gating (`AgentAction::Read` variant +
   wire-point coverage for the read surface).
 - **V08-PE-3** — Subprocess-chain visibility (eBPF on Linux, dtrace
   on macOS; surfaces the fork+exec chain to the engine).
 - **V08-PE-4** — Persistent audit queue (durable across daemon
   restart; closes the hard-crash gap in PE-3's process-local queue).
-- **V08-PE-5** — Severity-based human escalation (`Decision::Escalate`
-  with operator dashboard + approval queue).
+- **V08-PE-5** — Severity-based human escalation. The
+  `Decision::Escalate` verdict + the `escalate` severity (schema v66)
+  **shipped at v0.8.0 (#1727)**, failing closed pending review; the
+  operator dashboard + interactive approval queue remain open here.
 - **V08-PE-6** — TPM-bound binary integrity (the daemon attests the
   shipping binary against a signed manifest at boot).
 - **V08-PE-7** — Refuse-by-default profile (procurement-tier rule

@@ -663,6 +663,125 @@ pub fn refund_op(conn: &Connection, agent_id: &str, namespace: &str, op: QuotaOp
     Ok(())
 }
 
+/// #1544 — charge ONLY the per-agent storage-bytes ceiling, NOT the
+/// daily memory WRITE-COUNT.
+///
+/// Used by the federation RECEIVE path (`sync_push` /
+/// `sync_push_via_store`). Replicating an already-attested peer memory is
+/// not net-new authorship by the receiver's accounting: charging the
+/// ORIGINAL author's daily write-count both double-counts a memory that
+/// already cleared the author's quota at its origin AND lets an enrolled
+/// peer exhaust an absent author's daily cap — 503-ing that author's OWN
+/// local writes (a cross-tenant DoS). The storage-bytes ceiling stays
+/// enforced so a flood still can't exhaust disk; the daily write-count
+/// quota remains the right control on the AUTHORING node's write path,
+/// where it already lives. Decision: 5-agent vote (memory `4d3ea1c5`).
+///
+/// Atomic `BEGIN IMMEDIATE` check+record, the same shape as
+/// [`check_and_record`] minus the `MemoriesPerDay` dimension.
+///
+/// # Errors
+///
+/// [`QuotaCheckError::Quota`] with [`QuotaLimit::StorageBytes`] when the
+/// op would exceed `max_storage_bytes`; [`QuotaCheckError::Sql`] on a
+/// substrate error.
+pub fn check_and_record_storage_only(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    bytes: i64,
+) -> std::result::Result<(), QuotaCheckError> {
+    let _ = ensure_row(conn, agent_id, namespace).map_err(QuotaCheckError::Sql)?;
+    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
+        .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("BEGIN IMMEDIATE failed: {e}")))?;
+    let result: std::result::Result<(), QuotaCheckError> = (|| {
+        let row = load_row(conn, agent_id, namespace)
+            .map_err(QuotaCheckError::Sql)?
+            .ok_or_else(|| {
+                QuotaCheckError::Sql(anyhow::anyhow!(
+                    "quota row vanished mid-transaction for agent {agent_id} namespace {namespace}"
+                ))
+            })?;
+        if row.current_storage_bytes.saturating_add(bytes) > row.max_storage_bytes {
+            return Err(QuotaCheckError::Quota(QuotaError {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: QuotaLimit::StorageBytes,
+                current: row.current_storage_bytes,
+                max: row.max_storage_bytes,
+            }));
+        }
+        // Storage bytes are cumulative (never daily-reset), so no
+        // day-roll branch is needed — just accumulate.
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE agent_quotas SET
+               current_storage_bytes = current_storage_bytes + ?1,
+               updated_at = ?2
+             WHERE agent_id = ?3 AND namespace = ?4",
+            params![bytes, now, agent_id, namespace],
+        )
+        .map_err(quota_update_failed)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
+                .map_err(|e| QuotaCheckError::Sql(anyhow::anyhow!("quota commit failed: {e}")))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
+/// #1807 — byte estimate for a coordination create (action / signal /
+/// checkpoint). Sums the UTF-8 lengths of the string fields plus the
+/// serialized lengths of the JSON payload fields, saturating to `i64::MAX`.
+/// Mirrors the `(title + content + serialized-metadata)` accounting the
+/// memory write path uses so the same per-namespace storage cap applies
+/// uniformly to coordination objects (which were previously unquota'd +
+/// payload-unbounded). 5-agent review (memory `4d3ea1c5`) deemed #1807
+/// legitimate; this is the precedent-copy of the federation-receive
+/// `check_and_record_storage_only` accounting.
+#[must_use]
+pub fn coordination_payload_bytes(strs: &[&str], jsons: &[&serde_json::Value]) -> i64 {
+    let total: usize = strs.iter().map(|s| s.len()).sum::<usize>()
+        + jsons
+            .iter()
+            .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum::<usize>();
+    i64::try_from(total).unwrap_or(i64::MAX)
+}
+
+/// #1544 — refund a storage-only charge made by
+/// [`check_and_record_storage_only`]: decrements `current_storage_bytes`
+/// only (the daily write-count is never incremented on the receive
+/// path). Saturating at zero, mirroring [`refund_op`] for the storage
+/// dimension.
+///
+/// # Errors
+///
+/// Wrapped SQL errors on update failure.
+pub fn refund_storage_only(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    bytes: i64,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE agent_quotas SET
+           current_storage_bytes = MAX(current_storage_bytes - ?1, 0),
+           updated_at = ?2
+         WHERE agent_id = ?3 AND namespace = ?4",
+        params![bytes, now, agent_id, namespace],
+    )?;
+    Ok(())
+}
+
 /// v0.7 K8 — record a successful write against the
 /// `(agent_id, namespace)` quota counters. Called AFTER the underlying
 /// insert succeeds so a failed store does not consume quota.
@@ -1271,6 +1390,53 @@ mod tests {
             QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::StorageBytes),
             QuotaCheckError::Sql(e) => panic!("expected quota, got SQL: {e}"),
         }
+    }
+
+    /// #1544 — the federation RECEIVE charge (`check_and_record_storage_only`)
+    /// must NOT consume the per-agent daily WRITE-COUNT (so replication is
+    /// never 429-capped at `max_memories_per_day`, killing the cross-tenant
+    /// DoS) while STILL enforcing the storage-bytes ceiling (anti-flood).
+    #[test]
+    fn storage_only_ignores_daily_count_but_enforces_storage_cap() {
+        let conn = fresh_db();
+        // Materialise the row, then pin the daily-count cap to 1.
+        check_and_record_storage_only(&conn, "fed-author", GLOBAL_NAMESPACE, 10).unwrap();
+        conn.execute(
+            "UPDATE agent_quotas SET max_memories_per_day = 1, max_storage_bytes = 100000
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["fed-author", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        // 50 more storage-only charges all succeed despite the count cap of
+        // 1 — replication is never daily-count-capped.
+        for _ in 0..50 {
+            check_and_record_storage_only(&conn, "fed-author", GLOBAL_NAMESPACE, 10).unwrap();
+        }
+        let s = get_status(&conn, "fed-author", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(
+            s.current_memories_today, 0,
+            "storage-only must NEVER charge the daily write-count"
+        );
+        assert_eq!(s.current_storage_bytes, 510, "51 charges x 10 bytes");
+
+        // The storage ceiling IS still enforced.
+        conn.execute(
+            "UPDATE agent_quotas SET max_storage_bytes = 515
+             WHERE agent_id = ?1 AND namespace = ?2",
+            params!["fed-author", GLOBAL_NAMESPACE],
+        )
+        .unwrap();
+        let err = check_and_record_storage_only(&conn, "fed-author", GLOBAL_NAMESPACE, 10)
+            .expect_err("storage cap must still fire");
+        match err {
+            QuotaCheckError::Quota(q) => assert_eq!(q.limit, QuotaLimit::StorageBytes),
+            QuotaCheckError::Sql(e) => panic!("expected Quota(StorageBytes), got SQL: {e}"),
+        }
+        // refund_storage_only decrements only storage (count was never charged).
+        refund_storage_only(&conn, "fed-author", GLOBAL_NAMESPACE, 110).unwrap();
+        let s2 = get_status(&conn, "fed-author", GLOBAL_NAMESPACE).unwrap();
+        assert_eq!(s2.current_storage_bytes, 400);
+        assert_eq!(s2.current_memories_today, 0);
     }
 
     #[test]

@@ -11,6 +11,8 @@
 //! gating behavior, so the path strings live here exactly once.
 //! Param segments use the axum `{param}` capture syntax.
 
+pub const ACTIONS_ID_TRANSITION: &str = "/api/v1/actions/{id}/transition";
+pub const SIGNALS: &str = "/api/v1/signals";
 pub const AGENTS: &str = "/api/v1/agents";
 /// #1539 — admin-gated attestation pubkey bind for a registered agent.
 pub const AGENTS_ID_PUBKEY: &str = "/api/v1/agents/{id}/pubkey";

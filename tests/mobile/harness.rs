@@ -38,8 +38,9 @@ use std::sync::OnceLock;
 /// - **Android**: `<Context.getFilesDir>/ai-memory-test-<test_name>.db`
 ///   on the emulator that's `/data/data/<pkg>/files/` (the test
 ///   runner injects this via the `ANDROID_DATA_DIR` env var).
-/// - **Host (linux/macOS/windows)**: a `std::env::temp_dir()`
-///   subdir, used as the smoke-run fallback in normal CI.
+/// - **Host (linux/macOS/windows)**: a project-local `.local-runs/`
+///   subdir, used as the smoke-run fallback in normal CI (honors the
+///   no-/tmp HARD RULE in CLAUDE.md — see `sandbox_root`).
 pub fn sandbox_db_path(test_name: &str) -> PathBuf {
     let base = sandbox_root();
     let p = base.join(format!("ai-memory-test-{test_name}.db"));

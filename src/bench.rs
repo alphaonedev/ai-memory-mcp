@@ -388,6 +388,7 @@ fn run_search_fts(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             None,
             None,
             false,
+            None, // #1720 — bench has no identity; trust-all
         )?;
         let elapsed = start.elapsed();
         if i >= config.warmup {
@@ -419,6 +420,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             None,
             false,
             None,
+            None, // #1720 — bench has no identity; trust-all
         )?;
     }
     let mut samples = Vec::with_capacity(config.iterations);
@@ -439,6 +441,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
             None,
             false,
             None,
+            None, // #1720 — bench has no identity; trust-all
         )?;
         samples.push(start.elapsed());
     }
@@ -649,6 +652,7 @@ fn synth_memory(namespace: &str, i: usize, prefix: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     }
 }
 

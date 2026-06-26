@@ -42,9 +42,9 @@ agents and humans always know exactly what's loaded and what's configured.
 ```
 
 > DOC-4 (med/low review batch) — example version + schema bumped to
-> match the v0.7.0 substrate (`CURRENT_SCHEMA_VERSION = 57`). The
-> pre-v0.7.0 example showed v0.6.3 / schema v19, which was 32
-> migrations behind the substrate and 2+ major releases behind the
+> match the current v0.8.0-dev substrate (`CURRENT_SCHEMA_VERSION = 70`).
+> The pre-v0.7.0 example showed v0.6.3 / schema v19, which was many
+> migrations behind the substrate and major releases behind the
 > daemon binary integrators land on today.
 
 The four status variants share the same manifest shape; only the first
@@ -149,7 +149,7 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 
 | File | Agent | Category | Installer | Status |
 |---|---|---|---|---|
-| [`claude-code.md`](claude-code.md) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (hook) | yes | reference recipe |
+| [`claude-code.md`](claude-code.md) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (2 hooks: SessionStart boot + PreToolUse governance) | yes | reference recipe |
 | [`cursor.md`](cursor.md) | Cursor | 2 (MCP + rules) | yes | recipe |
 | [`cline.md`](cline.md) | Cline (VS Code extension) | 2 (MCP + custom instructions) | yes (--config) | recipe |
 | [`roo-code.md`](roo-code.md) | Roo Code (Cline fork) | 2 (MCP + custom instructions) | no (PR-2 follow-up) | recipe |

@@ -74,6 +74,13 @@
 #   sudo ./postgres-droplet-reinit.sh --dry-run       # show plan, take no action
 #   sudo ./postgres-droplet-reinit.sh --skip-disposable
 #                                                     # only re-init `aimemory`
+#   sudo ./postgres-droplet-reinit.sh --yes           # skip the interactive
+#                                                     # type-the-db-name confirm
+#                                                     # (vetted automation only)
+#
+# The live (non --dry-run) path prompts you to TYPE the primary db name
+# (#1785) before any DROP DATABASE runs; pass --yes/-y to bypass it for
+# vetted automation. A non-interactive stdin without --yes is refused.
 #
 # POST-RUN VERIFICATION
 # ---------------------
@@ -126,11 +133,13 @@ DISPOSABLE_DBS=(
 
 DRY_RUN=0
 SKIP_DISPOSABLE=0
+ASSUME_YES=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --skip-disposable) SKIP_DISPOSABLE=1 ;;
+        --yes|-y) ASSUME_YES=1 ;;
         --help|-h)
             sed -n '1,/^set -euo pipefail$/p' "$0" | sed -e 's/^# \?//' -e '$d'
             exit 0
@@ -165,6 +174,39 @@ require_password() {
     fi
     PG_PWD="$(cat "$PG_PASSWORD_FILE")"
     export PGPASSWORD="$PG_PWD"
+}
+
+# #1785 — interactive confirmation gate on the LIVE (non-dry-run)
+# destructive path. The operator must TYPE the primary db name to confirm
+# before any `DROP DATABASE` runs (step 2 primary + step 4 disposables).
+# No-op under --dry-run (psql_postgres only logs there). Bypassable with
+# --yes/-y for vetted automation; refuses to silently proceed on a
+# non-interactive stdin without --yes so a fat-fingered piped invocation
+# cannot drop the prod db unattended.
+confirm_destruction() {
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ "$ASSUME_YES" -eq 1 ]]; then
+        log "confirmation bypassed via --yes; proceeding with destructive reinit"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        echo "FATAL: refusing to DROP DATABASE on a non-interactive stdin without --yes." >&2
+        echo "       Re-run attached to a terminal, or pass --yes if this is vetted automation." >&2
+        exit 6
+    fi
+    echo "" >&2
+    echo "WARNING: this will DROP DATABASE ${PG_PRIMARY_DB} (and the disposable scenario" >&2
+    echo "         databases unless --skip-disposable) on host ${PG_HOST}. This DESTROYS data." >&2
+    echo "         A pg_dump backup was taken at ${BACKUP_FILE}, but recovery is manual." >&2
+    local typed=""
+    read -r -p "Type the database name (${PG_PRIMARY_DB}) to confirm, anything else to abort: " typed
+    if [[ "$typed" != "$PG_PRIMARY_DB" ]]; then
+        echo "FATAL: confirmation text did not match '${PG_PRIMARY_DB}' — aborting before destructive step." >&2
+        exit 6
+    fi
+    log "confirmation accepted; proceeding with destructive reinit"
 }
 
 psql_postgres() {
@@ -239,6 +281,10 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2 — drop + recreate primary
 # ---------------------------------------------------------------------------
+
+# #1785 — interactive confirm AFTER the backup (so the pg_dump-first guard
+# is preserved) and BEFORE the first DROP. No-op under --dry-run.
+confirm_destruction
 
 log "step 2: drop + recreate ${PG_PRIMARY_DB}"
 psql_postgres -c "DROP DATABASE IF EXISTS ${PG_PRIMARY_DB};"

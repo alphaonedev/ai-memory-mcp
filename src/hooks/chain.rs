@@ -613,6 +613,61 @@ pub fn spawn_eviction_observer(
     tx
 }
 
+/// v0.8.0 Pillar-1 (#1714) — spawn a POST/observability-event observer that
+/// bridges a SYNCHRONOUS producer to the async [`HookChain::fire`]. Returns the
+/// send-half of a tokio unbounded channel; each JSON payload sent re-enters the
+/// chain as `event`.
+///
+/// The MCP stdio dispatch (the primary NHI interface) runs on a
+/// `spawn_blocking` thread with NO entered tokio runtime, so it can neither
+/// `.await` a chain nor `tokio::spawn` onto the caller's runtime. This observer
+/// therefore owns a SELF-CONTAINED current-thread runtime — fully independent
+/// of the producer's context. It mirrors [`spawn_eviction_observer`] (the
+/// `OnIndexEviction` post/observe bridge) but with that runtime-independence.
+///
+/// POST-ONLY by contract: the observer drains AFTER the producing operation has
+/// already returned, so a `Deny`/`Modify` it produced would be unactionable; a
+/// `debug_assert` refuses a pre-event. The unbounded `Sender` is
+/// `Send + Sync + Clone` and its `send` is runtime-free, so a sync producer can
+/// hold it inside a `Fn + Send + Sync` callback (a `std::sync::mpsc::Sender` is
+/// `!Sync` and could not). When every `Sender` clone drops (process shutdown)
+/// `recv` returns `None`, the loop ends, the runtime drops, and the thread exits.
+#[must_use]
+pub fn spawn_post_event_observer(
+    chain: Arc<HookChain>,
+    mut registry: ExecutorRegistry,
+    event: HookEvent,
+) -> tokio::sync::mpsc::UnboundedSender<Value> {
+    debug_assert!(
+        !is_pre_event(event),
+        "spawn_post_event_observer is POST-only; refusing pre-event {event:?}"
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::warn!(
+                    event = ?event,
+                    error = %e,
+                    "hooks: post-event observer could not build its runtime; \
+                     events for this chain will be dropped"
+                );
+                return;
+            }
+        };
+        rt.block_on(async move {
+            while let Some(payload) = rx.recv().await {
+                let _ = chain.fire(event, payload, &mut registry).await;
+            }
+        });
+    });
+    tx
+}
+
 // ---------------------------------------------------------------------------
 // Delta merging helpers
 // ---------------------------------------------------------------------------

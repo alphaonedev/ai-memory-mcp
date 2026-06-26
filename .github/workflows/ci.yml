@@ -250,7 +250,16 @@ jobs:
       # ~7 GB ubuntu ceiling. Cross-OS safe: only narrows debuginfo,
       # does not affect the `--release` build (debug=0). Mirrors the
       # postgres-feature / coverage jobs' knob.
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      #
+      # CI-speed (windows): windows is the slowest of the three REQUIRED
+      # `Check (os)` gates (the only checks that block a merge to
+      # main/develop), and its `cargo test` cost is dominated by MSVC
+      # link + PDB generation. Drop dev debuginfo to 0 on windows ONLY so
+      # no PDB is generated/linked — pure link-time win, behavior-identical
+      # (tests pass/fail exactly the same; only panic backtraces lose
+      # line numbers, which ubuntu/macos still retain at debug=1). Keep
+      # ubuntu at 1 for the OOM posture above + readable backtraces.
+      CARGO_PROFILE_DEV_DEBUG: ${{ matrix.os == 'windows-latest' && '0' || '1' }}
     strategy:
       fail-fast: false
       matrix:
@@ -289,7 +298,16 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL    || true  # ~5 GiB
           sudo rm -rf /usr/local/lib/android         || true  # ~13 GiB
           sudo rm -rf /opt/ghc                       || true  # ~5 GiB
+          sudo rm -rf /usr/local/.ghcup              || true  # ~6 GiB (#1810)
+          sudo docker system prune -af --volumes     || true  # ~4 GiB (#1810)
           sudo apt-get clean
+          # #1810 — bring the Check job's pre-test disk cleanup up to parity
+          # with the (passing, heavier-llvm-cov) Coverage job, which already
+          # frees `.ghcup` + docker images. The full `cargo test` compile of
+          # all integration bins under DEV_DEBUG=1 (full debug symbols)
+          # exhausted the ubuntu runner disk on c3087e33 with
+          # `rustc-LLVM ERROR: No space left on device`; the extra ~10 GiB
+          # restores headroom. macOS/Windows Check + Coverage were unaffected.
           # #1407 — add 8 GB swap on /mnt (ephemeral data disk) so the
           # heavy lib-test link step has headroom above the ~7 GB RAM
           # ceiling and stops dying with `ld ... signal 7 [Bus error]`.
@@ -449,8 +467,15 @@ jobs:
           du -sh target 2>/dev/null || true
           echo "::endgroup::"
 
-      - name: Build release
-        if: needs.classify.outputs.docs_only != 'true'
+      # CI-speed: the release build here is only a release-PROFILE compile
+      # smoke (opt-level + thin-LTO). The distributable per-OS artifacts are
+      # produced by release.yml on tag, and a release-profile-only break that
+      # the debug `cargo test` build on ubuntu wouldn't already catch is
+      # vanishingly rare for this pure-Rust + bundled-sqlite crate. Running it
+      # on ubuntu ONLY takes it off the windows critical path (-759s) and macos
+      # (-~400s) — the prep `cargo clean` step above is already ubuntu-only.
+      - name: Build release (ubuntu — release-profile smoke)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'ubuntu-latest'
         run: cargo build --release
 
   # M16 — Postgres-feature gate. The cross-platform `check` matrix above
@@ -492,11 +517,15 @@ jobs:
       # `--features sal-postgres` build (sqlx + sqlx-postgres + AGE +
       # pgvector = massive symbol table).
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
-      # Downgrade dev-profile debug info from level 2 (full DWARF)
-      # to level 1 (line tables only). The Postgres feature gate
-      # uses the dev profile via `cargo test`, not the `coverage`
-      # profile, so the env-var override is the cleanest knob.
-      CARGO_PROFILE_DEV_DEBUG: "1"
+      # Drop dev-profile debug info entirely (level 0). The Postgres
+      # feature gate uses the dev profile via `cargo test`, not the
+      # `coverage` profile, so the env-var override is the cleanest knob.
+      # #1744: line-table DWARF on the heavy sal-postgres test binaries
+      # cost GBs of target/ space — enough to exhaust the ~14 GB runner
+      # disk during the test compile ("No space left on device", run
+      # 27818775169). The #1492 hung-test watchdog uses timeout(1), not
+      # symbolized backtraces, so debug info buys nothing here.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     services:
       postgres:
         # pgvector/pgvector:pg16 ships postgres 16 with pgvector already
@@ -573,6 +602,26 @@ jobs:
 
       - name: Clippy (sal-postgres feature, lib + tests)
         run: cargo clippy --features sal-postgres --tests -- -D warnings -D clippy::all -D clippy::pedantic
+
+      - name: Reclaim disk before test compile (#1744)
+        run: |
+          # #1744 — the Clippy step above lands a full sal-postgres debug
+          # build in target/. The test step then compiles the test
+          # binaries on top, and the sum overflowed the ~14 GB runner disk
+          # ("No space left on device", run 27818775169). The one-shot
+          # "Free disk" step runs before Clippy, too early to help the
+          # test-compile peak. Drop the Clippy-only incremental + dep
+          # artifacts here so the test compile starts with headroom; the
+          # crate's own fresh objects rebuild cheaply.
+          echo "::group::disk before reclaim"
+          df -h /
+          du -sh target 2>/dev/null || true
+          echo "::endgroup::"
+          rm -rf target/debug/incremental || true
+          cargo clean -p ai-memory 2>/dev/null || true
+          echo "::group::disk after reclaim"
+          df -h /
+          echo "::endgroup::"
 
       - name: Run lib + integration tests (sal-postgres feature, impact-aware)
         env:

@@ -14,6 +14,8 @@
 use crate::cli::CliOutput;
 use crate::curator::reflection_pass;
 use crate::identity::keypair as identity_keypair;
+#[cfg(feature = "sal")]
+use crate::store::{CallerContext, Filter, MemoryStore};
 use crate::{autonomy, config, curator, db, llm};
 use anyhow::{Context, Result};
 use clap::Args;
@@ -172,6 +174,14 @@ pub async fn run(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     if args.rollback.is_some() || args.rollback_last.is_some() {
+        // #1748 (slice-3c2) — when `--store-url` selects a (postgres) SAL
+        // store, reverse the rollback rows the store-backed curator wrote
+        // (slice-3c1) through the `MemoryStore` trait; the rusqlite path
+        // below only ever sees the local SQLite file.
+        #[cfg(feature = "sal")]
+        if curator_store_url(args).is_some() {
+            return run_store_backed_rollback(db_path, args, app_config, out).await;
+        }
         return run_rollback(db_path, args, out);
     }
 
@@ -202,7 +212,7 @@ pub async fn run(
         dry_run: args.dry_run,
         include_namespaces: args.include_namespaces.clone(),
         exclude_namespaces: args.exclude_namespaces.clone(),
-        compaction: curator::CompactionConfig::default(),
+        compaction: curator_compaction_config(app_config),
     };
 
     let feature_tier = app_config.effective_tier(None);
@@ -240,10 +250,30 @@ pub async fn run(
         args.dry_run,
         args.include_namespaces.clone(),
         args.exclude_namespaces.clone(),
+        // #1749 — resolve compaction.enabled here (the daemon body has no
+        // AppConfig in scope) and thread it as a primitive.
+        app_config.resolve_compaction_enabled(),
         llm.map(std::sync::Arc::new),
         shutdown,
     )
     .await
+}
+
+/// v0.8.0 #1749/#1750 — build the curator's [`curator::CompactionConfig`] from
+/// operator config. `enabled` (#1749, env > `[curator.compaction]` > false) and
+/// `cosine_threshold` (#1750, env > config > 0.75 — threaded into the live
+/// clusterer via `ConsolidationPass::with_cosine_threshold`) are
+/// operator-reachable; `max_corpus_bytes` stays at its compiled default (size-GC
+/// eviction is gated on `enabled` and not yet operator-exposed — when it is, it
+/// gets its own `[curator.size_gc]` switch per the #1750 vote `a9b2fe09`).
+/// Shared by every production `CuratorConfig` build site so resolution is
+/// identical across the sqlite + store-backed paths.
+fn curator_compaction_config(app_config: &config::AppConfig) -> curator::CompactionConfig {
+    curator::CompactionConfig {
+        enabled: app_config.resolve_compaction_enabled(),
+        cosine_threshold: app_config.resolve_compaction_cosine_threshold(),
+        ..Default::default()
+    }
 }
 
 /// v0.7.0 #1548 — resolve the operator-supplied `--store-url` flag in
@@ -294,7 +324,27 @@ async fn run_store_backed_sweep(
     let feature_tier = app_config.effective_tier(None);
     let llm = build_curator_llm(feature_tier);
 
+    // v0.8.0 Pillar-2.5 slice-3c1 (#1747) — config for the store-backed
+    // consolidation sweep. `compaction.enabled` resolved from operator config
+    // (#1749, env > [curator.compaction] > default false); the gate mirrors the
+    // sqlite `run_once` path.
+    let curator_cfg = curator::CuratorConfig {
+        interval_secs: args.interval_secs,
+        max_ops_per_cycle: args.max_ops,
+        dry_run: args.dry_run,
+        include_namespaces: args.include_namespaces.clone(),
+        exclude_namespaces: args.exclude_namespaces.clone(),
+        compaction: curator_compaction_config(app_config),
+    };
     if args.once {
+        // Consolidation BEFORE reflection (dedup, then reflect over survivors).
+        let consolidation = store_backed_consolidation_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            &curator_cfg,
+        )
+        .await;
+        log_store_backed_consolidation(&consolidation);
         let report = store_backed_reflection_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
@@ -335,6 +385,14 @@ async fn run_store_backed_sweep(
     );
 
     while !shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        // Consolidation BEFORE reflection (dedup, then reflect over survivors).
+        let consolidation = store_backed_consolidation_sweep(
+            store.as_ref(),
+            llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
+            &curator_cfg,
+        )
+        .await;
+        log_store_backed_consolidation(&consolidation);
         let report = store_backed_reflection_sweep(
             store.as_ref(),
             llm.as_ref().map(|c| c as &dyn crate::autonomy::AutonomyLlm),
@@ -395,6 +453,129 @@ async fn store_backed_reflection_sweep(
         |_ns: &str| true,
     )
     .await
+}
+
+/// v0.8.0 Pillar-2.5 slice-3c1 (#1747) — run the SAL `ConsolidationPass` over a
+/// store-backed (postgres or `--store-url` sqlite) curator tick: the
+/// backend-agnostic twin of [`store_backed_reflection_sweep`]. Gated on
+/// `cfg.compaction.enabled` (default `false` → no-op, production byte-unchanged).
+/// Iterates non-reserved namespaces via [`MemoryStore::list_namespaces`], gathers
+/// + filters candidates (`needs_curation`, capped at `max_ops_per_cycle` so a
+/// store-backed cycle consolidates the same population the sqlite path would),
+/// and runs [`ConsolidationPass::run`] real (respecting `cfg.dry_run`). A missing
+/// LLM folds into the report rather than aborting the daemon (mirrors
+/// [`run_reflection_pass_with_optional_llm`]).
+///
+/// **Run BEFORE reflection** in the sweep so consolidation's hard-DELETE of
+/// near-duplicate sources happens before reflection links over the surviving
+/// corpus — avoiding dangling `reflects_on` edges to consolidated-away rows.
+///
+/// **Rollback (#1748, slice-3c2):** the operator-reversible rollback rows the
+/// pass writes ARE reversible on both backends — `ai-memory curator --rollback
+/// [--store-url postgres://…]` dispatches to
+/// [`crate::autonomy::reverse_rollback_entry_store`] over the `MemoryStore`
+/// trait. (The slice-3c1 remote-store WARN is gone now that reversal works.)
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` (#1747).
+#[cfg(feature = "sal")]
+async fn store_backed_consolidation_sweep(
+    store: &dyn MemoryStore,
+    llm: Option<&dyn autonomy::AutonomyLlm>,
+    cfg: &curator::CuratorConfig,
+) -> curator::compaction::ConsolidationRunReport {
+    let mut report = curator::compaction::ConsolidationRunReport::default();
+    if !cfg.compaction.enabled {
+        return report; // default-off → true no-op
+    }
+    let Some(llm) = llm else {
+        report
+            .errors
+            .push("no LLM client configured — consolidation skipped".to_string());
+        return report;
+    };
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+    let namespaces = match store.list_namespaces().await {
+        Ok(ns) => ns,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation: list_namespaces failed: {e}"));
+            return report;
+        }
+    };
+
+    // Gather candidates across non-reserved namespaces, applying the SAME
+    // `needs_curation` filter the sqlite path uses, capped at max_ops_per_cycle.
+    let cap = cfg.max_ops_per_cycle.max(1);
+    let mut candidates: Vec<crate::models::Memory> = Vec::new();
+    'ns: for nsc in &namespaces {
+        if nsc.namespace.starts_with('_') {
+            continue;
+        }
+        let filter = Filter {
+            namespace: Some(nsc.namespace.clone()),
+            limit: cap,
+            ..Default::default()
+        };
+        match store.list(&ctx, &filter).await {
+            Ok(rows) => {
+                for m in rows {
+                    if curator::candidates::needs_curation(&m, cfg) {
+                        candidates.push(m);
+                        if candidates.len() >= cap {
+                            break 'ns;
+                        }
+                    }
+                }
+            }
+            Err(e) => report.errors.push(format!(
+                "consolidation: list({}) failed: {e}",
+                nsc.namespace
+            )),
+        }
+    }
+
+    if candidates.is_empty() {
+        return report;
+    }
+
+    // #1750 — thread the operator-resolved cosine gate into the clusterer.
+    let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run)
+        .with_cosine_threshold(cfg.compaction.cosine_threshold);
+    match pass.run(&candidates).await {
+        Ok(out) => {
+            // Preserve any list/namespace errors gathered above.
+            let mut merged = out;
+            merged.errors.splice(0..0, report.errors.clone());
+            report = merged;
+        }
+        Err(e) => report
+            .errors
+            .push(format!("consolidation pass failed: {e}")),
+    }
+    report
+}
+
+/// Emit a `tracing` line summarising a store-backed consolidation sweep, mirroring
+/// the reflection-sweep cycle log. No-op-quiet when compaction is disabled (the
+/// report is all-zero).
+#[cfg(feature = "sal")]
+fn log_store_backed_consolidation(report: &curator::compaction::ConsolidationRunReport) {
+    if report.clusters_formed == 0 && report.memories_consolidated == 0 && report.errors.is_empty()
+    {
+        return;
+    }
+    tracing::info!(
+        target: curator::compaction::COMPACTION_TRACE_TARGET,
+        "curator SAL consolidation: clusters_formed={} eligible={} consolidated={} \
+         rollback_entries={} rolled_back={} errors={}",
+        report.clusters_formed,
+        report.eligible_clusters,
+        report.memories_consolidated,
+        report.rollback_entries_written,
+        report.rolled_back,
+        report.errors.len(),
+    );
 }
 
 /// v0.7.0 #1548 — run the reflection pass over a SAL store with an
@@ -539,6 +720,156 @@ async fn run_reflect(
         writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
     } else {
         print_reflection_report(&report, out)?;
+    }
+
+    // #1393 sub-unit 2 — transcript-classify pass, opt-in via
+    // `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED`. Reuses the same SAL store +
+    // LLM + keypair-derived identity the reflection pass just ran with, so
+    // `curator --reflect` reclassifies recovered Observations the LLM refines
+    // (Decision/Claim/Event…) via the audited `reclassify_memory_kind` path.
+    // `classify_kind` is a no-op on stub/abstaining backends, so the pass is
+    // inert without a real LLM — skip with a note rather than scan for nothing.
+    if app_config.resolve_transcript_classify_enabled() {
+        if let Some(client) = llm.as_ref() {
+            let agent_id = keypair.as_ref().map_or_else(
+                || crate::identity::sentinels::AI_CURATOR.to_string(),
+                |k| k.agent_id.clone(),
+            );
+            let tc_result = crate::curator::transcript_classify_pass::run_transcript_classify_pass(
+                store.as_ref(),
+                client as &dyn crate::autonomy::AutonomyLlm,
+                &agent_id,
+                args.namespace.as_deref(),
+                args.dry_run,
+                0, // default per-cycle cap
+            )
+            .await;
+            match tc_result {
+                Ok(tc) => {
+                    if args.json {
+                        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&tc)?)?;
+                    } else {
+                        writeln!(
+                            out.stdout,
+                            "transcript-classify: scanned={} classified={} reclassified={} \
+                             abstained={} errors={} (dry_run={})",
+                            tc.observations_scanned,
+                            tc.classified,
+                            tc.reclassified,
+                            tc.abstained,
+                            tc.errors.len(),
+                            tc.dry_run,
+                        )?;
+                    }
+                }
+                Err(e) => writeln!(out.stderr, "transcript-classify pass error: {e}")?,
+            }
+        } else {
+            writeln!(
+                out.stderr,
+                "transcript-classify: skipped (AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED set but no LLM backend configured)"
+            )?;
+        }
+    }
+
+    // #1764 (v0.8.0 slice) — reflection-corpus decorrelation VISIBILITY probe,
+    // opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE` (default `off`). Reuses
+    // the same SAL store + keypair-derived curator identity the reflection pass
+    // ran with; read-only (no writes). Called unconditionally — the step
+    // early-returns when the mode is `off` (the default), so the curator's
+    // output + DB are byte-unchanged when disabled. Design: 5-agent vote
+    // (4d3ea1c5).
+    let decorrelation_agent_id = keypair.as_ref().map_or_else(
+        || crate::identity::sentinels::AI_CURATOR.to_string(),
+        |k| k.agent_id.clone(),
+    );
+    run_decorrelation_probe_step(
+        store.as_ref(),
+        &decorrelation_agent_id,
+        args,
+        config::reflect_decorrelation_mode(),
+        config::reflect_decorrelation_dominance_threshold(),
+        out,
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// #1764 (v0.8.0 slice) — run the reflection-corpus decorrelation VISIBILITY
+/// probe and render its report. Early-returns (no output, no scan) when `mode`
+/// is `off` (the default). Split out of [`run_reflect`] so the active path is
+/// unit-testable by passing `mode` directly — no env mutation, no test races.
+/// `enforce` is INERT at v0.8.0 (the runner degrades it to advisory with a
+/// one-shot WARN) — write-time N≥3 model-family-distinct REFUSAL is the tracked
+/// v0.9 lane (#1719 / #1171).
+#[cfg(feature = "sal")]
+async fn run_decorrelation_probe_step(
+    store: &dyn crate::store::MemoryStore,
+    agent_id: &str,
+    args: &CuratorArgs,
+    mode: config::ReflectDecorrelationMode,
+    threshold: f64,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if !mode.is_active() {
+        return Ok(());
+    }
+    let probe_result = crate::curator::decorrelation_probe::run_decorrelation_probe(
+        store,
+        agent_id,
+        args.namespace.as_deref(),
+        mode,
+        threshold,
+        crate::curator::decorrelation_probe::MIN_REFLECTIONS_FLOOR,
+    )
+    .await;
+    match probe_result {
+        Ok(probe) => print_decorrelation_report(&probe, args.json, out)?,
+        Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
+    }
+    Ok(())
+}
+
+/// #1764 — render a [`crate::curator::decorrelation_probe::DecorrelationProbeReport`]
+/// to `out` as pretty JSON (`json = true`) or a one-line summary + an indented
+/// `ADVISORY` line per dominated namespace (each carrying the CLAIMED-not-attested
+/// caveat).
+#[cfg(feature = "sal")]
+fn print_decorrelation_report(
+    probe: &crate::curator::decorrelation_probe::DecorrelationProbeReport,
+    json: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    if json {
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(probe)?)?;
+        return Ok(());
+    }
+    writeln!(
+        out.stdout,
+        "decorrelation-probe: mode={} threshold={:.2} namespaces={} \
+         reflections={} advisories={}{}",
+        probe.mode,
+        probe.threshold,
+        probe.namespaces_scanned,
+        probe.reflections_scanned,
+        probe.advisories.len(),
+        if probe.enforce_degraded_to_advisory {
+            " (enforce INERT at v0.8.0 → advisory)"
+        } else {
+            ""
+        },
+    )?;
+    for adv in &probe.advisories {
+        writeln!(
+            out.stdout,
+            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={} — {}",
+            adv.namespace,
+            adv.report.dominance_ratio,
+            adv.report.dominant_producer.as_deref().unwrap_or("?"),
+            adv.report.distinct_producers,
+            adv.caveat,
+        )?;
     }
     Ok(())
 }
@@ -726,6 +1057,85 @@ fn run_rollback(db_path: &Path, args: &CuratorArgs, out: &mut CliOutput<'_>) -> 
     // preserves the audit message but keeps the failure recoverable (typed
     // CLI exit code) instead of crashing the process with a panic.
     anyhow::bail!("run_rollback entered without --rollback or --rollback-last");
+}
+
+/// v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed twin of
+/// [`run_rollback`]. Dispatched from [`run`] when `--store-url` selects a
+/// (postgres) SAL store, so `curator --rollback[-last] --store-url
+/// postgres://…` reverses the consolidations the store-backed curator
+/// wrote (slice-3c1, #1747) through
+/// [`autonomy::reverse_rollback_entry_store`] over the
+/// [`crate::store::MemoryStore`] trait — rather than the rusqlite-bound
+/// [`autonomy::reverse_rollback_entry`], which only ever sees the local
+/// SQLite file. Closes the slice-3c1 rollback-trap (the WARN in
+/// [`store_backed_consolidation_sweep`] is removed accordingly).
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` → Option B (memory `ed85b972`).
+#[cfg(feature = "sal")]
+async fn run_store_backed_rollback(
+    db_path: &Path,
+    args: &CuratorArgs,
+    app_config: &config::AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let store =
+        crate::daemon_runtime::build_curator_store(curator_store_url(args), db_path, app_config)
+            .await?;
+    let ctx = CallerContext::for_admin(crate::identity::sentinels::AI_CURATOR);
+
+    if let Some(id) = &args.rollback {
+        let mem = match store.get(&ctx, id).await {
+            Ok(m) => m,
+            Err(crate::store::StoreError::NotFound { .. }) => {
+                anyhow::bail!("rollback entry {id} not found");
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let entry: autonomy::RollbackEntry = serde_json::from_str(&mem.content)
+            .context("rollback entry content is not a valid RollbackEntry JSON")?;
+        let applied = autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+        if !mem.tags.iter().any(|t| t == "_reversed") {
+            let mut tagged = mem.clone();
+            tagged.tags.push("_reversed".to_string());
+            store.store(&ctx, &tagged).await?;
+        }
+        writeln!(
+            out.stdout,
+            "rollback {id}: {}",
+            if applied { "applied" } else { "no-op" }
+        )?;
+        return Ok(());
+    }
+
+    if let Some(n) = args.rollback_last {
+        let filter = Filter {
+            namespace: Some("_curator/rollback".to_string()),
+            limit: n.max(1),
+            ..Default::default()
+        };
+        let log = store.list(&ctx, &filter).await?;
+        let mut reversed = 0usize;
+        for mem in &log {
+            if mem.tags.iter().any(|t| t == "_reversed") {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<autonomy::RollbackEntry>(&mem.content) else {
+                continue;
+            };
+            let applied =
+                autonomy::reverse_rollback_entry_store(store.as_ref(), &ctx, &entry).await?;
+            if applied {
+                reversed += 1;
+                let mut tagged = mem.clone();
+                tagged.tags.push("_reversed".to_string());
+                store.store(&ctx, &tagged).await?;
+            }
+        }
+        writeln!(out.stdout, "reversed {reversed} rollback entries")?;
+        return Ok(());
+    }
+
+    anyhow::bail!("run_store_backed_rollback entered without --rollback or --rollback-last");
 }
 
 #[cfg(test)]
@@ -951,6 +1361,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).expect("db::insert")
     }
@@ -1000,6 +1411,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap()
         };
@@ -1076,6 +1488,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             let m2 = crate::models::Memory {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1104,6 +1517,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             t1 = db::insert(&conn, &m1).unwrap();
             t2 = db::insert(&conn, &m2).unwrap();
@@ -1178,6 +1592,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             target = db::insert(&conn, &mem).unwrap();
         }
@@ -1222,6 +1637,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             entry_id = db::insert(&conn, &mem).unwrap();
         }
@@ -1487,6 +1903,131 @@ mod tests {
         assert!(s.contains("reflection pass report"));
     }
 
+    // ── #1764 — decorrelation VISIBILITY probe wiring coverage ──────────
+    #[cfg(feature = "sal")]
+    fn sample_decorrelation_report(
+        degraded: bool,
+    ) -> crate::curator::decorrelation_probe::DecorrelationProbeReport {
+        use crate::curator::decorrelation_probe::{
+            CLAIMED_NOT_ATTESTED_CAVEAT, DecorrelationAdvisory, DecorrelationProbeReport,
+            DominanceReport,
+        };
+        DecorrelationProbeReport {
+            mode: "advisory".to_string(),
+            enforce_degraded_to_advisory: degraded,
+            threshold: 0.8,
+            namespaces_scanned: 1,
+            reflections_scanned: 5,
+            advisories: vec![DecorrelationAdvisory {
+                namespace: "team/eng".to_string(),
+                report: DominanceReport {
+                    total: 5,
+                    distinct_producers: 1,
+                    dominant_producer: Some("ai:solo".to_string()),
+                    dominant_count: 5,
+                    dominance_ratio: 1.0,
+                },
+                threshold: 0.8,
+                caveat: CLAIMED_NOT_ATTESTED_CAVEAT.to_string(),
+            }],
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn print_decorrelation_report_text_emits_advisory_line() {
+        // Text branch + the `for adv` loop body + the enforce-degraded suffix.
+        let report = sample_decorrelation_report(true);
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            print_decorrelation_report(&report, false, &mut out).unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert!(s.contains("decorrelation-probe: mode=advisory"));
+        assert!(s.contains("advisories=1"));
+        assert!(s.contains("enforce INERT at v0.8.0"));
+        assert!(s.contains("ADVISORY ns=team/eng"));
+        assert!(s.contains("dominant=ai:solo"));
+        assert!(s.contains("CLAIMED"));
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn print_decorrelation_report_json_round_trips() {
+        // JSON branch (no enforce-degraded suffix).
+        let report = sample_decorrelation_report(false);
+        let mut stdout = Vec::<u8>::new();
+        let mut stderr = Vec::<u8>::new();
+        {
+            let mut out = crate::cli::CliOutput::from_std(&mut stdout, &mut stderr);
+            print_decorrelation_report(&report, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value =
+            serde_json::from_str(String::from_utf8(stdout).unwrap().trim()).unwrap();
+        assert_eq!(v["mode"], "advisory");
+        assert_eq!(v["advisories"].as_array().unwrap().len(), 1);
+        assert_eq!(v["advisories"][0]["namespace"], "team/eng");
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn decorrelation_step_off_is_silent() {
+        // Off mode → early return, no output (the default-safe path; also
+        // exercised by every existing `--reflect` test through `run_reflect`).
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace = Some("team/eng".to_string());
+        let store = build_reflect_store(&db, &args, &cfg).await.unwrap();
+        {
+            let mut out = env.output();
+            run_decorrelation_probe_step(
+                store.as_ref(),
+                "ai:curator",
+                &args,
+                config::ReflectDecorrelationMode::Off,
+                0.8,
+                &mut out,
+            )
+            .await
+            .unwrap();
+        }
+        assert!(env.stdout_str().is_empty());
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn decorrelation_step_advisory_empty_store_reports_zero() {
+        // Advisory mode against an empty store → runner scans, no reflections,
+        // 0 advisories. Covers the active path (runner call + Ok arm + the
+        // text formatter) without env mutation.
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = config::AppConfig::default();
+        let mut args = default_args();
+        args.namespace = Some("team/eng".to_string());
+        let store = build_reflect_store(&db, &args, &cfg).await.unwrap();
+        {
+            let mut out = env.output();
+            run_decorrelation_probe_step(
+                store.as_ref(),
+                "ai:curator",
+                &args,
+                config::ReflectDecorrelationMode::Advisory,
+                0.8,
+                &mut out,
+            )
+            .await
+            .unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("decorrelation-probe: mode=advisory"));
+        assert!(s.contains("advisories=0"));
+    }
+
     // ── #1548 coverage — the SAL `--store-url` curator path ──────────
     #[cfg(feature = "sal")]
     #[tokio::test]
@@ -1615,6 +2156,121 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| e.contains("no LLM client configured"))
+        );
+    }
+
+    // ── #1747 (slice-3c1) — store-backed consolidation sweep ─────────────
+    // Backend-agnostic: drives the actual sweep entry point (not
+    // ConsolidationPass::run directly) over a real SqliteStore, so the same
+    // wiring the postgres curator uses is exercised in always-on CI.
+    #[cfg(feature = "sal")]
+    fn seed_two_dup_memories(db_path: &std::path::Path) {
+        let conn = db::open(db_path).unwrap();
+        let dup = "kubernetes rolling canary deploy strategy notes with enough length";
+        let mk = |id: &str, title: &str| crate::models::Memory {
+            id: id.to_string(),
+            namespace: "ns".to_string(),
+            title: title.to_string(),
+            content: dup.to_string(),
+            tier: crate::models::Tier::Mid,
+            access_count: 5,
+            ..Default::default()
+        };
+        let m1 = mk("aaa11111", "t1");
+        let m2 = mk("bbb22222", "t2");
+        db::insert(&conn, &m1).unwrap();
+        db::insert(&conn, &m2).unwrap();
+        // Aligned embeddings → cosine gate passes (same ns).
+        db::set_embedding(&conn, &m1.id, &[1.0, 0.0]).unwrap();
+        db::set_embedding(&conn, &m2.id, &[1.0, 0.0]).unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_consolidates_and_folds_when_enabled() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let cfg = curator::CuratorConfig {
+            max_ops_per_cycle: 100,
+            compaction: curator::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default() // dry_run = false → real consolidation
+        };
+        let report = store_backed_consolidation_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            &cfg,
+        )
+        .await;
+        assert_eq!(
+            report.memories_consolidated, 2,
+            "both sources folded; errors: {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.rollback_entries_written, 1,
+            "one operator-reversible rollback entry persisted"
+        );
+        // The [consolidated] row landed.
+        let conn = db::open(&env.db_path).unwrap();
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert!(
+            rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+            "a consolidated row must exist"
+        );
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_noop_when_disabled() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        // Default config → compaction.enabled = false.
+        let cfg = curator::CuratorConfig::default();
+        let report = store_backed_consolidation_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            &cfg,
+        )
+        .await;
+        assert_eq!(
+            report.memories_consolidated, 0,
+            "disabled → no consolidation"
+        );
+        assert_eq!(report.clusters_formed, 0);
+        assert!(report.errors.is_empty(), "no errors: {:?}", report.errors);
+        // Both source rows remain; no consolidated row.
+        let conn = db::open(&env.db_path).unwrap();
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 2, "both source rows remain live");
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_no_llm_folds_into_report() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let cfg = curator::CuratorConfig {
+            compaction: curator::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // No LLM → folds an error into the report, never panics.
+        let report = store_backed_consolidation_sweep(&store, None, &cfg).await;
+        assert_eq!(report.memories_consolidated, 0);
+        assert!(
+            report.errors.iter().any(|e| e.contains("no LLM")),
+            "no-LLM error surfaced: {:?}",
+            report.errors
         );
     }
 

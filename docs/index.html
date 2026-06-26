@@ -374,7 +374,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <!-- ============ HERO ============ -->
 <header class="hero">
   <div class="container">
-    <span class="badge">v0.7.1 &middot; attested-cortex &middot; Apache-2.0</span>
+    <span class="badge">v0.8.0 &middot; distributed-coordination &middot; Apache-2.0</span>
     <h1>Memory for AI agents that runs on <span class="accent">your hardware</span> &mdash; and proves what they did.</h1>
     <p class="subtitle">
       ai-memory is the <strong>endpoint-resident, model-neutral</strong> memory layer for AI agents &mdash; local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong>, from servers to mobile to fully <strong>air-gapped</strong>, with no cloud dependency and no phone-home. Every state-changing operation lands in an <strong>append-only, tamper-evident audit chain</strong> &mdash; enable attestation and each write is Ed25519-signed at the source &mdash; so you can reconstruct what any agent knew, and when. Neutral by construction: any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama, local models) reads and writes the same store. It doesn't just retrieve &mdash; it <strong>governs</strong>: typed, deterministic refusals at the endpoint, so the substrate can be stopped and audited without corrupting the record.
@@ -382,9 +382,11 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <div class="meta">
       <span>Local-first &middot; air-gappable</span>
       <span>Model-neutral (MCP)</span>
-      <span>Ed25519 audit chain</span>
+      <span>100 MCP tools</span>
+      <span>91 HTTP routes (77 unique paths)</span>
+      <span>83 CLI subcommands</span>
+      <span>Ed25519 attested audit chain</span>
       <span>SQLite&nbsp;+&nbsp;Postgres&#x202F;/&#x202F;AGE</span>
-      <span>74 MCP tools &middot; 80 CLI</span>
       <span><a href="compliance/nsa-csi-mcp.html" style="color:#6ee7ff">NSA CSI MCP 10/10 · 7/7</a></span>
       <span><a href="evidence.html" style="color:#6ee7ff">15,951 / 0 regression suite</a></span>
     </div>
@@ -496,7 +498,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <div class="feat cyan">
         <span class="tag">Knowledge graph</span>
         <h3>Typed links, temporal validity</h3>
-        <p>Six relation kinds (<code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>) with <code>valid_from</code> / <code>valid_until</code>. Apache AGE acceleration on Postgres.</p>
+        <p>Nine relation kinds (<code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>, plus the v0.8.0 typed-cognition trio <code>decomposes_into</code>, <code>depends_on</code>, <code>advances</code>) with <code>valid_from</code> / <code>valid_until</code>. Apache AGE acceleration on Postgres.</p>
       </div>
       <div class="feat amber">
         <span class="tag amber">Attestation</span>
@@ -537,6 +539,16 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <span class="tag violet">Recursive learning</span>
         <h3>Reflect, atomise, consolidate</h3>
         <p><code>memory_reflect</code> with a hard depth cap, atomisation into linked atom rows, consolidation, persona generation, and a skills registry. Agents that improve their own memory &mdash; under governance.</p>
+      </div>
+      <div class="feat amber">
+        <span class="tag amber">Coordination</span>
+        <h3>Distributed-coordination primitives</h3>
+        <p>v0.8.0 Pillar-1: a typed action DAG with state machine, leases + heartbeats, Ed25519-signed inter-agent signals, attested checkpoints, and scheduled routines &mdash; the substrate for multi-agent orchestration.</p>
+      </div>
+      <div class="feat violet">
+        <span class="tag violet">Typed cognition</span>
+        <h3>Goal / Plan / Step lifecycle</h3>
+        <p>v0.8.0 Pillar-2: a typed-cognition vocabulary (Goal/Plan/Step + <code>lifecycle_state</code>) wired into the knowledge graph via the <code>decomposes_into</code> / <code>depends_on</code> / <code>advances</code> relations &mdash; plan trees agents can reason over.</p>
       </div>
       <div class="feat cyan">
         <span class="tag">Observability</span>
@@ -734,13 +746,13 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="int-card" href="API_REFERENCE.md">
         <div class="label">HTTP</div>
         <h4>REST API</h4>
-        <p>89 routes (75 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
+        <p>91 routes (77 unique paths) at <code>/api/v1/</code>. Axum daemon on port 9077. mTLS optional.</p>
         <span class="arrow">API reference &rarr;</span>
       </a>
       <a class="int-card" href="CLI_REFERENCE.md">
         <div class="label">CLI</div>
         <h4>Command line</h4>
-        <p>80 subcommands (82 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
+        <p>83 subcommands (85 with <code>--features sal</code>), optional <code>--json</code>. For shell scripts, cron, and humans.</p>
         <span class="arrow">CLI reference &rarr;</span>
       </a>
     </div>
@@ -861,6 +873,10 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
           <strong>Federation</strong>
           <span class="desc">Quorum sync, peer attestation, mTLS allowlist, nonce + signature posture.</span>
         </a>
+        <a class="lk" href="coordination.md">
+          <strong>Distributed coordination</strong>
+          <span class="desc">v0.8.0 Pillar-1 + Pillar-2: action DAG, leases, signed signals, attested checkpoints, routines, and the Goal/Plan/Step typed-cognition lifecycle.</span>
+        </a>
         <a class="lk" href="zero-touch-trust.html">
           <strong>Zero-Touch Trust</strong>
           <span class="desc">CA-rooted federation identity at scale — O(1) enrollment, short-lived auto-rotating credentials, hierarchical trust. OS-agnostic.</span>
@@ -935,8 +951,8 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <a class="lk" href="evidence.html"><strong>Evidence &mdash; frozen claims</strong><span class="desc">Every public number, pinned to a commit + test artifact. 15,951/0 final baseline.</span></a>
       <a class="lk" href="USER_GUIDE.md"><strong>User guide</strong><span class="desc">End-to-end MCP tool reference</span></a>
       <a class="lk" href="DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Build from source, extend, add tools</span></a>
-      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">89 routes (75 unique paths)</span></a>
-      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">80 subcommands</span></a>
+      <a class="lk" href="API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">91 routes (77 unique paths)</span></a>
+      <a class="lk" href="CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">83 subcommands</span></a>
       <a class="lk" href="GLOSSARY.md"><strong>Glossary</strong><span class="desc">Every concept, one place</span></a>
       <a class="lk" href="knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links, temporal validity</span></a>
       <a class="lk" href="agent-identity.html"><strong>Agent identity (NHI)</strong><span class="desc">agent_id semantics</span></a>

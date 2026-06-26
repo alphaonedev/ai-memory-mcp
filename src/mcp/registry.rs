@@ -34,6 +34,22 @@ use serde_json::{Value, json};
 /// `memory_<lower_snake>` so the call site reads naturally
 /// (`tool_names::MEMORY_STORE => …` ⇒ `"memory_store" => …`).
 pub mod tool_names {
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action DAG edge insert.
+    pub const MEMORY_ACTION_ADD_EDGE: &str = "memory_action_add_edge";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action create.
+    pub const MEMORY_ACTION_CREATE: &str = "memory_action_create";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action DAG edge list.
+    pub const MEMORY_ACTION_EDGES: &str = "memory_action_edges";
+    /// v0.8.0 Pillar 1 (#1709 §11.4) — ranked UNBLOCKED action frontier.
+    pub const MEMORY_ACTION_FRONTIER: &str = "memory_action_frontier";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action fetch-by-id.
+    pub const MEMORY_ACTION_GET: &str = "memory_action_get";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action query by namespace/state.
+    pub const MEMORY_ACTION_LIST: &str = "memory_action_list";
+    /// v0.8.0 Pillar 1 (#1709 §11.4) — the single top UNBLOCKED action to do next.
+    pub const MEMORY_ACTION_NEXT: &str = "memory_action_next";
+    /// v0.8.0 Pillar 1 (#1709) — coordination-action state-guarded transition.
+    pub const MEMORY_ACTION_TRANSITION: &str = "memory_action_transition";
     pub const MEMORY_AGENT_LIST: &str = "memory_agent_list";
     pub const MEMORY_AGENT_REGISTER: &str = "memory_agent_register";
     pub const MEMORY_ARCHIVE_LIST: &str = "memory_archive_list";
@@ -49,6 +65,14 @@ pub mod tool_names {
     pub const MEMORY_CAPTURE_TURN: &str = "memory_capture_turn";
     pub const MEMORY_CHECK_AGENT_ACTION: &str = "memory_check_agent_action";
     pub const MEMORY_CHECK_DUPLICATE: &str = "memory_check_duplicate";
+    /// v0.8.0 Pillar 1 (#1709) — create a pending attested checkpoint.
+    pub const MEMORY_CHECKPOINT_CREATE: &str = "memory_checkpoint_create";
+    /// v0.8.0 Pillar 1 (#1709) — query checkpoints by ns/condition/state.
+    pub const MEMORY_CHECKPOINT_QUERY: &str = "memory_checkpoint_query";
+    /// v0.8.0 Pillar 1 (#1709) — resolve a checkpoint (attested).
+    pub const MEMORY_CHECKPOINT_RESOLVE: &str = "memory_checkpoint_resolve";
+    /// v0.8.0 Pillar 1 (#1709) — verify a checkpoint's attested resolution.
+    pub const MEMORY_CHECKPOINT_VERIFY: &str = "memory_checkpoint_verify";
     pub const MEMORY_CONSOLIDATE: &str = "memory_consolidate";
     pub const MEMORY_DELETE: &str = "memory_delete";
     pub const MEMORY_DEPENDENTS_OF_INVALIDATED: &str = "memory_dependents_of_invalidated";
@@ -69,6 +93,14 @@ pub mod tool_names {
     pub const MEMORY_KG_INVALIDATE: &str = "memory_kg_invalidate";
     pub const MEMORY_KG_QUERY: &str = "memory_kg_query";
     pub const MEMORY_KG_TIMELINE: &str = "memory_kg_timeline";
+    /// v0.8.0 Pillar 1 (#1709) — acquire a single-holder lease on an action.
+    pub const MEMORY_LEASE_ACQUIRE: &str = "memory_lease_acquire";
+    /// v0.8.0 Pillar 1 (#1709) — read the lease on an action.
+    pub const MEMORY_LEASE_GET: &str = "memory_lease_get";
+    /// v0.8.0 Pillar 1 (#1709) — release an owned lease on an action.
+    pub const MEMORY_LEASE_RELEASE: &str = "memory_lease_release";
+    /// v0.8.0 Pillar 1 (#1709) — heartbeat-renew an owned lease on an action.
+    pub const MEMORY_LEASE_RENEW: &str = "memory_lease_renew";
     pub const MEMORY_LINK: &str = "memory_link";
     pub const MEMORY_LIST: &str = "memory_list";
     pub const MEMORY_LIST_SUBSCRIPTIONS: &str = "memory_list_subscriptions";
@@ -90,10 +122,25 @@ pub mod tool_names {
     pub const MEMORY_REFLECT: &str = "memory_reflect";
     pub const MEMORY_REFLECTION_ORIGIN: &str = "memory_reflection_origin";
     pub const MEMORY_REPLAY: &str = "memory_replay";
+    /// v0.8.0 Pillar 1 (#1709) — create a draft routine (action+edge template).
+    pub const MEMORY_ROUTINE_CREATE: &str = "memory_routine_create";
+    /// v0.8.0 Pillar 1 (#1709) — freeze a routine (Draft → Frozen, attested).
+    pub const MEMORY_ROUTINE_FREEZE: &str = "memory_routine_freeze";
+    /// v0.8.0 Pillar 1 (#1709) — list a namespace's routines by state.
+    pub const MEMORY_ROUTINE_LIST: &str = "memory_routine_list";
+    /// v0.8.0 Pillar 1 (#1709) — materialise a frozen routine under arguments.
+    pub const MEMORY_ROUTINE_RUN: &str = "memory_routine_run";
+    /// v0.8.0 Pillar 1 (#1709) — fetch a routine run by id.
+    pub const MEMORY_ROUTINE_STATUS: &str = "memory_routine_status";
     pub const MEMORY_RULE_LIST: &str = "memory_rule_list";
     pub const MEMORY_SEARCH: &str = "memory_search";
     pub const MEMORY_SESSION_START: &str = "memory_session_start";
     pub const MEMORY_SHARE: &str = "memory_share";
+    pub const MEMORY_SIGNAL_ACK: &str = "memory_signal_ack";
+    pub const MEMORY_SIGNAL_INBOX: &str = "memory_signal_inbox";
+    pub const MEMORY_SIGNAL_READ: &str = "memory_signal_read";
+    pub const MEMORY_SIGNAL_SEND: &str = "memory_signal_send";
+    pub const MEMORY_SIGNAL_THREAD: &str = "memory_signal_thread";
     pub const MEMORY_SKILL_COMPOSITIONAL_CONTEXT: &str = "memory_skill_compositional_context";
     pub const MEMORY_SKILL_EXPORT: &str = "memory_skill_export";
     pub const MEMORY_SKILL_GET: &str = "memory_skill_get";
@@ -125,6 +172,14 @@ pub mod tool_names {
     /// without re-typing it.
     #[allow(dead_code)]
     pub const ALL: &[&str] = &[
+        MEMORY_ACTION_ADD_EDGE,
+        MEMORY_ACTION_CREATE,
+        MEMORY_ACTION_EDGES,
+        MEMORY_ACTION_FRONTIER,
+        MEMORY_ACTION_GET,
+        MEMORY_ACTION_LIST,
+        MEMORY_ACTION_NEXT,
+        MEMORY_ACTION_TRANSITION,
         MEMORY_AGENT_LIST,
         MEMORY_AGENT_REGISTER,
         MEMORY_ARCHIVE_LIST,
@@ -138,6 +193,10 @@ pub mod tool_names {
         MEMORY_CAPTURE_TURN,
         MEMORY_CHECK_AGENT_ACTION,
         MEMORY_CHECK_DUPLICATE,
+        MEMORY_CHECKPOINT_CREATE,
+        MEMORY_CHECKPOINT_QUERY,
+        MEMORY_CHECKPOINT_RESOLVE,
+        MEMORY_CHECKPOINT_VERIFY,
         MEMORY_CONSOLIDATE,
         MEMORY_DELETE,
         MEMORY_DEPENDENTS_OF_INVALIDATED,
@@ -158,6 +217,10 @@ pub mod tool_names {
         MEMORY_KG_INVALIDATE,
         MEMORY_KG_QUERY,
         MEMORY_KG_TIMELINE,
+        MEMORY_LEASE_ACQUIRE,
+        MEMORY_LEASE_GET,
+        MEMORY_LEASE_RELEASE,
+        MEMORY_LEASE_RENEW,
         MEMORY_LINK,
         MEMORY_LIST,
         MEMORY_LIST_SUBSCRIPTIONS,
@@ -179,10 +242,20 @@ pub mod tool_names {
         MEMORY_REFLECT,
         MEMORY_REFLECTION_ORIGIN,
         MEMORY_REPLAY,
+        MEMORY_ROUTINE_CREATE,
+        MEMORY_ROUTINE_FREEZE,
+        MEMORY_ROUTINE_LIST,
+        MEMORY_ROUTINE_RUN,
+        MEMORY_ROUTINE_STATUS,
         MEMORY_RULE_LIST,
         MEMORY_SEARCH,
         MEMORY_SESSION_START,
         MEMORY_SHARE,
+        MEMORY_SIGNAL_ACK,
+        MEMORY_SIGNAL_INBOX,
+        MEMORY_SIGNAL_READ,
+        MEMORY_SIGNAL_SEND,
+        MEMORY_SIGNAL_THREAD,
         MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
         MEMORY_SKILL_EXPORT,
         MEMORY_SKILL_GET,
@@ -271,6 +344,14 @@ pub mod tool_names {
         /// `Claude Desktop reload` time.
         #[test]
         fn const_values_byte_equal_to_historical_wire_strings() {
+            assert_eq!(MEMORY_ACTION_ADD_EDGE, "memory_action_add_edge");
+            assert_eq!(MEMORY_ACTION_CREATE, "memory_action_create");
+            assert_eq!(MEMORY_ACTION_EDGES, "memory_action_edges");
+            assert_eq!(MEMORY_ACTION_FRONTIER, "memory_action_frontier");
+            assert_eq!(MEMORY_ACTION_GET, "memory_action_get");
+            assert_eq!(MEMORY_ACTION_LIST, "memory_action_list");
+            assert_eq!(MEMORY_ACTION_NEXT, "memory_action_next");
+            assert_eq!(MEMORY_ACTION_TRANSITION, "memory_action_transition");
             assert_eq!(MEMORY_AGENT_LIST, "memory_agent_list");
             assert_eq!(MEMORY_AGENT_REGISTER, "memory_agent_register");
             assert_eq!(MEMORY_ARCHIVE_LIST, "memory_archive_list");
@@ -283,6 +364,10 @@ pub mod tool_names {
             assert_eq!(MEMORY_CAPABILITIES, "memory_capabilities");
             assert_eq!(MEMORY_CHECK_AGENT_ACTION, "memory_check_agent_action");
             assert_eq!(MEMORY_CHECK_DUPLICATE, "memory_check_duplicate");
+            assert_eq!(MEMORY_CHECKPOINT_CREATE, "memory_checkpoint_create");
+            assert_eq!(MEMORY_CHECKPOINT_QUERY, "memory_checkpoint_query");
+            assert_eq!(MEMORY_CHECKPOINT_RESOLVE, "memory_checkpoint_resolve");
+            assert_eq!(MEMORY_CHECKPOINT_VERIFY, "memory_checkpoint_verify");
             assert_eq!(MEMORY_CONSOLIDATE, "memory_consolidate");
             assert_eq!(MEMORY_DELETE, "memory_delete");
             assert_eq!(
@@ -306,6 +391,10 @@ pub mod tool_names {
             assert_eq!(MEMORY_KG_INVALIDATE, "memory_kg_invalidate");
             assert_eq!(MEMORY_KG_QUERY, "memory_kg_query");
             assert_eq!(MEMORY_KG_TIMELINE, "memory_kg_timeline");
+            assert_eq!(MEMORY_LEASE_ACQUIRE, "memory_lease_acquire");
+            assert_eq!(MEMORY_LEASE_GET, "memory_lease_get");
+            assert_eq!(MEMORY_LEASE_RELEASE, "memory_lease_release");
+            assert_eq!(MEMORY_LEASE_RENEW, "memory_lease_renew");
             assert_eq!(MEMORY_LINK, "memory_link");
             assert_eq!(MEMORY_LIST, "memory_list");
             assert_eq!(MEMORY_LIST_SUBSCRIPTIONS, "memory_list_subscriptions");
@@ -336,10 +425,20 @@ pub mod tool_names {
             assert_eq!(MEMORY_REFLECT, "memory_reflect");
             assert_eq!(MEMORY_REFLECTION_ORIGIN, "memory_reflection_origin");
             assert_eq!(MEMORY_REPLAY, "memory_replay");
+            assert_eq!(MEMORY_ROUTINE_CREATE, "memory_routine_create");
+            assert_eq!(MEMORY_ROUTINE_FREEZE, "memory_routine_freeze");
+            assert_eq!(MEMORY_ROUTINE_LIST, "memory_routine_list");
+            assert_eq!(MEMORY_ROUTINE_RUN, "memory_routine_run");
+            assert_eq!(MEMORY_ROUTINE_STATUS, "memory_routine_status");
             assert_eq!(MEMORY_RULE_LIST, "memory_rule_list");
             assert_eq!(MEMORY_SEARCH, "memory_search");
             assert_eq!(MEMORY_SESSION_START, "memory_session_start");
             assert_eq!(MEMORY_SHARE, "memory_share");
+            assert_eq!(MEMORY_SIGNAL_ACK, "memory_signal_ack");
+            assert_eq!(MEMORY_SIGNAL_INBOX, "memory_signal_inbox");
+            assert_eq!(MEMORY_SIGNAL_READ, "memory_signal_read");
+            assert_eq!(MEMORY_SIGNAL_SEND, "memory_signal_send");
+            assert_eq!(MEMORY_SIGNAL_THREAD, "memory_signal_thread");
             assert_eq!(
                 MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
                 "memory_skill_compositional_context"
@@ -628,6 +727,44 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::ingest_multistep::IngestMultistepTool>(),
         RegisteredTool::of::<crate::mcp::atomise::AtomiseTool>(),
         RegisteredTool::of::<crate::mcp::share::ShareTool>(),
+        // v0.8.0 Pillar 1 (#1709) — coordination-action create/get +
+        // transition/list/add_edge/edges (the full DAG surface).
+        RegisteredTool::of::<crate::mcp::action::ActionCreateTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionGetTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionTransitionTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionListTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionAddEdgeTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionEdgesTool>(),
+        // v0.8.0 Pillar 1 (#1709 §11.4) — the FRONTIER surface: ranked
+        // unblocked actions + the single next action to pick up.
+        RegisteredTool::of::<crate::mcp::action::ActionFrontierTool>(),
+        RegisteredTool::of::<crate::mcp::action::ActionNextTool>(),
+        // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+        // (acquire/renew/release/get) over the `crate::actions` substrate.
+        RegisteredTool::of::<crate::mcp::action::LeaseAcquireTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseRenewTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseReleaseTool>(),
+        RegisteredTool::of::<crate::mcp::action::LeaseGetTool>(),
+        // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+        // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+        RegisteredTool::of::<crate::mcp::signal::SignalSendTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalReadTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalInboxTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalThreadTool>(),
+        RegisteredTool::of::<crate::mcp::signal::SignalAckTool>(),
+        // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+        // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointCreateTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointResolveTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointQueryTool>(),
+        RegisteredTool::of::<crate::mcp::checkpoint::CheckpointVerifyTool>(),
+        // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+        // (create/freeze/run/status/list) over the `crate::routines` substrate.
+        RegisteredTool::of::<crate::mcp::routine::RoutineCreateTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineFreezeTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineRunTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineStatusTool>(),
+        RegisteredTool::of::<crate::mcp::routine::RoutineListTool>(),
         RegisteredTool::of::<crate::mcp::calibrate_confidence::CalibrateConfidenceTool>(),
         RegisteredTool::of::<crate::mcp::capabilities::CapabilitiesTool>(),
         // v0.7.0 #1389 L4 — host-volunteered turn capture per RFC-0001.

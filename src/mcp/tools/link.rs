@@ -245,6 +245,18 @@ pub(super) fn handle_link(
         || crate::quotas::GLOBAL_NAMESPACE.to_string(),
         |mem| mem.namespace.clone(),
     );
+    // #1786 — owner gate: refuse forging a link ROOTED at a source memory owned
+    // by a DIFFERENT agent (the MCP link path bypasses the HTTP source-owner
+    // gate, leaving a graph-forge primitive). Keyed on the ENFORCED-read caller
+    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
+    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
+    // trust-all default byte-unchanged.
+    if let Some(src) = link_owner.as_ref()
+        && let Some(caller) = crate::identity::resolve_read_visibility_caller()
+        && !crate::visibility::caller_owns_for_mutation(src, &caller, false)
+    {
+        return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+    }
     // H12 (#628 blocker): combine the link quota check + counter
     // increment in a single atomic transaction. The check + record
     // pair was previously a TOCTOU window; `check_and_record` closes
@@ -512,6 +524,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -581,14 +594,24 @@ mod tests {
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
+        // #1812 — use a well-formed-but-off-taxonomy label (plain lowercase
+        // letters, NOT a hyphen). The pre-fix test used "weird-relation",
+        // which was rejected only by the `[a-z0-9_]+` charset check, so it
+        // passed for the WRONG reason and masked the bug where a label like
+        // `frobnicate` slipped past validation and was then silently dropped
+        // by the DB CHECK under `INSERT OR IGNORE` (false `linked:true`).
+        // The relation taxonomy is closed; this must error loudly.
         let err = handle_link(
             &conn,
             &db_path,
-            &json!({"source_id": a, "target_id": b, "relation": "weird-relation"}),
+            &json!({"source_id": a, "target_id": b, "relation": "frobnicate"}),
             None,
         )
         .unwrap_err();
-        assert!(!err.is_empty());
+        assert!(
+            err.contains("invalid relation"),
+            "#1812: off-taxonomy relation must be rejected at validation, got: {err}"
+        );
     }
 
     // D. state-dependent — source missing → storage rejects (FK violation)
@@ -849,6 +872,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

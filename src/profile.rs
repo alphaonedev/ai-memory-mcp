@@ -257,7 +257,45 @@ impl Family {
             // Sync RFC pulled forward per operator directive
             // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-level
             // point-to-point copy into `_shared/<from>→<to>/`.
-            | tn::MEMORY_SHARE => Some(Self::Power),
+            | tn::MEMORY_SHARE
+            // v0.8.0 Pillar 1 (#1709) — coordination-action create/get.
+            // Operator/substrate surface over the action DAG; lives in
+            // Power alongside the other write-side substrate tools.
+            | tn::MEMORY_ACTION_CREATE
+            | tn::MEMORY_ACTION_GET
+            | tn::MEMORY_ACTION_TRANSITION
+            | tn::MEMORY_ACTION_LIST
+            | tn::MEMORY_ACTION_ADD_EDGE
+            | tn::MEMORY_ACTION_EDGES
+            // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface.
+            | tn::MEMORY_ACTION_FRONTIER
+            | tn::MEMORY_ACTION_NEXT
+            // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+            // (acquire/renew/release/get) over the action DAG.
+            | tn::MEMORY_LEASE_ACQUIRE
+            | tn::MEMORY_LEASE_RENEW
+            | tn::MEMORY_LEASE_RELEASE
+            | tn::MEMORY_LEASE_GET
+            // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+            // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+            | tn::MEMORY_SIGNAL_SEND
+            | tn::MEMORY_SIGNAL_READ
+            | tn::MEMORY_SIGNAL_INBOX
+            | tn::MEMORY_SIGNAL_THREAD
+            | tn::MEMORY_SIGNAL_ACK
+            // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+            // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+            | tn::MEMORY_CHECKPOINT_CREATE
+            | tn::MEMORY_CHECKPOINT_RESOLVE
+            | tn::MEMORY_CHECKPOINT_QUERY
+            | tn::MEMORY_CHECKPOINT_VERIFY
+            // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+            // (create/freeze/run/status/list) over the `crate::routines` substrate.
+            | tn::MEMORY_ROUTINE_CREATE
+            | tn::MEMORY_ROUTINE_FREEZE
+            | tn::MEMORY_ROUTINE_RUN
+            | tn::MEMORY_ROUTINE_STATUS
+            | tn::MEMORY_ROUTINE_LIST => Some(Self::Power),
             // meta (6 — 5 baseline + v0.7.0 Gap 3 (#886)
             // memory_recall_observations).
             tn::MEMORY_CAPABILITIES
@@ -482,6 +520,46 @@ impl Family {
                 // `28860423-d12c-4959-bc8b-8fa9a94a33d9`. Substrate-
                 // level point-to-point copy into `_shared/<from>→<to>/`.
                 tn::MEMORY_SHARE,
+                // v0.8.0 Pillar 1 (#1709) — coordination-action DAG surface
+                // (create/get + transition/list/add_edge/edges) over the
+                // `crate::actions` substrate.
+                tn::MEMORY_ACTION_CREATE,
+                tn::MEMORY_ACTION_GET,
+                tn::MEMORY_ACTION_TRANSITION,
+                tn::MEMORY_ACTION_LIST,
+                tn::MEMORY_ACTION_ADD_EDGE,
+                tn::MEMORY_ACTION_EDGES,
+                // v0.8.0 Pillar 1 (#1709 §11.4) — FRONTIER surface
+                // (ranked unblocked actions + the next action to do).
+                tn::MEMORY_ACTION_FRONTIER,
+                tn::MEMORY_ACTION_NEXT,
+                // v0.8.0 Pillar 1 (#1709) — coordination LEASE surface
+                // (acquire/renew/release/get) over the action DAG.
+                tn::MEMORY_LEASE_ACQUIRE,
+                tn::MEMORY_LEASE_RENEW,
+                tn::MEMORY_LEASE_RELEASE,
+                tn::MEMORY_LEASE_GET,
+                // v0.8.0 Pillar 1 (#1709) — signed-signal coordination surface
+                // (send/read/inbox/thread/ack) over the `crate::signals` substrate.
+                tn::MEMORY_SIGNAL_SEND,
+                tn::MEMORY_SIGNAL_READ,
+                tn::MEMORY_SIGNAL_INBOX,
+                tn::MEMORY_SIGNAL_THREAD,
+                tn::MEMORY_SIGNAL_ACK,
+                // v0.8.0 Pillar 1 (#1709) — attested-checkpoint coordination surface
+                // (create/resolve/query/verify) over the `crate::checkpoints` substrate.
+                tn::MEMORY_CHECKPOINT_CREATE,
+                tn::MEMORY_CHECKPOINT_RESOLVE,
+                tn::MEMORY_CHECKPOINT_QUERY,
+                tn::MEMORY_CHECKPOINT_VERIFY,
+                // v0.8.0 Pillar 1 (#1709) — routine coordination surface
+                // (create/freeze/run/status/list) over the
+                // `crate::routines` parameterised-template substrate.
+                tn::MEMORY_ROUTINE_CREATE,
+                tn::MEMORY_ROUTINE_FREEZE,
+                tn::MEMORY_ROUTINE_RUN,
+                tn::MEMORY_ROUTINE_STATUS,
+                tn::MEMORY_ROUTINE_LIST,
             ],
             Self::Meta => &[
                 tn::MEMORY_CAPABILITIES,

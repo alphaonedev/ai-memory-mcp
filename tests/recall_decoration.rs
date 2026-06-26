@@ -97,6 +97,14 @@ fn gap7_recall_row_carries_full_provenance_block_by_default() {
         row["freshness_state"].is_string(),
         "Gap 7: freshness_state decoration present"
     );
+    // v0.8.0 #1709 §2.5 T1 (C1a): provenance_tier decoration present
+    // under verbose (default). Seeded rows are caller-provided + unlinked
+    // ⇒ lowest-trust unsigned_caller tier.
+    assert_eq!(
+        row["provenance_tier"].as_str(),
+        Some("unsigned_caller"),
+        "v0.8.0 #1709 T1: provenance_tier decoration present under verbose"
+    );
 
     // The recall envelope echoes the Gap 3 recall_id so the caller
     // can cite it on a downstream store/link.
@@ -147,6 +155,10 @@ fn gap7_verbose_provenance_false_collapses_to_legacy_shape() {
     assert!(
         row.get("latest_link_attest_level").is_none(),
         "verbose_provenance=false ⇒ no latest_link_attest_level decoration"
+    );
+    assert!(
+        row.get("provenance_tier").is_none(),
+        "verbose_provenance=false ⇒ no provenance_tier decoration"
     );
 }
 
@@ -452,7 +464,9 @@ fn gap7_token_budget_guard_still_passes_post_decoration() {
         "Gap 7 regression: trimmed full-profile total {trimmed} exceeds the 11000-token ceiling"
     );
     assert!(
-        verbose <= 17_000,
-        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 17000-token ceiling"
+        verbose <= 22_000,
+        "Gap 7 regression: verbose full-profile total {verbose} exceeds the 22000-token ceiling \
+         (raised 17K->18K->20K->22K across the v0.8.0 #1709 Pillar-1 \
+          memory_action_*/memory_lease_*/memory_routine_* tools)"
     );
 }

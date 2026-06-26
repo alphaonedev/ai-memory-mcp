@@ -37,6 +37,7 @@
 // defined as aliases of `crate::models::field_names::*` so each string
 // has exactly ONE spelling in the tree. The public surface (const name,
 // value, ALL_PARAM_NAMES census) is unchanged.
+pub const ACTION_ID: &str = "action_id";
 pub const AGENT_FILTER: &str = crate::models::field_names::AGENT_FILTER;
 pub const AGENT_ID: &str = "agent_id";
 pub const AGENT_TYPE: &str = crate::models::field_names::AGENT_TYPE;
@@ -45,19 +46,27 @@ pub const ALIASES: &str = "aliases";
 pub const ALLOWED_AGENTS: &str = "allowed_agents";
 pub const ARGUMENTS: &str = "arguments";
 pub const AS_AGENT: &str = "as_agent";
+pub const BODY: &str = "body";
 pub const BY_SOURCE_URI: &str = "by_source_uri";
 pub const BYTE_ESTIMATE: &str = "byte_estimate";
 pub const CALLER_AGENT_ID: &str = "caller_agent_id";
 pub const CANONICAL_NAME: &str = crate::models::field_names::CANONICAL_NAME;
 pub const CAPABILITIES: &str = crate::models::field_names::CAPABILITIES;
 pub const CITATIONS: &str = "citations";
+pub const CLAIMED_BY: &str = "claimed_by";
+pub const CONDITION: &str = "condition";
+pub const CONDITION_TYPE: &str = "condition_type";
 pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
 pub const CONTEXT: &str = "context";
+pub const CORRELATION_ID: &str = crate::models::field_names::CORRELATION_ID;
 pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
+pub const CREATED_BY: &str = "created_by";
+pub const DEADLINE_AT: &str = "deadline_at";
 pub const DEPTH: &str = "depth";
 pub const DRY_RUN: &str = "dry_run";
+pub const EDGE_TYPE: &str = "edge_type";
 pub const EDIT_SOURCE: &str = "edit_source";
 pub const ENTITY_ID: &str = crate::models::field_names::ENTITY_ID;
 pub const EVENT_TYPES: &str = "event_types";
@@ -70,7 +79,10 @@ pub const FOLDER_PATH: &str = "folder_path";
 pub const FORCE: &str = "force";
 pub const FORCE_RE_ATOMISE: &str = "force_re_atomise";
 pub const FORMAT: &str = "format";
+pub const FROM_ACTION: &str = "from_action";
+pub const FROM_AGENT: &str = "from_agent";
 pub const GOVERNANCE: &str = crate::models::field_names::GOVERNANCE;
+pub const HOLDER: &str = "holder";
 pub const ID: &str = "id";
 pub const ID_A: &str = "id_a";
 pub const ID_B: &str = "id_b";
@@ -80,9 +92,11 @@ pub const INCLUDE_INVALIDATED: &str = "include_invalidated";
 pub const INHERIT: &str = "inherit";
 pub const INLINE_SKILL: &str = "inline_skill";
 pub const INTENT: &str = "intent";
+pub const IN_REPLY_TO: &str = "in_reply_to";
 pub const K: &str = "k";
 pub const KIND: &str = "kind";
 pub const KIND_INNER: &str = "kind_inner";
+pub const LIFECYCLE_STATE: &str = "lifecycle_state";
 pub const LIMIT: &str = "limit";
 pub const LINK_ID: &str = "link_id";
 pub const MAX_ATOM_TOKENS: &str = "max_atom_tokens";
@@ -100,14 +114,22 @@ pub const PARENT: &str = "parent";
 pub const PATTERN: &str = "pattern";
 pub const PAYLOAD: &str = "payload";
 pub const PIPELINE_OVERRIDE: &str = "pipeline_override";
+pub const PARAMETERS: &str = "parameters";
 pub const PRIORITY: &str = "priority";
 pub const QUERY: &str = "query";
+pub const REFERENCE_IDS: &str = "reference_ids";
 pub const REFLECTION_ID: &str = "reflection_id";
 pub const RELATION: &str = "relation";
 pub const REMEMBER: &str = "remember";
+pub const RESOLUTION: &str = "resolution";
+pub const RESOLUTION_NOTE: &str = "resolution_note";
+pub const RESOLVED_BY: &str = "resolved_by";
 pub const RESOURCE_PATH: &str = "resource_path";
+pub const ROUTINE_ID: &str = "routine_id";
+pub const RUN_ID: &str = "run_id";
 pub const SCOPE: &str = "scope";
 pub const SECRET: &str = "secret";
+pub const SIGNAL_TYPE: &str = "signal_type";
 pub const SIGNATURE: &str = "signature";
 pub const SINCE: &str = "since";
 pub const SKILL_DESCRIPTION: &str = "skill_description";
@@ -119,7 +141,9 @@ pub const SOURCE_IDS: &str = crate::models::field_names::SOURCE_IDS;
 pub const SOURCE_MEMORY_ID: &str = crate::models::field_names::SOURCE_MEMORY_ID;
 pub const SOURCE_SPAN: &str = crate::models::field_names::SOURCE_SPAN;
 pub const SOURCE_URI: &str = crate::models::field_names::SOURCE_URI;
+pub const STATE: &str = "state";
 pub const STATUS: &str = "status";
+pub const SUBJECT: &str = "subject";
 pub const SUBSCRIPTION_ID: &str = crate::models::field_names::SUBSCRIPTION_ID;
 pub const SUMMARY: &str = "summary";
 pub const TAGS: &str = "tags";
@@ -127,11 +151,16 @@ pub const TARGET_AGENT_ID: &str = crate::models::field_names::TARGET_AGENT_ID;
 pub const TARGET_FOLDER: &str = crate::models::field_names::TARGET_FOLDER;
 pub const TARGET_ID: &str = "target_id";
 pub const TARGET_TIER: &str = "target_tier";
+pub const TEMPLATE: &str = "template";
 pub const THRESHOLD: &str = "threshold";
 pub const TIER: &str = "tier";
 pub const TITLE: &str = "title";
+pub const TO: &str = "to";
+pub const TO_ACTION: &str = "to_action";
+pub const TO_AGENT: &str = "to_agent";
 pub const TO_NAMESPACE: &str = "to_namespace";
 pub const TTL_SECONDS: &str = "ttl_seconds";
+pub const TTL_SECS: &str = "ttl_secs";
 pub const UNREAD_ONLY: &str = "unread_only";
 pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
@@ -150,6 +179,7 @@ pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
 /// const that no production code references — surfaces dead consts
 /// for cleanup).
 pub const ALL_PARAM_NAMES: &[&str] = &[
+    ACTION_ID,
     AGENT_FILTER,
     AGENT_ID,
     AGENT_TYPE,
@@ -164,13 +194,19 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CANONICAL_NAME,
     CAPABILITIES,
     CITATIONS,
+    CLAIMED_BY,
+    CONDITION,
+    CONDITION_TYPE,
     CONFIDENCE,
     CONSUMED,
     CONTENT,
     CONTEXT,
     CREATED_AT,
+    CREATED_BY,
+    DEADLINE_AT,
     DEPTH,
     DRY_RUN,
+    EDGE_TYPE,
     EDIT_SOURCE,
     ENTITY_ID,
     EVENT_TYPES,
@@ -183,7 +219,9 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     FORCE,
     FORCE_RE_ATOMISE,
     FORMAT,
+    FROM_ACTION,
     GOVERNANCE,
+    HOLDER,
     ID,
     ID_A,
     ID_B,
@@ -196,6 +234,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     K,
     KIND,
     KIND_INNER,
+    LIFECYCLE_STATE,
     LIMIT,
     LINK_ID,
     MAX_ATOM_TOKENS,
@@ -209,6 +248,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     OFFSET,
     OLDER_THAN_DAYS,
     ON_CONFLICT,
+    PARAMETERS,
     PARENT,
     PATTERN,
     PAYLOAD,
@@ -218,7 +258,12 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     REFLECTION_ID,
     RELATION,
     REMEMBER,
+    RESOLUTION,
+    RESOLUTION_NOTE,
+    RESOLVED_BY,
     RESOURCE_PATH,
+    ROUTINE_ID,
+    RUN_ID,
     SCOPE,
     SECRET,
     SIGNATURE,
@@ -232,6 +277,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     SOURCE_MEMORY_ID,
     SOURCE_SPAN,
     SOURCE_URI,
+    STATE,
     STATUS,
     SUBSCRIPTION_ID,
     SUMMARY,
@@ -240,11 +286,15 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     TARGET_FOLDER,
     TARGET_ID,
     TARGET_TIER,
+    TEMPLATE,
     THRESHOLD,
     TIER,
     TITLE,
+    TO,
+    TO_ACTION,
     TO_NAMESPACE,
     TTL_SECONDS,
+    TTL_SECS,
     UNREAD_ONLY,
     UNTIL,
     URL,
@@ -266,7 +316,7 @@ mod tests {
         //      confirm no orphan-literal drift.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            100,
+            121,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

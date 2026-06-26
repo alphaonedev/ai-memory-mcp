@@ -116,7 +116,7 @@ pub fn run(
             // wholesale.
             let existing =
                 db::get(&conn, &resolved_id)?.map_or_else(|| serde_json::json!({}), |m| m.metadata);
-            Some(crate::identity::preserve_agent_id(&existing, &v))
+            Some(crate::identity::preserve_provenance_keys(&existing, &v))
         }
     };
     if let Some(ref s) = args.source_uri {

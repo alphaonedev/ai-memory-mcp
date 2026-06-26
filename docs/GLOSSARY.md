@@ -147,8 +147,8 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing **74 advertised entries at
-`--profile full` at v0.7.0** (73 callable "memory tools" + the always-on
+an MCP server via `ai-memory mcp` exposing **100 advertised entries at
+`--profile full` at v0.8.0** (99 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
@@ -158,7 +158,7 @@ Codex, Grok, Gemini, Llama Stack. See `docs/USER_GUIDE.md`.
 
 ## Memory
 
-The core data unit. **A 26-field record at v0.7.0** (was 15 at v0.6.x) —
+The core data unit. **A 27-field record at v0.8.0** (26 at v0.7.0, was 15 at v0.6.x; the 27th field is `lifecycle_state`, the v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64) —
 adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind`
 (Batman Form-6 vocabulary), `entity_id`/`persona_version` (QW-2 persona
 artefact), `citations`/`source_uri`/`source_span` (Form-4 fact
@@ -173,10 +173,12 @@ upserts. Canonical truth in `src/models/memory.rs`. See
 
 ## Memory link
 
-A typed relationship between two memories. **Six kinds at v0.7.0** (was
-four at v0.6.x): `related_to`, `supersedes`, `contradicts`,
+A typed relationship between two memories. **Nine kinds at v0.8.0** (six
+at v0.7.0, was four at v0.6.x): `related_to`, `supersedes`, `contradicts`,
 `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from`
-(WT-1-A atomisation). Used by consolidate (to
+(WT-1-A atomisation), and the v0.8.0 Pillar-2 typed-cognition trio
+`decomposes_into` / `depends_on` / `advances` (#1709, closed-taxonomy
+CHECK extended 6→9 at schema v63). Used by consolidate (to
 track provenance) and the curator (to mark contradictions).
 
 ## Namespace

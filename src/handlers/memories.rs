@@ -101,24 +101,26 @@ pub async fn get_memory(
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
-    // PERF-1 (FX-3): wrap the rusqlite read sequence in `db_op` so the
-    // FTS5 + memory_links lookups run on the blocking pool, not on the
-    // tokio worker. `get_memory` is on the per-id retrieval hot path.
-    // The visibility check is pure CPU on the owned Memory so it stays
-    // outside the helper; only the SQL touches the DB lock.
+    // #1580 (PERF, supersedes the PERF-1/FX-3 `db_op` wrap): `get_memory`
+    // is a pure read (resolve_id + get_links), so it dispatches through
+    // the WAL read-pool (`db_read_op`) instead of the single writer
+    // mutex — concurrent GETs now run on distinct read-only connections
+    // rather than serializing. The visibility check is pure CPU on the
+    // owned Memory so it stays outside the helper; only the SELECTs touch
+    // a pool connection.
     let id_clone = id.clone();
     let lookup: Result<
         Option<(crate::models::Memory, Vec<crate::models::MemoryLink>)>,
         anyhow::Error,
-    > = super::db_op(app.db.clone(), move |guard| {
-        match db::resolve_id(&guard.0, &id_clone) {
+    > = super::read_pool::db_read_op(app.db.clone(), move |conn| {
+        match db::resolve_id(conn, &id_clone) {
             Ok(Some(mem)) => {
                 // #869 audit (Category B — safe default): a substrate
                 // failure on `get_links` is non-fatal — the memory
                 // body itself was retrieved cleanly. Empty `links`
                 // array degrades graph navigation rather than
                 // failing the GET.
-                let links = db::get_links(&guard.0, &mem.id).unwrap_or_default();
+                let links = db::get_links(conn, &mem.id).unwrap_or_default();
                 Ok(Some((mem, links)))
             }
             Ok(None) => Ok(None),
@@ -264,6 +266,14 @@ pub async fn update_memory(
             // db::update_with_expected_version) so this was a
             // postgres-only data drop.
             expires_at: body.expires_at.clone(),
+            // v0.8.0 Pillar 2 (#1726) — thread the lifecycle transition
+            // target so the postgres trait `update` enforces
+            // `can_transition_to` (illegal edge → 409 via
+            // `StoreError::InvalidTransition`). Already validated above.
+            lifecycle_state: body
+                .lifecycle_state
+                .as_deref()
+                .and_then(crate::models::LifecycleState::from_str),
         };
         // v0.7.0 ship-hardening (2026-05-19): resolve caller from
         // X-Agent-Id header so update() can authorize against the
@@ -468,7 +478,7 @@ pub async fn update_memory(
             || serde_json::Value::Object(serde_json::Map::new()),
             |m| m.metadata.clone(),
         );
-        crate::identity::preserve_agent_id(&existing_meta, new_meta)
+        crate::identity::preserve_provenance_keys(&existing_meta, new_meta)
     });
     match db::update_with_expected_version(
         &lock.0,
@@ -486,6 +496,32 @@ pub async fn update_memory(
         if_match_version,
     ) {
         Ok((true, _)) => {
+            // v0.8.0 Pillar 2 (#1726) — apply an optional lifecycle
+            // transition through the self-validating storage primitive. An
+            // illegal edge surfaces as a typed `InvalidTransition` → 409
+            // CONFLICT (byte-parity error detail with the postgres branch's
+            // `StoreError::InvalidTransition`); a request equal to the stored
+            // state is an idempotent no-op. `body.lifecycle_state` was already
+            // shape-validated by `validate_update` above.
+            if let Some(target) = body
+                .lifecycle_state
+                .as_deref()
+                .and_then(crate::models::LifecycleState::from_str)
+                && let Err(e) = db::set_lifecycle_state(&lock.0, &resolved_id, target)
+            {
+                if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "status": "conflict",
+                            "id": resolved_id,
+                            "error": it.to_string(),
+                        })),
+                    )
+                        .into_response();
+                }
+                return crate::handlers::errors::handler_error_500(&e);
+            }
             let mem = db::get(&lock.0, &resolved_id).ok().flatten();
             // Issue #219: regenerate the embedding when the searchable text
             // (title/content) changed. Without this, the semantic index keeps

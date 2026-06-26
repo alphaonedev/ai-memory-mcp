@@ -78,3 +78,111 @@ async fn test_load_mtls_rustls_config_empty_allowlist_bails() {
         "expected 'refuse to start' wording, got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R-10 (#1798 Grok full-spectrum review) — TLS serve + graceful-shutdown
+// integration. The config-load paths above are covered; the acceptor
+// handshake is covered by tests/mtls_nodelay_acceptor.rs; and the NON-TLS
+// serve+shutdown seam is covered by
+// `daemon_runtime::tests::test_serve_http_with_shutdown_future_serves_then_stops`.
+// The remaining untested seam is the TLS branch of `serve()`: that
+// `axum_server::Handle::graceful_shutdown(..)` actually drains and stops the
+// `axum_server::bind().acceptor(serve_rustls_acceptor).handle().serve()` loop
+// after a real TLS request. This test reproduces that exact production bind
+// chain (daemon_runtime.rs serve() TLS arm) over a minimal router and asserts
+// it serves, then stops gracefully on the shutdown signal.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_serve_tls_graceful_shutdown_serves_then_stops() {
+    use axum::routing::get;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    // Under feature graphs where BOTH `ring` and `aws-lc-rs` are present
+    // (e.g. coverage's `--features sal,sal-postgres`), rustls cannot
+    // auto-select a process CryptoProvider — pin ring explicitly, as the
+    // production serve() path and the sibling mTLS tests do. Idempotent.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Production server TLS config from the committed fixtures (the plain-TLS
+    // `--tls-cert`/`--tls-key` path, no client-auth).
+    let tls_config =
+        tls::load_rustls_config(&fixture("valid_cert.pem"), &fixture("valid_key_pkcs8.pem"))
+            .await
+            .expect("server rustls config from committed fixtures");
+
+    // Bind a free loopback port.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let socket_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let app = axum::Router::new().route("/api/v1/health", get(|| async { "ok" }));
+
+    // EXACT serve() TLS arm: an `axum_server::Handle` whose graceful_shutdown
+    // is triggered by a spawned signal listener (here a `Notify` standing in
+    // for ctrl_c / SIGTERM), then `bind().acceptor(serve_rustls_acceptor).
+    // handle().serve()`.
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = shutdown.clone();
+    let grace = Duration::from_secs(5);
+    tokio::spawn(async move {
+        shutdown_clone.notified().await;
+        handle_clone.graceful_shutdown(Some(grace));
+    });
+
+    let serve = tokio::spawn(async move {
+        axum_server::bind(socket_addr)
+            .acceptor(tls::serve_rustls_acceptor(&tls_config))
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+    });
+
+    // A real HTTPS client (reqwest's rustls backend) that accepts the
+    // self-signed fixture cert. Poll until the listener is up, then assert a
+    // 200 from the TLS-served /health.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+    let url = format!("https://127.0.0.1:{port}/api/v1/health");
+    let mut served = false;
+    for _ in 0..60 {
+        if let Ok(resp) = client.get(&url).send().await {
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        served,
+        "TLS server must answer /health over HTTPS before shutdown"
+    );
+
+    // Signal graceful shutdown — the serve future MUST return Ok within the
+    // grace window (this is the seam R-10 names: Handle::graceful_shutdown
+    // actually stopping the rustls serve loop).
+    shutdown.notify_one();
+    let joined = tokio::time::timeout(Duration::from_secs(10), serve)
+        .await
+        .expect("TLS serve task must finish within the grace+timeout window")
+        .expect("TLS serve task must not panic");
+    assert!(joined.is_ok(), "TLS serve returned an error: {joined:?}");
+
+    // After graceful shutdown the port no longer accepts new TLS connections.
+    let after = client.get(&url).send().await;
+    assert!(
+        after.is_err(),
+        "server must stop accepting new connections after graceful shutdown"
+    );
+}

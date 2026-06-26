@@ -126,6 +126,7 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
         // v45 schema (Gap-1 optimistic concurrency, issue #884) — fresh
         // share row starts at version 1.
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     db::insert(conn, &shared).map_err(|e| e.to_string())?;
@@ -239,6 +240,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

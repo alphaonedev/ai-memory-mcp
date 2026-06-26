@@ -103,6 +103,18 @@ pub(super) fn handle_promote(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
+    // #1786 — owner gate: refuse a cross-owner promote / namespace-clone. The
+    // MCP promote path calls raw `db::*` directly (bypassing the HTTP
+    // `require_caller_owns_memory`, #930). Keyed on the ENFORCED-read caller
+    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
+    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
+    // trust-all default byte-unchanged. `allow_inbox = false`.
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+        if !crate::visibility::caller_owns_for_mutation(&target, &caller, false) {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+    }
+
     // Task 1.9: governance enforcement (promote-side).
     {
         use crate::models::{GovernanceDecision, GovernedAction};
@@ -324,5 +336,75 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    fn agent_id_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn insert_owned(conn: &rusqlite::Connection, title: &str, ns: &str, owner: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mem = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("c {title}"),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: json!({"agent_id": owner}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: vec![],
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        };
+        db::insert(conn, &mem).expect("insert")
+    }
+
+    #[test]
+    fn cross_owner_promote_refused_1786() {
+        // #1786 — with AI_MEMORY_AGENT_ID set (the multi-tenant opt-in) a
+        // cross-owner promote is REFUSED by the owner gate, and the owner passes
+        // it. (Unset = trust-all single-tenant default, gate skipped — covered by
+        // the other promote tests that run without the env set.)
+        let _envg = agent_id_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = open_conn();
+        let id = insert_owned(&conn, "alice-row", "promo-gate-1786", "ai:alice");
+
+        // Caller ai:bob (≠ owner) → refused by the owner gate.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:bob") };
+        let err = handle_promote(&conn, Path::new(":memory:"), &json!({"id": id}), None)
+            .expect_err("cross-owner promote must be refused");
+        assert!(err.contains("does not own"), "got: {err}");
+
+        // Caller ai:alice (owner) → passes the owner gate (later gates are
+        // out of scope for this test; assert only that the OWNER gate allows).
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+        if let Err(e) = handle_promote(&conn, Path::new(":memory:"), &json!({"id": id}), None) {
+            assert!(
+                !e.contains("does not own"),
+                "owner must pass the owner gate, got: {e}"
+            );
+        }
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
 }

@@ -43,20 +43,25 @@ use crate::models::{Memory, Tier};
 
 /// Source label stamped on memories the autonomy curator writes
 /// (one spelling across the three write paths — #1558).
-const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
+// Shared `source` label for curator-written consolidation + rollback rows.
+// `pub(crate)` so the SAL `ConsolidationPass` (#1746 cutover) stamps the SAME
+// value on consolidated rows — preserving byte-continuity of the `source`
+// column across the autonomy→SAL cutover (the "(autonomy)" suffix is historical
+// and kept stable deliberately; it denotes the curator, not the internal pass).
+pub(crate) const CURATOR_SOURCE_LABEL: &str = "ai-memory curator (autonomy)";
 
 /// Minimum Jaccard-keyword overlap required to treat two memories as
 /// "near-duplicates" candidates for a consolidation cluster. Tuned
 /// loosely — actual merge decision is still gated by an LLM pass.
 ///
-/// v0.7.0 R3-S2 — Jaccard is now a *cheap pre-filter* (O(N) per pair)
-/// when embeddings are available; cosine on the 384d MiniLM
-/// embeddings is the primary signal at
-/// [`CONSOLIDATE_COSINE_THRESHOLD`]. The Jaccard threshold is
-/// retained as the keyword-tier fall-back when no embeddings are
-/// present (so consolidation still works on a keyword-only
-/// deployment) and as a pre-filter to skip the embedding lookup on
-/// obviously-unrelated pairs.
+/// v0.7.0 R3-S2 — Jaccard is a *cheap pre-filter* (O(N) per pair);
+/// cosine on the 384d MiniLM embeddings is the primary signal at
+/// [`CONSOLIDATE_COSINE_THRESHOLD`]. Both must hold for a pair to
+/// cluster. Per #1774 (5-agent vote 4d3ea1c5) the Jaccard pre-filter
+/// is NOT a stand-alone fall-back: when a stored embedding is absent
+/// on either side the pair does not merge — a destructive merge always
+/// requires the cosine safety gate. The pre-filter's only role is to
+/// skip the embedding lookup on obviously-unrelated pairs.
 pub const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.55;
 
 /// v0.7.0 R3-S2 — cosine similarity threshold (on 384d L2-normalised
@@ -65,11 +70,11 @@ pub const CONSOLIDATE_JACCARD_THRESHOLD: f64 = 0.55;
 /// it captures rephrasings and semantically near-equivalent content
 /// without merging merely topically-adjacent memories.
 ///
-/// Applied as the primary signal whenever both memories carry an
-/// embedding row in the DB (`db::get_embedding` returns `Some`).
-/// Jaccard is the cheap pre-filter (skips the embedding lookup) and
-/// the fall-back signal when embeddings are missing
-/// (keyword-tier deployments).
+/// Applied as a MANDATORY gate whenever a pair is considered: both
+/// memories must carry an embedding row in the DB (`db::get_embedding`
+/// returns `Some`) and clear this threshold. Per #1774 a pair lacking a
+/// stored embedding on either side does not merge — there is no
+/// Jaccard-only fall-back for the destructive consolidation merge.
 pub const CONSOLIDATE_COSINE_THRESHOLD: f64 = 0.75;
 
 /// Cap on the number of memories in a single consolidation cluster —
@@ -97,6 +102,24 @@ pub trait AutonomyLlm {
 
     /// Produce a consolidated summary of N memories.
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String>;
+
+    /// #1393 — classify a recovered transcript turn into a refined
+    /// [`crate::models::MemoryKind`] (the "decision-detector": is this
+    /// observation actually a Decision / Claim / Event …?). Returns `None`
+    /// to ABSTAIN — the caller leaves the existing kind untouched. The default
+    /// abstains so the 17 stub/mock impls compile unchanged; only the real
+    /// LLM-backed [`OllamaClient`] overrides it (mirrors the curator's other
+    /// LLM passes, which run only against the real backend).
+    ///
+    /// # Errors
+    /// Propagates the underlying LLM client error.
+    fn classify_kind(
+        &self,
+        _title: &str,
+        _content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        Ok(None)
+    }
 }
 
 impl AutonomyLlm for OllamaClient {
@@ -112,6 +135,13 @@ impl AutonomyLlm for OllamaClient {
     fn summarize_memories(&self, memories: &[(String, String)]) -> Result<String> {
         Self::summarize_memories(self, memories)
     }
+    fn classify_kind(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        Self::classify_kind(self, title, content)
+    }
 }
 
 /// Rollback-log entry stored as a memory in `_curator/rollback/<rfc3339>`.
@@ -124,12 +154,24 @@ impl AutonomyLlm for OllamaClient {
 /// The `Consolidate` variant is deliberately large (carries full
 /// pre-merge memory snapshots) compared to `PriorityAdjust`. That's the
 /// cost of being able to reverse a merge without network round-trips.
+///
+/// **Recovery scope (#1771).** A rollback restores the pre-merge memory
+/// ROWS only. It does NOT restore the merged sources' `memory_links`
+/// edges or other `ON DELETE CASCADE` provenance (`recall_observations`,
+/// confidence-calibration rows, `memory_transcript_links`): those were
+/// cascade-reaped when the sources were deleted at merge time and are not
+/// captured in `originals`. So a reversed merge returns the text but
+/// leaves the relationship graph of the merged sources destroyed, until
+/// archive-link preservation lands (#1771 structural fix).
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RollbackEntry {
     /// A consolidation was applied. `originals` are the full Memory
     /// snapshots pre-merge; `result_id` is the consolidated memory id.
+    /// NOTE (#1771): `originals` carries the memory ROWS only — NOT the
+    /// merged sources' cascade-deleted `memory_links` / provenance edges,
+    /// which a rollback therefore cannot restore yet.
     Consolidate {
         originals: Vec<Memory>,
         result_id: String,
@@ -172,6 +214,13 @@ pub struct AutonomyPassReport {
 /// consolidate → forget superseded → priority feedback → record
 /// rollback log → write self-report. `dry_run` suppresses all writes.
 ///
+/// `skip_consolidation` suppresses **Pass 1 only** (forget-superseded +
+/// priority-feedback still run). Set by the curator when the SAL
+/// `ConsolidationPass` owns consolidation (`compaction.enabled`, #1746
+/// cutover) so the corpus is never consolidated twice in one cycle. The two
+/// consolidators are mutually exclusive, driven from a single
+/// `compaction.enabled` predicate in `curator::run_once`.
+///
 /// Returns an `AutonomyPassReport` rather than `Result<…>` because
 /// per-pass errors are already aggregated into `report.errors`;
 /// the function itself cannot fail at the outer level.
@@ -180,26 +229,31 @@ pub fn run_autonomy_passes(
     llm: &dyn AutonomyLlm,
     candidates: &[Memory],
     dry_run: bool,
+    skip_consolidation: bool,
 ) -> AutonomyPassReport {
     let mut report = AutonomyPassReport::default();
 
-    // Pass 1 — consolidation.
-    let clusters = find_consolidation_clusters(conn, candidates);
-    report.clusters_formed = clusters.len();
-    for cluster in clusters {
-        match consolidate_cluster(conn, llm, &cluster, dry_run) {
-            Ok(Some(entry)) => {
-                if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
-                    report.errors.push(rollback_log_write_failed(&e));
-                } else {
-                    report.rollback_entries_written += 1;
+    // Pass 1 — consolidation. Skipped when the SAL ConsolidationPass owns
+    // consolidation (#1746); the curator folds that pass's counts into this
+    // report so the self-report stays accurate.
+    if !skip_consolidation {
+        let clusters = find_consolidation_clusters(conn, candidates);
+        report.clusters_formed = clusters.len();
+        for cluster in clusters {
+            match consolidate_cluster(conn, llm, &cluster, dry_run) {
+                Ok(Some(entry)) => {
+                    if !dry_run && let Err(e) = persist_rollback_entry(conn, &entry) {
+                        report.errors.push(rollback_log_write_failed(&e));
+                    } else {
+                        report.rollback_entries_written += 1;
+                    }
+                    if let RollbackEntry::Consolidate { originals, .. } = entry {
+                        report.memories_consolidated += originals.len();
+                    }
                 }
-                if let RollbackEntry::Consolidate { originals, .. } = entry {
-                    report.memories_consolidated += originals.len();
-                }
+                Ok(None) => {}
+                Err(e) => report.errors.push(format!("consolidate failed: {e}")),
             }
-            Ok(None) => {}
-            Err(e) => report.errors.push(format!("consolidate failed: {e}")),
         }
     }
 
@@ -252,14 +306,22 @@ pub fn run_autonomy_passes(
 ///      pairs join the cluster.
 ///
 /// When *either* memory in a pair has no embedding row (e.g.,
-/// keyword-tier deployment that never ran the embedder), the cosine
-/// stage is skipped for that pair and the Jaccard signal alone
-/// decides — preserving v0.6.x behaviour on keyword deployments
-/// while making cosine the primary signal anywhere the embedder is
-/// available. The function never errors on a DB read miss; it
-/// silently degrades to Jaccard so a partial-coverage corpus (some
-/// embedded, some not) still clusters productively.
-fn find_consolidation_clusters(conn: &Connection, candidates: &[Memory]) -> Vec<Vec<Memory>> {
+/// keyword-tier deployment that never ran the embedder, or an
+/// oversize / never-embedded row), the pair does **NOT** cluster
+/// (#1774, 5-agent vote 4d3ea1c5): a destructive consolidation merge
+/// requires the cosine safety gate on both sides and is never decided
+/// on Jaccard lexical overlap alone. Two distinct memories can share
+/// high Jaccard (templated content), so lexical overlap is not a safe
+/// basis for a merge-and-delete. This mirrors the substrate's
+/// skip-on-missing-embedding posture for the other destructive path
+/// (`proactive_conflict_check` filters `embedding IS NOT NULL`).
+/// Un-embedded corpora no longer auto-consolidate (documented behaviour
+/// change). The function never errors on a DB read miss; a missing
+/// embedding simply blocks the merge for that pair.
+pub(crate) fn find_consolidation_clusters(
+    conn: &Connection,
+    candidates: &[Memory],
+) -> Vec<Vec<Memory>> {
     // Group by namespace first — we never merge across namespaces.
     let mut by_ns: std::collections::HashMap<&str, Vec<&Memory>> = std::collections::HashMap::new();
     for m in candidates {
@@ -280,8 +342,8 @@ fn find_consolidation_clusters(conn: &Connection, candidates: &[Memory]) -> Vec<
             used[i] = true;
             // Cache the seed memory's embedding (looked up once per
             // outer-loop iteration). `None` means "embedding missing
-            // for this memory" — we fall back to Jaccard-only on the
-            // inner pairs.
+            // for this memory" — per #1774 a missing embedding on
+            // either side blocks the merge for that pair.
             let seed_emb = db::get_embedding(conn, &group[i].id).ok().flatten();
             for j in (i + 1)..group.len() {
                 if used[j] {
@@ -303,10 +365,11 @@ fn find_consolidation_clusters(conn: &Connection, candidates: &[Memory]) -> Vec<
                         let cos = f64::from(crate::embeddings::Embedder::cosine_similarity(a, b));
                         cos >= CONSOLIDATE_COSINE_THRESHOLD
                     }
-                    // At least one side has no embedding — fall back
-                    // to Jaccard-only (already passed the pre-filter
-                    // above so the pair clusters).
-                    _ => true,
+                    // #1774 (5-agent vote 4d3ea1c5) — at least one side
+                    // has no embedding, so there is no cosine value. A
+                    // destructive merge is never decided on Jaccard
+                    // lexical overlap alone: the pair does NOT cluster.
+                    _ => false,
                 };
                 if matches_cluster {
                     cluster.push(group[j].clone());
@@ -546,9 +609,21 @@ fn rollback_log_write_failed(e: &dyn std::fmt::Display) -> String {
 }
 
 fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()> {
+    db::insert(conn, &build_rollback_memory(entry)?)?;
+    Ok(())
+}
+
+/// Build the `_curator/rollback` `Memory` row for a [`RollbackEntry`] —
+/// the serialised, operator-reversible snapshot that
+/// [`reverse_rollback_entry`] (and `ai-memory curator --rollback`)
+/// consumes. Extracted so the backend-agnostic SAL `ConsolidationPass`
+/// (#1745) can persist a byte-identical rollback row via
+/// [`crate::store::MemoryStore::store`] instead of a raw `Connection`,
+/// keeping the two consolidation paths' rollback rows interchangeable.
+pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
-    let mem = Memory {
+    Ok(Memory {
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: format!("{CURATOR_NAMESPACE}/rollback"),
@@ -582,9 +657,8 @@ fn persist_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Result<()
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
-    };
-    db::insert(conn, &mem)?;
-    Ok(())
+        lifecycle_state: crate::models::LifecycleState::Open,
+    })
 }
 
 /// Write the cycle's report as a memory in `_curator/reports/<ts>`
@@ -646,6 +720,7 @@ pub fn persist_self_report(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     db::insert(conn, &mem)?;
     Ok(())
@@ -703,6 +778,113 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
                 None,
             )?;
             Ok(true)
+        }
+    }
+}
+
+/// v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed, backend-agnostic
+/// twin of [`reverse_rollback_entry`]. Reverses a single rollback-log
+/// entry through the SAL [`crate::store::MemoryStore`] trait so
+/// `ai-memory curator --rollback --store-url postgres://…` reverses a
+/// consolidation the store-backed curator wrote (slice-3c1, #1747) —
+/// closing the "irreversible hard-DELETE behind a reversible-looking
+/// API" gap slice-3c1 disclosed via a runtime WARN.
+///
+/// Returns `true` if a reverse action was applied, `false` if the entry
+/// was already superseded (idempotent rollback) — mirroring
+/// [`reverse_rollback_entry`].
+///
+/// Decision provenance: 5-agent vote `4d3ea1c5` → Option B (free async
+/// fn over `&dyn MemoryStore`, 3/5; memory `ed85b972`). The two
+/// dissents' hazards are encoded as guardrails:
+///
+/// * **Collision guard (G2):** before reinserting a snapshot we ask the
+///   store whether a DIFFERENT id now owns the same `(title, namespace)`
+///   key (via [`crate::store::MemoryStore::find_by_title_namespace`]) and
+///   refuse — `store.store` is an UPSERT on that key and would silently
+///   clobber the unrelated row. Mirrors the rusqlite [`check_no_collision`].
+/// * **Fail-safe ordering (G3):** the `Consolidate` arm reinserts the
+///   originals BEFORE deleting the consolidated summary, so a crash mid-
+///   reversal never destroys the summary while the originals are still
+///   missing. The summary's `[consolidated]` title never collides with an
+///   original, so the ordering introduces no UPSERT hazard.
+/// * **Atomicity (G4):** the SAL trait's `begin_transaction` is
+///   Postgres-internal only (SQLite returns `UnsupportedCapability`), so a
+///   backend-agnostic free fn cannot wrap the multi-write in one
+///   transaction. The non-atomic window is EXACT PARITY with the rusqlite
+///   [`reverse_rollback_entry`] (also separate statements, no
+///   BEGIN/COMMIT); G3 ordering minimises it.
+#[cfg(feature = "sal")]
+pub async fn reverse_rollback_entry_store(
+    store: &dyn crate::store::MemoryStore,
+    ctx: &crate::store::CallerContext,
+    entry: &RollbackEntry,
+) -> Result<bool> {
+    use crate::store::StoreError;
+
+    // G2 — refuse to overwrite a memory that took the (title, namespace)
+    // slot after the rollback target was forgotten/consolidated.
+    async fn guard_no_collision(store: &dyn crate::store::MemoryStore, m: &Memory) -> Result<()> {
+        if let Some(existing) = store
+            .find_by_title_namespace(&m.title, &m.namespace)
+            .await?
+        {
+            if existing != m.id {
+                anyhow::bail!(
+                    "rollback refused: (title={:?}, namespace={:?}) is now owned by memory \
+                     {existing}, not the snapshot {} — resolve the conflict (delete the \
+                     offender or rename one) before reversing",
+                    m.title,
+                    m.namespace,
+                    m.id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    match entry {
+        RollbackEntry::Consolidate {
+            originals,
+            result_id,
+        } => {
+            for m in originals {
+                guard_no_collision(store, m).await?;
+            }
+            // G3 — reinsert the originals BEFORE deleting the summary.
+            for m in originals {
+                store.store(ctx, m).await?;
+            }
+            // Delete the consolidated summary; `NotFound` → already removed
+            // (idempotent no-op), matching the rusqlite `existed` bool.
+            match store.delete(ctx, result_id).await {
+                Ok(()) => Ok(true),
+                Err(StoreError::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }
+        RollbackEntry::Forget { snapshot } => {
+            guard_no_collision(store, snapshot).await?;
+            store.store(ctx, snapshot).await?;
+            Ok(true)
+        }
+        RollbackEntry::PriorityAdjust {
+            memory_id,
+            before,
+            after: _,
+        } => {
+            // Restore the prior priority. get → mutate → store (UPSERT on the
+            // existing (title, namespace): no new row, so no collision guard
+            // needed). `NotFound` → the row is gone (idempotent no-op).
+            match store.get(ctx, memory_id).await {
+                Ok(mut mem) => {
+                    mem.priority = *before;
+                    store.store(ctx, &mem).await?;
+                    Ok(true)
+                }
+                Err(StoreError::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
         }
     }
 }
@@ -826,6 +1008,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -874,6 +1057,13 @@ mod tests {
             Tier::Mid,
         );
         let (_tmp, conn) = setup_conn();
+        // #1774 — both sides need a stored embedding to merge; this test's
+        // subject is namespace grouping, so attach aligned vectors (cosine
+        // ≈ 1.0) to the in-ns pair.
+        for m in [&a, &b, &c] {
+            db::insert(&conn, m).unwrap();
+            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let clusters = find_consolidation_clusters(&conn, &[a, b, c]);
         // ns1 should cluster a+b; ns2 has only one memory so no cluster.
         assert_eq!(clusters.len(), 1);
@@ -975,12 +1165,13 @@ mod tests {
         assert_eq!(clusters2[0].len(), 2);
     }
 
-    /// `test_consolidation_falls_back_to_jaccard_no_embeddings` —
-    /// keyword-tier corpus (no embeddings persisted) still clusters
-    /// via Jaccard alone. This preserves v0.6.x consolidation
-    /// behaviour on deployments that never run the embedder.
+    /// `test_consolidation_no_embeddings_does_not_merge_1774` —
+    /// keyword-tier corpus (no embeddings persisted) does NOT cluster.
+    /// Per #1774 (5-agent vote 4d3ea1c5) a destructive consolidation
+    /// merge requires the cosine safety gate on both sides; un-embedded
+    /// pairs never merge on Jaccard lexical overlap alone.
     #[test]
-    fn test_consolidation_falls_back_to_jaccard_no_embeddings() {
+    fn test_consolidation_no_embeddings_does_not_merge_1774() {
         let (_tmp, conn) = setup_conn();
         let a = sample_mem(
             "a",
@@ -997,17 +1188,16 @@ mod tests {
             Tier::Long,
         );
         // Insert WITHOUT attaching embeddings — get_embedding returns
-        // None, the cosine stage is skipped, Jaccard alone decides.
+        // None on both sides, so there is no cosine value and the pair
+        // does NOT merge (#1774).
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
 
         let clusters = find_consolidation_clusters(&conn, &[a, b]);
-        assert_eq!(
-            clusters.len(),
-            1,
-            "keyword-tier corpus (no embeddings) must still cluster via Jaccard"
+        assert!(
+            clusters.is_empty(),
+            "un-embedded corpus must NOT cluster on Jaccard alone; got {clusters:?}"
         );
-        assert_eq!(clusters[0].len(), 2);
     }
 
     #[test]
@@ -1147,6 +1337,107 @@ mod tests {
         }
     }
 
+    // v0.8.0 Pillar-2.5 slice-3c2 (#1748) — store-backed reversal over the
+    // SAL `MemoryStore` trait. Deterministic SQLite-backed twin of the
+    // rusqlite `reverse_consolidation_restores_originals`; the postgres arm
+    // is exercised by tests/cov_postgres_core.rs (soft-skips off-CI).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reverse_rollback_entry_store_restores_originals_sqlite() {
+        use crate::store::MemoryStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
+        let ctx = crate::store::CallerContext::for_admin("ai:test");
+
+        let a = sample_mem(
+            "a",
+            "app",
+            "Deploy plan",
+            "kubernetes rolling canary",
+            Tier::Long,
+        );
+        let b = sample_mem(
+            "b",
+            "app",
+            "Deploy process",
+            "kubernetes canary strategy",
+            Tier::Long,
+        );
+        let summary = sample_mem("c", "app", "[consolidated] Deploy", "merged", Tier::Long);
+
+        // Simulate the post-consolidation state: originals hard-deleted, the
+        // `[consolidated]` summary present, a reversible entry on hand.
+        store.store(&ctx, &summary).await.unwrap();
+        let entry = RollbackEntry::Consolidate {
+            originals: vec![a.clone(), b.clone()],
+            result_id: summary.id.clone(),
+        };
+        assert!(
+            store.get(&ctx, "a").await.is_err(),
+            "original absent pre-reverse"
+        );
+        assert!(
+            store.get(&ctx, &summary.id).await.is_ok(),
+            "summary present pre-reverse"
+        );
+
+        let applied = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap();
+        assert!(applied, "summary existed → reverse applied");
+
+        // Originals restored; summary removed.
+        assert!(store.get(&ctx, "a").await.is_ok(), "original a restored");
+        assert!(store.get(&ctx, "b").await.is_ok(), "original b restored");
+        assert!(
+            store.get(&ctx, &summary.id).await.is_err(),
+            "summary removed"
+        );
+
+        // Idempotent: a second reverse is a no-op (summary already gone).
+        let again = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap();
+        assert!(!again, "summary already removed → no-op");
+    }
+
+    // #1748 — the G2 collision guard: refuse to clobber a DIFFERENT memory
+    // that took the (title, namespace) slot, leaving the summary intact
+    // (G3 ordering guarantees the guard fires before any delete).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn reverse_rollback_entry_store_collision_aborts_sqlite() {
+        use crate::store::MemoryStore;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = crate::store::sqlite::SqliteStore::open(tmp.path()).expect("open store");
+        let ctx = crate::store::CallerContext::for_admin("ai:test");
+
+        let a = sample_mem("a", "app", "Deploy plan", "orig", Tier::Long);
+        let summary = sample_mem("c", "app", "[consolidated] Deploy", "merged", Tier::Long);
+        store.store(&ctx, &summary).await.unwrap();
+        // A DIFFERENT id now owns ("Deploy plan", "app").
+        let intruder = sample_mem("z", "app", "Deploy plan", "unrelated", Tier::Long);
+        store.store(&ctx, &intruder).await.unwrap();
+
+        let entry = RollbackEntry::Consolidate {
+            originals: vec![a],
+            result_id: summary.id.clone(),
+        };
+        let err = reverse_rollback_entry_store(&store, &ctx, &entry)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("rollback refused"),
+            "expected collision refusal, got: {err}"
+        );
+        // Guard fired before the delete: summary and intruder both intact.
+        assert!(
+            store.get(&ctx, &summary.id).await.is_ok(),
+            "summary not deleted"
+        );
+        assert!(store.get(&ctx, "z").await.is_ok(), "intruder not clobbered");
+    }
+
     #[test]
     fn full_autonomy_cycle_end_to_end() {
         let (_tmp, conn) = setup_conn();
@@ -1201,6 +1492,12 @@ mod tests {
         for m in [&m_a, &m_b, &m_chat, &m_old, &m_new] {
             db::insert(&conn, m).unwrap();
         }
+        // #1774 — the deploy near-duplicates need stored embeddings on both
+        // sides to clear the cosine gate; attach aligned vectors (cosine
+        // ≈ 1.0) so the deploy cluster forms.
+        for id in ["ma", "mb"] {
+            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
 
         let candidates = vec![
             m_a.clone(),
@@ -1209,7 +1506,7 @@ mod tests {
             m_old.clone(),
             m_new.clone(),
         ];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Consolidated at least once (deploy cluster).
         assert!(report.clusters_formed >= 1);
@@ -1288,11 +1585,15 @@ mod tests {
         );
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
+        // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
+        // gate is cleared and the pair clusters.
+        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
 
         let llm = StubLlm::new("LLM-generated consolidated summary");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Key assertions: LLM was used (clusters formed and consolidation happened)
         assert!(report.clusters_formed > 0);
@@ -1319,11 +1620,15 @@ mod tests {
         );
         db::insert(&conn, &a).unwrap();
         db::insert(&conn, &b).unwrap();
+        // #1774 — attach aligned embeddings (cosine ≈ 1.0) so the cosine
+        // gate is cleared and consolidation produces a rollback entry.
+        db::set_embedding(&conn, &a.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        db::set_embedding(&conn, &b.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
 
         let llm = StubLlm::new("mock summary result");
         let candidates = vec![a, b];
 
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // Report should reflect successful cycle
         assert_eq!(report.errors.len(), 0, "autonomy cycle should not error");
@@ -1450,7 +1755,7 @@ mod tests {
 
         let llm = StubLlm::new("consolidated");
         let candidates = vec![a, b];
-        let _report = run_autonomy_passes(&conn, &llm, &candidates, true);
+        let _report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
 
         let final_count = db::list(
             &conn,
@@ -1480,7 +1785,7 @@ mod tests {
         let mem = sample_mem("id", "ns", "Title", "content", Tier::Mid);
         let llm = StubLlm::new("summary");
         let candidates = vec![mem];
-        let report = run_autonomy_passes(&conn, &llm, &candidates, false);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, false, false);
 
         // At minimum, report structure should be valid
         assert!(report.clusters_formed > 0 || report.clusters_formed == 0);
@@ -1733,6 +2038,12 @@ mod tests {
         for m in [&m_a, &m_b, &m_old, &m_new, &m_hot] {
             db::insert(&conn, m).unwrap();
         }
+        // #1774 — the deploy near-duplicates need stored embeddings on both
+        // sides to clear the cosine gate; attach aligned vectors (cosine ≈ 1.0)
+        // so the deploy cluster forms in the dry-run report.
+        for id in ["ma", "mb"] {
+            db::set_embedding(&conn, id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let candidates = vec![
             m_a.clone(),
             m_b.clone(),
@@ -1746,7 +2057,7 @@ mod tests {
         assert!(db::get(&conn, "mold").unwrap().is_some());
 
         let llm = StubLlm::new("dry-run summary");
-        let report = run_autonomy_passes(&conn, &llm, &candidates, true);
+        let report = run_autonomy_passes(&conn, &llm, &candidates, true, false);
 
         // Report still reflects the would-be actions.
         assert!(report.clusters_formed >= 1);
@@ -1796,6 +2107,13 @@ mod tests {
             ));
         }
         let (_tmp, conn) = setup_conn();
+        // #1774 — both sides need a stored embedding to merge; this test's
+        // subject is the cluster-size cap, so attach aligned vectors
+        // (cosine ≈ 1.0) so every near-duplicate pair clears the cosine gate.
+        for m in &candidates {
+            db::insert(&conn, m).unwrap();
+            db::set_embedding(&conn, &m.id, &synth_emb(&[1.0, 0.0, 0.0, 0.0])).unwrap();
+        }
         let clusters = find_consolidation_clusters(&conn, &candidates);
         assert!(!clusters.is_empty());
         for c in &clusters {
