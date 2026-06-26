@@ -1580,7 +1580,7 @@ footer.site-foot a { color: var(--text-muted); }
 <section id="roadmap">
   <div class="container">
     <span class="eyebrow">Roadmap</span>
-    <h2>From v0.7.0 today to v1.0 federation maturity.</h2>
+    <h2>From v0.8.0 today to v1.0 federation maturity.</h2>
     <p class="lede">
       Public release sequence. Each release ships one demoable headline plus operational substrate the next release builds on. No version skipping. No quiet feature drift. <a href="https://github.com/alphaonedev/ai-memory-mcp-dev/blob/develop/ROADMAP.md" style="color:var(--pillar-1)">Public ROADMAP.md →</a>
     </p>
@@ -1605,13 +1605,13 @@ footer.site-foot a { color: var(--text-muted); }
         </div>
       </div>
 
-      <div class="roadmap-row next">
+      <div class="roadmap-row shipped">
         <div class="roadmap-marker">
           <div class="roadmap-dot"></div>
           <div class="version">v0.7</div>
         </div>
         <div class="roadmap-content">
-          <div class="rmt-theme">Trust + A2A Maturity</div>
+          <div class="rmt-theme">Trust + A2A Maturity · <span style="color:var(--good)">SHIPPED</span></div>
           <div class="rmt-eta">End Q2 2026 · gates Q3 commercial Attest launch</div>
           <div class="rmt-desc">Ed25519 attested identity, Apache AGE acceleration, A2A messaging maturity, programmable hook pipeline.</div>
           <ul class="rmt-bullets">
@@ -1625,14 +1625,14 @@ footer.site-foot a { color: var(--text-muted); }
         </div>
       </div>
 
-      <div class="roadmap-row future">
+      <div class="roadmap-row shipped">
         <div class="roadmap-marker">
           <div class="roadmap-dot"></div>
           <div class="version">v0.8</div>
         </div>
         <div class="roadmap-content">
-          <div class="rmt-theme">Coordination Primitives</div>
-          <div class="rmt-eta">Q4 2026</div>
+          <div class="rmt-theme">Coordination Primitives · <span style="color:var(--good)">SHIPPED</span></div>
+          <div class="rmt-eta">Jun 2026 · GA</div>
           <div class="rmt-desc">Distributed task queue, typed cognition, CRDTs. The multi-agent substrate.</div>
           <ul class="rmt-bullets">
             <li>Task queue with attested claim/complete/abandon (replay-safe)</li>
@@ -1744,7 +1744,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="step-title">mTLS federation</div>
         <div class="step-desc">Client-cert pinning, fingerprint allowlist, no central PKI. Multi-machine baseline.</div>
       </div>
-      <div class="trust-step next">
+      <div class="trust-step shipped">
         <div class="step-num">3</div>
         <div class="step-tier">v0.7 · OSS</div>
         <div class="step-title">Ed25519 attested identity</div>
@@ -1915,7 +1915,7 @@ footer.site-foot a { color: var(--text-muted); }
         <p style="color:var(--text-muted); margin-bottom:.75rem">
           AI mandates are real. Cloud bans are real. Foreign-vendor concerns are real. <strong>An OSS Rust binary that runs entirely on your hardware, requires zero outbound traffic, and ships with auditable source code is the only AI-memory primitive that works for federal, state, local, and municipal deployments.</strong>
         </p>
-        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.7.0 already runs air-gapped with no compromise.</p>
+        <p style="color:var(--text-muted); font-size:.9rem">v0.7's attested-identity work targets FIPS-grade key handling. v1.0's federation maturity work targets multi-region resilience. Today's v0.8.0 already runs air-gapped with no compromise.</p>
       </div>
     </div>
   </div>
@@ -2131,7 +2131,7 @@ footer.site-foot a { color: var(--text-muted); }
         <div class="card p2" style="height:100%;display:flex;flex-direction:column">
           <div class="card-eyebrow" style="color:var(--pillar-2)">▸ RUST TYPE REFERENCE</div>
           <div class="card-title">Types</div>
-          <p class="card-body">Every public struct and enum from <code>src/models/</code>. 16 enums, 50 structs at v0.7.0. Field-level types, defaults, serde tags. The wire-format contract.</p>
+          <p class="card-body">Every public struct and enum from <code>src/models/</code>. 5 enums, 22 structs at v0.8.0. Field-level types, defaults, serde tags. The wire-format contract.</p>
           <div style="margin-top:.85rem;font-family:var(--font-mono);font-size:.78rem;color:var(--pillar-2)">types.html →</div>
         </div>
       </a>

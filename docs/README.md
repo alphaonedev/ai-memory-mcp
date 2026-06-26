@@ -2,16 +2,16 @@
 
 <div align="center">
 
-## 🎯 Current release · **v0.7.1** (`attested-cortex`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
+## 🎯 Current release · **v0.8.0** (`distributed-coordination`) · ≥92% line coverage (ratchet pinned in [`.coverage-baseline`](../.coverage-baseline))
 
-[![Release](https://img.shields.io/badge/release-v0.7.1-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.7.1)
+[![Release](https://img.shields.io/badge/release-v0.8.0-brightgreen?logo=github)](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.8.0)
 [![A2A Gate](https://img.shields.io/badge/A2A_gate-9%2F9_green-brightgreen)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)
 [![Ship Gate](https://img.shields.io/badge/ship_gate-green-brightgreen)](https://alphaonedev.github.io/ai-memory-ship-gate/)
 [![crates.io](https://img.shields.io/crates/v/ai-memory)](https://crates.io/crates/ai-memory)
 
 **v0.6.3** cleared the a2a-gate certification bar (three consecutive full-testbook green runs across three agent frameworks and three transport modes — **324 passing scenarios**, zero partial greens); **v0.7.0** layers on the attested-cortex epic (Ed25519 attestation, 25-event hook pipeline, postgres+AGE first-class backend, schema v57). Full release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md).
 
-**📦 [Release v0.7.1](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.7.1)** ·
+**📦 [Release v0.8.0](https://github.com/alphaonedev/ai-memory-mcp/releases/tag/v0.8.0)** ·
 **📊 [A2A gate (umbrella spec)](https://alphaonedev.github.io/ai-memory-ai2ai-gate/)** ·
 **🚢 [Ship gate](https://alphaonedev.github.io/ai-memory-ship-gate/)** ·
 **📖 [AI-NHI insights](https://alphaonedev.github.io/ai-memory-ai2ai-gate/insights/)** ·
@@ -93,7 +93,7 @@ authoritative for its topic; this page is just the map.
 ## SDKs
 
 - **[sdk/typescript/README.md](../sdk/typescript/README.md)** —
-  `@alphaone/ai-memory` sync client, all 25 methods + webhook verifier.
+  `@alphaone/ai-memory` sync client, all 27 methods + webhook verifier.
 - **[sdk/python/README.md](../sdk/python/README.md)** — `ai-memory`
   package, sync + async clients, Pydantic v2 models.
 

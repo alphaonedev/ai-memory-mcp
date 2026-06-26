@@ -33,14 +33,14 @@ operator dry-runs are safe.
 The act of releasing is a deliberate, named action — not a side effect
 of green tests.
 
-> **Status (pending tag-cut):** v0.8.0 is **release-pending**. The
-> `distributed-coordination` epic ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
-> is fully drained on `release/v0.8.0`; all eight CI workflows are
-> GREEN; the post-feature multi-agent security review and the v0.8.0
-> NHI dogfood findings are closed (see §"Security review + NHI dogfood"
-> below). **AI NHI makes all decisions EXCEPT the tag cut.** Per the
-> v0.7.0 release-gate framework the tag cut + publish remain
-> OPERATOR-GATED — the operator reviews and cuts the tag.
+> **Status: RELEASED — GA 2026-06-25.** v0.8.0 (`distributed-coordination`,
+> epic [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)) is
+> generally available. The full CI matrix is GREEN on the release commit; the
+> post-feature multi-agent security review and the v0.8.0 NHI validation findings
+> are closed (see §"Security review + NHI validation" below). Published to every
+> channel — GitHub Release, crates.io, Homebrew, Fedora COPR, GHCR, npm, and
+> PyPI — with binaries for macOS / Linux / Windows / iOS / Android. The
+> `v0.8.0` tag is signed and promoted to `main`.
 
 ## Headline
 
@@ -429,13 +429,13 @@ operator keygen/sign/enable workflow are unchanged
 (`ai-memory rules ...`; mutation over MCP is explicitly disabled so a
 compromised agent cannot weaken its own constraints).
 
-## Security review + NHI dogfood
+## Security review + NHI validation
 
 The post-feature work followed the v0.7.0 testing-loop discipline: a
 2-round multi-agent security review of `release/v0.8.0` plus a v0.8.0
-NHI dogfood pass against the installed binary. The review surfaced
+NHI validation pass against the installed binary. The review surfaced
 findings **[#1804](https://github.com/alphaonedev/ai-memory-mcp/issues/1804)–[#1810](https://github.com/alphaonedev/ai-memory-mcp/issues/1810)**
-(all triaged legit and fixed — #1804 was the HIGH), and the dogfood pass
+(all triaged legit and fixed — #1804 was the HIGH), and the validation pass
 surfaced **[#1811](https://github.com/alphaonedev/ai-memory-mcp/issues/1811)**
 (the PreToolUse enforcement bug, fixed as documented in §"Claude Code
 integration") and **[#1812](https://github.com/alphaonedev/ai-memory-mcp/issues/1812)**.
@@ -445,7 +445,7 @@ Each was fixed, retested, and closed in-release per the prime directive
 > The detailed per-issue write-ups for #1804–#1810 and #1812 are tracked
 > in the GitHub issues + the campaign memory rather than this CHANGELOG;
 > they are summarized here for completeness and to record that the
-> review/dogfood loop closed green before the (operator-gated) tag cut.
+> review/validation loop closed green before the (operator-gated) tag cut.
 
 ## Schema ladder v58 → v70
 

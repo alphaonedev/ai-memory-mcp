@@ -5,16 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+_Next development cycle. Nothing yet._
+
 ## [0.8.0] — 2026-06-25 — `distributed-coordination` (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-In progress on `release/v0.8.0`. Schema advances v57 → **v67** (additive: actions /
+Released 2026-06-25 from `release/v0.8.0`. Schema advances v57 → **v70** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
 routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
 6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
 v64; the `memory_links` signature-trigger restore at v65; the
 `governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
 for the §22 PE-5 `Decision::Escalate` verdict at v66; the
-`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **100 MCP tools** at `--profile full` and
+`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A); the
+`encrypted_envelope` column on `memories` (postgres parity) + `archived_memories`
+(both backends) at v68 (#228/#1728); the `kg_projection_outbox` deferred-AGE-projection
+queue at v69 (#1735); and the `archived_memory_links` archive-edge snapshot table at
+v70 (#1771)). Surface grows to **100 MCP tools** at `--profile full` and
 **27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).

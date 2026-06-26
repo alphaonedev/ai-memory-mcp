@@ -383,7 +383,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **57** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **70** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 
@@ -736,7 +736,7 @@ Content-Type: application/json
 {"source_id": "id1", "target_id": "id2", "relation": "related_to"}
 ```
 
-Relations: `related_to`, `supersedes`, `contradicts`, `derived_from`. Self-links rejected. Response (201): `{"linked": true}`
+Relations (nine at v0.8.0): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Self-links rejected. Response (201): `{"linked": true}`
 
 ### Get Links
 
@@ -934,7 +934,7 @@ At least one filter is required.
 ai-memory link <source-id> <target-id> --relation supersedes
 ```
 
-Relation types: `related_to` (default), `supersedes`, `contradicts`, `derived_from`. Self-links rejected.
+Relation types (nine at v0.8.0): `related_to` (default), `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Self-links rejected.
 
 ### `consolidate`
 
