@@ -580,3 +580,17 @@ verify the chosen model exists on their account before relying on it.
 - CLAUDE.md `### Environment Variables` — full env-var table with
   precedence ladder and classification (`secret` / `config` /
   `test-only`).
+
+## v0.8.0 curator-pass knobs (opt-in)
+
+Three v0.8.0 curator passes are gated behind opt-in env vars (all read by
+`ai-memory curator --reflect`; require `--features sal`). All default to the
+no-op posture so production behaviour is byte-unchanged until enabled.
+
+| Env var | Type | Default | Purpose |
+|---|---|---|---|
+| `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` | bool | `false` | [#1393](https://github.com/alphaonedev/ai-memory-mcp/issues/1393) — activates the transcript-classify pass: the curator re-classifies still-`Observation` memories recovered from host transcripts via the autonomy LLM and re-tags refined kinds through the audited `reclassify_memory_kind` path (`memory.reclassified` signed-events row). Config: `[curator].transcript_classify_enabled`. |
+| `AI_MEMORY_REFLECT_DECORRELATION_MODE` | enum `off`/`advisory`/`enforce` | `off` | [#1764](https://github.com/alphaonedev/ai-memory-mcp/issues/1764) — reflection-corpus decorrelation **visibility** probe (DeepMind AGI-audit rec #1). `advisory` emits a structured WARN + per-namespace advisory when a single CLAIMED producer dominates the Reflection corpus (distinctness is CLAIMED, not ATTESTED); `enforce` is reserved for the v0.9 write-time N≥3 attested-model-family refusal and degrades to `advisory` at v0.8.0. |
+| `AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD` | float `(0.0, 1.0]` | `0.8` | [#1764](https://github.com/alphaonedev/ai-memory-mcp/issues/1764) — producer-dominance threshold for the decorrelation advisory (over ≥3 reflections). Only consulted when the mode above is `advisory`/`enforce`. |
+
+(Companion v0.8.0 curator knobs already covered above: `AI_MEMORY_COMPACTION_ENABLED` + `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` for Pillar-2.5 consolidation.)

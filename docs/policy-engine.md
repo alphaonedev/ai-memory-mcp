@@ -461,8 +461,9 @@ ai-memory rules sign-seed
 ai-memory rules enable R001 --sign
 
 # 4. (Optional) Install the harness hook so Claude Code consults the
-#    substrate on every PreToolUse. Requires PE-2 (#695) — in flight.
-ai-memory install --harness claude-code --enforce-policy
+#    substrate on every PreToolUse. PE-2 (#695) shipped; at v0.8.0 the
+#    installed hook is the enforcing `type: command` wrapper (#1811).
+ai-memory install claude-code --hook pretool --apply
 
 # 5. Verify with a smoke test. The check verb runs the audited path so
 #    every check shows up in signed_events.

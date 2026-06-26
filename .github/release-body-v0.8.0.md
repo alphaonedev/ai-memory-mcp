@@ -32,7 +32,7 @@ v0.8.0 is the release that makes **autonomous AI safe to actually run autonomous
 - **Governed & stoppable.** Every agent action can be gated by operator-signed rules; refusals are enforced and fail closed. You own the kill-switch, cryptographically.
 - **Attested & auditable.** Every write and inter-agent message can be Ed25519-signed; the audit trail is a tamper-evident hash chain. That's the difference between "the AI says it did X" and "here is signed, replayable proof of what happened" — the foundation of a defensible compliance story.
 - **No lock-in, no data exfiltration.** Self-hosted, single binary or container, on SQLite or your existing PostgreSQL. Provider-agnostic — local models or 15+ cloud LLM/embedding vendors, swappable by config. Your memory corpus is yours.
-- **Real, not vapor.** Validated by an end-to-end multi-agent dogfood, an external-model adversarial security review (all findings fixed), and a live agent-to-agent campaign across heterogeneous models.
+- **Real, not vapor.** Validated by an end-to-end multi-agent validation, an external-model adversarial security review (all findings fixed), and a live agent-to-agent campaign across heterogeneous models.
 
 **Why care:** it converts "we're nervous about giving an AI agency" into "we can give it bounded agency we can audit and revoke." That's the gate between a pilot and production.
 
@@ -117,7 +117,7 @@ v57 → **v70**. Additive coordination/typed-cognition/encryption-prep/archive-e
 
 ## Quality gate
 
-Full CI matrix green on the release commit — Linux/macOS/Windows test legs, the SQLite **and** PostgreSQL+AGE feature gates, `clippy -D pedantic` + `fmt`, per-module coverage, iOS/Android cross-compile, MSRV (Rust 1.96), and Docker build · `cargo audit` clean. Validated end-to-end by a P0–P11 multi-agent dogfood, a 5-agent (2-round) external-model security review with every finding fixed, and a live agent-to-agent campaign across heterogeneous models — zero defects.
+Full CI matrix green on the release commit — Linux/macOS/Windows test legs, the SQLite **and** PostgreSQL+AGE feature gates, `clippy -D pedantic` + `fmt`, per-module coverage, iOS/Android cross-compile, MSRV (Rust 1.96), and Docker build · `cargo audit` clean. Validated end-to-end by a P0–P11 multi-agent validation, a 5-agent (2-round) external-model security review with every finding fixed, and a live agent-to-agent campaign across heterogeneous models — zero defects.
 
 ---
 

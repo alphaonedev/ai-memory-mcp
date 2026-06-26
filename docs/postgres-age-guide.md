@@ -599,9 +599,9 @@ pass-through.
 ### What still returns 501 on postgres
 
 After Wave-3 Continuation 3, **no standard HTTP endpoint** returns
-501 on a postgres-backed daemon. Every endpoint listed in the v0.7.0
-router (**89 production `.route(...)` registrations in `src/lib.rs`
-at v0.7.0 — 75 unique URL paths**, surfaced through
+501 on a postgres-backed daemon. Every endpoint listed in the
+router (**91 production `.route(...)` registrations in `src/lib.rs`
+at v0.8.0 — 77 unique URL paths**, surfaced through
 `/api/v1/capabilities`) dispatches through the SAL trait or is handled
 directly by the postgres adapter.
 

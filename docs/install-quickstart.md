@@ -1,4 +1,4 @@
-# ai-memory v0.7.0 — install quickstart (Path A: super simple)
+# ai-memory v0.8.0 — install quickstart (Path A: super simple)
 
 A friendly, no-jargon install guide. If you can use a terminal, you can
 get ai-memory running in under five minutes. No software engineering
