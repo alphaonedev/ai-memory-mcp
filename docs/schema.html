@@ -31,6 +31,17 @@ p{color:var(--text-muted)}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:760px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
 .hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
+.hero .stats{display:flex;justify-content:center;gap:.75rem;flex-wrap:wrap;margin-top:1.75rem}
+.hero .stat{display:flex;flex-direction:column;align-items:center;min-width:132px;padding:.9rem 1.15rem;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;position:relative;overflow:hidden}
+.hero .stat::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--p1)}
+.hero .stat:nth-child(2)::before{background:var(--p2)}
+.hero .stat:nth-child(3)::before{background:var(--p3)}
+.hero .stat:nth-child(4)::before{background:var(--gold)}
+.hero .stat:nth-child(5)::before{background:var(--p2)}
+.hero .stat-num{font-family:var(--font-mono);font-size:1.5rem;font-weight:700;color:var(--text);line-height:1.05}
+.hero .stat-label{font-family:var(--font-mono);font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin-top:.4rem;text-align:center}
+.hero .hero-note{font-size:.9rem;color:var(--text-dim);max-width:660px;margin:1.6rem auto 0}
+.hero .hero-note a{color:var(--p1)}
 
 section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
 .eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
@@ -248,13 +259,15 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The schema, table by table.</h1>
-  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v70 at v0.8.0</strong> (was v57 at v0.7.0, v33 at v0.6.4). The v34 → v57 ladder shipped V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156, <code>federation_nonce_cache</code> at v51 #1255, <code>transcript_line_dedup</code> at v52 #1389, <code>memories_au</code> FTS5 trigger scoping at v53 #1418, tier-default expiry backfill at v54 #1466, the sargable <code>list_memories_updated_since</code> rewrite + <code>idx_memories_updated_at</code> at v55 #1476, composite list-ordering indexes at v56 + the postgres stored tsvector at v57 (both #1579). The <strong>v58 → v70 ladder is the v0.8.0 coordination + typed-cognition + encryption-prep work</strong>: recall-observations identity binding at v58 #1705, the <code>actions</code> / <code>action_edges</code> / <code>leases</code> coordination substrate at v59, signed <code>signals</code> at v60, attested <code>checkpoints</code> at v61 (all #1709), <code>routines</code> / <code>routine_runs</code> at v62, the <code>memory_links</code> relation CHECK 6→9 at v63, the <code>memories.lifecycle_state</code> column at v64, signature-trigger restore at v65, governance-rule <code>+escalate</code> severity at v66, owner-visibility index at v67 #1720, postgres/archive <code>encrypted_envelope</code> parity at v68 #228/#1728, the <code>kg_projection_outbox</code> cold-path queue at v69 #1735, and the <code>archived_memory_links</code> edge-preservation snapshot at v70 #1771. Migration is automatic on first daemon start.</p>
-  <div class="pills">
-    <span class="pill">34 tables</span>
-    <span class="pill">65+ indexes</span>
-    <span class="pill">v70 schema</span>
-    <span class="pill">SQLite + Postgres mirror</span>
+  <p class="tagline">Every table, every column, every index, every foreign key that ai-memory creates &mdash; SQLite by default, with a Postgres mirror through the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). This atlas tracks the live schema at <strong>v70</strong>, shipped in <strong>v0.8.0</strong>.</p>
+  <div class="stats">
+    <div class="stat"><span class="stat-num">v70</span><span class="stat-label">schema version</span></div>
+    <div class="stat"><span class="stat-num">34</span><span class="stat-label">first-class tables</span></div>
+    <div class="stat"><span class="stat-num">27</span><span class="stat-label">Memory fields</span></div>
+    <div class="stat"><span class="stat-num">9</span><span class="stat-label">link relations</span></div>
+    <div class="stat"><span class="stat-num">13</span><span class="stat-label">MemoryKind variants</span></div>
   </div>
+  <p class="hero-note">The full v34&nbsp;&rarr;&nbsp;v70 migration history is laid out in the <a href="#migration-ladder">version timeline table</a> below. Migration is automatic on first daemon start.</p>
 </section>
 
 <section>
@@ -647,7 +660,7 @@ footer a{color:var(--text-muted)}
 </section>
 
 <!-- ============== MIGRATION / VERSIONING ============== -->
-<section>
+<section id="migration-ladder">
   <div class="container">
     <span class="eyebrow">Migrations</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Schema is versioned. Migrations are idempotent.</h2>

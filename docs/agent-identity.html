@@ -255,10 +255,10 @@ blockquote strong{color:var(--p1)}
     <p>Default recall output (TOON compact format):</p>
 <pre><code>count:5|mode:hybrid|tokens_used:842
 memories[id|title|tier|namespace|priority|score|tags|agent_id]:
-a1b2|Project DB is PostgreSQL 16|long|infra|8|0.91|database,postgres|ai:claude-code@workstation:pid-3812
-c3d4|API rate limit is 100 rps|long|infra|7|0.87|api,limits|ai:claude-desktop@laptop:pid-5219
-e5f6|Use TOON not JSON for MCP|long|protocol|9|0.82|toon,mcp,tokens|host:pop-os:pid-1144-ad1b9c
-g7h8|Deploy gate fixed for v0.6.3|long|releases|6|0.79|deploy,gate|ai:codex@server:pid-9911
+a1b2|Project DB is PostgreSQL 16|long|infra|8|0.91|database,postgres|ai:claude-code@workstation
+c3d4|API rate limit is 100 rps|long|infra|7|0.87|api,limits|ai:claude-desktop@laptop
+e5f6|Use TOON not JSON for MCP|long|protocol|9|0.82|toon,mcp,tokens|host:pop-os
+g7h8|Deploy gate fixed for v0.8.0|long|releases|6|0.79|deploy,gate|ai:codex@server
 i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
     <p>Eight columns. Last column is <code>agent_id</code>. The recall blends what's relevant (text, semantics, priority, recency) <strong>and</strong> tells you who wrote it.</p>
   </div>
@@ -270,7 +270,7 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
     <h2>What <code>agent_id</code> means.</h2>
     <p><code>agent_id</code> is a <em>claimed</em> identity attached to every memory at write time. It survives every operation that touches the memory: update, dedup, import, sync, consolidate. It's the substrate for filtering, scoping, governance, and — as of v0.7.0 (#626 Layer-3) — cryptographic attestation that upgrades a claimed id to an <em>attested</em> one.</p>
     <blockquote>
-      <strong>Honest framing:</strong> by default an <em>unsigned</em> <code>agent_id</code> is <em>claimed</em>, not <em>attested</em> — don't make security decisions on it alone. As of <strong>v0.7.0 (#626 Layer-3)</strong> a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> over the canonical <code>SignableWrite</code> envelope on every store surface (CLI <code>--sign</code>, MCP <code>memory_store</code>, HTTP <code>POST /api/v1/memories</code>); the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code> (forged → <code>403 ATTESTATION_FAILED</code>). Operators can require it process-wide with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>. The earlier link-level signature reservation (<code>memory_links.signature</code>, schema v15, v0.6.3) remains the attestation substrate for KG edges. Two edges stay claimed-by-design at v0.7.0 — the federation receive path (mTLS + peer allowlist is the trust boundary) and the permissive default posture — both tracked for v0.8 hardening under <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>.
+      <strong>Honest framing:</strong> by default an <em>unsigned</em> <code>agent_id</code> is <em>claimed</em>, not <em>attested</em> — don't make security decisions on it alone. As of <strong>v0.7.0 (#626 Layer-3)</strong> a caller holding the agent's keypair can present a detached Ed25519 <code>signature</code> over the canonical <code>SignableWrite</code> envelope on every store surface (CLI <code>--sign</code>, MCP <code>memory_store</code>, HTTP <code>POST /api/v1/memories</code>); the daemon verifies it against the agent's bound public key and stamps <code>metadata.attest_level = "agent_attested"</code> (forged → <code>403 ATTESTATION_FAILED</code>). Operators can require it process-wide with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code>. The earlier link-level signature reservation (<code>memory_links.signature</code>, schema v15, v0.6.3) remains the attestation substrate for KG edges. At <strong>v0.8.0</strong> the federation receive path also gained per-write content attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>): a relayed memory carrying a detached Ed25519 signature in <code>metadata.write_signature</code> over the <code>SignableWrite</code> envelope is verified against the attributed author's enrolled key and upgraded to <code>attest_level = "agent_attested"</code>; <code>AI_MEMORY_FED_REQUIRE_WRITE_SIG</code> makes a third-party relayed claim without a valid signature fail-closed (it stays permissive by default — replication is data, not net-new authorship). The remaining claimed-by-design edge is that permissive default posture; the sender-side signature EMIT + a promoted typed wire field + TOFU key distribution are the tracked v0.9 hardening half.
     </blockquote>
   </div>
 </section>
@@ -285,10 +285,13 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
     <ol>
       <li>Explicit value from caller — <code>--agent-id &lt;id&gt;</code> flag, or <code>agent_id</code> field on the MCP tool, or <code>metadata.agent_id</code> embedded in a store request</li>
       <li><code>AI_MEMORY_AGENT_ID</code> environment variable</li>
-      <li>(MCP only) Captured from <code>initialize.clientInfo.name</code> → e.g. <code>ai:claude-code@workstation:pid-3812</code></li>
-      <li>Stable per-process fallback → <code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code></li>
-      <li><code>anonymous:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> if hostname unavailable</li>
+      <li>(MCP only) Captured from <code>initialize.clientInfo.name</code> → e.g. <code>ai:claude-code@workstation</code> (<strong>durable, pid-free since #1720 B1</strong>)</li>
+      <li>Durable host-scoped default → <code>host:&lt;hostname&gt;</code> (<strong>pid-free since #1720 B1</strong>)</li>
+      <li><code>anonymous:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> — ephemeral fallback only when the hostname is unavailable (or <code>AI_MEMORY_ANONYMIZE=1</code>)</li>
     </ol>
+    <blockquote>
+      <strong>#1720 B1 — durable owner stamps.</strong> Steps 3 + 4 intentionally omit the live <code>pid</code>/<code>uuid</code> discriminator so the owner id is <em>stable across process restarts</em>. A pid-suffixed stamp changes every boot — and the moment an operator opts in to enforced multi-agent reads by setting <code>AI_MEMORY_AGENT_ID</code>, every pre-existing <code>scope=private</code> row owned by the old <code>host:&lt;host&gt;:pid-N</code> id would be orphaned, self-locking the operator out of their own private memories. The process discriminator (<code>process_discriminator()</code>) now backs <em>only</em> the ephemeral <code>anonymous:</code> principal. Per-agent isolation across processes on one host is achieved by giving each agent a distinct explicit <code>AI_MEMORY_AGENT_ID</code> (step 2), not the pid. Safe opt-in rests on three pieces: durable stamps (B1), the <code>ai-memory reown</code> re-ownership tool (B2), and the boot lockout guard (B3) — see below.
+    </blockquote>
 
     <h3>HTTP daemon path (multi-tenant — no process-level default)</h3>
     <ol>
@@ -303,7 +306,24 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
       <li><code>AI_MEMORY_AGENT_ID</code> environment variable (when set + shape-valid)</li>
       <li><code>None</code> — trust-all, single-tenant read posture</li>
     </ol>
-    <p>The pid-synthesized <code>ai:&lt;client&gt;@&lt;host&gt;:pid-&lt;pid&gt;</code> clientInfo id is <strong>deliberately not</strong> used here: it embeds the live PID, so it could never equal the <code>metadata.agent_id</code> an <em>earlier</em> process wrote, which would hide every prior-session private row from its own owner. When <code>AI_MEMORY_AGENT_ID</code> is set, the read tools drop cross-agent <code>scope=private</code> rows (owned by a different agent, not shared/targeted at the caller) before they reach the wire; collective and caller-owned rows always pass. When unset, the read path keeps the trust-all single-tenant behavior. Multi-tenant MCP hosts must set <code>AI_MEMORY_AGENT_ID</code> per tenant to get private-row isolation on reads.</p>
+    <p>The synthesized clientInfo / host write-stamps are <strong>deliberately not</strong> used as the read caller. Historically (pre-#1720 B1) they embedded the live PID, so they could never equal the <code>metadata.agent_id</code> an <em>earlier</em> process wrote, which would hide every prior-session private row from its own owner (#1469). #1720 B1 made those <em>write</em>-side stamps pid-free and durable — but this read ladder still resolves the caller from <code>AI_MEMORY_AGENT_ID</code> only. Durable stamps make a future enforced-read opt-in <em>safe</em>; they do not flip filtering on. When <code>AI_MEMORY_AGENT_ID</code> is set, the read tools drop cross-agent <code>scope=private</code> rows (owned by a different agent, not shared/targeted at the caller) via <code>visibility::is_visible_to_caller</code> before they reach the wire; collective and caller-owned rows always pass. When unset, the read path keeps the trust-all single-tenant behavior. Multi-tenant MCP hosts must set <code>AI_MEMORY_AGENT_ID</code> per tenant to get private-row isolation on reads.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">v0.8.0 · owner safety</span>
+    <h2>Re-ownership &amp; the lockout guard.</h2>
+    <p>Durable owner stamps (#1720 B1) are one leg of a three-part design that makes opting in to enforced multi-agent reads <strong>safe on a live deployment</strong>:</p>
+    <ul>
+      <li><strong>B1 — durable stamps.</strong> The clientInfo / host owner ids are pid-free and stable across restarts (see the resolution ladder above), so a new boot doesn't orphan the rows the previous boot owned.</li>
+      <li><strong>B2 — <code>ai-memory reown</code>.</strong> A CLI re-ownership tool that rewrites <code>metadata.agent_id</code> on existing rows from a legacy / pid-suffixed / unowned id to the operator's chosen durable id — so private rows written before the cutover remain visible to their owner once filtering is enabled.</li>
+      <li><strong>B3 — boot owner-lockout guard.</strong> At MCP boot (<code>enforce_owner_lockout_guard</code>) the substrate runs a single indexed <code>COUNT</code> of pre-existing <code>scope=private</code> rows that the resolved caller would <em>not</em> be able to see. By default a non-zero count emits a loud stderr <code>WARN</code> naming <code>ai-memory reown</code> as the fix; setting <code>AI_MEMORY_REQUIRE_OWNED_ROWS</code> (truthy) turns that same condition into a hard refusal so a strict operator cannot silently boot into a locked-out state. The probe never changes filtering — it only reports the rows the existing predicate would hide.</li>
+    </ul>
+    <p>Backing this, schema <strong>v67</strong> added the <code>target_agent_id_idx</code> owner-keyed generated column on <code>memories</code>, so the <code>scope=private</code> visibility check (and the lockout COUNT) resolve against an index rather than scanning JSON metadata per row.</p>
+    <blockquote>
+      <strong>Why it matters.</strong> Filtering is OFF by default (trust-all single-tenant reads), so durable stamps changing the default owner id on a live deployment is non-breaking — new rows get the stable id, old pid-suffixed rows keep theirs until <code>ai-memory reown</code>. The three pieces together turn a one-way trap ("set <code>AI_MEMORY_AGENT_ID</code> and lock yourself out") into a reversible, signposted migration.
+    </blockquote>
   </div>
 </section>
 
@@ -342,7 +362,7 @@ i9j0|Ship-gate cleanup complete|long|releases|5|0.74|cleanup|alice</code></pre>
     <h2>Filter by agent.</h2>
     <p>Every recall, list, and search supports <code>agent_id</code> filtering:</p>
 <pre><code># CLI
-ai-memory list --agent-id ai:claude-desktop@laptop:pid-5219
+ai-memory list --agent-id ai:claude-desktop@laptop
 ai-memory search --agent-id alice "deploy"
 
 # MCP — the agent_id property
@@ -375,7 +395,7 @@ curl 'http://127.0.0.1:9077/api/v1/search?q=deploy&agent_id=alice'</code></pre>
   <div class="container">
     <span class="eyebrow">Privacy</span>
     <h2>Scrub the leaky default.</h2>
-    <p>The fallback <code>host:&lt;hostname&gt;:pid-&lt;pid&gt;-&lt;uuid8&gt;</code> exposes hostname and PID. <strong>When writing memories to a shared or upstream database, set an opaque <code>--agent-id</code> or <code>AI_MEMORY_AGENT_ID</code>.</strong> Tracking issue: #198.</p>
+    <p>The fallback <code>host:&lt;hostname&gt;</code> still exposes the hostname (since #1720 B1 it no longer carries the PID). <strong>When writing memories to a shared or upstream database, set an opaque <code>--agent-id</code> or <code>AI_MEMORY_AGENT_ID</code></strong>, or set <code>AI_MEMORY_ANONYMIZE=1</code> to fall back to the <code>anonymous:pid-…</code> form instead. Tracking issue: #198.</p>
 <pre><code># Production daemon — opaque identity
 AI_MEMORY_AGENT_ID=fleet-prod-9 ai-memory serve --host 0.0.0.0 --port 9077
 
