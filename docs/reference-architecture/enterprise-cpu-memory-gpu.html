@@ -16,6 +16,8 @@
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
 /* three-leg accents (centerpiece) */
 --leg1:#6ee7ff;--leg2:#c8a2ff;--leg3:#ffb86b;
+/* GPU local-embed accent (the differentiator vs the CPU-only sibling) */
+--gpu:#3fb950;
 /* three regions */
 --rg-nyc:#6ee7ff;--rg-fra:#c8a2ff;--rg-sgp:#ffb86b;
 --font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -116,7 +118,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .legend{display:flex;flex-wrap:wrap;gap:1rem 1.5rem;justify-content:center;margin-top:1rem;font-size:.8rem;color:var(--text-muted)}
 .legend .item{display:flex;align-items:center;gap:.45rem;font-family:var(--font-mono)}
 .legend .sw{width:26px;height:0;border-top:3px dashed currentColor;border-radius:2px}
-.legend .leg1c{color:var(--leg1)}.legend .leg2c{color:var(--leg2)}.legend .leg3c{color:var(--leg3)}
+.legend .leg1c{color:var(--leg1)}.legend .leg2c{color:var(--leg2)}.legend .leg3c{color:var(--leg3)}.legend .gpuc{color:var(--gpu)}
 .legend .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
 
 /* keyframes: dash-march for encrypted flows, glow pulse, shield shimmer */
@@ -132,6 +134,8 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .flow.leg3{stroke:var(--leg3);animation:march 1.1s linear infinite}
 /* thinner client link for NHI agent → regional peer (Leg-1 client role, not the quorum trunk) */
 .flow.agentlink{stroke:var(--leg1);stroke-width:1.4;stroke-dasharray:5 5;animation:march 1.5s linear infinite}
+/* GPU embed loopback (daemon → node-local Ollama over localhost) — the on-node, zero-egress lane */
+.flow.gpu{stroke:var(--gpu);stroke-width:2.2;stroke-dasharray:7 6;animation:march 1.1s linear infinite}
 .flow.shim{animation:march 1.3s linear infinite, shimmer 2.4s ease-in-out infinite}
 .flow.leg2.shim{animation:march 1.6s linear infinite, shimmer 2.8s ease-in-out infinite}
 .flow.leg3.shim{animation:march 1.1s linear infinite, shimmer 2.1s ease-in-out infinite}
@@ -141,7 +145,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 .svg-label{font-family:var(--font-mono);fill:var(--text-muted)}
 .svg-title{font-family:var(--font-mono);fill:var(--text)}
 @media(prefers-reduced-motion:reduce){
-  .flow,.flow.leg1,.flow.leg2,.flow.leg3,.flow.agentlink,.flow.shim,.flow.leg2.shim,.flow.leg3.shim,.glowpath,.peernode,.shield{animation:none}
+  .flow,.flow.leg1,.flow.leg2,.flow.leg3,.flow.agentlink,.flow.gpu,.flow.shim,.flow.leg2.shim,.flow.leg3.shim,.glowpath,.peernode,.shield{animation:none}
 }
 @media(max-width:560px){.diagram-wrap{padding:.4rem}}
 </style>
@@ -176,7 +180,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
     <div class="right">
       <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="../whats-new-v07.html" style="color:#6ee7ff">v0.7.0</a>
+      <a href="../whats-new-v08.html" style="color:#6ee7ff">v0.8.0</a>
       <div class="menu">
         <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -221,6 +225,13 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <span class="eyebrow">Reference Architecture</span>
     <h1>Enterprise Reference Architecture: CPU + Memory + GPU Federated Nodes</h1>
     <p class="tagline">Local Ollama embeddings on GPU-equipped nodes for enterprise federated ai-memory deployments — with the when-to-choose-which guidance vs. the CPU-only API-embeddings shape.</p>
+    <div class="pills" style="justify-content:flex-start">
+      <span class="pill">v0.8.0 GA</span>
+      <span class="pill">local GPU embeddings</span>
+      <span class="pill">nomic-embed-text · 768d</span>
+      <span class="pill">W-of-N quorum · mTLS</span>
+      <span class="pill">schema v70</span>
+    </div>
   </div>
 </section>
 
@@ -241,27 +252,158 @@ deployment topologies is
 capacity / cost / SLA planning is
 <a href="../enterprise-deployment.html"><code>docs/enterprise-deployment.md</code></a>.</p>
 <h2 id="topology">Topology</h2>
-<pre><code>                      federated mesh (N nodes, W-of-N quorum)
-   ┌────────────────────────────────────────────────────────────────────┐
-   │                                                                    │
-   │   node-a (CPU+RAM+GPU)            node-b (CPU+RAM+GPU)             │
-   │   ┌─────────────────────┐  mTLS   ┌─────────────────────┐          │
-   │   │ ai-memory serve     │◀───────▶│ ai-memory serve     │  ◀─▶ …   │
-   │   │  sqlite/pg+AGE      │ signed  │  sqlite/pg+AGE      │          │
-   │   │        │ localhost  │  sync   │        │ localhost  │          │
-   │   │        ▼ /api/embed │         │        ▼ /api/embed │          │
-   │   │ ┌─────────────────┐ │         │ ┌─────────────────┐ │          │
-   │   │ │ Ollama (GPU)    │ │         │ │ Ollama (GPU)    │ │          │
-   │   │ │ nomic-embed-text│ │         │ │ nomic-embed-text│ │          │
-   │   │ └─────────────────┘ │         │ └─────────────────┘ │          │
-   │   └─────────────────────┘         └─────────────────────┘          │
-   │                                                                    │
-   └────────────────────────────────────────────────────────────────────┘
+<div class="diagram-wrap">
+  <svg viewBox="0 0 1240 600" role="img" aria-labelledby="gpu-topo-title gpu-topo-desc" preserveAspectRatio="xMidYMid meet">
+    <title id="gpu-topo-title">CPU + Memory + GPU federated node topology</title>
+    <desc id="gpu-topo-desc">A federated mesh of N identical CPU+RAM+GPU nodes under a W-of-N write quorum. Two representative peers (node-a, node-b) are shown; the remainder are abstracted as "+N peers". Each node runs one ai-memory serve daemon (Axum on :9077) that computes every embedding on a node-local GPU Ollama instance over a localhost loopback /api/embed call (the green GPU embed leg — ~5 to 30 ms, zero per-token cost, no egress), reads and writes its own SQLite or PostgreSQL + Apache AGE store (the amber store leg), and federates to every peer over a cross-node W-of-N synchronous quorum secured by mTLS plus per-message Ed25519 signatures and nonces (the violet quorum leg). An NHI agent connects to a node as an mTLS client on :9077 (the cyan client leg). Every node carries a Batman maximum-secure shield-lock glyph.</desc>
 
-   embeddings hop p50: ~5–30 ms (localhost, GPU)   federation: W=2 quorum,
-                                                   mTLS, X-Memory-Sig +
-                                                   X-Memory-Nonce
-</code></pre>
+    <defs>
+      <radialGradient id="rgGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#6ee7ff" stop-opacity="0.10"/>
+        <stop offset="100%" stop-color="#6ee7ff" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="pgGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#1c160c"/><stop offset="100%" stop-color="#120d06"/>
+      </linearGradient>
+      <linearGradient id="gpuGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#0a1a10"/><stop offset="100%" stop-color="#06130b"/>
+      </linearGradient>
+      <symbol id="shieldlock" viewBox="0 0 32 36">
+        <path d="M16 1 L30 6 V18 C30 27 24 33 16 35 C8 33 2 27 2 18 V6 Z" fill="rgba(255,215,0,0.08)" stroke="#ffd700" stroke-width="1.6"/>
+        <rect x="10" y="16" width="12" height="10" rx="1.6" fill="rgba(255,215,0,0.12)" stroke="#ffd700" stroke-width="1.3"/>
+        <path d="M12 16 V13 a4 4 0 0 1 8 0 V16" fill="none" stroke="#ffd700" stroke-width="1.3"/>
+        <circle cx="16" cy="20.5" r="1.6" fill="#ffd700"/>
+      </symbol>
+    </defs>
+
+    <!-- cross-node federation quorum trunks (leg2 violet) — drawn first so node cards sit on top -->
+    <g aria-hidden="true">
+      <path class="flow leg2 shim glowpath" d="M300 120 C420 74 470 66 552 66"/>
+      <path class="flow leg2 shim glowpath" d="M598 66 C690 66 760 78 850 120"/>
+      <path class="flow leg2 shim glowpath" d="M600 78 C820 120 1010 200 1150 248"/>
+    </g>
+    <!-- quorum hub marker -->
+    <g transform="translate(575,66)">
+      <circle r="34" fill="url(#rgGlow)"/>
+      <circle r="23" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.6" class="glowpath"/>
+      <text x="0" y="-1" text-anchor="middle" class="svg-label" font-size="11" fill="#c8a2ff" font-weight="700">W-of-N</text>
+      <text x="0" y="12" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">quorum</text>
+      <text x="0" y="46" text-anchor="middle" class="svg-label" font-size="9.5">mTLS · Ed25519 X-Memory-Sig + X-Memory-Nonce · vector-clock merge</text>
+    </g>
+
+    <!-- ===== node-a (cyan) ===== -->
+    <g>
+      <rect x="60" y="120" width="470" height="380" rx="16" fill="#060d0f" stroke="#13343d" stroke-width="1.4"/>
+      <text x="84" y="152" class="svg-title" font-size="15" font-weight="700" fill="#6ee7ff">node-a</text>
+      <text x="84" y="170" class="svg-label" font-size="10">CPU + RAM + GPU · ai-memory serve :9077 · autonomous tier</text>
+      <use href="#shieldlock" x="486" y="132" width="22" height="25" class="shield"/>
+
+      <!-- node-local GPU Ollama embedder -->
+      <g class="peernode">
+        <rect x="300" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke="#3fb950" stroke-width="1.5"/>
+        <text x="405" y="222" text-anchor="middle" class="svg-title" font-size="11.5" fill="#3fb950" font-weight="700">Ollama · GPU</text>
+        <text x="405" y="240" text-anchor="middle" class="svg-label" font-size="9">nomic-embed-text · 768d</text>
+        <text x="405" y="256" text-anchor="middle" class="svg-label" font-size="9">/api/embed · loopback</text>
+        <text x="405" y="274" text-anchor="middle" class="svg-label" font-size="8.5" fill="#3fb950">~5–30 ms · $0 · no egress</text>
+      </g>
+
+      <!-- ai-memory serve daemon -->
+      <g class="peernode">
+        <rect x="84" y="232" width="178" height="150" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.4"/>
+        <text x="173" y="262" text-anchor="middle" class="svg-title" font-size="11.5" fill="#6ee7ff" font-weight="700">ai-memory serve</text>
+        <text x="173" y="280" text-anchor="middle" class="svg-label" font-size="9">Axum HTTP · :9077</text>
+        <text x="173" y="300" text-anchor="middle" class="svg-label" font-size="9">recall · embed · federate</text>
+        <text x="173" y="320" text-anchor="middle" class="svg-label" font-size="9">HNSW · FTS5 · reranker</text>
+        <text x="173" y="346" text-anchor="middle" class="svg-label" font-size="8.5" fill="#6ee7ff">permissions = enforce</text>
+        <text x="173" y="362" text-anchor="middle" class="svg-label" font-size="8.5" fill="#6ee7ff">attestation · fail-closed</text>
+      </g>
+
+      <!-- store -->
+      <g class="peernode">
+        <rect x="300" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
+        <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
+        <text x="405" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
+        <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
+        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v70</text>
+      </g>
+
+      <!-- GPU embed loopback leg (green) -->
+      <path class="flow gpu" d="M262 252 C284 240 286 216 300 210" aria-hidden="true"/>
+      <text x="244" y="216" class="svg-label" font-size="8" fill="#3fb950">embed</text>
+      <!-- store leg (amber) -->
+      <path class="flow leg3 shim" d="M262 348 C284 360 288 376 300 386" aria-hidden="true"/>
+    </g>
+
+    <!-- ===== node-b (violet) ===== -->
+    <g>
+      <rect x="620" y="120" width="470" height="380" rx="16" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.4"/>
+      <text x="644" y="152" class="svg-title" font-size="15" font-weight="700" fill="#c8a2ff">node-b</text>
+      <text x="644" y="170" class="svg-label" font-size="10">CPU + RAM + GPU · ai-memory serve :9077 · autonomous tier</text>
+      <use href="#shieldlock" x="1046" y="132" width="22" height="25" class="shield"/>
+
+      <g class="peernode">
+        <rect x="860" y="196" width="210" height="96" rx="10" fill="url(#gpuGrad)" stroke="#3fb950" stroke-width="1.5"/>
+        <text x="965" y="222" text-anchor="middle" class="svg-title" font-size="11.5" fill="#3fb950" font-weight="700">Ollama · GPU</text>
+        <text x="965" y="240" text-anchor="middle" class="svg-label" font-size="9">nomic-embed-text · 768d</text>
+        <text x="965" y="256" text-anchor="middle" class="svg-label" font-size="9">/api/embed · loopback</text>
+        <text x="965" y="274" text-anchor="middle" class="svg-label" font-size="8.5" fill="#3fb950">~5–30 ms · $0 · no egress</text>
+      </g>
+
+      <g class="peernode">
+        <rect x="644" y="232" width="178" height="150" rx="10" fill="#120a1c" stroke="#c8a2ff" stroke-width="1.4"/>
+        <text x="733" y="262" text-anchor="middle" class="svg-title" font-size="11.5" fill="#c8a2ff" font-weight="700">ai-memory serve</text>
+        <text x="733" y="280" text-anchor="middle" class="svg-label" font-size="9">Axum HTTP · :9077</text>
+        <text x="733" y="300" text-anchor="middle" class="svg-label" font-size="9">recall · embed · federate</text>
+        <text x="733" y="320" text-anchor="middle" class="svg-label" font-size="9">HNSW · FTS5 · reranker</text>
+        <text x="733" y="346" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">permissions = enforce</text>
+        <text x="733" y="362" text-anchor="middle" class="svg-label" font-size="8.5" fill="#c8a2ff">attestation · fail-closed</text>
+      </g>
+
+      <g class="peernode">
+        <rect x="860" y="336" width="210" height="104" rx="10" fill="url(#pgGrad)" stroke="#ffb86b" stroke-width="1.5"/>
+        <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
+        <text x="965" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
+        <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
+        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v70</text>
+      </g>
+
+      <path class="flow gpu" d="M822 252 C844 240 846 216 860 210" aria-hidden="true"/>
+      <text x="804" y="216" class="svg-label" font-size="8" fill="#3fb950">embed</text>
+      <path class="flow leg3 shim" d="M822 348 C844 360 848 376 860 386" aria-hidden="true"/>
+    </g>
+
+    <!-- +N peers (abstracted remainder of the quorum) -->
+    <g class="peernode" aria-hidden="true">
+      <rect x="1110" y="240" width="100" height="180" rx="12" fill="#0b070d" stroke="#2a1a3a" stroke-width="1.3" stroke-dasharray="5 4"/>
+      <text x="1160" y="318" text-anchor="middle" class="svg-title" font-size="13" fill="#c8a2ff" font-weight="700">+ N peers</text>
+      <text x="1160" y="338" text-anchor="middle" class="svg-label" font-size="8.5">identical shape</text>
+      <text x="1160" y="353" text-anchor="middle" class="svg-label" font-size="8.5">in the quorum</text>
+    </g>
+
+    <!-- NHI agent over leg1 (cyan mTLS client) -->
+    <g>
+      <rect x="120" y="522" width="220" height="56" rx="10" fill="#08161a" stroke="#6ee7ff" stroke-width="1.3" stroke-dasharray="4 3"/>
+      <text x="230" y="546" text-anchor="middle" class="svg-title" font-size="11" fill="#6ee7ff" font-weight="700">NHI agent · grok-4.3</text>
+      <text x="230" y="564" text-anchor="middle" class="svg-label" font-size="9">mTLS client-cert + x-api-key → :9077</text>
+    </g>
+    <path class="flow agentlink" d="M230 522 C230 470 180 420 173 384" aria-hidden="true"/>
+  </svg>
+</div>
+<div class="legend">
+  <span class="item leg1c"><span class="sw"></span>NHI agent — mTLS client → :9077</span>
+  <span class="item gpuc"><span class="sw"></span>GPU embed — localhost /api/embed (loopback)</span>
+  <span class="item leg3c"><span class="sw"></span>Store — SQLite / Postgres + AGE</span>
+  <span class="item leg2c"><span class="sw"></span>Federation — W-of-N quorum · mTLS + Ed25519</span>
+  <span class="item"><span class="dot" style="background:#ffd700"></span>Batman maximum-secure</span>
+</div>
+<div class="stats" style="margin-top:1.5rem">
+  <div class="stat"><div class="n">v70</div><div class="l">DB schema</div></div>
+  <div class="stat"><div class="n">100 / 7</div><div class="l">MCP tools (full / core)</div></div>
+  <div class="stat"><div class="n">83 / 85</div><div class="l">CLI subcommands (default / sal)</div></div>
+  <div class="stat"><div class="n">91 / 77</div><div class="l">HTTP routes / paths</div></div>
+  <div class="stat"><div class="n">9</div><div class="l">Link relations</div></div>
+  <div class="stat"><div class="n">27</div><div class="l">Memory fields</div></div>
+</div>
 <p><strong>When to choose this.</strong> Your fleet nodes have GPUs (or you are
 sizing new nodes and embedding volume justifies them). You want the
 lowest embedding latency, zero per-token embedding cost, and no
@@ -269,6 +411,80 @@ embedding traffic leaving the node — at the price of GPU hardware,
 Ollama as a per-node dependency, and model weights in every node
 image.</p>
 <h2 id="per-node-configuration">Per-node configuration</h2>
+<p class="lede">Every memory-bearing node in this fleet is the <strong>same shape</strong> — one
+<code>ai-memory serve</code> daemon, one node-local GPU Ollama embedder, one store. The
+spec below is the per-node contract; the canonical <code>config.toml</code> and the
+verified <code>AI_MEMORY_*</code> override battery follow.</p>
+
+<div class="cards">
+  <div class="card leg1">
+    <span class="leg-tag">Node role</span>
+    <h3>Memory-bearing peer</h3>
+    <p>One <code>ai-memory serve</code> daemon per node, autonomous tier (keyword → semantic
+    → smart → autonomous reranking). Identical across the fleet — every node both
+    serves recall and is a federation quorum member.</p>
+  </div>
+  <div class="card leg3">
+    <span class="leg-tag">Hardware / sizing</span>
+    <h3>CPU + RAM + GPU</h3>
+    <p>CPU cores for FTS5 / HNSW / cross-encoder rerank; RAM for the in-memory HNSW
+    index + the 256&nbsp;MiB sqlite <code>mmap</code> default. <strong>NVIDIA GPU mandatory</strong>
+    (operator GPU policy) to host Ollama — <code>ai-memory doctor</code> WARNs on a
+    GPU-less node running <code>backend = ollama</code>.</p>
+  </div>
+  <div class="card leg1">
+    <span class="leg-tag">Embedder</span>
+    <h3>Local GPU Ollama</h3>
+    <p><code>backend = ollama</code>, <code>nomic-embed-text</code> (768d, in
+    <code>KNOWN_EMBEDDING_DIMS</code>) over the loopback <code>/api/embed</code> wire — ~5–30&nbsp;ms,
+    <strong>$0 per token, no embedding egress</strong>. The compiled-default backend.</p>
+  </div>
+  <div class="card leg2">
+    <span class="leg-tag">Chat LLM</span>
+    <h3>Decoupled (#1067)</h3>
+    <p>Independent of the embedder: point <code>[llm]</code> at a cloud vendor
+    (<code>openrouter</code> / <code>x-ai/grok-4.3</code> reference) or at the <em>same</em> local
+    Ollama for a full airgap. Any tier can speak to any provider.</p>
+  </div>
+  <div class="card leg3">
+    <span class="leg-tag">Store</span>
+    <h3>SQLite or Postgres + AGE</h3>
+    <p>Single-node: SQLite WAL + FTS5. Shared fleet: PostgreSQL + Apache AGE +
+    pgvector via <code>ai-memory serve --store-url postgres://…</code> (the SAL trait path).
+    <strong>Schema v70</strong> in lockstep across all peers.</p>
+  </div>
+  <div class="card leg2">
+    <span class="leg-tag">Federation &amp; security</span>
+    <h3>W-of-N · Batman</h3>
+    <p>W-of-N synchronous quorum, vector-clock merge, periodic catch-up pull. mTLS +
+    fingerprint allowlist, per-message Ed25519 (<code>X-Memory-Sig</code> +
+    <code>X-Memory-Nonce</code>), peer enrollment <strong>fail-closed by default at v0.8.0</strong>
+    (#1789), <code>permissions = enforce</code>.</p>
+  </div>
+</div>
+
+<h3>Key <code>AI_MEMORY_*</code> overrides</h3>
+<p>The env battery a node sets explicitly (each resolves through the uniform ladder
+<code>CLI flag &gt; AI_MEMORY_* env &gt; config.toml &gt; compiled default</code>):</p>
+<div class="table-wrap"><table>
+<thead>
+<tr><th>Knob</th><th>Value</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>AI_MEMORY_EMBED_BACKEND</code></td><td><code>ollama</code></td><td>Node-local GPU embeddings via native <code>/api/embed</code> (no auth)</td></tr>
+<tr><td><code>AI_MEMORY_EMBED_BASE_URL</code></td><td><code>http://localhost:11434</code></td><td>Loopback Ollama endpoint — keeps embedding traffic on-node</td></tr>
+<tr><td><code>AI_MEMORY_EMBED_MODEL</code></td><td><code>nomic-embed-text</code></td><td>768-dim, resolved from <code>KNOWN_EMBEDDING_DIMS</code></td></tr>
+<tr><td><code>AI_MEMORY_LLM_BACKEND</code></td><td><code>openrouter</code></td><td>Chat LLM, decoupled from the embedder (#1067)</td></tr>
+<tr><td><code>AI_MEMORY_LLM_MODEL</code></td><td><code>x-ai/grok-4.3</code></td><td>Vendor model id, passed verbatim to the chat endpoint</td></tr>
+<tr><td><code>AI_MEMORY_PERMISSIONS_MODE</code></td><td><code>enforce</code></td><td>K3/K9 governance gate (secure default)</td></tr>
+<tr><td><code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION</code></td><td><code>1</code></td><td>Fail-closed: unsigned writes rejected <code>403</code></td></tr>
+<tr><td><code>AI_MEMORY_FED_REQUIRE_SIG</code></td><td><code>1</code></td><td>Reject unsigned <code>/sync/push</code> with <code>401</code></td></tr>
+<tr><td><code>AI_MEMORY_FED_REQUIRE_NONCE</code></td><td><code>1</code></td><td>Per-message replay guard (<code>X-Memory-Nonce</code>)</td></tr>
+<tr><td><code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code></td><td><code>1</code></td><td>Unenrolled peer → <code>401</code>; secure default ON at v0.8.0 (#1789)</td></tr>
+</tbody>
+</table></div>
+
+<h3>Canonical <code>config.toml</code></h3>
 <pre><code class="language-toml">schema_version = 2
 tier = &quot;autonomous&quot;
 
@@ -307,9 +523,9 @@ same as on API backends.</p>
 difference. Per <a href="../federation.html"><code>docs/federation.md</code></a>: TLS + mTLS
 fingerprint allowlist at the transport layer, <code>--api-key</code> at the
 application layer, per-message Ed25519 signed sync (<code>X-Memory-Sig</code> +
-<code>X-Memory-Nonce</code>, secure-by-default at v0.7.0) with peer enrollment
-at the identity layer, W-of-N quorum writes + vector-clock merge +
-periodic catch-up pull.</p>
+<code>X-Memory-Nonce</code>, secure-by-default) with peer enrollment
+fail-closed by default at v0.8.0 (#1789) at the identity layer, W-of-N
+quorum writes + vector-clock merge + periodic catch-up pull.</p>
 <p><strong>Embedding-dim consistency is fleet-critical</strong> here too: every peer
 must run the same embedding model/dim. Mixed fleets (some GPU nodes
 on local <code>nomic-embed-text</code>, some CPU nodes on a 3072-dim API model)
@@ -398,8 +614,10 @@ the serving tier.</p>
 <ul>
 <li><a href="enterprise-cpu-memory.html">CPU + Memory sibling architecture</a> —
   cloud + airgapped API-embedding shapes, sizing and security posture.</li>
-<li><a href="../v0.7.0/release-notes.html"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
-  — the #1598 change inventory.</li>
+<li><a href="../whats-new-v08.html">What's New in v0.8.0</a> — distributed-coordination
+  GA (schema v70, 100/7 MCP tools, 9 link relations, 27 memory fields).</li>
+<li><a href="../v0.8.0/release-notes.html"><code>docs/v0.8.0/release-notes.md</code></a>
+  — the v0.8.0 GA change inventory.</li>
 <li><a href="../RUNBOOK-ollama-kv-tuning.html"><code>docs/RUNBOOK-ollama-kv-tuning.md</code></a>
   — Ollama serving tunables on GPU nodes.</li>
 <li><a href="../federation.html"><code>docs/federation.md</code></a> — hardening + quorum
@@ -414,10 +632,10 @@ the serving tier.</p>
     <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
     <a href="../batman-active-mode.html">Batman Mode</a>
     <a href="../credits.html">Credits</a>
-    <a href="../whats-new-v07.html">v0.7.0</a>
+    <a href="../whats-new-v08.html">v0.8.0</a>
   </div>
   <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
-  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.7.0 GA deliverable.</div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a Batman-mode AI Agent Hive. A v0.8.0 GA deliverable.</div>
   <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>

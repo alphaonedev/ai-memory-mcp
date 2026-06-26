@@ -176,7 +176,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <a class="home-link" href="../">ai-memory <span style="opacity:.5">▸ Reference Architecture</span></a>
     <div class="right">
       <a href="../at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="../whats-new-v07.html" style="color:#6ee7ff">v0.7.0</a>
+      <a href="../whats-new-v08.html" style="color:#6ee7ff">v0.8.0</a>
       <div class="menu">
         <button class="menu-btn active">Architectures<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -371,7 +371,7 @@ only the embedder leg. Per
   <code>/api/v1/health</code>).</li>
 <li><strong>Identity / wire integrity</strong> — per-message Ed25519 signed sync
   (<code>X-Memory-Sig</code> + <code>X-Memory-Nonce</code>; <code>AI_MEMORY_FED_REQUIRE_SIG=1</code> +
-  <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> are the v0.7.0 secure defaults),
+  <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> are the secure defaults),
   peer enrollment (<code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1</code>).</li>
 <li><strong>Quorum</strong> — W-of-N writes (W = 2 for 2–3 peers; <code>ceil((N+1)/2)</code>
   above that), vector-clock CRDT-lite merge, periodic catch-up pull.</li>
@@ -447,10 +447,10 @@ models do not compare. Roll out a model change fleet-wide:
     <a href="../compliance/nsa-csi-mcp.html">NSA CSI MCP</a>
     <a href="../batman-active-mode.html">Batman Mode</a>
     <a href="../credits.html">Credits</a>
-    <a href="../whats-new-v07.html">v0.7.0</a>
+    <a href="../whats-new-v08.html">v0.8.0</a>
   </div>
   <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
-  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.7.0 GA deliverable.</div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.8.0 GA deliverable.</div>
   <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>

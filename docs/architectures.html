@@ -254,7 +254,7 @@ section p{margin-bottom:.85rem}
   <div class="pills">
     <span class="pill">5 tiers</span>
     <span class="pill">T1–T3 ship today</span>
-    <span class="pill">T4 SHIPPED v0.7.0 GA</span>
+    <span class="pill">T4 GA · v0.8.0</span>
     <span class="pill">T5 vision · v1.0+</span>
   </div>
 </section>
@@ -294,10 +294,10 @@ section p{margin-bottom:.85rem}
       <a href="architectures-t4.html" class="arch-tier-card">
         <span class="tier-id">TIER 4</span>
         <h3>Data-center swarm</h3>
-        <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind the <code>sal-postgres</code> feature flag, GA at v0.7.0.</p>
+        <p>Multi-rack deployment with quorum writes shipping today; <strong>Postgres+pgvector backbone</strong> behind the <code>sal-postgres</code> feature flag, GA at v0.8.0.</p>
         <span class="tier-scale">SCALE: 100s nodes · 1000s agents · racked &amp; zoned</span>
         <span class="cap-badge cap-today">CORE TODAY</span>
-        <span class="cap-badge cap-today">PG GA · v0.7.0</span>
+        <span class="cap-badge cap-today">PG GA · v0.8.0</span>
       </a>
 
       <a href="architectures-t5.html" class="arch-tier-card">
@@ -455,8 +455,8 @@ section p{margin-bottom:.85rem}
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
           <td><span class="cap-badge cap-partial">feature flag</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.7.0</span></td>
-          <td><span class="cap-badge cap-today">GA · v0.7.0</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
+          <td><span class="cap-badge cap-today">GA · v0.8.0</span></td>
         </tr>
         <tr>
           <td>Cryptographic agent attestation (Ed25519 <code>signature</code>, #626 Layer-3)</td>
@@ -523,7 +523,7 @@ section p{margin-bottom:.85rem}
       <li><code>src/storage/</code> — <code>compute_visibility_prefixes()</code> + <code>visibility_clause()</code> enforce scope-based recall filtering at the SQL level using the indexed <code>scope_idx</code> generated column.</li>
       <li><code>src/models/</code> — <code>GovernancePolicy</code> per-namespace, <code>PendingAction</code> queue, <code>namespace_ancestors()</code> for visibility hierarchy.</li>
       <li><code>src/replication.rs</code> — <code>QuorumPolicy</code> + <code>AckTracker</code>, <strong>functional</strong>, wired into the write path.</li>
-      <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature flag for the v0.7 GA Postgres+pgvector backbone (<code>sqlx</code> + <code>pgvector</code> deps, schema parity fixes shipped #294-#297).</li>
+      <li><code>Cargo.toml</code> — <code>sal-postgres</code> feature flag for the v0.8.0 GA Postgres+pgvector backbone (<code>sqlx</code> + <code>pgvector</code> deps, schema parity fixes shipped #294-#297).</li>
     </ul>
   </div>
 </section>

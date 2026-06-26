@@ -82,6 +82,20 @@ section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
 .act .desc{font-size:.85rem;color:var(--text-muted);line-height:1.45}
 .act .ws{font-family:var(--font-mono);font-size:.7rem;color:var(--text-dim);margin-top:.4rem}
 
+/* Quick-reference chip groups (governance vocabulary at-a-glance) */
+.qref-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(258px,1fr));gap:1rem;margin-bottom:1.5rem}
+.qref{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.15rem 1.25rem}
+.qref .lbl{font-family:var(--font-mono);font-size:.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.75rem}
+.qref .chips{display:flex;flex-wrap:wrap;gap:.45rem}
+.chip{font-family:var(--font-mono);font-size:.8rem;padding:.32rem .72rem;border-radius:999px;border:1px solid var(--border-hl);background:var(--bg-elev);color:var(--text)}
+.chip.allow{border-color:var(--good);color:var(--good)}
+.chip.deny{border-color:var(--bad);color:var(--bad)}
+.chip.pending{border-color:var(--warn);color:var(--warn)}
+/* Secure-default posture table reuses .matrix; per-cell tinting */
+.matrix td.secure{font-family:var(--font-mono);color:var(--good);font-size:.82rem}
+.matrix td.optout{font-family:var(--font-mono);font-size:.8rem;color:var(--text-muted)}
+.matrix td.iss{font-family:var(--font-mono);font-size:.78rem;color:var(--text-dim)}
+
 footer{padding:3rem 1.5rem;text-align:center;font-size:.85rem;color:var(--text-dim);border-top:1px solid var(--border)}
 footer a{color:var(--text-muted)}
 
@@ -260,31 +274,145 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The governance gate.</h1>
-  <p class="tagline">Three decisions: <strong style="color:var(--good)">Allow</strong>, <strong style="color:var(--bad)">Deny</strong>, <strong style="color:var(--warn)">Pending</strong>. Three actions: <code>store</code>, <code>delete</code>, <code>promote</code>. Four levels: Any, Registered, Owner, Approve. Three approver types: Human, Agent, Consensus. Every governed write either returns immediately or queues for approval — never silently succeeds. <strong>The K9 permission system</strong> layers on top: <code>enforce</code> / <code>advisory</code> / <code>off</code> modes with declarative <code>[[permissions.rules]]</code> overlays + fail-CLOSED defaults across SSRF, governance-error, and federation signature paths.</p>
+  <p class="tagline">Every governed write resolves to exactly one of three decisions, then either returns immediately or queues for approval — it never silently succeeds. The permission engine and the harness-enforcing PreToolUse hook layer on top of the namespace-policy gate.</p>
   <div class="pills">
-    <span class="pill">Task 1.8 — policy shape</span>
-    <span class="pill">Task 1.9 — enforcement</span>
-    <span class="pill">Task 1.10 — approver types</span>
-    <span class="pill">v0.6.2 S34 — federation propagation</span>
-    <span class="pill">v0.7.0 K1 — inheritance enforcement</span>
-    <span class="pill">v0.7.0 K9 — permissions mode (enforce default)</span>
-    <span class="pill">v0.7.0 #1054 — fail-CLOSED on rule-consult error</span>
-    <span class="pill">v0.7.0 #1053 — SSRF fail-CLOSED on DNS-fail</span>
-    <span class="pill">v0.7.0 R3-S1.HMAC — webhook dispatch MANDATORY-signed</span>
+    <span class="pill">3 decisions</span>
+    <span class="pill">3 governed actions</span>
+    <span class="pill">4 levels</span>
+    <span class="pill">3 approver types</span>
+    <span class="pill" style="border-color:var(--p1);color:var(--p1)">v0.8.0</span>
   </div>
+</section>
 
-  <!-- v0.7.0 callout block: secure-default flips + migration command -->
-  <div style="background:rgba(243,156,18,.08);border-left:4px solid var(--warn);padding:1.25rem 1.5rem;margin-top:1.5rem;border-radius:6px;max-width:820px;margin-left:auto;margin-right:auto">
-    <p style="margin:0;font-size:.95rem"><strong>v0.7.0 secure-default posture flips</strong> (operators upgrading from v0.6.x):</p>
-    <ul style="margin:.75rem 0 0 0;font-size:.9rem;color:var(--text-muted);padding-left:1.5rem">
-      <li><code>permissions.mode</code> default <code>advisory</code> → <strong><code>enforce</code></strong>. Opt-out: <code>AI_MEMORY_PERMISSIONS_MODE=advisory</code>.</li>
-      <li><code>AI_MEMORY_FED_REQUIRE_SIG=1</code> + <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> default-on (federation Ed25519 <code>X-Memory-Sig</code> + anti-replay <code>X-Memory-Nonce</code> required). Set <code>=0</code> during peer Ed25519 enrolment.</li>
-      <li><code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0</code> (governance fail-CLOSED on rule-consultation error). #1054.</li>
-      <li><code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS=0</code> (passphrase file mode 0400 required). #1055.</li>
-      <li><code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=0</code> (SSRF guard fail-CLOSED on DNS NXDOMAIN). #1053.</li>
-      <li>Webhook dispatch: <strong>HMAC-signed only</strong> (unsigned dispatch DISABLED per R3-S1.HMAC).</li>
-    </ul>
-    <p style="margin:.75rem 0 0 0;font-size:.9rem"><strong>Operator-facing tools:</strong> <code>ai-memory governance migrate-to-permissions [--apply]</code> (translate legacy <code>[governance]</code> policies into the v0.7 <code>[[permissions.rules]]</code> shape). See <a href="MIGRATION_QUICKSTART.html" style="color:var(--p1)">MIGRATION_QUICKSTART.md</a> for the tiered upgrade recipe with staged-rollout env-var opt-outs.</p>
+<section>
+  <div class="container">
+    <span class="eyebrow">At a glance</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">The governance vocabulary.</h2>
+    <p class="lede">Four closed sets define every governed write. The <strong>decision</strong> is the verdict; the <strong>action</strong> selects which policy field applies; the <strong>level</strong> is the gate on that field; the <strong>approver</strong> resolves an <code>Approve</code> verdict.</p>
+    <div class="qref-grid">
+      <div class="qref">
+        <div class="lbl">Decisions — the verdict</div>
+        <div class="chips">
+          <span class="chip allow">Allow</span>
+          <span class="chip deny">Deny</span>
+          <span class="chip pending">Pending</span>
+        </div>
+      </div>
+      <div class="qref">
+        <div class="lbl">Governed actions</div>
+        <div class="chips">
+          <span class="chip">store</span>
+          <span class="chip">delete</span>
+          <span class="chip">promote</span>
+        </div>
+      </div>
+      <div class="qref">
+        <div class="lbl">Levels — the gate</div>
+        <div class="chips">
+          <span class="chip">Any</span>
+          <span class="chip">Registered</span>
+          <span class="chip">Owner</span>
+          <span class="chip">Approve</span>
+        </div>
+      </div>
+      <div class="qref">
+        <div class="lbl">Approver types</div>
+        <div class="chips">
+          <span class="chip">Human</span>
+          <span class="chip">Agent(id)</span>
+          <span class="chip">Consensus(N)</span>
+        </div>
+      </div>
+      <div class="qref">
+        <div class="lbl">Permission engine mode</div>
+        <div class="chips">
+          <span class="chip">enforce</span>
+          <span class="chip">advisory</span>
+          <span class="chip">off</span>
+        </div>
+      </div>
+    </div>
+    <p class="lede" style="margin-bottom:0">The permission engine layers declarative <code>[[permissions.rules]]</code> overlays on top of the namespace-policy gate, with fail-CLOSED defaults across SSRF, governance-error, and federation-signature paths.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Secure-default posture</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Fail-closed by default.</h2>
+    <p class="lede">The substrate ships with the strict posture on. Each flag below defaults to its secure value; the opt-out column is the env var override for a staged rollout (e.g. peer Ed25519 enrolment) — flip it back once the fleet has caught up.</p>
+    <table class="matrix">
+      <thead><tr>
+        <th>Env var</th>
+        <th>Secure default</th>
+        <th>Opt-out</th>
+        <th>Issue</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><code>AI_MEMORY_PERMISSIONS_MODE</code></td>
+          <td class="secure">enforce</td>
+          <td class="optout"><code>=advisory</code> / <code>=off</code></td>
+          <td class="iss">K9</td>
+        </tr>
+        <tr>
+          <td><code>AI_MEMORY_FED_REQUIRE_SIG</code></td>
+          <td class="secure">1 — Ed25519 <code>X-Memory-Sig</code> required</td>
+          <td class="optout"><code>=0</code></td>
+          <td class="iss">#791</td>
+        </tr>
+        <tr>
+          <td><code>AI_MEMORY_FED_REQUIRE_NONCE</code></td>
+          <td class="secure">1 — anti-replay <code>X-Memory-Nonce</code> required</td>
+          <td class="optout"><code>=0</code></td>
+          <td class="iss">#922</td>
+        </tr>
+        <tr>
+          <td><code>AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR</code></td>
+          <td class="secure">0 — fail-CLOSED on rule-consult error</td>
+          <td class="optout"><code>=1</code></td>
+          <td class="iss">#1054</td>
+        </tr>
+        <tr>
+          <td><code>AI_MEMORY_PASSPHRASE_FILE_ALLOW_LAX_PERMS</code></td>
+          <td class="secure">0 — passphrase file 0400 required</td>
+          <td class="optout"><code>=1</code></td>
+          <td class="iss">#1055</td>
+        </tr>
+        <tr>
+          <td><code>AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL</code></td>
+          <td class="secure">0 — fail-CLOSED on DNS NXDOMAIN</td>
+          <td class="optout"><code>=1</code></td>
+          <td class="iss">#1053</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="lede" style="margin-top:1.25rem;margin-bottom:0"><strong>Operator tooling:</strong> <code>ai-memory governance migrate-to-permissions [--apply]</code> translates legacy <code>[governance]</code> policies into the <code>[[permissions.rules]]</code> shape. Webhook dispatch is HMAC-signed only — unsigned dispatch is disabled.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">New in v0.8.0</span>
+    <h2 style="font-family:var(--font-sans);font-size:1.75rem">Enforcement, made real.</h2>
+    <p class="lede">v0.8.0 closes three gaps where governance could be <em>consulted</em> but not actually <em>enforced</em>.</p>
+    <div class="cards">
+      <div class="card">
+        <div class="lbl">harness enforcement · #1811</div>
+        <h3>Enforcing PreToolUse hook</h3>
+        <p>The installed Claude Code hook is a <code>type:command</code> entry running <code>ai-memory governance check-action --from-pretool-stdin</code>. It emits <code>permissionDecision:"deny"</code> on a Refuse / Escalate verdict, so a refused tool is actually BLOCKED. The earlier <code>type:mcp_tool</code> form could not enforce — a tool error was non-blocking and its JSON was shown as plain text.</p>
+      </div>
+      <div class="card">
+        <div class="lbl">presence enforcement · #1734</div>
+        <h3>Mandatory hook presence</h3>
+        <p><code>AI_MEMORY_HOOKS_ENFORCE_MODE</code> = <code>off</code> / <code>advisory</code> / <code>enforce</code>. Paired with <code>[hooks].required_events</code>, <code>enforce</code> returns <code>Deny{503}</code> when a required pre-* event has no enabled hook — closing the silent no-enforcement gap where an absent governance hook simply Allowed. Default <code>off</code> + empty required-events is a deliberate no-op self-DOS guard.</p>
+      </div>
+      <div class="card pending">
+        <div class="lbl">§22 PE-5 · schema v66</div>
+        <h3>Escalate severity</h3>
+        <p>The <code>governance_rules.severity</code> CHECK gains <code>escalate</code> alongside <code>refuse</code> / <code>warn</code> / <code>log</code>. A matched <code>escalate</code> rule pauses the action for human review and fails closed (<code>is_allowed() == false</code>), mirroring refusal-wins; the PreToolUse wrapper maps it to <code>permissionDecision:"deny"</code>.</p>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -530,7 +658,7 @@ footer a{color:var(--text-muted)}
   <span class="key">"delete"</span>:   <span class="val">"approve"</span>,
   <span class="key">"approver"</span>: {<span class="key">"agent"</span>: <span class="val">"alice"</span>}  <span class="cm">// alice approves everything</span>
 }</div>
-    <p class="lede" style="margin-top:1rem"><strong>Defensive defaults (v0.6.2 S34):</strong> <code>promote</code>, <code>delete</code>, and <code>approver</code> carry <code>#[serde(default)]</code> so partial-policy payloads (a common shape for operator CLIs / test harnesses that only care about <code>write</code>) round-trip instead of 400-ing on missing fields. <code>write</code> remains required.</p>
+    <p class="lede" style="margin-top:1rem"><strong>Defensive defaults:</strong> <code>promote</code>, <code>delete</code>, and <code>approver</code> carry <code>#[serde(default)]</code> so partial-policy payloads (a common shape for operator CLIs / test harnesses that only care about <code>write</code>) round-trip instead of 400-ing on missing fields. <code>write</code> remains required.</p>
   </div>
 </section>
 
@@ -558,7 +686,7 @@ footer a{color:var(--text-muted)}
 
 <section>
   <div class="container">
-    <span class="eyebrow">Federation propagation — v0.6.2 S34/S35</span>
+    <span class="eyebrow">Federation propagation</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Decisions and policies cross peer boundaries.</h2>
     <p class="lede">Without propagation, a decision on node-2 wouldn't reach node-1, and a caller on node-1 would still see <code>pending</code> after the action was already approved. Two additive sync_push fields close that gap:</p>
     <div class="cards">
@@ -584,9 +712,9 @@ footer a{color:var(--text-muted)}
     <p class="lede">Governance is a write-side gate. Reads, federation, and audit live elsewhere. Calling these out so AI clients don't assume the wrong contract.</p>
     <div class="snip" style="font-family:var(--font-sans);white-space:normal;line-height:1.7">
       <div><strong style="color:var(--bad)">Not covered:</strong> read paths (<code>memory_get</code>, <code>memory_list</code>, <code>memory_recall</code>, <code>memory_search</code>) — those use the <code>scope</code>/<code>as_agent</code> visibility filter, not governance.</div>
-      <div><strong style="color:var(--bad)">Not covered:</strong> link creation (<code>memory_link</code>) — passes link validation only; KG edges are not gated by the write/promote/delete policy (the v0.7.0 hook pipeline can run link-write hooks on top).</div>
+      <div><strong style="color:var(--bad)">Not covered:</strong> link creation (<code>memory_link</code>) — passes link validation only; KG edges are not gated by the write/promote/delete policy (the hook pipeline can run link-write hooks on top).</div>
       <div><strong style="color:var(--bad)">Not covered:</strong> sync push receive — peers trust each other on validated payloads, but governance is <em>not</em> re-checked on the receiver. The sender's verdict is authoritative.</div>
-      <div><strong style="color:var(--good)">Now layered on top (v0.7.0):</strong> the 25-event hook pipeline (Bucket 0) and the K9 permission system (<code>enforce</code> / <code>advisory</code> / <code>off</code> + <code>[[permissions.rules]]</code> overlays, Bucket 3) SHIPPED — both extend, rather than replace, the namespace-policy gate documented on this page.</div>
+      <div><strong style="color:var(--good)">Layered on top:</strong> the hook pipeline (Bucket 0), the K9 permission system (<code>enforce</code> / <code>advisory</code> / <code>off</code> + <code>[[permissions.rules]]</code> overlays, Bucket 3), and the v0.8.0 hook-presence enforcement + enforcing PreToolUse hook all <em>extend</em>, rather than replace, the namespace-policy gate documented on this page.</div>
     </div>
   </div>
 </section>
