@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Per-agent daily quotas (K8)
 
 v0.7.0 ships per-agent daily quotas plus a structured read surface

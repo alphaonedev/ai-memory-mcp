@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Cline (VS Code extension) — MCP server + custom instructions
 
 **Category 2.** Cline is MCP-capable; configure via Cline's Settings

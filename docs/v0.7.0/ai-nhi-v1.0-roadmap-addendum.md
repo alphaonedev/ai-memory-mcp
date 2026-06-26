@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI v1.0 Roadmap Addendum — Cognitive Substrate Coverage Across Singleton / Swarm / Hive Reference Architectures
 
 > **Authored from inside the substrate** by the AI NHI (Opus 4.7 + ai-memory v0.7.0)

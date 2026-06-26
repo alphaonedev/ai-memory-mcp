@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory enterprise audit trail
 
 PR-5 of issue [#487](https://github.com/alphaonedev/ai-memory-mcp/issues/487).

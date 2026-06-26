@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # <Campaign name> — for SME engineers + architects (<DATE>)
 
 > SKELETON. Target length: 1,500–2,000 words. Deep-dive, every claim traceable. Pin SHAs and versions at write time — they will move.

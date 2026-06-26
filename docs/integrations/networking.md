@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Networking — running `ai-memory` on macOS + VPNs
 
 This page collects the third-party-networking gotchas that operators

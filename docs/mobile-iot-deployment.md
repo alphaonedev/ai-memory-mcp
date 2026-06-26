@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory on phones, IoT, and the edge
 
 > **Status — v0.7.0 (2026-05-22):** the build pipeline (cross-compile +

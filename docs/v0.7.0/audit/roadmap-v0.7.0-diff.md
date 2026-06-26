@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ROADMAP.md ↔ v0.7.0 Source Reconciliation Diff
 
 **Branch:** `release/v0.7.0` · **Tracking issue:** [#1448](https://github.com/alphaonedev/ai-memory-mcp/issues/1448)

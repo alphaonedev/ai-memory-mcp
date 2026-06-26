@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # RFC — Collapse Default MCP Tool Surface to 5 (cross-harness token economics)
 
 **Status:** APPROVED — v0.6.4 sprint authorized 2026-05-02; dev cycle Mon 2026-05-04 → Fri 2026-05-08

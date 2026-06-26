@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Sourcegraph Cody — programmatic system-message prepend
 
 **Category 3 (programmatic).** 100% reliable when implemented.

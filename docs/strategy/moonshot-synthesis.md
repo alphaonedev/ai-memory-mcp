@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory — Moonshot Synthesis
 
 > **Document classification:** Strategic anchor document. Candidate input for a moonshot-level revision of `ROADMAP.md`.

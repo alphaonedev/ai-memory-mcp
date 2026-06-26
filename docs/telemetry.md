@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Telemetry & Observability Policy
 
 **Audience:** operators evaluating what `ai-memory` emits, where it goes, and what guarantees the binary makes about your data leaving the host. **Companion guide:** [`production-deployment.md`](production-deployment.md). **Threat model:** [`SECURITY.md`](../SECURITY.md).

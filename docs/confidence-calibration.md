@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Confidence Calibration (v0.7.0 Form 5)
 
 This document explains the substrate-side confidence pipeline: how

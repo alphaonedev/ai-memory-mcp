@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Migrating from ai-memory v0.6.2 to v0.6.3
 
 **Audience:** operators upgrading running v0.6.2 deployments to v0.6.3.

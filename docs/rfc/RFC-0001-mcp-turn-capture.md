@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # RFC-0001 — MCP `memory_capture_turn` host-volunteered turn capture
 
 | Field | Value |

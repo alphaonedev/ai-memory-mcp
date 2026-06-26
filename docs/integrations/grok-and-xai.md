@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # xAI Grok — programmatic prepend, via Cursor, or as ai-memory's LLM backend
 
 **Category 3 (programmatic) for raw API; category 2 if used via Cursor; ALSO usable as ai-memory's own LLM backend (see below).**

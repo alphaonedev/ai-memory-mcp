@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 test configuration
 
 > **Status:** living doc. Operator-stamped configuration for future

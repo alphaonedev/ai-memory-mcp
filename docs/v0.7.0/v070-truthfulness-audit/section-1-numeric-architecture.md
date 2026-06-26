@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Truthfulness Audit — Section 1: Numeric Architecture
 
 **Auditor:** Truthfulness-Audit Specialist 1 of 6

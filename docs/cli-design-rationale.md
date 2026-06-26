@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # CLI Design Rationale
 
 ## Why there is no flat `ai-memory reflect` verb

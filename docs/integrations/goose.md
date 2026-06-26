@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Block Goose — MCP server + system-instructions directive
 
 **Category 2 (MCP-capable, no native session-start hook).**

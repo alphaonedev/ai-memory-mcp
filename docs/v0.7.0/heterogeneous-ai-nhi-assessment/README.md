@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Heterogeneous AI NHI Assessment of ai-memory v0.7.0 (`attested-cortex`)
 
 A first-of-its-kind multi-evaluator, model-heterogeneous assessment of the v0.7.0 substrate by three frontier AI NHI agents (Anthropic Claude Opus 4.7, OpenAI GPT 5.5, xAI Grok 4.3) running the same prompt in isolation, then synthesized.

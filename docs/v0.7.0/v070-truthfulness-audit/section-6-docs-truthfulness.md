@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 6 — Documentation Truthfulness Audit
 
 **Auditor:** Truthfulness-Audit Specialist 6 of 6 (docs-truthfulness)

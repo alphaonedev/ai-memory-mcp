@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # GPU Integration Roadmap — multi-vendor, v0.7.0-frozen reference
 
 > **Status:** v0.7.0-frozen REFERENCE. Tracker, not a release commitment.

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Baseline — ai-memory-mcp v0.6.3.1
 
 > **Purpose.** This file is the canonical, code-derived snapshot of what

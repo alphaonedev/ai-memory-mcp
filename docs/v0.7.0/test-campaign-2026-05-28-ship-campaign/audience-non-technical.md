@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # What we tested on 2026-05-28, and why it matters
 
 ## The short version

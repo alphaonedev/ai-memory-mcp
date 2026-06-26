@@ -1,0 +1,20 @@
+# GitHub Pages (legacy Jekyll) configuration for the ai-memory docs site.
+#
+# Purpose: render the hand-written Markdown docs as styled HTML pages.
+# The hand-authored *.html files carry NO YAML front matter, so Jekyll
+# copies them verbatim (untouched). Every *.md file is given front matter
+# (`layout: doc`) so Jekyll wraps it in _layouts/doc.html — the professional
+# documentation shell that matches the rest of the site.
+#
+# Kept intentionally minimal: GitHub Pages' github-pages gem already injects
+# safe defaults; this file only pins GitHub-Flavored Markdown so tables,
+# fenced code blocks, and autolinks render correctly.
+
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  hard_wrap: false
+
+# Exclude repo/dev scaffolding from the build output.
+exclude:
+  - "*.bak"

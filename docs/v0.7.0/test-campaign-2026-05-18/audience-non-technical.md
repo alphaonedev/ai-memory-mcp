@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track A NHI re-run — for non-technical readers (2026-05-18)
 
 **Verdict:** SHIP. Everything we tested worked. Nothing failed.

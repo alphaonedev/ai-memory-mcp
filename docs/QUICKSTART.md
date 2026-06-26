@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Quickstart — first memory in under 5 minutes
 
 This guide gets you from zero to a working ai-memory install and your

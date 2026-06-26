@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory reference architectures
 
 ASCII topology diagrams + sizing notes for every deployment shape

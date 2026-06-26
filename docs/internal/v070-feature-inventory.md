@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Feature Inventory — Net-New from v0.6.4
 
 > Baseline: **v0.6.4** (tag `v0.6.4`)

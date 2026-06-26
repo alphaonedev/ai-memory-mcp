@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track D — Docs + Pages Drift Remediation Results (2026-05-28)
 
 Track D is the 100% remediation of the v0.7.0 docs + GitHub Pages

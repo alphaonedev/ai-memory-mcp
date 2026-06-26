@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # PostgreSQL + Apache AGE operator guide (ai-memory v0.8.0)
 
 > **Audience.** Operators running `ai-memory` who want PostgreSQL as the

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Test campaign template (v0.7.0+)
 
 > **How to use this template.** Copy this directory to

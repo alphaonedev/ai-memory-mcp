@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # Track A — Build + Install Verification Results (2026-05-22)
 
 Phase-1 build + install verification for the v0.7.0 release-gate campaign
@@ -205,3 +209,4 @@ container, and env-var topology are reproducible, single-source, and
 match the contract the downstream tracks consume.
 
 Drafted by Claude (Opus 4.7, 1M context).
+{% endraw %}

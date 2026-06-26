@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Enterprise deployment topologies for ai-memory v0.7.0
 
 **Audience.** Subject-matter-expert software engineers and architects

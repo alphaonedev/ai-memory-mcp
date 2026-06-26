@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Zed assistant — MCP server + assistant directive
 
 **Category 2 (MCP-capable, no native session-start hook).**

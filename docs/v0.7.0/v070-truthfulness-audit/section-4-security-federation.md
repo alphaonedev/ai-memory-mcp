@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Truthfulness Audit — Section 4: Security / Federation / Audit
 
 **Specialist:** Truthfulness-Audit Specialist 4 of 6

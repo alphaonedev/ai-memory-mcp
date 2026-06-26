@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Claude Agent SDK — programmatic system-message prepend
 
 **Category 3 (programmatic).** 100% reliable when implemented.

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # K10 SSE approvals — `/api/v1/approvals/stream`
 
 v0.7.0 ships a server-sent-events stream that surfaces pending-approval

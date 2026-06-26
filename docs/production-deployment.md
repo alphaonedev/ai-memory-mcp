@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Production Deployment Guide
 
 **Audience:** operators standing up `ai-memory` for real workloads — single-instance, hub-spoke teams, or W-of-N federations. **Reading time:** 10 minutes.

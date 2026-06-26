@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track A — NHI Test Playbook Re-run Results (Run 3, 2026-05-19)
 
 Third full P0-P11 re-run of the v0.7.0 NHI playbook (memory id `8ccc7fed-7b93-4d2e-8d83-ea2562637f95`, namespace `ai-memory/v0.7.0-nhi-testing`). Purpose: confirm zero regression from the dogfood-fix sprint (Gap 1 / Gap 2 / Gap 5 wire-schema exposure for `source_uri`, `expected_version`, `edit_source`).

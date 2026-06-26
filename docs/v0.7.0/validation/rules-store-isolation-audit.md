@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # V-2 `RulesStore` handle isolation audit
 
 **Branch:** `validation/policy-engine-commercial-claim` @ `22101a7`

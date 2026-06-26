@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Windsurf (Codeium) — MCP server + windsurfrules
 
 **Category 2.** Windsurf is MCP-capable; configure in Settings → Cascade →

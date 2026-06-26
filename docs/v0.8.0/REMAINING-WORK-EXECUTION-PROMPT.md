@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI Execution Prompt — v0.8.0 Remaining-Work Closeout (gauntlet-verified)
 ### Feed verbatim to the Claude Code CLI `/goal` loop driving EPIC #1709
 

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory AI Developer Workflow
 
 > Operational, step-by-step workflow for AI coding agents (Claude Code, Cursor, Copilot,

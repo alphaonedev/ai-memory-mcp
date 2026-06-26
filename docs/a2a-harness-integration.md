@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # A2A Campaign Harness Integration Contract — v0.7.0
 
 **GH issue:** #718 (cross-repo).

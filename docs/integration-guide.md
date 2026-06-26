@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.8.0 — integration guide
 
 How to wire ai-memory to **any AI** — Claude, Cursor, ChatGPT,

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory vs Batman's 6-Form Write-Time-Investment Framework — Honest Audit
 
 > ## Post-audit status (2026-05-15, HEAD `c9472c1`)

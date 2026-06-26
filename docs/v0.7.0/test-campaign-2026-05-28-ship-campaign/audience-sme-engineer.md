@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Ship Campaign 2026-05-28 — SME / Engineer / Architect Briefing
 
 ## Verdict

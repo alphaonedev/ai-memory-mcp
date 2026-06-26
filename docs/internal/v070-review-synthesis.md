@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Review Synthesis — Fix Dispatch Backlog
 
 > Synthesized from 6 parallel reviewers (security/correctness/perf/API-UX/docs/coverage)

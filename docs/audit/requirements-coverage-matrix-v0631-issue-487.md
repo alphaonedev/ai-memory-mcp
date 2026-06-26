@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Issue #487 — Requirements Coverage Matrix
 
 Generated: 2026-04-30

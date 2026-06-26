@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Atomisation substrate primitive (v0.7.0 WT-1)
 
 The v0.7.0 WT-1 wave ships substrate-native **atomisation**: a curator

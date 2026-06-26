@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Security Overview
 
 Threat model, trust boundaries, and hardening options for operators.

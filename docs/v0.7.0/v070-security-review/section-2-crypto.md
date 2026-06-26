@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 2 — Cryptographic + Signing Surface
 
 **Reviewer:** Specialist 2 of 6

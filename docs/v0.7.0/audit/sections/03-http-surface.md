@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 03 — HTTP Route Surface (v0.7.0)
 
 Domain: `src/handlers/` (~35.3k LOC across 32 files) + the route-registration

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track A — NHI Test Playbook Results (2026-05-17)
 
 Per the v0.7.0 NHI test playbook (memory id `8ccc7fed-7b93-4d2e-8d83-ea2562637f95`, namespace `ai-memory/v0.7.0-nhi-testing`). All 12 phases (P0 → P11) re-run on the post-PR-#820-fixes binary.

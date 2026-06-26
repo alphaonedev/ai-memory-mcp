@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # ai-memory v0.8.0 — `distributed-coordination` (release notes)
 
 ## Release procedure (operator-gated)
@@ -467,3 +471,4 @@ All additive (CLAUDE.md §Database is the SSOT). Both adapters mirror via
 | v68 | `encrypted_envelope` postgres + archive parity ([#228](https://github.com/alphaonedev/ai-memory-mcp/issues/228) / [#1728](https://github.com/alphaonedev/ai-memory-mcp/issues/1728)) |
 | v69 | `kg_projection_outbox` (deferred AGE cold-path, postgres-only) ([#1735](https://github.com/alphaonedev/ai-memory-mcp/issues/1735)) |
 | v70 | `archived_memory_links` edge-preservation snapshot ([#1771](https://github.com/alphaonedev/ai-memory-mcp/issues/1771)) |
+{% endraw %}

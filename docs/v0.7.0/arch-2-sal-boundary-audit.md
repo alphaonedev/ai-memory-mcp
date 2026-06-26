@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ARCH-2 SAL boundary audit — direct `crate::storage::*` / `db::*` reaches in handlers
 
 Base SHA: `11b05229754d43a0c75c0f75d16eb6c676c88627`

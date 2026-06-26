@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Troubleshooting
 
 Common errors, causes, and fixes. If your scenario isn't here, check

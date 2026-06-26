@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 02 — CLI Subcommand Surface (v0.7.0)
 
 Audit of the `ai-memory` clap CLI surface: the top-level `pub enum Command`

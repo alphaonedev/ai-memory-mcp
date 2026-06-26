@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Inference Backend — Supply-Chain Attestation Plan
 
 **GH issue:** #654 (Strategic IP: distilled hot-path model + attested

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # `/goal` EPIC kickoff — ai-memory **v0.8.0** "Distributed Coordination Substrate"
 
 > **What this document is.** The full-spectrum, holistic execution prompt to feed to a fresh Claude Code CLI session via `/goal` to drive the **v0.8.0 development EPIC** end-to-end. It is the single load-bearing brief: North Star, scope (codegraph-verified), phased build order, disciplines, gates, and the cutline. Tracking hub: **issue #1709**. Source of truth: `ROADMAP.md` §11.4 + §22 + §5. Companion: the v0.7.1 hub #1683.

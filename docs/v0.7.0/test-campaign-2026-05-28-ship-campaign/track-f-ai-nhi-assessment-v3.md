@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track F — Heterogeneous AI-NHI Assessment v3 Pointer (2026-05-28)
 
 Track F is the parallel-dispatched heterogeneous AI-NHI assessment

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI dogfood test — for SME engineers + architects (2026-05-18)
 
 This is the deep-dive page. For a one-screen summary go to [audience-c-level.md](audience-c-level.md). For the flat finding list go to [findings.md](findings.md). For the plain-English version go to [audience-non-technical.md](audience-non-technical.md).

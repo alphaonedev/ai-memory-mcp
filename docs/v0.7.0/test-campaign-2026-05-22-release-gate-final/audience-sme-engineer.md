@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Release-Gate Final Testing — SME / Engineer / Architect Briefing
 
 ## Verdict

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — 2026-05-28 Ship Campaign Dossier
 
 ## What this is

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Agent Skills (v0.7.0)
 
 > **Status (2026-05-14):** Agent Skills (Pillar 1.5) ships in v0.7.0

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Signed events V-4 closeout — cross-row hash chain
 
 v0.7.0 flips the V-4 validation from YELLOW to GREEN by adding a

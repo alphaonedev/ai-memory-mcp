@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Roo Code (Cline fork) — MCP server + custom instructions
 
 **Category 2 (MCP-capable, no native session-start hook).**

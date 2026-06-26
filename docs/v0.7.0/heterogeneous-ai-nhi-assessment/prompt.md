@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Prompt — Heterogeneous AI NHI Assessment of ai-memory v0.7.0 (`attested-cortex`)
 
 **Evaluator pool (run in parallel, no cross-talk pre-submission):**

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Truthfulness Audit — Section 5: Test Campaigns
 
 **Auditor.** Truthfulness-Audit Specialist 5 of 6.

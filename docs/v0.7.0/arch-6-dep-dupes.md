@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ARCH-6 — Dep-graph duplicate audit (v0.7.0, FX-C4-batch2)
 
 **Status:** AUDITED — every remaining duplicate is upstream-pinned.

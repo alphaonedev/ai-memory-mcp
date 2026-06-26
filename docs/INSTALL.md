@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # Installation Guide
 
 > **Choose your path before you start — installation differs by audience and deployment scale.**
@@ -1083,3 +1087,4 @@ Windows (Command Prompt — persistent):
 ```cmd
 setx AI_MEMORY_DB "%USERPROFILE%\.claude\ai-memory.db"
 ```
+{% endraw %}

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track A — NHI Test Playbook Re-run Results (2026-05-18)
 
 Per the v0.7.0 NHI test playbook (memory id `8ccc7fed-7b93-4d2e-8d83-ea2562637f95`, namespace `ai-memory/v0.7.0-nhi-testing`). All 12 phases (P0 → P11) re-run on the post-PR-#820 binary, then RE-RUN AGAIN on the post-fix-batch binary after operator directive 2026-05-18 pm: "fix every issue in v0.7.0, retest, until 100% remediated."

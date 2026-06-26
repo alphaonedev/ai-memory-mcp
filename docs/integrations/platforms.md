@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # Platform-specific notes
 
 `ai-memory` runs anywhere Rust + SQLite run, which in practice covers every
@@ -745,3 +749,4 @@ referencing #487.
   [ARM Linux](#arm-linux-raspberry-pi-aws-graviton-others) ·
   [Commercial Unix](#commercial-unix-aix-solaris-hp-ux--best-effort) ·
   [Embedded Linux](#embedded-linux-openwrt-yocto-buildroot)
+{% endraw %}

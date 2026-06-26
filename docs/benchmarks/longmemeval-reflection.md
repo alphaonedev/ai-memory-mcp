@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # LongMemEval-Reflection benchmark (v0.7.0 L3-1)
 
 Empirical claim: ai-memory's substrate-native recursive-refinement

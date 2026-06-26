@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ADR-0003 — `memory_kg_invalidate` is eventually consistent across the federation
 
 Status: **Accepted** — implemented in v0.6.3 (PR #390).

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Runbook — Ollama KV-cache compression for ai-memory
 
 Status: **executable on any ai-memory host running Ollama ≥ 0.5.0**.

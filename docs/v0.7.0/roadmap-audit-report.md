@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Roadmap Audit Report — fold-J / SHIP Phase J (#700)
 
 **Audit branch:** `fold-j/roadmap-audit`

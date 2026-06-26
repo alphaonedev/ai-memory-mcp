@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — Track A NHI Re-run + In-Campaign Fix Batch (2026-05-18)
 
 ## What this is

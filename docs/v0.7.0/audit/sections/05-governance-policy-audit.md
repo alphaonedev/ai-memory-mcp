@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 05 — Governance / Policy Engine / Audit Chain / Identity / Federation (v0.7.0)
 
 Branch: `release/v0.7.0`. Every load-bearing claim below is confirmed by a Read of

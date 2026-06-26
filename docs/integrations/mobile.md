@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Mobile artifact signing — consumer-signs-at-app-integration
 
 > **Status — v0.7.0:** ai-memory's iOS xcframework (`ai-memory-ios.xcframework.tar.gz`)

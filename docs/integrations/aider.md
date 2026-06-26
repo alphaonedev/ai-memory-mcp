@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Aider — programmatic system-message prepend via `--message-file`
 
 **Category 3 (programmatic).** 100% reliable when implemented.

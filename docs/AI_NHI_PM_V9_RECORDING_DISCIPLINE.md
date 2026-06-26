@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 <!-- Copyright 2026 AlphaOne LLC. SPDX-License-Identifier: Apache-2.0 -->
 
 # PM-V9 — AI NHI Recording Discipline

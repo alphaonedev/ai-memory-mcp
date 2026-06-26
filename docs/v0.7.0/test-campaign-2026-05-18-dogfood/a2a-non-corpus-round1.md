@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # A2A non-corpus campaign — Round 1 + Round 2 SHIP report
 
 **Window.** 2026-05-18 evening → 2026-05-19 morning (overnight).

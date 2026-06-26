@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 #1182 — Round 2 A2A Regression (reproducibility confirmation, 2026-06-01)
 
 Operator directive (2026-05-31): *"Do a 2nd round of A2A testing once the

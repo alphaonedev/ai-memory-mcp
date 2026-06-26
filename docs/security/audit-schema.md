@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory audit schema v1
 
 PR-5 of issue [#487](https://github.com/alphaonedev/ai-memory-mcp/issues/487).

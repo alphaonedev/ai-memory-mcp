@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # `ai-memory doctor` — operator health dashboard
 
 **Phase P7 / R7** (v0.6.3.1). Read-only health-and-fitness report for an

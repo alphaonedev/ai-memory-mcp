@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Ship-Readiness — Final Verification
 
 > Status: **SHIP-READY** as of 2026-05-15.

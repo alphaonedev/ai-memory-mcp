@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Continue (VS Code / JetBrains) — MCP server + systemMessage
 
 **Category 2.** Continue supports MCP via `~/.continue/config.json`.

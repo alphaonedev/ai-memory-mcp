@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7 E2 — post-ship convergence verification runbook
 
 > **Status:** SHIPPING with v0.7.0 — Track E task E2

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Engineering Standards
 
 > Authoritative reference for all development, testing, security, and release processes.

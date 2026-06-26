@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # Distributed coordination (Pillar-1 + Pillar-2)
 
 > v0.8.0 turns the memory substrate into a **coordination substrate**:
@@ -224,3 +228,4 @@ DAG above has a cognitive counterpart in the memory store itself.
 These fields are additive, permissive options on the existing
 `memory_store` / `memory_update` requests — no new tool is introduced for
 Pillar-2.
+{% endraw %}

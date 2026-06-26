@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # `ai-memory` v0.6.x → v0.7.0 migration quickstart
 
 **Purpose.** The shortest, safest path to upgrade an existing

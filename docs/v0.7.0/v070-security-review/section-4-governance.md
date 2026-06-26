@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 4 — Governance Enforcement + Audit + Forensic Chain
 
 **Specialist:** S4 (governance / audit / forensic chain)

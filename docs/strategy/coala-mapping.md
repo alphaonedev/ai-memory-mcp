@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # CoALA mapping (Sumers et al. 2024)
 
 > **Document classification:** Public-facing strategic supplement.

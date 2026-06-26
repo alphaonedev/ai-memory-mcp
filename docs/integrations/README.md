@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Session-boot integrations — agent matrix
 
 This directory documents how to wire `ai-memory` into every AI agent so the

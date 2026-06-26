@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Google Gemini CLI / Gemini Code Assist — programmatic prepend
 
 **Category 3 (programmatic).** 100% reliable when implemented.

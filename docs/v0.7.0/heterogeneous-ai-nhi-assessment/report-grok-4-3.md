@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # report-grok-4-3.md
 
 > **Status: Awaiting Phase 1 independent execution by xAI Grok 4.3.**

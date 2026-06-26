@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track B — A2A Non-Corpus Regression Results (2026-05-22)
 
 Track B re-verifies the 8 A2A non-corpus scenarios from the

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Sidechain transcripts (Track I)
 
 v0.7.0 ships raw conversation / reasoning trail storage in zstd-3

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — Release-Gate Final Testing Dossier (2026-05-22)
 
 ## What this is
