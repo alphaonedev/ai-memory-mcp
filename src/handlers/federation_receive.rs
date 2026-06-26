@@ -27,7 +27,7 @@ use super::federation_signing_check::verify_signature_or_reject;
 
 /// Tracing target for receive-side peer-attestation checks
 /// (#1558 tracing-target SSOT).
-const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
+pub(super) const ATTESTATION_TRACE_TARGET: &str = "federation::attestation";
 
 /// v0.7.0 federation security — extract the peer's self-claimed
 /// `x-peer-id` header. Lowercase form per HTTP/2 wire convention;
@@ -87,9 +87,15 @@ fn attestation_refusal_response(err: &AttestError) -> Response {
 // ---------------------------------------------------------------------------
 // Phase 3 foundation (issue #224) — HTTP sync endpoints.
 //
-// These ship in v0.6.0 GA as SKELETONS running today's timestamp-aware merge
-// (`db::insert_if_newer`). Field-level CRDT-lite merge rules, streaming,
-// resume-on-interrupt, and per-peer auth tokens are v0.8.0 targets.
+// These shipped in v0.6.0 GA as SKELETONS running a timestamp-aware merge
+// (`db::insert_if_newer`). v0.8.0 Pillar-3 (#1709) WIRED the #224
+// field-level CRDT-lite merge: the reconciliation site below now routes
+// through `db::merge_inbound`, which field-merges a divergent same-`id`
+// inbound row via `crate::models::merge_memory` (tags union, max-merge on
+// the counters, metadata deep-merge, agent_id/governance immutable-to-
+// local) and falls through to `insert_if_newer` for fresh / dedup rows.
+// Streaming, resume-on-interrupt, and per-peer auth tokens remain v0.8.0+
+// targets.
 // ---------------------------------------------------------------------------
 
 /// v0.7.0 S6-LOW2 — log a warning when the sender's claimed wall-clock
@@ -141,33 +147,178 @@ pub(super) fn check_sender_clock_skew(sender_agent_id: &str, body: &SyncPushBody
     }
 }
 
-/// v0.7.0 S6-M2 — per-agent quota gate for federation receive. Closes
-/// the F7 gap (#639) where mTLS-authenticated peers could push past
-/// the local `agent_quotas` storage caps that would have blocked an
-/// equivalent HTTP `POST /memories` from the same identity.
+/// v0.7.0 S6-M2 / #1464 (v0.8.0, P0, security-high) — resolve the
+/// quota + ownership attribution for an inbound federated memory, gating
+/// the claimed `metadata.agent_id` against the operator's per-peer
+/// authorship allowlist. Returns the agent id the substrate will charge
+/// for the row, and mutates `to_insert` in place when a claim is refused.
 ///
-/// `attribute_agent` is the identity the substrate will charge for the
-/// row. Resolution precedence (mTLS-attested first; falls back to the
-/// claim chain when no cert peeking is available):
-///   1. `mem.metadata.agent_id` — the original author of the row
-///      (NHI provenance preserved across federation). This is what
-///      `quota_status` reports against, so charging this id makes the
-///      receiver-side quota a true mirror of the originator's daily
-///      budget. A misbehaving peer cannot substitute another agent's
-///      id without crashing the upstream signature check (H3).
-///   2. `sender_agent_id` — substrate identity of the peer that
-///      delivered the row. Used when the row carries no
-///      `metadata.agent_id` (legacy / unauthored federation push).
+/// ## The hole this closes
 ///
-/// Returns `Ok(())` on a clean check + record (counters incremented),
-/// `Err(QuotaError)` on a refusal. The caller renders the refusal as
-/// `429 Too Many Requests` with an `X-Quota-Reset-At` header.
-pub(super) fn attribute_agent_for_quota(sender_agent_id: &str, mem: &Memory) -> String {
-    mem.metadata
-        .get("agent_id")
+/// Pre-#1464 the receiver trusted `metadata.agent_id` VERBATIM. The
+/// docstring used to claim "a misbehaving peer cannot substitute another
+/// agent's id without crashing the upstream signature check (H3)" — that
+/// was FALSE (§17 honesty): #791 signs the whole BODY by the *sender*,
+/// not each row's author, and `Memory` carries no per-write signature to
+/// re-verify. So an enrolled peer `mallory` could push a memory claiming
+/// `metadata.agent_id = "alice"` and have alice charged for quota AND
+/// recorded as owner (the #1720 owner-keyed visibility row).
+///
+/// ## The gate (#1464 — chosen by a 5-agent adversarial vote, 4-1)
+///
+/// Extend the shipped #238 allowlist ([`PeerScope::allowed_sender_agent_ids`])
+/// from the body-sender to per-memory granularity:
+///   1. No `metadata.agent_id` → attribute to `sender_agent_id` (legacy /
+///      unauthored push).
+///   2. Claim == `sender_agent_id` → the #238-attested body author; trust.
+///   3. Enrolled posture (operator configured an allowlist): trust the
+///      claim only if the operator authorized this peer to author as that
+///      agent (`scope_for(peer_id).allowed_sender_agent_ids`). Otherwise
+///      attribute to the sender AND rewrite `to_insert.metadata.agent_id`
+///      to the sender so a forged claim cannot own the row, stamping
+///      `attest_level = "claimed"` so downstream knows it is a bare claim.
+///   4. Zero-config (no allowlist): preserve the faith-based posture
+///      (#1056 / #238 — an unenrolled mesh trusts signed peer-ids; the
+///      operator opts into authorship enforcement by enrolling peers).
+///
+/// This preserves legitimate multi-author relay provenance (a hub/curator
+/// relaying a fleet of agents the operator allowlisted) while closing the
+/// forge hole for unauthorized claims.
+pub(super) fn resolve_inbound_attribution(
+    to_insert: &mut Memory,
+    sender_agent_id: &str,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) -> String {
+    let Some(claimed) = to_insert
+        .metadata
+        .get(crate::META_KEY_AGENT_ID)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| sender_agent_id.to_string())
+    else {
+        return sender_agent_id.to_string();
+    };
+    // The #238-attested body author is always trusted to author as itself.
+    if claimed == sender_agent_id {
+        return claimed;
+    }
+    // Enrolled posture: a relayed third-party claim is trusted ONLY if the
+    // operator authorized this peer to author as that agent. Zero-config
+    // (no allowlist) preserves the faith-based posture.
+    let authorized = if attest_cfg.has_allowlist() {
+        peer_id
+            .and_then(|p| attest_cfg.scope_for(p))
+            .is_some_and(|scope| scope.allowed_sender_agent_ids.iter().any(|a| a == &claimed))
+    } else {
+        true
+    };
+    if authorized {
+        return claimed;
+    }
+    // Unauthorized relayed claim: do not trust it for quota OR ownership.
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        memory_id = %to_insert.id,
+        claimed_agent = %claimed,
+        sender = %sender_agent_id,
+        peer_id = %peer_id.unwrap_or(""),
+        "sync_push: peer not authorized to author as claimed agent_id (#1464); \
+         re-attributing the row to the sender"
+    );
+    if let Some(obj) = to_insert.metadata.as_object_mut() {
+        obj.insert(
+            crate::META_KEY_AGENT_ID.to_string(),
+            serde_json::Value::String(sender_agent_id.to_string()),
+        );
+        obj.insert(
+            crate::models::field_names::ATTEST_LEVEL.to_string(),
+            serde_json::Value::String(
+                crate::identity::verify::AttestLevel::Claimed
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+    }
+    sender_agent_id.to_string()
+}
+
+/// #1464 (v0.8.0) — per-write CONTENT attestation on the federation receive
+/// path. The ATTRIBUTION lane ([`resolve_inbound_attribution`]) resolves
+/// WHO a relayed memory is attributed to; this resolves WHETHER the relayed
+/// CONTENT is cryptographically attested to that author.
+///
+/// When the relayed memory carries a base64 detached Ed25519 signature in
+/// `metadata.write_signature`, it is verified — through the same store-path
+/// [`crate::identity::attest::stamp_attestation`] gate (#626), which
+/// recomputes `sha256(content)` over the PERSISTED content bytes (never
+/// trusting a presented digest) and re-derives the canonical `SignableWrite`
+/// envelope — against the attributed author's locally ENROLLED Ed25519 key
+/// (`bound_pubkey_b64`, resolved per-backend by the caller). A valid
+/// signature upgrades the row to `attest_level=agent_attested`; an unsigned
+/// relayed write keeps `attest_level=claimed` (the documented accept-and-flag
+/// data-lane posture). `agent_attested` commits to the six `SignableWrite`
+/// fields ONLY (agent_id, namespace, title, kind, created_at,
+/// sha256(content)) — NOT tags/priority/metadata.
+///
+/// Composition rules (the data-lane security semantics, single-sourced here
+/// so both the sqlite and postgres receive paths behave identically):
+/// - **Re-attributed rows are skipped.** When an unauthorized third-party
+///   claim was already downgraded to `claimed` + re-attributed to the sender
+///   by [`resolve_inbound_attribution`] (`original_claim != attribute_agent`),
+///   a signature minted by the *original* claimant must NOT be checked
+///   against the re-attributed sender (it would spuriously read as forged).
+///   The row already correctly landed `claimed`; leave it.
+/// - **Strict mode is third-party-only.** `require_write_sig_env`
+///   (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`, default off) is honored only for a
+///   HONORED third-party relayed claim (`attribute_agent != sender_agent_id`);
+///   self-authored relays stay faith-based (already gated by the #238
+///   envelope attestation + #29 signature + #30 nonce + #43 enrollment), so a
+///   strict operator never bricks self-authored replication.
+///
+/// On the honored path this re-stamps `attest_level` from WHAT WE VERIFIED,
+/// overriding any peer-asserted `attest_level` in the inbound metadata (a
+/// peer cannot self-assert `agent_attested`).
+///
+/// # Errors
+///
+/// Returns `Err` when a presented signature is forged/malformed, or when
+/// strict mode requires a signature that is absent/unverifiable for a honored
+/// third-party claim. The caller rejects (skips) that single memory without
+/// aborting the batch. 5-agent vote (`4d3ea1c5`).
+pub(super) fn apply_inbound_write_attestation(
+    to_insert: &mut Memory,
+    attribute_agent: &str,
+    sender_agent_id: &str,
+    original_claim: Option<&str>,
+    bound_pubkey_b64: Option<&str>,
+    require_write_sig_env: bool,
+) -> anyhow::Result<()> {
+    // Skip re-attributed rows — the original claimant's signature would not
+    // verify against the re-attributed sender, and the row already correctly
+    // landed `claimed`.
+    if original_claim.is_some_and(|c| c != attribute_agent) {
+        return Ok(());
+    }
+    let presented_sig: Option<Vec<u8>> = to_insert
+        .metadata
+        .get(crate::models::field_names::WRITE_SIGNATURE)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|s| {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.trim())
+                .ok()
+        });
+    // Strict requirement applies only to HONORED third-party relayed claims.
+    let require = require_write_sig_env && attribute_agent != sender_agent_id;
+    crate::identity::attest::stamp_attestation(
+        to_insert,
+        attribute_agent,
+        bound_pubkey_b64,
+        presented_sig.as_deref(),
+        require,
+    )
+    .map(|_| ())
 }
 
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
@@ -275,8 +426,11 @@ pub struct SyncPushBody {
     /// never enforced.
     #[serde(default)]
     pub sender_wall_clock: Option<String>,
-    /// Memories the sender is offering. Applied via the existing
-    /// timestamp-aware merge (`insert_if_newer`).
+    /// Memories the sender is offering. Applied via the v0.8.0 Pillar-3
+    /// (#1709 / #224) field-level CRDT-lite merge (`db::merge_inbound`):
+    /// a divergent same-`id` inbound row is field-merged via
+    /// `crate::models::merge_memory`; fresh / `(title, namespace)`-dedup
+    /// rows fall through to the timestamp-aware `insert_if_newer` LWW path.
     pub memories: Vec<Memory>,
     /// #1566 / #1579 B1 — source-side embedding vectors for the rows
     /// in `memories` (embed-once-replicate-vector). Inside the
@@ -341,6 +495,23 @@ pub struct SyncPushBody {
     /// node-2's peer, breaking cross-peer rule-lifecycle assertions.
     #[serde(default)]
     pub namespace_meta_clears: Vec<String>,
+    /// #1718 v0.8.0 Pillar-1 — signed inter-agent signals the sender wants
+    /// propagated (the v60 `signals` table). Applied accept-and-flag-unsigned
+    /// like memories/links (a signal is a *message*, not an authority grant):
+    /// idempotent on the signal UUID, a present-but-invalid signature is
+    /// refused as forged, an unsigned signal lands verbatim. See
+    /// `crate::federation::receive_auth` for why action *transitions* (the
+    /// authority-granting sibling) are fail-closed instead.
+    #[serde(default)]
+    pub signals: Vec<crate::models::Signal>,
+    /// #1718 v0.8.0 Pillar-1 — coordination-action state transitions the sender
+    /// wants propagated (the v59 `actions` table). Applied FAIL-CLOSED: a
+    /// transition is an *authority-granting* write, so each op is cryptographically
+    /// authorized (`receive_auth::authorize_remote_transition`) before the atomic
+    /// compare-and-swap on the expected `from_state` (#1718 H1/H2; 5-agent vote
+    /// `4d3ea1c5`). An op for an action this node does not have is a no-op.
+    #[serde(default)]
+    pub action_transitions: Vec<crate::federation::sync::ActionTransitionOp>,
     /// Preview mode — classify and count, do not write.
     #[serde(default)]
     pub dry_run: bool,
@@ -557,6 +728,27 @@ pub async fn sync_push(
         )
             .into_response();
     }
+    if body.signals.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("sync_push limited to {} signals per request", app.max_page_size)
+            })),
+        )
+            .into_response();
+    }
+    if body.action_transitions.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} action_transitions per request",
+                    app.max_page_size
+                )
+            })),
+        )
+            .into_response();
+    }
     if body.pending_decisions.len() > app.max_page_size {
         return (
             StatusCode::BAD_REQUEST,
@@ -704,28 +896,92 @@ pub async fn sync_push(
         // on the HTTP POST store path but federation receive was a
         // back-door bypass: an mTLS peer could push N memories per
         // second past the local `agent_quotas.max_memories_per_day`
-        // ceiling because `insert_if_newer` is the substrate-level
+        // ceiling because `merge_inbound` (the #1709/#224 reconciliation
+        // writer wrapping `insert_if_newer`) is the substrate-level
         // upsert and doesn't consult quotas. Charge each accepted
         // memory against the original author's quota row so the cap
         // is a true cluster-wide budget. On refusal: emit a signed
         // refusal event (for the cryptographic audit chain) and
         // short-circuit the loop with `quota_refused`; the outer
         // handler renders 429 + X-Quota-Reset-At so callers back off.
-        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
-        let bytes_estimate =
-            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
-                .unwrap_or(i64::MAX);
+        // #1464 (v0.8.0, P0) — build the row first, then resolve its quota
+        // + ownership attribution by gating the claimed `metadata.agent_id`
+        // against the per-peer authorship allowlist (see
+        // `resolve_inbound_attribution`). Done before the quota gate so the
+        // gate charges the attributed agent, and so the persisted row's
+        // owner (`metadata.agent_id`) reflects any re-attribution.
+        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            cap_for_namespace,
+        );
+        // #1464 — capture the originally-claimed author BEFORE attribution
+        // may rewrite it, so the content-attestation step can skip rows that
+        // get re-attributed to the sender (an unauthorized third-party claim).
+        let original_claim = to_insert
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let attribute_agent = resolve_inbound_attribution(
+            &mut to_insert,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
+        // #1464 (v0.8.0) — per-write CONTENT attestation. Verify any
+        // presented `metadata.write_signature` against the attributed
+        // author's enrolled key → upgrade to `agent_attested` (vs `claimed`);
+        // reject a forged signature, or (strict, opt-in) an unsigned honored
+        // third-party relayed claim. Skips re-attributed rows internally.
+        if let Err(e) = apply_inbound_write_attestation(
+            &mut to_insert,
+            &attribute_agent,
+            &body.sender_agent_id,
+            original_claim.as_deref(),
+            db::agent_pubkey(&lock.0, &attribute_agent)
+                .ok()
+                .flatten()
+                .as_deref(),
+            crate::federation::receive_auth::require_write_sig_enabled(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %to_insert.id,
+                attribute_agent = %attribute_agent,
+                sender = %body.sender_agent_id,
+                error = %e,
+                "sync_push: per-write content attestation failed; rejecting memory (#1464)"
+            );
+            skipped += 1;
+            continue;
+        }
+        let bytes_estimate = i64::try_from(
+            to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
+        )
+        .unwrap_or(i64::MAX);
         // v0.7.0 #1156 — charge against the per-namespace accounting
         // row. Federation peers can no longer drain an agent's cap by
         // fanning across namespaces (the per-namespace dimension keeps
         // each namespace's allotment intact).
-        match crate::quotas::check_and_record(
+        // #1544 — charge the per-agent STORAGE-BYTES ceiling only (NOT the
+        // daily write-COUNT) on the federation RECEIVE path. Replicating an
+        // already-attested peer memory is not net-new authorship: the
+        // pre-#1544 daily-count charge double-counted a memory that already
+        // cleared the author's quota at its origin AND let an enrolled peer
+        // exhaust an absent author's daily cap (503-ing that author's own
+        // local writes — a cross-tenant DoS) AND 429-stormed the push DLQ
+        // past 1000/day. Storage-bytes stays enforced (anti-flood). The
+        // five inbound controls (enrollment + mTLS pin + attestation +
+        // signature + nonce) gate fan-in; see 5-agent vote (memory 4d3ea1c5).
+        match crate::quotas::check_and_record_storage_only(
             &lock.0,
             &attribute_agent,
             &mem.namespace,
-            crate::quotas::QuotaOp::Memory {
-                bytes: bytes_estimate,
-            },
+            bytes_estimate,
         ) {
             Ok(()) => {}
             Err(crate::quotas::QuotaCheckError::Quota(q)) => {
@@ -785,29 +1041,12 @@ pub async fn sync_push(
                 continue;
             }
         }
-        // v0.7.0 L2-2 (S6-M1) — stamp `metadata.reflection_origin` on
-        // inbound reflection rows before the insert. The stamped copy
-        // carries `peer_origin`, `original_depth`, and the receiver's
-        // local cap at arrival time; the substrate row preserves the
-        // original `reflection_depth` so derived-write cap enforcement
-        // (storage::reflect) sees the same value the source peer saw.
-        // Non-reflection rows (depth == 0) pass through unchanged.
-        //
-        // #961 (SAL-boundary cleanup): use the `db::` namespace alias
-        // (which re-exports `crate::storage` from `src/lib.rs:52`) so
-        // every sqlite-direct call in this branch reads as a single
-        // module surface — keeps the alias hygiene that the rest of
-        // this file already follows (`db::insert_if_newer`,
-        // `db::archive_memory`, etc.).
-        let cap_for_namespace = db::resolve_governance_policy(&lock.0, &mem.namespace)
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
-        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
-            mem,
-            &body.sender_agent_id,
-            cap_for_namespace,
-        );
-        match db::insert_if_newer(&lock.0, &to_insert) {
+        // (`cap_for_namespace`, `to_insert` + the #1464 per-write
+        // attribution gate were resolved above the quota gate so the gate
+        // operates on the exact row — with any re-attribution applied —
+        // that is persisted here. `stamp_reflection_origin` carried the
+        // `peer_origin` / `original_depth` / local-cap metadata.)
+        match db::merge_inbound(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
                 // #1566 / #1579 B1 — store a dim-matching shipped
@@ -864,7 +1103,7 @@ pub async fn sync_push(
                         bytes: bytes_estimate,
                     },
                 );
-                tracing::warn!("sync_push: insert_if_newer failed for {}: {e}", mem.id);
+                tracing::warn!("sync_push: merge_inbound failed for {}: {e}", mem.id);
                 skipped += 1;
             }
         }
@@ -1152,6 +1391,176 @@ pub async fn sync_push(
         }
     }
 
+    // #1718 v0.8.0 Pillar-1 — process incoming signals. Accept-and-flag-unsigned
+    // (a signal is a message, not an authority grant — same posture as
+    // memories/links; the authority-granting action *transition* sibling is
+    // fail-closed in `receive_auth`). Idempotent on the signal UUID; a
+    // present-but-invalid signature is refused as forged. #1544: the receive
+    // path charges the storage-bytes quota only (replication is not net-new
+    // authorship) — a refusal skips the offending signal without 429-ing the
+    // whole push (signals are not the primary write surface).
+    let mut signals_applied = 0usize;
+    for sig in &body.signals {
+        if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if !sig.signature.is_empty() && !crate::signals::verify(sig) {
+            tracing::warn!(
+                "sync_push: signal {} has an invalid signature — skipping (forged)",
+                sig.id
+            );
+            skipped += 1;
+            continue;
+        }
+        match crate::signals::get(&lock.0, &sig.id) {
+            Ok(Some(_)) => {
+                noop += 1; // already have it — idempotent replay
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("sync_push: signal get failed for {}: {e}", sig.id);
+                skipped += 1;
+                continue;
+            }
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
+        if let Err(e) = crate::quotas::check_and_record_storage_only(
+            &lock.0,
+            &sig.from_agent,
+            &sig.namespace,
+            bytes,
+        ) {
+            tracing::warn!("sync_push: signal {} refused by storage quota: {e}", sig.id);
+            skipped += 1;
+            continue;
+        }
+        match crate::signals::insert(&lock.0, sig) {
+            Ok(_) => signals_applied += 1,
+            Err(e) => {
+                tracing::warn!("sync_push: signal insert failed for {}: {e}", sig.id);
+                skipped += 1;
+            }
+        }
+    }
+
+    // #1718 v0.8.0 Pillar-1 — process incoming action-state transitions.
+    // FAIL-CLOSED authorization (a transition is an authority-granting write,
+    // unlike signals/memories): each op is cryptographically authorized via
+    // `receive_auth::authorize_remote_transition` (signature verified against
+    // the attested actor's ENROLLED key + best-effort local lease-holder auth;
+    // 5-agent vote `4d3ea1c5`) BEFORE the atomic compare-and-swap on the
+    // expected `from_state` (H1). An op for an action this node does not have,
+    // or that loses the CAS, is a safe no-op. No storage quota is charged: a
+    // transition mutates existing action state — it is not net-new storage
+    // (#1544 scope is replication bytes, not state changes).
+    let mut action_transitions_applied = 0usize;
+    let require_tx_sig = crate::federation::receive_auth::require_transition_sig_enabled();
+    for op in &body.action_transitions {
+        if validate::validate_id(&op.action_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let local = match crate::actions::get(&lock.0, &op.action_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                noop += 1; // action unknown here — nothing to transition
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("sync_push: action get failed for {}: {e}", op.action_id);
+                skipped += 1;
+                continue;
+            }
+        };
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let enrolled = op
+            .claimed_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let lease_holder = crate::actions::lease_get(&lock.0, &op.action_id)
+            .ok()
+            .flatten()
+            .map(|l| l.holder);
+        let signable = crate::identity::sign::SignableTransition {
+            action_id: &op.action_id,
+            namespace: &local.namespace,
+            from_state: op.from_state.as_str(),
+            to_state: op.to_state.as_str(),
+            claimed_by: op.claimed_by.as_deref(),
+            nonce: &op.nonce,
+            created_at: op.updated_at,
+        };
+        match crate::federation::receive_auth::authorize_remote_transition(
+            &signable,
+            &op.signature,
+            enrolled.as_ref(),
+            lease_holder.as_deref(),
+            require_tx_sig,
+        ) {
+            crate::federation::receive_auth::TransitionAuthz::Accept => {
+                // #1805 — per-transition nonce anti-replay. The transition
+                // nonce is signed (tamper-evident) but was never recorded, so a
+                // captured signed transition re-wrapped in a FRESH outer
+                // envelope replays through CAS on a cyclic/ABA edge (CAS is
+                // causal ordering, not anti-replay). Record it in the per-peer
+                // nonce cache (the #30 envelope-nonce store) and refuse a
+                // repeat. Rides the #1718 / 4d3ea1c5 fail-closed posture; an
+                // empty nonce = unsigned op (heterogeneous rollout) → not gated.
+                if !op.nonce.is_empty() {
+                    use base64::Engine as _;
+                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
+                    if matches!(
+                        app.federation_nonce_cache
+                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                        crate::identity::replay::ReplayDecision::Replay
+                    ) {
+                        tracing::warn!(
+                            target: crate::federation::SIGNING_TRACE_TARGET,
+                            action_id = %op.action_id,
+                            "sync_push: replayed action-transition nonce refused (#1805)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                match crate::actions::transition_cas(
+                    &lock.0,
+                    &op.action_id,
+                    op.from_state,
+                    op.to_state,
+                    op.claimed_by.as_deref(),
+                    op.updated_at,
+                ) {
+                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
+                    Ok(_) => noop += 1, // CAS miss / not-found / illegal edge — safe no-op
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push: action transition {} cas failed: {e}",
+                            op.action_id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    "sync_push: action transition {} refused ({verdict:?})",
+                    op.action_id
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // v0.6.2 (S35): process incoming namespace_meta rows. Applies via
     // `set_namespace_standard` so the peer's inheritance-chain walk has
     // the originator's explicit parent link. The standard memory itself
@@ -1219,6 +1628,21 @@ pub async fn sync_push(
         tracing::warn!("sync_push: sync_state_observe failed: {e}");
     }
 
+    // v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite merge: fold
+    // the sender's full vector clock into the receiver's persisted
+    // sync-state (pointwise max). Additive over the per-peer `observe`
+    // above — `observe` advances only what THIS push told us about the
+    // sender, whereas the merge enriches the receiver clock with every
+    // peer the sender has transitively observed, so the receiver's clock
+    // reflects all known peer timestamps (the reconciliation foundation
+    // for redundant-push short-circuiting). Monotonic: an older incoming
+    // timestamp never regresses a newer stored entry. Skipped in dry-run.
+    if !body.dry_run
+        && let Err(e) = db::sync_state_merge(&lock.0, &local_agent_id, &body.sender_clock)
+    {
+        tracing::warn!("sync_push: sync_state_merge failed: {e}");
+    }
+
     // #1566 / #1579 B1 — the pre-#1566 synchronous embed loop lived
     // here (one `emb.embed()` per applied row, ~1s/row via ollama,
     // WHILE HOLDING the DB lock and inside the sender's quorum-ack
@@ -1261,6 +1685,8 @@ pub async fn sync_push(
             "links_applied": links_applied,
             "pendings_applied": pendings_applied,
             "pending_decisions_applied": pending_decisions_applied,
+            "signals_applied": signals_applied,
+            "action_transitions_applied": action_transitions_applied,
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,
@@ -1278,6 +1704,249 @@ pub async fn sync_push(
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    // ---- #1464 per-write CONTENT attestation (apply_inbound_write_attestation) ----
+
+    use crate::identity::{attest, keypair};
+    use base64::Engine as _;
+
+    /// A relayed memory authored by `author`, with the identity-bearing
+    /// `SignableWrite` fields populated so a real per-write signature can be
+    /// minted + verified.
+    fn wsig_mem(author: &str) -> Memory {
+        Memory {
+            id: "m-1464-wsig".to_string(),
+            namespace: "team/alpha".to_string(),
+            title: "kubernetes deployment guide".to_string(),
+            content: "scale the deployment to three replicas".to_string(),
+            created_at: "2026-06-01T12:00:00+00:00".to_string(),
+            metadata: serde_json::json!({ "agent_id": author }),
+            ..Memory::default()
+        }
+    }
+
+    fn pk_b64(kp: &keypair::AgentKeypair) -> String {
+        base64::engine::general_purpose::STANDARD.encode(kp.public.to_bytes())
+    }
+
+    fn put_write_sig(mem: &mut Memory, sig: &[u8]) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(sig);
+        mem.metadata.as_object_mut().unwrap().insert(
+            crate::models::field_names::WRITE_SIGNATURE.to_string(),
+            serde_json::json!(b64),
+        );
+    }
+
+    /// A valid presented per-write signature, verified against the author's
+    /// enrolled key, upgrades a HONORED third-party relayed claim from
+    /// `claimed` to `agent_attested`. (The signature is inserted into
+    /// `metadata` AFTER signing — proving `SignableWrite`'s exclusion of
+    /// `metadata` keeps the signature stable as the key is added.)
+    #[test]
+    fn write_attestation_valid_sig_upgrades_to_agent_attested_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        put_write_sig(&mut mem, &sig);
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        )
+        .expect("valid sig must verify");
+        assert_eq!(mem.metadata["attest_level"], "agent_attested");
+    }
+
+    /// A forged/tampered presented signature is rejected unconditionally
+    /// (even under the permissive default).
+    #[test]
+    fn write_attestation_forged_sig_rejected_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let mut sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        sig[0] ^= 0xFF; // flip a byte
+        put_write_sig(&mut mem, &sig);
+        let err = apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        );
+        assert!(err.is_err(), "forged signature must be rejected");
+    }
+
+    /// An unsigned relayed write keeps `attest_level=claimed` under the
+    /// permissive default — and a peer-asserted `agent_attested` in the
+    /// inbound metadata is overridden to `claimed` (a peer cannot self-assert
+    /// attestation).
+    #[test]
+    fn write_attestation_unsigned_stays_claimed_permissive_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        // Peer lies: claims agent_attested with no signature.
+        mem.metadata.as_object_mut().unwrap().insert(
+            "attest_level".to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false,
+        )
+        .expect("unsigned permissive must pass");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// Strict mode (`AI_MEMORY_FED_REQUIRE_WRITE_SIG`) refuses an unsigned
+    /// HONORED third-party relayed claim.
+    #[test]
+    fn write_attestation_strict_third_party_unsigned_rejected_1464() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let err = apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay", // attribute(author) != sender → third-party
+            Some(author),
+            Some(&pk_b64(&kp)),
+            true, // strict
+        );
+        assert!(err.is_err(), "strict third-party unsigned must be rejected");
+    }
+
+    /// Strict mode never bricks a SELF-authored relay (attribute == sender):
+    /// the requirement is third-party-only, so an unsigned self relay still
+    /// lands `claimed`.
+    #[test]
+    fn write_attestation_strict_self_authored_unsigned_passes_1464() {
+        let mut mem = wsig_mem("ai:relay");
+        apply_inbound_write_attestation(
+            &mut mem,
+            "ai:relay",
+            "ai:relay", // attribute == sender → self-authored
+            Some("ai:relay"),
+            None,
+            true, // strict, but does not apply to self
+        )
+        .expect("strict self-authored unsigned must still pass");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// A RE-ATTRIBUTED row (original third-party claim downgraded to the
+    /// sender by `resolve_inbound_attribution`) is skipped: a signature
+    /// minted by the original claimant must NOT be checked against the
+    /// re-attributed sender (it would spuriously read as forged). The row
+    /// keeps its already-stamped `claimed`.
+    #[test]
+    fn write_attestation_reattributed_row_skipped_1464() {
+        // Post-attribution state: an unauthorized "bob" claim was rewritten
+        // to sender "ai:relay" + stamped claimed.
+        let mut mem = wsig_mem("bob");
+        {
+            let obj = mem.metadata.as_object_mut().unwrap();
+            obj.insert("agent_id".to_string(), serde_json::json!("ai:relay"));
+            obj.insert("attest_level".to_string(), serde_json::json!("claimed"));
+        }
+        // A signature bob minted (would be forged against ai:relay).
+        let kp_bob = keypair::generate("bob").unwrap();
+        let sig = attest::sign_memory_write(&kp_bob, &mem, "bob").unwrap();
+        put_write_sig(&mut mem, &sig);
+        // original_claim "bob" != attribute "ai:relay" → re-attributed → skip.
+        apply_inbound_write_attestation(&mut mem, "ai:relay", "ai:relay", Some("bob"), None, true)
+            .expect("re-attributed row must be skipped, not rejected");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    /// #1464 (v0.8.0, P0, security-high) — the per-memory authorship gate
+    /// `resolve_inbound_attribution` must close the forge hole: an enrolled
+    /// peer cannot have an unauthorized claimed `metadata.agent_id` trusted
+    /// for quota OR ownership. Pins all five arms.
+    #[test]
+    fn resolve_inbound_attribution_gates_per_memory_claims_1464() {
+        use crate::federation::peer_attestation::PeerScope;
+        use std::collections::HashMap;
+
+        fn claiming(agent: &str) -> Memory {
+            Memory {
+                id: "m-1464".to_string(),
+                metadata: serde_json::json!({ "agent_id": agent }),
+                ..Memory::default()
+            }
+        }
+
+        // Enrolled config: peer "ai:relay" is authorized to author as "bob".
+        let mut peers = HashMap::new();
+        peers.insert(
+            "ai:relay".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["bob".to_string()],
+                ..PeerScope::default()
+            },
+        );
+        let cfg = PeerAttestationConfig { peers };
+        let zero = PeerAttestationConfig::default();
+
+        // (1) Zero-config faith posture (no allowlist): the claim is trusted
+        // verbatim and NOT rewritten (preserve #1056/#238 behaviour).
+        let mut m = claiming("alice");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m, "ai:relay", &zero, Some("ai:relay")),
+            "alice"
+        );
+        assert_eq!(m.metadata["agent_id"], "alice");
+
+        // (2) Enrolled, peer NOT authorized to author as "alice" → attribute
+        // to the sender AND rewrite ownership; stamp the bare-claim level.
+        let mut m2 = claiming("alice");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m2, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+        assert_eq!(
+            m2.metadata["agent_id"], "ai:relay",
+            "ownership re-attributed"
+        );
+        assert_eq!(m2.metadata["attest_level"], "claimed");
+
+        // (3) Enrolled, peer authorized to author as "bob" → trusted, preserved.
+        let mut m3 = claiming("bob");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m3, "ai:relay", &cfg, Some("ai:relay")),
+            "bob"
+        );
+        assert_eq!(m3.metadata["agent_id"], "bob");
+
+        // (4) Self-authored (claim == sender, the #238-attested body author)
+        // → trusted regardless of the allowlist.
+        let mut m4 = claiming("ai:relay");
+        assert_eq!(
+            resolve_inbound_attribution(&mut m4, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+
+        // (5) No claim at all → attribute to the sender.
+        let mut m5 = Memory {
+            id: "m-none".to_string(),
+            metadata: serde_json::json!({}),
+            ..Memory::default()
+        };
+        assert_eq!(
+            resolve_inbound_attribution(&mut m5, "ai:relay", &cfg, Some("ai:relay")),
+            "ai:relay"
+        );
+    }
 
     /// v0.7.0 #1049 (Agent-5 #9) — `extract_peer_id` validates the
     /// header value through `crate::validate::validate_agent_id`

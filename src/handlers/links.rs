@@ -302,23 +302,14 @@ pub async fn create_link(
     // S82's wire shape uses `{from, to, rel_type}`; resolve canonical
     // (source_id, target_id, relation) from either field set.
     let (source_id, target_id, relation) = body.resolved();
-    if let Err(e) =
-        validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-    // v0.7.0 G-PHASE-E-1 (#706) — the SQL-side CHECK constraint on
-    // `memory_links.relation` (migration 0027) admits only the five
-    // canonical relations. `validate_relation` is intentionally more
-    // permissive (accepts arbitrary `[a-z0-9_]+`) for forward-compat,
-    // but anything outside the canonical set will crash the INSERT
-    // with a generic CHECK violation. Pre-flight the relation against
-    // the closed set here so callers get a structured 400 instead of
-    // a generic 500.
+    // v0.7.0 G-PHASE-E-1 (#706) — the `memory_links.relation` CHECK admits
+    // only the closed canonical taxonomy. Pre-flight the relation against the
+    // closed set FIRST so HTTP callers get the structured, machine-parseable
+    // `{error:"invalid_relation", got, allowed}` 400 (richer than the shared
+    // validator's plain message). #1812 — `validate_relation` is now ALSO
+    // closed-set (it previously accepted any `[a-z0-9_]+`, which then silently
+    // dropped at the CHECK), so this check must run BEFORE `validate_link_triple`
+    // or that shared validator would shadow this structured response.
     if crate::models::MemoryLinkRelation::from_str(&relation).is_none() {
         return (
             StatusCode::BAD_REQUEST,
@@ -327,6 +318,15 @@ pub async fn create_link(
                 "got": relation,
                 "allowed": ALLOWED_LINK_RELATIONS,
             })),
+        )
+            .into_response();
+    }
+    if let Err(e) =
+        validate::RequestValidator::validate_link_triple(&source_id, &target_id, &relation)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
         )
             .into_response();
     }
@@ -543,7 +543,7 @@ pub async fn create_link(
                     tracing::error!("create_link: quota substrate error: {se}");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": "quota check failed"})),
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
                     )
                         .into_response()
                 }

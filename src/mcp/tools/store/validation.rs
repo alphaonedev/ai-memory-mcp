@@ -251,6 +251,15 @@ pub(super) fn parse_and_build_memory(
     crate::validate::validate_kind(kind_param).map_err(|e| e.to_string())?;
     let caller_kind = kind_param.and_then(crate::models::MemoryKind::from_str);
 
+    // v0.8.0 Pillar 2 (#1709) — caller-supplied initial `lifecycle_state`.
+    // An explicit, non-parseable value is REJECTED (naming the valid set);
+    // omitted / unknown-after-validation → `Open` (the schema DEFAULT).
+    let lifecycle_state_param = params["lifecycle_state"].as_str();
+    crate::validate::validate_lifecycle_state(lifecycle_state_param).map_err(|e| e.to_string())?;
+    let caller_lifecycle_state = lifecycle_state_param
+        .and_then(crate::models::LifecycleState::from_str)
+        .unwrap_or_default();
+
     let source_uri = match params[param_names::SOURCE_URI].as_str().map(str::trim) {
         Some(s) if !s.is_empty() => {
             crate::validate::validate_source_uri(s).map_err(|e| e.to_string())?;
@@ -321,6 +330,9 @@ pub(super) fn parse_and_build_memory(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        // v0.8.0 Pillar 2 (#1709) — caller-set initial lifecycle (validated
+        // above); omitted → Open.
+        lifecycle_state: caller_lifecycle_state,
     };
 
     Ok((mem, on_conflict, agent_id, explicit_scope))

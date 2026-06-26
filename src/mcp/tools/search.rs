@@ -83,6 +83,21 @@ pub(super) fn handle_search(
 ) -> Result<Value, String> {
     let query = params["query"].as_str();
     let namespace = params["namespace"].as_str();
+    // v0.8.0 PE-2 (#1730) — read-action governance gate (zero-config
+    // fast-path when no read_action rules exist).
+    {
+        let actor = caller
+            .or_else(|| params["agent_id"].as_str())
+            .unwrap_or_default();
+        crate::governance::agent_action::gate_read_surface(conn, actor, "search", namespace, query)
+            .map_err(|r| {
+                crate::governance::deny_message(
+                    "search",
+                    crate::governance::DenyGate::Governance,
+                    &r.reason,
+                )
+            })?;
+    }
     let tier = params["tier"].as_str().and_then(Tier::from_str);
     // Ultrareview #339: saturate instead of panic on 32-bit targets
     // where u64 may exceed usize::MAX. A malicious client passing
@@ -122,9 +137,15 @@ pub(super) fn handle_search(
             // #975 — propagate the caller's `as_agent` to the reciprocal
             // source-uri endpoint so the MCP source_uri-only path
             // respects the same scope=private gate as `search_with_source_uri`.
-            let results =
-                db::list_by_source_uri(conn, uri, namespace, Some(limit.min(200)), as_agent)
-                    .map_err(|e| e.to_string())?;
+            let results = db::list_by_source_uri(
+                conn,
+                uri,
+                namespace,
+                Some(limit.min(200)),
+                as_agent,
+                caller,
+            )
+            .map_err(|e| e.to_string())?;
             let results = filter_visible(results, caller);
             return Ok(json!({"results": results, "count": results.len()}));
         }
@@ -145,6 +166,7 @@ pub(super) fn handle_search(
         as_agent,
         include_archived,
         source_uri,
+        caller,
     )
     .map_err(|e| e.to_string())?;
     let results = filter_visible(results, caller);
@@ -212,6 +234,7 @@ mod visibility_1468_tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 

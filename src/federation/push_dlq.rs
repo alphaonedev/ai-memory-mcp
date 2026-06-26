@@ -54,6 +54,7 @@
 //!   §federation-push-DLQ.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use super::FederationConfig;
@@ -131,6 +132,25 @@ pub trait FederationDlqSink: Send + Sync {
     /// replay worker to maintain the `federation_push_dlq_depth`
     /// Prometheus gauge.
     async fn pending_dlq_count(&self) -> Result<i64, String>;
+
+    /// #1544 — refresh `last_error` on a pending row WITHOUT bumping
+    /// `attempt_count`. Called when a replay attempt is THROTTLED (peer
+    /// 429): the row is left pending so it converges once the quota
+    /// window rolls, and the attempt budget is preserved so a transient
+    /// throttle never quarantines a valid row. Recording the throttle
+    /// reason lets the cause-label classifier + the un-quarantine sweep
+    /// recognise the row.
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String>;
+
+    /// #1544 — un-quarantine rows that were quarantined SOLELY because a
+    /// 429 throttle burned their `attempt_count` past
+    /// [`MAX_REPLAY_ATTEMPTS`] before the quota window rolled. Resets
+    /// `attempt_count = 0` for pending rows at/over the ceiling whose
+    /// `last_error` indicates a throttle (429) — scoped to throttles so
+    /// genuinely-systematic failures (signature/schema refusals) stay
+    /// quarantined (resetting those would resume infinite no-op POST
+    /// amplification). Returns the number of rows un-quarantined.
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String>;
 }
 
 /// Spawn the federation push DLQ replay worker.
@@ -249,10 +269,77 @@ pub fn replay_max_batch() -> usize {
 /// systematic-rejection footguns quickly.
 pub const MAX_REPLAY_ATTEMPTS: i32 = 100;
 
+/// #1544 — env knob for the federation push-DLQ depth WARN threshold.
+const FED_DLQ_DEPTH_WARN_THRESHOLD_ENV: &str = "AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD";
+/// Compiled default depth at which the rising-edge WARN fires.
+const DEFAULT_FED_DLQ_DEPTH_WARN_THRESHOLD: i64 = 1000;
+
+/// Resolve the depth-WARN threshold (env > compiled default). A
+/// non-positive / unparseable value falls through to the default.
+fn dlq_depth_warn_threshold() -> i64 {
+    std::env::var(FED_DLQ_DEPTH_WARN_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FED_DLQ_DEPTH_WARN_THRESHOLD)
+}
+
+/// #1544 — rising-edge tracker so the DLQ-depth WARN fires ONCE when the
+/// depth crosses up through the threshold (and an INFO once on recovery
+/// below it), not every replay tick — a per-tick WARN at 80k rows would
+/// drown the very signal it is meant to be. `0` = below, `1` = at/over.
+static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
+
+/// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
+/// cause label so the Prometheus label cardinality is bounded by
+/// construction (never the raw string). `quota` is operator-actionable
+/// (raise `AI_MEMORY_MAX_MEMORIES_PER_DAY` / wait for the daily reset);
+/// `permanent` is a broken row needing a manual drain.
+fn classify_quarantine_cause(last_error: &str) -> &'static str {
+    if last_error.contains("429") {
+        "quota"
+    } else if last_error.contains("401") || last_error.contains("403") {
+        // The replay last_error is the `http {status}` shape, so 401/403
+        // is the enrolment/auth signal (the peer's JSON `peer_not_enrolled`
+        // body is not carried in last_error).
+        "unenrolled_peer"
+    } else if last_error.contains("id_drift") {
+        "id_drift"
+    } else if last_error.contains("no longer in FederationConfig") {
+        "peer_removed"
+    } else if last_error.contains("400")
+        || last_error.contains("422")
+        || last_error.contains("signature")
+        || last_error.contains("schema")
+    {
+        "permanent"
+    } else {
+        "other"
+    }
+}
+
 /// Drive one replay pass. Public so the integration test in
 /// `tests/federation_dlq_replay.rs` can advance the worker manually
 /// without waiting on the `tokio::time::sleep` cadence.
 pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink) {
+    // #1544 — before draining, un-quarantine rows that were quarantined
+    // SOLELY because a 429 throttle (per-agent / federation quota window)
+    // burned their attempt budget past MAX_REPLAY_ATTEMPTS before the
+    // window rolled (the #1535 atlas-corpus burst stalled ~75k valid
+    // rows this way). Throttle-scoped, so genuinely-systematic failures
+    // stay quarantined. Cheap bounded UPDATE that no-ops when nothing is
+    // throttle-quarantined.
+    match sink.reset_throttled_quarantine().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: un-quarantined {n} throttle-stalled (429) DLQ row(s) for retry"
+        ),
+        Err(e) => tracing::warn!(
+            target: PUSH_DLQ_TRACE_TARGET,
+            "replay: reset_throttled_quarantine failed (non-fatal): {e}"
+        ),
+    }
     // #1579 B5 — adaptive drain batch. Scale the per-tick take with
     // the live backlog (`min(backlog, configurable cap)`, floored at
     // the historical REPLAY_BATCH_SIZE) so a bulk backlog drains at
@@ -308,18 +395,45 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
             crate::metrics::registry()
                 .federation_push_dlq_quarantined
                 .inc();
-            tracing::warn!(
-                target: PUSH_DLQ_TRACE_TARGET,
-                row_id = row.id,
-                peer_id = %row.peer_id,
-                memory_id = %row.memory_id,
-                attempt_count = row.attempt_count,
-                "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}); \
-                 no CLI drain surface ships at v0.7.0 — see docs/TROUBLESHOOTING.md \
-                 §federation-push-DLQ for the data-layer drain procedure (#1578)",
-                row.id,
-                row.attempt_count,
-            );
+            // #1544 — cause-labeled sibling counter (closed-set label).
+            let cause = classify_quarantine_cause(&row.last_error);
+            crate::metrics::registry()
+                .federation_push_dlq_quarantined_by_cause
+                .with_label_values(&[cause])
+                .inc();
+            if cause == "quota" {
+                // Operator-actionable: name the remediation explicitly.
+                // (Post-#1544 a 429 is a Throttle that never burns an
+                // attempt, so reaching quarantine via a quota cause means
+                // a peer-side throttle the leader cannot classify — still
+                // recoverable by raising the cap or waiting for the reset.)
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    peer_id = %row.peer_id,
+                    memory_id = %row.memory_id,
+                    cause,
+                    "replay: row {} quarantined with a QUOTA (429) cause — raise \
+                     AI_MEMORY_MAX_MEMORIES_PER_DAY on the peer or wait for the daily \
+                     quota window to reset; the row will converge once admitted (#1544)",
+                    row.id,
+                );
+            } else {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    peer_id = %row.peer_id,
+                    memory_id = %row.memory_id,
+                    attempt_count = row.attempt_count,
+                    cause,
+                    "replay: row {} quarantined after {} attempts (ceiling {MAX_REPLAY_ATTEMPTS}, \
+                     cause={cause}); no CLI drain surface ships at v0.7.0 — see \
+                     docs/TROUBLESHOOTING.md §federation-push-DLQ for the data-layer drain \
+                     procedure (#1578)",
+                    row.id,
+                    row.attempt_count,
+                );
+            }
             continue;
         }
 
@@ -399,6 +513,26 @@ pub async fn replay_once(config: &FederationConfig, sink: &dyn FederationDlqSink
                     row.id,
                 );
             }
+            // #1544 — a THROTTLE (peer 429: per-agent / federation quota
+            // window) is retryable on its own once the window rolls. Do
+            // NOT call `bump_dlq_attempt` — burning a `MAX_REPLAY_ATTEMPTS`
+            // attempt on a throttle is exactly what quarantined ~75k valid
+            // rows before the daily quota reset (#1544). Refresh
+            // `last_error` for operator visibility (so the cause-label
+            // classifier + un-quarantine sweep can see it) but leave the
+            // attempt budget intact so the row keeps retrying until it
+            // lands.
+            AckOutcome::Throttled(reason) => {
+                let _ = sink.note_dlq_throttled(row.id, &reason).await;
+                tracing::debug!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    row_id = row.id,
+                    "replay: peer {} throttled (429) on row {} — leaving pending without \
+                     burning a quarantine attempt: {reason}",
+                    row.peer_id,
+                    row.id,
+                );
+            }
         }
     }
 
@@ -413,6 +547,35 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
             crate::metrics::registry()
                 .federation_push_dlq_depth
                 .set(depth);
+            // #1544 — edge-triggered, rate-limited depth alarm. Fire ONE
+            // WARN when the backlog crosses UP through the threshold and
+            // ONE INFO when it recovers below it; never per-tick (the
+            // pre-#1544 stall was silent — operators only saw a growing
+            // gauge, never an alert).
+            let threshold = dlq_depth_warn_threshold();
+            let now_over = i64::from(depth >= threshold);
+            let was_over = DLQ_DEPTH_OVER_THRESHOLD.swap(now_over, Ordering::Relaxed);
+            if now_over == 1 && was_over == 0 {
+                tracing::warn!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    depth,
+                    threshold,
+                    "federation push-DLQ depth {depth} crossed the alert threshold \
+                     {threshold} — pushes are backing up. Common cause: a peer-side \
+                     per-agent quota (429) throttle on a corpus-scale federation; the \
+                     replayer drains automatically once admitted, or raise \
+                     AI_MEMORY_MAX_MEMORIES_PER_DAY (tune the alarm via \
+                     AI_MEMORY_FED_DLQ_DEPTH_WARN_THRESHOLD). #1544",
+                );
+            } else if now_over == 0 && was_over == 1 {
+                tracing::info!(
+                    target: PUSH_DLQ_TRACE_TARGET,
+                    depth,
+                    threshold,
+                    "federation push-DLQ depth recovered below the alert threshold \
+                     {threshold} (now {depth})"
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -423,22 +586,43 @@ async fn refresh_depth_gauge(sink: &dyn FederationDlqSink) {
     }
 }
 
-/// Sqlite implementation of [`FederationDlqSink`] backed by the
-/// shared `handlers::Db` mutex-wrapped `rusqlite::Connection`.
+/// Sqlite implementation of [`FederationDlqSink`] backed by a
+/// **dedicated** writable `rusqlite::Connection` (#1580 / F5.11).
 ///
-/// All methods acquire the mutex for the duration of one SQL call so
-/// the sink stays compatible with the legacy single-connection
-/// posture. Concurrent callers serialise on the mutex; for v0.7.0 GA
-/// loads the per-failure SQL is microseconds so this is acceptable.
+/// Previously the sink wrapped the shared `handlers::Db` writer mutex
+/// and `take_pending_dlq_rows` held that mutex across its SELECT — so a
+/// DLQ poll blocked every concurrent HTTP request at the coarse tokio
+/// mutex (Reviewer-5 F5.11). The sink now owns a private connection to
+/// the same database file: its reads run WAL-concurrently with the HTTP
+/// writer, and its brief writes serialize with the writer only at
+/// SQLite's fine-grained WAL lock (`busy_timeout`), never the process
+/// mutex. The DLQ table lives in the same DB, so a second WAL connection
+/// is consistent with whatever the HTTP path commits.
 pub struct SqliteDlqSink {
-    db: crate::handlers::Db,
+    conn: std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
 }
 
 impl SqliteDlqSink {
-    /// Build a new sink over the daemon's shared sqlite connection.
-    #[must_use]
-    pub fn new(db: crate::handlers::Db) -> Self {
-        Self { db }
+    /// Open a dedicated writable connection for the DLQ worker, learning
+    /// the on-disk path from the daemon's shared [`crate::handlers::Db`]
+    /// (so callers keep passing the same handle they already hold).
+    ///
+    /// # Errors
+    ///
+    /// Returns the formatted open-error string when the dedicated
+    /// connection cannot be opened (e.g. the path is unwritable). The
+    /// shared handle was already opened successfully by the caller, so
+    /// this is not expected in practice.
+    pub async fn new(db: crate::handlers::Db) -> Result<Self, String> {
+        let db_path = {
+            let guard = db.lock().await;
+            guard.1.clone()
+        };
+        let conn = crate::storage::open(&db_path)
+            .map_err(|e| format!("SqliteDlqSink: open dedicated connection: {e}"))?;
+        Ok(Self {
+            conn: std::sync::Arc::new(tokio::sync::Mutex::new(conn)),
+        })
     }
 }
 
@@ -453,24 +637,23 @@ impl FederationDlqSink for SqliteDlqSink {
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let payload_str = payload_json.to_string();
-        let conn = self.db.lock().await;
+        let conn = self.conn.lock().await;
         // Use `ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS
         // NULL DO UPDATE` so a flapping peer doesn't stack duplicate
         // pending rows — bumps attempt_count + refreshes last_error
         // instead. Partial unique index from the v48 migration backs
         // this conflict target.
-        conn.0
-            .execute(
-                "INSERT INTO federation_push_dlq \
+        conn.execute(
+            "INSERT INTO federation_push_dlq \
                  (memory_id, peer_id, payload_json, attempt_count, last_error, failed_at) \
                  VALUES (?1, ?2, ?3, 1, ?4, ?5) \
                  ON CONFLICT(memory_id, peer_id) WHERE replayed_at IS NULL \
                  DO UPDATE SET \
                    attempt_count = attempt_count + 1, \
                    last_error    = excluded.last_error",
-                rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
-            )
-            .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
+            rusqlite::params![memory_id, peer_id, payload_str, last_error, now],
+        )
+        .map_err(|e| format!("sqlite enqueue_push_failure: {e}"))?;
         Ok(())
     }
 
@@ -478,9 +661,8 @@ impl FederationDlqSink for SqliteDlqSink {
         &self,
         limit: usize,
     ) -> Result<Vec<FederationPushDlqRow>, String> {
-        let conn = self.db.lock().await;
+        let conn = self.conn.lock().await;
         let mut stmt = conn
-            .0
             .prepare(
                 "SELECT id, memory_id, peer_id, payload_json, attempt_count, last_error \
                  FROM federation_push_dlq \
@@ -514,38 +696,64 @@ impl FederationDlqSink for SqliteDlqSink {
 
     async fn mark_dlq_row_replayed(&self, id: i64) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.db.lock().await;
-        conn.0
-            .execute(
-                "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
-                rusqlite::params![now, id],
-            )
-            .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE federation_push_dlq SET replayed_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| format!("sqlite mark_dlq_row_replayed: {e}"))?;
         Ok(())
     }
 
     async fn bump_dlq_attempt(&self, id: i64, last_error: &str) -> Result<(), String> {
-        let conn = self.db.lock().await;
-        conn.0
-            .execute(
-                "UPDATE federation_push_dlq \
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE federation_push_dlq \
                  SET attempt_count = attempt_count + 1, last_error = ?1 \
                  WHERE id = ?2 AND replayed_at IS NULL",
-                rusqlite::params![last_error, id],
-            )
-            .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
+            rusqlite::params![last_error, id],
+        )
+        .map_err(|e| format!("sqlite bump_dlq_attempt: {e}"))?;
         Ok(())
     }
 
     async fn pending_dlq_count(&self) -> Result<i64, String> {
-        let conn = self.db.lock().await;
-        conn.0
-            .query_row(
-                "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
-                [],
-                |r| r.get::<_, i64>(0),
+        let conn = self.conn.lock().await;
+        conn.query_row(
+            "SELECT COUNT(*) FROM federation_push_dlq WHERE replayed_at IS NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
+    }
+
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+        // #1544 — refresh last_error ONLY; do NOT touch attempt_count.
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE federation_push_dlq SET last_error = ?1 \
+             WHERE id = ?2 AND replayed_at IS NULL",
+            rusqlite::params![last_error, id],
+        )
+        .map_err(|e| format!("sqlite note_dlq_throttled: {e}"))?;
+        Ok(())
+    }
+
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        // #1544 — un-quarantine rows quarantined SOLELY by a 429 throttle.
+        // Scoped to throttle rows (last_error names a 429) so genuinely
+        // systematic failures stay quarantined.
+        let conn = self.conn.lock().await;
+        let n = conn
+            .execute(
+                "UPDATE federation_push_dlq SET attempt_count = 0 \
+                 WHERE replayed_at IS NULL \
+                   AND attempt_count >= ?1 \
+                   AND last_error LIKE '%429%'",
+                rusqlite::params![MAX_REPLAY_ATTEMPTS],
             )
-            .map_err(|e| format!("sqlite pending_dlq_count: {e}"))
+            .map_err(|e| format!("sqlite reset_throttled_quarantine: {e}"))?;
+        Ok(n as u64)
     }
 }
 
@@ -667,6 +875,37 @@ impl FederationDlqSink for PostgresDlqSink {
                 .map_err(|e| format!("postgres pending_dlq_count: {e}"))?;
         Ok(row.0)
     }
+
+    async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+        // #1544 — refresh last_error ONLY; do NOT touch attempt_count.
+        let pool = self.store.pool();
+        sqlx::query(
+            "UPDATE federation_push_dlq SET last_error = $1 \
+             WHERE id = $2 AND replayed_at IS NULL",
+        )
+        .bind(last_error)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres note_dlq_throttled: {e}"))?;
+        Ok(())
+    }
+
+    async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+        // #1544 — un-quarantine 429-throttled rows only (see trait doc).
+        let pool = self.store.pool();
+        let res = sqlx::query(
+            "UPDATE federation_push_dlq SET attempt_count = 0 \
+             WHERE replayed_at IS NULL \
+               AND attempt_count >= $1 \
+               AND last_error LIKE '%429%'",
+        )
+        .bind(MAX_REPLAY_ATTEMPTS)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("postgres reset_throttled_quarantine: {e}"))?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -681,8 +920,8 @@ mod replay_arm_tests {
 
     use super::{
         DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
-        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, replay_max_batch,
-        replay_once,
+        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, classify_quarantine_cause,
+        replay_max_batch, replay_once,
     };
     use crate::federation::{FederationConfig, PeerEndpoint};
     use crate::replication::QuorumPolicy;
@@ -705,6 +944,9 @@ mod replay_arm_tests {
         rows: Mutex<Vec<FederationPushDlqRow>>,
         marked_replayed: Mutex<Vec<i64>>,
         bumped: Mutex<Vec<(i64, String)>>,
+        // #1544 — records note_dlq_throttled calls so a test can assert a
+        // 429 throttle did NOT go through bump_dlq_attempt.
+        throttled: Mutex<Vec<(i64, String)>>,
         count_should_err: bool,
         take_should_err: bool,
         take_calls: AtomicUsize,
@@ -759,6 +1001,32 @@ mod replay_arm_tests {
                 return Err("mock count error".to_string());
             }
             Ok(self.rows.lock().unwrap().len() as i64)
+        }
+
+        async fn note_dlq_throttled(&self, id: i64, last_error: &str) -> Result<(), String> {
+            // Record the throttle WITHOUT bumping attempt_count, then
+            // refresh last_error on the matching row.
+            self.throttled
+                .lock()
+                .unwrap()
+                .push((id, last_error.to_string()));
+            for row in self.rows.lock().unwrap().iter_mut() {
+                if row.id == id {
+                    row.last_error = last_error.to_string();
+                }
+            }
+            Ok(())
+        }
+
+        async fn reset_throttled_quarantine(&self) -> Result<u64, String> {
+            let mut n = 0u64;
+            for row in self.rows.lock().unwrap().iter_mut() {
+                if row.attempt_count >= MAX_REPLAY_ATTEMPTS && row.last_error.contains("429") {
+                    row.attempt_count = 0;
+                    n += 1;
+                }
+            }
+            Ok(n)
         }
     }
 
@@ -912,5 +1180,105 @@ mod replay_arm_tests {
         // Take errored → early return, no replay/bump.
         assert!(sink.marked_replayed.lock().unwrap().is_empty());
         assert!(sink.bumped.lock().unwrap().is_empty());
+    }
+
+    // ----- #1544 throttle / un-quarantine -----------------------------
+
+    fn dlq_row(id: i64, attempt_count: i32, last_error: &str) -> FederationPushDlqRow {
+        FederationPushDlqRow {
+            id,
+            memory_id: format!("m{id}"),
+            peer_id: "peer-0".to_string(),
+            payload_json: serde_json::json!({}),
+            attempt_count,
+            last_error: last_error.to_string(),
+        }
+    }
+
+    /// #1544 — a 429 throttle must un-quarantine ONLY rows whose
+    /// last_error names the throttle; a genuinely-systematic failure
+    /// (e.g. http 400) stays quarantined so the worker doesn't resume
+    /// infinite no-op POST amplification against a permanently-broken row.
+    #[tokio::test]
+    async fn reset_throttled_quarantine_is_scoped_to_429_rows() {
+        let sink = MockSink::default();
+        {
+            let mut rows = sink.rows.lock().unwrap();
+            rows.push(dlq_row(
+                1,
+                MAX_REPLAY_ATTEMPTS,
+                "http 429 Too Many Requests",
+            ));
+            rows.push(dlq_row(2, MAX_REPLAY_ATTEMPTS, "http 400 Bad Request"));
+            rows.push(dlq_row(3, 5, "http 429 Too Many Requests")); // not quarantined
+        }
+        let n = sink.reset_throttled_quarantine().await.expect("reset");
+        assert_eq!(n, 1, "only the quarantined 429 row is un-quarantined");
+        let rows = sink.rows.lock().unwrap();
+        let by_id = |id: i64| rows.iter().find(|r| r.id == id).unwrap().attempt_count;
+        assert_eq!(by_id(1), 0, "429-quarantined row reset to 0");
+        assert_eq!(
+            by_id(2),
+            MAX_REPLAY_ATTEMPTS,
+            "permanent-failure (400) row STAYS quarantined"
+        );
+        assert_eq!(by_id(3), 5, "below-ceiling 429 row untouched");
+    }
+
+    /// #1544 — a throttle records via note_dlq_throttled and must NOT go
+    /// through bump_dlq_attempt (which would burn a quarantine attempt).
+    #[tokio::test]
+    async fn throttle_notes_without_bumping_attempt_count() {
+        let sink = MockSink::default();
+        sink.rows
+            .lock()
+            .unwrap()
+            .push(dlq_row(1, 5, "previous error"));
+        sink.note_dlq_throttled(1, "http 429 Too Many Requests")
+            .await
+            .expect("note");
+        assert!(
+            sink.bumped.lock().unwrap().is_empty(),
+            "a throttle must NOT bump attempt_count"
+        );
+        assert_eq!(sink.throttled.lock().unwrap().len(), 1);
+        assert!(
+            sink.rows.lock().unwrap()[0].last_error.contains("429"),
+            "last_error refreshed to the throttle reason"
+        );
+    }
+
+    /// #1544 — the quarantine-cause classifier maps free-text last_error
+    /// onto a CLOSED label set (bounded Prometheus cardinality).
+    #[test]
+    fn classify_quarantine_cause_maps_to_closed_set() {
+        assert_eq!(
+            classify_quarantine_cause("http 429 Too Many Requests"),
+            "quota"
+        );
+        assert_eq!(
+            classify_quarantine_cause("http 400 Bad Request"),
+            "permanent"
+        );
+        assert_eq!(
+            classify_quarantine_cause("http 422 invalid signature"),
+            "permanent"
+        );
+        assert_eq!(
+            classify_quarantine_cause("http 401 Unauthorized"),
+            "unenrolled_peer"
+        );
+        assert_eq!(
+            classify_quarantine_cause("replay observed id_drift on peer ack"),
+            "id_drift"
+        );
+        assert_eq!(
+            classify_quarantine_cause("peer no longer in FederationConfig"),
+            "peer_removed"
+        );
+        assert_eq!(
+            classify_quarantine_cause("connection reset by peer"),
+            "other"
+        );
     }
 }

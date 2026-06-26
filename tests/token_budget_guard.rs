@@ -62,7 +62,19 @@ use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tok
 /// future field additions; partial compensation comes from D1.7
 /// (#988) when the trimmer's allow-list filtering of schemars
 /// metadata lands.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 17_000;
+///
+/// **v0.8.0 #1709 update.** The Pillar-1 coordination tools landed in
+/// waves: `memory_action_create`/`get` nudged the verbose total to ~17K
+/// (ceiling 17K->18K); the `memory_action_transition`/`list`/`add_edge`/
+/// `edges` DAG tools + the `memory_lease_acquire`/`renew`/`release`/`get`
+/// lease tools brought the 84-tool catalog to ~18.2K, so the ceiling is
+/// re-raised to 20K to restore ~1.8K headroom.
+///
+/// 2026-06-16 — re-raised 20K -> 22K for the v0.8.0 #1709 Pillar-1
+/// `memory_routine_*` tool family (create/freeze/run/status/list): the
+/// 98-tool catalog measures ~20.6K, so the ceiling moves to 22K to
+/// restore ~1.4K headroom.
+const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 22_000;
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///

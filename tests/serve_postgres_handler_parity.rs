@@ -582,6 +582,25 @@ async fn bucket_c_namespace_meta_propagation() {
         "get-standard must surface the persisted standard_id; got: {v}"
     );
 
+    // #1655 — the PATH-form GET /api/v1/namespaces/{ns}/standard must also
+    // return 200 (not 501) on postgres now that it delegates to the
+    // SAL-backed qs handler. Pre-#1655 this 501'd via the postgres gate.
+    let resp = client
+        .get(format!("{base}/api/v1/namespaces/{parent_ns}/standard"))
+        .send()
+        .await
+        .expect("path-form get-standard GET");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "path-form get-standard must return 200 (not 501) on postgres (#1655)"
+    );
+    let v: Value = resp.json().await.expect("path-form body");
+    assert!(
+        v["standard_id"].as_str() == Some(&standard_id) || v["id"].as_str() == Some(&standard_id),
+        "path-form get-standard must surface the persisted standard_id; got: {v}"
+    );
+
     shutdown.notify_one();
     let _ = handle.await;
 }

@@ -189,7 +189,17 @@ fn compute_visibility_prefixes(as_agent: Option<&str>) -> VisibilityPrefixes {
 /// visibility (the HNSW branch of `recall_hybrid` iterates memories loaded
 /// via `get()`). Returns `true` when `as_agent` is unset (no filter) or
 /// when the memory's scope + namespace grant visibility to the caller.
-fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
+///
+/// v0.8.0 #1720 A4 — the `Private` arm is now **owner-keyed**, not
+/// namespace-keyed. It delegates to the canonical
+/// [`crate::visibility::is_visible_to_caller`] (owner OR inbox-target)
+/// using `caller` (the agent's `metadata.agent_id`) rather than the
+/// pre-#1720 `&mem.namespace == ns` check, which leaked every private
+/// row in a namespace to any same-namespace caller. `caller` is
+/// DISTINCT from the `as_agent` namespace that drives the
+/// team/unit/org subtree arms (still namespace-keyed by design).
+/// Fail-closed: a `None` caller matches NO private rows.
+fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes, caller: Option<&str>) -> bool {
     // v0.7.0 multi-agent literal-sweep (scanner B finding F-B8.x):
     // typed-enum exhaustive match via `MemoryScope` + `META_KEY_SCOPE`
     // SSOT. Adding a new scope variant from here forward is a
@@ -212,7 +222,12 @@ fn is_visible(mem: &Memory, prefixes: &VisibilityPrefixes) -> bool {
     };
     match scope {
         MemoryScope::Collective => true,
-        MemoryScope::Private => p.as_ref().is_some_and(|ns| &mem.namespace == ns),
+        // v0.8.0 #1720 A4 — owner-keyed: visible iff the caller owns
+        // the row or is its inbox target. Fail-closed when `caller` is
+        // `None` (no identity → no private rows).
+        MemoryScope::Private => {
+            caller.is_some_and(|c| crate::visibility::is_visible_to_caller(mem, c))
+        }
         MemoryScope::Team => matches_subtree(&mem.namespace, t.as_deref()),
         MemoryScope::Unit => matches_subtree(&mem.namespace, u.as_deref()),
         MemoryScope::Org => matches_subtree(&mem.namespace, o.as_deref()),
@@ -327,7 +342,35 @@ fn is_archived_source(mem: &Memory) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
-fn visibility_clause(start: usize, table_alias: &str) -> String {
+/// v0.8.0 #1720 A2 — owner-keyed `scope=private` visibility.
+///
+/// Placeholder layout (explicit, not derived from `start`): the four
+/// namespace-prefix placeholders are `?start .. ?start+3`
+/// (private/team/unit/org — bind order matches
+/// [`compute_visibility_prefixes`]). The **caller** placeholder is
+/// passed explicitly as `caller_ph` so each call-site can choose a
+/// safe index (the visibility prefixes are not always the last
+/// placeholders in the host query — e.g. the `source_uri` filter binds
+/// after them on the recall/search/hybrid paths, so `caller_ph` is
+/// bound right after `?start+3` and the trailing filter renumbered up
+/// by one). `caller_ph` holds the resolved visibility caller (the
+/// agent's `metadata.agent_id`, e.g. `ai:bob`) — DISTINCT from the
+/// `as_agent` namespace that drives the team/unit/org subtree arms.
+///
+/// The private arm is **owner-keyed**: a private row is visible iff the
+/// caller owns it (`agent_id_idx = ?caller`) OR the caller is the inbox
+/// recipient (`target_agent_id_idx = ?caller`, the #1720 A1 generated
+/// column projecting `metadata.target_agent_id`). This mirrors the
+/// canonical [`crate::visibility::is_visible_to_caller`] predicate
+/// (owner OR inbox-target) rather than the pre-#1720 namespace-keyed
+/// `namespace = ?private_ph`, which leaked every private row in a
+/// namespace to any same-namespace caller.
+///
+/// Fail-closed: the `?caller_ph IS NOT NULL` guard means an
+/// unidentified caller (NULL — no stable env identity) matches NO
+/// private rows. The `?start IS NULL` sentinel (trust-all, no
+/// filtering) is unchanged.
+fn visibility_clause(start: usize, caller_ph: usize, table_alias: &str) -> String {
     let private_ph = start;
     let team_ph = start + 1;
     let unit_ph = start + 2;
@@ -337,7 +380,7 @@ fn visibility_clause(start: usize, table_alias: &str) -> String {
         "AND (\
             ?{private_ph} IS NULL \
             OR {ta}.scope_idx = 'collective' \
-            OR ({ta}.scope_idx = 'private' AND {ta}.namespace = ?{private_ph}) \
+            OR ({ta}.scope_idx = 'private' AND ?{caller_ph} IS NOT NULL AND ({ta}.agent_id_idx = ?{caller_ph} OR {ta}.target_agent_id_idx = ?{caller_ph})) \
             OR ({ta}.scope_idx = 'team' AND ?{team_ph} IS NOT NULL AND ({ta}.namespace = ?{team_ph} OR {ta}.namespace LIKE replace(replace(?{team_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
             OR ({ta}.scope_idx = 'unit' AND ?{unit_ph} IS NOT NULL AND ({ta}.namespace = ?{unit_ph} OR {ta}.namespace LIKE replace(replace(?{unit_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\')) \
             OR ({ta}.scope_idx = 'org'  AND ?{org_ph}  IS NOT NULL AND ({ta}.namespace = ?{org_ph}  OR {ta}.namespace LIKE replace(replace(?{org_ph}, '%', '\\%'), '_', '\\_') || '/%' ESCAPE '\\'))\
@@ -376,6 +419,10 @@ pub(crate) mod connection;
 // invoke `migrate_v34_backfill_chain` directly to exercise the
 // idempotent-replay property without going through a full daemon
 // boot cycle.
+// #1720 B3 — boot owner-lockout probe (read-only COUNT over the indexed
+// visibility generated columns). Lives in its own submodule to keep this
+// already-large module under the qual_10 size ceiling.
+pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
 pub(crate) mod reflect;
@@ -384,6 +431,8 @@ pub(crate) mod reflect;
 // is re-published at `crate::storage::*` (and therefore `crate::db::*`
 // via the lib.rs shim) so callsites keep resolving without churn.
 pub use connection::open;
+// #1580 — read-only connection opener for the HTTP WAL read-pool.
+pub use connection::open_read_only;
 // #1579 B7 — mmap_size knob. `set_db_mmap_size` is the boot-time
 // seeding hook (`daemon_runtime::run`); the DEFAULT const is the
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
@@ -394,6 +443,7 @@ pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
 // `ai_memory::storage::current_schema_version_for_tests()` or the
 // existing `ai_memory::db::current_schema_version_for_tests()` shim
 // (via `pub use storage as db;` in `src/lib.rs`).
+pub use lockout::count_private_rows_hidden_from;
 pub use migrations::current_schema_version_for_tests;
 // Pre-migration safety-snapshot infix accessor — lets coverage tests
 // locate / name-assert the snapshot file without restamping the literal.
@@ -487,7 +537,7 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
                 }
             },
         );
-    Ok(Memory {
+    let mut memory = Memory {
         id: row_id,
         tier,
         namespace: row.get("namespace")?,
@@ -554,7 +604,52 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
         // value a pre-v45 row would land at the moment the ALTER
         // fires in the migrate ladder).
         version: row.get::<_, i64>("version").unwrap_or(1),
-    })
+        // v0.8.0 Pillar 2 (#1709) — schema v64 column. Falls back to
+        // `Open` on pre-v64 rows (column absent) and on any unrecognised
+        // value from a future schema (forward-compat), matching the SQL
+        // `DEFAULT 'open'`.
+        lifecycle_state: row
+            .get::<_, String>(field_names::LIFECYCLE_STATE)
+            .ok()
+            .and_then(|s| crate::models::LifecycleState::from_str(&s))
+            .unwrap_or_default(),
+    };
+
+    // #228 Commit B — at-rest content decryption. The decrypt branch is
+    // gated on envelope PRESENCE (a non-NULL `encrypted_envelope`), NOT on
+    // `encryption_enabled`, so rows written while encryption was on remain
+    // readable after the flag is toggled off. When the column is NULL
+    // (every legacy row + every row written under encryption-off) this is
+    // a no-op — `memory.content` keeps the plaintext read above, so the
+    // default path stays byte-identical. `.unwrap_or(None)` tolerates the
+    // column being absent on a pre-v44 backup (the migrate ladder may not
+    // have reached this DB yet); an absent column reads as NULL.
+    let enc: Option<Vec<u8>> = row
+        .get::<_, Option<Vec<u8>>>(field_names::ENCRYPTED_ENVELOPE)
+        .unwrap_or(None);
+    if let Some(bytes) = enc {
+        let agent_id = memory
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match crate::encryption::open_content(&bytes, agent_id) {
+            Ok(plaintext) => memory.content = plaintext,
+            Err(e) => {
+                // FAIL-CLOSED: a row with a non-NULL envelope MUST decrypt
+                // or the read errors. Never return the empty placeholder as
+                // if it were the plaintext content — that would silently
+                // surface an empty memory and mask key loss / corruption.
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Blob,
+                    Box::new(std::io::Error::other(format!("decrypt failed: {e}"))),
+                ));
+            }
+        }
+    }
+
+    Ok(memory)
 }
 
 /// v0.7.0 polish PERF-8 (issue #781) — extract the canonical
@@ -629,7 +724,25 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     consult_governance_pre_write(mem)?;
 
     let tags_json = serde_json::to_string(&mem.tags)?;
-    let metadata_json = serde_json::to_string(&mem.metadata)?;
+    // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
+    // component of the per-memory vector clock. `db::insert` is the
+    // LOCAL-authorship sqlite chokepoint (SAL `store()` + MCP
+    // `handle_store` + CLI all land here); the federation RECEIVE writes
+    // use the separate `insert_if_newer` / `overwrite_full_row_by_id`, so
+    // a remote-applied row never falsely bumps this node. Stamp a cloned
+    // metadata so the in-memory `mem` is untouched; the ON CONFLICT arm
+    // updates `metadata = excluded.metadata`, so a re-store persists the
+    // advanced clock too.
+    let stamped_metadata = {
+        let mut m = mem.metadata.clone();
+        crate::models::stamp_version_vector(
+            &mut m,
+            crate::federation::identity::resolver::local_node_identity(),
+            &mem.updated_at,
+        );
+        m
+    };
+    let metadata_json = serde_json::to_string(&stamped_metadata)?;
     // v0.7.0 Form 4 — encode citations/source_span to JSON for the
     // schema v38 TEXT columns. citations always lands as a JSON array
     // (default `[]` when caller supplied nothing); source_span lands as
@@ -653,15 +766,38 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // `[entity:X]` title-marker fallback) on reflection rows. See
     // `extract_mentioned_entity_id` for the resolution order.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #228 Commit B — at-rest content encryption. When enabled, seal the
+    // plaintext content to the per-agent X25519 key; the `content` column
+    // then carries the empty placeholder and the ciphertext envelope lands
+    // in `encrypted_envelope`. When disabled (default) `sealed` is None and
+    // the content column holds the plaintext verbatim with a NULL envelope
+    // — byte-identical to pre-wiring behaviour. agent_id is the NHI
+    // provenance marker from metadata (fail-closed under an enabled gate
+    // when absent). Content-only: title / tags / metadata stay plaintext.
+    let agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+    let content_to_store = sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = excluded.content,
+            -- #228 Commit B — content + envelope move together on upsert so
+            -- a re-store under encryption replaces both the placeholder and
+            -- the ciphertext (and a re-store under encryption-off writes the
+            -- plaintext + NULL envelope, clearing any stale ciphertext).
+            encrypted_envelope = excluded.encrypted_envelope,
             tags = excluded.tags,
             priority = MAX(memories.priority, excluded.priority),
             confidence = MAX(memories.confidence, excluded.confidence),
@@ -673,16 +809,21 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             updated_at = excluded.updated_at,
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
                               ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            -- Preserve metadata.agent_id across upsert (NHI provenance is immutable).
-            metadata = CASE
-                WHEN json_extract(memories.metadata, '$.agent_id') IS NOT NULL
-                THEN json_set(
-                    excluded.metadata,
-                    '$.agent_id',
-                    json_extract(memories.metadata, '$.agent_id')
+            -- #1784 — preserve immutable provenance keys (agent_id + the
+            -- consolidation derived_from / consolidated_from_agents arrays)
+            -- across upsert. json_patch overlays the existing row's
+            -- provenance object on top of excluded (existing-wins) and
+            -- preserves nested array values that the prior agent_id-only
+            -- json_set handled but the array keys would have double-encoded.
+            metadata = json_patch(
+                excluded.metadata,
+                COALESCE(
+                    (SELECT json_group_object(key, value)
+                     FROM json_each(memories.metadata)
+                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                    '{}'
                 )
-                ELSE excluded.metadata
-            END,
+            ),
             -- v0.7.0 Task 1/8 — recursion depth takes the max across upsert
             -- so a subsequent reflection at higher depth doesn't lose its
             -- provenance signal when re-stored at the same (title, namespace).
@@ -730,6 +871,13 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- blank out the indexed column) while letting a fresh
             -- extraction populate previously-NULL rows.
             mentioned_entity_id = COALESCE(excluded.mentioned_entity_id, memories.mentioned_entity_id),
+            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state is preserved across
+            -- a plain re-store: the stored value wins so a re-store of an
+            -- already-`active`/`done` row does NOT reset it to the incoming
+            -- (typically `open`) initial state. Lifecycle ADVANCES go
+            -- through the typed `memory_update` transition gate, never a
+            -- silent upsert.
+            lifecycle_state = memories.lifecycle_state,
             -- #1632 — upsert-merge IS a mutation (content/tags/priority
             -- can change), so the Gap-1 optimistic-concurrency counter
             -- bumps here exactly like db::update. Pre-#1632 a re-store
@@ -746,7 +894,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.tier.as_str(),
             mem.namespace,
             mem.title,
-            mem.content,
+            content_to_store,
             tags_json,
             mem.priority,
             mem.confidence,
@@ -768,6 +916,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             confidence_signals_json,
             mem.confidence_decayed_at,
             mentioned_entity_id,
+            mem.lifecycle_state.as_str(),
+            encrypted_envelope,
         ],
         |r| r.get(0),
     )?;
@@ -940,6 +1090,111 @@ pub fn capture_turn_idempotent(
     }
 }
 
+/// #1693 — L2 transcript-recovery idempotent write (sqlite SSOT). The L2
+/// sibling of [`capture_turn_idempotent`]: dedup-probe → `BEGIN IMMEDIATE`
+/// → insert memory + `transcript_line_dedup` row → `COMMIT`. Differs from
+/// the L4 path in two ways: L2 is an unsigned backstop so it appends NO
+/// `signed_events` audit row, and it dedups on a DUAL key — the canonical
+/// `(host_session_id, host_turn_index)` when the host format provides both
+/// (bridging to L4 capture rows for the same turn), OR the content sha
+/// (normalized + raw-line, so a host re-serialization can't re-recover an
+/// already-captured turn). Reached directly by the sync recover path and via
+/// `SqliteStore::recover_turn_idempotent` through the SAL trait (#1693 gives
+/// postgres-backed daemons a callable L2 surface).
+///
+/// # Errors
+///
+/// Returns a stringified failure label (`DEDUP_QUERY_FAILED` /
+/// `TX_BEGIN_FAILED` / `MEMORY_INSERT_FAILED` / `DEDUP_INSERT_FAILED` /
+/// `TX_COMMIT_FAILED`); the transaction rolls back so an orphaned memory can
+/// never exist without its dedup row.
+pub fn recover_turn_idempotent(
+    conn: &Connection,
+    write: &crate::models::RecoverTurnWrite,
+) -> std::result::Result<crate::models::RecoverTurnResult, String> {
+    use rusqlite::OptionalExtension;
+
+    // Dedup probe 1 — canonical (host_session_id, host_turn_index), when the
+    // host format provides both (also bridges to L4 `capture_turn` rows).
+    if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
+        let hit: Option<String> = conn
+            .prepare_cached(
+                "SELECT memory_id FROM transcript_line_dedup \
+                 WHERE host_session_id = ?1 AND host_turn_index = ?2",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_row(params![sid, tix], |row| row.get(0))
+                    .optional()
+            })
+            .map_err(|e| format!("DEDUP_SIDTIX_QUERY_FAILED: {e}"))?;
+        if let Some(memory_id) = hit {
+            return Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+    }
+    // Dedup probe 2 — content sha (normalized this version writes + raw-line
+    // pre-#1573 recoveries wrote).
+    let sha_hit: Option<String> = conn
+        .prepare_cached("SELECT memory_id FROM transcript_line_dedup WHERE sha256 IN (?1, ?2)")
+        .and_then(|mut stmt| {
+            stmt.query_row(params![write.normalized_sha256, write.raw_sha256], |row| {
+                row.get(0)
+            })
+            .optional()
+        })
+        .map_err(|e| format!("DEDUP_SHA_QUERY_FAILED: {e}"))?;
+    if let Some(memory_id) = sha_hit {
+        return Ok(crate::models::RecoverTurnResult {
+            memory_id,
+            dedup_hit: true,
+        });
+    }
+
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
+        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
+
+    let tx_result = (|| -> std::result::Result<String, String> {
+        let inserted_id =
+            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+        conn.prepare_cached(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .and_then(|mut stmt| {
+            stmt.execute(params![
+                write.normalized_sha256,
+                inserted_id,
+                write.host_kind,
+                write.transcript_path,
+                write.host_session_id,
+                write.host_turn_index,
+                write.recovered_at_ms,
+            ])
+        })
+        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
+        Ok(inserted_id)
+    })();
+
+    match tx_result {
+        Ok(memory_id) => {
+            conn.execute_batch(connection::SQL_COMMIT)
+                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
+            Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: false,
+            })
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
 /// v0.7.0 fix campaign R1-M3 (#690) — insert a memory under an
 /// explicit [`ConflictMode`].
 ///
@@ -1019,6 +1274,21 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // first-write happy path; otherwise the auto-persona matcher
             // would miss every reflection minted via reflect.
             let mentioned_entity_id = extract_mentioned_entity_id(mem);
+            // #228 Commit B — at-rest content encryption on the
+            // ConflictMode::Error first-write path (used by db::reflect).
+            // Mirrors `insert`: seal content to the per-agent key when
+            // enabled, store the placeholder + envelope; None (default)
+            // stores plaintext verbatim with a NULL envelope.
+            let agent_id = mem
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+            let content_to_store = sealed
+                .as_ref()
+                .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+            let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
             // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
             // This INSERT path was added by the fix-campaign R1-M3
             // (ConflictMode::Error refuses duplicates) and originally
@@ -1029,18 +1299,18 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
                  RETURNING id",
                 params![
-                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, mem.content,
+                    mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
                     tags_json, mem.priority, mem.confidence, mem.source, mem.access_count,
                     mem.created_at, mem.updated_at, mem.last_accessed_at, mem.effective_expires_at(),
                     metadata_json, mem.reflection_depth, mem.memory_kind.as_str(),
                     mem.entity_id, mem.persona_version,
                     citations_json, mem.source_uri, source_span_json,
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
-                    mentioned_entity_id,
+                    mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -1134,10 +1404,14 @@ pub fn get_by_prefix(conn: &Connection, prefix: &str) -> Result<Option<Memory>> 
     let escaped = prefix.replace('%', "\\%").replace('_', "\\_");
     let pattern = format!("{escaped}%");
     let mut stmt = conn.prepare("SELECT * FROM memories WHERE id LIKE ?1 ESCAPE '\\'")?;
+    // #228 Commit B — collect with `?` (not `.filter_map(Result::ok)`) so a
+    // row whose `encrypted_envelope` fails to decrypt surfaces the
+    // fail-closed FromSqlConversionFailure from `row_to_memory` instead of
+    // being silently dropped from the match set (which would mask key loss
+    // / corruption AND could flip an ambiguous prefix to a false single hit).
     let rows: Vec<Memory> = stmt
         .query_map(params![pattern], row_to_memory)?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     match rows.len() {
         0 => Ok(None),
         1 => Ok(Some(rows.into_iter().next().expect("len checked"))),
@@ -1252,6 +1526,22 @@ pub fn touch_many(
     if ids.is_empty() {
         return Ok(0);
     }
+    // #1580 — the WAL read-pool opens its connections with
+    // `PRAGMA query_only = ON`. `touch_many` is best-effort access
+    // bookkeeping (access_count bump / TTL extend / promotion), so on a
+    // read-only pool connection it no-ops: the read path stays
+    // write-free and the *authoritative* touch runs afterwards on the
+    // writer connection (see `handlers::recall`). Without this guard the
+    // recall SELECT, when dispatched through the read-pool, would hit a
+    // guaranteed `BEGIN IMMEDIATE` failure + a WARN on every request.
+    // The pragma read is one cheap round-trip; on the writer connection
+    // `query_only` is `0` and the touch proceeds normally.
+    let query_only: i64 = conn
+        .query_row("PRAGMA query_only", [], |r| r.get(0))
+        .unwrap_or(0);
+    if query_only != 0 {
+        return Ok(0);
+    }
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let short_expires = (now + chrono::Duration::seconds(short_extend)).to_rfc3339();
@@ -1336,6 +1626,90 @@ impl std::fmt::Display for VersionConflict {
 }
 
 impl std::error::Error for VersionConflict {}
+
+/// v0.8.0 Pillar 2 (#1726) — typed error returned when a lifecycle-state
+/// transition is illegal per
+/// [`crate::models::LifecycleState::can_transition_to`] (e.g. `open → done`
+/// skipping `active`, any move out of a terminal state, or a self-loop).
+/// Carries `from`/`to` for a useful diagnostic; surfaced as HTTP 409
+/// Conflict, mirroring [`VersionConflict`].
+#[derive(Debug, Clone)]
+pub struct InvalidTransition {
+    pub id: String,
+    pub from: crate::models::LifecycleState,
+    pub to: crate::models::LifecycleState,
+}
+
+impl std::fmt::Display for InvalidTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CONFLICT: illegal lifecycle transition for memory {}: {} -> {} is not permitted",
+            self.id, self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for InvalidTransition {}
+
+/// v0.8.0 Pillar 2 (#1709 / #1726) — persist a lifecycle-state transition
+/// on a single memory, ENFORCING the transition machine
+/// ([`crate::models::LifecycleState::can_transition_to`]). The current
+/// state is read and an illegal edge (`open → done`, a move out of a
+/// terminal state, a self-loop) is rejected with a typed
+/// [`InvalidTransition`] BEFORE any write — #1726 wired this gate, which
+/// the v64 column previously left inert. Bumps the Gap-1 `version` counter
+/// because a lifecycle advance IS a mutation observable to
+/// optimistic-concurrency callers.
+///
+/// Returns `true` when a row was updated, `false` when `id` did not match
+/// a live row (no transition to validate).
+///
+/// # Errors
+///
+/// * [`InvalidTransition`] — the `current → state` edge is not permitted.
+/// * Propagates rusqlite errors from the SELECT / UPDATE.
+pub fn set_lifecycle_state(
+    conn: &Connection,
+    id: &str,
+    state: crate::models::LifecycleState,
+) -> Result<bool> {
+    // #1726 — read the current state and validate the edge before writing.
+    use rusqlite::OptionalExtension;
+    let current: Option<String> = conn
+        .query_row(
+            "SELECT lifecycle_state FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(current_str) = current else {
+        return Ok(false);
+    };
+    let from = crate::models::LifecycleState::from_str(&current_str).unwrap_or_default();
+    // A no-op (requested == current) is idempotent success, not a self-loop
+    // error — mirrors the `memory_update` handler contract ("a request equal
+    // to the stored state is a no-op, no error"). Lets the patch / HTTP
+    // callers pass the current state through without a pre-check.
+    if from == state {
+        return Ok(true);
+    }
+    if !from.can_transition_to(state) {
+        return Err(InvalidTransition {
+            id: id.to_string(),
+            from,
+            to: state,
+        }
+        .into());
+    }
+    let now = Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+         WHERE id = ?3",
+        params![state.as_str(), now, id],
+    )?;
+    Ok(n > 0)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn update(
@@ -1464,6 +1838,28 @@ pub fn update_with_expected_version(
     let metadata_json = serde_json::to_string(metadata)?;
     let now = Utc::now().to_rfc3339();
 
+    // #228 Commit B — at-rest content encryption on the in-place update
+    // path. Seal the effective NEW content (post-merge) to the per-agent
+    // key when enabled; the `content` column then holds the placeholder
+    // and `encrypted_envelope` the ciphertext. When disabled (default),
+    // `sealed` is None so we write the plaintext verbatim and set the
+    // envelope to NULL (clearing any stale ciphertext under encryption-off
+    // — byte-identical to the pre-wiring path where the column was always
+    // NULL). agent_id is the resolved metadata NHI marker (the patch's
+    // metadata if supplied, else the existing row's), matching the seal
+    // key that `insert` used for this row. Both columns are SET together
+    // so content + envelope can never desynchronize.
+    let update_agent_id = metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let update_sealed = crate::encryption::seal_content(new_content, update_agent_id)?;
+    let update_content_to_store = update_sealed
+        .as_ref()
+        .map_or(new_content, |(_, ph)| ph.as_str());
+    let update_encrypted_envelope: Option<&[u8]> =
+        update_sealed.as_ref().map(|(env, _)| env.as_slice());
+
     // Ultrareview #354: rely on the UNIQUE INDEX on (title, namespace)
     // to enforce collision atomically at the DB layer. The previous
     // check-then-update sequence had a race — another transaction
@@ -1485,59 +1881,107 @@ pub fn update_with_expected_version(
     // patch that doesn't touch source_uri must NOT blank it out).
     // When `Some(uri)`, the row's source_uri is rewritten verbatim
     // (rename / scheme migration / bad-data correction).
-    let update_res = conn.execute(
-        "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), version = version + 1
-         WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-        params![effective_tier.as_str(), namespace, new_title, new_content, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version],
-    );
-    match update_res {
-        Ok(0) => {
-            // Either the row vanished between SELECT and UPDATE, or
-            // the version drifted (racing writer slipped in). When
-            // expected_version was supplied, re-read so the CONFLICT
-            // envelope carries the current stored value.
-            if let Some(expected) = expected_version {
-                let current_version: Option<i64> = conn
+    // #1725 (v0.8.0) — lossless default update path. The
+    // archive-of-prior-content + the in-place UPDATE must run atomically
+    // so a mid-failure — or a version-conflict UPDATE that matches 0 rows
+    // — rolls BOTH back, leaving the OLD content live (no orphan archive
+    // row). The prior content is snapshotted BEFORE the UPDATE overwrites
+    // it, under `archive_reason='in_place_edit'` with the SAME memory_id,
+    // and ONLY when title/content actually changed (metadata / tag /
+    // priority patches don't touch content, so they don't archive).
+    //
+    // Transaction-aware: some callers already hold an open transaction —
+    // the synthesis merge path (`src/mcp/tools/store/synthesis.rs`) wraps
+    // candidate updates + provenance rows in ONE `BEGIN IMMEDIATE`. A
+    // nested `BEGIN` there fails with "cannot start a transaction within a
+    // transaction", so we open our own tx ONLY when none is active
+    // (`is_autocommit()` is true only outside a transaction); when the
+    // caller owns the tx, the archive + UPDATE run inside it and the
+    // caller's commit/rollback covers atomicity.
+    let owns_tx = conn.is_autocommit();
+    if owns_tx {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    }
+    let txn_result = (|| -> Result<(bool, bool)> {
+        if content_changed {
+            archive_memory_insert_only(
+                conn,
+                id,
+                crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT,
+            )?;
+        }
+        let update_res = conn.execute(
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
+             WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope],
+        );
+        match update_res {
+            Ok(0) => {
+                // Either the row vanished between SELECT and UPDATE, or
+                // the version drifted (racing writer slipped in). When
+                // expected_version was supplied, re-read so the CONFLICT
+                // envelope carries the current stored value. Returning an
+                // Err here rolls the tx back, reverting the archive so a
+                // version-conflict snapshots nothing.
+                if let Some(expected) = expected_version {
+                    let current_version: Option<i64> = conn
+                        .query_row(
+                            "SELECT version FROM memories WHERE id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    if let Some(current) = current_version {
+                        return Err(VersionConflict {
+                            id: id.to_string(),
+                            expected,
+                            current,
+                        }
+                        .into());
+                    }
+                }
+                Ok((false, false))
+            }
+            Ok(_) => Ok((true, content_changed)),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                let other: Option<String> = conn
                     .query_row(
-                        "SELECT version FROM memories WHERE id = ?1",
-                        params![id],
+                        "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
+                        params![new_title, namespace, id],
                         |r| r.get(0),
                     )
                     .ok();
-                if let Some(current) = current_version {
-                    return Err(VersionConflict {
-                        id: id.to_string(),
-                        expected,
-                        current,
-                    }
-                    .into());
+                if let Some(other_id) = other {
+                    // #962 typed envelope — UniqueConflict surfaces as
+                    // `MemoryError::Conflict` (HTTP 409).
+                    return Err(anyhow::Error::new(StorageError::UniqueConflict {
+                        reason: format!(
+                            "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
+                        ),
+                    }));
                 }
+                Err(anyhow::anyhow!("update failed with constraint violation"))
             }
-            Ok((false, false))
+            Err(e) => Err(e.into()),
         }
-        Ok(_) => Ok((true, content_changed)),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.code == rusqlite::ErrorCode::ConstraintViolation =>
-        {
-            let other: Option<String> = conn
-                .query_row(
-                    "SELECT id FROM memories WHERE title = ?1 AND namespace = ?2 AND id != ?3",
-                    params![new_title, namespace, id],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(other_id) = other {
-                // #962 typed envelope — UniqueConflict surfaces as
-                // `MemoryError::Conflict` (HTTP 409).
-                return Err(anyhow::Error::new(StorageError::UniqueConflict {
-                    reason: format!(
-                        "title '{new_title}' already exists in namespace '{namespace}' (memory {other_id})"
-                    ),
-                }));
+    })();
+    match txn_result {
+        Ok(r) => {
+            if owns_tx {
+                conn.execute_batch(connection::SQL_COMMIT)?;
             }
-            Err(anyhow::anyhow!("update failed with constraint violation"))
+            Ok(r)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => {
+            // Only roll back a tx we opened. When the caller owns the tx,
+            // propagating the Err lets THEIR rollback revert the archive.
+            if owns_tx {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            }
+            Err(e)
+        }
     }
 }
 
@@ -1803,6 +2247,72 @@ pub fn archive_memory(conn: &Connection, id: &str, reason: Option<&str>) -> Resu
     }
 }
 
+/// #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — snapshot a memory's
+/// `memory_links` edges into `archived_memory_links` BEFORE the memory
+/// row is deleted, so [`restore_archived`] can re-insert them.
+///
+/// archive-then-delete copies only the memory ROW into
+/// `archived_memories`; the same-tx cascade `DELETE FROM memories` reaps
+/// the row's `memory_links` (FK `ON DELETE CASCADE`). Without this
+/// snapshot a restored memory comes back with an EMPTY edge graph. Every
+/// edge where the memory is either endpoint (`source_id = id OR
+/// target_id = id`) is copied; `INSERT OR IGNORE` keeps the snapshot
+/// idempotent against a prior snapshot of the same edge (the archive
+/// PK is `(source_id, target_id, relation)`, same as `memory_links`).
+///
+/// Callers MUST already hold an open transaction — this is called WITHIN
+/// the same `BEGIN IMMEDIATE` as the subsequent `DELETE`, so the snapshot
+/// and the delete pin to the identical row set. Returns the number of
+/// rows snapshotted.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+pub fn archive_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
+    let now = Utc::now().to_rfc3339();
+    let snapshotted = conn.execute(
+        "INSERT OR IGNORE INTO archived_memory_links
+             (source_id, target_id, relation, created_at, valid_from, valid_until,
+              observed_by, signature, attest_level, archived_at)
+         SELECT source_id, target_id, relation, created_at, valid_from, valid_until,
+                observed_by, signature, attest_level, ?2
+         FROM memory_links WHERE source_id = ?1 OR target_id = ?1",
+        params![id, now],
+    )?;
+    Ok(snapshotted)
+}
+
+/// #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — re-insert a restored memory's
+/// preserved `archived_memory_links` edges back into `memory_links`.
+///
+/// Called from [`restore_archived`] / [`restore_archived_for_caller`]
+/// AFTER the memory row is re-inserted, still inside the restore tx. Only
+/// edges whose BOTH endpoints currently exist in `memories` are restored —
+/// `memory_links` carries an `ON DELETE CASCADE` FK on both endpoints, so
+/// an edge whose OTHER endpoint is permanently gone would be rejected (and
+/// is correctly skipped here). Idempotent via `INSERT OR IGNORE`. Returns
+/// the number of edges re-inserted.
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+fn restore_links_for_memory(conn: &Connection, id: &str) -> Result<usize> {
+    let restored = conn.execute(
+        "INSERT OR IGNORE INTO memory_links
+             (source_id, target_id, relation, created_at, valid_from, valid_until,
+              observed_by, signature, attest_level)
+         SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                aml.valid_from, aml.valid_until, aml.observed_by, aml.signature,
+                aml.attest_level
+         FROM archived_memory_links aml
+         WHERE (aml.source_id = ?1 OR aml.target_id = ?1)
+           AND EXISTS (SELECT 1 FROM memories WHERE id = aml.source_id)
+           AND EXISTS (SELECT 1 FROM memories WHERE id = aml.target_id)",
+        params![id],
+    )?;
+    Ok(restored)
+}
+
 /// #1638 — transaction-free core of [`archive_memory`], for callers
 /// that already hold an open transaction (the supersede path wraps
 /// archive + insert in ONE `BEGIN IMMEDIATE` so a mid-failure leaves
@@ -1834,7 +2344,7 @@ pub(crate) fn archive_memory_no_tx(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -1842,10 +2352,13 @@ pub(crate) fn archive_memory_no_tx(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
+        // #1771 — snapshot the row's memory_links BEFORE the cascade DELETE
+        // reaps them, so restore_archived can re-insert the edge graph.
+        archive_links_for_memory(conn, id)?;
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
         conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
@@ -1853,6 +2366,340 @@ pub(crate) fn archive_memory_no_tx(
         Ok(removed > 0)
     })();
     result
+}
+
+/// #1725 (v0.8.0) — INSERT-only archive of a STILL-LIVE row. Unlike
+/// [`archive_memory_no_tx`] this does NOT delete the live row or its
+/// `namespace_meta` standard: it snapshots the row's CURRENT content
+/// into `archived_memories` while the row keeps living in `memories`.
+/// Used by the default in-place update path
+/// ([`update_with_expected_version`]) to make a content edit lossless —
+/// the prior content is captured BEFORE the in-place `UPDATE` overwrites
+/// it, under `archive_reason='in_place_edit'`, with the SAME memory_id
+/// (no fork — distinct from the #888 supersede path).
+///
+/// Single-snapshot retention: `INSERT OR REPLACE` keeps the
+/// MOST-RECENT pre-edit snapshot (the "immediately-prior content"). A
+/// second edit replaces the first snapshot — by design (#1725 archives
+/// the immediately-prior content, not a per-edit history; full lineage
+/// is the #888 supersede fork). The only same-id archive row a live,
+/// in-place-editable row can collide with is a PRIOR `in_place_edit`
+/// snapshot: supersede forks a new id + deletes the old live row, GC
+/// deletes the live row, and restore removes the archive row on
+/// success — so this `REPLACE` never clobbers a different
+/// `archive_reason`'s record. Callers MUST already hold a transaction
+/// (the caller wraps archive + UPDATE in one `BEGIN IMMEDIATE` so a
+/// mid-failure rolls both back, leaving the OLD content live).
+///
+/// # Errors
+///
+/// Returns an error if the INSERT-SELECT fails.
+pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    // Mirrors the INSERT-SELECT column carry in `archive_memory_no_tx`
+    // (#1025 full v0.7.0 shape: embedding + original_tier/expires_at +
+    // the Form-4/5/6 provenance columns) so an in_place_edit snapshot
+    // round-trips to the same shape an archive/restore would.
+    conn.execute(
+        "INSERT OR REPLACE INTO archived_memories
+         (id, tier, namespace, title, content, tags, priority, confidence,
+          source, access_count, created_at, updated_at, last_accessed_at,
+          expires_at, archived_at, archive_reason, metadata,
+          embedding, embedding_dim, original_tier, original_expires_at,
+          reflection_depth, atomised_into, atom_of, memory_kind,
+          entity_id, persona_version, citations, source_uri, source_span,
+          confidence_source, confidence_signals, confidence_decayed_at,
+          mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+         SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, ?1, ?2, metadata,
+                embedding, embedding_dim, tier, expires_at,
+                reflection_depth, atomised_into, atom_of, memory_kind,
+                entity_id, persona_version, citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+         FROM memories WHERE id = ?3",
+        params![now, reason, id],
+    )?;
+    Ok(())
+}
+
+/// #1727 (v0.8.0) — read a column's `metadata.agent_id` from a single
+/// row, returning the empty string when the row has no `agent_id` key
+/// (legacy / unowned rows). `table` is a trusted internal literal
+/// (`memories` | `archived_memories`), never caller input.
+///
+/// `sal`-gated: only the [`undo_in_place_edit`] free fn consumes it, and
+/// that fn returns a `crate::store` type (the `store` module is itself
+/// `#[cfg(feature = "sal")]`).
+#[cfg(feature = "sal")]
+fn read_owner_agent_id(conn: &Connection, table: &str, id: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    // `table` is an internal trusted literal, so the format! is not an
+    // injection surface; rusqlite cannot bind an identifier.
+    let sql = format!("SELECT metadata FROM {table} WHERE id = ?1");
+    let meta: Option<String> = conn.query_row(&sql, params![id], |r| r.get(0)).optional()?;
+    Ok(meta.map(|m| {
+        serde_json::from_str::<serde_json::Value>(&m)
+            .ok()
+            .as_ref()
+            .and_then(|v| v.get("agent_id"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }))
+}
+
+/// #1727 (v0.8.0) — the restorable fields read off an `in_place_edit`
+/// archive snapshot for re-application to the live row.
+#[cfg(feature = "sal")]
+struct UndoSnapshot {
+    title: String,
+    /// Decrypted plaintext content (so the in-place update path re-seals
+    /// it correctly under encryption-at-rest; verbatim when unencrypted).
+    content: String,
+    tier: String,
+    namespace: String,
+    tags: Vec<String>,
+    priority: i32,
+    confidence: f64,
+    expires_at: Option<String>,
+    metadata: serde_json::Value,
+    source_uri: Option<String>,
+}
+
+/// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit (the sqlite
+/// reference implementation behind
+/// [`crate::store::MemoryStore::undo_in_place_edit`]).
+///
+/// When a memory was edited in place, #1725 snapshotted the PRIOR row
+/// into `archived_memories` under `archive_reason='in_place_edit'` with
+/// the SAME id (single slot). This reads that snapshot and re-applies its
+/// restorable fields to the live row through the EXISTING
+/// [`update_with_expected_version`] path. There is DELIBERATELY no raw
+/// `DELETE` of the live row — a delete would cascade-reap the 15
+/// `ON DELETE CASCADE` children (links / observations / confidence). The
+/// apply itself auto-snapshots the CURRENT content as a fresh
+/// `in_place_edit`, so undo is reversible (a second call is a redo).
+///
+/// `caller` is the dual-ownership principal: when `Some`, BOTH the live
+/// row's `metadata.agent_id` AND the snapshot's `metadata.agent_id` must
+/// strict-equal it, else [`StorageError::LinkPermissionDenied`]. When
+/// `None` (admin / operator bypass) the gate is skipped.
+///
+/// `dry_run` returns the before/after diff with `applied=false` and
+/// writes NOTHING. With no `in_place_edit` snapshot the returned
+/// [`crate::store::UndoOutcome`] has `applied=false` and before == after.
+///
+/// **No `lifecycle_state` restore.** The snapshot's `lifecycle_state` is
+/// DELIBERATELY not re-applied: the [`update_with_expected_version`] path
+/// does not set `lifecycle_state`, and lifecycle transitions are
+/// separately governed by
+/// [`crate::models::LifecycleState::can_transition_to`] (#1726) — forcing
+/// one backward could violate the state machine.
+///
+/// # Errors
+///
+/// * [`StorageError::MemoryNotFound`] — no live memory matches `id`.
+/// * [`StorageError::LinkPermissionDenied`] — the dual-ownership gate
+///   rejected a non-bypass caller.
+/// * Other rusqlite / encryption errors bubble up.
+///
+/// `sal`-gated: returns a `crate::store::UndoOutcome` and the `store`
+/// module is itself `#[cfg(feature = "sal")]`.
+#[cfg(feature = "sal")]
+pub fn undo_in_place_edit(
+    conn: &Connection,
+    id: &str,
+    caller: Option<&str>,
+    dry_run: bool,
+) -> Result<crate::store::UndoOutcome> {
+    use rusqlite::OptionalExtension;
+    // (a) Load the live row (fail-closed NotFound when absent). Decrypts
+    // content via row_to_memory's #228 branch when encryption is on.
+    let live = {
+        let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
+        let mut rows = stmt.query_map(params![id], row_to_memory)?;
+        match rows.next() {
+            Some(Ok(m)) => m,
+            _ => {
+                return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+                    id: id.to_string(),
+                    role: None,
+                }));
+            }
+        }
+    };
+
+    // (b) Read the in_place_edit snapshot for this id, if any. The
+    // restorable content is decrypted the same way the live read is so
+    // the re-apply hands plaintext to `update_with_expected_version`
+    // (which re-seals under encryption-on).
+    let snapshot: Option<UndoSnapshot> = conn
+        .query_row(
+            "SELECT title, content, tier, namespace, tags, priority, confidence,
+                    expires_at, metadata, source_uri, encrypted_envelope
+             FROM archived_memories
+             WHERE id = ?1 AND archive_reason = ?2",
+            params![id, field_names::ARCHIVE_REASON_IN_PLACE_EDIT],
+            |r| {
+                let tags_json: String = r.get(4)?;
+                let metadata_json: String =
+                    r.get::<_, String>(8).unwrap_or_else(|_| "{}".to_string());
+                let raw_content: String = r.get(1)?;
+                let envelope: Option<Vec<u8>> = r.get::<_, Option<Vec<u8>>>(10).unwrap_or(None);
+                let content =
+                    match resolve_embeddable_content(id, raw_content, envelope, &metadata_json) {
+                        Some(c) => c,
+                        None => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Blob,
+                                Box::new(std::io::Error::other(
+                                    "undo: in_place_edit snapshot envelope failed to decrypt",
+                                )),
+                            ));
+                        }
+                    };
+                Ok(UndoSnapshot {
+                    title: r.get(0)?,
+                    content,
+                    tier: r.get(2)?,
+                    namespace: r.get(3)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    priority: r.get(5)?,
+                    confidence: r.get::<_, f64>(6).unwrap_or(1.0),
+                    expires_at: r.get(7)?,
+                    metadata: serde_json::from_str(&metadata_json)
+                        .unwrap_or_else(|_| serde_json::json!({})),
+                    source_uri: r.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+
+    // (c) DUAL-OWNERSHIP fail-closed: when `caller` is Some, BOTH the
+    // live row's agent_id AND the snapshot's agent_id (when a snapshot
+    // exists) must strict-equal `caller`. Admin/operator (caller=None)
+    // bypasses. This runs BEFORE any write and BEFORE returning a diff so
+    // a non-owner cannot even observe another owner's content.
+    if let Some(caller) = caller {
+        let live_owner = read_owner_agent_id(conn, "memories", id)?.unwrap_or_default();
+        if live_owner != caller {
+            return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                reason: format!(
+                    "undo_in_place_edit denied: caller {caller} is not the owner of memory {id}"
+                ),
+            }));
+        }
+        if let Some(snap) = &snapshot {
+            let snap_owner = snap
+                .metadata
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if snap_owner != caller {
+                return Err(anyhow::Error::new(StorageError::LinkPermissionDenied {
+                    reason: format!(
+                        "undo_in_place_edit denied: caller {caller} is not the owner of the \
+                         in_place_edit snapshot for memory {id}"
+                    ),
+                }));
+            }
+        }
+    }
+
+    // (d) No snapshot → nothing to undo. before == after, applied=false.
+    let Some(snap) = snapshot else {
+        return Ok(crate::store::UndoOutcome {
+            applied: false,
+            id: id.to_string(),
+            before_version: live.version,
+            after_version: None,
+            before_title: live.title.clone(),
+            after_title: live.title.clone(),
+            before_content: live.content.clone(),
+            after_content: live.content,
+        });
+    };
+
+    // (e) Dry-run: return the diff, write NOTHING.
+    if dry_run {
+        return Ok(crate::store::UndoOutcome {
+            applied: false,
+            id: id.to_string(),
+            before_version: live.version,
+            after_version: None,
+            before_title: live.title,
+            after_title: snap.title,
+            before_content: live.content,
+            after_content: snap.content,
+        });
+    }
+
+    // (f) Apply: re-write the live row from the snapshot through the
+    // EXISTING in-place update path (which auto-snapshots the CURRENT
+    // content as a fresh in_place_edit, making undo reversible) with
+    // expected_version pinned so a concurrent writer can't be clobbered.
+    // DELIBERATELY does NOT pass lifecycle_state (see fn doc).
+    let snap_tier = Tier::from_str(&snap.tier);
+    let (found, _content_changed) = update_with_expected_version(
+        conn,
+        id,
+        Some(snap.title.as_str()),
+        Some(snap.content.as_str()),
+        snap_tier.as_ref(),
+        Some(snap.namespace.as_str()),
+        Some(&snap.tags),
+        Some(snap.priority),
+        Some(snap.confidence),
+        snap.expires_at.as_deref(),
+        Some(&snap.metadata),
+        snap.source_uri.as_deref(),
+        Some(live.version),
+    )?;
+    if !found {
+        // Row vanished between our read and the update (or version
+        // drifted, surfaced as VersionConflict above). Treat as NotFound.
+        return Err(anyhow::Error::new(StorageError::MemoryNotFound {
+            id: id.to_string(),
+            role: None,
+        }));
+    }
+
+    // Append a signed_events audit row capturing before/after id+version
+    // under a destructive-update label. Mirrors the reclassify path's
+    // with_daemon_signature + append idiom. `update_with_expected_version`
+    // opens + commits its own tx, so we are back in autocommit here; use
+    // the public `append_signed_event` which opens its own tx.
+    let after_version = live.version + 1;
+    let ph = crate::signed_events::payload_hash(
+        format!(
+            "memory.undo_in_place_edit|{id}|{}|{after_version}",
+            live.version
+        )
+        .as_bytes(),
+    );
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        ph,
+        caller
+            .unwrap_or(crate::identity::sentinels::AI_OPERATOR)
+            .to_string(),
+        crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
+        Utc::now().to_rfc3339(),
+    );
+    crate::signed_events::append_signed_event(conn, &event)?;
+
+    Ok(crate::store::UndoOutcome {
+        applied: true,
+        id: id.to_string(),
+        before_version: live.version,
+        after_version: Some(after_version),
+        before_title: live.title,
+        after_title: snap.title,
+        before_content: live.content,
+        after_content: snap.content,
+    })
 }
 
 /// #940 (security-high, 2026-05-20) — caller-scoped archive variant.
@@ -1914,7 +2761,7 @@ pub fn archive_memory_for_caller(
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
@@ -1922,7 +2769,7 @@ pub fn archive_memory_for_caller(
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = ?3",
             params![now, reason, id],
         )?;
@@ -2016,100 +2863,174 @@ pub fn forget(
         }));
     }
 
-    if archive {
-        // Archive matching memories before deletion
-        let now = Utc::now().to_rfc3339();
+    // #1776 — archive + delete MUST be ONE atomic transaction. Pre-fix the
+    // archive INSERT and the DELETE ran as two separate autocommit statements,
+    // so a crash / SIGKILL between them left every matched row BOTH archived
+    // AND live (duplicate), and the DELETE re-evaluated the match independently
+    // of the archive SELECT (a concurrent write between them could diverge the
+    // two row sets → a row deleted that was never archived). Wrapping both in
+    // one `BEGIN IMMEDIATE` (mirroring `gc` / the #1026 `run_gc` fix) makes them
+    // atomic AND pins them to the identical row set: the write lock is held for
+    // the whole transaction, so no concurrent writer can change the match set
+    // between the archive and the delete.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let result = (|| -> Result<usize> {
+        if archive {
+            // Archive matching memories before deletion.
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on
+                // forget-archive. v0.7.0 issue #861 — also project `metadata`
+                // into the archive row (mirrors the gc + explicit-archive
+                // paths that already preserve metadata).
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?4, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE rowid IN (
+                        SELECT m.rowid FROM memories_fts fts
+                        JOIN memories m ON m.rowid = fts.rowid
+                        WHERE memories_fts MATCH ?1
+                          AND (?2 IS NULL OR m.namespace = ?2)
+                          AND (?3 IS NULL OR m.tier = ?3)
+                     )",
+                    params![fts_query, namespace, tier_str, now],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?3, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
+                    params![namespace, tier_str, now],
+                )?;
+            }
+        }
+
+        // #1771 — snapshot the to-be-deleted set's memory_links into
+        // archived_memory_links BEFORE the cascade DELETE reaps them, so
+        // restore_archived can re-insert the edge graph. Snapshots edges
+        // touching ANY victim id (source or target endpoint), reusing the
+        // identical victim-id subquery the DELETE below uses so the two pin
+        // to the same row set. Runs only when `archive` so a hard
+        // (non-recoverable) forget keeps its documented edge-loss.
+        if archive {
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?4
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                        )
+                        OR ml.target_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                        )",
+                    params![fts_query, namespace, tier_str, now],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?3
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                        )
+                        OR ml.target_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                        )",
+                    params![namespace, tier_str, now],
+                )?;
+            }
+        }
+
+        // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
             let fts_query = forget_fts_query(pat);
             let tier_str = tier.map(|t| t.as_str().to_string());
-            // v0.6.3.1 P2 (G5) — preserve embedding + tier + expiry on forget-archive.
-            // v0.7.0 issue #861 — also project `metadata` into the
-            // archive row. The pre-fix INSERT omitted both the column
-            // and the SELECT expression, so the column defaulted to
-            // `'{}'` and `memory_archive_list` returned an empty object
-            // for every forget-archived row (silently stripping
-            // `agent_id`, `imported_from_*`, and every other operator-
-            // visible attribution key). Mirrors the gc + explicit-
-            // archive paths that already preserve metadata.
             conn.execute(
-                "INSERT OR REPLACE INTO archived_memories
-                 (id, tier, namespace, title, content, tags, priority, confidence,
-                  source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at,
-                  reflection_depth, atomised_into, atom_of, memory_kind,
-                  entity_id, persona_version, citations, source_uri, source_span,
-                  confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?4, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version
-                 FROM memories WHERE rowid IN (
+                "DELETE FROM memories WHERE rowid IN (
                     SELECT m.rowid FROM memories_fts fts
                     JOIN memories m ON m.rowid = fts.rowid
                     WHERE memories_fts MATCH ?1
                       AND (?2 IS NULL OR m.namespace = ?2)
                       AND (?3 IS NULL OR m.tier = ?3)
-                 )",
-                params![fts_query, namespace, tier_str, now],
-            )?;
+                )",
+                params![fts_query, namespace, tier_str],
+            )
         } else {
             let tier_str = tier.map(|t| t.as_str().to_string());
-            // v0.7.0 issue #861 — same metadata-projection fix as the
-            // patterned branch above. Forget without a pattern still
-            // archives whole namespaces/tiers, so the same bug applied.
             conn.execute(
-                "INSERT OR REPLACE INTO archived_memories
-                 (id, tier, namespace, title, content, tags, priority, confidence,
-                  source, access_count, created_at, updated_at, last_accessed_at,
-                  expires_at, archived_at, archive_reason, metadata,
-                  embedding, embedding_dim, original_tier, original_expires_at,
-                  reflection_depth, atomised_into, atom_of, memory_kind,
-                  entity_id, persona_version, citations, source_uri, source_span,
-                  confidence_source, confidence_signals, confidence_decayed_at,
-                  mentioned_entity_id, version)
-                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
-                        source, access_count, created_at, updated_at, last_accessed_at,
-                        expires_at, ?3, 'forget', metadata,
-                        embedding, embedding_dim, tier, expires_at,
-                        reflection_depth, atomised_into, atom_of, memory_kind,
-                        entity_id, persona_version, citations, source_uri, source_span,
-                        confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version
-                 FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
-                params![namespace, tier_str, now],
-            )?;
+                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
+                params![namespace, tier_str],
+            )
+        }
+        .map_err(anyhow::Error::from)
+    })();
+
+    match result {
+        Ok(deleted) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(deleted)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
         }
     }
-
-    // If pattern provided, use FTS to find matching IDs
-    if let Some(pat) = pattern {
-        let fts_query = forget_fts_query(pat);
-        let tier_str = tier.map(|t| t.as_str().to_string());
-        let deleted = conn.execute(
-            "DELETE FROM memories WHERE rowid IN (
-                SELECT m.rowid FROM memories_fts fts
-                JOIN memories m ON m.rowid = fts.rowid
-                WHERE memories_fts MATCH ?1
-                  AND (?2 IS NULL OR m.namespace = ?2)
-                  AND (?3 IS NULL OR m.tier = ?3)
-            )",
-            params![fts_query, namespace, tier_str],
-        )?;
-        return Ok(deleted);
-    }
-
-    let tier_str = tier.map(|t| t.as_str().to_string());
-    let deleted = conn.execute(
-        "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)",
-        params![namespace, tier_str],
-    )?;
-    Ok(deleted)
 }
 
 /// #1602 — one row of a forget preview / deletion audit listing.
@@ -2186,6 +3107,338 @@ pub fn forget_matches(
         .query_map(params![namespace, tier_str, limit_i64], row_to_match)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// #1772 — owner-scoped twin of [`forget_count`] for the multi-tenant
+/// opt-in (`AI_MEMORY_AGENT_ID` set → MCP `handle_forget` resolves a
+/// `caller` via [`crate::identity::resolve_read_visibility_caller`]).
+///
+/// Identical to [`forget_count`] except every row-selection branch gains
+/// an **unstamped-inclusive** owner clause (mirrors #936/#940
+/// `purge_archive_for_caller`): the caller counts their OWN rows + legacy
+/// unstamped rows (`metadata.agent_id` NULL or `''`), never a different
+/// named owner's. `caller` is always `Some(...)` at the call site.
+pub fn forget_count_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: &str,
+) -> Result<usize> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE rowid IN (
+                SELECT m.rowid FROM memories_fts fts
+                JOIN memories m ON m.rowid = fts.rowid
+                WHERE memories_fts MATCH ?1
+                  AND (?2 IS NULL OR m.namespace = ?2)
+                  AND (?3 IS NULL OR m.tier = ?3)
+                  AND (json_extract(m.metadata,'$.agent_id') = ?4
+                       OR json_extract(m.metadata,'$.agent_id') IS NULL
+                       OR json_extract(m.metadata,'$.agent_id') = '')
+            )",
+            params![fts_query, namespace, tier_str, caller],
+            |r| r.get(0),
+        )?;
+        return Ok(usize::try_from(count).unwrap_or(0));
+    }
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+           AND (?2 IS NULL OR tier = ?2)
+           AND (json_extract(metadata,'$.agent_id') = ?3
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')",
+        params![namespace, tier_str, caller],
+        |r| r.get(0),
+    )?;
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// #1772 — owner-scoped twin of [`forget_matches`] for the multi-tenant
+/// opt-in. Identical to [`forget_matches`] except both row-selection
+/// branches gain the **unstamped-inclusive** owner clause (caller's own
+/// rows + legacy unstamped rows, never a different named owner's), so the
+/// preview reflects exactly the set [`forget_for_caller`] would delete.
+/// `caller` is always `Some(...)` at the call site.
+pub fn forget_matches_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    limit: usize,
+    caller: &str,
+) -> Result<Vec<ForgetMatch>> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — same refusal as `forget` / `forget_count`.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+    let row_to_match = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ForgetMatch> {
+        Ok(ForgetMatch {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            namespace: row.get(2)?,
+            tier: row.get(3)?,
+        })
+    };
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.title, m.namespace, m.tier
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.namespace = ?2)
+               AND (?3 IS NULL OR m.tier = ?3)
+               AND (json_extract(m.metadata,'$.agent_id') = ?5
+                    OR json_extract(m.metadata,'$.agent_id') IS NULL
+                    OR json_extract(m.metadata,'$.agent_id') = '')
+             ORDER BY m.rowid
+             LIMIT ?4",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![fts_query, namespace, tier_str, limit_i64, caller],
+                row_to_match,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, title, namespace, tier FROM memories
+         WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+           AND (json_extract(metadata,'$.agent_id') = ?4
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')
+         ORDER BY rowid
+         LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![namespace, tier_str, limit_i64, caller],
+            row_to_match,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// #1772 — owner-scoped twin of [`forget`] for the multi-tenant opt-in.
+/// Identical to [`forget`] (including the #1776 `BEGIN IMMEDIATE`
+/// archive+delete atomic transaction, preserved verbatim) except every
+/// SQL row-selection site — both archive INSERT-SELECT branches AND both
+/// DELETE branches — gains the **unstamped-inclusive** owner clause, so
+/// the caller forgets only their OWN rows + legacy unstamped rows, never a
+/// different named owner's. `caller` is always `Some(...)` at the call
+/// site.
+pub fn forget_for_caller(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    archive: bool,
+    caller: &str,
+) -> Result<usize> {
+    if pattern.is_none() && namespace.is_none() && tier.is_none() {
+        // #962 typed envelope — 400 BAD_REQUEST via ValidationFailed.
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::FORGET_FILTER_REQUIRED.to_string(),
+        }));
+    }
+
+    // #1776 — archive + delete MUST be ONE atomic transaction (see [`forget`]
+    // for the full rationale). The owner clause (#1772) is pinned to the
+    // identical row set across the archive SELECT and the DELETE because the
+    // `BEGIN IMMEDIATE` write lock is held for the whole transaction.
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let result = (|| -> Result<usize> {
+        if archive {
+            // Archive matching memories before deletion.
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?4, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE rowid IN (
+                        SELECT m.rowid FROM memories_fts fts
+                        JOIN memories m ON m.rowid = fts.rowid
+                        WHERE memories_fts MATCH ?1
+                          AND (?2 IS NULL OR m.namespace = ?2)
+                          AND (?3 IS NULL OR m.tier = ?3)
+                          AND (json_extract(m.metadata,'$.agent_id') = ?5
+                               OR json_extract(m.metadata,'$.agent_id') IS NULL
+                               OR json_extract(m.metadata,'$.agent_id') = '')
+                     )",
+                    params![fts_query, namespace, tier_str, now, caller],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR REPLACE INTO archived_memories
+                     (id, tier, namespace, title, content, tags, priority, confidence,
+                      source, access_count, created_at, updated_at, last_accessed_at,
+                      expires_at, archived_at, archive_reason, metadata,
+                      embedding, embedding_dim, original_tier, original_expires_at,
+                      reflection_depth, atomised_into, atom_of, memory_kind,
+                      entity_id, persona_version, citations, source_uri, source_span,
+                      confidence_source, confidence_signals, confidence_decayed_at,
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                            source, access_count, created_at, updated_at, last_accessed_at,
+                            expires_at, ?3, 'forget', metadata,
+                            embedding, embedding_dim, tier, expires_at,
+                            reflection_depth, atomised_into, atom_of, memory_kind,
+                            entity_id, persona_version, citations, source_uri, source_span,
+                            confidence_source, confidence_signals, confidence_decayed_at,
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                     FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                       AND (?2 IS NULL OR tier = ?2)
+                       AND (json_extract(metadata,'$.agent_id') = ?4
+                            OR json_extract(metadata,'$.agent_id') IS NULL
+                            OR json_extract(metadata,'$.agent_id') = '')",
+                    params![namespace, tier_str, now, caller],
+                )?;
+            }
+        }
+
+        // #1771 — snapshot the to-be-deleted set's memory_links into
+        // archived_memory_links BEFORE the cascade DELETE reaps them (see
+        // [`forget`] for the full rationale). The owner clause (#1772) is
+        // carried into the victim-id subquery so the snapshot pins to the same
+        // owner-scoped row set as the DELETE. Runs only when `archive`.
+        if archive {
+            let now = Utc::now().to_rfc3339();
+            if let Some(pat) = pattern {
+                let fts_query = forget_fts_query(pat);
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?4
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                              AND (json_extract(m.metadata,'$.agent_id') = ?5
+                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
+                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                        )
+                        OR ml.target_id IN (
+                            SELECT m.id FROM memories_fts fts
+                            JOIN memories m ON m.rowid = fts.rowid
+                            WHERE memories_fts MATCH ?1
+                              AND (?2 IS NULL OR m.namespace = ?2)
+                              AND (?3 IS NULL OR m.tier = ?3)
+                              AND (json_extract(m.metadata,'$.agent_id') = ?5
+                                   OR json_extract(m.metadata,'$.agent_id') IS NULL
+                                   OR json_extract(m.metadata,'$.agent_id') = '')
+                        )",
+                    params![fts_query, namespace, tier_str, now, caller],
+                )?;
+            } else {
+                let tier_str = tier.map(|t| t.as_str().to_string());
+                conn.execute(
+                    "INSERT OR IGNORE INTO archived_memory_links
+                         (source_id, target_id, relation, created_at, valid_from, valid_until,
+                          observed_by, signature, attest_level, archived_at)
+                     SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                            ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                            ml.attest_level, ?3
+                     FROM memory_links ml
+                     WHERE ml.source_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                              AND (json_extract(metadata,'$.agent_id') = ?4
+                                   OR json_extract(metadata,'$.agent_id') IS NULL
+                                   OR json_extract(metadata,'$.agent_id') = '')
+                        )
+                        OR ml.target_id IN (
+                            SELECT id FROM memories
+                            WHERE (?1 IS NULL OR namespace = ?1) AND (?2 IS NULL OR tier = ?2)
+                              AND (json_extract(metadata,'$.agent_id') = ?4
+                                   OR json_extract(metadata,'$.agent_id') IS NULL
+                                   OR json_extract(metadata,'$.agent_id') = '')
+                        )",
+                    params![namespace, tier_str, now, caller],
+                )?;
+            }
+        }
+
+        // Delete the same matched set (same tx, same write lock → same rows).
+        if let Some(pat) = pattern {
+            let fts_query = forget_fts_query(pat);
+            let tier_str = tier.map(|t| t.as_str().to_string());
+            conn.execute(
+                "DELETE FROM memories WHERE rowid IN (
+                    SELECT m.rowid FROM memories_fts fts
+                    JOIN memories m ON m.rowid = fts.rowid
+                    WHERE memories_fts MATCH ?1
+                      AND (?2 IS NULL OR m.namespace = ?2)
+                      AND (?3 IS NULL OR m.tier = ?3)
+                      AND (json_extract(m.metadata,'$.agent_id') = ?4
+                           OR json_extract(m.metadata,'$.agent_id') IS NULL
+                           OR json_extract(m.metadata,'$.agent_id') = '')
+                )",
+                params![fts_query, namespace, tier_str, caller],
+            )
+        } else {
+            let tier_str = tier.map(|t| t.as_str().to_string());
+            conn.execute(
+                "DELETE FROM memories WHERE (?1 IS NULL OR namespace = ?1)
+                   AND (?2 IS NULL OR tier = ?2)
+                   AND (json_extract(metadata,'$.agent_id') = ?3
+                        OR json_extract(metadata,'$.agent_id') IS NULL
+                        OR json_extract(metadata,'$.agent_id') = '')",
+                params![namespace, tier_str, caller],
+            )
+        }
+        .map_err(anyhow::Error::from)
+    })();
+
+    match result {
+        Ok(deleted) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(deleted)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
 }
 
 /// #1579 A2 — build the sargable `list` SQL + parameter vector.
@@ -2340,6 +3593,9 @@ pub fn search(
     // sources whose atoms surface in their place. See
     // [`recall_with_telemetry`] for the full contract.
     include_archived: bool,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See
+    // [`search_with_source_uri`].
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     search_with_source_uri(
         conn,
@@ -2355,6 +3611,7 @@ pub fn search(
         as_agent,
         include_archived,
         None,
+        caller,
     )
 }
 
@@ -2382,14 +3639,24 @@ pub fn search_with_source_uri(
     as_agent: Option<&str>,
     include_archived: bool,
     source_uri: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`, e.g. `ai:bob`). Bound at the
+    // `visibility_clause` caller placeholder (`?15`) so the owner-keyed
+    // private arm gates on ownership, not namespace. DISTINCT from
+    // `as_agent` (the namespace driving team/unit/org). `None` =
+    // fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let tier_str = tier.map(|t| t.as_str().to_string());
     let fts_query = sanitize_fts_query(query, false);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     let archived_fragment = archived_source_clause(include_archived, "m");
+    // #1720 A3 — `source_uri` renumbered ?15 → ?16: the caller
+    // placeholder (?15) is bound right after the visibility prefixes
+    // (?11..?14), so the trailing source_uri filter shifts up by one.
     let source_uri_fragment = if source_uri.is_some() {
-        "AND m.source_uri = ?15"
+        "AND m.source_uri = ?16"
     } else {
         ""
     };
@@ -2400,7 +3667,8 @@ pub fn search_with_source_uri(
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1
@@ -2422,7 +3690,7 @@ pub fn search_with_source_uri(
            + (1.0 / (1.0 + (julianday('now') - julianday(m.updated_at)) * 0.1))
            DESC
          LIMIT ?9",
-        vis = visibility_clause(11, "m"),
+        vis = visibility_clause(11, 15, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
@@ -2442,7 +3710,8 @@ pub fn search_with_source_uri(
                 vis_t,
                 vis_u,
                 vis_o,
-                uri,
+                caller, // ?15
+                uri,    // ?16
             ],
             row_to_memory,
         )?
@@ -2465,6 +3734,7 @@ pub fn search_with_source_uri(
                 vis_t,
                 vis_u,
                 vis_o,
+                caller, // ?15
             ],
             row_to_memory,
         )?
@@ -2494,11 +3764,16 @@ pub fn list_by_source_uri(
     namespace: Option<&str>,
     limit: Option<usize>,
     as_agent: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See
+    // [`visibility_clause`]. `None` = fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let cap = limit.unwrap_or(LIST_DEFAULT_CAP).min(LIST_MAX_LIMIT);
     let (vis_p, vis_t, vis_u, vis_o) = compute_visibility_prefixes(as_agent);
     // Placeholder layout: ?1 = uri, ?2 = namespace, ?3 = limit,
-    // ?4..?7 = visibility prefixes (private/team/unit/org).
+    // ?4..?7 = visibility prefixes (private/team/unit/org), ?8 = caller
+    // (visibility_clause owner-keyed private arm). The vis block + the
+    // caller are the trailing placeholders, so no downstream renumber.
     let sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -2506,14 +3781,14 @@ pub fn list_by_source_uri(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
-                m.version
+                m.version, m.encrypted_envelope
          FROM memories m
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
            {vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
-        vis = visibility_clause(4, "m"),
+        vis = visibility_clause(4, 8, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -2525,6 +3800,7 @@ pub fn list_by_source_uri(
             vis_t,
             vis_u,
             vis_o,
+            caller, // ?8
         ],
         row_to_memory,
     )?;
@@ -2852,6 +4128,8 @@ pub fn recall_with_telemetry(
     // index covers the lookup and excluded rows never enter the
     // top-K. See [`recall`] for the contract.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -2871,6 +4149,7 @@ pub fn recall_with_telemetry(
         budget_tokens,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     let telemetry = crate::models::RecallTelemetry {
         fts_candidates: results.len(),
@@ -2906,6 +4185,12 @@ pub fn recall(
     // that subsequently filtered to fewer. `None` preserves the legacy
     // no-filter behaviour for callers that filter post-hoc.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`). Bound at the `visibility_clause` caller
+    // placeholder (`?12`) so the owner-keyed private arm gates on
+    // ownership, not namespace. DISTINCT from `as_agent` (the
+    // namespace). `None` = fail-closed (no private rows).
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -2931,9 +4216,12 @@ pub fn recall(
     // already-escaped prefix + `%`; combined with the partial index
     // on `source_uri WHERE source_uri IS NOT NULL`, SQLite picks the
     // index for the lookup. See [`escape_like_pattern`].
+    // #1720 A3 — `source_uri` renumbered ?12 → ?13: the caller
+    // placeholder (?12) binds right after the visibility prefixes
+    // (?8..?11), so the trailing source_uri LIKE filter shifts up one.
     let (source_uri_fragment, source_uri_param): (&str, Option<String>) = match source_uri_prefix {
         Some(prefix) if !prefix.is_empty() => (
-            "AND m.source_uri LIKE ?12 ESCAPE '\\'",
+            "AND m.source_uri LIKE ?13 ESCAPE '\\'",
             Some(format!("{}%", escape_like_pattern(prefix))),
         ),
         _ => ("", None),
@@ -2946,6 +4234,11 @@ pub fn recall(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                -- #228 Commit B — encrypted_envelope so row_to_memory
+                -- decrypts at-rest content on this recall path; the trailing
+                -- `score` column is read by name (not positionally) so this
+                -- insertion is safe.
+                m.encrypted_envelope,
                 (fts.rank * -1)
                 + (m.priority * 0.5)
                 + (MIN(m.access_count, 50) * 0.1)
@@ -2967,10 +4260,10 @@ pub fn recall(
            {vis}
          ORDER BY score DESC
          LIMIT ?7",
-        vis = visibility_clause(8, "m"),
+        vis = visibility_clause(8, 12, "m"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    // Bind ?12 only when the source-URI fragment is active; SQLite
+    // Bind ?13 only when the source-URI fragment is active; SQLite
     // errors on parameter-count mismatch.
     let row_handler = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Memory, f64)> {
         let mem = row_to_memory(row)?;
@@ -2997,7 +4290,8 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
-                uri_param,
+                caller,    // ?12
+                uri_param, // ?13
             ],
             row_handler,
         )?;
@@ -3016,6 +4310,7 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
+                caller, // ?12
             ],
             row_handler,
         )?;
@@ -3126,6 +4421,7 @@ pub fn promote_to_namespace(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
     let actual_id = insert(conn, &clone)?;
     // Clone → source: derived_from. Safe to ignore if the link layer
@@ -3281,7 +4577,8 @@ fn find_similar_title_candidates(
                 m.last_accessed_at, m.expires_at, m.metadata, m.reflection_depth,
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
-                m.confidence_source, m.confidence_signals, m.confidence_decayed_at
+                m.confidence_source, m.confidence_signals, m.confidence_decayed_at,
+                m.encrypted_envelope
          FROM memories_fts fts
          JOIN memories m ON m.rowid = fts.rowid
          WHERE memories_fts MATCH ?1 AND m.namespace = ?2
@@ -4105,7 +5402,17 @@ pub fn get_link_for_verify(
 pub const CONSOLIDATION_SOURCE: &str = "consolidation";
 
 /// Consolidate multiple memories into one. Returns the new memory ID.
-/// Deletes the source memories and creates links from new → old (`derived_from`).
+///
+/// Hard-DELETEs the source memories and records their ids on the new
+/// memory's `metadata.derived_from` (plus the source authors on
+/// `metadata.consolidated_from_agents`). Provenance is stored as metadata
+/// — NOT navigable `memory_links` edges — because a real edge to a source
+/// would be FK `ON DELETE CASCADE`-killed the instant the source is
+/// deleted (and the source is never archived, so it can't be pointed at).
+/// Per #1784 these provenance keys are now immutable: a later
+/// `update` / dedup metadata overwrite preserves them (existing-wins,
+/// like `agent_id`) instead of silently dropping them. The pointer is
+/// inherently non-navigable (its targets no longer exist) by design.
 #[allow(clippy::too_many_arguments)]
 pub fn consolidate(
     conn: &Connection,
@@ -4255,6 +5562,7 @@ pub fn consolidate(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write(&candidate)?;
 
@@ -5521,6 +6829,7 @@ pub fn entity_register(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = insert(conn, &mem).context("insert entity memory")?;
         (id, true)
@@ -6408,6 +7717,7 @@ pub fn register_agent(
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     insert(conn, &mem)
@@ -6716,7 +8026,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
-                      mentioned_entity_id, version)
+                      mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
@@ -6724,7 +8034,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
-                            mentioned_entity_id, version
+                            mentioned_entity_id, version, lifecycle_state, encrypted_envelope
                      FROM memories
                      WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
                 ))?;
@@ -6763,6 +8073,143 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
     );
     Ok(total)
 }
+
+/// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction (size-GC).
+///
+/// The byte-pressure sibling of [`gc`] (which evicts on TTL expiry).
+/// When a namespace's LIVE corpus byte size exceeds `max_corpus_bytes`,
+/// this evicts the lowest-value memories one at a time — archiving each
+/// (restorable, via [`archive_memory_no_tx`]) when `archive` is true, or
+/// hard-deleting it otherwise — until the running corpus total is back at
+/// or under the cap. Returns the count evicted. Deterministic and
+/// LLM-free: victim order is a pure SQL ranking, so the same corpus +
+/// cap always evicts the same rows.
+///
+/// **Corpus byte definition.** Mirrors the K8 quota accounting
+/// (`src/quotas.rs`): the per-row payload size is
+/// `length(title) + length(content) + length(metadata)`, summed over the
+/// non-archived rows in `namespace`. Distinct from
+/// [`crate::quotas::DEFAULT_MAX_STORAGE_BYTES`], which is the per-agent
+/// WRITE quota — this cap is an eviction trigger on the namespace corpus.
+///
+/// **Eviction order (victim = evicted FIRST).** Least-durable tier first,
+/// then lowest value: `tier` (short → mid → long), then `priority` ASC,
+/// then `access_count` ASC, then `last_accessed_at` ASC. So a high-value
+/// long-tier frequently-accessed row is evicted LAST — only if the corpus
+/// is still over cap after every cheaper victim is gone.
+///
+/// **Disabled-cap contract.** A non-positive `max_corpus_bytes` is treated
+/// as "disabled" — the function early-returns `Ok(0)` without scanning.
+/// Callers (the curator) gate on `Option<i64>::is_some()`, so a disabled
+/// namespace never reaches this with a positive cap.
+///
+/// Each archive+delete (or delete) is its own step that re-reads the
+/// running total, matching how [`gc`] bounds its lock-hold per victim;
+/// the FTS-trigger sync that the archive / delete primitives already
+/// perform is preserved.
+pub fn size_gc(
+    conn: &Connection,
+    namespace: &str,
+    max_corpus_bytes: i64,
+    archive: bool,
+) -> Result<usize> {
+    // Disabled-cap guard: a non-positive cap is a no-op. The curator
+    // gates on `Option::is_some`, so this only fires on a misconfigured
+    // explicit `<= 0` cap — fail safe (evict nothing) rather than panic.
+    if max_corpus_bytes <= 0 {
+        return Ok(0);
+    }
+
+    use rusqlite::OptionalExtension;
+
+    let mut corpus = namespace_corpus_bytes(conn, namespace)?;
+    if corpus <= max_corpus_bytes {
+        return Ok(0);
+    }
+
+    let mut evicted = 0usize;
+    // Evict one victim at a time, re-reading the running total after each,
+    // until the corpus is back at/under cap or the namespace is drained.
+    while corpus > max_corpus_bytes {
+        // Lowest-value victim: least-durable tier first, then lowest
+        // priority / access_count / last_accessed_at.
+        let victim: Option<(String, i64)> = conn
+            .query_row(SQL_SIZE_GC_NEXT_VICTIM, params![namespace], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
+            .optional()?;
+        let Some((id, row_bytes)) = victim else {
+            // No live rows left in the namespace — cannot get under cap.
+            break;
+        };
+
+        // #1782 — wrap each victim's archive+delete in ONE `BEGIN IMMEDIATE`.
+        // `archive_memory_no_tx` does an archive INSERT followed by a DELETE and
+        // its contract REQUIRES the caller to already hold a transaction; pre-fix
+        // `size_gc` opened none, so each victim's INSERT + DELETE ran as two
+        // autocommit statements → a crash between them left that victim both
+        // archived AND live (duplicate). Per-victim tx bounds the lock-hold
+        // (mirrors `gc`'s chunked sweep) while making each eviction atomic.
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let victim_result = (|| -> Result<()> {
+            if archive {
+                // Restorable eviction: archive-before-delete in one step,
+                // reusing the same primitive the supersede / GC paths use.
+                archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
+            } else {
+                conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+                conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
+            }
+            Ok(())
+        })();
+        match victim_result {
+            Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+            Err(e) => {
+                let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+                return Err(e);
+            }
+        }
+
+        evicted += 1;
+        corpus -= row_bytes;
+    }
+
+    Ok(evicted)
+}
+
+/// Live corpus byte size for `namespace` — `SUM(length(title) +
+/// length(content) + length(metadata))` over the non-archived rows.
+/// Mirrors the K8 quota byte definition (`src/quotas.rs`). Shared by
+/// [`size_gc`] and its unit tests so the cap check and the eviction loop
+/// agree on the metric.
+pub(crate) fn namespace_corpus_bytes(conn: &Connection, namespace: &str) -> Result<i64> {
+    let bytes: i64 =
+        conn.query_row(SQL_NAMESPACE_CORPUS_BYTES, params![namespace], |r| r.get(0))?;
+    Ok(bytes)
+}
+
+/// `archive_reason` stamped on rows evicted by [`size_gc`], distinct from
+/// the `ttl_expired` reason [`gc`] uses so an operator can tell byte-cap
+/// eviction apart from TTL expiry in the archive.
+const SIZE_GC_ARCHIVE_REASON: &str = "size_gc";
+
+/// Live-corpus byte-size aggregate for one namespace. `COALESCE` guards
+/// the all-NULL empty-namespace case (`SUM` over zero rows is NULL).
+const SQL_NAMESPACE_CORPUS_BYTES: &str = "SELECT COALESCE(SUM(\
+     length(title) + length(content) + length(metadata)), 0) \
+     FROM memories WHERE namespace = ?1";
+
+/// Next size-GC victim id + its payload byte size. Lowest-value first:
+/// least-durable tier (short → mid → long), then lowest priority /
+/// access_count / last_accessed_at. NULL `last_accessed_at` sorts first
+/// (never-accessed rows are the cheapest to evict).
+const SQL_SIZE_GC_NEXT_VICTIM: &str = "SELECT id, \
+     length(title) + length(content) + length(metadata) \
+     FROM memories WHERE namespace = ?1 \
+     ORDER BY CASE tier \
+         WHEN 'short' THEN 0 WHEN 'mid' THEN 1 WHEN 'long' THEN 2 ELSE 3 END ASC, \
+     priority ASC, access_count ASC, last_accessed_at ASC \
+     LIMIT 1";
 
 // ---------------------------------------------------------------------------
 // Archive operations
@@ -6884,6 +8331,27 @@ pub fn list_archived(
         .map_err(Into::into)
 }
 
+/// Restore an archived memory ROW back into the live `memories` table.
+///
+/// **Recovery scope (#1771).** Restores the memory row (with full v0.7.0
+/// column carry per #1025) AND its `memory_links` edge graph, on sqlite.
+/// The explicit/recovery-expected delete paths (`forget`,
+/// `forget_for_caller`, `archive_memory_no_tx`) snapshot the memory's
+/// edges into `archived_memory_links` BEFORE the same-tx cascade
+/// `DELETE FROM memories` reaps them, and this restore re-inserts every
+/// preserved edge whose BOTH endpoints currently exist (an edge whose
+/// other endpoint is permanently gone is correctly skipped — the FK would
+/// reject it). Idempotent.
+///
+/// **NOT recovered:** edges lost to the auto-eviction paths (`gc` /
+/// `size_gc`) — those are intentionally NOT snapshotted (nobody restores
+/// an auto-eviction; snapshotting there is a perf regression per the
+/// 5-agent vote 4d3ea1c5), so a memory archived by gc restores with an
+/// empty edge graph. Other `ON DELETE CASCADE` provenance
+/// (`recall_observations`, confidence-calibration rows,
+/// `memory_transcript_links`) is regenerable telemetry and is NOT
+/// preserved by design. POSTGRES edge restore is a tracked follow-up
+/// (this commit wires sqlite only).
 pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
@@ -6957,7 +8425,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -6972,10 +8440,16 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     COALESCE(confidence_source, 'caller_provided'),
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1)
+                    COALESCE(version, 1),
+                    COALESCE(lifecycle_state, 'open'),
+                    encrypted_envelope
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
+        // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
+        // idempotent). Edges whose other endpoint is permanently gone are
+        // correctly skipped (the FK would reject them).
+        restore_links_for_memory(conn, id)?;
         conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
         Ok(true)
     })();
@@ -7082,7 +8556,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -7097,10 +8571,15 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     COALESCE(confidence_source, 'caller_provided'),
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1)
+                    COALESCE(version, 1),
+                    COALESCE(lifecycle_state, 'open'),
+                    encrypted_envelope
              FROM archived_memories WHERE id = ?2",
             params![now, id],
         )?;
+        // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
+        // idempotent). See [`restore_archived`] for the contract.
+        restore_links_for_memory(conn, id)?;
         conn.execute("DELETE FROM archived_memories WHERE id = ?1", params![id])?;
         Ok(true)
     })();
@@ -7142,6 +8621,15 @@ fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
                 COALESCE(version, 1) AS version
          FROM archived_memories WHERE id = ?1",
     )?;
+    // #228 Commit B — DELIBERATELY does NOT select `encrypted_envelope`.
+    // This Memory feeds only the GOVERNANCE_PRE_WRITE hook, which inspects
+    // namespace / tier / title (all plaintext) and never `content`. If the
+    // envelope were selected, `row_to_memory` would fail-closed on any
+    // archived row whose key has rotated / is absent, blocking the restore
+    // entirely — even though the restore INSERT-SELECT carries the
+    // ciphertext envelope verbatim (Commit A) and the row is fully
+    // restorable. The hook seeing the empty placeholder for `content` is
+    // harmless (content is not a governance input).
     let mem = stmt.query_row(params![id], row_to_memory)?;
     Ok(mem)
 }
@@ -7343,16 +8831,43 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // so a stale peer cannot blank out a value the matcher's index
     // depends on.
     let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #228 Commit B — at-rest content encryption on the federation
+    // newer-wins merge path. Seal the (already-plaintext) inbound content
+    // to the local per-agent key when enabled; the `content` column
+    // carries the placeholder and the ciphertext lands in
+    // `encrypted_envelope`. None (default) stores the plaintext verbatim
+    // with a NULL envelope. NOTE: federation merge re-seals the inbound
+    // plaintext under the LOCAL recipient key — the encrypted_envelope
+    // moves together with content under the SAME newer-wins CASE so a
+    // timestamp winner never desynchronizes placeholder vs ciphertext.
+    let agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let sealed = crate::encryption::seal_content(&mem.content, agent_id)?;
+    let content_to_store = sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
     // #1579 B6 — federation catch-up replays this newer-wins upsert
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
          ON CONFLICT(title, namespace) DO UPDATE SET
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                            THEN excluded.content ELSE memories.content END,
+            -- #228 Commit B — the at-rest ciphertext envelope moves with
+            -- `content` under the IDENTICAL newer-wins tiebreak so the
+            -- placeholder and its ciphertext are never split across the
+            -- winner boundary (a winner's placeholder with the loser's
+            -- ciphertext would be undecryptable).
+            encrypted_envelope = CASE WHEN excluded.updated_at > memories.updated_at
+                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                      THEN excluded.encrypted_envelope ELSE memories.encrypted_envelope END,
             tags = CASE WHEN excluded.updated_at > memories.updated_at
                           OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                         THEN excluded.tags ELSE memories.tags END,
@@ -7369,22 +8884,23 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             access_count = MAX(memories.access_count, excluded.access_count),
             expires_at = CASE WHEN excluded.tier = 'long' OR memories.tier = 'long' THEN NULL
                               ELSE COALESCE(excluded.expires_at, memories.expires_at) END,
-            -- Preserve metadata.agent_id across newer-wins merge (NHI provenance immutable).
-            metadata = CASE
-                WHEN json_extract(memories.metadata, '$.agent_id') IS NOT NULL
-                THEN json_set(
-                    CASE WHEN excluded.updated_at > memories.updated_at
-                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                         THEN excluded.metadata
-                         ELSE memories.metadata END,
-                    '$.agent_id',
-                    json_extract(memories.metadata, '$.agent_id')
+            -- #1784 — preserve immutable provenance keys (agent_id + the
+            -- consolidation derived_from / consolidated_from_agents arrays)
+            -- across a newer-wins merge: json_patch overlays the existing
+            -- row's provenance object (existing-wins, array-safe) on top of
+            -- the newer-wins base (excluded if newer, else the existing row).
+            metadata = json_patch(
+                CASE WHEN excluded.updated_at > memories.updated_at
+                          OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                     THEN excluded.metadata
+                     ELSE memories.metadata END,
+                COALESCE(
+                    (SELECT json_group_object(key, value)
+                     FROM json_each(memories.metadata)
+                     WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                    '{}'
                 )
-                ELSE CASE WHEN excluded.updated_at > memories.updated_at
-                               OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                          THEN excluded.metadata
-                          ELSE memories.metadata END
-            END,
+            ),
             -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
             -- signal isn't lost on newer-wins federation merges.
             reflection_depth = MAX(memories.reflection_depth, excluded.reflection_depth),
@@ -7440,7 +8956,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             -- MAX(local, remote) so an out-of-order peer push can't
             -- roll the Gap-1 optimistic-concurrency counter backwards.
             -- Matches the pg `apply_remote_memory` GREATEST arm.
-            version = MAX(memories.version, excluded.version)
+            version = MAX(memories.version, excluded.version),
+            -- v0.8.0 Pillar 2 (#1709) — lifecycle_state on the newer-wins
+            -- federation merge: the timestamp winner's state is adopted so
+            -- a peer that advanced a Goal open→done replicates that state;
+            -- a stale peer push (loses the tiebreak) preserves the local
+            -- lifecycle. Transition legality is enforced at the originating
+            -- update site, so the replicated value is already-validated.
+            lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
+                                        OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END
          RETURNING id",
     )?;
     let actual_id: String = newer_wins_stmt.query_row(
@@ -7449,7 +8974,7 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.tier.as_str(),
             mem.namespace,
             mem.title,
-            mem.content,
+            content_to_store,
             tags_json,
             mem.priority,
             mem.confidence,
@@ -7472,10 +8997,236 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.confidence_decayed_at,
             mentioned_entity_id,
             mem.version,
+            mem.lifecycle_state.as_str(),
+            encrypted_envelope,
         ],
         |r| r.get(0),
     )?;
     Ok(actual_id)
+}
+
+/// v0.8.0 Pillar-3 (#1709 / #224) — federation conflict-path entry that
+/// makes the CRDT-lite per-field [`crate::models::merge_memory`] reconciler
+/// **load-bearing**. This is the federation reconciliation site's writer:
+/// it field-merges a divergent same-`id` inbound row instead of the coarse
+/// scalar last-write-wins clobber the `(title, namespace)` upsert in
+/// [`insert_if_newer`] applies.
+///
+/// Atomic read-merge-write (mirrors the `consolidate` / `size_gc`
+/// `BEGIN IMMEDIATE` … `COMMIT` / `ROLLBACK` idiom): the write lock is
+/// taken up front so a concurrent peer push can't slip a write between the
+/// read and the merge, and a failure rolls the whole merge back.
+///
+/// 1. Look up the existing row BY `inbound.id` ([`get`]).
+/// 2. **Existing row found** → `merged = merge_memory(&existing, inbound)`
+///    (the SAME pure #224 reconciler the postgres adapter calls in Rust,
+///    so there is no per-backend merge drift) and persist the FULL merged
+///    row by id via [`overwrite_full_row_by_id`] — every one of the 27
+///    columns is written verbatim (no MAX / CASE / COALESCE re-application,
+///    because `merge_memory` has already resolved every field). Returns the
+///    existing id.
+/// 3. **No row by that id** → fall through to [`insert_if_newer`], which
+///    keeps the OLD behaviour for a brand-new row (fresh INSERT) and for a
+///    `(title, namespace)` dedup collision (the existing newer-wins LWW
+///    upsert). Returns its result.
+///
+/// This is purely additive: fresh memories + `(title, namespace)` dedup
+/// keep the historical semantics; ONLY a same-`id`-but-divergent inbound
+/// now field-merges (tags union, priority/confidence/access_count/version
+/// max, metadata deep-merge, `agent_id`/governance immutable-to-local)
+/// instead of clobbering. The #224 invariants (`agent_id` immutable,
+/// governance owner-only, metadata deep-merge) are preserved automatically
+/// by `merge_memory`.
+///
+/// # Errors
+///
+/// Bubbles up rusqlite / serde errors from the read, the merge-write, or
+/// the `insert_if_newer` fall-through. On any error inside the merge
+/// transaction the partial write is rolled back.
+pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
+    // Take the write lock up front so the read-merge-write is atomic
+    // against a concurrent peer push (BEGIN IMMEDIATE — same idiom as
+    // `consolidate` / `size_gc`).
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let tx_result = (|| -> Result<Option<String>> {
+        match get(conn, &inbound.id)? {
+            Some(existing) => {
+                // #1719 item 3a — NEVER trust a peer's self-asserted
+                // attestation for the merge tiebreak: neutralize the
+                // inbound's `metadata.attest_level` to `claimed` so a
+                // forged remote cannot win the attested-identity LWW
+                // tiebreak by self-asserting `agent_attested`. Only the
+                // receiver's own stored local level can win on attestation.
+                let sanitized = crate::models::sanitize_inbound_attestation(inbound);
+                // #1755 item 3b — cap a relayed row's post-dated
+                // `updated_at` (the primary LWW key) to a freshness ceiling
+                // so an enrolled relay cannot win the merge by stamping a
+                // far-future timestamp. now + the attestation skew window.
+                let prepared = crate::models::clamp_inbound_updated_at(
+                    sanitized,
+                    &chrono::Utc::now().to_rfc3339(),
+                    crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
+                );
+                // #224 field-wise merge — the SAME pure reconciler the
+                // postgres adapter calls in Rust (no per-backend drift).
+                let merged = crate::models::merge_memory(&existing, &prepared);
+                overwrite_full_row_by_id(conn, &merged)?;
+                Ok(Some(merged.id))
+            }
+            // No row by this id — defer to the (title, namespace) dedup
+            // path OUTSIDE this transaction (signalled by `None`).
+            None => Ok(None),
+        }
+    })();
+
+    match tx_result {
+        Ok(Some(id)) => {
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            Ok(id)
+        }
+        Ok(None) => {
+            // Nothing was written in the merge transaction; close it
+            // cleanly and fall through to the unchanged LWW path
+            // (handles fresh insert + (title, namespace) dedup-upsert).
+            conn.execute_batch(connection::SQL_COMMIT)?;
+            insert_if_newer(conn, inbound)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
+/// v0.8.0 Pillar-3 (#1709 / #224) — persist a fully-merged [`Memory`] by
+/// `id`, writing EVERY column verbatim. This is the full-row writer for
+/// [`merge_inbound`]: the row it receives has already had every field
+/// resolved by [`crate::models::merge_memory`], so this helper applies NO
+/// merge logic of its own — it is a faithful column-for-column overwrite.
+///
+/// Deliberately NOT [`update`] (which is a partial-patch interface that
+/// imposes optimistic-concurrency / governance gates that would reject a
+/// federation write) and NOT [`insert`] (which upserts on
+/// `(title, namespace)`, not `id`). The UPDATE is keyed on `id`, so it
+/// also rewrites `title` / `namespace` when the merge picked the remote's
+/// (a LWW visibility edit) without tripping the `(title, namespace)`
+/// dedup path. Writes all 27 logical columns + the denormalised
+/// `mentioned_entity_id` (re-derived from the merged row, same as the
+/// `insert` / `insert_if_newer` chokepoints).
+///
+/// # Errors
+///
+/// Bubbles up serde encode errors for the JSON-shaped columns and any
+/// rusqlite error from the UPDATE.
+fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
+    // #1773 (MEDIUM) — snapshot the pre-merge row before this peer-driven
+    // LWW content overwrite, mirroring the #1725 in_place_edit snapshot, so a
+    // federation merge where the remote wins the tiebreak leaves a recoverable
+    // copy instead of permanently discarding prior local content. INSERT OR
+    // REPLACE so a repeated merge of the same id is idempotent; archives the
+    // CURRENT row (incl its encrypted_envelope) before the UPDATE below.
+    archive_memory_insert_only(conn, &mem.id, "federation_merge")?;
+
+    let tags_json = serde_json::to_string(&mem.tags)?;
+    let metadata_json = serde_json::to_string(&mem.metadata)?;
+    let citations_json = serde_json::to_string(&mem.citations)?;
+    let source_span_json = match mem.source_span {
+        Some(span) => Some(serde_json::to_string(&span)?),
+        None => None,
+    };
+    let confidence_signals_json = match &mem.confidence_signals {
+        Some(s) => Some(serde_json::to_string(s)?),
+        None => None,
+    };
+    // Re-derive the denormalised mention tag from the merged row, mirroring
+    // the `insert` / `insert_if_newer` write chokepoints so the indexed
+    // column stays consistent with the row's own metadata/title.
+    let mentioned_entity_id = extract_mentioned_entity_id(mem);
+    // #1773 (HIGH, encryption-on) — seal the merged content + set
+    // `encrypted_envelope` as a MATCHED PAIR (mirrors
+    // `update_with_expected_version` ~1851). The prior UPDATE wrote plaintext
+    // into `content` but omitted `encrypted_envelope`, so under at-rest
+    // encryption the row kept its STALE non-NULL envelope: the next read
+    // decrypted the OLD content and silently discarded the merged value. With
+    // encryption off, `seal_content` returns None → we store the plaintext
+    // verbatim and clear the envelope to NULL (byte-identical to the
+    // pre-wiring path). agent_id is the merged row's NHI marker — the same key
+    // `insert`/`update_with_expected_version` use for this row.
+    let merge_agent_id = mem
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let merge_sealed = crate::encryption::seal_content(&mem.content, merge_agent_id)?;
+    let merge_content_to_store = merge_sealed
+        .as_ref()
+        .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
+    let merge_encrypted_envelope: Option<&[u8]> =
+        merge_sealed.as_ref().map(|(env, _)| env.as_slice());
+    conn.execute(
+        "UPDATE memories SET
+            tier = ?1,
+            namespace = ?2,
+            title = ?3,
+            content = ?4,
+            tags = ?5,
+            priority = ?6,
+            confidence = ?7,
+            source = ?8,
+            access_count = ?9,
+            created_at = ?10,
+            updated_at = ?11,
+            last_accessed_at = ?12,
+            expires_at = ?13,
+            metadata = ?14,
+            reflection_depth = ?15,
+            memory_kind = ?16,
+            entity_id = ?17,
+            persona_version = ?18,
+            citations = ?19,
+            source_uri = ?20,
+            source_span = ?21,
+            confidence_source = ?22,
+            confidence_signals = ?23,
+            confidence_decayed_at = ?24,
+            mentioned_entity_id = ?25,
+            version = ?26,
+            lifecycle_state = ?27,
+            encrypted_envelope = ?28
+         WHERE id = ?29",
+        params![
+            mem.tier.as_str(),
+            mem.namespace,
+            mem.title,
+            merge_content_to_store,
+            tags_json,
+            mem.priority,
+            mem.confidence,
+            mem.source,
+            mem.access_count,
+            mem.created_at,
+            mem.updated_at,
+            mem.last_accessed_at,
+            mem.effective_expires_at(),
+            metadata_json,
+            mem.reflection_depth,
+            mem.memory_kind.as_str(),
+            mem.entity_id,
+            mem.persona_version,
+            citations_json,
+            mem.source_uri,
+            source_span_json,
+            mem.confidence_source.as_str(),
+            confidence_signals_json,
+            mem.confidence_decayed_at,
+            mentioned_entity_id,
+            mem.version,
+            mem.lifecycle_state.as_str(),
+            merge_encrypted_envelope,
+            mem.id,
+        ],
+    )?;
+    Ok(())
 }
 
 // --- Embedding support ---
@@ -7797,18 +9548,15 @@ pub fn get_unembedded_ids_batch(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
+    // #1779 — pull encrypted_envelope + metadata so encrypted rows are
+    // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
     let mut stmt = conn.prepare_cached(
-        "SELECT id, title, content FROM memories WHERE embedding IS NULL LIMIT ?1",
+        "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
+         WHERE embedding IS NULL LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![limit], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+    let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
+    let raw = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(resolve_embeddable_rows(raw))
 }
 
 /// #1595 — keyset-paginated variant of [`get_unembedded_ids_batch`].
@@ -7835,29 +9583,94 @@ pub fn get_unembedded_ids_batch_after(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
-    let map_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    };
-    let rows = if let Some(after) = after_id {
+    // #1779 — pull encrypted_envelope + metadata so encrypted rows are
+    // decrypted (or skipped) before embedding; see `resolve_embeddable_content`.
+    let raw = if let Some(after) = after_id {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content FROM memories \
+            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
              WHERE embedding IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![after, limit], map_row)?;
+        let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     } else {
         let mut stmt = conn.prepare_cached(
-            "SELECT id, title, content FROM memories \
+            "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
              WHERE embedding IS NULL ORDER BY id LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit], map_row)?;
+        let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(rows)
+    Ok(resolve_embeddable_rows(raw))
+}
+
+/// #1779 — `query_map` row mapper for the embedding-fetch SELECTs that now
+/// also pull `encrypted_envelope` + `metadata`:
+/// `(id, title, content, envelope, metadata_json)`.
+type EmbeddableRawRow = (String, String, String, Option<Vec<u8>>, String);
+fn embeddable_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<EmbeddableRawRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, Option<Vec<u8>>>(3)?,
+        row.get::<_, String>(4)?,
+    ))
+}
+
+/// #1779 — map raw embedding-fetch rows to `(id, title, content)`, decrypting
+/// encrypted-at-rest rows and SKIPPING (omitting) any whose envelope won't
+/// decrypt. See [`resolve_embeddable_content`].
+fn resolve_embeddable_rows(raw: Vec<EmbeddableRawRow>) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::with_capacity(raw.len());
+    for (id, title, content, envelope, metadata_json) in raw {
+        if let Some(resolved) = resolve_embeddable_content(&id, content, envelope, &metadata_json) {
+            out.push((id, title, resolved));
+        }
+    }
+    out
+}
+
+/// #1779 — resolve the embeddable plaintext for a backfill / reembed row.
+/// At-rest-encrypted rows store the empty placeholder in `content` (the
+/// plaintext lives in `encrypted_envelope`); embedding the placeholder would
+/// yield a title-only vector and — under `set_embeddings_batch*` REPLACE
+/// semantics — overwrite a good store-time embedding corpus-wide. Returns
+/// `Some(plaintext)` for unencrypted rows (verbatim) and encrypted rows that
+/// decrypt; returns `None` (caller SKIPS — no embedding write) when an
+/// envelope is present but won't decrypt (e.g. key absent), failing loud
+/// rather than degrading the vector (mirrors the #1593 fail-loud-skip
+/// embedder posture). agent_id is read from the row's `metadata.agent_id`.
+fn resolve_embeddable_content(
+    id: &str,
+    content: String,
+    envelope: Option<Vec<u8>>,
+    metadata_json: &str,
+) -> Option<String> {
+    match envelope {
+        None => Some(content),
+        Some(env) => {
+            let agent_id = serde_json::from_str::<serde_json::Value>(metadata_json)
+                .ok()
+                .as_ref()
+                .and_then(|m| m.get("agent_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match crate::encryption::open_content(&env, &agent_id) {
+                Ok(plaintext) => Some(plaintext),
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %id,
+                        error = %e,
+                        "embed: skipping encrypted row whose envelope failed to decrypt — \
+                         embedding its empty placeholder would overwrite a good store-time \
+                         embedding (#1779)"
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// #1598 — keyset-paginated scan over ALL live memories (embedded or
@@ -7877,46 +9690,49 @@ pub fn get_memory_texts_batch(
     after_id: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, String, String)>> {
-    let map_row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    };
-    let rows = match (namespace, after_id) {
+    // #1779 — also pull `encrypted_envelope` + `metadata` so at-rest-encrypted
+    // rows (where `content` holds the empty placeholder and the plaintext lives
+    // in the envelope) are DECRYPTED before embedding. Embedding the
+    // placeholder yields a title-only vector, and `set_embeddings_batch_reembed`
+    // REPLACE semantics would then overwrite the good store-time embedding
+    // corpus-wide. A row whose envelope fails to decrypt (e.g. key absent) is
+    // SKIPPED with a WARN rather than embedded as a degraded placeholder —
+    // mirrors the #1593 fail-loud-skip embedder posture.
+    let raw = match (namespace, after_id) {
         (Some(ns), Some(after)) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE namespace = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![ns, after, limit], map_row)?;
+            let rows = stmt.query_map(params![ns, after, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (Some(ns), None) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE namespace = ?1 ORDER BY id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![ns, limit], map_row)?;
+            let rows = stmt.query_map(params![ns, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (None, Some(after)) => {
             let mut stmt = conn.prepare_cached(
-                "SELECT id, title, content FROM memories \
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
                  WHERE id > ?1 ORDER BY id LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![after, limit], map_row)?;
+            let rows = stmt.query_map(params![after, limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
         (None, None) => {
-            let mut stmt = conn
-                .prepare_cached("SELECT id, title, content FROM memories ORDER BY id LIMIT ?1")?;
-            let rows = stmt.query_map(params![limit], map_row)?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, title, content, encrypted_envelope, metadata FROM memories \
+                 ORDER BY id LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit], embeddable_row_mapper)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         }
     };
-    Ok(rows)
+    Ok(resolve_embeddable_rows(raw))
 }
 
 /// #1598 — REPLACE-semantics sibling of [`set_embeddings_batch`] for
@@ -7963,6 +9779,110 @@ pub fn set_embeddings_batch_reembed(
     }
     tx.commit()?;
     Ok(rows_updated)
+}
+
+/// v0.8.0 #1709/#1720 WS-B B2 — outcome of a [`reown`] sweep.
+///
+/// `matched` is the number of rows the namespace + ownership filter
+/// selected; `rewritten` is the number actually written (`0` under a
+/// dry-run, otherwise `== matched` because the `UPDATE` and the
+/// `COUNT` share the same `WHERE`). `dry_run` echoes the requested
+/// mode so the CLI / JSON envelope can render the right verb without
+/// re-deriving it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReownReport {
+    /// Rows selected by the namespace + ownership filter.
+    pub matched: usize,
+    /// Rows whose `metadata.agent_id` was rewritten (0 on dry-run).
+    pub rewritten: usize,
+    /// Whether this was a dry-run (count only, no write).
+    pub dry_run: bool,
+}
+
+/// v0.8.0 #1709/#1720 WS-B B2 — rewrite `metadata.agent_id` (the NHI
+/// ownership stamp) on the memories in **exactly** `namespace` to
+/// `to_id`, establishing durable ownership BEFORE an operator turns on
+/// `scope=private` visibility filtering (so a namespace can be claimed
+/// without the operator locking themselves out of legacy rows).
+///
+/// Semantics (least-surprising; documented in the CLI `--help`):
+/// - Target rows are the EXACT-namespace match (`namespace = ?ns`), not
+///   the namespace subtree — predictable + safe for an admin migration.
+/// - Default: rewrite every row whose `metadata.agent_id` is present
+///   (any current owner) to `to_id` — the operator is explicitly
+///   claiming the whole namespace. Rows with an absent/empty
+///   `agent_id` (legacy / unowned) are LEFT UNTOUCHED.
+/// - `claim_unowned`: ADDITIONALLY rewrite rows with NULL/empty
+///   `agent_id`, so the `empty_owner_blocks_named_caller` legacy class
+///   gets a durable owner too.
+/// - `dry_run`: COUNT the matched rows, write NOTHING, return
+///   `rewritten = 0`.
+///
+/// Only `metadata.agent_id` is touched (`json_set` of the single key) —
+/// every other metadata key is preserved, and the `agent_id_idx`
+/// generated column re-projects the new owner automatically (no schema
+/// change, no FTS sync — FTS tracks `(title, content, tags)` only).
+/// `to_id` is validated via [`crate::validate::validate_agent_id`] so a
+/// malformed owner can never be written.
+///
+/// Idempotent: a second run rewrites the same rows to the same id with
+/// no error (the metadata is byte-identical after the first pass).
+///
+/// # Errors
+///
+/// - `to_id` fails [`crate::validate::validate_agent_id`].
+/// - the underlying `COUNT` / `UPDATE` fails.
+pub fn reown(
+    conn: &Connection,
+    namespace: &str,
+    to_id: &str,
+    claim_unowned: bool,
+    dry_run: bool,
+) -> Result<ReownReport> {
+    crate::validate::validate_agent_id(to_id)
+        .map_err(|e| anyhow::anyhow!("reown: invalid --to agent_id: {e}"))?;
+
+    // Ownership predicate. Default: rows that already carry an
+    // `agent_id` (any owner). `--claim-unowned`: ALSO rows with a
+    // NULL/empty `agent_id` — i.e. every row in the namespace.
+    let owner_filter = if claim_unowned {
+        ""
+    } else {
+        " AND json_extract(metadata, '$.agent_id') IS NOT NULL \
+          AND json_extract(metadata, '$.agent_id') != ''"
+    };
+
+    let matched: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM memories WHERE namespace = ?1{owner_filter}"),
+        params![namespace],
+        |row| row.get(0),
+    )?;
+    let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+
+    if dry_run {
+        return Ok(ReownReport {
+            matched,
+            rewritten: 0,
+            dry_run: true,
+        });
+    }
+
+    // `json_set` rewrites ONLY `$.agent_id`, preserving the rest of the
+    // metadata object; the `agent_id_idx` generated column auto-updates.
+    let rewritten = conn.execute(
+        &format!(
+            "UPDATE memories \
+             SET metadata = json_set(metadata, '$.agent_id', ?2) \
+             WHERE namespace = ?1{owner_filter}"
+        ),
+        params![namespace, to_id],
+    )?;
+
+    Ok(ReownReport {
+        matched,
+        rewritten,
+        dry_run: false,
+    })
 }
 
 /// #1598 — `(total_rows, rows_with_embeddings)` for the reembed
@@ -8040,12 +9960,8 @@ pub fn distinct_embedding_dims(conn: &Connection, namespace: Option<&str>) -> Re
 ///
 /// Bubbles the rusqlite error from the COUNT query.
 pub fn count_embedded_memories(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
+    conn.query_row(crate::SQL_COUNT_EMBEDDED_MEMORIES, [], |row| row.get(0))
+        .map_err(Into::into)
 }
 
 /// Get all stored embeddings as (id, embedding) pairs for building the HNSW index.
@@ -8116,6 +10032,8 @@ pub fn recall_hybrid(
     // partial `idx_memories_source_uri` index covers the lookup. See
     // [`recall`] for the contract.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -8134,6 +10052,7 @@ pub fn recall_hybrid(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     Ok((results, outcome))
 }
@@ -8162,6 +10081,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -8180,6 +10101,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )?;
     Ok((results, outcome))
 }
@@ -8224,6 +10146,13 @@ struct HybridPrep<'a> {
     fts_query: String,
     now: String,
     prefixes: VisibilityPrefixes,
+    // v0.8.0 #1720 A3 — read-path visibility caller (the agent's
+    // `metadata.agent_id`). Threaded into BOTH the SQL
+    // `visibility_clause` caller bind (FTS + linear-scan branches) and
+    // the Rust `is_visible` HNSW branch so the owner-keyed private arm
+    // gates on ownership. Owned `Option<String>` (not a borrow) so the
+    // prep struct outlives the caller arg across the phase calls.
+    caller: Option<String>,
     fts_hierarchy_fragment: String,
     sem_hierarchy_fragment: String,
     effective_namespace: Option<&'a str>,
@@ -8249,6 +10178,8 @@ fn prepare_hybrid_query<'a>(
     as_agent: Option<&str>,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`HybridPrep`].
+    caller: Option<&str>,
 ) -> HybridPrep<'a> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -8276,13 +10207,17 @@ fn prepare_hybrid_query<'a>(
         Some(prefix) if !prefix.is_empty() => Some(format!("{}%", escape_like_pattern(prefix))),
         _ => None,
     };
+    // #1720 A3 — source_uri renumbered up one on both branches because
+    // the caller placeholder binds right after the visibility prefixes:
+    // FTS ?12 → ?13 (vis ?8..?11, caller ?12); semantic ?10 → ?11
+    // (vis ?6..?9, caller ?10).
     let fts_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND m.source_uri LIKE ?12 ESCAPE '\\'"
+        "AND m.source_uri LIKE ?13 ESCAPE '\\'"
     } else {
         ""
     };
     let sem_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND memories.source_uri LIKE ?10 ESCAPE '\\'"
+        "AND memories.source_uri LIKE ?11 ESCAPE '\\'"
     } else {
         ""
     };
@@ -8290,6 +10225,7 @@ fn prepare_hybrid_query<'a>(
         fts_query,
         now,
         prefixes,
+        caller: caller.map(String::from),
         fts_hierarchy_fragment,
         sem_hierarchy_fragment,
         effective_namespace,
@@ -8324,6 +10260,12 @@ fn fts_keyword_phase(
                 m.memory_kind, m.entity_id, m.persona_version,
                 m.citations, m.source_uri, m.source_span,
                 m.confidence_source, m.confidence_signals, m.confidence_decayed_at, m.embedding,
+                -- #228 Commit B — encrypted_envelope rides this recall FTS
+                -- SELECT so row_to_memory decrypts at-rest content. It sits
+                -- AFTER m.embedding (positional index 25, read by row.get(25))
+                -- so the embedding index is unchanged; row_to_memory + the
+                -- fts_score read are by-name and unaffected.
+                m.encrypted_envelope,
                 (fts.rank * -1) + (m.priority * 0.5) + (MIN(m.access_count, 50) * 0.1)
                 + (m.confidence * 2.0)
                 + (CASE m.tier WHEN 'long' THEN 3.0 WHEN 'mid' THEN 1.0 ELSE 0.0 END)
@@ -8346,7 +10288,7 @@ fn fts_keyword_phase(
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
-        vis = visibility_clause(8, "m"),
+        vis = visibility_clause(8, 12, "m"),
     );
     // #1579 B6 — recall’s FTS branch is the hottest read statement;
     // prepare_cached amortises re-parsing across recalls (shape cardinality
@@ -8363,6 +10305,7 @@ fn fts_keyword_phase(
             Ok((mem, fts_score, embedding_bytes))
         };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let caller = prep.caller.as_deref();
     let rows: Vec<(Memory, f64, Option<Vec<u8>>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             fts_stmt
@@ -8379,7 +10322,8 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        uri_param,
+                        caller,    // ?12
+                        uri_param, // ?13
                     ],
                     fts_row_handler,
                 )?
@@ -8399,6 +10343,7 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
+                        caller, // ?12
                     ],
                     fts_row_handler,
                 )?
@@ -8557,7 +10502,7 @@ fn semantic_phase(
             {
                 continue;
             }
-            if !is_visible(mem, &prep.prefixes) {
+            if !is_visible(mem, &prep.prefixes, prep.caller.as_deref()) {
                 continue;
             }
             if !include_archived && is_archived_source(mem) {
@@ -8583,9 +10528,16 @@ fn semantic_phase(
 
     // Fallback: linear scan over all embeddings.
     let sem_sql = format!(
+        // #228 Commit B — `encrypted_envelope` appended AFTER `embedding`
+        // so `row_to_memory` can decrypt at-rest content on this semantic
+        // linear-scan path while the positional `row.get(17)` for
+        // `embedding` (zero-based index 17) stays valid. row_to_memory
+        // reads encrypted_envelope by name, so its position is irrelevant
+        // to the decrypt; only the embedding's positional index is pinned.
         "SELECT id, tier, namespace, title, content, tags, priority,
                 confidence, source, access_count, created_at, updated_at,
-                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding
+                last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, embedding,
+                encrypted_envelope
          FROM memories
          WHERE embedding IS NOT NULL
            AND (?1 IS NULL OR namespace = ?1)
@@ -8600,7 +10552,7 @@ fn semantic_phase(
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
-        vis = visibility_clause(6, "memories"),
+        vis = visibility_clause(6, 10, "memories"),
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
@@ -8613,6 +10565,7 @@ fn semantic_phase(
         Ok((mem, emb_bytes))
     };
     let (vis_p, vis_t, vis_u, vis_o) = prep.prefixes.clone();
+    let caller = prep.caller.as_deref();
     let sem_results: Vec<(Memory, Option<Vec<u8>>)> =
         if let Some(ref uri_param) = prep.source_uri_like_param {
             sem_stmt
@@ -8627,7 +10580,8 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        uri_param,
+                        caller,    // ?10
+                        uri_param, // ?11
                     ],
                     sem_row_handler,
                 )?
@@ -8645,6 +10599,7 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
+                        caller, // ?10
                     ],
                     sem_row_handler,
                 )?
@@ -8821,6 +10776,8 @@ pub fn recall_hybrid_with_telemetry(
     // both pools are constrained by the partial
     // `idx_memories_source_uri` index, not the post-fetch Rust filter.
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -8844,6 +10801,7 @@ pub fn recall_hybrid_with_telemetry(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )
 }
 
@@ -8882,6 +10840,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -8905,6 +10865,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         scoring,
         include_archived,
         source_uri_prefix,
+        caller,
     )
 }
 
@@ -8933,6 +10894,8 @@ fn recall_hybrid_with_telemetry_inner(
     scoring: &crate::config::ResolvedScoring,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
+    // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
+    caller: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -8946,6 +10909,7 @@ fn recall_hybrid_with_telemetry_inner(
         as_agent,
         include_archived,
         source_uri_prefix,
+        caller,
     );
 
     // Stage 2 — FTS5 keyword phase.
@@ -9109,6 +11073,29 @@ pub fn sync_state_observe(
     Ok(())
 }
 
+/// v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — CRDT-lite merge: fold an
+/// `incoming` peer vector clock into `agent_id`'s persisted sync-state
+/// via pointwise max. Each `(peer, last_seen_at)` entry is applied
+/// through the same monotonic [`sync_state_observe`] upsert, so an older
+/// incoming timestamp never regresses a newer stored entry, and peers
+/// the receiver had not yet seen are added.
+///
+/// Additive over [`sync_state_observe`]: where `observe` advances ONE
+/// `(peer, ts)` entry, this enriches the stored receiver clock with
+/// EVERY peer the sender has observed, so the receiver's vector clock
+/// reflects the full transitive set of peer timestamps — the
+/// reconciliation foundation for redundant-push short-circuiting.
+pub fn sync_state_merge(
+    conn: &Connection,
+    agent_id: &str,
+    incoming: &crate::models::VectorClock,
+) -> Result<()> {
+    for (peer_id, seen_at) in &incoming.entries {
+        sync_state_observe(conn, agent_id, peer_id, seen_at)?;
+    }
+    Ok(())
+}
+
 /// Load the full vector clock for `agent_id` — the set of
 /// (`peer_id` -> `last_seen_at`) this local agent tracks.
 pub fn sync_state_load(conn: &Connection, agent_id: &str) -> Result<crate::models::VectorClock> {
@@ -9193,9 +11180,16 @@ pub fn memories_updated_since(
     // the None path read in index order (no predicate) and the Some path
     // use the index as a range bound (`updated_at > ?1`), each with
     // early-stop under the LIMIT.
+    // #228 Commit B — `encrypted_envelope` is included so `row_to_memory`
+    // decrypts at-rest content on this federation catch-up outbound path
+    // (the receiver re-seals under its own local key via `insert_if_newer`).
+    // Omitting it would let the column read as NULL and serve the empty
+    // placeholder as the peer's content. The other named-column reader
+    // (`metadata` etc.) tolerates the addition because `row_to_memory`
+    // reads every column by name.
     const COLS: &str = "SELECT id, tier, namespace, title, content, tags, priority, confidence, \
                 source, access_count, created_at, updated_at, last_accessed_at, \
-                expires_at, metadata \
+                expires_at, metadata, encrypted_envelope \
          FROM memories ";
     let rows = match since {
         None => {
@@ -9870,7 +11864,7 @@ pub fn enforce_governance(
         None
     };
 
-    let decision = evaluate_level(
+    let mut decision = evaluate_level(
         conn,
         action,
         namespace,
@@ -9879,6 +11873,24 @@ pub fn enforce_governance(
         memory_owner,
         ns_owner.as_deref(),
     );
+
+    // #1720 C — per-namespace `required_scope` (refuse-only, fail-closed;
+    // see `governance::required_scope_refusal`). Only overrides an `Allow`,
+    // BEFORE the Advisory/Enforce branch so both modes handle it uniformly.
+    if matches!(action, GovernedAction::Store)
+        && matches!(decision, GovernanceDecision::Allow)
+        && let Some(required) = policy.core.required_scope
+        && let Some(refusal) = crate::governance::required_scope_refusal(
+            required,
+            payload,
+            action,
+            policy.core.write.clone(),
+            agent_id,
+            namespace,
+        )
+    {
+        decision = GovernanceDecision::Deny(refusal);
+    }
 
     // K3 — `Advisory` logs the would-be outcome but does not block or
     // queue a pending row. The capabilities surface continues to
@@ -10270,12 +12282,45 @@ pub enum ApproveOutcome {
     Approved,
 }
 
+/// #1796 (5-agent vote 4d3ea1c5) — the calling surface for
+/// [`approve_with_approver_type`], selecting the Human-arm self-approval
+/// posture. Deliberately has NO `Default`: every caller MUST name its
+/// surface so a future approve route cannot silently inherit the wrong
+/// (hole-reopening) disposition — the original #1796 bug was exactly an
+/// ambient/implicit gate (process env) that never fired on the
+/// multi-tenant HTTP surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApproveSurface {
+    /// The multi-tenant HTTP daemon (`POST /api/v1/...` approve routes).
+    /// The requester and approver are distinct per-request `X-Agent-Id`
+    /// principals, so the Human-arm self-approval reject + registered-approver
+    /// requirement is enforced **unconditionally** (matching the #1793
+    /// postgres fix). There is a real adversary here (any tenant), so a
+    /// requester must never be able to self-approve their own Human-gated
+    /// action.
+    Http,
+    /// The single-operator local surfaces (MCP/stdio + CLI). The Human-arm
+    /// gate is enforced only under the multi-agent **opt-in**
+    /// (`resolve_read_visibility_caller()` Some = `AI_MEMORY_AGENT_ID` set).
+    /// In the trust-all default the requester and approver both resolve to
+    /// the same durable `host:<hostname>` id (#1720 B1), so an unconditional
+    /// reject-self would self-lock the lone operator out of approving their
+    /// own queued actions — and there is no adversary (one caller).
+    LocalOperator,
+}
+
 /// Task 1.10 — approver-type aware approve. Enforces the
 /// `metadata.governance.approver` of the pending action's namespace.
+///
+/// `surface` (#1796) selects the Human-arm self-approval posture — see
+/// [`ApproveSurface`]. The multi-tenant HTTP surface enforces
+/// unconditionally; the single-operator MCP/CLI surfaces keep the
+/// `AI_MEMORY_AGENT_ID` opt-in.
 pub fn approve_with_approver_type(
     conn: &Connection,
     pending_id: &str,
     approver_agent_id: &str,
+    surface: ApproveSurface,
 ) -> Result<ApproveOutcome> {
     let Some(pa) = get_pending_action(conn, pending_id)? else {
         // #1620 — typed NotFound (was Rejected → 403; postgres 404'd).
@@ -10296,6 +12341,51 @@ pub fn approve_with_approver_type(
 
     match approver {
         ApproverType::Human => {
+            // #1787 (5-agent vote 4d3ea1c5 → C) — the Human arm (the DEFAULT
+            // when a namespace has no/loose standard) otherwise accepts ANY
+            // claimed `approver_agent_id`, so an agent whose action was routed
+            // to a Human-gated `pending` queue could self-approve it, defeating
+            // the human-in-the-loop gate. Harden it ONLY under the multi-tenant
+            // opt-in (`resolve_read_visibility_caller()` Some = AI_MEMORY_AGENT_ID
+            // set), mirroring the #1786/#1772 owner-gate posture: in the
+            // single-operator trust-all default the requester and the approver
+            // both resolve to the same durable `host:<hostname>` id (#1720 B1),
+            // so an unconditional reject-self would self-lock the operator out of
+            // approving their own queued actions — and there is no adversary (one
+            // caller). Under the opt-in: (1) the requester may not approve their
+            // own action, and (2) the approver must be a REGISTERED agent —
+            // raising the bar from "claim any string" to "operator pre-registered
+            // this id", the same hardening #216 applied to the Consensus arm.
+            // (Full operator-pubkey SIGNATURE attestation would require threading
+            // a signature through the MCP request -> handler -> this storage fn,
+            // a public-contract change tracked as a separate follow-up.)
+            //
+            // #1796 (5-agent vote 4d3ea1c5) — the opt-in predicate above was
+            // correct ONLY for the single-operator MCP/CLI surface. The
+            // multi-tenant HTTP daemon does NOT set `AI_MEMORY_AGENT_ID`
+            // (it uses per-request `X-Agent-Id`), so the env-keyed gate never
+            // fired there and a requester could self-approve their own
+            // Human-gated action. The `surface` arg now selects the posture:
+            // HTTP enforces UNCONDITIONALLY (matching the #1793 postgres fix);
+            // the local single-operator surfaces keep the env opt-in.
+            let enforce_human_gate = match surface {
+                ApproveSurface::Http => true,
+                ApproveSurface::LocalOperator => {
+                    crate::identity::resolve_read_visibility_caller().is_some()
+                }
+            };
+            if enforce_human_gate {
+                if approver_agent_id == pa.requested_by {
+                    return Ok(ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.into(),
+                    ));
+                }
+                if !is_registered_agent(conn, approver_agent_id) {
+                    return Ok(ApproveOutcome::Rejected(format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
+            }
             let ok = decide_pending_action(conn, pending_id, true, approver_agent_id)?;
             if ok {
                 Ok(ApproveOutcome::Approved)
@@ -11551,17 +13641,33 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
     fn mem_with_scope(ns: &str, scope: Option<&str>) -> Memory {
+        mem_with_scope_owner(ns, scope, None)
+    }
+
+    // v0.8.0 #1720 A4 — the Private arm is owner-keyed, so the
+    // `is_visible` matrix test needs to stamp `metadata.agent_id` on
+    // private rows to assert owner / non-owner / inbox-target outcomes.
+    fn mem_with_scope_owner(ns: &str, scope: Option<&str>, owner: Option<&str>) -> Memory {
         let mut m = make_memory("scoped", ns, Tier::Long, 5);
+        let mut map = serde_json::Map::new();
         if let Some(s) = scope {
-            let mut map = serde_json::Map::new();
             map.insert(
                 crate::META_KEY_SCOPE.to_string(),
                 serde_json::Value::String(s.to_string()),
             );
+        }
+        if let Some(o) = owner {
+            map.insert(
+                crate::META_KEY_AGENT_ID.to_string(),
+                serde_json::Value::String(o.to_string()),
+            );
+        }
+        if !map.is_empty() {
             m.metadata = serde_json::Value::Object(map);
         }
         m
@@ -11574,11 +13680,20 @@ mod tests {
     // carry — leaving the other arms uncovered. Deterministic, no DB.
     #[test]
     fn is_visible_scope_matrix_covers_every_arm() {
-        // No-agent caller (all-None prefixes) bypasses the filter entirely.
+        // v0.8.0 #1720 A4 — Private is owner-keyed; team/unit/org stay
+        // namespace-keyed (by design). `caller` is the resolved
+        // visibility principal (the agent's `metadata.agent_id`),
+        // DISTINCT from the namespace prefixes.
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+
+        // No-agent (all-None prefixes) bypasses the filter entirely,
+        // regardless of caller.
         let unfiltered = (None, None, None, None);
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web", Some("private")),
-            &unfiltered
+            &mem_with_scope_owner("acme/eng/web", Some("private"), Some(ALICE)),
+            &unfiltered,
+            Some(BOB),
         ));
 
         // 4-level agent ns populates every prefix slot:
@@ -11594,64 +13709,97 @@ mod tests {
             )
         );
 
-        // Collective: visible to anyone.
+        // Collective: visible to anyone (caller irrelevant).
         assert!(super::is_visible(
             &mem_with_scope("zzz/other", Some("collective")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
-        // Private: only the caller's own namespace (p) is visible.
+        // Private: OWNER-keyed — owner sees it regardless of namespace;
+        // a non-owner does NOT (this is the #1720 leak fix). The
+        // pre-#1720 contract (visible iff same namespace) is GONE.
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web/team", Some("private")),
-            &prefixes
+            &mem_with_scope_owner("zzz/unrelated/ns", Some("private"), Some(ALICE)),
+            &prefixes,
+            Some(ALICE),
         ));
         assert!(!super::is_visible(
-            &mem_with_scope("acme/eng/web", Some("private")),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE)),
+            &prefixes,
+            Some(BOB),
+        ));
+        // Inbox carve-out: target_agent_id=bob lets bob read alice's
+        // private row.
+        {
+            let mut inbox = mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE));
+            if let serde_json::Value::Object(map) = &mut inbox.metadata {
+                map.insert(
+                    crate::META_KEY_TARGET_AGENT_ID.to_string(),
+                    serde_json::Value::String(BOB.to_string()),
+                );
+            }
+            assert!(super::is_visible(&inbox, &prefixes, Some(BOB)));
+        }
+        // Fail-closed: a NULL caller sees NO private rows.
+        assert!(!super::is_visible(
+            &mem_with_scope_owner("acme/eng/web/team", Some("private"), Some(ALICE)),
+            &prefixes,
+            None,
         ));
 
-        // Absent scope key → MemoryScope::default() (Private) semantics.
+        // Absent scope key → MemoryScope::default() (Private) → owner-keyed.
         assert!(super::is_visible(
-            &mem_with_scope("acme/eng/web/team", None),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", None, Some(ALICE)),
+            &prefixes,
+            Some(ALICE),
         ));
         assert!(!super::is_visible(
-            &mem_with_scope("acme/other", None),
-            &prefixes
+            &mem_with_scope_owner("acme/eng/web/team", None, Some(ALICE)),
+            &prefixes,
+            Some(BOB),
         ));
 
-        // Team subtree (t = acme/eng/web): exact + descendant in, sibling out.
+        // Team subtree (t = acme/eng/web): exact + descendant in, sibling
+        // out. Namespace-keyed — caller identity does not gate team/unit/org.
         assert!(super::is_visible(
             &mem_with_scope("acme/eng/web", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(super::is_visible(
             &mem_with_scope("acme/eng/web/team/v2", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("acme/eng/api", Some("team")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // Unit subtree (u = acme/eng).
         assert!(super::is_visible(
             &mem_with_scope("acme/eng", Some("unit")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("acme/sales", Some("unit")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // Org subtree (o = acme).
         assert!(super::is_visible(
             &mem_with_scope("acme", Some("org")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
         assert!(!super::is_visible(
             &mem_with_scope("globex", Some("org")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // matches_subtree None arm: a shallow agent leaves the org slot empty,
@@ -11660,19 +13808,196 @@ mod tests {
         assert_eq!(shallow.3, None);
         assert!(!super::is_visible(
             &mem_with_scope("acme", Some("org")),
-            &shallow
+            &shallow,
+            Some(BOB),
         ));
 
         // Unknown scope string → from_str None → caller denied.
         assert!(!super::is_visible(
             &mem_with_scope("acme/eng/web/team", Some("definitely-not-a-scope")),
-            &prefixes
+            &prefixes,
+            Some(BOB),
         ));
 
         // None-agent → all-None tuple (the no-filter sentinel).
         assert_eq!(
             super::compute_visibility_prefixes(None),
             (None, None, None, None)
+        );
+    }
+
+    /// v0.8.0 #1720 A5 — anti-re-drift MATRIX. Asserts the THREE
+    /// visibility predicates agree across
+    /// `scope × owner × caller × namespace-relationship`:
+    ///
+    ///   1. the SQL `visibility_clause` (exercised through a real
+    ///      `db::search` against an in-memory DB holding ONE row),
+    ///   2. the Rust `is_visible` (the HNSW-branch predicate),
+    ///   3. the canonical `crate::visibility::is_visible_to_caller`.
+    ///
+    /// The load-bearing point: **private is owner-keyed in ALL THREE**.
+    /// The team/unit/org scopes are namespace-keyed by design in the SQL
+    /// + `is_visible` predicates, while `is_visible_to_caller` only
+    /// models private/collective/owner — so the matrix asserts:
+    ///   - private + collective cells: ALL THREE agree.
+    ///   - team/unit/org cells: SQL and `is_visible` agree (both
+    ///     namespace-keyed); `is_visible_to_caller` is not asserted on
+    ///     those cells because it does not model subtree scoping
+    ///     (documented by-design divergence).
+    #[test]
+    fn visibility_private_owner_keyed_matrix_1720() {
+        use crate::models::namespace::MemoryScope;
+
+        const ALICE: &str = "ai:alice";
+        const BOB: &str = "ai:bob";
+        // The caller's namespace position. All rows live in `MATCH`;
+        // `SUBTREE` is a parent of `MATCH`; `MISMATCH` is unrelated.
+        const MATCH: &str = "fortitude/team/x";
+        const SUBTREE: &str = "fortitude/team"; // parent (team/unit arms)
+        const MISMATCH: &str = "globex/other";
+
+        // The single row always lives in MATCH so the namespace-keyed
+        // arms (team/unit/org) see it from MATCH/SUBTREE callers.
+        let row_ns = MATCH;
+
+        // Build the single matrix row.
+        let make_row = |scope: Option<&str>, owner: Option<&str>| -> Memory {
+            let mut m = make_memory("matrix-needle", row_ns, Tier::Long, 5);
+            // shared FTS token so `db::search("needle")` matches.
+            m.content = "needle in the matrix haystack".to_string();
+            let mut map = serde_json::Map::new();
+            if let Some(s) = scope {
+                map.insert(
+                    crate::META_KEY_SCOPE.to_string(),
+                    serde_json::Value::String(s.to_string()),
+                );
+            }
+            if let Some(o) = owner {
+                map.insert(
+                    crate::META_KEY_AGENT_ID.to_string(),
+                    serde_json::Value::String(o.to_string()),
+                );
+            }
+            m.metadata = serde_json::Value::Object(map);
+            m
+        };
+
+        // SQL outcome: insert the row, run a real `db::search` with the
+        // given `as_agent` (namespace) + `caller` (owner identity), and
+        // report whether the row surfaced.
+        let sql_visible = |scope: Option<&str>,
+                           owner: Option<&str>,
+                           as_agent: Option<&str>,
+                           caller: Option<&str>|
+         -> bool {
+            let conn = test_db();
+            let m = make_row(scope, owner);
+            insert(&conn, &m).expect("insert matrix row");
+            let hits = search(
+                &conn, "needle", None, None, 10, None, None, None, None, None, as_agent, false,
+                caller,
+            )
+            .expect("search");
+            !hits.is_empty()
+        };
+
+        // The matrix axes.
+        let scopes = [
+            ("private", MemoryScope::Private.as_str()),
+            ("collective", MemoryScope::Collective.as_str()),
+            ("team", MemoryScope::Team.as_str()),
+            ("unit", MemoryScope::Unit.as_str()),
+            ("org", MemoryScope::Org.as_str()),
+        ];
+        let owners = [("alice", Some(ALICE)), ("none", None)];
+        let callers = [("alice", Some(ALICE)), ("bob", Some(BOB)), ("none", None)];
+        // The namespace position the CALLER operates from (as_agent).
+        let ns_rels = [
+            ("match", MATCH),
+            ("mismatch", MISMATCH),
+            ("subtree", SUBTREE),
+        ];
+
+        for (scope_label, scope) in scopes {
+            for (owner_label, owner) in owners {
+                for (caller_label, caller) in callers {
+                    for (ns_label, as_agent) in ns_rels {
+                        let m = make_row(Some(scope), owner);
+                        let prefixes = super::compute_visibility_prefixes(Some(as_agent));
+
+                        let sql = sql_visible(Some(scope), owner, Some(as_agent), caller);
+                        let rust = super::is_visible(&m, &prefixes, caller);
+
+                        let cell = format!(
+                            "scope={scope_label} owner={owner_label} caller={caller_label} \
+                             ns={ns_label}: sql={sql} rust={rust}"
+                        );
+
+                        // SQL and the Rust HNSW predicate must ALWAYS
+                        // agree — they are the two enforcement points
+                        // for the same row (private owner-keyed,
+                        // team/unit/org namespace-keyed, collective open).
+                        assert_eq!(sql, rust, "SQL vs is_visible disagree — {cell}");
+
+                        // The canonical `is_visible_to_caller` is only
+                        // defined for a concrete caller (the `None`
+                        // fail-closed contract lives in its wrappers —
+                        // `is_visible` + the SQL `?caller IS NOT NULL`
+                        // guard — not in the predicate itself). So the
+                        // all-three agreement is asserted on the cells
+                        // `is_visible_to_caller` models: private +
+                        // collective, with a `Some` caller. team/unit/org
+                        // are namespace-keyed by design and NOT modelled
+                        // by `is_visible_to_caller` (documented
+                        // divergence); the `sql==rust` assert above pins
+                        // their agreement.
+                        if let Some(c) = caller
+                            && (scope == MemoryScope::Private.as_str()
+                                || scope == MemoryScope::Collective.as_str())
+                        {
+                            let canon = crate::visibility::is_visible_to_caller(&m, c);
+                            assert_eq!(
+                                sql, canon,
+                                "private/collective must be owner-keyed in ALL THREE — \
+                                 {cell} canon={canon}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Explicit spot-checks of the headline #1720 fix (private is
+        // owner-keyed, NOT namespace-keyed):
+        // bob in the SAME namespace as alice's private row sees NOTHING.
+        assert!(
+            !sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MATCH),
+                Some(BOB)
+            ),
+            "#1720: bob (same namespace) MUST NOT see alice's private row"
+        );
+        // alice (owner) sees it from ANY namespace position.
+        assert!(
+            sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MISMATCH),
+                Some(ALICE)
+            ),
+            "owner MUST see her own private row regardless of as_agent namespace"
+        );
+        // NULL caller (no identity) sees no private row: fail-closed.
+        assert!(
+            !sql_visible(
+                Some(MemoryScope::Private.as_str()),
+                Some(ALICE),
+                Some(MATCH),
+                None
+            ),
+            "fail-closed: NULL caller MUST NOT see private rows"
         );
     }
 
@@ -12092,6 +14417,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller — as_agent None => trust-all, caller irrelevant
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -12115,6 +14441,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller
         )
         .unwrap();
         assert_eq!(results.len(), 0);
@@ -12148,6 +14475,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -12176,6 +14504,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -12479,6 +14808,140 @@ mod tests {
         );
     }
 
+    /// #1771 — DOCUMENTS the current archive->restore edge-loss: a restored
+    /// memory comes back WITHOUT its `memory_links` (cascade-reaped at delete
+    /// time, never copied into the archive). This pins the KNOWN-LOSS behaviour
+    /// as the honesty floor of #1771 (5-agent vote 4d3ea1c5); when the
+    /// `archived_memory_links` structural fix lands, the final assertion flips
+    /// to expect edge SURVIVAL (1), and this test becomes the regression guard.
+    #[test]
+    fn restore_does_not_recover_links_documented_loss_1771() {
+        let conn = test_db();
+        // A is a gc-eligible short-tier row (past expiry); B is permanent.
+        let mut a = make_memory("link-loss-A", "ns1771", Tier::Short, 5);
+        a.expires_at = Some("2020-01-01T00:00:00+00:00".to_string());
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("link-loss-B", "ns1771", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "precondition: A has one outbound link"
+        );
+
+        // Archive + delete A (the same-tx cascade reaps the A->B link).
+        let removed = gc(&conn, true).unwrap();
+        assert!(
+            removed >= 1,
+            "gc must archive+delete the expired short-tier A"
+        );
+        assert!(
+            get(&conn, &a_id).unwrap().is_none(),
+            "A is deleted from live memories"
+        );
+
+        // Restore A: the ROW returns, the edge graph does NOT (#1771).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert!(get(&conn, &a_id).unwrap().is_some(), "A is live again");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            0,
+            "#1771 DOCUMENTED LOSS: a restored memory's memory_links are NOT \
+             recovered (cascade-reaped at delete time, not archived). Flip this \
+             to expect 1 when archived_memory_links preservation lands."
+        );
+    }
+
+    /// #1771 (5-agent vote 4d3ea1c5) — `forget(archive=true)` then restore
+    /// preserves the archived memory's `memory_links`. A is in a namespace
+    /// the forget targets; B is permanent in a DIFFERENT namespace so it
+    /// survives the forget and is a live endpoint at restore time.
+    #[test]
+    fn forget_then_restore_preserves_links_1771() {
+        let conn = test_db();
+        let a = make_memory("forget-link-A", "ns-forget-A", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("forget-link-B", "ns-survives-B", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "precondition: A has one outbound link to B"
+        );
+
+        // Forget (archive) only A's namespace; B is in another namespace.
+        let deleted = forget(&conn, Some("ns-forget-A"), None, None, true).unwrap();
+        assert_eq!(deleted, 1, "forget archives+deletes A only");
+        assert!(get(&conn, &a_id).unwrap().is_none(), "A removed from live");
+        assert!(
+            get(&conn, &b_id).unwrap().is_some(),
+            "B survives the forget"
+        );
+
+        // Restore A: the A->B edge returns (B is still a live endpoint).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "#1771: restore re-inserts the preserved A->B link (B survived)"
+        );
+    }
+
+    /// #1771 — `archive_memory` (single-row clean archive) then restore
+    /// preserves the memory's `memory_links`. Both A and B are permanent.
+    #[test]
+    fn archive_memory_then_restore_preserves_links_1771() {
+        let conn = test_db();
+        let a = make_memory("archive-link-A", "ns1771b", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("archive-link-B", "ns1771b", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(get_links(&conn, &a_id).unwrap().len(), 1);
+
+        assert!(
+            archive_memory(&conn, &a_id, None).unwrap(),
+            "A archived+deleted"
+        );
+        assert!(get(&conn, &a_id).unwrap().is_none(), "A removed from live");
+
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            1,
+            "#1771: restore re-inserts the preserved A->B link"
+        );
+    }
+
+    /// #1771 — restore SKIPS a preserved edge whose OTHER endpoint is
+    /// permanently gone (the FK `ON DELETE CASCADE` would reject it). No FK
+    /// error; the orphan edge is simply not restored.
+    #[test]
+    fn restore_skips_link_whose_other_endpoint_is_gone_1771() {
+        let conn = test_db();
+        let a = make_memory("orphan-link-A", "ns1771c", Tier::Long, 5);
+        let a_id = insert(&conn, &a).unwrap();
+        let b = make_memory("orphan-link-B", "ns1771c", Tier::Long, 5);
+        let b_id = insert(&conn, &b).unwrap();
+        create_link(&conn, &a_id, &b_id, "related_to").unwrap();
+        assert_eq!(get_links(&conn, &a_id).unwrap().len(), 1);
+
+        // Archive A (snapshots the A->B edge), then HARD-delete B so its
+        // endpoint is permanently gone.
+        assert!(archive_memory(&conn, &a_id, None).unwrap());
+        assert!(delete(&conn, &b_id).unwrap(), "B hard-deleted");
+
+        // Restore A: the A->B edge is skipped (B no longer exists).
+        assert!(restore_archived(&conn, &a_id).unwrap(), "A row restored");
+        assert_eq!(
+            get_links(&conn, &a_id).unwrap().len(),
+            0,
+            "#1771: orphan edge correctly skipped (B's endpoint is gone) — no FK error"
+        );
+    }
+
     #[test]
     fn purge_archive_removes_all() {
         let conn = test_db();
@@ -12591,6 +15054,214 @@ mod tests {
         assert!(archive_memory(&conn, &id, None).unwrap());
         let archived = list_archived(&conn, None, 10, 0).unwrap();
         assert_eq!(archived[0]["archive_reason"], "archive");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-2.5 (#1709) — size_gc (corpus byte-cap eviction)
+    // -----------------------------------------------------------------
+
+    /// Build a memory whose `content` is exactly `content_len` bytes (ASCII
+    /// 'x'), so the row's `length(title)+length(content)+length(metadata)`
+    /// payload size is fully predictable for cap arithmetic.
+    fn sized_memory(
+        title: &str,
+        ns: &str,
+        tier: Tier,
+        priority: i32,
+        content_len: usize,
+    ) -> Memory {
+        let mut m = make_memory(title, ns, tier, priority);
+        m.content = "x".repeat(content_len);
+        m
+    }
+
+    #[test]
+    fn size_gc_under_cap_is_noop() {
+        let conn = test_db();
+        let m = sized_memory("a", "sgc", Tier::Long, 5, 100);
+        insert(&conn, &m).unwrap();
+        // Corpus is well under a generous cap → 0 evicted, row stays live.
+        let evicted = size_gc(&conn, "sgc", 1_000_000, true).unwrap();
+        assert_eq!(evicted, 0, "under-cap is a no-op");
+        assert!(get(&conn, &m.id).unwrap().is_some(), "row stays live");
+    }
+
+    #[test]
+    fn size_gc_cap_exactly_at_corpus_does_not_evict() {
+        let conn = test_db();
+        let m = sized_memory("exact", "sgc", Tier::Long, 5, 100);
+        insert(&conn, &m).unwrap();
+        // corpus == length(title) + length(content) + length(metadata).
+        let corpus = namespace_corpus_bytes(&conn, "sgc").unwrap();
+        // Cap exactly at corpus → `corpus <= cap` holds → no eviction.
+        let evicted = size_gc(&conn, "sgc", corpus, true).unwrap();
+        assert_eq!(evicted, 0, "cap exactly at corpus evicts nothing");
+        assert!(get(&conn, &m.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn size_gc_over_cap_evicts_to_under_cap() {
+        let conn = test_db();
+        // Three ~1KB rows, all long tier so tier doesn't reorder them; the
+        // tie-break then falls to priority ASC.
+        let low = sized_memory("low", "sgc", Tier::Long, 1, 1000);
+        let mid = sized_memory("mid", "sgc", Tier::Long, 5, 1000);
+        let high = sized_memory("high", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &low).unwrap();
+        insert(&conn, &mid).unwrap();
+        insert(&conn, &high).unwrap();
+
+        // Cap at ~1.5 rows so two rows must be evicted (lowest priority
+        // first: `low` then `mid`), leaving only `high` under cap.
+        let cap = 1500;
+        let evicted = size_gc(&conn, "sgc", cap, true).unwrap();
+        assert_eq!(evicted, 2, "two lowest-value rows evicted to reach cap");
+        assert!(get(&conn, &low.id).unwrap().is_none(), "low-priority gone");
+        assert!(get(&conn, &mid.id).unwrap().is_none(), "mid-priority gone");
+        assert!(
+            get(&conn, &high.id).unwrap().is_some(),
+            "highest-priority survives"
+        );
+        assert!(
+            namespace_corpus_bytes(&conn, "sgc").unwrap() <= cap,
+            "corpus is back at/under cap"
+        );
+    }
+
+    #[test]
+    fn size_gc_archive_eviction_is_atomic_1782() {
+        // #1782 — each victim's archive+delete must commit ATOMICALLY: an
+        // evicted row must land in archived_memories (reason 'size_gc'), never
+        // deleted-but-not-archived. The per-victim `BEGIN IMMEDIATE` wrapper
+        // guarantees this; a regression to the unwrapped `archive_memory_no_tx`
+        // call (the pre-#1782 shape, two autocommit statements) fails here.
+        let conn = test_db();
+        let low = sized_memory("low", "sgc2", Tier::Long, 1, 1000);
+        let high = sized_memory("high", "sgc2", Tier::Long, 9, 1000);
+        insert(&conn, &low).unwrap();
+        insert(&conn, &high).unwrap();
+
+        let evicted = size_gc(&conn, "sgc2", 1500, true).unwrap();
+        assert_eq!(evicted, 1, "one lowest-value row evicted to reach cap");
+        assert!(
+            get(&conn, &low.id).unwrap().is_none(),
+            "low-value row evicted from live memories"
+        );
+
+        // The evicted row was archived (archive committed in the same tx).
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories \
+                 WHERE id = ?1 AND archive_reason = 'size_gc'",
+                params![low.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archived, 1,
+            "#1782: evicted row must be archived (restorable), not lost"
+        );
+    }
+
+    #[test]
+    fn size_gc_eviction_order_tier_dominates_priority() {
+        // A low-priority SHORT-tier row must be evicted BEFORE a
+        // high-priority LONG-tier row: tier is the primary ranking key.
+        let conn = test_db();
+        let short_lowp = sized_memory("short", "sgc", Tier::Short, 1, 1000);
+        let long_highp = sized_memory("long", "sgc", Tier::Long, 10, 1000);
+        insert(&conn, &short_lowp).unwrap();
+        insert(&conn, &long_highp).unwrap();
+
+        // Cap that forces exactly one eviction.
+        let evicted = size_gc(&conn, "sgc", 1500, true).unwrap();
+        assert_eq!(evicted, 1, "one row evicted");
+        assert!(
+            get(&conn, &short_lowp.id).unwrap().is_none(),
+            "short-tier row evicted first (least durable)"
+        );
+        assert!(
+            get(&conn, &long_highp.id).unwrap().is_some(),
+            "long-tier high-priority row survives"
+        );
+    }
+
+    #[test]
+    fn size_gc_archived_victims_are_restorable() {
+        let conn = test_db();
+        let victim = sized_memory("victim", "sgc", Tier::Short, 1, 1000);
+        let keep = sized_memory("keep", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &victim).unwrap();
+        insert(&conn, &keep).unwrap();
+
+        let evicted = size_gc(&conn, "sgc", 1500, true).unwrap();
+        assert_eq!(evicted, 1);
+        // The evicted row lands in the archive with the size_gc reason and
+        // is therefore restorable.
+        let stats = archive_stats(&conn).unwrap();
+        assert_eq!(stats["archived_total"], 1, "victim archived, not lost");
+        let archived = list_archived(&conn, Some("sgc"), 10, 0).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0]["id"], victim.id);
+        assert_eq!(
+            archived[0]["archive_reason"], "size_gc",
+            "archive carries the size_gc reason, distinct from ttl_expired"
+        );
+        // Restore round-trips the row back to live.
+        assert!(restore_archived(&conn, &victim.id).unwrap(), "restorable");
+        assert!(
+            get(&conn, &victim.id).unwrap().is_some(),
+            "row is live again"
+        );
+    }
+
+    #[test]
+    fn size_gc_hard_delete_path_does_not_archive() {
+        let conn = test_db();
+        let victim = sized_memory("victim", "sgc", Tier::Short, 1, 1000);
+        let keep = sized_memory("keep", "sgc", Tier::Long, 9, 1000);
+        insert(&conn, &victim).unwrap();
+        insert(&conn, &keep).unwrap();
+
+        // archive=false → hard delete, nothing in the archive.
+        let evicted = size_gc(&conn, "sgc", 1500, false).unwrap();
+        assert_eq!(evicted, 1);
+        assert!(get(&conn, &victim.id).unwrap().is_none());
+        let stats = archive_stats(&conn).unwrap();
+        assert_eq!(
+            stats["archived_total"], 0,
+            "hard-delete path archives nothing"
+        );
+    }
+
+    #[test]
+    fn size_gc_nonpositive_cap_is_disabled() {
+        let conn = test_db();
+        let m = sized_memory("a", "sgc", Tier::Long, 5, 1000);
+        insert(&conn, &m).unwrap();
+        // A zero / negative cap is treated as disabled (no-op), never a
+        // total wipe.
+        assert_eq!(size_gc(&conn, "sgc", 0, true).unwrap(), 0);
+        assert_eq!(size_gc(&conn, "sgc", -1, true).unwrap(), 0);
+        assert!(get(&conn, &m.id).unwrap().is_some(), "row untouched");
+    }
+
+    #[test]
+    fn size_gc_is_namespace_scoped() {
+        // Eviction must only touch the target namespace.
+        let conn = test_db();
+        let target = sized_memory("t", "sgc-a", Tier::Long, 1, 2000);
+        let other = sized_memory("o", "sgc-b", Tier::Short, 1, 2000);
+        insert(&conn, &target).unwrap();
+        insert(&conn, &other).unwrap();
+
+        let evicted = size_gc(&conn, "sgc-a", 500, true).unwrap();
+        assert_eq!(evicted, 1, "only the target namespace row evicted");
+        assert!(get(&conn, &target.id).unwrap().is_none());
+        assert!(
+            get(&conn, &other.id).unwrap().is_some(),
+            "other namespace untouched even though it is over the same cap"
+        );
     }
 
     #[test]
@@ -12816,6 +15487,43 @@ mod tests {
     }
 
     #[test]
+    fn forget_archive_and_delete_are_atomic_1776() {
+        // #1776 — forget(archive=true) must archive AND delete the SAME matched
+        // set inside ONE transaction: every deleted row lands in
+        // archived_memories (none deleted-but-not-archived), and none is left
+        // both live and archived. The `BEGIN IMMEDIATE` wrapper guarantees this;
+        // this test pins the contract so a regression to two autocommit
+        // statements (the pre-#1776 shape) fails here.
+        let conn = test_db();
+        insert(&conn, &make_memory("A", "forget-ns", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("B", "forget-ns", Tier::Long, 5)).unwrap();
+        insert(&conn, &make_memory("C", "keep-ns", Tier::Long, 5)).unwrap();
+
+        let deleted = forget(&conn, Some("forget-ns"), None, None, true).unwrap();
+        assert_eq!(deleted, 2, "both forget-ns rows deleted");
+
+        // Deleted from live `memories` (only keep-ns remains).
+        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].namespace, "keep-ns");
+
+        // Every deleted row was archived (archive set == delete set, both
+        // committed) — no row deleted-but-not-archived, no divergence.
+        let archived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM archived_memories \
+                 WHERE namespace = ?1 AND archive_reason = 'forget'",
+                params!["forget-ns"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            archived, 2,
+            "#1776: every deleted row must be archived (archive set must equal delete set)"
+        );
+    }
+
+    #[test]
     fn set_and_get_embedding() {
         let conn = test_db();
         let mem = make_memory("Embed test", "test", Tier::Long, 5);
@@ -12949,6 +15657,171 @@ mod tests {
         .unwrap();
         assert_eq!(n, 0);
         assert_eq!(set_embeddings_batch_reembed(&mut conn, &[]).unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 #1709/#1720 WS-B B2 — `reown` (rewrite metadata.agent_id).
+    // -----------------------------------------------------------------
+
+    /// Insert a row with explicit metadata so the reown tests can seed
+    /// owned / unowned / multi-key shapes.
+    fn insert_with_meta(
+        conn: &Connection,
+        title: &str,
+        ns: &str,
+        meta: serde_json::Value,
+    ) -> String {
+        let mut m = make_memory(title, ns, Tier::Long, 5);
+        m.metadata = meta;
+        insert(conn, &m).unwrap()
+    }
+
+    fn agent_id_of(conn: &Connection, id: &str) -> Option<String> {
+        get(conn, id)
+            .unwrap()
+            .unwrap()
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    /// Default reown rewrites every OWNED row's agent_id to `--to`,
+    /// preserves the other metadata keys, leaves unowned rows + other
+    /// namespaces untouched, and the `agent_id_idx` reflects the owner.
+    #[test]
+    fn reown_rewrites_owned_rows_preserving_other_keys_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice", "scope": "private", "k": "v"}),
+        );
+        let other_ns = insert_with_meta(
+            &conn,
+            "elsewhere",
+            "other-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+
+        let report = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.rewritten, 1);
+        assert!(!report.dry_run);
+
+        // Owner rewritten; sibling metadata keys preserved.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+        let meta = get(&conn, &owned).unwrap().unwrap().metadata;
+        assert_eq!(meta.get("scope").and_then(|v| v.as_str()), Some("private"));
+        assert_eq!(meta.get("k").and_then(|v| v.as_str()), Some("v"));
+
+        // Generated agent_id_idx re-projects the new owner.
+        let idx: Option<String> = conn
+            .query_row(
+                "SELECT agent_id_idx FROM memories WHERE id = ?1",
+                params![owned],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx.as_deref(), Some("bob"));
+
+        // Other namespace untouched.
+        assert_eq!(agent_id_of(&conn, &other_ns).as_deref(), Some("alice"));
+    }
+
+    /// dry-run COUNTS matched rows but writes NOTHING.
+    #[test]
+    fn reown_dry_run_counts_but_does_not_write_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.rewritten, 0);
+        assert!(report.dry_run);
+        // No write happened.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
+    }
+
+    /// `--claim-unowned` covers empty/missing-agent_id rows; the default
+    /// leaves them untouched.
+    #[test]
+    fn reown_claim_unowned_covers_empty_and_missing_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let empty = insert_with_meta(
+            &conn,
+            "empty",
+            "claim-ns",
+            serde_json::json!({"agent_id": ""}),
+        );
+        let missing = insert_with_meta(
+            &conn,
+            "missing",
+            "claim-ns",
+            serde_json::json!({"scope": "private"}),
+        );
+
+        // Default leaves the unowned rows alone (matches only `owned`).
+        let default_report = reown(&conn, "claim-ns", "bob", false, true).unwrap();
+        assert_eq!(default_report.matched, 1);
+
+        // claim_unowned covers all three.
+        let report = reown(&conn, "claim-ns", "bob", true, false).unwrap();
+        assert_eq!(report.matched, 3);
+        assert_eq!(report.rewritten, 3);
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+        assert_eq!(agent_id_of(&conn, &empty).as_deref(), Some("bob"));
+        assert_eq!(agent_id_of(&conn, &missing).as_deref(), Some("bob"));
+        // The previously-missing row had its other keys preserved.
+        let meta = get(&conn, &missing).unwrap().unwrap().metadata;
+        assert_eq!(meta.get("scope").and_then(|v| v.as_str()), Some("private"));
+    }
+
+    /// Running reown twice is idempotent (second run rewrites the same
+    /// rows to the same id, no error, same count).
+    #[test]
+    fn reown_is_idempotent_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        let first = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        let second = reown(&conn, "claim-ns", "bob", false, false).unwrap();
+        assert_eq!(first.rewritten, 1);
+        assert_eq!(second.matched, 1);
+        assert_eq!(second.rewritten, 1);
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("bob"));
+    }
+
+    /// A malformed `--to` agent_id is rejected before any write.
+    #[test]
+    fn reown_rejects_invalid_to_id_b2() {
+        let conn = test_db();
+        let owned = insert_with_meta(
+            &conn,
+            "owned",
+            "claim-ns",
+            serde_json::json!({"agent_id": "alice"}),
+        );
+        // Whitespace / control chars are rejected by validate_agent_id.
+        let err = reown(&conn, "claim-ns", "bad id\n", false, false).unwrap_err();
+        assert!(format!("{err}").contains("agent_id"), "got: {err}");
+        // No write happened.
+        assert_eq!(agent_id_of(&conn, &owned).as_deref(), Some("alice"));
     }
 
     /// #1598 — dry-run coverage counts, with and without the namespace
@@ -13284,6 +16157,240 @@ mod tests {
         assert_eq!(got.content, "Updated via sync");
     }
 
+    /// #1757 / #1719 item 2b — populate-on-write. A LOCAL `insert`
+    /// advances THIS node's own component of the per-memory vector clock;
+    /// the federation RECEIVE write (`insert_if_newer`) does NOT stamp, so
+    /// a remote row the receiver did not author never gains a fabricated
+    /// clock component (it only learns peers' components via merge).
+    #[test]
+    fn insert_stamps_local_clock_but_insert_if_newer_does_not_1757() {
+        let conn = test_db();
+
+        // Local authorship → this node's entry is stamped = updated_at.
+        let local = make_memory("VV local", "test", Tier::Long, 5);
+        let id = insert(&conn, &local).unwrap();
+        let stored = get(&conn, &id).unwrap().unwrap();
+        let node = crate::federation::identity::resolver::local_node_identity();
+        assert_eq!(
+            stored.metadata["version_vector"]["entries"][node].as_str(),
+            Some(stored.updated_at.as_str()),
+            "local insert advances this node's version_vector entry"
+        );
+
+        // Federation receive (insert_if_newer) on a remote row that
+        // carries NO clock → no stamp (receiver does not fabricate a
+        // component for a row it did not author).
+        let mut remote = make_memory("VV remote", "test", Tier::Long, 5);
+        remote.id = "remote-id-1757".to_string();
+        let rid = insert_if_newer(&conn, &remote).unwrap();
+        let got_remote = get(&conn, &rid).unwrap().unwrap();
+        assert!(
+            got_remote.metadata.get("version_vector").is_none(),
+            "federation receive must NOT stamp the receiver's node"
+        );
+    }
+
+    // --- v0.8.0 Pillar-3 (#1709 / #224) merge_inbound tests ---
+
+    /// A divergent same-`id` inbound row is FIELD-MERGED per #224
+    /// (tags union, priority/confidence/access_count/version max,
+    /// metadata deep-merge, agent_id immutable→local) — NOT scalar
+    /// clobbered the way the bare `(title, namespace)` LWW upsert would.
+    #[test]
+    fn merge_inbound_field_merges_divergent_same_id() {
+        let conn = test_db();
+        let mut local = make_memory("merge-base", "test", Tier::Mid, 3);
+        local.tags = vec!["a".to_string(), "shared".to_string()];
+        local.confidence = 0.2;
+        local.access_count = 40;
+        local.version = 7;
+        local.metadata = serde_json::json!({
+            "agent_id": "original-owner",
+            "k_local": 1,
+            "nested": {"x": 1}
+        });
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+        // `insert` relies on the SQL DEFAULT for `version` (it is not in
+        // the INSERT column list), so seed the persisted row's version=7
+        // directly to exercise the max-merge against a real stored value.
+        conn.execute("UPDATE memories SET version = 7 WHERE id = ?1", params![id])
+            .unwrap();
+
+        // Inbound: same id, NEWER, divergent fields + a peer trying to
+        // rewrite agent_id.
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.tags = vec!["shared".to_string(), "b".to_string()];
+        inbound.priority = 9;
+        inbound.confidence = 0.8;
+        inbound.access_count = 7;
+        inbound.version = 3;
+        inbound.metadata = serde_json::json!({
+            "agent_id": "peer-impostor",
+            "k_remote": 2,
+            "nested": {"y": 2}
+        });
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        let result_id = merge_inbound(&conn, &inbound).unwrap();
+        assert_eq!(result_id, id, "merge returns the existing row id");
+
+        let got = get(&conn, &id).unwrap().unwrap();
+        // tags union (both survive, "shared" deduped).
+        let mut tags = got.tags.clone();
+        tags.sort();
+        assert_eq!(tags, vec!["a", "b", "shared"]);
+        // priority / confidence / access_count / version are MAX.
+        assert_eq!(got.priority, 9);
+        assert!((got.confidence - 0.8).abs() < f64::EPSILON);
+        assert_eq!(got.access_count, 40, "access_count is max(40, 7)");
+        assert_eq!(got.version, 7, "version is max(7, 3) — never rolls back");
+        // metadata deep-merge keeps disjoint keys on both sides.
+        assert_eq!(got.metadata["k_local"], serde_json::json!(1));
+        assert_eq!(got.metadata["k_remote"], serde_json::json!(2));
+        assert_eq!(got.metadata["nested"]["x"], serde_json::json!(1));
+        assert_eq!(got.metadata["nested"]["y"], serde_json::json!(2));
+        // agent_id is immutable: the original (local) value survives even
+        // though the inbound row is the newer (LWW) side.
+        assert_eq!(
+            got.metadata["agent_id"],
+            serde_json::json!("original-owner")
+        );
+    }
+
+    /// A brand-new id (no existing row) falls through to `insert_if_newer`
+    /// and creates the row fresh (OLD behaviour preserved).
+    #[test]
+    fn merge_inbound_brand_new_id_inserts_fresh() {
+        let conn = test_db();
+        let mem = make_memory("merge-fresh", "test", Tier::Mid, 5);
+        let inbound_id = mem.id.clone();
+        let result_id = merge_inbound(&conn, &mem).unwrap();
+        assert_eq!(result_id, inbound_id, "fresh insert returns the row id");
+        let got = get(&conn, &inbound_id).unwrap().unwrap();
+        assert_eq!(got.title, "merge-fresh");
+        assert_eq!(got.priority, 5);
+    }
+
+    /// CORRECTNESS BOUNDARY (#1709 Pillar-3): an inbound with a BRAND-NEW
+    /// id that collides on `(title, namespace)` with an existing
+    /// DIFFERENT-id row must NOT field-merge across the two distinct
+    /// memories. `merge_inbound` keys the #224 field-merge on `id`; a new
+    /// id misses `get(id)` and falls through to `insert_if_newer`, whose
+    /// `(title, namespace)` LWW upsert dedups onto the existing row. If a
+    /// future refactor keyed the merge on `(title, namespace)` instead of
+    /// `id`, two genuinely-distinct federated memories would silently
+    /// union their tags/metadata — corruption. This pins the boundary.
+    #[test]
+    fn merge_inbound_new_id_title_ns_collision_dedups_not_field_merges() {
+        let conn = test_db();
+        let mut local = make_memory("collide-title", "test", Tier::Mid, 3);
+        local.tags = vec!["a".to_string()];
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id_a = insert(&conn, &local).unwrap();
+
+        // Inbound: a BRAND-NEW id, same (title, namespace), NEWER, with a
+        // disjoint tag. Must NOT produce the {a,b} union (that would be a
+        // cross-id field-merge); insert_if_newer LWW-replaces instead.
+        let mut inbound = make_memory("collide-title", "test", Tier::Mid, 9);
+        let id_b = uuid::Uuid::new_v4().to_string();
+        inbound.id = id_b.clone();
+        inbound.tags = vec!["b".to_string()];
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        let result_id = merge_inbound(&conn, &inbound).unwrap();
+
+        // Deduped onto the existing row (kept its id); the new id never
+        // became a separate row.
+        assert_eq!(
+            result_id, id_a,
+            "a (title,namespace) collision must dedup onto the existing row id, not mint the inbound id"
+        );
+        assert!(
+            get(&conn, &id_b).unwrap().is_none(),
+            "the brand-new inbound id must NOT exist as a separate row"
+        );
+        // The surviving row took the newer inbound's tags by LWW — NOT the
+        // {a,b} cross-id union that same-id merge_inbound would produce.
+        let got = get(&conn, &id_a).unwrap().unwrap();
+        assert_eq!(
+            got.tags,
+            vec!["b".to_string()],
+            "distinct-id collision is LWW-dedup (tags replaced), NOT a field-merge union; got {:?}",
+            got.tags
+        );
+    }
+
+    /// The merged row is fully consistent after the atomic read-merge-write
+    /// (every column reflects the #224 resolution, not a partial write).
+    #[test]
+    fn merge_inbound_merged_row_is_fully_consistent() {
+        let conn = test_db();
+        let mut local = make_memory("merge-atomic", "test", Tier::Short, 2);
+        local.content = "local-content".to_string();
+        local.reflection_depth = 4;
+        local.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.content = "remote-content".to_string();
+        inbound.tier = Tier::Long; // durability upgrade
+        inbound.reflection_depth = 1;
+        // Inbound is immortal (no expiry). #224 `expires_at` rule: null
+        // (never-expires) wins over any non-null — so the merged row is
+        // immortal, demonstrating preservation-over-loss.
+        inbound.expires_at = None;
+        inbound.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+
+        merge_inbound(&conn, &inbound).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        // LWW content (inbound newer) + max-durability tier + max depth —
+        // all consistent in the single persisted row.
+        assert_eq!(got.content, "remote-content");
+        assert_eq!(
+            got.tier,
+            Tier::Long,
+            "tier never downgrades (max durability)"
+        );
+        assert_eq!(got.reflection_depth, 4, "reflection_depth is max(4, 1)");
+        // expires_at: #224 null-wins rule (inbound immortal) ⇒ merged is
+        // immortal. The full-row writer persists what merge_memory chose.
+        assert_eq!(
+            got.expires_at, None,
+            "null (never-expires) wins over non-null per #224"
+        );
+    }
+
+    /// Merged `version` is `max(local, remote)` (the Gap-1 optimistic-
+    /// concurrency counter never rolls backwards on a merge).
+    #[test]
+    fn merge_inbound_version_is_max() {
+        let conn = test_db();
+        let mut local = make_memory("merge-version", "test", Tier::Mid, 5);
+        local.version = 12;
+        local.updated_at = "2026-06-16T09:00:00+00:00".to_string();
+        let id = insert(&conn, &local).unwrap();
+        // `insert` does not persist `version` (SQL DEFAULT); seed it so the
+        // stored row genuinely carries version=12 for the max-merge.
+        conn.execute(
+            "UPDATE memories SET version = 12 WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+        // Inbound is OLDER by updated_at but carries a lower version.
+        let mut inbound = local.clone();
+        inbound.id = id.clone();
+        inbound.version = 4;
+        inbound.updated_at = "2026-06-16T00:00:00+00:00".to_string();
+
+        merge_inbound(&conn, &inbound).unwrap();
+        let got = get(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.version, 12, "version is max(12, 4)");
+    }
+
     // --- Metadata tests (Task 1.1) ---
 
     #[test]
@@ -13292,7 +16399,14 @@ mod tests {
         let mem = make_memory("Default metadata", "test", Tier::Long, 5);
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id).unwrap().unwrap();
-        assert_eq!(got.metadata, serde_json::json!({}));
+        // #1757 — `insert` stamps the system-managed per-memory vector
+        // clock (`version_vector`); strip it so the assertion still pins
+        // that the caller-visible metadata DEFAULT is the empty object.
+        let mut md = got.metadata.clone();
+        md.as_object_mut()
+            .unwrap()
+            .remove(crate::models::field_names::VERSION_VECTOR);
+        assert_eq!(md, serde_json::json!({}));
     }
 
     #[test]
@@ -13422,6 +16536,7 @@ mod tests {
             None,
             None,
             false,
+            None, // #1720 caller
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -13449,6 +16564,7 @@ mod tests {
             None,
             false,
             None,
+            None, // #1720 caller
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -13489,7 +16605,13 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(metadata_str, "{}");
+        // #1757 — `insert` stamps the system-managed `version_vector`;
+        // strip it so this still pins the default metadata column shape.
+        let mut md: serde_json::Value = serde_json::from_str(&metadata_str).unwrap();
+        md.as_object_mut()
+            .unwrap()
+            .remove(crate::models::field_names::VERSION_VECTOR);
+        assert_eq!(md, serde_json::json!({}));
     }
 
     #[test]
@@ -13572,6 +16694,82 @@ mod tests {
         assert_eq!(got.metadata["agent"], "claude");
         assert_eq!(got.metadata["model"], "opus");
         assert_eq!(got.metadata["shared"], "from_b");
+    }
+
+    #[test]
+    fn consolidate_provenance_preserved_across_upsert_1784() {
+        // #1784 — metadata.derived_from + consolidated_from_agents are
+        // immutable provenance: a later upsert (re-store under the same
+        // title/namespace) that OMITS them must NOT clobber them
+        // (existing-wins, mirroring agent_id; the in-SQL json_patch overlay).
+        let conn = test_db();
+        let mut mem_a = make_memory("Prov A", "test", Tier::Long, 5);
+        mem_a.metadata = serde_json::json!({ "agent_id": "author-a" });
+        let id_a = insert(&conn, &mem_a).unwrap();
+        let mut mem_b = make_memory("Prov B", "test", Tier::Long, 7);
+        mem_b.metadata = serde_json::json!({ "agent_id": "author-b" });
+        let id_b = insert(&conn, &mem_b).unwrap();
+
+        let new_id = consolidate(
+            &conn,
+            &[id_a.clone(), id_b.clone()],
+            "Prov Merged",
+            "summary",
+            "test",
+            &Tier::Long,
+            "consolidation",
+            "consolidator-x",
+        )
+        .unwrap();
+
+        // The consolidated memory records source ids + source authors.
+        let got = get(&conn, &new_id).unwrap().unwrap();
+        let derived = got.metadata["derived_from"]
+            .as_array()
+            .expect("derived_from array");
+        assert!(
+            derived.iter().any(|v| v == &serde_json::json!(id_a))
+                && derived.iter().any(|v| v == &serde_json::json!(id_b)),
+            "derived_from carries both source ids: {:?}",
+            got.metadata
+        );
+        assert!(
+            got.metadata["consolidated_from_agents"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "consolidated_from_agents carries source authors: {:?}",
+            got.metadata
+        );
+
+        // Re-store a DISTINCT memory under the SAME (title, namespace) with
+        // metadata that OMITS the provenance keys → the ON CONFLICT upsert
+        // must PRESERVE them (pre-#1784 it clobbered all but agent_id).
+        let mut clobber = make_memory("Prov Merged", "test", Tier::Long, 6);
+        clobber.metadata = serde_json::json!({ "unrelated": "value" });
+        let upserted_id = insert(&conn, &clobber).unwrap();
+        assert_eq!(
+            upserted_id, new_id,
+            "upsert resolves to the same (title,ns) row"
+        );
+
+        let after = get(&conn, &new_id).unwrap().unwrap();
+        assert_eq!(after.metadata["unrelated"], "value", "the new key applied");
+        let derived_after = after.metadata["derived_from"]
+            .as_array()
+            .expect("#1784: derived_from must survive the overwriting upsert");
+        assert!(
+            derived_after.iter().any(|v| v == &serde_json::json!(id_a))
+                && derived_after.iter().any(|v| v == &serde_json::json!(id_b)),
+            "#1784: derived_from survives the metadata-overwriting upsert: {:?}",
+            after.metadata
+        );
+        assert!(
+            after.metadata["consolidated_from_agents"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "#1784: consolidated_from_agents survives the upsert: {:?}",
+            after.metadata
+        );
     }
 
     #[test]
@@ -15149,6 +18347,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -15192,6 +18391,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -15292,6 +18492,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: false,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -15334,6 +18535,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let standard_id = insert(&conn, &standard).unwrap();
         set_namespace_standard(&conn, parent_ns, &standard_id, None).unwrap();
@@ -16599,6 +19801,180 @@ mod tests {
         assert_eq!(count_signed_events(&conn, "pending_action.approved"), 0);
     }
 
+    /// #1787 (5-agent vote 4d3ea1c5 → C) — under the multi-tenant opt-in
+    /// (`AI_MEMORY_AGENT_ID` set), the `ApproverType::Human` arm refuses
+    /// self-approval (approver == requester) AND refuses an unregistered
+    /// approver, while a registered non-requester approves. With the opt-in
+    /// OFF (single-operator trust-all default), any approval is accepted
+    /// (byte-unchanged — the requester and approver share one durable id, so
+    /// reject-self would self-lock the sole operator).
+    #[test]
+    fn human_arm_self_approval_gated_under_opt_in_1787() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = test_db();
+        let payload = serde_json::json!({"title": "x", "namespace": "ns/h1787"});
+        let ns = "ns/h1787"; // no standard → approver defaults to Human
+
+        // (no-regression) opt-in OFF: self-approval accepted (single-operator).
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let pid_unset = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                approve_with_approver_type(
+                    &conn,
+                    &pid_unset,
+                    "ai:alice",
+                    ApproveSurface::LocalOperator
+                )
+                .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "single-operator default: self-approval must be accepted (no opt-in)"
+        );
+
+        // opt-in ON.
+        let pid = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
+
+        // (1) self-approval refused.
+        match approve_with_approver_type(&conn, &pid, "ai:alice", ApproveSurface::LocalOperator)
+            .unwrap()
+        {
+            ApproveOutcome::Rejected(m) => {
+                assert!(
+                    m.contains("self-approval"),
+                    "want self-approval refusal, got: {m}"
+                );
+            }
+            other => panic!("expected self-approval rejection, got {other:?}"),
+        }
+        // (2) different but UNREGISTERED approver refused.
+        match approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+            .unwrap()
+        {
+            ApproveOutcome::Rejected(m) => {
+                assert!(
+                    m.contains("not a registered agent"),
+                    "want unregistered refusal, got: {m}"
+                );
+            }
+            other => panic!("expected unregistered rejection, got {other:?}"),
+        }
+        // (3) different REGISTERED approver → approved.
+        register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid, "ai:bob", ApproveSurface::LocalOperator)
+                    .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "a registered non-requester must be able to approve under the opt-in"
+        );
+
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+    }
+
+    /// #1796 (5-agent vote 4d3ea1c5) — the HTTP surface
+    /// (`ApproveSurface::Http`) enforces the Human-arm self-approval reject +
+    /// registered-approver gate UNCONDITIONALLY, even when the
+    /// `AI_MEMORY_AGENT_ID` opt-in is UNSET (the multi-tenant HTTP daemon never
+    /// sets it — that was the #1796 hole: a requester could self-approve their
+    /// own Human-gated action on the sqlite-backed HTTP daemon). The
+    /// `LocalOperator` surface (MCP/CLI) keeps the opt-in, so with the env unset
+    /// it STILL accepts self-approval (no self-lock for the lone operator).
+    #[test]
+    fn http_surface_rejects_self_approval_without_env_opt_in_1796() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        // Env opt-in OFF throughout — this is the multi-tenant HTTP posture.
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+        let conn = test_db();
+        let payload = serde_json::json!({"title": "x", "namespace": "ns/h1796"});
+        let ns = "ns/h1796"; // no standard → approver defaults to Human
+
+        // (A) HTTP surface: self-approval REFUSED even with the env opt-in OFF.
+        let pid_self = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:alice",
+            &payload,
+        )
+        .unwrap();
+        match approve_with_approver_type(&conn, &pid_self, "ai:alice", ApproveSurface::Http)
+            .unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("self-approval"),
+                "HTTP surface must refuse self-approval with no env opt-in, got: {m}"
+            ),
+            other => panic!("HTTP self-approval must be rejected, got {other:?}"),
+        }
+
+        // (B) HTTP surface: a DIFFERENT but UNREGISTERED approver is also refused.
+        match approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http).unwrap()
+        {
+            ApproveOutcome::Rejected(m) => assert!(
+                m.contains("not a registered agent"),
+                "HTTP surface must require a registered approver, got: {m}"
+            ),
+            other => panic!("HTTP unregistered approver must be rejected, got {other:?}"),
+        }
+
+        // (C) HTTP surface: a DIFFERENT REGISTERED approver → approved.
+        register_agent(&conn, "ai:bob", "ai:generic", &[]).expect("register");
+        assert!(
+            matches!(
+                approve_with_approver_type(&conn, &pid_self, "ai:bob", ApproveSurface::Http)
+                    .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "HTTP surface: a registered non-requester must approve"
+        );
+
+        // (D) LocalOperator surface, SAME env-OFF posture, STILL accepts
+        //     self-approval — the single-operator opt-in is preserved (the lone
+        //     operator must not be self-locked out of their own queued action).
+        let pid_local = queue_pending_action(
+            &conn,
+            crate::models::GovernedAction::Store,
+            ns,
+            None,
+            "ai:carol",
+            &payload,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                approve_with_approver_type(
+                    &conn,
+                    &pid_local,
+                    "ai:carol",
+                    ApproveSurface::LocalOperator
+                )
+                .unwrap(),
+                ApproveOutcome::Approved
+            ),
+            "LocalOperator must preserve the single-operator opt-in (self-approval accepted, env unset)"
+        );
+    }
+
     /// S5-M1 — a successful approve+execute MUST append a
     /// `pending_action.approved` row to `signed_events`. Pre-fix the
     /// audit chain had no record of the approval transition.
@@ -17034,6 +20410,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let ref_mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
@@ -17062,6 +20439,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
 
         insert(&conn, &obs).unwrap();
@@ -17131,6 +20509,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let id = insert(&conn, &mem).unwrap();
         let got = get(&conn, &id)
@@ -17180,6 +20559,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         insert(&conn, &mem_reflection).unwrap();
 
@@ -17211,6 +20591,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         insert(&conn, &mem_obs).unwrap();
 
@@ -17542,5 +20923,34 @@ mod tests {
             .public_base64();
         bind_agent_pubkey(&conn, "ai:curator", &k2).expect("rebind k2");
         assert_eq!(agent_pubkey(&conn, "ai:curator").unwrap(), Some(k2));
+    }
+
+    #[test]
+    fn sync_state_merge_applies_pointwise_max_and_never_regresses() {
+        // v0.8.0 Pillar-3 (#1709) / #224 Task 3a.1 — fold an incoming
+        // peer clock into the persisted sync-state via pointwise max:
+        // a NEW peer is added, a NEWER timestamp advances an existing
+        // peer, and an OLDER incoming timestamp must NOT regress a newer
+        // stored entry.
+        let conn = test_db();
+        let local = "ai:receiver";
+        // Seed the receiver clock: p-existing at a mid timestamp.
+        sync_state_observe(&conn, local, "p-existing", "2026-03-01T00:00:00Z").expect("seed");
+        sync_state_observe(&conn, local, "p-stable", "2026-05-01T00:00:00Z").expect("seed2");
+
+        let mut incoming = crate::models::VectorClock::default();
+        incoming.observe("p-existing", "2026-04-01T00:00:00Z"); // newer → wins
+        incoming.observe("p-stable", "2026-01-01T00:00:00Z"); // older → must NOT regress
+        incoming.observe("p-new", "2026-02-01T00:00:00Z"); // new peer → added
+
+        sync_state_merge(&conn, local, &incoming).expect("merge");
+
+        let merged = sync_state_load(&conn, local).expect("reload");
+        assert_eq!(
+            merged.latest_from("p-existing"),
+            Some("2026-04-01T00:00:00Z")
+        );
+        assert_eq!(merged.latest_from("p-stable"), Some("2026-05-01T00:00:00Z"));
+        assert_eq!(merged.latest_from("p-new"), Some("2026-02-01T00:00:00Z"));
     }
 }

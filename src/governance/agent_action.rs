@@ -104,6 +104,11 @@ pub mod action_kinds {
     pub const PROCESS_SPAWN: &str = "process_spawn";
     /// [`AgentAction::Custom`] wire tag.
     pub const CUSTOM: &str = "custom";
+    /// [`AgentAction::Read`] wire tag (PE-2 / §5.5 / #1730 — read-action
+    /// gating). Distinct from the snake_case of the variant name (`read`)
+    /// so the wire kind reads as an action verb consistent with the
+    /// `governance_rules.kind` column the operator authors against.
+    pub const READ_ACTION: &str = "read_action";
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +172,24 @@ pub enum AgentAction {
         custom_kind: String,
         payload: serde_json::Value,
     },
+    /// v0.8.0 PE-2 (§5.5 / #697 / #1730) — a memory READ the substrate is
+    /// about to serve (recall / search / list / get / session_start).
+    /// Unlike the agent-EXTERNAL variants above, this is a substrate read;
+    /// it is modelled here so reads route through the same rule-engine +
+    /// `signed_events` audit chain as the rest of the action vocabulary.
+    /// `surface` names the read entry point; `namespace` / `query` are the
+    /// match dimensions a `read_action` rule can narrow on (both optional —
+    /// a list/session_start read may carry neither). The `#[serde(rename)]`
+    /// pins the wire tag to `read_action` (not the default snake_case
+    /// `read`) to match [`action_kinds::READ_ACTION`].
+    #[serde(rename = "read_action")]
+    Read {
+        surface: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
 }
 
 impl AgentAction {
@@ -180,6 +203,7 @@ impl AgentAction {
             AgentAction::NetworkRequest { .. } => action_kinds::NETWORK_REQUEST,
             AgentAction::ProcessSpawn { .. } => action_kinds::PROCESS_SPAWN,
             AgentAction::Custom { .. } => action_kinds::CUSTOM,
+            AgentAction::Read { .. } => action_kinds::READ_ACTION,
         }
     }
 
@@ -222,19 +246,55 @@ pub enum Decision {
     /// are present for the audit row but the harness should not
     /// block.
     Warn { rule_id: String, reason: String },
+    /// Action paused for severity-based human escalation (§22 PE-5).
+    /// The harness routes it to a human review queue; the substrate
+    /// emits + audits the verdict. `rule_id` names the firing
+    /// `escalate` rule; `reason` is its operator-authored
+    /// explanation. **Fails closed:** an unresolved `Escalate` does
+    /// NOT permit the action ([`Decision::is_allowed`] returns
+    /// `false`) — the harness MUST block until a human resolves it.
+    ///
+    /// `// #697 PE-5 follow-on:` queue persistence + timeout-sweep +
+    /// the PE-5 profile auto-install (PE-1+PE-3+PE-4) are NOT in this
+    /// verdict primitive — they are the next PE-5 unit.
+    Escalate { rule_id: String, reason: String },
 }
 
 impl Decision {
-    /// `true` if the decision blocks the action.
+    /// `true` if the decision is a refusal (`Refuse` only).
+    ///
+    /// Precise — does NOT cover `Escalate`. Callers that gate a
+    /// proceed/block choice on "does this verdict block the action?"
+    /// MUST use [`Decision::is_blocking`] (or `!is_allowed()`), not
+    /// `is_refusal`, so an `Escalate` is not silently let through.
     #[must_use]
     pub fn is_refusal(&self) -> bool {
         matches!(self, Decision::Refuse { .. })
     }
 
+    /// `true` if the decision is an escalation (`Escalate` only).
+    #[must_use]
+    pub fn is_escalation(&self) -> bool {
+        matches!(self, Decision::Escalate { .. })
+    }
+
+    /// `true` if the decision blocks the action (`Refuse` OR
+    /// `Escalate`). The load-bearing fail-closed predicate: an
+    /// unresolved `Escalate` blocks exactly like a `Refuse`.
+    #[must_use]
+    pub fn is_blocking(&self) -> bool {
+        matches!(self, Decision::Refuse { .. } | Decision::Escalate { .. })
+    }
+
     /// `true` if the decision permits the action (Allow or Warn).
+    ///
+    /// Defined as an explicit allow-list (`Allow | Warn`), NOT as
+    /// `!is_refusal()`, so that `Escalate` — which is neither a
+    /// refusal nor permitted — fails CLOSED here. An `Escalate` that
+    /// fell through to "proceed" would be a security hole (§22 PE-5).
     #[must_use]
     pub fn is_allowed(&self) -> bool {
-        !self.is_refusal()
+        matches!(self, Decision::Allow | Decision::Warn { .. })
     }
 }
 
@@ -251,6 +311,11 @@ pub enum Severity {
     Refuse,
     Warn,
     Log,
+    /// §22 PE-5 — a matched `escalate` rule pauses the action for
+    /// severity-based human escalation. Maps to
+    /// [`Decision::Escalate`], which fails closed (does NOT permit
+    /// the action). Added at schema v66.
+    Escalate,
 }
 
 impl Severity {
@@ -261,6 +326,7 @@ impl Severity {
             Severity::Refuse => "refuse",
             Severity::Warn => "warn",
             Severity::Log => "log",
+            Severity::Escalate => "escalate",
         }
     }
 
@@ -272,6 +338,7 @@ impl Severity {
             "refuse" => Some(Severity::Refuse),
             "warn" => Some(Severity::Warn),
             "log" => Some(Severity::Log),
+            "escalate" => Some(Severity::Escalate),
             _ => None,
         }
     }
@@ -329,6 +396,59 @@ pub fn matcher_applies(rule: &Rule, action: &AgentAction) -> bool {
             custom_kind,
             payload,
         } => match_custom(&matcher, custom_kind, payload),
+        AgentAction::Read {
+            surface,
+            namespace,
+            query,
+        } => match_read(&matcher, surface, namespace.as_deref(), query.as_deref()),
+    }
+}
+
+/// PE-2 (§5.5 / #1730) — match a `read_action` rule against a read.
+/// Recognized matcher fields (all optional, AND-combined when present):
+/// `surface` (glob on the read entry point), `namespace` (glob on the
+/// read's namespace), `query_substring` (literal substring on the query).
+/// A matcher carrying NONE of these is a blanket read rule ONLY when it
+/// sets `{"all": true}` — an empty / unrecognized matcher matches nothing,
+/// so an operator can't accidentally deny every read with a typo. A
+/// `namespace` / `query_substring` matcher against a read that carries no
+/// namespace / query does NOT match (the dimension is absent to narrow on).
+fn match_read(
+    matcher: &serde_json::Value,
+    surface: &str,
+    namespace: Option<&str>,
+    query: Option<&str>,
+) -> bool {
+    let mut saw_field = false;
+    if let Some(glob) = matcher.get("surface").and_then(|v| v.as_str()) {
+        saw_field = true;
+        if !crate::governance::glob_matches(glob, surface) {
+            return false;
+        }
+    }
+    if let Some(glob) = matcher.get("namespace").and_then(|v| v.as_str()) {
+        saw_field = true;
+        match namespace {
+            Some(ns) if crate::governance::glob_matches(glob, ns) => {}
+            _ => return false,
+        }
+    }
+    if let Some(needle) = matcher.get("query_substring").and_then(|v| v.as_str()) {
+        saw_field = true;
+        match query {
+            Some(q) if q.contains(needle) => {}
+            _ => return false,
+        }
+    }
+    if saw_field {
+        // Every present narrowing field matched.
+        true
+    } else {
+        // No narrowing field — only an explicit blanket opt-in matches.
+        matcher
+            .get("all")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -570,7 +690,10 @@ fn disk_free_gib_at_path(_path: &std::path::Path) -> Option<u64> {
 /// Adding a new severity variant or matcher field meant touching three
 /// near-identical loops. The `RuleEngine` collapses the load + routing
 /// logic into one place; the three legacy free functions remain as
-/// thin wrappers so the public API is wire-stable.
+/// thin wrappers so the public API is wire-stable. (Concretely: the
+/// §22 PE-5 `escalate` severity, schema v66, was a single new arm in
+/// [`RuleEngine::evaluate`] + the matching [`Decision::Escalate`]
+/// translation, not three.)
 ///
 /// `rules` holds the snapshot of enabled rules of the *target kind*
 /// (the engine is constructed per-action, not per-table — kind-scoped
@@ -666,6 +789,16 @@ impl RuleEngine {
             match severity {
                 Severity::Refuse => {
                     return Decision::Refuse {
+                        rule_id: rule.id.clone(),
+                        reason: rule.reason.clone(),
+                    };
+                }
+                Severity::Escalate => {
+                    // §22 PE-5 — a matched `escalate` rule pauses the
+                    // action for human review. Returns immediately
+                    // (escalation-wins, mirroring refusal-wins); the
+                    // verdict fails closed via `is_allowed() == false`.
+                    return Decision::Escalate {
                         rule_id: rule.id.clone(),
                         reason: rule.reason.clone(),
                     };
@@ -788,6 +921,7 @@ fn emit_forensic_decision(agent_id: &str, action: &AgentAction, decision: &Decis
         Decision::Allow => ("allow", String::new()),
         Decision::Refuse { rule_id, .. } => ("refuse", rule_id.clone()),
         Decision::Warn { rule_id, .. } => ("warn", rule_id.clone()),
+        Decision::Escalate { rule_id, .. } => ("escalate", rule_id.clone()),
     };
     // payload is `{action, decision_detail}` — keeps the forensic row
     // self-describing without depending on cross-table joins for a
@@ -848,6 +982,108 @@ fn emit_check_event(
     };
     append_signed_event(conn, &event).context("emit_check_event: append_signed_event")?;
     Ok(())
+}
+
+/// v0.8.0 PE-2 (§5.5 / #697 / #1730) — governance gate for a memory READ
+/// surface (recall / search / list / get / session_start). The read-side
+/// sibling of [`check_agent_action`], shaped by the 5-agent design vote
+/// (ai-memory `4d3ea1c5`):
+///
+/// * **Zero-config fast-path.** When NO enabled `read_action` rules are
+///   configured, returns `Ok(())` immediately — no rule eval, no audit
+///   row. Default deployments pay nothing, so the recall hot path stays
+///   free (a per-read `signed_events` INSERT would turn every read into a
+///   serialized WAL write).
+/// * **Best-effort audit (NON-FATAL).** When read rules exist, the
+///   decision is appended to `signed_events`, but an append failure is
+///   logged and the read PROCEEDS — read availability is never coupled to
+///   audit-sink liveness (the SPLIT fail-posture; the deferred-audit DLQ
+///   keeps the trail recoverable). This is why it does NOT reuse
+///   `check_agent_action`'s fatal `emit_check_event(...)?`.
+/// * **Fail-CLOSED on a blocking verdict** (`Refuse` / `Escalate`) and on a
+///   rule-LOAD error — unless the operator opted into
+///   `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (same knob the write
+///   pre-hook honors).
+///
+/// Returns `Err(GovernanceRefusal)` when the read is refused; the caller
+/// maps it to the standard governance-refusal wire shape.
+///
+/// # Errors
+///
+/// Returns [`crate::storage::GovernanceRefusal`] when a `read_action`
+/// rule blocks the read (or governance is unavailable and the deployment
+/// is fail-closed).
+pub fn gate_read(
+    conn: &Connection,
+    agent_id: &str,
+    action: &AgentAction,
+) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    // Load the enabled `read_action` rules. A load error is a governance
+    // outage: fail CLOSED unless the operator opted into the legacy
+    // permissive posture (parity with the write pre-hook).
+    let engine = match RuleEngine::load_for_action(conn, action) {
+        Ok(e) => e,
+        Err(e) => {
+            if crate::daemon_runtime::governance_fail_open_on_error() {
+                tracing::warn!(
+                    "read-gate: rule load failed, failing OPEN per \
+                     AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR: {e:#}"
+                );
+                return Ok(());
+            }
+            return Err(crate::storage::GovernanceRefusal {
+                reason: "read governance unavailable (failing closed)".to_string(),
+            });
+        }
+    };
+
+    // Zero-config fast-path: no read rules → allow, no eval, no audit.
+    if engine.rules().is_empty() {
+        return Ok(());
+    }
+
+    let decision = engine.evaluate(agent_id, action);
+
+    // Best-effort audit — a read is NEVER blocked by an audit-append
+    // failure (SPLIT fail-posture; the DLQ keeps the trail recoverable).
+    if let Err(e) = emit_check_event(conn, agent_id, action, &decision) {
+        tracing::warn!("read-gate: audit append failed (read proceeds; DLQ-backed): {e:#}");
+    }
+    emit_forensic_decision(agent_id, action, &decision);
+
+    if decision.is_blocking() {
+        let reason = match &decision {
+            Decision::Refuse { reason, .. } | Decision::Escalate { reason, .. } => reason.clone(),
+            // Unreachable (is_blocking ⇒ Refuse|Escalate) but keeps the
+            // match total without an unwrap.
+            _ => "read refused by governance".to_string(),
+        };
+        return Err(crate::storage::GovernanceRefusal { reason });
+    }
+    Ok(())
+}
+
+/// PE-2 (#1730) — ergonomic wrapper over [`gate_read`] for the MCP read
+/// handlers: builds the [`AgentAction::Read`] from the surface name + the
+/// optional match dimensions and delegates. Keeps the 5 read call sites to
+/// a single line each (one tested gate, no per-surface drift).
+///
+/// # Errors
+///
+/// Propagates [`gate_read`]'s [`crate::storage::GovernanceRefusal`].
+pub fn gate_read_surface(
+    conn: &Connection,
+    agent_id: &str,
+    surface: &str,
+    namespace: Option<&str>,
+    query: Option<&str>,
+) -> std::result::Result<(), crate::storage::GovernanceRefusal> {
+    let action = AgentAction::Read {
+        surface: surface.to_string(),
+        namespace: namespace.map(str::to_string),
+        query: query.map(str::to_string),
+    };
+    gate_read(conn, agent_id, &action)
 }
 
 /// v0.7.0 L1-6 Deliverable E — read-only variant of [`check_agent_action`]
@@ -967,7 +1203,10 @@ pub fn check_agent_action_deferred_cached(
     queue: &crate::governance::deferred_audit::DeferredAuditQueue,
 ) -> Result<Decision> {
     let decision = check_agent_action_no_audit_cached(conn, cache, action)?;
-    if decision.is_refusal() {
+    // Chain-log every BLOCKING verdict (Refuse OR Escalate, §22
+    // PE-5) to the deferred audit queue. `submit_refusal` enqueues
+    // any blocking verdict; Allow / Warn are not chain-logged here.
+    if decision.is_blocking() {
         queue.submit_refusal(agent_id, action, &decision);
     }
     Ok(decision)
@@ -1183,10 +1422,210 @@ mod tests {
 
     #[test]
     fn severity_roundtrip() {
-        for s in &[Severity::Refuse, Severity::Warn, Severity::Log] {
+        for s in &[
+            Severity::Refuse,
+            Severity::Warn,
+            Severity::Log,
+            Severity::Escalate,
+        ] {
             assert_eq!(Severity::from_str(s.as_str()), Some(*s));
         }
         assert_eq!(Severity::from_str("nope"), None);
+    }
+
+    #[test]
+    fn severity_escalate_wire_string() {
+        // §22 PE-5 — the wire string must be the stable `escalate`
+        // literal (it is the governance_rules.severity column value
+        // and the Decision::Escalate serde tag).
+        assert_eq!(Severity::Escalate.as_str(), "escalate");
+        assert_eq!(Severity::from_str("escalate"), Some(Severity::Escalate));
+    }
+
+    #[test]
+    fn decision_escalate_serde_roundtrip() {
+        // §22 PE-5 — {"decision":"escalate", rule_id, reason}.
+        let d = Decision::Escalate {
+            rule_id: "E001".into(),
+            reason: "human review required".into(),
+        };
+        let json = serde_json::to_value(&d).unwrap();
+        assert_eq!(json["decision"], "escalate");
+        assert_eq!(json["rule_id"], "E001");
+        assert_eq!(json["reason"], "human review required");
+        let back: Decision = serde_json::from_value(json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    #[test]
+    fn escalate_fails_closed_is_allowed_false() {
+        // THE load-bearing safety assertion: an unresolved Escalate
+        // must NOT permit the action. is_allowed() is FALSE for
+        // Escalate (defined as an explicit Allow|Warn allow-list, not
+        // !is_refusal()), so an Escalate that fell through to
+        // "proceed" cannot happen.
+        let escalate = Decision::Escalate {
+            rule_id: "E001".into(),
+            reason: "pause".into(),
+        };
+        assert!(
+            !escalate.is_allowed(),
+            "Escalate must FAIL CLOSED — is_allowed() must be false"
+        );
+        assert!(!escalate.is_refusal(), "Escalate is not a refusal");
+        assert!(escalate.is_escalation());
+        assert!(escalate.is_blocking(), "Escalate blocks the action");
+    }
+
+    #[test]
+    fn is_allowed_is_blocking_is_escalation_partition() {
+        let allow = Decision::Allow;
+        let warn = Decision::Warn {
+            rule_id: "W".into(),
+            reason: "r".into(),
+        };
+        let refuse = Decision::Refuse {
+            rule_id: "R".into(),
+            reason: "r".into(),
+        };
+        let escalate = Decision::Escalate {
+            rule_id: "E".into(),
+            reason: "r".into(),
+        };
+
+        // is_allowed: Allow + Warn only.
+        assert!(allow.is_allowed());
+        assert!(warn.is_allowed());
+        assert!(!refuse.is_allowed());
+        assert!(!escalate.is_allowed());
+
+        // is_blocking: Refuse + Escalate.
+        assert!(!allow.is_blocking());
+        assert!(!warn.is_blocking());
+        assert!(refuse.is_blocking());
+        assert!(escalate.is_blocking());
+
+        // is_refusal: Refuse only.
+        assert!(refuse.is_refusal());
+        assert!(!escalate.is_refusal());
+
+        // is_escalation: Escalate only.
+        assert!(escalate.is_escalation());
+        assert!(!refuse.is_escalation());
+
+        // is_allowed and is_blocking are exact complements across all
+        // four verdicts (no verdict is both proceed AND block, none is
+        // neither).
+        for d in [&allow, &warn, &refuse, &escalate] {
+            assert_ne!(d.is_allowed(), d.is_blocking());
+        }
+    }
+
+    #[test]
+    fn escalate_rule_returns_escalate_verdict() {
+        // §22 PE-5 — a matched `escalate`-severity rule yields
+        // Decision::Escalate{rule_id, reason}, and emit_forensic
+        // records "escalate".
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "E001",
+            "bash",
+            r#"{"command_substring":"sudo"}"#,
+            "escalate",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "sudo rm -rf /".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        match &decision {
+            Decision::Escalate { rule_id, reason } => {
+                assert_eq!(rule_id, "E001");
+                assert_eq!(reason, "E001: test");
+            }
+            other => panic!("expected Escalate, got {other:?}"),
+        }
+        // Fails closed at the verdict level.
+        assert!(!decision.is_allowed());
+        assert!(decision.is_blocking());
+    }
+
+    #[test]
+    fn first_blocking_rule_by_id_order_wins_refuse_then_escalate() {
+        // The engine scans rules in `id ASC` order
+        // (`list_enabled_by_kind` ORDER BY id) and BOTH Refuse and
+        // Escalate are terminal (short-circuit) arms — so the
+        // lexicographically-first blocking rule wins. With a Refuse at
+        // 'A001' and an Escalate at 'Z001', the Refuse (scanned first)
+        // wins; either way the action is BLOCKED.
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "A001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "refuse",
+            true,
+        );
+        add_rule(
+            &conn,
+            "Z001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "escalate",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "rm x".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        // The Refuse (id 'A001') is scanned before the Escalate (id
+        // 'Z001'), so Refuse wins; regardless, the verdict is blocking.
+        assert!(decision.is_refusal(), "lower-id Refuse wins the scan");
+        assert!(decision.is_blocking());
+    }
+
+    #[test]
+    fn lower_id_escalate_wins_over_higher_id_refuse_both_block() {
+        // Symmetric to the above: an Escalate at the lower id ('A001')
+        // is scanned before a Refuse at the higher id ('Z001'), so the
+        // Escalate wins the short-circuit. Both are blocking, so the
+        // action is paused/blocked either way — the load-bearing
+        // property is that NEITHER lets the action proceed.
+        let _forensic = forensic_lock();
+        let _no_pubkey = no_operator_pubkey();
+        let conn = fresh_conn();
+        add_rule(
+            &conn,
+            "A001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "escalate",
+            true,
+        );
+        add_rule(
+            &conn,
+            "Z001",
+            "bash",
+            r#"{"command_substring":"rm"}"#,
+            "refuse",
+            true,
+        );
+        let action = AgentAction::Bash {
+            command: "rm x".into(),
+            cwd: None,
+        };
+        let decision = check_agent_action(&conn, "agent:t", &action).unwrap();
+        assert!(decision.is_escalation(), "lower-id Escalate wins the scan");
+        assert!(decision.is_blocking());
+        assert!(!decision.is_allowed());
     }
 
     #[test]
@@ -2320,5 +2759,175 @@ mod tests {
             Decision::Refuse { rule_id, .. } => assert_eq!(rule_id, "R-engine"),
             other => panic!("expected Refuse, got {other:?}"),
         }
+    }
+
+    // ── PE-2 (§5.5 / #1730) read-action gating ───────────────────────────
+
+    /// Full-schema conn so `gate_read`'s best-effort `signed_events` append
+    /// has a table to land in (the bare `fresh_conn` only builds
+    /// `governance_rules`).
+    fn full_conn() -> Connection {
+        crate::storage::open(std::path::Path::new(":memory:")).expect("open full schema")
+    }
+
+    fn read_act(surface: &str, ns: Option<&str>, query: Option<&str>) -> AgentAction {
+        AgentAction::Read {
+            surface: surface.to_string(),
+            namespace: ns.map(str::to_string),
+            query: query.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn gate_read_allows_when_no_read_rules_1730() {
+        // Zero-config fast-path: no read_action rules → allow, no audit.
+        let conn = full_conn();
+        gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), Some("q")))
+            .expect("fast-path must allow when no read rules are configured");
+    }
+
+    #[test]
+    fn gate_read_refuses_on_blanket_refuse_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-read",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "refuse",
+            true,
+        );
+        let err = gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
+            .expect_err("a matching refuse rule must deny the read");
+        assert!(err.reason.contains("R-read"), "got: {}", err.reason);
+    }
+
+    #[test]
+    fn gate_read_blocks_on_escalate_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-esc",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "escalate",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("search", None, None)).is_err(),
+            "an escalate verdict must fail CLOSED for a read"
+        );
+    }
+
+    #[test]
+    fn gate_read_allows_on_warn_rule_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-warn",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "warn",
+            true,
+        );
+        gate_read(&conn, "ai:t", &read_act("list", None, None))
+            .expect("a warn rule must NOT block the read");
+    }
+
+    #[test]
+    fn gate_read_narrows_by_surface_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-surf",
+            action_kinds::READ_ACTION,
+            r#"{"surface":"search"}"#,
+            "refuse",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("search", None, None)).is_err(),
+            "the matching surface must be denied"
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", None, None))
+            .expect("a non-matching surface must be allowed");
+    }
+
+    #[test]
+    fn gate_read_narrows_by_namespace_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-ns",
+            action_kinds::READ_ACTION,
+            r#"{"namespace":"secret"}"#,
+            "refuse",
+            true,
+        );
+        assert!(
+            gate_read(&conn, "ai:t", &read_act("recall", Some("secret"), None)).is_err(),
+            "a read in the matched namespace must be denied"
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", Some("public"), None))
+            .expect("a read in a different namespace must be allowed");
+        gate_read(&conn, "ai:t", &read_act("get", None, None))
+            .expect("a read with no namespace cannot match a namespace-narrowed rule");
+    }
+
+    #[test]
+    fn gate_read_empty_matcher_does_not_blanket_deny_1730() {
+        // Safety: an empty `{}` matcher must NOT lock out every read — only
+        // an explicit {"all":true} is a blanket. Guards against an operator
+        // typo denying all reads.
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-empty",
+            action_kinds::READ_ACTION,
+            "{}",
+            "refuse",
+            true,
+        );
+        gate_read(&conn, "ai:t", &read_act("recall", Some("ns"), None))
+            .expect("an empty matcher must not blanket-deny reads");
+    }
+
+    #[test]
+    fn gate_read_audits_engaged_decision_1730() {
+        let _g = forensic_lock();
+        let _np = no_operator_pubkey();
+        let conn = full_conn();
+        add_rule(
+            &conn,
+            "R-aud",
+            action_kinds::READ_ACTION,
+            r#"{"all":true}"#,
+            "refuse",
+            true,
+        );
+        let _ = gate_read(&conn, "ai:auditor", &read_act("recall", None, None));
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND agent_id = ?2",
+                rusqlite::params![GOVERNANCE_CHECK_EVENT_TYPE, "ai:auditor"],
+                |r| r.get(0),
+            )
+            .expect("count audit rows");
+        assert!(
+            n >= 1,
+            "an engaged read gate must append a governance.check audit row"
+        );
     }
 }

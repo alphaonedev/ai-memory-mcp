@@ -42,7 +42,18 @@ pub(crate) mod pipeline;
 // `run_reflection_pass`) consumed by the integration test crate plus
 // the CLI's `--reflect` mode. Items inside the module that should
 // stay crate-private use `pub(crate)` directly.
+/// #1764 (v0.8.0 slice) — reflection-corpus decorrelation VISIBILITY probe.
+/// The pure dominance analyzer (`compute_producer_dominance` /
+/// `evaluate_namespace`) is backend-agnostic; the `sal`-gated
+/// `run_decorrelation_probe` scans the Reflection corpus through the
+/// `MemoryStore` trait. Opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE`.
+pub mod decorrelation_probe;
 pub mod reflection_pass;
+/// #1393 sub-unit 2 — curator transcript-classify pass. Entirely
+/// `sal`-gated: it operates exclusively through the `MemoryStore` trait
+/// (`reclassify_memory_kind` + `list`), so it only exists in `sal` builds.
+#[cfg(feature = "sal")]
+pub mod transcript_classify_pass;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -86,8 +97,8 @@ pub struct CompactionConfig {
     /// namespace entirely.  Set to `true` to opt in.
     #[serde(default)]
     pub enabled: bool,
-    /// Cosine similarity threshold for cluster formation.
-    /// Passed through to [`crate::curator::cluster::CosineClustering`].
+    /// Cosine similarity threshold for cluster formation (the cosine gate in
+    /// [`crate::curator::cluster::ConsolidationClustering`]).
     /// Defaults to `0.75` when omitted.
     #[serde(default = "default_cosine_threshold")]
     pub cosine_threshold: f32,
@@ -100,6 +111,20 @@ pub struct CompactionConfig {
     /// globally.
     #[serde(default)]
     pub reflection_pass: reflection_pass::ReflectionPassConfig,
+    /// v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap for size-GC eviction.
+    ///
+    /// `None` (the default) disables byte-pressure eviction entirely,
+    /// matching the `enabled = false` opt-in posture of the rest of the
+    /// compaction surface. When `Some(cap)` with `cap > 0`, the curator's
+    /// size-GC pass evicts (archive-before-delete, restorable) the
+    /// lowest-value memories in each scanned namespace whose live corpus
+    /// (`length(title)+length(content)+length(metadata)` summed) exceeds
+    /// `cap`, until the namespace is back under the cap. Pure SQL ranking
+    /// — deterministic and LLM-free. Distinct from the per-agent K8 write
+    /// quota (`AI_MEMORY_MAX_STORAGE_BYTES`): this is a per-namespace
+    /// eviction trigger, not a write gate.
+    #[serde(default)]
+    pub max_corpus_bytes: Option<i64>,
 }
 
 fn default_cosine_threshold() -> f32 {
@@ -112,6 +137,7 @@ impl Default for CompactionConfig {
             enabled: false,
             cosine_threshold: default_cosine_threshold(),
             reflection_pass: reflection_pass::ReflectionPassConfig::default(),
+            max_corpus_bytes: None,
         }
     }
 }
@@ -178,6 +204,31 @@ pub struct CuratorReport {
     /// `_curator/reports` JSON self-report.
     #[serde(default)]
     pub personas_generated: usize,
+    /// v0.8.0 Pillar-2.5 (#1709) — count of memories evicted by the
+    /// size-GC (corpus byte-cap) pass this cycle. Zero when
+    /// `compaction.max_corpus_bytes` is `None`, in dry-run, or when no
+    /// scanned namespace exceeded its cap. The pass archives victims
+    /// before deleting them, so the count is restorable from the archive.
+    #[serde(default)]
+    pub memories_evicted_size_gc: usize,
+    /// v0.8.0 Pillar-2.5 (#1738/#1746) — clusters the SAL `ConsolidationPass`
+    /// found eligible to consolidate this cycle, when
+    /// `compaction.enabled = true`. Post-#1746 cutover the pass is the LIVE
+    /// consolidator (autonomy Pass-1 is suppressed); this counts the clusters
+    /// it acted on (or, in a dry-run cycle, would act on). Zero when compaction
+    /// is disabled (the default) or on an in-memory DB. The consolidation
+    /// counts themselves fold into `autonomy.{clusters_formed,
+    /// memories_consolidated, rollback_entries_written}` so the self-report
+    /// stays accurate regardless of which consolidator ran.
+    #[serde(default)]
+    pub compaction_pass_clusters_eligible: usize,
+    /// v0.8.0 Pillar-2.5 (#1746) — clusters the SAL `ConsolidationPass` rolled
+    /// back this cycle after a Stage-6 (#664) verify failure (sources restored,
+    /// unverifiable summary removed). Preserved as a distinct safety counter —
+    /// `AutonomyPassReport` has no field for it. Zero when compaction is
+    /// disabled or no verify failed.
+    #[serde(default)]
+    pub compaction_pass_rolled_back: usize,
     pub errors: Vec<String>,
     pub dry_run: bool,
 }
@@ -228,6 +279,16 @@ pub fn run_once(
         .filter(|m| needs_curation(m, cfg))
         .collect();
     report.memories_eligible = eligible.len();
+
+    // v0.8.0 Pillar-2.5 (#1709) — size-GC (corpus byte-cap eviction).
+    // Pure SQL, LLM-free, and independent of the autonomy pass output, so
+    // it runs on EVERY cycle that has `compaction.max_corpus_bytes` set —
+    // including cycles with no LLM configured. Placed before the no-LLM
+    // early-return below precisely so byte-pressure eviction is NOT
+    // silently skipped on LLM-less deployments (the helper itself gates on
+    // cap.is_some() && !dry_run). Best-effort: per-namespace errors land
+    // in report.errors, never aborting the cycle.
+    run_size_gc_pass(conn, &candidates, cfg, &mut report);
 
     let Some(llm_client) = llm else {
         report.errors.push("no LLM client configured".to_string());
@@ -300,10 +361,30 @@ pub fn run_once(
         .filter(|m| needs_curation(m, cfg))
         .cloned()
         .collect();
-    let pass_report =
-        crate::autonomy::run_autonomy_passes(conn, llm_client, &autonomy_candidates, cfg.dry_run);
+    // v0.8.0 Pillar-2.5 (#1746) — single-source cutover predicate. When
+    // `compaction.enabled`, the SAL `ConsolidationPass` OWNS consolidation:
+    // autonomy Pass-1 is suppressed AND the SAL pass runs live, BOTH driven
+    // from this one bool so they can never drift into double-consolidation
+    // (both run) or zero-consolidation (neither runs). Default false → autonomy
+    // Pass-1 runs and the SAL pass is a no-op (production byte-unchanged).
+    let compaction_owns_consolidation = cfg.compaction.enabled;
+    let pass_report = crate::autonomy::run_autonomy_passes(
+        conn,
+        llm_client,
+        &autonomy_candidates,
+        cfg.dry_run,
+        /* skip_consolidation = */ compaction_owns_consolidation,
+    );
     report.errors.extend(pass_report.errors.clone());
     report.autonomy = pass_report;
+
+    // SAL `ConsolidationPass`. When `compaction.enabled` it is the LIVE
+    // consolidator (real writes, respecting `cfg.dry_run`), and its counts fold
+    // into `report.autonomy` so the self-report is accurate. When disabled it is
+    // a no-op (autonomy Pass-1 above did the consolidation). `llm_client:
+    // &OllamaClient` coerces to `&dyn AutonomyLlm`. Best-effort: errors land in
+    // report.errors.
+    run_consolidation_pass(conn, &autonomy_candidates, cfg, llm_client, &mut report);
 
     // Issue #816 — auto-persona sweep. After auto_tag has populated
     // `mentioned_entity_id` on this cycle's reflections, scan for
@@ -359,6 +440,173 @@ pub fn run_once(
     );
 
     Ok(report)
+}
+
+/// v0.8.0 Pillar-2.5 (#1709) — size-GC pass driver.
+///
+/// Gated on `cfg.compaction.max_corpus_bytes.is_some()` (a positive cap)
+/// AND `!cfg.dry_run` (dry-run must never mutate). For each distinct
+/// namespace in the cycle's candidate batch — filtered by the same
+/// include / exclude / `_`-prefix rules the rest of the curator honours
+/// — calls [`crate::storage::size_gc`] with `archive = true` so victims
+/// are restorable. Accumulates the evicted count into
+/// `report.memories_evicted_size_gc`. Best-effort: a per-namespace
+/// size_gc error is pushed to `report.errors` and the next namespace
+/// continues, matching the auto_tag / contradiction / persona passes.
+///
+/// LLM-free + deterministic (pure SQL ranking inside `size_gc`), so this
+/// runs on every cycle with a cap set, including LLM-less deployments.
+fn run_size_gc_pass(
+    conn: &Connection,
+    candidates: &[Memory],
+    cfg: &CuratorConfig,
+    report: &mut CuratorReport,
+) {
+    // #1750 (Pillar-2.5) — DEFENSIVE GATE: size-GC byte-cap eviction is a
+    // hard-DELETE pass (archive-before-delete, restorable) DISTINCT from
+    // consolidation. It must never arm decoupled from the operator's
+    // compaction opt-in: the #1749 5-agent vote (memory `1817bc8f`) flagged the
+    // `max_corpus_bytes.is_some()`-only gate as a hazard — an operator setting
+    // only a byte cap would silently activate a second deletion pass. We
+    // additionally require `compaction.enabled`. `max_corpus_bytes` stays OUT of
+    // operator config this slice (always compiled-default `None` → still inert
+    // in production); this gate is future-proofing. FORWARD-CONSTRAINT (#1750
+    // vote `a9b2fe09`): if `max_corpus_bytes` is ever exposed, it must get its
+    // own dedicated `[curator.size_gc].enabled` switch — NOT ride under
+    // `[curator.compaction]` — and this gate switches to that flag.
+    if !cfg.compaction.enabled {
+        return;
+    }
+    let Some(cap) = cfg.compaction.max_corpus_bytes else {
+        return;
+    };
+    if cap <= 0 || cfg.dry_run {
+        return;
+    }
+
+    // Distinct namespaces in the candidate set, honouring the curator's
+    // namespace scoping (skip `_`-prefixed + respect include / exclude).
+    use std::collections::BTreeSet;
+    let mut namespaces: BTreeSet<&str> = BTreeSet::new();
+    for mem in candidates {
+        let ns = mem.namespace.as_str();
+        if ns.starts_with('_') {
+            continue;
+        }
+        if !cfg.include_namespaces.is_empty() && !cfg.include_namespaces.iter().any(|n| n == ns) {
+            continue;
+        }
+        if cfg.exclude_namespaces.iter().any(|n| n == ns) {
+            continue;
+        }
+        namespaces.insert(ns);
+    }
+
+    for ns in namespaces {
+        match crate::storage::size_gc(conn, ns, cap, true) {
+            Ok(evicted) => report.memories_evicted_size_gc += evicted,
+            Err(e) => report
+                .errors
+                .push(format!("size_gc failed for namespace {ns}: {e}")),
+        }
+    }
+}
+
+/// v0.8.0 Pillar-2.5 (#1746 cutover) — SAL `ConsolidationPass` live driver.
+///
+/// Gated on `cfg.compaction.enabled` (default `false` → no-op, production
+/// byte-unchanged: autonomy Pass-1 did the consolidation). When enabled, the
+/// caller has ALSO suppressed autonomy Pass-1 (single-source predicate in
+/// `run_once`), so this pass is the LIVE consolidator: it opens a second
+/// `SqliteStore` handle at the curator connection's backing file and runs
+/// [`ConsolidationPass::run`] with `dry_run = cfg.dry_run` — real writes on a
+/// normal cycle, simulate-only on a `--dry-run` cycle. Its counts FOLD into
+/// `report.autonomy.{clusters_formed, memories_consolidated,
+/// rollback_entries_written}` (the self-report is keyed on those fields, so it
+/// stays accurate regardless of which consolidator ran); `eligible_clusters`
+/// and the Stage-6 (#664) `rolled_back` count surface on the SAL-specific
+/// `report.compaction_pass_*` fields. Operator-reversible rollback rows are
+/// written by the pass itself at autonomy parity (#1745).
+///
+/// `clusters_formed` is folded from the pass's `eligible_clusters` (not its raw
+/// `clusters_formed`) for parity: autonomy's `clusters_formed` is already
+/// post-reserved-namespace-filter, which is what `eligible_clusters` measures.
+///
+/// Sync↔async bridge: the curator daemon runs on a `spawn_blocking` OS thread
+/// (no ambient runtime), so a scoped current-thread runtime `block_on` is safe
+/// here — never call this from inside the async `serve` runtime. Best-effort:
+/// store/runtime/sweep errors land in `report.errors`, never aborting the
+/// cycle. In-memory (`:memory:`) connections have no path to re-open and are
+/// skipped. Decision provenance: 5-agent vote `4d3ea1c5` (#1746).
+#[cfg(feature = "sal")]
+fn run_consolidation_pass(
+    conn: &Connection,
+    candidates: &[Memory],
+    cfg: &CuratorConfig,
+    llm: &dyn crate::autonomy::AutonomyLlm,
+    report: &mut CuratorReport,
+) {
+    if !cfg.compaction.enabled {
+        return;
+    }
+    let Some(path) = conn.path().map(std::path::PathBuf::from) else {
+        return; // in-memory DB — no backing file to open a 2nd SAL handle.
+    };
+    let store = match crate::store::sqlite::SqliteStore::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation pass: store open failed: {e}"));
+            return;
+        }
+    };
+    let pass = crate::curator::compaction::ConsolidationPass::new(
+        &store,
+        llm,
+        /* dry_run = */ cfg.dry_run,
+    )
+    // #1750 — thread the operator-resolved cosine gate into the clusterer.
+    .with_cosine_threshold(cfg.compaction.cosine_threshold);
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            report
+                .errors
+                .push(format!("consolidation pass: runtime build failed: {e}"));
+            return;
+        }
+    };
+    match rt.block_on(pass.run(candidates)) {
+        Ok(out) => {
+            // Fold the SAL consolidator's outcome into the autonomy report so
+            // the self-report (keyed on AutonomyPassReport fields) is accurate
+            // even though autonomy Pass-1 was suppressed this cycle.
+            report.autonomy.clusters_formed += out.eligible_clusters;
+            report.autonomy.memories_consolidated += out.memories_consolidated;
+            report.autonomy.rollback_entries_written += out.rollback_entries_written;
+            // SAL-specific counters (no AutonomyPassReport home).
+            report.compaction_pass_clusters_eligible += out.eligible_clusters;
+            report.compaction_pass_rolled_back += out.rolled_back;
+            report.errors.extend(out.errors);
+        }
+        Err(e) => report.errors.push(format!("consolidation pass: {e}")),
+    }
+}
+
+/// Non-`sal` builds carry no SAL `ConsolidationPass`; the consolidation pass is
+/// a compile-time no-op so `run_once` stays uniform across feature sets.
+#[cfg(not(feature = "sal"))]
+fn run_consolidation_pass(
+    _conn: &Connection,
+    _candidates: &[Memory],
+    _cfg: &CuratorConfig,
+    _llm: &dyn crate::autonomy::AutonomyLlm,
+    _report: &mut CuratorReport,
+) {
 }
 
 /// Issue #816 — auto-persona sweep helper.
@@ -614,6 +862,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -647,6 +896,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -680,6 +930,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         assert!(!needs_curation(&mem, &CuratorConfig::default()));
     }
@@ -713,6 +964,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mut cfg = CuratorConfig {
             include_namespaces: vec!["other".to_string()],
@@ -752,6 +1004,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let cfg = CuratorConfig {
             exclude_namespaces: vec!["noisy".to_string()],
@@ -812,6 +1065,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1035,6 +1289,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             db::insert(&conn, &mem).unwrap();
         }
@@ -1323,6 +1578,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1622,6 +1878,146 @@ mod tests {
         assert_eq!(r2.operations_attempted, 0);
     }
 
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-2.5 (#1709) — size-GC pass wiring in run_once.
+    // size_gc is LLM-free, so these run with `llm = None` (the pass runs
+    // before the no-LLM early-return). Long-tier rows are used because the
+    // curator candidate scan only collects mid + long tier.
+    // -----------------------------------------------------------------
+
+    /// Build a long-tier row with `content_len` bytes of payload in `ns`
+    /// at the given priority — predictable corpus arithmetic for the cap.
+    fn make_sized_curator_memory(
+        ns: &str,
+        title: &str,
+        priority: i32,
+        content_len: usize,
+    ) -> Memory {
+        let mut m = make_eligible_memory(ns, title);
+        m.priority = priority;
+        m.content = "x".repeat(content_len);
+        m
+    }
+
+    #[test]
+    fn run_once_size_gc_evicts_and_increments_counter() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        // Two ~1KB long-tier rows; lower-priority is the eviction victim.
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                // #1750 — size-GC now additionally requires `enabled`.
+                enabled: true,
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        // No LLM needed — size_gc is pure SQL and runs before the early-return.
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(
+            report.memories_evicted_size_gc, 1,
+            "one lowest-value row evicted, counter incremented"
+        );
+        assert!(
+            db::get(&conn, &low.id).unwrap().is_none(),
+            "low-priority evicted"
+        );
+        assert!(
+            db::get(&conn, &high.id).unwrap().is_some(),
+            "high-priority kept"
+        );
+    }
+
+    #[test]
+    fn run_once_size_gc_none_cap_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let m = make_sized_curator_memory("sgc-ns", "a", 1, 5000);
+        db::insert(&conn, &m).unwrap();
+
+        // Default compaction → max_corpus_bytes = None → disabled.
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            ..CuratorConfig::default()
+        };
+        assert!(cfg.compaction.max_corpus_bytes.is_none());
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(report.memories_evicted_size_gc, 0, "None cap = no eviction");
+        assert!(db::get(&conn, &m.id).unwrap().is_some(), "row untouched");
+    }
+
+    #[test]
+    fn run_once_size_gc_dry_run_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        let cfg = CuratorConfig {
+            dry_run: true,
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                // #1750 — `enabled` set so this test pins the dry_run gate
+                // specifically (not the new enabled gate).
+                enabled: true,
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(report.memories_evicted_size_gc, 0, "dry_run evicts nothing");
+        assert!(
+            db::get(&conn, &low.id).unwrap().is_some(),
+            "dry_run keeps low"
+        );
+        assert!(
+            db::get(&conn, &high.id).unwrap().is_some(),
+            "dry_run keeps high"
+        );
+    }
+
+    /// #1750 (Pillar-2.5) — the defensive gate: a byte cap set WITHOUT
+    /// `compaction.enabled` must NOT evict. Pins the hazard the #1749 vote
+    /// (`1817bc8f`) flagged — size-GC can no longer arm decoupled from the
+    /// operator's compaction opt-in.
+    #[test]
+    fn run_once_size_gc_cap_without_enabled_does_not_evict() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let low = make_sized_curator_memory("sgc-ns", "low", 1, 1000);
+        let high = make_sized_curator_memory("sgc-ns", "high", 9, 1000);
+        db::insert(&conn, &low).unwrap();
+        db::insert(&conn, &high).unwrap();
+
+        // Cap is set, but compaction.enabled stays false (default).
+        let cfg = CuratorConfig {
+            include_namespaces: vec!["sgc-ns".to_string()],
+            compaction: CompactionConfig {
+                max_corpus_bytes: Some(1500),
+                ..CompactionConfig::default()
+            },
+            ..CuratorConfig::default()
+        };
+        assert!(!cfg.compaction.enabled, "guard: enabled is false");
+        let report = run_once(&conn, None, &cfg, None).unwrap();
+        assert_eq!(
+            report.memories_evicted_size_gc, 0,
+            "cap without enabled = no eviction (defensive gate)"
+        );
+        assert!(db::get(&conn, &low.id).unwrap().is_some(), "low kept");
+        assert!(db::get(&conn, &high.id).unwrap().is_some(), "high kept");
+    }
+
     /// A multi-row cycle records multiple `operations_attempted` and the
     /// LLM is invoked for each. The cycle proceeds even if one row's
     /// LLM call fails — covered indirectly via the error-server above;
@@ -1690,6 +2086,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let m_b = Memory {
             id: "smart-b".to_string(),
@@ -1699,6 +2096,10 @@ mod tests {
         };
         db::insert(&conn, &m_a).unwrap();
         db::insert(&conn, &m_b).unwrap();
+        // #1774 — both sides need a stored embedding to clear the cosine gate;
+        // attach aligned vectors (cosine = 1.0) so the dup pair clusters.
+        db::set_embedding(&conn, &m_a.id, &[1.0, 0.0]).unwrap();
+        db::set_embedding(&conn, &m_b.id, &[1.0, 0.0]).unwrap();
 
         let cfg = CuratorConfig {
             include_namespaces: vec!["smart".to_string()],
@@ -1954,6 +2355,7 @@ fn apply_rollback_handles_storage_error() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     // Insert the memory so it exists
@@ -2014,6 +2416,7 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     let mem2 = Memory {
@@ -2043,6 +2446,7 @@ fn consolidate_pair_skips_when_namespaces_disagree() {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
     };
 
     db::insert(&conn, &mem1).unwrap();
@@ -2098,4 +2502,198 @@ fn cycle_aborts_on_database_error() {
     let report = result.unwrap();
     // The "no LLM" error is recorded in the report
     assert!(report.errors.iter().any(|e| e.contains("no LLM")));
+}
+
+// ---------------------------------------------------------------------------
+// Pillar-2.5 (#1738/#1746) — ConsolidationPass live-pass wiring tests.
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "sal"))]
+mod consolidation_pass_tests_1746 {
+    use super::*;
+    use crate::autonomy::AutonomyLlm;
+    use crate::models::{Memory, Tier};
+    use std::sync::Mutex;
+
+    /// Counts `summarize_memories` calls so a test can prove the dry-run
+    /// path never invokes the LLM (and the real path does).
+    struct CountingStubLlm {
+        summarize_calls: Mutex<usize>,
+    }
+    impl AutonomyLlm for CountingStubLlm {
+        fn auto_tag(&self, _t: &str, _c: &str) -> anyhow::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn detect_contradiction(&self, _a: &str, _b: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        fn summarize_memories(&self, _m: &[(String, String)]) -> anyhow::Result<String> {
+            *self.summarize_calls.lock().unwrap() += 1;
+            Ok("synth".to_string())
+        }
+    }
+
+    fn dup(ns: &str, title: &str, content: &str) -> Memory {
+        let now = chrono::Utc::now().to_rfc3339();
+        Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            tier: Tier::Mid,
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            tags: vec![],
+            priority: 5,
+            confidence: 1.0,
+            source: "test".to_string(),
+            access_count: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            last_accessed_at: None,
+            expires_at: None,
+            metadata: serde_json::json!({}),
+            reflection_depth: 0,
+            memory_kind: crate::models::MemoryKind::Observation,
+            entity_id: None,
+            persona_version: None,
+            citations: Vec::new(),
+            source_uri: None,
+            source_span: None,
+            confidence_source: crate::models::ConfidenceSource::CallerProvided,
+            confidence_signals: None,
+            confidence_decayed_at: None,
+            version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
+        }
+    }
+
+    fn seed(conn: &rusqlite::Connection) -> Vec<Memory> {
+        // Distinct titles so the (title, namespace) upsert keeps both rows;
+        // identical content so Jaccard clusters them.
+        let c = "kubernetes rolling canary deploy strategy notes";
+        let m1 = dup("ns", "t1", c);
+        let m2 = dup("ns", "t2", c);
+        crate::db::insert(conn, &m1).unwrap();
+        crate::db::insert(conn, &m2).unwrap();
+        // #1774 — both sides need a stored embedding to clear the cosine gate;
+        // attach aligned vectors (cosine = 1.0) so the dup pair clusters (the
+        // un-embedded path no longer merges).
+        crate::db::set_embedding(conn, &m1.id, &[1.0, 0.0]).unwrap();
+        crate::db::set_embedding(conn, &m2.id, &[1.0, 0.0]).unwrap();
+        vec![m1, m2]
+    }
+
+    #[test]
+    fn consolidation_pass_real_consolidates_and_folds_when_enabled() {
+        // #1746 cutover: with compaction.enabled and a normal (non-dry-run)
+        // cycle, the SAL pass is the LIVE consolidator — it summarises, writes
+        // the [consolidated] row, hard-deletes the sources, and FOLDS its counts
+        // into report.autonomy so the self-report is accurate.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: super::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default() // dry_run = false → real consolidation
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report.compaction_pass_clusters_eligible >= 1,
+            "the dup cluster should be eligible"
+        );
+        // Counts folded into report.autonomy (self-report parity).
+        assert_eq!(
+            report.autonomy.memories_consolidated, 2,
+            "both sources folded into report.autonomy"
+        );
+        assert!(report.autonomy.clusters_formed >= 1);
+        assert_eq!(
+            report.autonomy.rollback_entries_written, 1,
+            "one operator-reversible rollback entry persisted (#1745)"
+        );
+        assert!(
+            *llm.summarize_calls.lock().unwrap() >= 1,
+            "real mode summarises via the LLM"
+        );
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert!(
+            rows.iter().any(|m| m.title.starts_with("[consolidated]")),
+            "the live pass writes a consolidated row"
+        );
+        // Source label byte-continuity with the autonomy path (#1746).
+        let consolidated = rows
+            .iter()
+            .find(|m| m.title.starts_with("[consolidated]"))
+            .unwrap();
+        assert_eq!(consolidated.source, crate::autonomy::CURATOR_SOURCE_LABEL);
+    }
+
+    #[test]
+    fn consolidation_pass_dry_run_does_not_write_when_enabled() {
+        // compaction.enabled but a --dry-run cycle: simulate-only, no LLM, no
+        // write — the pass respects cfg.dry_run.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        let cfg = CuratorConfig {
+            compaction: super::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            dry_run: true,
+            ..Default::default()
+        };
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(true);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert!(
+            report.compaction_pass_clusters_eligible >= 1,
+            "eligible counted"
+        );
+        assert_eq!(
+            report.autonomy.memories_consolidated, 0,
+            "dry-run writes nothing"
+        );
+        assert_eq!(
+            *llm.summarize_calls.lock().unwrap(),
+            0,
+            "dry-run skips the LLM"
+        );
+        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        assert_eq!(rows.len(), 2, "both source rows remain live");
+    }
+
+    #[test]
+    fn consolidation_pass_noop_when_compaction_disabled() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let conn = db::open(tmp.path()).unwrap();
+        let candidates = seed(&conn);
+        // Default config → compaction.enabled = false.
+        let cfg = CuratorConfig::default();
+        let llm = CountingStubLlm {
+            summarize_calls: Mutex::new(0),
+        };
+        let mut report = CuratorReport::new(false);
+        run_consolidation_pass(&conn, &candidates, &cfg, &llm, &mut report);
+
+        assert_eq!(
+            report.compaction_pass_clusters_eligible, 0,
+            "disabled compaction must not run the pass"
+        );
+        assert_eq!(report.autonomy.memories_consolidated, 0);
+        assert!(
+            report.errors.is_empty(),
+            "no errors expected: {:?}",
+            report.errors
+        );
+    }
 }

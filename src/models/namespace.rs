@@ -542,6 +542,13 @@ pub struct CorePolicy {
     /// payloads byte-identical for legacy peers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reflection_depth: Option<u32>,
+    /// #1720 C — per-namespace required write scope. When `Some(scope)`, a
+    /// `Store` whose effective scope (metadata.scope; absent ⇒ private)
+    /// does not equal this is REFUSED at the governance gate (refuse-only;
+    /// the gate never coerces the write). `None` ⇒ no scope requirement.
+    /// Rides in the existing `metadata.governance` blob; no schema migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_scope: Option<crate::models::MemoryScope>,
 }
 
 impl Default for CorePolicy {
@@ -553,6 +560,7 @@ impl Default for CorePolicy {
             approver: default_approver(),
             inherit: default_inherit(),
             max_reflection_depth: None,
+            required_scope: None,
         }
     }
 }
@@ -953,7 +961,12 @@ impl GovernancePolicy {
     /// then call this accessor on the result.
     #[must_use]
     pub fn effective_max_reflection_depth(&self) -> u32 {
-        self.core.max_reflection_depth.unwrap_or(3)
+        // #1680 — the governance default and the reranker's advertised cap
+        // share ONE const at the crate root (no more two independent
+        // literal `3`s that could drift).
+        self.core
+            .max_reflection_depth
+            .unwrap_or(crate::DEFAULT_REFLECTION_MAX_DEPTH_CAP)
     }
 
     /// v0.7.0 QW-1 — resolve the file-backed-export policy. Returns
@@ -1569,6 +1582,71 @@ mod tests {
         let meta = json!({"governance": {"write": 42}});
         let res = GovernancePolicy::from_metadata(&meta).unwrap();
         assert!(res.is_err());
+    }
+
+    // ---- #1720 C: required_scope serde round-trip ---------------------------
+
+    #[test]
+    fn core_policy_required_scope_some_serializes_and_round_trips() {
+        let p = GovernancePolicy {
+            core: CorePolicy {
+                required_scope: Some(MemoryScope::Collective),
+                ..CorePolicy::default()
+            },
+            ..GovernancePolicy::default()
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        // The key is present on the wire with the snake_case scope value.
+        assert!(
+            json.contains("required_scope"),
+            "required_scope key missing on wire: {json}"
+        );
+        assert!(
+            json.contains("collective"),
+            "scope value missing on wire: {json}"
+        );
+        let back: GovernancePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.core.required_scope, Some(MemoryScope::Collective));
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn core_policy_required_scope_none_is_omitted_on_wire() {
+        // skip_serializing_if = "Option::is_none" keeps the absent shape so
+        // pre-#1720 federation peers see no payload drift.
+        let p = GovernancePolicy::default();
+        assert_eq!(p.core.required_scope, None);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("required_scope"),
+            "required_scope key must be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn legacy_governance_blob_without_required_scope_deserializes_to_none() {
+        // A pre-#1720 metadata.governance blob carries no required_scope key;
+        // #[serde(default)] must resolve it to None (no migration needed).
+        let meta = json!({
+            "governance": {
+                "write": "owner",
+                "max_reflection_depth": 4,
+            },
+        });
+        let parsed = GovernancePolicy::from_metadata(&meta).unwrap().unwrap();
+        assert_eq!(parsed.core.required_scope, None);
+    }
+
+    #[test]
+    fn from_metadata_parses_required_scope_from_governance_blob() {
+        let meta = json!({
+            "governance": {
+                "write": "any",
+                "required_scope": "private",
+            },
+        });
+        let parsed = GovernancePolicy::from_metadata(&meta).unwrap().unwrap();
+        assert_eq!(parsed.core.required_scope, Some(MemoryScope::Private));
     }
 
     // ---- MemoryScope coverage tests (FX-F3, 2026-05-31) ---------------------

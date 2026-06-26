@@ -344,6 +344,92 @@ async fn recall_get_verbose_provenance_header() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// #1710 — the sqlite HTTP recall branch MUST populate the
+/// `recall_observations` ledger (parity with the postgres HTTP branch
+/// per #1705 and the MCP sqlite path), stamp the caller `agent_id` +
+/// `namespace`, AND echo a non-empty `recall_id` in the response — all
+/// WITHOUT deadlocking on the held DB lock (the fix calls the
+/// `record_recall_with_identity` free-fn on the already-held conn, never
+/// re-acquiring via `app.store`). A deadlock would HANG this test
+/// (the `current_thread` tokio runtime + single DB mutex would never
+/// make progress); completion is itself the no-deadlock proof.
+#[tokio::test(flavor = "current_thread")]
+async fn recall_post_sqlite_populates_observations_ledger_1710() {
+    let (r, db_tmp) = sqlite_router();
+
+    // (1) Store a memory the recall will return. The `post_json` helper
+    // sends `x-agent-id: ai:cov3-tester` so the caller principal resolves.
+    let (store_status, store_body) = post_json(
+        &r,
+        "/api/v1/memories",
+        json!({
+            "title": "ledger-parity-1710",
+            "content": "the sqlite http recall branch must record observations",
+            "namespace": "ns-1710",
+            "tier": "long",
+            // `collective` scope so the recall (whose visibility caller
+            // principal is the X-Agent-Id `ai:cov3-tester`, a different
+            // namespace than `ns-1710`) actually returns the row — the
+            // ledger records the RECALLED set, so the recalled set must be
+            // non-empty. The caller agent_id is still stamped on the
+            // ledger row regardless of scope.
+            "scope": "collective"
+        }),
+    )
+    .await;
+    assert!(
+        store_status.is_success(),
+        "store failed: {store_status} {store_body}"
+    );
+
+    // (2) Recall it over the sqlite HTTP branch. If the ledger write
+    // re-acquired the lock this call would never return.
+    let (status, body) = post_json(
+        &r,
+        "/api/v1/recall",
+        json!({"context": "observations", "namespace": "ns-1710", "limit": 10}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "recall failed: {body}");
+    assert!(
+        body["count"].as_i64().unwrap_or(0) >= 1,
+        "recall must return the seeded memory (ledger records the recalled set): {body}"
+    );
+
+    // (3) The response echoes a non-empty recall_id (postgres parity).
+    let recall_id = body
+        .get("recall_id")
+        .and_then(Value::as_str)
+        .expect("recall_id must be present in the sqlite recall response");
+    assert!(!recall_id.is_empty(), "recall_id must be non-empty");
+
+    // (4) A recall_observations row exists, stamped with the caller
+    // agent_id + namespace. Open a fresh connection on the same DB path.
+    let conn = ai_memory::db::open(db_tmp.path()).expect("reopen sqlite for ledger assert");
+    let (row_count, agent_id, namespace): (i64, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(agent_id), MAX(namespace) \
+             FROM recall_observations WHERE recall_id = ?1",
+            [recall_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("query recall_observations");
+    assert!(
+        row_count >= 1,
+        "expected >=1 recall_observations row for recall_id {recall_id}, got {row_count}"
+    );
+    assert_eq!(
+        agent_id.as_deref(),
+        Some("ai:cov3-tester"),
+        "ledger row must be stamped with the caller agent_id"
+    );
+    assert_eq!(
+        namespace.as_deref(),
+        Some("ns-1710"),
+        "ledger row must be stamped with the recall namespace"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // links — create / delete / get / verify validation + error arms
 // ---------------------------------------------------------------------------

@@ -540,11 +540,14 @@ pub struct Capabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kg_backend: Option<String>,
 
-    /// L1-1 (v0.7.0) — the set of typed memory kinds this binary
-    /// supports.  Always `["observation", "reflection"]` for v0.7.0;
-    /// Goal/Plan/Step/Decision land in L1-6/v0.8.0.  Callers that want
-    /// to enumerate valid values for a `memory_kind` filter should
-    /// consult this field rather than hardcoding the list.
+    /// L1-1 (v0.7.0) — the legacy lifecycle hint surfaced on older
+    /// capabilities envelopes (`["observation", "reflection"]`). The
+    /// authoritative, complete accepted vocabulary lives on the Form-6
+    /// `memory_kind_vocab` block (compile-anchored to
+    /// [`crate::models::MemoryKind::all`]) — including the Form-6
+    /// Batman variants (#759) and the v0.8.0 Goal/Plan/Step
+    /// typed-cognition kinds (#1709). Callers should consult that block
+    /// rather than hardcoding the list.
     ///
     /// `#[serde(default)]` keeps older capabilities consumers that
     /// don't know the field from breaking.
@@ -959,7 +962,9 @@ pub struct CapabilityHooks {
     /// enumerating the enum.
     ///
     /// History: G2 shipped 20; G10 added the 21st; Task 6/8 added
-    /// the 22nd + 23rd; L1-7 adds the 24th + 25th → total **25**.
+    /// the 22nd + 23rd; L1-7 added the 24th + 25th; v0.8.0 #1709 adds
+    /// the 26th + 27th (`pre_signal_send`, `post_signal_ack`) →
+    /// total **27**.
     #[serde(default = "default_hook_events_count")]
     pub hook_events_count: usize,
     /// v0.7-polish SEC-15 / COR-11 (issue #780): mirror of the
@@ -983,7 +988,7 @@ pub struct CapabilityHooks {
 /// Compile-time count of `HookEvent` variants.  Updated here when new
 /// variants land; the corresponding enum exhaustiveness check in
 /// `src/hooks/timeouts.rs` enforces the count at test time.
-pub const HOOK_EVENTS_COUNT: usize = 25;
+pub const HOOK_EVENTS_COUNT: usize = 27;
 
 fn default_hook_events_count() -> usize {
     HOOK_EVENTS_COUNT
@@ -1596,10 +1601,11 @@ fn default_capability_atomisation() -> CapabilityAtomisation {
 /// Field → implementation anchor map:
 ///
 /// - `vocabulary`: the complete enumerated vocabulary the substrate
-///   accepts on the `memory_kind` column. Always
+///   accepts on the `memory_kind` column. The Form-6 v0.7.x set
 ///   `["observation", "reflection", "persona", "concept", "entity",
-///   "claim", "relation", "event", "conversation", "decision"]` in
-///   v0.7.x — anchored at compile time by
+///   "claim", "relation", "event", "conversation", "decision"]`
+///   extended at v0.8.0 (#1709) with the typed-cognition cluster
+///   `"goal", "plan", "step"` — anchored at compile time by
 ///   [`crate::models::MemoryKind::all`].
 /// - `recall_filter`: MCP `memory_recall` and HTTP recall accept a
 ///   `kinds` parameter (CSV string or JSON array). `"implemented"`
@@ -3519,6 +3525,57 @@ pub struct CuratorSection {
     /// (`AI_MEMORY_CONFIDENCE_DECAY=1`).
     #[serde(default)]
     pub confidence_decay_half_life_days: Option<std::collections::HashMap<String, f64>>,
+
+    /// #1749 — `[curator.compaction]` activation for the Pillar-2.5
+    /// consolidation pass. See [`CuratorCompactionSection`].
+    #[serde(default)]
+    pub compaction: Option<CuratorCompactionSection>,
+
+    /// #1393 sub-unit 2 — `[curator].transcript_classify_enabled` activation
+    /// for the transcript-classify pass
+    /// (`crate::curator::transcript_classify_pass::TranscriptClassifyPass`):
+    /// when `true`, `curator --reflect` also reclassifies recovered-from-
+    /// transcript `Observation` memories whose LLM-classified kind is more
+    /// specific (Decision / Claim / Event …) via the audited
+    /// `reclassify_memory_kind` path. Default `false` (opt-in). Env override:
+    /// `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` (see
+    /// [`ENV_TRANSCRIPT_CLASSIFY_ENABLED`]).
+    #[serde(default)]
+    pub transcript_classify_enabled: Option<bool>,
+}
+
+/// v0.8.0 #1749 — `[curator.compaction]` activation knobs for the Pillar-2.5
+/// consolidation pass (`crate::curator::compaction::ConsolidationPass`).
+///
+/// ```toml
+/// [curator.compaction]
+/// enabled = true
+/// ```
+///
+/// Only `enabled` is operator-reachable in this slice. Setting it `true` makes
+/// the curator run the SAL `ConsolidationPass` as the LIVE consolidator
+/// (suppressing the legacy autonomy Pass-1) — a hard-DELETE merge of
+/// near-duplicate memories. Default `false` (opt-in). Consolidations are
+/// operator-reversible via `ai-memory curator --rollback` on **sqlite** (#1745);
+/// on **postgres** that reversal is not yet wired (#1748) and the curator emits
+/// a runtime WARN. The clustering `cosine_threshold` is operator-tunable here
+/// (#1750, threaded into the live clusterer). The size-GC `max_corpus_bytes`
+/// knob is still intentionally NOT exposed — when it is, it must get its own
+/// dedicated `[curator.size_gc]` switch rather than ride under this block
+/// (#1750 5-agent vote, memory `a9b2fe09`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CuratorCompactionSection {
+    /// When `true`, the curator runs the SAL `ConsolidationPass` live. Default
+    /// `false`. Env override: `AI_MEMORY_COMPACTION_ENABLED` (see
+    /// [`ENV_COMPACTION_ENABLED`]).
+    pub enabled: Option<bool>,
+    /// #1750 — cosine similarity gate for consolidation cluster formation.
+    /// `None` → the compiled default (`0.75`,
+    /// [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]). Env override:
+    /// `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` (see
+    /// [`ENV_COMPACTION_COSINE_THRESHOLD`]). Threaded into the live clusterer via
+    /// `ConsolidationPass::with_cosine_threshold` (previously dead config).
+    pub cosine_threshold: Option<f32>,
 }
 
 /// v0.7.x (#1146) — `[storage]` sectioned storage configuration.
@@ -3564,6 +3621,14 @@ pub struct StorageSection {
     /// across-the-board winner of the P1 perf-audit PRAGMA A/B
     /// (15-30% on large-corpus reads).
     pub db_mmap_size_bytes: Option<i64>,
+
+    /// #1735 (Pillar-4 4.C) — AGE graph-projection posture for postgres
+    /// link writes: `"sync"` (default, inline MERGE) or `"deferred"`
+    /// (enqueue to `kg_projection_outbox`, cold drainer projects later).
+    /// Env override: `AI_MEMORY_AGE_PROJECTION_MODE` ([`ENV_AGE_PROJECTION_MODE`]).
+    /// Postgres-only; SQLite has no graph backend and ignores it.
+    /// Unparseable / unset falls through to the compiled default `sync`.
+    pub age_projection_mode: Option<String>,
 }
 
 /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
@@ -3607,6 +3672,12 @@ pub struct LimitsSection {
     /// Maximum items returned in a single list response / accepted in a
     /// single bulk or federation-sync request.
     pub max_page_size: Option<usize>,
+
+    /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
+    /// cap. When `Some(n)` with `n > 0`, the daemon admits at most `n`
+    /// concurrent in-flight requests and sheds the rest with a typed
+    /// `503`. `None` / `Some(0)` leaves admission control disabled.
+    pub max_inflight_requests: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3936,6 +4007,12 @@ pub struct ResolvedStorage {
     /// > compiled 256 MiB default). `0` disables memory-mapped I/O.
     /// Seeded into `crate::storage::set_db_mmap_size` at boot.
     pub db_mmap_size_bytes: i64,
+    /// #1735 (Pillar-4 4.C) — resolved AGE-projection mode
+    /// (`AI_MEMORY_AGE_PROJECTION_MODE` env > `[storage].age_projection_mode`
+    /// > compiled default `Sync`). Seeded into
+    /// `crate::config::set_age_projection_mode` at boot; read by
+    /// `PostgresStore::link_internal`.
+    pub age_projection_mode: AgeProjectionMode,
     /// #1590 — per-field provenance of `default_namespace`:
     /// [`ConfigSource::Config`] when `[storage].default_namespace` is
     /// explicitly set, [`ConfigSource::Legacy`] when only the
@@ -4032,6 +4109,9 @@ pub struct ResolvedLimits {
     pub max_links_per_day: i64,
     /// Maximum items per list response / bulk-or-sync request.
     pub max_page_size: usize,
+    /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
+    /// cap. `0` means disabled (no inflight layer composed).
+    pub max_inflight_requests: usize,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -4044,6 +4124,16 @@ pub const ENV_MAX_STORAGE_BYTES: &str = "AI_MEMORY_MAX_STORAGE_BYTES";
 pub const ENV_MAX_LINKS_PER_DAY: &str = "AI_MEMORY_MAX_LINKS_PER_DAY";
 /// Env override for `[limits].max_page_size`.
 pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
+/// #1733 (Pillar-4 4.A) — env override for `[limits].max_inflight_requests`,
+/// the global HTTP admission-control concurrency cap.
+pub const ENV_MAX_INFLIGHT_REQUESTS: &str = "AI_MEMORY_MAX_INFLIGHT_REQUESTS";
+/// #1733 (Pillar-4 4.A) — compiled default for the HTTP admission-control
+/// in-flight-request cap. `0` means **disabled** (the layer is not composed
+/// at all, so the daemon's concurrency behaviour is byte-identical to a
+/// build without admission control). Admission control is strictly opt-in:
+/// operators set `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or
+/// `[limits].max_inflight_requests`) to a positive cap to enable load-shedding.
+pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 0;
 
 /// #1579 B7 — env override for the sqlite `PRAGMA mmap_size`
 /// (`[storage].db_mmap_size_bytes`), in whole bytes. `0` disables
@@ -4051,6 +4141,34 @@ pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
 /// the `[storage]` section, then to the compiled 256 MiB default
 /// (`crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES`).
 pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
+/// #1735 (Pillar-4 4.C) — env override for `[storage].age_projection_mode`
+/// (`sync` | `deferred`). Selects whether postgres link writes run the
+/// inline AGE MERGE synchronously (default) or defer it to the cold-path
+/// projection drainer via `kg_projection_outbox`.
+pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
+
+/// #1463 Tier 1 — env override for the operational-log sink destination
+/// (`[logging].sink`). Highest layer of the `env > [logging].sink > file`
+/// ladder; see [`resolve_log_sink`] / [`LogSink`].
+pub const ENV_LOG_SINK: &str = "AI_MEMORY_LOG_SINK";
+
+/// #1765 Tier 2 — env override for the remote syslog collector address
+/// (`host:port`, e.g. `logs.example.com:6514`). Highest layer of the
+/// `env > [logging].syslog_address` ladder; consulted only when the resolved
+/// [`LogSink`] is [`LogSink::Syslog`]. Read by the `syslog`-feature sink
+/// builder in `src/logging.rs`.
+pub const ENV_LOG_SYSLOG_ADDRESS: &str = "AI_MEMORY_LOG_SYSLOG_ADDRESS";
+
+/// #1765 Tier 2 — env override for the syslog transport: `tls` (RFC 5425, the
+/// norm for any routable collector) or `tcp` (plaintext; intended only for a
+/// loopback / sidecar forwarder). `env > [logging].syslog_transport > tls`.
+pub const ENV_LOG_SYSLOG_TRANSPORT: &str = "AI_MEMORY_LOG_SYSLOG_TRANSPORT";
+
+/// #1765 Tier 2 — env override for the PEM file holding the collector's CA (or
+/// self-signed leaf) used to verify the TLS server certificate. Required when
+/// the syslog transport is `tls` (the dep-free trust anchor — no public-roots
+/// dependency). `env > [logging].syslog_tls_ca_file`.
+pub const ENV_LOG_SYSLOG_TLS_CA_FILE: &str = "AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE";
 
 /// #1604 — env override for the tokenized length of rerank inputs
 /// (`[reranker].max_seq_tokens`), in tokens. Values that are zero,
@@ -4068,6 +4186,49 @@ pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
 /// [`crate::reranker::RerankerScoreFloor::Off`]). Unparseable values
 /// fall through to the next layer.
 pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
+
+/// v0.8.0 #1749 — env override for `[curator.compaction].enabled`. Truthy
+/// (`1`/`true`) or falsy (`0`/`false`) wins over config; anything else falls
+/// through to the config field then the compiled default `false`.
+pub const ENV_COMPACTION_ENABLED: &str = "AI_MEMORY_COMPACTION_ENABLED";
+
+/// #1393 sub-unit 2 — env override for the transcript-classify pass
+/// activation (`[curator].transcript_classify_enabled`). Uniform ladder:
+/// this env > config field > compiled `false`. See
+/// [`AppConfig::resolve_transcript_classify_enabled`].
+pub const ENV_TRANSCRIPT_CLASSIFY_ENABLED: &str = "AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED";
+
+/// v0.8.0 #1750 — env override for `[curator.compaction].cosine_threshold`.
+/// A parseable `f32` in `(0.0, 1.0]` wins over config; an unparseable or
+/// out-of-range value falls through to the config field then the compiled
+/// default (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]).
+pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_THRESHOLD";
+
+/// v0.8.0 #1734 (PE-1) — env override for `[hooks].enforce_mode`. A valid
+/// `off` / `advisory` / `enforce` token (case-insensitive) wins over config;
+/// anything else falls through to the config field then the compiled default
+/// [`crate::hooks::HookEnforceMode::Off`].
+pub const ENV_HOOKS_ENFORCE_MODE: &str = "AI_MEMORY_HOOKS_ENFORCE_MODE";
+
+/// v0.8.0 #1764 — env-only knob for the reflection-corpus DECORRELATION
+/// VISIBILITY probe (DeepMind From-AGI-to-ASI audit rec #1; 5-agent vote
+/// `4d3ea1c5`). A valid `off` / `advisory` / `enforce` token (case-insensitive)
+/// selects the mode; anything else (incl. unset) falls through to the compiled
+/// default [`ReflectDecorrelationMode::Off`]. Env-only direct-read (no
+/// `[curator]` field, mirroring #1718/#1765) — no `config_precedence` entry.
+/// At v0.8.0 `enforce` is documented-but-INERT: it degrades to advisory with a
+/// one-shot WARN because binding N≥3 model-family-distinct REFUSAL is gated on
+/// the unbuilt attested-provenance primitive (#1719 / #1171), deferred to v0.9.
+/// See [`reflect_decorrelation_mode`].
+pub const ENV_REFLECT_DECORRELATION_MODE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE";
+
+/// v0.8.0 #1764 — env-only override for the producer-dominance threshold above
+/// which the decorrelation probe emits an advisory (a parseable `f64` in
+/// `(0.0, 1.0]` wins; unparseable / out-of-range falls through to the compiled
+/// default [`crate::curator::decorrelation_probe::DEFAULT_DOMINANCE_THRESHOLD`]
+/// = `0.8`). See [`reflect_decorrelation_dominance_threshold`].
+pub const ENV_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD: &str =
+    "AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD";
 
 /// v0.7.0 (a) — env override for the postgres pool ceiling
 /// (`postgres_pool_max_connections`). Byte-matches the name documented
@@ -4386,6 +4547,19 @@ pub struct HooksConfig {
     /// `[hooks.subscription]` sub-block. Optional — when omitted, no
     /// server-wide HMAC override applies.
     pub subscription: Option<HooksSubscriptionConfig>,
+    /// #1734 PE-1 — mandatory-hook presence enforcement mode
+    /// (`off` / `advisory` / `enforce`). Env override:
+    /// `AI_MEMORY_HOOKS_ENFORCE_MODE` (see [`ENV_HOOKS_ENFORCE_MODE`]).
+    /// `None` / omitted → compiled default `off` (byte-identical to today).
+    #[serde(default)]
+    pub enforce_mode: Option<crate::hooks::HookEnforceMode>,
+    /// #1734 PE-1 — events that MUST have an enabled hook present. Default
+    /// EMPTY (an empty set is a hard no-op even under `enforce` — the
+    /// self-DOS guard). Only pre-* mutation / governance events are eligible;
+    /// ineligible entries are dropped with a WARN by
+    /// [`AppConfig::resolve_required_events`].
+    #[serde(default)]
+    pub required_events: Option<Vec<crate::hooks::HookEvent>>,
 }
 
 /// `[hooks.subscription]` sub-block. K7 ships one knob today
@@ -4746,6 +4920,228 @@ impl PermissionsMode {
     }
 }
 
+/// #1735 (Pillar-4 4.C) — AGE graph-projection posture for postgres link
+/// writes. `Sync` (default) runs the inline `project_link_into_age` MERGE
+/// in the link-write transaction (byte-identical to pre-4.C behaviour).
+/// `Deferred` enqueues a `kg_projection_outbox` row in the same tx and lets
+/// the cold drainer project it out-of-band, taking the ~6 synchronous AGE
+/// Cypher round-trips off the link-write hot path. Postgres-only — AGE is
+/// Postgres-only; the SQLite adapter has no graph backend and ignores this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AgeProjectionMode {
+    /// Inline synchronous AGE MERGE in the link-write tx (default).
+    #[default]
+    Sync,
+    /// Enqueue to `kg_projection_outbox`; cold drainer projects later.
+    Deferred,
+}
+
+impl AgeProjectionMode {
+    /// Lowercase wire string for config / doctor / banner surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Deferred => "deferred",
+        }
+    }
+
+    /// Parse a case-insensitive `sync` / `deferred` token. Returns `None`
+    /// for anything else so the resolver falls through to its default
+    /// (mirrors `PermissionsMode` parsing).
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "sync" => Some(Self::Sync),
+            "deferred" => Some(Self::Deferred),
+            _ => None,
+        }
+    }
+}
+
+/// v0.8.0 #1764 — tri-state posture for the reflection-corpus DECORRELATION
+/// VISIBILITY probe (DeepMind audit rec #1; 5-agent vote `4d3ea1c5`). Mirrors
+/// [`crate::hooks::HookEnforceMode`] / [`AgeProjectionMode`].
+///
+/// `Off` (default) = no probe (byte-identical to pre-#1764). `Advisory` = scan
+/// the Reflection corpus, compute single-producer dominance, and emit a
+/// structured WARN + advisory report when dominance crosses the threshold —
+/// the safe visibility rung. `Enforce` is RESERVED for the v0.9 write-time N≥3
+/// model-family-distinct REFUSAL: at v0.8.0 it is **inert** and degrades to
+/// `Advisory` (with a one-shot WARN) because binding "distinct" requires
+/// attested model-family provenance that does not exist yet (#1719 / #1171) —
+/// so a probe that refused on CLAIMED distinctness would be security theater
+/// (the unanimous 5-agent finding). Distinctness measured here is therefore
+/// CLAIMED, not ATTESTED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReflectDecorrelationMode {
+    /// No probe (default).
+    #[default]
+    Off,
+    /// Scan + WARN on producer dominance; never refuse. The visibility rung.
+    Advisory,
+    /// RESERVED for v0.9 write-time refusal; INERT at v0.8.0 (→ `Advisory`).
+    Enforce,
+}
+
+impl ReflectDecorrelationMode {
+    /// Lowercase wire string for config / banner / report surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// Case-insensitive parse of `off` / `advisory` / `enforce`. Returns `None`
+    /// for anything else so the resolver falls through to the compiled default
+    /// (mirrors [`AgeProjectionMode::from_str_opt`]).
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "advisory" => Some(Self::Advisory),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+
+    /// `true` when the probe should run (`Advisory` or `Enforce`). `Off` is the
+    /// only inactive posture.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// v0.8.0 #1764 — resolve the reflection-decorrelation probe mode. Env-only
+/// direct-read (`AI_MEMORY_REFLECT_DECORRELATION_MODE` > compiled
+/// [`ReflectDecorrelationMode::Off`]); a valid `off`/`advisory`/`enforce` token
+/// wins, anything else (incl. unset) yields `Off`. Mirrors the
+/// [`age_projection_mode`] env-only reader convention.
+#[must_use]
+pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
+    std::env::var(ENV_REFLECT_DECORRELATION_MODE)
+        .ok()
+        .and_then(|s| ReflectDecorrelationMode::from_str_opt(&s))
+        .unwrap_or_default()
+}
+
+/// v0.8.0 #1764 — resolve the producer-dominance threshold for the probe.
+/// Env-only direct-read (`AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD`
+/// > compiled default `0.8`). A parseable `f64` in `(0.0, 1.0]` wins; an
+/// unparseable / out-of-range value falls through to the default.
+#[must_use]
+pub fn reflect_decorrelation_dominance_threshold() -> f64 {
+    const DEFAULT: f64 = 0.8;
+    std::env::var(ENV_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 1.0)
+        .unwrap_or(DEFAULT)
+}
+
+/// #1463 Tier 1 — operational-log sink destination. `File` (default) is the
+/// existing rolling file appender (byte-identical to pre-#1463); `Stdout`
+/// emits to stdout via the SAME `tracing_appender::non_blocking` worker so
+/// the init system (systemd-journald / launchd unified log / Windows Event
+/// Log) captures and routes it. The native `journald` / `syslog` protocol
+/// sinks are the dep-gated Tier 2 (a separate follow-up issue), which will
+/// add further variants here behind cargo features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogSink {
+    /// Rolling file appender under the resolved log dir (default).
+    #[default]
+    File,
+    /// Structured/plain lines to stdout for OS-tier capture.
+    Stdout,
+    /// #1765 (v0.8.0) Tier 2 — OS-agnostic remote syslog: RFC 5424 framed
+    /// records over TCP (with optional rustls TLS, RFC 5425) to a
+    /// collector/SIEM. Pure network I/O, so unlike the Linux-only journald
+    /// sink it behaves identically on every platform. The target lives in the
+    /// `[logging].syslog_*` fields (env `AI_MEMORY_LOG_SYSLOG_*`). The writer
+    /// is compiled only under `--features syslog`; selecting this sink in a
+    /// build WITHOUT that feature fail-CLOSES at boot (`init_file_logging`
+    /// returns an error) rather than silently falling back to a local file —
+    /// the operator explicitly opted into off-host shipping, so a silent local
+    /// write would be a confidentiality surprise. The variant itself (and its
+    /// `as_str`/`from_str_opt` parsing) is always compiled so config / doctor /
+    /// banner surfaces recognize the value uniformly.
+    Syslog,
+}
+
+impl LogSink {
+    /// Lowercase wire string for config / doctor / banner surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Stdout => "stdout",
+            Self::Syslog => "syslog",
+        }
+    }
+
+    /// Parse a case-insensitive `file` / `stdout` / `syslog` token. Returns
+    /// `None` for anything else so the resolver falls through to its default
+    /// (mirrors [`AgeProjectionMode::from_str_opt`]). `syslog` parses in every
+    /// build (feature-independent); the fail-closed-when-not-compiled check
+    /// lives at the `init_file_logging` consumer, not here.
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "file" => Some(Self::File),
+            "stdout" => Some(Self::Stdout),
+            "syslog" => Some(Self::Syslog),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the operational-log sink, uniform ladder `AI_MEMORY_LOG_SINK`
+/// env > `[logging].sink` > compiled default (`File`). Mirrors the
+/// `resolve_storage` mmap/age ladders: an unrecognized value at any layer
+/// falls THROUGH rather than erroring (the `logging::init_file_logging`
+/// path emits a one-shot operator WARN when a configured value was
+/// unrecognized — see `logging::unrecognized_sink_value`). Pure + free of
+/// global state so the precedence is unit-testable without the fragile
+/// process-global subscriber install (the #1711 lesson).
+#[must_use]
+pub fn resolve_log_sink(cfg: &LoggingConfig) -> LogSink {
+    std::env::var(ENV_LOG_SINK)
+        .ok()
+        .and_then(|s| LogSink::from_str_opt(&s))
+        .or_else(|| cfg.sink.as_deref().and_then(LogSink::from_str_opt))
+        .unwrap_or_default()
+}
+
+/// Process-wide AGE-projection mode, seeded once at daemon boot from the
+/// resolved `[storage]` config (`AI_MEMORY_AGE_PROJECTION_MODE` env >
+/// `[storage].age_projection_mode` > compiled default `sync`). Read by
+/// `PostgresStore::link_internal` at write time (it has no `AppConfig`
+/// handle), mirroring the `crate::storage::set_db_mmap_size` boot-seeded
+/// global precedent. `0` = `Sync` (default), `1` = `Deferred`.
+static AGE_PROJECTION_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Seed the process-wide AGE-projection mode (#1735). Called once at boot.
+pub fn set_age_projection_mode(mode: AgeProjectionMode) {
+    let v = match mode {
+        AgeProjectionMode::Sync => 0,
+        AgeProjectionMode::Deferred => 1,
+    };
+    AGE_PROJECTION_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide AGE-projection mode (#1735). Defaults to `Sync`.
+#[must_use]
+pub fn age_projection_mode() -> AgeProjectionMode {
+    match AGE_PROJECTION_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => AgeProjectionMode::Deferred,
+        _ => AgeProjectionMode::Sync,
+    }
+}
+
 /// `[permissions]` block in `config.toml`. Carries the gate's
 /// enforcement posture and (v0.7.0 K9) the declarative rule list
 /// the unified [`crate::permissions::Permissions::evaluate`]
@@ -5067,6 +5463,31 @@ pub struct LoggingConfig {
     pub rotation: Option<String>,
     /// Override the rotated-file prefix. Default `"ai-memory.log"`.
     pub filename_prefix: Option<String>,
+    /// Operational-log SINK destination (#1463 Tier 1): `file` (default —
+    /// the rolling file appender, byte-identical to pre-#1463) or `stdout`
+    /// (structured-stdout, so the init system — systemd-journald / macOS
+    /// unified logging / Windows Event Log — captures + routes/retains it
+    /// natively). The native `journald` / `syslog` sinks are the dep-gated
+    /// Tier 2 (separate issue). An unrecognized value falls back to `file`
+    /// with a one-shot WARN. Resolved once at boot (env `AI_MEMORY_LOG_SINK`
+    /// > this field > `file`); never read on the store/recall hot path.
+    pub sink: Option<String>,
+    /// #1765 Tier 2 — remote syslog collector address `host:port` (e.g.
+    /// `logs.example.com:6514`). Required when `sink = "syslog"`. Consulted
+    /// only for the syslog sink; env `AI_MEMORY_LOG_SYSLOG_ADDRESS` wins.
+    pub syslog_address: Option<String>,
+    /// #1765 Tier 2 — syslog transport: `tls` (RFC 5425, default, the norm for
+    /// any routable collector) or `tcp` (plaintext; only for a loopback /
+    /// sidecar forwarder). Env `AI_MEMORY_LOG_SYSLOG_TRANSPORT` wins.
+    pub syslog_transport: Option<String>,
+    /// #1765 Tier 2 — PEM file with the collector's CA / self-signed cert used
+    /// to verify the TLS server certificate (the dep-free trust anchor; no
+    /// public-roots dependency). Required when the transport is `tls`. Env
+    /// `AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE` wins.
+    pub syslog_tls_ca_file: Option<String>,
+    /// #1765 Tier 2 — RFC 5424 `APP-NAME` field stamped on every emitted
+    /// record. `None` → `"ai-memory"`. Consulted only for the syslog sink.
+    pub syslog_app_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -5450,7 +5871,10 @@ fn backend_default_model(backend: &str) -> &'static str {
         "cerebras" => "llama-3.3-70b",
         "openrouter" => "openai/gpt-5",
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        "lmstudio" => "local-model",
+        // v0.8.0 #1709 §11.4.C — vLLM shares LMStudio's single-model
+        // placeholder default (centralised in llm.rs).
+        "lmstudio" => crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER,
+        s if s == crate::llm::BACKEND_VLLM => crate::llm::LOCAL_SERVER_MODEL_PLACEHOLDER,
         // ollama / openai-compatible / any unknown alias → legacy default.
         _ => "gemma3:4b",
     }
@@ -6185,6 +6609,58 @@ impl AppConfig {
         mode
     }
 
+    /// v0.8.0 #1734 (PE-1) — resolve the mandatory-hook enforcement mode.
+    /// Ladder: `AI_MEMORY_HOOKS_ENFORCE_MODE` env > `[hooks].enforce_mode`
+    /// config > compiled default [`crate::hooks::HookEnforceMode::Off`]. A
+    /// valid `off`/`advisory`/`enforce` env token wins; an unparseable env
+    /// value falls through to the config field then the default. Mirrors
+    /// [`Self::effective_permissions_mode`]. Default `off` makes the presence
+    /// check a no-op (byte-identical to pre-#1734).
+    #[must_use]
+    pub fn resolve_hooks_enforce_mode(&self) -> crate::hooks::HookEnforceMode {
+        use crate::hooks::HookEnforceMode;
+        if let Ok(raw) = std::env::var(ENV_HOOKS_ENFORCE_MODE) {
+            if let Some(m) = HookEnforceMode::from_str_opt(&raw) {
+                return m;
+            }
+            eprintln!(
+                "ai-memory: {ENV_HOOKS_ENFORCE_MODE}={raw:?} is not a valid mode \
+                 (expected off / advisory / enforce); falling back to config.toml"
+            );
+        }
+        self.hooks
+            .as_ref()
+            .and_then(|h| h.enforce_mode)
+            .unwrap_or(HookEnforceMode::Off)
+    }
+
+    /// v0.8.0 #1734 (PE-1) — resolve the declared `[hooks].required_events`
+    /// (config-only; no env surface). Default empty. INELIGIBLE events
+    /// (post-* / `OnIndexEviction`) are dropped with a WARN — only pre-*
+    /// mutation / governance events may be required (a post-event `Deny` is
+    /// log-only, so "required presence" is meaningless there). The boot
+    /// banner + `ai-memory doctor` pre-flight surface the resolved set.
+    #[must_use]
+    pub fn resolve_required_events(&self) -> Vec<crate::hooks::HookEvent> {
+        let raw = self
+            .hooks
+            .as_ref()
+            .and_then(|h| h.required_events.clone())
+            .unwrap_or_default();
+        raw.into_iter()
+            .filter(|e| {
+                let ok = crate::hooks::is_eligible_required_event(*e);
+                if !ok {
+                    eprintln!(
+                        "ai-memory: [hooks].required_events lists ineligible event {e:?} \
+                         (only pre-* mutation/governance events may be required); ignoring it"
+                    );
+                }
+                ok
+            })
+            .collect()
+    }
+
     /// v0.7.0 K9 — resolve the effective declarative rule set
     /// consulted by [`crate::permissions::Permissions::evaluate`].
     ///
@@ -6253,6 +6729,31 @@ impl AppConfig {
     #[allow(deprecated)]
     pub fn effective_archive_on_gc(&self) -> bool {
         self.archive_on_gc.unwrap_or(true)
+    }
+
+    /// #1775 — one-shot boot WARN when the resolved `archive_on_gc` is
+    /// `false`. An explicit `[storage].archive_on_gc = false` turns the
+    /// GC TTL sweep AND `memory_forget` into **permanent hard-delete with
+    /// no archive and no rollback** — the one spot where expiry-deletion
+    /// becomes irreversible. The default (`true`) is safe and silent; this
+    /// only fires on the misconfigured-false path. Mirrors the #1570
+    /// [`crate::handlers::admin_role::ENV_ADMIN_HEADER_TRUST`] boot-WARN
+    /// convention. Called from BOTH `serve` (`bootstrap_serve`) and `mcp`
+    /// boot; a [`std::sync::Once`] keeps it to a single emission even when
+    /// one process runs both surfaces.
+    pub fn warn_if_archive_on_gc_disabled(&self) {
+        if self.effective_archive_on_gc() {
+            return;
+        }
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                "[storage].archive_on_gc = false: the GC TTL sweep AND memory_forget will \
+                 PERMANENTLY HARD-DELETE expired/forgotten memories with NO archive and NO \
+                 rollback. Set archive_on_gc = true (the default) to archive before deletion \
+                 so memories remain restorable (#1775)."
+            );
+        });
     }
 
     /// v0.7.0 H7 (round-2) — resolved per-request HTTP timeout.
@@ -6755,6 +7256,87 @@ impl AppConfig {
         }
     }
 
+    /// v0.8.0 #1749 — resolve whether the curator runs Pillar-2.5 consolidation
+    /// (the SAL `ConsolidationPass`) as the live consolidator. Uniform ladder:
+    /// `AI_MEMORY_COMPACTION_ENABLED` env > `[curator.compaction].enabled`
+    /// config > compiled default `false`. An explicit truthy/falsy env value
+    /// wins; any other env string falls through to the config field, then to the
+    /// safe `false` default. Default-false is the opt-in posture — enabling this
+    /// activates a hard-DELETE merge of near-duplicate memories (reversible via
+    /// `curator --rollback` on sqlite; postgres reversal is #1748).
+    #[must_use]
+    pub fn resolve_compaction_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var(ENV_COMPACTION_ENABLED) {
+            let t = v.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") {
+                return true;
+            }
+            if t == "0" || t.eq_ignore_ascii_case("false") {
+                return false;
+            }
+            // Any other value: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.compaction.as_ref())
+            .and_then(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// #1393 sub-unit 2 — resolve the transcript-classify pass activation.
+    /// Uniform ladder: `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` env >
+    /// `[curator].transcript_classify_enabled` config > compiled `false`
+    /// (opt-in). Mirrors [`Self::resolve_compaction_enabled`]: an explicit
+    /// truthy/falsy env wins; any other env string falls through to the
+    /// config field then the default.
+    #[must_use]
+    pub fn resolve_transcript_classify_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var(ENV_TRANSCRIPT_CLASSIFY_ENABLED) {
+            let t = v.trim();
+            if t == "1" || t.eq_ignore_ascii_case("true") {
+                return true;
+            }
+            if t == "0" || t.eq_ignore_ascii_case("false") {
+                return false;
+            }
+            // Any other value: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.transcript_classify_enabled)
+            .unwrap_or(false)
+    }
+
+    /// v0.8.0 #1750 — resolve the consolidation cosine gate threshold. Uniform
+    /// ladder: `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` env >
+    /// `[curator.compaction].cosine_threshold` config > compiled default
+    /// (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]). A value
+    /// is accepted only when it parses as `f32` and lies in `(0.0, 1.0]`
+    /// (cosine similarity range; `0.0` would merge everything, so it is
+    /// rejected); out-of-range / unparseable values at any layer fall through
+    /// to the next. Threaded into the live clusterer via
+    /// `ConsolidationPass::with_cosine_threshold`.
+    #[must_use]
+    pub fn resolve_compaction_cosine_threshold(&self) -> f32 {
+        fn valid(t: f32) -> bool {
+            t > 0.0 && t <= 1.0
+        }
+        if let Ok(v) = std::env::var(ENV_COMPACTION_COSINE_THRESHOLD) {
+            if let Ok(t) = v.trim().parse::<f32>() {
+                if valid(t) {
+                    return t;
+                }
+            }
+            // Unparseable / out-of-range: fall through to config / default.
+        }
+        self.curator
+            .as_ref()
+            .and_then(|c| c.compaction.as_ref())
+            .and_then(|c| c.cosine_threshold)
+            .filter(|t| valid(*t))
+            .unwrap_or(crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
+    }
+
     /// #1691/n14 — resolve the recall-reranker score floor. Uniform
     /// ladder: `AI_MEMORY_RERANK_SCORE_FLOOR` env > `[reranker].score_floor`
     /// config > compiled default ([`crate::reranker::RerankerScoreFloor::Off`]).
@@ -6909,6 +7491,18 @@ impl AppConfig {
             .or_else(|| cfg.and_then(|s| s.db_mmap_size_bytes).filter(|n| *n >= 0))
             .unwrap_or(crate::storage::DEFAULT_DB_MMAP_SIZE_BYTES);
 
+        // #1735 (Pillar-4 4.C) — AGE-projection mode, uniform ladder:
+        // env > [storage] section > compiled default (`Sync`). Unparseable
+        // values warn-and-fall-through (mirrors the PermissionsMode parse).
+        let age_projection_mode = std::env::var(ENV_AGE_PROJECTION_MODE)
+            .ok()
+            .and_then(|s| AgeProjectionMode::from_str_opt(&s))
+            .or_else(|| {
+                cfg.and_then(|s| s.age_projection_mode.as_deref())
+                    .and_then(AgeProjectionMode::from_str_opt)
+            })
+            .unwrap_or_default();
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.default_namespace.is_some()
@@ -6927,6 +7521,7 @@ impl AppConfig {
             archive_max_days,
             max_memory_mb,
             db_mmap_size_bytes,
+            age_projection_mode,
             default_namespace_source,
             source,
         }
@@ -6983,16 +7578,28 @@ impl AppConfig {
             .or(page_cfg)
             .unwrap_or(crate::handlers::MAX_BULK_SIZE);
 
+        // #1733 (Pillar-4 4.A) — admission-control cap. `env_pos_usize`
+        // filters `> 0`, so a `0` / negative / garbage env or config value
+        // falls through to the compiled default (`0` = disabled), keeping
+        // admission control strictly opt-in.
+        let inflight_env = env_pos_usize(ENV_MAX_INFLIGHT_REQUESTS);
+        let inflight_cfg = cfg.and_then(|l| l.max_inflight_requests).filter(|n| *n > 0);
+        let max_inflight_requests = inflight_env
+            .or(inflight_cfg)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
+
         let source = if mem_env.is_some()
             || bytes_env.is_some()
             || links_env.is_some()
             || page_env.is_some()
+            || inflight_env.is_some()
         {
             ConfigSource::Env
         } else if mem_cfg.is_some()
             || bytes_cfg.is_some()
             || links_cfg.is_some()
             || page_cfg.is_some()
+            || inflight_cfg.is_some()
         {
             ConfigSource::Config
         } else {
@@ -7004,6 +7611,7 @@ impl AppConfig {
             max_storage_bytes,
             max_links_per_day,
             max_page_size,
+            max_inflight_requests,
             source,
         }
     }
@@ -8146,6 +8754,30 @@ legacy_scoring = false
         assert!(!cfg.effective_archive_on_gc());
     }
 
+    // #1775 — the boot WARN helper is a pure side-effecting `eprintln`/
+    // `tracing::warn!` gated by `effective_archive_on_gc()`, so the WARN
+    // text itself is not deterministically observable from a unit test
+    // (it routes through the process-wide tracing subscriber + a one-shot
+    // `Once`). What IS tractable: assert the gate branches correctly and
+    // neither call path panics — the default-true config takes the early
+    // return, the explicit-false config takes the WARN branch.
+    #[test]
+    fn warn_if_archive_on_gc_disabled_is_noop_on_safe_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.effective_archive_on_gc());
+        cfg.warn_if_archive_on_gc_disabled(); // early-return path, no panic
+    }
+
+    #[test]
+    fn warn_if_archive_on_gc_disabled_fires_branch_on_explicit_false() {
+        let cfg = AppConfig {
+            archive_on_gc: Some(false),
+            ..AppConfig::default()
+        };
+        assert!(!cfg.effective_archive_on_gc());
+        cfg.warn_if_archive_on_gc_disabled(); // WARN branch, no panic
+    }
+
     #[test]
     fn effective_autonomous_hooks_default_is_false() {
         // M9 — process-wide serialization via env_var_lock.
@@ -9041,6 +9673,7 @@ legacy_scoring = false
             ENV_MAX_STORAGE_BYTES,
             ENV_MAX_LINKS_PER_DAY,
             ENV_MAX_PAGE_SIZE,
+            ENV_MAX_INFLIGHT_REQUESTS,
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -9080,12 +9713,14 @@ legacy_scoring = false
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            max_inflight_requests: Some(64),
         });
         let r = cfg.resolve_limits();
         assert_eq!(r.max_memories_per_day, 5_000_000);
         assert_eq!(r.max_storage_bytes, 9_000_000_000);
         assert_eq!(r.max_links_per_day, 4_000_000);
         assert_eq!(r.max_page_size, 250_000);
+        assert_eq!(r.max_inflight_requests, 64);
         assert_eq!(r.source, ConfigSource::Config);
     }
 
@@ -9103,6 +9738,7 @@ legacy_scoring = false
             max_storage_bytes: Some(9_000_000_000),
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
+            max_inflight_requests: Some(64),
         });
         let r = cfg.resolve_limits();
         // env wins for the two it sets …
@@ -9696,6 +10332,43 @@ max_page_size = 1000000
         assert_eq!(resolved.embedding_dim, Some(3072), "gemini-embedding-2 dim");
     }
 
+    /// v0.8.0 #1709 §11.4.C — the dedicated `vllm` LLM alias is shared
+    /// by the embeddings resolver for free: `AI_MEMORY_EMBED_BACKEND=vllm`
+    /// classifies as an API backend (`is_api_embed_backend` — everything
+    /// but `ollama`) and falls back to the same per-alias vendor default
+    /// (`http://localhost:8000/v1`) declared once in `llm.rs`. This pins
+    /// the embed-surface parity for the new alias.
+    #[test]
+    fn resolve_embeddings_1709_vllm_alias_default_base_url() {
+        let _g = env_var_lock();
+        scrub_llm_env();
+        scrub_embed_env();
+        unsafe {
+            std::env::set_var(ENV_EMBED_BACKEND, crate::llm::BACKEND_VLLM);
+        }
+        let cfg = empty_app_config();
+        let resolved = cfg.resolve_embeddings();
+        // Restore env before asserting so a failed assertion cannot leak
+        // ENV_EMBED_BACKEND into sibling tests sharing `env_var_lock()`.
+        unsafe {
+            std::env::remove_var(ENV_EMBED_BACKEND);
+        }
+        assert_eq!(
+            resolved.backend,
+            crate::llm::BACKEND_VLLM,
+            "AI_MEMORY_EMBED_BACKEND=vllm must resolve the vllm backend"
+        );
+        assert_eq!(
+            resolved.url, "http://localhost:8000/v1",
+            "#1709 §11.4.C: the vllm embed alias must fall back to the \
+             vendor default base URL from llm.rs (port 8000 /v1)"
+        );
+        assert!(
+            is_api_embed_backend(&resolved.backend),
+            "#1709: vllm must classify as an API embed backend, not ollama-native"
+        );
+    }
+
     #[test]
     fn resolve_embeddings_1598_dim_override_beats_table() {
         let _g = env_var_lock();
@@ -10030,6 +10703,104 @@ max_page_size = 1000000
         }
     }
 
+    // ── #1463 Tier 1 — `[logging].sink` / AI_MEMORY_LOG_SINK ladder ──
+
+    #[test]
+    fn log_sink_from_str_opt_and_as_str_roundtrip() {
+        assert_eq!(LogSink::from_str_opt("file"), Some(LogSink::File));
+        assert_eq!(LogSink::from_str_opt("STDOUT"), Some(LogSink::Stdout));
+        assert_eq!(LogSink::from_str_opt("  Stdout  "), Some(LogSink::Stdout));
+        // #1765 Tier 2 — `syslog` now parses in every build (the fail-closed-
+        // when-not-compiled check lives at the init_file_logging consumer).
+        assert_eq!(LogSink::from_str_opt("syslog"), Some(LogSink::Syslog));
+        assert_eq!(LogSink::from_str_opt("  SYSLOG "), Some(LogSink::Syslog));
+        // journald was DROPPED from #1765's re-scope (Linux-only, can't be
+        // OS-agnostic); it is not a recognized sink.
+        assert_eq!(
+            LogSink::from_str_opt("journald"),
+            None,
+            "journald dropped (Linux-only); not OS-agnostic"
+        );
+        assert_eq!(LogSink::from_str_opt("garbage"), None);
+        assert_eq!(LogSink::File.as_str(), "file");
+        assert_eq!(LogSink::Stdout.as_str(), "stdout");
+        assert_eq!(LogSink::Syslog.as_str(), "syslog");
+        assert_eq!(LogSink::default(), LogSink::File);
+    }
+
+    #[test]
+    fn resolve_log_sink_compiled_default_is_file() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+        assert_eq!(
+            resolve_log_sink(&LoggingConfig::default()),
+            LogSink::File,
+            "no env + no [logging].sink must bottom out on file (byte-identical to pre-#1463)"
+        );
+    }
+
+    #[test]
+    fn resolve_log_sink_section_selects_stdout() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(resolve_log_sink(&cfg), LogSink::Stdout);
+    }
+
+    #[test]
+    fn resolve_log_sink_env_overrides_section() {
+        let _g = env_var_lock();
+        unsafe {
+            std::env::set_var(ENV_LOG_SINK, "file");
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(
+            resolve_log_sink(&cfg),
+            LogSink::File,
+            "env must beat the [logging].sink section"
+        );
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+    }
+
+    #[test]
+    fn resolve_log_sink_garbage_falls_through() {
+        let _g = env_var_lock();
+        // Unparseable env falls THROUGH to the section (mirrors mmap/age).
+        unsafe {
+            std::env::set_var(ENV_LOG_SINK, "not-a-sink");
+        }
+        let cfg = LoggingConfig {
+            sink: Some("stdout".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(
+            resolve_log_sink(&cfg),
+            LogSink::Stdout,
+            "garbage env falls through to the section value"
+        );
+        // Garbage at BOTH layers bottoms out on the compiled default.
+        let cfg_bad = LoggingConfig {
+            sink: Some("also-bad".to_string()),
+            ..LoggingConfig::default()
+        };
+        assert_eq!(resolve_log_sink(&cfg_bad), LogSink::File);
+        unsafe {
+            std::env::remove_var(ENV_LOG_SINK);
+        }
+    }
+
     // ── #1590 — `[storage].default_namespace` explicit-vs-compiled provenance ──
 
     /// #1590 regression — `resolve_storage` distinguishes an EXPLICIT
@@ -10154,8 +10925,10 @@ max_page_size = 1000000
         );
         let cfg = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: Some(ns_map),
                 confidence_decay_half_life_days: None,
+                compaction: None,
             }),
             ..AppConfig::default()
         };
@@ -10191,8 +10964,10 @@ max_page_size = 1000000
         hl.insert("team/nan".to_string(), f64::NAN); // non-finite → falls through
         let cfg = AppConfig {
             curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
                 reflection_namespaces: None,
                 confidence_decay_half_life_days: Some(hl),
+                compaction: None,
             }),
             ..AppConfig::default()
         };
@@ -10215,6 +10990,178 @@ max_page_size = 1000000
         let snap = cfg.confidence_decay_half_life_overrides();
         assert_eq!(snap.len(), 1, "only the finite positive entry survives");
         assert!((snap["team/eng"] - 14.0).abs() < f64::EPSILON);
+    }
+
+    /// #1749 — `[curator.compaction].enabled` config-field resolution (the env
+    /// layer is covered by `tests/config_precedence.rs`). Absent → false;
+    /// explicit true/false honored.
+    #[test]
+    fn curator_compaction_enabled_resolver_1749() {
+        // No config / no env → compiled default false.
+        let bare = AppConfig::default();
+        assert!(
+            !bare.resolve_compaction_enabled(),
+            "default-off opt-in posture"
+        );
+
+        let on = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: Some(true),
+                    cosine_threshold: None,
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            on.resolve_compaction_enabled(),
+            "[curator.compaction].enabled=true"
+        );
+
+        let off = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: Some(false),
+                    cosine_threshold: None,
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(!off.resolve_compaction_enabled(), "explicit false honored");
+
+        // Section present but enabled omitted → false.
+        let omitted = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: None,
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !omitted.resolve_compaction_enabled(),
+            "omitted enabled → false"
+        );
+    }
+
+    #[test]
+    fn transcript_classify_enabled_resolver_1393() {
+        // #1393 sub-unit 2 — config-layer resolution (env layer is process-
+        // global and asserted by the resolver's shared ladder; mirrors the
+        // compaction resolver test which is also config-only).
+        let bare = AppConfig::default();
+        assert!(
+            !bare.resolve_transcript_classify_enabled(),
+            "default-off opt-in posture"
+        );
+
+        let on = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: Some(true),
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            on.resolve_transcript_classify_enabled(),
+            "[curator].transcript_classify_enabled=true"
+        );
+
+        let off = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: Some(false),
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !off.resolve_transcript_classify_enabled(),
+            "explicit false honored"
+        );
+
+        // Section present but the field omitted → false.
+        let omitted = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: None,
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            !omitted.resolve_transcript_classify_enabled(),
+            "omitted field → false"
+        );
+    }
+
+    /// #1750 — resolve the consolidation cosine gate. Ladder:
+    /// `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` env > `[curator.compaction]`
+    /// config > compiled default 0.75; out-of-range / unparseable falls through.
+    #[test]
+    fn curator_compaction_cosine_threshold_resolver_1750() {
+        // Default (no env, no config) → 0.75.
+        let default_cfg = AppConfig::default();
+        assert!(
+            (default_cfg.resolve_compaction_cosine_threshold()
+                - crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
+                .abs()
+                < f32::EPSILON,
+            "default → DEFAULT_COSINE_THRESHOLD (0.75)"
+        );
+
+        // Config value honored.
+        let cfg = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: Some(0.9),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            (cfg.resolve_compaction_cosine_threshold() - 0.9).abs() < f32::EPSILON,
+            "config value honored"
+        );
+
+        // Out-of-range config value (> 1.0) falls through to default.
+        let bad = AppConfig {
+            curator: Some(CuratorSection {
+                transcript_classify_enabled: None,
+                reflection_namespaces: None,
+                confidence_decay_half_life_days: None,
+                compaction: Some(CuratorCompactionSection {
+                    enabled: None,
+                    cosine_threshold: Some(1.5),
+                }),
+            }),
+            ..AppConfig::default()
+        };
+        assert!(
+            (bad.resolve_compaction_cosine_threshold()
+                - crate::curator::cluster::DEFAULT_COSINE_THRESHOLD)
+                .abs()
+                < f32::EPSILON,
+            "out-of-range config → default"
+        );
     }
 
     /// #1604 — rerank sequence-cap ladder: env >

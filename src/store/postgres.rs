@@ -74,6 +74,12 @@ use crate::quotas::{QuotaStatus, quota_defaults};
 // Duplicated literals in this adapter hoisted to named consts per the
 // pm-v3.1 hardcoded-literal lint-gate (scripts/check-hardcoded-literals.sh).
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
+/// Clears an `archived_memories` row by id. Shared by the in-place-edit
+/// snapshot paths (the OPTIMISTIC `update_with_expected_version_once` and,
+/// per #1799, the non-If-Match trait `update` — both DELETE any stale
+/// snapshot before re-INSERTing the prior content) and by `restore_archived`
+/// (removes the archive row after a successful restore).
+const SQL_DELETE_ARCHIVED_MEMORY_BY_ID: &str = "DELETE FROM archived_memories WHERE id = $1";
 /// #1642 — postgres twin of `storage::SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID`
 /// (`src/storage/mod.rs`): deleting a memory that serves as a namespace
 /// standard must also remove the `namespace_meta` row that points at it,
@@ -81,6 +87,10 @@ const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = $1";
 const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
     "DELETE FROM namespace_meta WHERE standard_id = $1";
 const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1";
+/// Full-row select of a single memory by id. Shared by `get`,
+/// `merge_inbound`, and the lifecycle-state reader so the projection
+/// lives in exactly one place (pm-v3.1 hardcoded-literal discipline).
+const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = $1";
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
 const SQL_LOAD_AGE: &str = "LOAD 'age'";
@@ -504,7 +514,27 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       large deployments. SQLite twin is a version-stamp no-op (FTS5
 //       already materialises the text in `memories_fts`); lockstep
 //       pinned.
-const CURRENT_SCHEMA_VERSION: i32 = 57;
+// v67 = #1720 A1 (v0.8.0 Workstream-A) — index `metadata.target_agent_id`
+//       for the A2 owner-keyed `private` visibility clause
+//       (`agent_id_idx = ?caller OR target_agent_id_idx = ?caller`).
+//       STORED generated column `target_agent_id_idx TEXT GENERATED
+//       ALWAYS AS (metadata ->> 'target_agent_id') STORED` +
+//       `idx_memories_target_agent_id`, mirroring the `agent_id_idx`
+//       precedent (postgres_schema.sql:93) with the key swapped. Postgres
+//       has no VIRTUAL generated columns, so this is STORED where the
+//       SQLite twin is VIRTUAL (the scope_idx / agent_id_idx convention);
+//       both adapters carry the column + index. Pure additive ADD COLUMN
+//       IF NOT EXISTS + CREATE INDEX IF NOT EXISTS — idempotent +
+//       replay-safe. CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+// v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+//       edge-preservation snapshot table. Mirrors `memory_links` columns
+//       sans the `REFERENCES memories(id)` FK (archive table) + an
+//       `archived_at` stamp. Created on both backends for adapter-schema
+//       consistency; SQLite wires snapshot/restore this commit, postgres
+//       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
+//       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 70;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1032,7 +1062,13 @@ impl PostgresStore {
                      with configured embedder dim ({target_i32}); converting in place. \
                      Existing embeddings will be NULLed — re-embed required after this completes."
                 );
-                store.migrate_embedding_dim(dim).await?;
+                // #1781 — force = true here: the #877 daemon auto-migrate
+                // is the operator's explicit opt-in (they configured the
+                // mismatched embedder dim + chose the auto-migrate boot
+                // path), so it must NOT refuse like the CLI default does.
+                // The CLI `schema-init` path defaults to refuse (force =
+                // args.force_reembed); auto-migrate preserves #877.
+                store.migrate_embedding_dim(dim, true).await?;
                 Ok(store)
             }
         }
@@ -1299,8 +1335,47 @@ impl PostgresStore {
         if current_version < 56 {
             self.migrate_v56().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 57 {
             self.migrate_v57().await?;
+        }
+        if current_version < 58 {
+            self.migrate_v58().await?;
+        }
+        if current_version < 59 {
+            self.migrate_v59().await?;
+        }
+        if current_version < 60 {
+            self.migrate_v60().await?;
+        }
+        if current_version < 61 {
+            self.migrate_v61().await?;
+        }
+        if current_version < 62 {
+            self.migrate_v62().await?;
+        }
+        if current_version < 63 {
+            self.migrate_v63().await?;
+        }
+        if current_version < 64 {
+            self.migrate_v64().await?;
+        }
+        if current_version < 65 {
+            self.migrate_v65().await?;
+        }
+        if current_version < 66 {
+            self.migrate_v66().await?;
+        }
+        if current_version < 67 {
+            self.migrate_v67().await?;
+        }
+        if current_version < 68 {
+            self.migrate_v68().await?;
+        }
+        if current_version < 69 {
+            self.migrate_v69().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v70().await?;
         }
 
         Ok(())
@@ -2550,7 +2625,10 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("v57 drop memories_content_fts", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — a
+        // mid-ladder crash after this commit must resume at v58, not skip
+        // to the head (same crash-safety invariant as the v61/v62 arms).
+        record_schema_version(&mut tx, 57).await?;
 
         tx.commit()
             .await
@@ -2559,6 +2637,706 @@ impl PostgresStore {
         tracing::info!(
             target: TRACE_TARGET,
             "schema migration v57 applied (#1579 B2: stored generated tsv column + memories_tsv_gin; dropped expression index memories_content_fts)"
+        );
+        Ok(())
+    }
+
+    /// v58 (#1705, v0.8.0) — recall_observations identity binding.
+    /// Adds the additive nullable `agent_id` + `namespace` columns (+
+    /// their indexes) the ledger SAL-parity work stamps so the consume
+    /// flip can reject cross-agent recall_id replay and derived utility
+    /// is per-(memory, namespace) scoped. Postgres twin of
+    /// `migrations/sqlite/0048_v58_recall_observations_identity.sql`.
+    /// Pure additive `ADD COLUMN IF NOT EXISTS` — idempotent + replay-safe
+    /// (fresh schemas carry the columns inline in `postgres_schema.sql`).
+    async fn migrate_v58(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v58 tx", e))?;
+
+        sqlx::query("ALTER TABLE recall_observations ADD COLUMN IF NOT EXISTS agent_id TEXT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v58 add recall_observations.agent_id", e))?;
+
+        sqlx::query("ALTER TABLE recall_observations ADD COLUMN IF NOT EXISTS namespace TEXT")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v58 add recall_observations.namespace", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id \
+             ON recall_observations(agent_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v58 create idx_recall_observations_agent_id", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace \
+             ON recall_observations(namespace)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v58 create idx_recall_observations_namespace", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 58).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v58 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v58 applied (#1705: recall_observations agent_id + namespace identity columns)"
+        );
+        Ok(())
+    }
+
+    /// v59 (#1709, v0.8.0 Pillar 1) — distributed coordination substrate
+    /// foundation: additive `actions` / `action_edges` / `leases` tables
+    /// (state machine + typed dependency DAG + lease/heartbeat). Postgres
+    /// twin of `migrations/sqlite/0049_v59_action_substrate.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry these inline in `postgres_schema.sql`).
+    async fn migrate_v59(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v59 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS actions (
+                id           TEXT        NOT NULL PRIMARY KEY,
+                namespace    TEXT        NOT NULL,
+                kind         TEXT        NOT NULL,
+                state        TEXT        NOT NULL DEFAULT 'pending',
+                title        TEXT        NOT NULL DEFAULT '',
+                payload      TEXT        NOT NULL DEFAULT '{}',
+                priority     BIGINT      NOT NULL DEFAULT 5,
+                agent_id     TEXT,
+                claimed_by   TEXT,
+                vector_clock TEXT        NOT NULL DEFAULT '{}',
+                metadata     TEXT        NOT NULL DEFAULT '{}',
+                created_at   BIGINT      NOT NULL,
+                updated_at   BIGINT      NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_actions_ns_state ON actions(namespace, state)",
+            "CREATE INDEX IF NOT EXISTS idx_actions_state_priority ON actions(state, priority DESC)",
+            "CREATE TABLE IF NOT EXISTS action_edges (
+                from_action TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+                to_action   TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+                edge_type   TEXT   NOT NULL,
+                created_at  BIGINT NOT NULL,
+                PRIMARY KEY (from_action, to_action, edge_type)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_action_edges_to ON action_edges(to_action)",
+            "CREATE TABLE IF NOT EXISTS leases (
+                action_id    TEXT   NOT NULL PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,
+                holder       TEXT   NOT NULL,
+                acquired_at  BIGINT NOT NULL,
+                expires_at   BIGINT NOT NULL,
+                heartbeat_at BIGINT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v59 action-substrate DDL", e))?;
+        }
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 59).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v59 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v59 applied (#1709 Pillar 1: actions + action_edges + leases coordination substrate)"
+        );
+        Ok(())
+    }
+
+    /// v60 (#1709, v0.8.0 Pillar 1) — signed-signals storage foundation:
+    /// additive `signals` table (typed, Ed25519-signed inter-agent messages).
+    /// Postgres twin of `migrations/sqlite/0050_v60_signed_signals.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry the table inline in `postgres_schema.sql`). Epoch columns
+    /// are `BIGINT`, the Ed25519 `signature` / `sender_pubkey` columns are
+    /// `BYTEA`, and `reference_ids` is renamed from the ROADMAP's `references`
+    /// (a SQL reserved word).
+    async fn migrate_v60(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v60 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS signals (
+                id              TEXT NOT NULL PRIMARY KEY,
+                namespace       TEXT NOT NULL,
+                from_agent      TEXT NOT NULL,
+                to_agent        TEXT,
+                subject         TEXT NOT NULL,
+                body            TEXT NOT NULL,
+                signal_type     TEXT NOT NULL,
+                in_reply_to     TEXT REFERENCES signals(id),
+                correlation_id  TEXT,
+                reference_ids   TEXT   NOT NULL DEFAULT '[]',
+                created_at      BIGINT NOT NULL,
+                expires_at      BIGINT,
+                delivered_at    BIGINT,
+                read_at         BIGINT,
+                acknowledged_at BIGINT,
+                signature       BYTEA  NOT NULL,
+                sender_pubkey   BYTEA  NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_signals_namespace ON signals(namespace, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_to_agent ON signals(to_agent, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_correlation ON signals(correlation_id)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v60 signed-signals DDL", e))?;
+        }
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 60).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v60 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v60 applied (#1709 Pillar 1: signals signed-signal storage foundation)"
+        );
+        Ok(())
+    }
+
+    async fn migrate_v61(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v61 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS checkpoints (
+                id              TEXT NOT NULL PRIMARY KEY,
+                namespace       TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                condition_type  TEXT NOT NULL,
+                condition       TEXT   NOT NULL DEFAULT '{}',
+                state           TEXT NOT NULL,
+                created_by      TEXT NOT NULL,
+                resolved_by     TEXT,
+                resolution      TEXT,
+                resolution_note TEXT,
+                signature       BYTEA,
+                resolver_pubkey BYTEA,
+                created_at      BIGINT NOT NULL,
+                deadline_at     BIGINT,
+                resolved_at     BIGINT,
+                metadata        TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_ns_state ON checkpoints(namespace, state, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_condition_type ON checkpoints(condition_type)",
+            "CREATE INDEX IF NOT EXISTS idx_checkpoints_deadline ON checkpoints(deadline_at)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v61 attested-checkpoints DDL", e))?;
+        }
+
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v61
+        // is no longer the schema tip (v63 typed-cognition relations).
+        // Mirrors the v35 precedent so a v60 DB migrating up records
+        // 61/62/63 in sequence rather than jumping straight to the tip.
+        record_schema_version(&mut tx, 61).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v61 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v61 applied (#1709 Pillar 1: checkpoints attested-checkpoint storage foundation)"
+        );
+        Ok(())
+    }
+
+    /// v0.8.0 Pillar 1 (#1709) — routines storage foundation: additive
+    /// `routines` / `routine_runs` tables (parameterised action+edge
+    /// templates that can be frozen into an immutable, regulatory-hold
+    /// form, and their per-argument-binding materialisations). Postgres
+    /// twin of `migrations/sqlite/0052_v62_routines.sql`. Pure
+    /// `CREATE TABLE/INDEX IF NOT EXISTS` — idempotent + replay-safe (fresh
+    /// schemas carry the tables inline in `postgres_schema.sql`). Epoch
+    /// columns are `BIGINT`, the Ed25519 freeze-attestation `signature` /
+    /// `signer_pubkey` columns are `BYTEA` (nullable — populated only once a
+    /// routine is frozen), and `routine_runs.routine_id` carries the
+    /// documented FK back to `routines(id)`.
+    async fn migrate_v62(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v62 tx", e))?;
+
+        for stmt in [
+            "CREATE TABLE IF NOT EXISTS routines (
+                id            TEXT NOT NULL PRIMARY KEY,
+                namespace     TEXT NOT NULL,
+                name          TEXT NOT NULL,
+                template      TEXT NOT NULL,
+                parameters    TEXT   NOT NULL DEFAULT '[]',
+                state         TEXT NOT NULL,
+                created_by    TEXT NOT NULL,
+                created_at    BIGINT NOT NULL,
+                frozen_at     BIGINT,
+                signature     BYTEA,
+                signer_pubkey BYTEA,
+                metadata      TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_routines_ns_state ON routines(namespace, state, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_routines_name ON routines(name)",
+            "CREATE TABLE IF NOT EXISTS routine_runs (
+                id                 TEXT NOT NULL PRIMARY KEY,
+                routine_id         TEXT NOT NULL REFERENCES routines(id),
+                namespace          TEXT NOT NULL,
+                arguments          TEXT   NOT NULL DEFAULT '{}',
+                state              TEXT NOT NULL,
+                created_action_ids TEXT   NOT NULL DEFAULT '[]',
+                started_at         BIGINT NOT NULL,
+                finished_at        BIGINT,
+                error              TEXT,
+                metadata           TEXT   NOT NULL DEFAULT '{}'
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_routine_runs_ns_state ON routine_runs(namespace, state)",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v62 routines DDL", e))?;
+        }
+
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v62
+        // is no longer the schema tip (v63 typed-cognition relations).
+        record_schema_version(&mut tx, 62).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v62 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v62 applied (#1709 Pillar 1: routines/routine_runs storage foundation)"
+        );
+        Ok(())
+    }
+
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition relation taxonomy
+    /// extension. Extends the closed `memory_links.relation` CHECK with
+    /// `decomposes_into` / `depends_on` / `advances` so the
+    /// Goal/Plan/Step `MemoryKind` vocabulary can be wired into a typed
+    /// plan graph (6 -> 9 relations). Postgres twin of the SQLite
+    /// `0053_v63_memory_links_typed_cognition_relations.sql`
+    /// full-table-rebuild; postgres uses the native
+    /// `ALTER TABLE ... DROP CONSTRAINT ... ADD CONSTRAINT ...` rather
+    /// than a rebuild (mirrors the v35 `derives_from` CHECK-extend).
+    /// Idempotent: re-running `DROP CONSTRAINT IF EXISTS` + re-`ADD`
+    /// under the migration tx is replay-safe, and fresh installs carry
+    /// the extended constraint inline from `postgres_schema.sql`. The
+    /// 9-relation set MUST stay byte-identical to the SQLite CHECK,
+    /// `postgres_schema.sql`, and `crate::validate::VALID_RELATIONS`.
+    async fn migrate_v63(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v63 tx", e))?;
+
+        // Drop + re-add the closed-taxonomy CHECK under the pinned
+        // `_wt1a` constraint name (unchanged since v35) with the
+        // extended 9-relation set. `DROP CONSTRAINT IF EXISTS` keeps the
+        // migration idempotent / replay-safe.
+        for stmt in [
+            "ALTER TABLE memory_links \
+             DROP CONSTRAINT IF EXISTS memory_links_relation_check_wt1a",
+            "ALTER TABLE memory_links \
+             ADD CONSTRAINT memory_links_relation_check_wt1a \
+             CHECK (relation IN ('related_to', 'supersedes', 'contradicts', \
+                                 'derived_from', 'reflects_on', 'derives_from', \
+                                 'decomposes_into', 'depends_on', 'advances'))",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v63 memory_links relation CHECK extend", e))?;
+        }
+
+        // Literal arm version (crash-safety) — the terminal arm stamps its
+        // own number too, so adding v64 needs no edit here (see v57 note).
+        record_schema_version(&mut tx, 63).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v63 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v63 applied (#1709 Pillar 2: memory_links.relation CHECK \
+             extended with decomposes_into / depends_on / advances)"
+        );
+        Ok(())
+    }
+
+    /// v64 — v0.8.0 Pillar 2 (#1709) typed-cognition `lifecycle_state`
+    /// column on `memories` (+ the `archived_memories` mirror so
+    /// archive → restore is lossless). Additive
+    /// `TEXT NOT NULL DEFAULT 'open'`; Postgres `ADD COLUMN IF NOT EXISTS`
+    /// keeps the migration idempotent / replay-safe.
+    async fn migrate_v64(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v64 tx", e))?;
+
+        for stmt in [
+            "ALTER TABLE memories \
+             ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+            "ALTER TABLE archived_memories \
+             ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+        ] {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("v64 add lifecycle_state column", e))?;
+        }
+
+        // Literal arm version (crash-safety) — the postgres v57..v63 arms
+        // stamp their own literal so a crash mid-ladder records the exact
+        // applied tip; v64 keeps the invariant (record the LITERAL 64, NOT
+        // CURRENT_SCHEMA_VERSION).
+        record_schema_version(&mut tx, 64).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v64 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v64 applied (#1709 Pillar 2: memories.lifecycle_state \
+             + archived_memories mirror)"
+        );
+        Ok(())
+    }
+
+    /// v65 — postgres version-stamp no-op (#1709).
+    ///
+    /// The v65 schema bump restores the sqlite memory_links
+    /// `(attest_level, signature)` atomicity TRIGGERS that the v63
+    /// sqlite full-table-rebuild dropped. Postgres enforces the same
+    /// invariant through a real column CHECK constraint
+    /// (#902 / `migrate_v47`), and the v63 postgres migration swapped
+    /// only the relation CHECK in place — it never touched the
+    /// signature constraint. So there is nothing to apply on postgres;
+    /// this arm exists purely to keep `CURRENT_SCHEMA_VERSION` in
+    /// lockstep with sqlite (the v51 / v55 / v56 version-stamp-no-op
+    /// precedent). Records the LITERAL 65 (crash-safety invariant).
+    async fn migrate_v65(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v65 tx", e))?;
+
+        record_schema_version(&mut tx, 65).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v65 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v65 applied (#1709: sqlite-only memory_links \
+             signature-trigger restore; postgres signature CHECK already intact — \
+             version-stamp no-op)"
+        );
+        Ok(())
+    }
+
+    /// v66 — §22 PE-5 (#697): the sqlite `governance_rules.severity`
+    /// CHECK gains the `escalate` value (for the `Decision::Escalate`
+    /// verdict). The postgres bootstrap schema ships NO
+    /// `governance_rules` table (the agent-action governance engine is
+    /// sqlite-only), so there is no constraint to ALTER — this arm is a
+    /// version-stamp no-op (the v51 / v53 / v55 / v56 / v65 precedent).
+    /// Stamps the LITERAL 66 (crash-safety: a crash mid-ladder records
+    /// the exact applied tip, NOT `CURRENT_SCHEMA_VERSION`).
+    async fn migrate_v66(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v66 tx", e))?;
+
+        record_schema_version(&mut tx, 66).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v66 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v66 applied (#697 §22 PE-5: governance_rules.severity \
+             escalate CHECK is sqlite-only; postgres ships no governance_rules table — \
+             version-stamp no-op)"
+        );
+        Ok(())
+    }
+
+    /// v67 — #1720 A1 (v0.8.0 Workstream-A): index
+    /// `metadata.target_agent_id` for the A2 owner-keyed `private`
+    /// visibility clause (`agent_id_idx = ?caller OR
+    /// target_agent_id_idx = ?caller`). The postgres twin of the sqlite
+    /// v67 arm; mirrors the `agent_id_idx` generated-column precedent
+    /// (`metadata ->> 'agent_id'`, postgres_schema.sql:93) swapping the
+    /// key to `target_agent_id`. Postgres has no VIRTUAL generated
+    /// columns, so this is a STORED generated column (the
+    /// scope_idx / agent_id_idx convention). Pure additive
+    /// `ADD COLUMN IF NOT EXISTS` (Postgres 14+) + `CREATE INDEX IF NOT
+    /// EXISTS` — idempotent + replay-safe (fresh schemas carry both
+    /// inline in postgres_schema.sql). This unit ONLY adds the column +
+    /// index; the visibility-predicate change itself is A2 (separate).
+    /// Stamps the LITERAL 67 (crash-safety: a crash mid-ladder records
+    /// the exact applied tip, NOT `CURRENT_SCHEMA_VERSION`).
+    async fn migrate_v67(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v67 tx", e))?;
+
+        sqlx::query(
+            "ALTER TABLE memories ADD COLUMN IF NOT EXISTS target_agent_id_idx \
+             TEXT GENERATED ALWAYS AS (metadata ->> 'target_agent_id') STORED",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v67 add memories.target_agent_id_idx", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
+             ON memories (target_agent_id_idx)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v67 create idx_memories_target_agent_id", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 67).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v67 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v67 applied (#1720 A1: memories.target_agent_id_idx \
+             STORED generated column + idx_memories_target_agent_id)"
+        );
+        Ok(())
+    }
+
+    /// v68 — #228 / #1728 (v0.8.0 encryption wire-up, Commit A) — add the
+    /// `encrypted_envelope` BYTEA column to `memories` (the postgres twin
+    /// of the sqlite v44 column — the #228 primitive landed it on sqlite
+    /// ONLY) AND mirror it onto `archived_memories` so archiving an
+    /// encrypted memory carries the ciphertext envelope into the archive
+    /// and archive → restore round-trips it losslessly (the v49
+    /// lossless-archive precedent). Additive + nullable: NULL on every row
+    /// until encryption is wired into the write paths (Commit B), so this
+    /// is behaviorally inert today. `ADD COLUMN ... BYTEA` (nullable, no
+    /// default) is a metadata-only operation on postgres — no table
+    /// rewrite. Idempotent via `IF NOT EXISTS` (fresh schemas inherit the
+    /// column inline from `postgres_schema.sql`).
+    async fn migrate_v68(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v68 tx", e))?;
+
+        sqlx::query("ALTER TABLE memories ADD COLUMN IF NOT EXISTS encrypted_envelope BYTEA")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v68 add memories.encrypted_envelope", e))?;
+
+        sqlx::query(
+            "ALTER TABLE archived_memories ADD COLUMN IF NOT EXISTS encrypted_envelope BYTEA",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v68 add archived_memories.encrypted_envelope", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 68).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v68 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v68 applied (#228/#1728: encrypted_envelope BYTEA on \
+             memories + archived_memories — at-rest encryption column parity + archive carry)"
+        );
+        Ok(())
+    }
+
+    /// v69 (#1735, Pillar-4 4.C) — `kg_projection_outbox` table backing the
+    /// staggered AGE cold-path. When `AI_MEMORY_AGE_PROJECTION_MODE=deferred`,
+    /// `link_internal` enqueues a pending-projection row here in the SAME tx
+    /// as the relational `memory_links` INSERT (instead of running the
+    /// synchronous inline AGE MERGE), and the cold drainer worker projects
+    /// pending rows into `memory_graph` out-of-band. Postgres-only — AGE is
+    /// postgres-only; SQLite's `migrate` stamps v69 as a no-op (no graph
+    /// backend, find_paths always reads the relational recursive-CTE).
+    ///
+    /// `projected_at IS NULL` marks a pending row (mirrors
+    /// `federation_push_dlq.replayed_at`); quarantine is by `attempt_count`
+    /// threshold in the drainer's take-query, not a separate column.
+    async fn migrate_v69(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v69 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS kg_projection_outbox ( \
+                 id            BIGSERIAL PRIMARY KEY, \
+                 source_id     TEXT NOT NULL, \
+                 target_id     TEXT NOT NULL, \
+                 relation      TEXT NOT NULL, \
+                 attempt_count INTEGER NOT NULL DEFAULT 0, \
+                 last_error    TEXT NULL, \
+                 created_at    TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 projected_at  TIMESTAMPTZ NULL \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v69 create kg_projection_outbox", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_kg_projection_outbox_pending \
+                 ON kg_projection_outbox(created_at) WHERE projected_at IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v69 index kg_projection_outbox pending", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 69).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v69 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v69 applied (#1735 Pillar-4 4.C: kg_projection_outbox — \
+             staggered AGE cold-path projection queue)"
+        );
+        Ok(())
+    }
+
+    /// v70 (#1771, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+    /// edge-preservation snapshot table. archive-then-delete copies only
+    /// the memory ROW into `archived_memories`; the same-tx cascade
+    /// `DELETE FROM memories` reaps the row's `memory_links` (FK
+    /// `ON DELETE CASCADE`), so `restore_archived` brought the row back
+    /// with an empty edge graph. This table is the snapshot destination.
+    ///
+    /// **Postgres scope this commit:** the table + schema bump only — the
+    /// snapshot-before-delete + restore-re-insert wiring is wired on
+    /// SQLite this commit and is a tracked POSTGRES follow-up. The table
+    /// is created on both backends now so the two adapters share the
+    /// logical schema number and a future postgres wiring commit has the
+    /// destination already present.
+    ///
+    /// Additive `CREATE TABLE IF NOT EXISTS` (the v59/v60/v69 precedent) —
+    /// no rewrite of an existing table, replay-safe. Mirrors `memory_links`
+    /// columns but carries NO `REFERENCES memories(id)` FK (archive table,
+    /// like `archived_memories`) plus an `archived_at` stamp.
+    async fn migrate_v70(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v70 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS archived_memory_links ( \
+                 source_id    TEXT NOT NULL, \
+                 target_id    TEXT NOT NULL, \
+                 relation     TEXT NOT NULL DEFAULT 'related_to', \
+                 created_at   TIMESTAMPTZ NOT NULL, \
+                 valid_from   TIMESTAMPTZ, \
+                 valid_until  TIMESTAMPTZ, \
+                 observed_by  TEXT, \
+                 signature    BYTEA, \
+                 attest_level TEXT, \
+                 archived_at  TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 PRIMARY KEY (source_id, target_id, relation) \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 create archived_memory_links", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx \
+                 ON archived_memory_links(source_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 index archived_memory_links source", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS archived_memory_links_target_idx \
+                 ON archived_memory_links(target_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v70 index archived_memory_links target", e))?;
+
+        // Literal arm version (crash-safety) — see the v57 arm note.
+        record_schema_version(&mut tx, 70).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v70 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v70 applied (#1771: archived_memory_links — \
+             archive-link edge-preservation snapshot table)"
         );
         Ok(())
     }
@@ -2686,6 +3464,10 @@ impl PostgresStore {
         // semantics while guaranteeing the gate evaluated the row
         // that was actually replaced. Explicit If-Match callers keep
         // exactly-one-winner semantics (no retry).
+        // #1726 — capture the optional lifecycle target before the loop
+        // (LifecycleState is Copy); applied once after the value-gated UPDATE
+        // succeeds so the If-Match HTTP path enforces the transition machine.
+        let lifecycle_target = patch.lifecycle_state;
         const MAX_GATE_RETRIES: usize = 3;
         let mut attempt = 0;
         loop {
@@ -2694,7 +3476,10 @@ impl PostgresStore {
                 .update_with_expected_version_once(ctx, id, patch.clone(), expected_version)
                 .await?
             {
-                Some(new_version) => return Ok(new_version),
+                Some(new_version) => {
+                    self.apply_lifecycle_patch(id, lifecycle_target).await?;
+                    return Ok(new_version);
+                }
                 None => {
                     // 0 rows: row vanished or version drifted.
                     let observed: Option<(i64,)> =
@@ -2726,6 +3511,66 @@ impl PostgresStore {
         }
     }
 
+    /// #1726 (Pillar-2 typed cognition) — apply an optional lifecycle
+    /// transition on the postgres backend, ENFORCING the transition machine
+    /// ([`crate::models::LifecycleState::can_transition_to`]). Postgres twin
+    /// of the sqlite primitive [`crate::storage::set_lifecycle_state`]: SELECT
+    /// the current state, reject an illegal edge (`open → done`, a move out
+    /// of a terminal, etc.) with a typed [`StoreError::InvalidTransition`]
+    /// (→ HTTP 409 — byte-parity error detail with the sqlite Display), and
+    /// UPDATE on a legal one (bumping the Gap-1 `version`). A request equal
+    /// to the stored state is an idempotent no-op; `None` leaves the column
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::InvalidTransition`] — the `current → target` edge is
+    ///   not permitted.
+    /// * [`StoreError::NotFound`] — no live memory matches `id`.
+    /// * [`StoreError::BackendUnavailable`] — on SQL failure.
+    async fn apply_lifecycle_patch(
+        &self,
+        id: &str,
+        target: Option<crate::models::LifecycleState>,
+    ) -> StoreResult<()> {
+        use crate::models::LifecycleState;
+        let Some(target) = target else {
+            return Ok(());
+        };
+        let current: Option<(String,)> =
+            sqlx::query_as("SELECT lifecycle_state FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read lifecycle_state for transition gate", e))?;
+        let Some((current_str,)) = current else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let from = LifecycleState::from_str(&current_str).unwrap_or_default();
+        // No-op (requested == current) is idempotent success, not a self-loop
+        // error — mirrors the sqlite primitive + the memory_update contract.
+        if from == target {
+            return Ok(());
+        }
+        if !from.can_transition_to(target) {
+            return Err(StoreError::InvalidTransition {
+                detail: format!(
+                    "CONFLICT: illegal lifecycle transition for memory {id}: {from} -> {target} is not permitted"
+                ),
+            });
+        }
+        sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
+             WHERE id = $2",
+        )
+        .bind(target.as_str())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("update lifecycle_state", e))?;
+        Ok(())
+    }
+
     /// #1641 — single gate-CAS attempt. Returns `Ok(Some(new_version))`
     /// on success, `Ok(None)` when the guarded UPDATE matched 0 rows
     /// (version drifted / row vanished — the caller decides retry vs
@@ -2751,16 +3596,36 @@ impl PostgresStore {
         // alongside `version` so the pre-write hook can evaluate the
         // POST-MERGE row before the UPDATE (parity with the SQLite
         // backend and the insert/supersede PG paths).
-        let current_row: Option<(i64, String, String, String, String, serde_json::Value)> =
-            sqlx::query_as(
-                "SELECT version, namespace, tier, title, memory_kind, metadata \
-                 FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
+        // #1725 — the prior-content archive + the in-place UPDATE run in
+        // ONE transaction so a version-conflict UPDATE (0 rows) rolls the
+        // archive snapshot back, leaving no orphan archived_memories row.
+        // `content` is fetched so the content-change detection matches the
+        // sqlite path byte-for-byte (a metadata-only patch must not
+        // archive).
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|e| to_store_err("read memories row for update gate", e))?;
-        let Some((current, cur_ns, cur_tier, cur_title, cur_kind, cur_meta)) = current_row else {
+            .map_err(|e| to_store_err("begin update tx", e))?;
+        let current_row: Option<(
+            i64,
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            String,
+        )> = sqlx::query_as(
+            "SELECT version, namespace, tier, title, memory_kind, metadata, content \
+                 FROM memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("read memories row for update gate", e))?;
+        let Some((current, cur_ns, cur_tier, cur_title, cur_kind, cur_meta, cur_content)) =
+            current_row
+        else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
 
@@ -2775,6 +3640,19 @@ impl PostgresStore {
                 ),
             });
         }
+
+        // #1725 — compute the content-change flag BEFORE the governance
+        // `governed` builder below moves `cur_title`. Mirrors the sqlite
+        // `content_changed` (title OR content differs); a metadata / tag /
+        // priority patch leaves both untouched and so archives nothing.
+        let content_changed = patch
+            .title
+            .as_deref()
+            .is_some_and(|t| t != cur_title.as_str())
+            || patch
+                .content
+                .as_deref()
+                .is_some_and(|c| c != cur_content.as_str());
 
         // #1451 — consult GOVERNANCE_PRE_WRITE on the post-merge row.
         // Mirror the SQLite tier-downgrade protection so the gate sees
@@ -2797,6 +3675,82 @@ impl PostgresStore {
         };
         consult_governance_pre_write_pg(&governed)?;
 
+        // #228 Commit B — at-rest content encryption (postgres in-place
+        // update parity). Seal the effective NEW content (the patch's
+        // content when supplied, else the stored content) to the per-agent
+        // key when enabled; the UPDATE then writes the placeholder into
+        // `content` and the ciphertext into `encrypted_envelope`. When
+        // disabled (default), seal is None: the COALESCE keeps the patch's
+        // plaintext (or the stored value) AND the envelope is set to NULL,
+        // clearing any stale ciphertext — byte-identical to the pre-wiring
+        // path where the column was always NULL. agent_id resolves from the
+        // patch metadata when supplied, else the stored row's metadata
+        // (`governed.metadata` is exactly that merge). Both `content` and
+        // `encrypted_envelope` are SET together so they never desync.
+        let upd_effective_content: &str = patch.content.as_deref().unwrap_or(cur_content.as_str());
+        let upd_agent_id = governed
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let upd_sealed = crate::encryption::seal_content(upd_effective_content, upd_agent_id)
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("at-rest seal_content failed: {e}"),
+            })?;
+        // When sealing, write the placeholder verbatim into `content`
+        // (Some); when not sealing, bind None so the SQL COALESCE keeps the
+        // patch-or-stored plaintext exactly as before.
+        let upd_content_bind: Option<String> = upd_sealed
+            .as_ref()
+            .map(|(_, ph)| ph.clone())
+            .or_else(|| patch.content.clone());
+        let upd_encrypted_envelope: Option<Vec<u8>> =
+            upd_sealed.as_ref().map(|(env, _)| env.clone());
+
+        // #1725 — snapshot the prior content BEFORE the in-place UPDATE
+        // overwrites it, under archive_reason='in_place_edit', SAME
+        // memory_id (no fork). DELETE+INSERT mirrors sqlite's
+        // `INSERT OR REPLACE`, keeping the MOST-RECENT pre-edit snapshot
+        // (the "immediately-prior content"). The DELETE only ever removes
+        // a prior in_place_edit snapshot of this id: supersede forks a new
+        // id + deletes the old live row, GC deletes the live row, and
+        // restore removes the archive row on success — so a live,
+        // in-place-editable row can never collide with a different
+        // archive_reason's record. Runs inside the tx; a 0-row UPDATE
+        // below rolls it back.
+        if content_changed {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+            sqlx::query(
+                "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+        }
+
         let new_version = current + 1;
         // v0.7.0 Provenance Gap 2 (#906) — source_uri ($10) follows
         // COALESCE semantics so a patch that omits source_uri leaves
@@ -2806,6 +3760,14 @@ impl PostgresStore {
             "UPDATE memories SET
                 title = COALESCE($2, title),
                 content = COALESCE($3, content),
+                -- #228 Commit B — at-rest envelope. $13 carries the sealed
+                -- ciphertext when encryption is on (paired with the $3
+                -- placeholder) and NULL when off (paired with the plaintext
+                -- patch/stored content), so content + envelope always move
+                -- together. Unconditional assignment (not COALESCE): under
+                -- encryption-off this rewrites a previously-encrypted row's
+                -- envelope to NULL, matching the content rewrite.
+                encrypted_envelope = $13,
                 tier = CASE
                     WHEN $4::TEXT IS NULL THEN tier
                     WHEN tier_rank($4::TEXT) >= tier_rank(tier) THEN $4::TEXT
@@ -2817,10 +3779,15 @@ impl PostgresStore {
                 confidence = COALESCE($8, confidence),
                 metadata = CASE
                     WHEN $9::JSONB IS NULL THEN metadata
-                    WHEN metadata ? 'agent_id' THEN jsonb_set(
-                        $9::JSONB, '{agent_id}', metadata -> 'agent_id'
-                    )
-                    ELSE $9::JSONB
+                    -- #1784 — overlay the existing row's immutable provenance
+                    -- keys (agent_id + consolidation derived_from /
+                    -- consolidated_from_agents) on top of the patch so a
+                    -- whole-object metadata update can't silently drop them.
+                    ELSE ($9::JSONB || (
+                        SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                        FROM jsonb_each(metadata) AS prov(k, v)
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    ))
                 END,
                 source_uri = COALESCE($10, source_uri),
                 -- #1628/#1626 — If-Match PUTs route through this method
@@ -2841,7 +3808,7 @@ impl PostgresStore {
         )
         .bind(id)
         .bind(patch.title)
-        .bind(patch.content)
+        .bind(upd_content_bind)
         .bind(patch.tier.as_ref().map(Tier::as_str))
         .bind(patch.namespace)
         .bind(
@@ -2868,16 +3835,27 @@ impl PostgresStore {
         // #1628 — expires_at COALESCE slot ($12); see the SET-clause
         // comment above for the #1626 tier→long interplay.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
-        .execute(&self.pool)
+        // #228 Commit B — encrypted_envelope ($13): sealed ciphertext when
+        // encryption is on, NULL when off (paired with the $3 content).
+        .bind(upd_encrypted_envelope)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
         .rows_affected();
 
         if rows_affected == 0 {
             // #1641 — the caller (the retry wrapper) owns the
-            // drift-vs-vanished disposition.
+            // drift-vs-vanished disposition. #1725 — rolling the tx back
+            // reverts the prior-content archive so a version-conflict (or
+            // a vanished row) leaves no orphan archived_memories snapshot.
+            tx.rollback()
+                .await
+                .map_err(|e| to_store_err("rollback update tx", e))?;
             return Ok(None);
         }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit update tx", e))?;
         Ok(Some(new_version))
     }
 
@@ -3060,6 +4038,7 @@ impl PostgresStore {
             confidence_signals: existing.confidence_signals.clone(),
             confidence_decayed_at: existing.confidence_decayed_at.clone(),
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -3074,7 +4053,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -3082,7 +4061,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
              FROM memories WHERE id = $1
              ON CONFLICT (id) DO NOTHING",
         )
@@ -3304,6 +4283,8 @@ impl PostgresStore {
         &self,
         recall_id: &str,
         candidates: &[(String, String, i64, f64)],
+        agent_id: Option<&str>,
+        namespace: Option<&str>,
     ) -> StoreResult<usize> {
         if candidates.is_empty() {
             return Ok(0);
@@ -3317,8 +4298,8 @@ impl PostgresStore {
         for (memory_id, retriever, rank, score) in candidates {
             let n = sqlx::query(
                 "INSERT INTO recall_observations
-                    (recall_id, memory_id, retriever, rank, score)
-                 VALUES ($1, $2, $3, $4, $5)
+                    (recall_id, memory_id, retriever, rank, score, agent_id, namespace)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (recall_id, memory_id) DO NOTHING",
             )
             .bind(recall_id)
@@ -3326,6 +4307,8 @@ impl PostgresStore {
             .bind(retriever)
             .bind(rank)
             .bind(score)
+            .bind(agent_id)
+            .bind(namespace)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("insert recall_observation", e))?
@@ -3532,13 +4515,27 @@ impl PostgresStore {
     /// The whole operation runs in a single transaction so a mid-way
     /// failure leaves the schema untouched.
     ///
+    /// # Refuse-destructive-by-default (#1781)
+    ///
+    /// When the conversion is real (the live column dim differs from
+    /// `target_dim`) AND the corpus already holds stored embeddings,
+    /// the call REFUSES with `StoreError::InvalidInput` unless `force`
+    /// is set — re-running `ai-memory schema-init --embedding-dim` with
+    /// the wrong/default dim against a populated corpus would otherwise
+    /// silently NULL every embedding (semantic recall degrades to
+    /// keyword until a full re-embed). `force = true` is the explicit
+    /// `--force-reembed` escape hatch (CLI) or the operator-opted-in
+    /// #877 daemon auto-migrate path. Precedent: #1785 DROP-confirm.
+    ///
     /// # Errors
     ///
     /// - `StoreError::InvalidInput` when `target_dim` is not one of the
     ///   supported values (`SUPPORTED_EMBEDDING_DIMS`).
+    /// - `StoreError::InvalidInput` when stored embeddings exist and
+    ///   `force` is `false` (#1781 destructive-conversion refusal).
     /// - `StoreError::BackendUnavailable` on any SQL failure during
     ///   the conversion.
-    pub async fn migrate_embedding_dim(&self, target_dim: u32) -> StoreResult<bool> {
+    pub async fn migrate_embedding_dim(&self, target_dim: u32, force: bool) -> StoreResult<bool> {
         let target_i32 = i32::try_from(target_dim).map_err(|_| StoreError::InvalidInput {
             detail: format!("target_dim {target_dim} out of i32 range"),
         })?;
@@ -3562,11 +4559,39 @@ impl PostgresStore {
             return Ok(false);
         }
 
+        // #1781 — refuse-destructive-by-default. The conversion below
+        // NULLs every stored embedding (cross-dim reprojection isn't
+        // well-defined). Probe how many rows would lose their vector
+        // BEFORE touching anything; if any exist and the caller didn't
+        // opt in via `force`, refuse without mutating a single row.
+        let embeddings_at_risk: i64 = {
+            let live: i64 = sqlx::query_scalar(crate::SQL_COUNT_EMBEDDED_MEMORIES)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| to_store_err("count memories.embedding non-null", e))?;
+            let archived: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM archived_memories WHERE embedding IS NOT NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("count archived_memories.embedding non-null", e))?;
+            live + archived
+        };
+
+        if embeddings_at_risk > 0 && !force {
+            return Err(StoreError::InvalidInput {
+                detail: format!(
+                    "refusing destructive embedding-dim conversion vector({current:?})→vector({target_dim}): {embeddings_at_risk} stored embeddings would be NULLed (semantic recall degrades to keyword until a full re-embed). Re-run `ai-memory schema-init --embedding-dim {target_dim} --force-reembed` to proceed."
+                ),
+            });
+        }
+
         tracing::warn!(
             target: TRACE_TARGET,
             current = ?current,
             target = target_i32,
-            "v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; existing embeddings will be NULLed — operators MUST re-run embeddings after this conversion completes"
+            embeddings_nulled = embeddings_at_risk,
+            "{embeddings_at_risk} embeddings NULLed by vector({target_i32}) conversion — re-embed required (v29 embedding-dim migration: converting memories.embedding + archived_memories.embedding; operators MUST re-run embeddings after this conversion completes)"
         );
 
         let mut tx = self
@@ -5662,6 +6687,23 @@ impl PostgresStore {
         // backend-blind.
         match self.kg_backend {
             KgBackend::Age => {
+                // #1735 (Pillar-4 4.C) — under deferred AGE-projection mode the
+                // AGE graph lags the relational `memory_links` truth (a
+                // just-created edge sits in `kg_projection_outbox` until the
+                // cold drainer projects it). A healthy-but-stale AGE returns a
+                // successful empty result that the `is_age_runtime_failure`
+                // fallback below would NOT catch, so route `find_paths`
+                // through the always-current relational recursive-CTE to
+                // preserve read-your-own-write. Sync mode (the default) keeps
+                // the AGE-accelerated cypher path unchanged.
+                if matches!(
+                    crate::config::age_projection_mode(),
+                    crate::config::AgeProjectionMode::Deferred
+                ) {
+                    return self
+                        .find_paths_cte(source_id, target_id, max_depth, max_results)
+                        .await;
+                }
                 match self
                     .find_paths_cypher(source_id, target_id, max_depth, max_results)
                     .await
@@ -6267,77 +7309,107 @@ impl PostgresStore {
         .map_err(|e| to_store_err("insert memory_link", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            // v0.7.0 fold-A2A1.3 (#700) extended to the link path
-            // (#858 follow-up, 2026-05-18): AGE projection is
-            // best-effort. The relational `memory_links` insert
-            // above is the canonical source of truth — the AGE
-            // graph projection is a query-acceleration mirror used
-            // by the cypher-backed `find_paths_cypher` path, which
-            // already falls back to the recursive CTE
-            // (`is_age_runtime_failure` → `warn_age_fallback`) when
-            // AGE is unavailable at query time.
-            //
-            // Pre-fix: any AGE runtime failure here (e.g. the test
-            // postgres user lacking permission to `LOAD 'age'`)
-            // propagated up as `BackendUnavailable` → HTTP 503,
-            // even though the link row was successfully inserted
-            // into `memory_links`. That broke every link-creating
-            // postgres test (smoke + 5 handler_parity tests +
-            // anything else that creates a link before reading via
-            // cypher). The canonical link insert had already
-            // committed at this point (well, it was queued in
-            // `tx` — see below); the AGE projection failure should
-            // degrade to a warning, not a 503.
-            //
-            // Treatment: catch the failure, log a structured warn
-            // event with the same shape `warn_age_fallback` uses,
-            // and continue to commit. Operators monitoring the
-            // tracing stream see exactly which link skipped its
-            // AGE projection.
-            // #1542 — the WHOLE projection rides a SAVEPOINT. The
-            // pre-#1542 warn-and-continue arm left the outer tx in the
-            // ABORTED state after a projection error, so the commit
-            // below silently became a ROLLBACK and the canonical
-            // `memory_links` INSERT was lost while the handler
-            // returned 201. Rolling back to the savepoint keeps the
-            // outer tx healthy so the relational row truly commits —
-            // making the warning below honest.
-            sqlx::query("SAVEPOINT age_link_projection")
+            // #1735 (Pillar-4 4.C) — Deferred mode enqueues the AGE
+            // projection to `kg_projection_outbox` in THIS same tx as the
+            // relational `memory_links` INSERT above; the cold drainer
+            // (`drain_kg_projection_outbox`) projects it into `memory_graph`
+            // out-of-band, taking the ~6 synchronous AGE Cypher round-trips
+            // off the link-write hot path. The relational row is the source
+            // of truth and find_paths stays correct via the recursive-CTE
+            // fallback during the eventual-consistency window. Sync (the
+            // default) runs the inline SAVEPOINT+MERGE below — byte-identical
+            // to pre-4.C behaviour.
+            if matches!(
+                crate::config::age_projection_mode(),
+                crate::config::AgeProjectionMode::Deferred
+            ) {
+                sqlx::query(
+                    "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                     VALUES ($1, $2, $3)",
+                )
+                .bind(&link.source_id)
+                .bind(&link.target_id)
+                .bind(link.relation.as_str())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
-            match project_link_into_age(
-                &mut tx,
-                &link.source_id,
-                &link.target_id,
-                link.relation.as_str(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    sqlx::query("RELEASE SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("release savepoint age_link_projection", e))?;
+                .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
+            } else {
+                // v0.7.0 fold-A2A1.3 (#700) extended to the link path
+                // (#858 follow-up, 2026-05-18): AGE projection is
+                // best-effort. The relational `memory_links` insert
+                // above is the canonical source of truth — the AGE
+                // graph projection is a query-acceleration mirror used
+                // by the cypher-backed `find_paths_cypher` path, which
+                // already falls back to the recursive CTE
+                // (`is_age_runtime_failure` → `warn_age_fallback`) when
+                // AGE is unavailable at query time.
+                //
+                // Pre-fix: any AGE runtime failure here (e.g. the test
+                // postgres user lacking permission to `LOAD 'age'`)
+                // propagated up as `BackendUnavailable` → HTTP 503,
+                // even though the link row was successfully inserted
+                // into `memory_links`. That broke every link-creating
+                // postgres test (smoke + 5 handler_parity tests +
+                // anything else that creates a link before reading via
+                // cypher). The canonical link insert had already
+                // committed at this point (well, it was queued in
+                // `tx` — see below); the AGE projection failure should
+                // degrade to a warning, not a 503.
+                //
+                // Treatment: catch the failure, log a structured warn
+                // event with the same shape `warn_age_fallback` uses,
+                // and continue to commit. Operators monitoring the
+                // tracing stream see exactly which link skipped its
+                // AGE projection.
+                // #1542 — the WHOLE projection rides a SAVEPOINT. The
+                // pre-#1542 warn-and-continue arm left the outer tx in the
+                // ABORTED state after a projection error, so the commit
+                // below silently became a ROLLBACK and the canonical
+                // `memory_links` INSERT was lost while the handler
+                // returned 201. Rolling back to the savepoint keeps the
+                // outer tx healthy so the relational row truly commits —
+                // making the warning below honest.
+                sqlx::query("SAVEPOINT age_link_projection")
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("savepoint age_link_projection", e))?;
+                match project_link_into_age(
+                    &mut tx,
+                    &link.source_id,
+                    &link.target_id,
+                    link.relation.as_str(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        sqlx::query("RELEASE SAVEPOINT age_link_projection")
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| {
+                                to_store_err("release savepoint age_link_projection", e)
+                            })?;
+                    }
+                    Err(e) if is_age_runtime_failure(&e) => {
+                        sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e2| {
+                                to_store_err("rollback savepoint age_link_projection", e2)
+                            })?;
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            source_id = %link.source_id,
+                            target_id = %link.target_id,
+                            relation = link.relation.as_str(),
+                            err = %e,
+                            "AGE projection skipped on link insert — \
+                             relational memory_links row still committed. \
+                             find_paths_cypher will degrade to CTE fallback for \
+                             queries that traverse this edge."
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) if is_age_runtime_failure(&e) => {
-                    sqlx::query("ROLLBACK TO SAVEPOINT age_link_projection")
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e2| to_store_err("rollback savepoint age_link_projection", e2))?;
-                    tracing::warn!(
-                        target: TRACE_TARGET_KG,
-                        source_id = %link.source_id,
-                        target_id = %link.target_id,
-                        relation = link.relation.as_str(),
-                        err = %e,
-                        "AGE projection skipped on link insert — \
-                         relational memory_links row still committed. \
-                         find_paths_cypher will degrade to CTE fallback for \
-                         queries that traverse this edge."
-                    );
-                }
-                Err(e) => return Err(e),
             }
         }
 
@@ -6346,6 +7418,262 @@ impl PostgresStore {
             .map_err(|e| to_store_err("commit link tx", e))?;
 
         Ok(attest_level)
+    }
+
+    /// #1735 (Pillar-4 4.C) — max AGE-projection drain attempts before a
+    /// `kg_projection_outbox` row is quarantined (left pending with
+    /// `attempt_count >= MAX`, excluded from the take-query so a poison row
+    /// can't head-of-line-block the drain). Mirrors
+    /// `crate::federation::push_dlq::MAX_REPLAY_ATTEMPTS`.
+    pub const MAX_AGE_PROJECTION_ATTEMPTS: i32 = 100;
+
+    /// #1735 — default cold-drain batch size per tick (mirrors
+    /// `crate::federation::push_dlq::REPLAY_BATCH_SIZE`).
+    pub const AGE_PROJECTION_DRAIN_BATCH: i64 = 64;
+
+    /// #1735 (Pillar-4 4.C) — cold-path drainer for `kg_projection_outbox`.
+    /// Projects up to `batch` pending rows (oldest first, under the attempt
+    /// ceiling) into the AGE `memory_graph` out-of-band of the link-write hot
+    /// path. Each row is projected in its OWN tx: on success the AGE MERGE +
+    /// the `projected_at = now()` stamp commit atomically; on failure the tx
+    /// rolls back and `attempt_count` is bumped (with `last_error`) in a
+    /// separate statement, so a poison row is retried up to
+    /// [`Self::MAX_AGE_PROJECTION_ATTEMPTS`] then quarantined (the take-query
+    /// excludes `attempt_count >= MAX`, mirroring the federation push-DLQ).
+    /// Returns the count successfully projected this pass. No-op on non-AGE
+    /// backends (the outbox is only ever written when the AGE backend is
+    /// active under deferred mode).
+    pub async fn drain_kg_projection_outbox(&self, batch: i64) -> StoreResult<usize> {
+        let rows: Vec<(i64, i32, String, String, String)> = sqlx::query_as(
+            "SELECT id, attempt_count, source_id, target_id, relation \
+             FROM kg_projection_outbox \
+             WHERE projected_at IS NULL AND attempt_count < $1 \
+             ORDER BY created_at \
+             LIMIT $2",
+        )
+        .bind(Self::MAX_AGE_PROJECTION_ATTEMPTS)
+        .bind(batch)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("select kg_projection_outbox pending", e))?;
+
+        let mut projected = 0usize;
+        for (id, attempt_count, source_id, target_id, relation) in rows {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("begin kg_projection drain tx", e))?;
+            // #1783 (5-agent vote 4d3ea1c5) — existence guard. The
+            // relational `memory_links` row is the source of truth. If the
+            // link was hard-deleted (its memory cascade-reaped it) between
+            // enqueue and drain, projecting it now would RESURRECT the very
+            // ghost `:Memory` node/edge the delete path's DETACH DELETE
+            // removed. Re-check existence inside this per-row tx and, when
+            // the link is gone, drop the orphaned outbox row WITHOUT
+            // MERGEing — this is what makes deferred mode race-free against a
+            // concurrent delete with no new schema/op column.
+            let (link_still_exists,): (bool,) = sqlx::query_as(
+                "SELECT EXISTS(SELECT 1 FROM memory_links \
+                 WHERE source_id = $1 AND target_id = $2 AND relation = $3)",
+            )
+            .bind(&source_id)
+            .bind(&target_id)
+            .bind(&relation)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("kg_projection_outbox existence check", e))?;
+            if !link_still_exists {
+                sqlx::query("UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("drop deleted-link kg_projection_outbox row", e))?;
+                tx.commit()
+                    .await
+                    .map_err(|e| to_store_err("commit drop deleted-link outbox row", e))?;
+                continue;
+            }
+            match project_link_into_age(&mut tx, &source_id, &target_id, &relation).await {
+                Ok(()) => {
+                    sqlx::query(
+                        "UPDATE kg_projection_outbox SET projected_at = now() WHERE id = $1",
+                    )
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("mark kg_projection_outbox projected", e))?;
+                    tx.commit()
+                        .await
+                        .map_err(|e| to_store_err("commit kg_projection drain tx", e))?;
+                    projected += 1;
+                }
+                Err(e) => {
+                    // Roll back the failed projection, then record the attempt
+                    // in a fresh statement so the bump survives (drives the row
+                    // toward quarantine after MAX attempts).
+                    let _ = tx.rollback().await;
+                    let err_text = e.to_string();
+                    if let Err(e2) = sqlx::query(
+                        "UPDATE kg_projection_outbox \
+                         SET attempt_count = attempt_count + 1, last_error = $2 WHERE id = $1",
+                    )
+                    .bind(id)
+                    .bind(&err_text)
+                    .execute(&self.pool)
+                    .await
+                    {
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            err = %e2,
+                            "kg_projection_outbox: failed to record drain attempt bump"
+                        );
+                    }
+                    let metrics = crate::metrics::registry();
+                    metrics.age_projection_failed_total.inc();
+                    // This failure pushes attempt_count to attempt_count+1; if
+                    // that reaches the ceiling the row is now quarantined
+                    // (future take-queries exclude attempt_count >= MAX).
+                    if attempt_count + 1 >= Self::MAX_AGE_PROJECTION_ATTEMPTS {
+                        metrics.age_projection_quarantined_total.inc();
+                        tracing::error!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            attempts = attempt_count + 1,
+                            "kg_projection_outbox: row QUARANTINED after {} failed AGE-projection \
+                             attempts — relational edge exists but will not reach the AGE graph \
+                             until repaired/re-enqueued. Operator action required.",
+                            Self::MAX_AGE_PROJECTION_ATTEMPTS
+                        );
+                    } else {
+                        tracing::warn!(
+                            target: TRACE_TARGET_KG,
+                            outbox_id = id,
+                            source_id = %source_id,
+                            target_id = %target_id,
+                            relation = %relation,
+                            err = %err_text,
+                            "kg_projection_outbox: deferred AGE projection attempt failed; \
+                             will retry until quarantine"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Refresh the pending-depth gauge so operators see relational↔graph
+        // drift even between failures. Best-effort: a count failure must not
+        // abort the drain pass.
+        if let Ok((pending,)) = sqlx::query_as::<_, (i64,)>(
+            "SELECT count(*) FROM kg_projection_outbox WHERE projected_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        {
+            crate::metrics::registry()
+                .age_projection_pending_depth
+                .set(pending);
+        }
+
+        Ok(projected)
+    }
+
+    /// #1783 (5-agent vote 4d3ea1c5) — best-effort AGE unprojection for
+    /// hard-deleted memory ids on the POOL-DIRECT delete paths (`delete`,
+    /// `apply_remote_deletion`) that run without a surrounding tx. Opens a
+    /// short own tx, issues the per-id `DETACH DELETE`, and commits; any
+    /// failure is logged and swallowed so the already-committed relational
+    /// delete is never undone. No-op on the CTE backend (nothing is
+    /// projected). The non-atomicity is a crash-only residual — a crash
+    /// between the relational delete and this call re-orphans the node, the
+    /// exact LOW-severity defect this closes for the common path; the
+    /// tx-scoped delete paths (forget/consolidate/run_gc/size_gc) ride
+    /// their existing tx and clean the projection atomically.
+    async fn unproject_memory_ids_best_effort(&self, ids: &[&str]) {
+        if ids.is_empty() || !matches!(self.kg_backend, KgBackend::Age) {
+            return;
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    err = %to_store_err("begin unproject tx", e),
+                    "AGE unprojection skipped (begin tx failed) on hard-delete"
+                );
+                return;
+            }
+        };
+        for id in ids {
+            if let Err(e) = unproject_memory_from_age(&mut tx, id).await {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    memory_id = %id,
+                    err = %e,
+                    "AGE unprojection error on hard-delete (continuing)"
+                );
+            }
+        }
+        if let Err(e) = tx.commit().await {
+            tracing::warn!(
+                target: TRACE_TARGET_KG,
+                err = %to_store_err("commit unproject tx", e),
+                "AGE unprojection commit failed on hard-delete"
+            );
+        }
+    }
+
+    /// #1735 (Pillar-4 4.C) — spawn the cold-path AGE-projection drainer.
+    /// Drains once immediately at boot (crash-recovery: pick up any
+    /// `kg_projection_outbox` rows a previous process left pending between
+    /// the relational commit and the projection), then drains every
+    /// `interval`. Supervised by construction: every drain step returns a
+    /// `Result` that is logged and swallowed, so a transient AGE/DB error
+    /// never panics the task or aborts the loop. Only spawned by `serve`
+    /// when `AI_MEMORY_AGE_PROJECTION_MODE=deferred` on a postgres+AGE
+    /// backend.
+    pub fn spawn_drainer(
+        self: std::sync::Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Boot-recovery drain — self-heal projections orphaned by a crash.
+            if let Err(e) = self
+                .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
+                .await
+            {
+                tracing::warn!(
+                    target: TRACE_TARGET_KG,
+                    err = %e,
+                    "kg_projection drainer: boot-recovery drain failed (will retry on tick)"
+                );
+            }
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match self
+                    .drain_kg_projection_outbox(Self::AGE_PROJECTION_DRAIN_BATCH)
+                    .await
+                {
+                    Ok(n) if n > 0 => tracing::debug!(
+                        target: TRACE_TARGET_KG,
+                        projected = n,
+                        "kg_projection drainer: projected pending edges into memory_graph"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        target: TRACE_TARGET_KG,
+                        err = %e,
+                        "kg_projection drainer: drain tick failed; will retry next interval"
+                    ),
+                }
+            }
+        })
     }
 
     fn row_to_memory(row: &sqlx::postgres::PgRow) -> StoreResult<Memory> {
@@ -6394,7 +7722,7 @@ impl PostgresStore {
             .and_then(|s| crate::models::MemoryKind::from_str(&s))
             .unwrap_or_default();
 
-        Ok(Memory {
+        let mut memory = Memory {
             id: row_id.clone(),
             tier,
             namespace: row
@@ -6496,7 +7824,47 @@ impl PostgresStore {
             version: row
                 .try_get::<i64, _>("version")
                 .unwrap_or_else(|_| crate::models::default_memory_version()),
-        })
+            // v0.8.0 Pillar 2 (#1709) — read the v64 column. Pre-v64 rows /
+            // backups missing the column fall back to `Open` (SQL DEFAULT)
+            // and any unrecognised future value reads as `Open`.
+            lifecycle_state: row
+                .try_get::<String, _>(field_names::LIFECYCLE_STATE)
+                .ok()
+                .and_then(|s| crate::models::LifecycleState::from_str(&s))
+                .unwrap_or_default(),
+        };
+
+        // #228 Commit B — at-rest content decryption (postgres parity).
+        // Gated on envelope PRESENCE (a non-NULL BYTEA), NOT on
+        // `encryption_enabled`, so rows written while encryption was on stay
+        // readable after the flag is toggled off. NULL on every legacy row +
+        // every encryption-off row → no-op, so the default path is
+        // byte-identical (content keeps the plaintext read above). A missing
+        // column on a pre-v68 backup surfaces as a try_get error → None.
+        let enc: Option<Vec<u8>> = row
+            .try_get::<Option<Vec<u8>>, _>(field_names::ENCRYPTED_ENVELOPE)
+            .unwrap_or(None);
+        if let Some(bytes) = enc {
+            let agent_id = memory
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match crate::encryption::open_content(&bytes, agent_id) {
+                Ok(plaintext) => memory.content = plaintext,
+                Err(e) => {
+                    // FAIL-CLOSED: a row with a non-NULL envelope MUST
+                    // decrypt or the read errors. Never surface the empty
+                    // placeholder as if it were the plaintext content
+                    // (would mask key loss / corruption).
+                    return Err(StoreError::IntegrityFailed {
+                        detail: format!("decrypt failed for memory {}: {e}", memory.id),
+                    });
+                }
+            }
+        }
+
+        Ok(memory)
     }
 
     /// v0.7.0 recursive-learning Task 4/8 (issue #655) — Postgres parity
@@ -6770,6 +8138,7 @@ impl PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         if let Err(e) = consult_governance_pre_write_pg(&candidate) {
             // Map `StoreError::PermissionDenied` (the canonical refusal
@@ -6822,15 +8191,16 @@ impl PostgresStore {
                 priority = EXCLUDED.priority,
                 confidence = EXCLUDED.confidence,
                 updated_at = EXCLUDED.updated_at,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    ELSE EXCLUDED.memory_kind END,
@@ -7161,6 +8531,309 @@ fn to_store_err(what: &str, e: sqlx::Error) -> StoreError {
     }
 }
 
+/// #1709 Pillar 1 — `actions` by-id SELECT (canonical column order matching
+/// [`pg_row_to_action`]). One definition shared by the by-id reads.
+const PG_ACTION_SELECT_BY_ID: &str = "SELECT id, namespace, kind, state, title, payload, \
+     priority, agent_id, claimed_by, vector_clock, metadata, created_at, updated_at \
+     FROM actions WHERE id = $1";
+
+/// #1709 §11.4 Pillar-1 FRONTIER — the UNBLOCKED `WHERE`-tail shared by the
+/// postgres `action_frontier` / `action_next` reads. `$1` is the namespace.
+/// Byte-for-byte the same predicate the sqlite `crate::actions::frontier`
+/// uses (see `crate::actions::frontier_where_tail`): a pending action is
+/// UNBLOCKED iff every `requires` / `gated_by` prerequisite is `done` and no
+/// still-active `blocks` edge targets it.
+fn pg_frontier_where_tail() -> String {
+    use crate::models::{ActionState, EdgeType};
+    format!(
+        "a.namespace = $1 AND a.state = '{pending}' \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.to_action \
+             WHERE e.from_action = a.id \
+               AND e.edge_type IN ('{requires}', '{gated_by}') \
+               AND b.state <> '{done}') \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM action_edges e JOIN actions b ON b.id = e.from_action \
+             WHERE e.to_action = a.id AND e.edge_type = '{blocks}' \
+               AND b.state NOT IN ('{done}', '{failed}', '{abandoned}'))",
+        pending = ActionState::Pending.as_str(),
+        requires = EdgeType::Requires.as_str(),
+        gated_by = EdgeType::GatedBy.as_str(),
+        done = ActionState::Done.as_str(),
+        blocks = EdgeType::Blocks.as_str(),
+        failed = ActionState::Failed.as_str(),
+        abandoned = ActionState::Abandoned.as_str(),
+    )
+}
+
+/// Map a postgres row (the action column order) to an
+/// [`crate::models::Action`]. JSON columns are TEXT (parity with sqlite).
+/// Shared by `action_get` / `action_transition` / `action_list`.
+fn pg_row_to_action(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Action> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let state: String = r.try_get("state").map_err(|e| g("action.state", e))?;
+    let payload: String = r.try_get("payload").map_err(|e| g("action.payload", e))?;
+    let vector_clock: String = r
+        .try_get("vector_clock")
+        .map_err(|e| g("action.vector_clock", e))?;
+    let metadata: String = r.try_get("metadata").map_err(|e| g("action.metadata", e))?;
+    Ok(crate::models::Action {
+        id: r.try_get("id").map_err(|e| g("action.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("action.namespace", e))?,
+        kind: r.try_get("kind").map_err(|e| g("action.kind", e))?,
+        state: crate::models::ActionState::from_str(&state).unwrap_or_default(),
+        title: r.try_get("title").map_err(|e| g("action.title", e))?,
+        payload: serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null),
+        priority: r.try_get("priority").map_err(|e| g("action.priority", e))?,
+        agent_id: r.try_get("agent_id").ok(),
+        claimed_by: r.try_get("claimed_by").ok(),
+        vector_clock: serde_json::from_str(&vector_clock).unwrap_or(serde_json::Value::Null),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("action.created_at", e))?,
+        updated_at: r
+            .try_get("updated_at")
+            .map_err(|e| g("action.updated_at", e))?,
+    })
+}
+
+/// #1709 Pillar 1 — `leases` by-action-id SELECT (canonical order for
+/// [`pg_row_to_lease`]).
+const PG_LEASE_SELECT_BY_ID: &str = "SELECT action_id, holder, acquired_at, expires_at, heartbeat_at FROM leases WHERE action_id = $1";
+
+/// Map a postgres row to a [`crate::models::Lease`].
+fn pg_row_to_lease(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Lease> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    Ok(crate::models::Lease {
+        action_id: r
+            .try_get("action_id")
+            .map_err(|e| g("lease.action_id", e))?,
+        holder: r.try_get("holder").map_err(|e| g("lease.holder", e))?,
+        acquired_at: r
+            .try_get("acquired_at")
+            .map_err(|e| g("lease.acquired_at", e))?,
+        expires_at: r
+            .try_get("expires_at")
+            .map_err(|e| g("lease.expires_at", e))?,
+        heartbeat_at: r
+            .try_get("heartbeat_at")
+            .map_err(|e| g("lease.heartbeat_at", e))?,
+    })
+}
+
+/// #1709 Pillar 1 — `signals` by-id SELECT (canonical column order matching
+/// [`pg_row_to_signal`]). One definition shared by the by-id reads.
+const PG_SIGNAL_SELECT_BY_ID: &str = "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, in_reply_to, \
+     correlation_id, reference_ids, created_at, expires_at, delivered_at, read_at, \
+     acknowledged_at, signature, sender_pubkey FROM signals WHERE id = $1";
+
+/// Map a postgres row (the signal column order) to a [`crate::models::Signal`].
+/// JSON columns (`body`, `reference_ids`) are TEXT (parity with sqlite); the
+/// Ed25519 `signature` / `sender_pubkey` columns are BYTEA → `Vec<u8>`; epoch
+/// columns are BIGINT → `i64` / `Option<i64>`. Shared by `signal_get` /
+/// `signal_inbox` / `signal_thread`.
+fn pg_row_to_signal(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Signal> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let signal_type: String = r
+        .try_get("signal_type")
+        .map_err(|e| g("signal.signal_type", e))?;
+    let body: String = r.try_get("body").map_err(|e| g("signal.body", e))?;
+    let reference_ids: String = r
+        .try_get("reference_ids")
+        .map_err(|e| g("signal.reference_ids", e))?;
+    Ok(crate::models::Signal {
+        id: r.try_get("id").map_err(|e| g("signal.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("signal.namespace", e))?,
+        from_agent: r
+            .try_get("from_agent")
+            .map_err(|e| g("signal.from_agent", e))?,
+        to_agent: r.try_get("to_agent").ok(),
+        subject: r.try_get("subject").map_err(|e| g("signal.subject", e))?,
+        body: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        signal_type: crate::models::SignalType::from_str(&signal_type).unwrap_or_default(),
+        in_reply_to: r.try_get("in_reply_to").ok(),
+        correlation_id: r.try_get(crate::models::field_names::CORRELATION_ID).ok(),
+        reference_ids: serde_json::from_str(&reference_ids).unwrap_or(serde_json::Value::Null),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("signal.created_at", e))?,
+        expires_at: r.try_get("expires_at").ok(),
+        delivered_at: r.try_get("delivered_at").ok(),
+        read_at: r.try_get("read_at").ok(),
+        acknowledged_at: r.try_get("acknowledged_at").ok(),
+        signature: r
+            .try_get("signature")
+            .map_err(|e| g("signal.signature", e))?,
+        sender_pubkey: r
+            .try_get("sender_pubkey")
+            .map_err(|e| g("signal.sender_pubkey", e))?,
+    })
+}
+
+/// #1709 Pillar 1 — `checkpoints` by-id SELECT (canonical column order
+/// matching [`pg_row_to_checkpoint`]). One definition shared by the by-id
+/// reads.
+const PG_CHECKPOINT_SELECT_BY_ID: &str = "SELECT id, namespace, title, condition_type, condition, state, created_by, resolved_by, \
+     resolution, resolution_note, signature, resolver_pubkey, created_at, deadline_at, \
+     resolved_at, metadata FROM checkpoints WHERE id = $1";
+
+/// Map a postgres row (the checkpoint column order) to a
+/// [`crate::models::Checkpoint`]. JSON columns (`condition`, `metadata`) are
+/// TEXT (parity with sqlite); the Ed25519 `signature` / `resolver_pubkey`
+/// columns are nullable BYTEA → `Vec<u8>` (NULL collapses to an empty vec
+/// for an unattested row); epoch columns are BIGINT → `i64` / `Option<i64>`.
+/// Shared by `checkpoint_get` / `checkpoint_list` / `checkpoint_query` /
+/// `checkpoint_resolve`.
+fn pg_row_to_checkpoint(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Checkpoint> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let condition_type: String = r
+        .try_get("condition_type")
+        .map_err(|e| g("checkpoint.condition_type", e))?;
+    let condition: String = r
+        .try_get("condition")
+        .map_err(|e| g("checkpoint.condition", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("checkpoint.state", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("checkpoint.metadata", e))?;
+    Ok(crate::models::Checkpoint {
+        id: r.try_get("id").map_err(|e| g("checkpoint.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("checkpoint.namespace", e))?,
+        title: r.try_get("title").map_err(|e| g("checkpoint.title", e))?,
+        condition_type: crate::models::ConditionType::from_str(&condition_type).unwrap_or_default(),
+        condition: serde_json::from_str(&condition).unwrap_or(serde_json::Value::Null),
+        state: crate::models::CheckpointState::from_str(&state).unwrap_or_default(),
+        created_by: r
+            .try_get(crate::models::field_names::CREATED_BY)
+            .map_err(|e| g("checkpoint.created_by", e))?,
+        resolved_by: r.try_get("resolved_by").ok(),
+        resolution: r.try_get("resolution").ok(),
+        resolution_note: r.try_get("resolution_note").ok(),
+        signature: r
+            .try_get::<Option<Vec<u8>>, _>("signature")
+            .map_err(|e| g("checkpoint.signature", e))?
+            .unwrap_or_default(),
+        resolver_pubkey: r
+            .try_get::<Option<Vec<u8>>, _>("resolver_pubkey")
+            .map_err(|e| g("checkpoint.resolver_pubkey", e))?
+            .unwrap_or_default(),
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("checkpoint.created_at", e))?,
+        deadline_at: r.try_get("deadline_at").ok(),
+        resolved_at: r.try_get("resolved_at").ok(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// #1709 Pillar 1 — `routines` by-id SELECT (canonical column order matching
+/// [`pg_row_to_routine`]). One definition shared by the by-id reads.
+const PG_ROUTINE_SELECT_BY_ID: &str = "SELECT id, namespace, name, template, parameters, state, created_by, created_at, \
+     frozen_at, signature, signer_pubkey, metadata FROM routines WHERE id = $1";
+
+/// Map a postgres row (the routine column order) to a
+/// [`crate::models::Routine`]. JSON columns (`template`, `parameters`,
+/// `metadata`) are TEXT (parity with sqlite); the Ed25519 `signature` /
+/// `signer_pubkey` columns are nullable BYTEA → `Vec<u8>` (NULL collapses to
+/// an empty vec for an unfrozen row); epoch columns are BIGINT → `i64` /
+/// `Option<i64>`. Shared by `routine_get` / `routine_list` / `routine_freeze`.
+fn pg_row_to_routine(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::Routine> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let template: String = r
+        .try_get("template")
+        .map_err(|e| g("routine.template", e))?;
+    let parameters: String = r
+        .try_get("parameters")
+        .map_err(|e| g("routine.parameters", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("routine.state", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("routine.metadata", e))?;
+    Ok(crate::models::Routine {
+        id: r.try_get("id").map_err(|e| g("routine.id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("routine.namespace", e))?,
+        name: r.try_get("name").map_err(|e| g("routine.name", e))?,
+        template: serde_json::from_str(&template).unwrap_or(serde_json::Value::Null),
+        parameters: serde_json::from_str(&parameters).unwrap_or(serde_json::Value::Null),
+        state: crate::models::RoutineState::from_str(&state).unwrap_or_default(),
+        created_by: r
+            .try_get(crate::models::field_names::CREATED_BY)
+            .map_err(|e| g("routine.created_by", e))?,
+        created_at: r
+            .try_get(crate::models::field_names::CREATED_AT)
+            .map_err(|e| g("routine.created_at", e))?,
+        frozen_at: r.try_get("frozen_at").ok(),
+        signature: r
+            .try_get::<Option<Vec<u8>>, _>("signature")
+            .map_err(|e| g("routine.signature", e))?
+            .unwrap_or_default(),
+        signer_pubkey: r
+            .try_get::<Option<Vec<u8>>, _>("signer_pubkey")
+            .map_err(|e| g("routine.signer_pubkey", e))?
+            .unwrap_or_default(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// #1709 Pillar 1 — `routine_runs` by-id SELECT (canonical column order
+/// matching [`pg_row_to_routine_run`]). One definition shared by the by-id
+/// reads.
+const PG_ROUTINE_RUN_SELECT_BY_ID: &str = "SELECT id, routine_id, namespace, arguments, state, created_action_ids, \
+     started_at, finished_at, error, metadata FROM routine_runs WHERE id = $1";
+
+/// Map a postgres row (the routine-run column order) to a
+/// [`crate::models::RoutineRun`]. JSON columns (`arguments`,
+/// `created_action_ids`, `metadata`) are TEXT (parity with sqlite); epoch
+/// columns are BIGINT → `i64` / `Option<i64>`. Shared by `routine_run_get` /
+/// `routine_runs_for` / `routine_run_set_state`.
+fn pg_row_to_routine_run(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models::RoutineRun> {
+    use sqlx::Row;
+    let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+    let arguments: String = r
+        .try_get("arguments")
+        .map_err(|e| g("routine_run.arguments", e))?;
+    let state: String = r.try_get("state").map_err(|e| g("routine_run.state", e))?;
+    let created_action_ids: String = r
+        .try_get("created_action_ids")
+        .map_err(|e| g("routine_run.created_action_ids", e))?;
+    let metadata: String = r
+        .try_get("metadata")
+        .map_err(|e| g("routine_run.metadata", e))?;
+    Ok(crate::models::RoutineRun {
+        id: r.try_get("id").map_err(|e| g("routine_run.id", e))?,
+        routine_id: r
+            .try_get("routine_id")
+            .map_err(|e| g("routine_run.routine_id", e))?,
+        namespace: r
+            .try_get("namespace")
+            .map_err(|e| g("routine_run.namespace", e))?,
+        arguments: serde_json::from_str(&arguments).unwrap_or(serde_json::Value::Null),
+        state: crate::models::RoutineRunState::from_str(&state).unwrap_or_default(),
+        created_action_ids: serde_json::from_str(&created_action_ids)
+            .unwrap_or(serde_json::Value::Null),
+        started_at: r
+            .try_get("started_at")
+            .map_err(|e| g("routine_run.started_at", e))?,
+        finished_at: r.try_get("finished_at").ok(),
+        error: r.try_get("error").ok(),
+        metadata: serde_json::from_str(&metadata).unwrap_or(serde_json::Value::Null),
+    })
+}
+
 /// ARCH-1 — Postgres-side adapter for the substrate
 /// [`crate::storage::GOVERNANCE_PRE_WRITE`] hook.
 ///
@@ -7232,7 +8905,8 @@ impl PostgresStore {
                     COALESCE(confidence_source, 'caller_provided') AS confidence_source,
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
-                    COALESCE(version, 1) AS version
+                    COALESCE(version, 1) AS version,
+                    COALESCE(lifecycle_state, 'open') AS lifecycle_state
              FROM archived_memories WHERE id = $1",
         )
         .bind(id)
@@ -7240,6 +8914,12 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("load archived as memory", e))?;
         let row = row.ok_or_else(|| StoreError::NotFound { id: id.to_string() })?;
+        // #228 Commit B — DELIBERATELY does NOT select `encrypted_envelope`.
+        // This Memory feeds only the GOVERNANCE_PRE_WRITE hook (inspects
+        // namespace / tier / title, never content). Selecting the envelope
+        // would make `row_to_memory` fail-closed on a key-rotated / absent
+        // key and block an otherwise-restorable row; the restore INSERT-
+        // SELECT carries the ciphertext verbatim (Commit A) regardless.
         Self::row_to_memory(&row)
     }
 }
@@ -8130,6 +9810,106 @@ async fn project_link_into_age(
     Ok(())
 }
 
+/// #1783 (5-agent vote 4d3ea1c5) — remove a hard-deleted memory's AGE
+/// projection so `kg_query`/`find_paths` over the AGE backend don't
+/// return ghost edges to a row that no longer exists relationally.
+///
+/// [`project_link_into_age`] is MERGE-only; without this mirror a
+/// hard-deleted memory leaves an orphan `(:Memory {id})` node plus every
+/// edge incident to it in `memory_graph`. `DETACH DELETE` removes the
+/// node AND its incident edges in one statement; neighbour nodes survive
+/// (only edges touching `id` go away). Idempotent: a `MATCH` that finds
+/// no node — a keyword-tier memory that was never linked, so never
+/// projected — is a clean no-op returning zero rows.
+///
+/// Best-effort, mirroring the #1542/#1640 link-projection posture: the
+/// whole statement rides a SAVEPOINT and a tolerated AGE-runtime failure
+/// (`is_age_runtime_failure` — AGE absent / graph absent / `LOAD 'age'`
+/// refused) ROLLBACKs to the savepoint, warns, and returns `Ok` so the
+/// relational delete still commits. Any non-AGE error rolls the savepoint
+/// back before propagating, keeping the caller's tx healthy.
+///
+/// Callers gate on `KgBackend::Age`; on the CTE backend there is no
+/// projection to clean (the recursive-CTE path reads `memory_links`).
+async fn unproject_memory_from_age(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<()> {
+    sqlx::query("SAVEPOINT unproject_memory_age")
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("savepoint unproject_memory_age", e))?;
+    match unproject_memory_from_age_inner(tx, id).await {
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| to_store_err("release savepoint unproject_memory_age", e))?;
+            Ok(())
+        }
+        Err(e) if is_age_runtime_failure(&e) => {
+            sqlx::query("ROLLBACK TO SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("rollback savepoint unproject_memory_age", e2))?;
+            sqlx::query("RELEASE SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| to_store_err("release savepoint unproject_memory_age", e2))?;
+            tracing::warn!(
+                target: TRACE_TARGET_KG,
+                memory_id = %id,
+                err = %e,
+                "AGE unprojection skipped on memory hard-delete — relational \
+                 row already removed. kg_query may surface a ghost edge to this \
+                 id until reconciled; find_paths degrades to the CTE."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Non-AGE error: restore tx health before propagating so the
+            // caller's surrounding delete tx isn't left aborted.
+            sqlx::query("ROLLBACK TO SAVEPOINT unproject_memory_age")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e2| {
+                    to_store_err("rollback savepoint unproject_memory_age (err path)", e2)
+                })?;
+            Err(e)
+        }
+    }
+}
+
+/// #1783 — inner `DETACH DELETE` for [`unproject_memory_from_age`]. Kept
+/// separate so the SAVEPOINT discipline in the caller wraps the whole
+/// `LOAD` + search_path + cypher sequence as one tolerated unit.
+async fn unproject_memory_from_age_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> StoreResult<()> {
+    // #1542/#1640 — shared tolerated-LOAD helper.
+    load_age_tolerated(tx).await?;
+    // SET LOCAL confines the ag_catalog search path to this tx (same as
+    // project_link_into_age) so pooled-connection reuse doesn't inherit it.
+    sqlx::query(SQL_SET_AGE_SEARCH_PATH)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("set search_path (unproject_memory)", e))?;
+    // DETACH DELETE removes the node + all incident edges. AGE 1.5.0
+    // requires both the `AS (col agtype)` column list and a trailing
+    // RETURN even for writes; the id is bound through the params surface
+    // (never interpolated) exactly like the node MERGE above.
+    let sql = "SELECT n FROM cypher('memory_graph', \
+         $$ MATCH (n:Memory {id: $id}) DETACH DELETE n RETURN n $$, $1) AS (n agtype)";
+    let params = age_params_jsonb(&[("id", id)]);
+    sqlx::query(sql)
+        .bind(Agtype(params))
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| to_store_err("unproject memory node from AGE", e))?;
+    Ok(())
+}
+
 /// from sqlx; the AGE branch needs this helper to mirror the same
 /// shape so the upper-layer handler stays backend-blind.
 fn agtype_optional_string(s: &str) -> Option<String> {
@@ -8413,6 +10193,23 @@ impl MemoryStore for PostgresStore {
                 detail: serialize_err("tags", e),
             })?;
 
+        // #1757 / #1719 item 2b — populate-on-write: advance THIS node's
+        // own component of the per-memory vector clock on the LOCAL store
+        // path (postgres twin of the sqlite `db::insert` stamp). The
+        // federation RECEIVE writes are the separate `apply_remote_memory`
+        // / `merge_inbound`, so a remote-applied row never bumps this node.
+        // ON CONFLICT updates `metadata = EXCLUDED.metadata` (agent_id
+        // preserved), so a re-store persists the advanced clock too.
+        let store_stamped_metadata = {
+            let mut m = memory.metadata.clone();
+            crate::models::stamp_version_vector(
+                &mut m,
+                crate::federation::identity::resolver::local_node_identity(),
+                &memory.updated_at,
+            );
+            m
+        };
+
         // v0.7.0.1 G1 — INSERT memories + record quota usage in a single
         // transaction so the postgres path matches the SQLite parity laid
         // out in `quotas::check_and_record`. Without this, S61's wire
@@ -8477,6 +10274,30 @@ impl MemoryStore for PostgresStore {
         // here, matching the sqlite behaviour.
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
 
+        // #228 Commit B — at-rest content encryption (postgres parity).
+        // Seal the plaintext content to the per-agent X25519 key when
+        // enabled; the `content` column then carries the empty placeholder
+        // and the ciphertext envelope lands in the `encrypted_envelope`
+        // BYTEA column (schema v68). When disabled (default) `sealed` is
+        // None: content is stored verbatim and the envelope binds NULL —
+        // byte-identical to the pre-wiring path. agent_id is the NHI
+        // provenance marker from metadata (fail-closed under an enabled
+        // gate when absent). Content-only: title/tags/metadata stay plain.
+        let store_agent_id = memory
+            .metadata
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let store_sealed = crate::encryption::seal_content(&memory.content, store_agent_id)
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("at-rest seal_content failed: {e}"),
+            })?;
+        let store_content_to_store = store_sealed
+            .as_ref()
+            .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
+        let store_encrypted_envelope: Option<&[u8]> =
+            store_sealed.as_ref().map(|(env, _)| env.as_slice());
+
         let id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -8485,14 +10306,19 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state, encrypted_envelope
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26)
+                      $26, $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
+                -- #228 Commit B — content + envelope move together on upsert
+                -- so a re-store replaces both the placeholder and ciphertext
+                -- (encryption-off writes plaintext + NULL, clearing stale
+                -- ciphertext). Mirrors the sqlite `insert` ON CONFLICT.
+                encrypted_envelope = EXCLUDED.encrypted_envelope,
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
                         THEN EXCLUDED.tier
@@ -8514,15 +10340,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert so a
                 -- newer reflection at higher depth doesn't lose its provenance
                 -- signal when re-stored at the same (title, namespace).
@@ -8558,6 +10385,12 @@ impl MemoryStore for PostgresStore {
                 -- EXCLUDED is NULL (matches the sqlite ON CONFLICT clause
                 -- at `src/storage/mod.rs:689`).
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — sqlite parity: lifecycle_state
+                -- is preserved across a plain re-store (the stored value
+                -- wins) so a re-store does not reset an advanced
+                -- active/done state to the incoming open. Lifecycle
+                -- advances go through the typed `memory_update` gate.
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
                 -- optimistic-concurrency counter bumps exactly like
                 -- db::update (sqlite landed in 27b45dc2).
@@ -8568,7 +10401,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.tier.as_str())
         .bind(&memory.namespace)
         .bind(&memory.title)
-        .bind(&memory.content)
+        .bind(store_content_to_store)
         .bind(&tags_json)
         .bind(memory.priority)
         .bind(memory.confidence)
@@ -8578,7 +10411,7 @@ impl MemoryStore for PostgresStore {
         .bind(updated_at)
         .bind(last_accessed_at)
         .bind(expires_at)
-        .bind(&memory.metadata)
+        .bind(&store_stamped_metadata)
         .bind(memory.reflection_depth)
         .bind(memory.memory_kind.as_str())
         .bind(&citations_json)
@@ -8590,6 +10423,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.entity_id.as_deref())
         .bind(memory.persona_version)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
+        .bind(store_encrypted_envelope)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -8682,7 +10517,7 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) ",
         );
 
@@ -8780,7 +10615,9 @@ impl MemoryStore for PostgresStore {
                 // #1608 — QW-2 persona-artifact parity with `store()`.
                 .push_bind(memory.entity_id.clone())
                 .push_bind(memory.persona_version)
-                .push_bind(mentioned_entity_id);
+                .push_bind(mentioned_entity_id)
+                // v0.8.0 Pillar 2 (#1709) — lifecycle_state parity with `store()`.
+                .push_bind(memory.lifecycle_state.as_str().to_string());
         });
         if let Some(e) = push_err {
             return Err(e);
@@ -8805,15 +10642,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -8831,6 +10669,9 @@ impl MemoryStore for PostgresStore {
                 entity_id = COALESCE(memories.entity_id, EXCLUDED.entity_id),
                 persona_version = COALESCE(memories.persona_version, EXCLUDED.persona_version),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
+                -- re-store (sqlite parity).
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id, title, namespace",
@@ -9024,15 +10865,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
                                    WHEN memories.memory_kind = 'persona' THEN 'persona'
@@ -9132,6 +10974,229 @@ impl MemoryStore for PostgresStore {
         })
     }
 
+    /// #1693 — L2 transcript-recovery idempotent write (postgres parity).
+    /// The L2 sibling of [`Self::capture_turn_idempotent`]: same atomic
+    /// `memories` upsert + `transcript_line_dedup` row, but L2 is an unsigned
+    /// backstop so NO `signed_events` row is appended, and the dedup probe is
+    /// DUAL — the canonical `(host_session_id, host_turn_index)` when present
+    /// (bridging to L4 capture rows), then the content sha (normalized +
+    /// raw-line). Closes the postgres-daemon L2 gap (#1693): a postgres
+    /// deployment can now rehydrate from host transcripts.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        // Step 1 — dual dedup fast-path (no transaction needed for the read).
+        if let (Some(sid), Some(tix)) = (write.host_session_id.as_deref(), write.host_turn_index) {
+            let hit: Option<String> = sqlx::query_scalar(
+                "SELECT memory_id FROM transcript_line_dedup \
+                 WHERE host_session_id = $1 AND host_turn_index = $2",
+            )
+            .bind(sid)
+            .bind(tix)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recover_turn dedup (sid,tix) query", e))?;
+            if let Some(memory_id) = hit {
+                return Ok(crate::models::RecoverTurnResult {
+                    memory_id,
+                    dedup_hit: true,
+                });
+            }
+        }
+        let sha_hit: Option<String> = sqlx::query_scalar(
+            "SELECT memory_id FROM transcript_line_dedup WHERE sha256 IN ($1, $2)",
+        )
+        .bind(&write.normalized_sha256)
+        .bind(&write.raw_sha256)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("recover_turn dedup (sha) query", e))?;
+        if let Some(memory_id) = sha_hit {
+            return Ok(crate::models::RecoverTurnResult {
+                memory_id,
+                dedup_hit: true,
+            });
+        }
+
+        // ARCH-1 — substrate governance pre-write parity with the sqlite L2
+        // path (`storage::recover_turn_idempotent` → `storage::insert` →
+        // `consult_governance_pre_write`).
+        let memory = &write.memory;
+        consult_governance_pre_write_pg(memory)?;
+
+        let created_at = parse_rfc3339_required(&memory.created_at)?;
+        let updated_at = parse_rfc3339_required(&memory.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(memory.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(memory.effective_expires_at().as_deref());
+        let tags_json =
+            serde_json::to_value(&memory.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("tags", e),
+            })?;
+        let citations_json =
+            serde_json::to_string(&memory.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            })?;
+        let source_span_json = match memory.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(&span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &memory.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+
+        // Step 2 — atomic two-row write (memory + dedup; NO signed_events).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin recover_turn tx", e))?;
+
+        let inserted_id: String = sqlx::query(
+            "INSERT INTO memories (
+                id, tier, namespace, title, content, tags, priority, confidence,
+                source, access_count, created_at, updated_at, last_accessed_at,
+                expires_at, metadata, reflection_depth, memory_kind,
+                citations, source_uri, source_span,
+                confidence_source, confidence_signals, confidence_decayed_at,
+                mentioned_entity_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                      $18, $19, $20,
+                      $21, $22, $23,
+                      $24)
+            ON CONFLICT (title, namespace) DO UPDATE SET
+                content = EXCLUDED.content,
+                tier = CASE
+                    WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
+                        THEN EXCLUDED.tier
+                    ELSE memories.tier
+                END,
+                tags = EXCLUDED.tags,
+                priority = GREATEST(memories.priority, EXCLUDED.priority),
+                confidence = GREATEST(memories.confidence, EXCLUDED.confidence),
+                source = EXCLUDED.source,
+                updated_at = EXCLUDED.updated_at,
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
+                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
+                reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
+                memory_kind = CASE WHEN memories.memory_kind = 'reflection' THEN 'reflection'
+                                   WHEN memories.memory_kind = 'persona' THEN 'persona'
+                                   ELSE EXCLUDED.memory_kind END,
+                citations = CASE WHEN EXCLUDED.citations = '[]'
+                                 THEN memories.citations
+                                 ELSE EXCLUDED.citations END,
+                source_uri = COALESCE(EXCLUDED.source_uri, memories.source_uri),
+                source_span = COALESCE(EXCLUDED.source_span, memories.source_span),
+                confidence_source = CASE WHEN EXCLUDED.confidence_source != 'caller_provided'
+                                         THEN EXCLUDED.confidence_source
+                                         ELSE memories.confidence_source END,
+                confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
+                confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
+                mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                version = memories.version + 1
+            RETURNING id",
+        )
+        .bind(&memory.id)
+        .bind(memory.tier.as_str())
+        .bind(&memory.namespace)
+        .bind(&memory.title)
+        .bind(&memory.content)
+        .bind(&tags_json)
+        .bind(memory.priority)
+        .bind(memory.confidence)
+        .bind(&memory.source)
+        .bind(memory.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&memory.metadata)
+        .bind(memory.reflection_depth)
+        .bind(memory.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(memory.source_uri.as_deref())
+        .bind(source_span_json.as_deref())
+        .bind(memory.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(memory.confidence_decayed_at.as_deref())
+        .bind(mentioned_entity_id.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("recover_turn insert memory", e))?
+        .try_get::<String, _>("id")
+        .map_err(|e| to_store_err("recover_turn read returned id", e))?;
+
+        // `transcript_line_dedup` row (normalized sha + transcript_path).
+        // `ON CONFLICT (sha256) DO NOTHING` guards the concurrent-duplicate
+        // race under READ COMMITTED (the sqlite path serializes via
+        // BEGIN IMMEDIATE).
+        sqlx::query(
+            "INSERT INTO transcript_line_dedup \
+             (sha256, memory_id, host_kind, transcript_path, \
+              host_session_id, host_turn_index, recovered_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(&write.normalized_sha256)
+        .bind(&inserted_id)
+        .bind(&write.host_kind)
+        .bind(&write.transcript_path)
+        .bind(&write.host_session_id)
+        .bind(write.host_turn_index)
+        .bind(write.recovered_at_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("recover_turn insert dedup row", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit recover_turn tx", e))?;
+
+        Ok(crate::models::RecoverTurnResult {
+            memory_id: inserted_id,
+            dedup_hit: false,
+        })
+    }
+
+    /// #1693 — L2 recovery fast-path watermark on postgres: the most recent
+    /// `created_at` across the agent's memories, rendered RFC3339 to match
+    /// the sqlite string watermark the recover fast-path compares against.
+    async fn agent_max_created_at(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let v: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT MAX(created_at) FROM memories WHERE metadata->>'agent_id' = $1",
+        )
+        .bind(agent_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("agent_max_created_at", e))?;
+        Ok(v.map(|dt| dt.to_rfc3339()))
+    }
+
     async fn store_with_embedding(
         &self,
         ctx: &CallerContext,
@@ -9219,12 +11284,12 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, embedding,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
-                      $27)
+                      $27, $28)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -9243,15 +11308,16 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
                     ELSE COALESCE(EXCLUDED.expires_at, memories.expires_at)
                 END,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END,
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row through the metadata overwrite.
+                    -- `||` overlays them on top of EXCLUDED so existing wins
+                    -- (the superset of the pre-#1784 agent_id-only CASE).
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                )),
                 -- v0.7.0 Task 1/8 — recursion depth takes max on upsert.
                 reflection_depth = GREATEST(memories.reflection_depth, EXCLUDED.reflection_depth),
                 -- L1-1 — kind is sticky (reflection AND persona, #1629).
@@ -9276,6 +11342,10 @@ impl MemoryStore for PostgresStore {
                 -- #1383 — preserve a previously-extracted attribution
                 -- if EXCLUDED is NULL (sqlite parity).
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
+                -- re-store (sqlite parity); advances go through the typed
+                -- update gate.
+                lifecycle_state = memories.lifecycle_state,
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id",
@@ -9307,6 +11377,7 @@ impl MemoryStore for PostgresStore {
         .bind(memory.persona_version)
         .bind(emb_pgvec)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -9423,7 +11494,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
-        let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
+        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -9465,6 +11536,105 @@ impl MemoryStore for PostgresStore {
         // errors; see assert_caller_owns_for_mutation).
         self.assert_caller_owns_for_mutation(ctx, id, "update", REASON_UNSTAMPED_TENANT_WRITE)
             .await?;
+
+        // #1726 — capture the optional lifecycle target before the binds
+        // below move the rest of `patch` (LifecycleState is Copy); applied
+        // through the self-validating helper after the COALESCE UPDATE lands.
+        let lifecycle_target = patch.lifecycle_state;
+
+        // #1799 — snapshot the prior content under
+        // archive_reason='in_place_edit' BEFORE this one-shot COALESCE
+        // UPDATE overwrites it, mirroring the OPTIMISTIC path
+        // (`update_with_expected_version_once`, snapshot block ~L3704) and
+        // the sqlite trait `update` (`db::update_with_expected_version`).
+        // Pre-#1799 this non-If-Match trait path did a blind one-shot
+        // UPDATE on `&self.pool` with NO snapshot, so a content edit
+        // routed here (PUT without If-Match / CLI / federation catchup)
+        // was lossy + un-undoable on postgres — a partial-#1725 backend
+        // asymmetry surfaced by the #1798 R-02 adversarial review. The
+        // snapshot + UPDATE now run atomically in one tx: any early
+        // return / drop rolls back BOTH so a row is never half-archived.
+        //
+        // Clone the change-check fields BEFORE the binds below move
+        // `patch.{title,content}` into the UPDATE.
+        let snap_title = patch.title.clone();
+        let snap_content = patch.content.clone();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("update begin tx", e))?;
+
+        // Read the current title+content for the content-change check. A
+        // missing row → NotFound (the tx drops / rolls back). This also
+        // pre-empts the post-UPDATE `rows_affected == 0` NotFound below
+        // (kept as a safety net for a concurrent delete between this read
+        // and the UPDATE inside the same tx).
+        let cur: Option<(String, String)> =
+            sqlx::query_as("SELECT title, content FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("update read current", e))?;
+        let Some((cur_title, cur_content)) = cur else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+
+        // `content_changed` is true when the patch supplies a title OR
+        // content that differs from the stored row. A metadata / tag /
+        // priority-only patch leaves both untouched and archives nothing.
+        //
+        // At-rest-encryption nuance: when encryption is ON the stored
+        // `content` is a sealed placeholder, never the plaintext, so a
+        // plaintext patch always compares "changed" → a harmless
+        // over-snapshot (the snapshot row carries the same sealed
+        // placeholder + its `encrypted_envelope`, so undo still round-
+        // trips). The default build is plaintext, so the common case is
+        // an exact title/content comparison.
+        let content_changed = snap_title.as_deref().is_some_and(|t| t != cur_title)
+            || snap_content.as_deref().is_some_and(|c| c != cur_content);
+
+        // #1799 — DELETE+INSERT the prior content into `archived_memories`
+        // under archive_reason='in_place_edit', SAME memory_id (no fork),
+        // copying the exact 37-column list from the optimistic path's
+        // snapshot block (~L3722). The DELETE only ever removes a stale
+        // in_place_edit snapshot of this id (supersede forks a new id +
+        // deletes the old live row; GC deletes the live row; restore
+        // removes the archive row on success — so a live, in-place-
+        // editable row can never collide with a different archive_reason).
+        if content_changed {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+            sqlx::query(
+                "INSERT INTO archived_memories
+                    (id, tier, namespace, title, content, tags, priority, confidence,
+                     source, access_count, created_at, updated_at, last_accessed_at,
+                     expires_at, archived_at, archive_reason, metadata,
+                     embedding, embedding_dim, original_tier, original_expires_at,
+                     reflection_depth, atomised_into, atom_of, memory_kind,
+                     entity_id, persona_version, citations, source_uri, source_span,
+                     confidence_source, confidence_signals, confidence_decayed_at,
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, NOW(), $2, metadata,
+                        embedding, embedding_dim, tier, expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive prior content in_place_edit", e))?;
+        }
 
         // One-shot COALESCE update — each patch field overrides only if
         // Some, otherwise falls through to the existing value.
@@ -9509,12 +11679,15 @@ impl MemoryStore for PostgresStore {
                 confidence = COALESCE($8, confidence),
                 metadata = CASE
                     WHEN $9::JSONB IS NULL THEN metadata
-                    WHEN metadata ? 'agent_id' THEN jsonb_set(
-                        $9::JSONB,
-                        '{agent_id}',
-                        metadata -> 'agent_id'
-                    )
-                    ELSE $9::JSONB
+                    -- #1784 — overlay the existing row's immutable provenance
+                    -- keys (agent_id + consolidation derived_from /
+                    -- consolidated_from_agents) on top of the patch so a
+                    -- whole-object metadata update can't silently drop them.
+                    ELSE ($9::JSONB || (
+                        SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                        FROM jsonb_each(metadata) AS prov(k, v)
+                        WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                    ))
                 END,
                 source_uri = COALESCE($10, source_uri),
                 -- #1626 — tier→long ⇒ expires_at = NULL. A patch that
@@ -9561,16 +11734,32 @@ impl MemoryStore for PostgresStore {
         // patch tier is 'long' the SET clause above ignores $11 and
         // clears the expiry unconditionally.
         .bind(parse_rfc3339_opt(patch.expires_at.as_deref()))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update", e))?
         .rows_affected();
 
+        // Safety net: the pre-UPDATE SELECT already returned NotFound for a
+        // missing row, but a concurrent delete between that read and this
+        // UPDATE (within the same tx isolation) is still caught here. The
+        // early return drops `tx`, rolling back the snapshot above.
         if rows_affected == 0 {
-            Err(StoreError::NotFound { id: id.to_string() })
-        } else {
-            Ok(())
+            return Err(StoreError::NotFound { id: id.to_string() });
         }
+
+        // #1799 — commit the atomic snapshot + UPDATE before any
+        // pool-direct follow-up. `apply_lifecycle_patch` below uses
+        // `self.pool` separately (its own statement), so it MUST run after
+        // the tx commits, preserving the pre-#1799 post-update ordering.
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("update commit tx", e))?;
+
+        // #1726 — apply an optional lifecycle transition through the
+        // self-validating helper (the non-If-Match HTTP PUT path routes here).
+        // `lifecycle_target` was captured before the binds moved `patch`.
+        self.apply_lifecycle_patch(id, lifecycle_target).await?;
+        Ok(())
     }
 
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
@@ -9606,6 +11795,11 @@ impl MemoryStore for PostgresStore {
         if rows_affected == 0 {
             Err(StoreError::NotFound { id: id.to_string() })
         } else {
+            // #1783 — the relational row + its cascade-deleted memory_links
+            // are gone; remove the now-orphaned AGE :Memory node + edges so
+            // kg_query/find_paths don't return ghost edges. Best-effort,
+            // own-tx (this path is pool-direct, no surrounding tx).
+            self.unproject_memory_ids_best_effort(&[id]).await;
             Ok(())
         }
     }
@@ -9711,24 +11905,25 @@ impl MemoryStore for PostgresStore {
         limit: usize,
     ) -> StoreResult<Vec<Memory>> {
         let limit: i64 = (limit as i64).clamp(1, STORE_LIST_MAX_LIMIT_SAL);
-        // Sargable prefix scan via a half-open byte range on the
-        // `namespace` btree (`memories_namespace_idx`). The database
-        // collation is byte-ordered (C.UTF-8), so
-        //   namespace >= prefix AND namespace < upper_bound(prefix)
-        // selects exactly the rows whose namespace starts with `prefix`
-        // — and the planner turns it into an `Index Cond` even under the
-        // generic prepared-statement plan sqlx uses (a parameterized
-        // `LIKE`/`~>=~` does NOT: it degrades to a full index Filter
-        // scan). This is the per-write dispatch hot path; the prior
-        // `list(namespace=None)` here seq-scanned the entire table on
-        // every write.
+        // Sargable BYTE-range prefix scan on the `namespace`
+        // text_pattern_ops btree (`idx_memories_namespace_path`).
+        //
+        // `prefix_upper_bound` computes the upper bound by BYTE arithmetic, so
+        // the comparison MUST be byte-ordered. `memories.namespace` has no
+        // `COLLATE "C"`, so plain `>=`/`<` use the DB default collation —
+        // `en_US.utf8` (glibc linguistic) on stock postgres — which is NOT
+        // byte order and silently DROPS valid children (e.g. a '9'-terminated
+        // prefix excludes `<prefix>/alpha`; see #1724). We therefore use the
+        // byte-comparison operators `~>=~` / `~<~` (collation-independent,
+        // sargable on the text_pattern_ops index); the in-process re-filter
+        // below is belt-and-suspenders.
         let upper = prefix_upper_bound(prefix);
         let rows = match upper {
             Some(ref upper) => {
                 sqlx::query(
                     "SELECT * FROM memories
-                     WHERE namespace >= $1 AND namespace < $2
-                     ORDER BY namespace
+                     WHERE namespace ~>=~ $1 AND namespace ~<~ $2
+                     ORDER BY namespace USING ~<~
                      LIMIT $3",
                 )
                 .bind(prefix)
@@ -9740,8 +11935,8 @@ impl MemoryStore for PostgresStore {
             None => {
                 sqlx::query(
                     "SELECT * FROM memories
-                     WHERE namespace >= $1
-                     ORDER BY namespace
+                     WHERE namespace ~>=~ $1
+                     ORDER BY namespace USING ~<~
                      LIMIT $2",
                 )
                 .bind(prefix)
@@ -10234,11 +12429,11 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
-                mentioned_entity_id
+                mentioned_entity_id, lifecycle_state
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27
+                $27, $28
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -10293,15 +12488,15 @@ impl MemoryStore for PostgresStore {
                     WHEN EXCLUDED.updated_at > memories.updated_at
                          OR (EXCLUDED.updated_at = memories.updated_at
                              AND EXCLUDED.id > memories.id) THEN
-                        CASE
-                            WHEN memories.metadata ? 'agent_id'
-                                THEN jsonb_set(
-                                    EXCLUDED.metadata,
-                                    '{agent_id}',
-                                    memories.metadata -> 'agent_id'
-                                )
-                            ELSE EXCLUDED.metadata
-                        END
+                        -- #1784 — on a newer-wins federation merge, overlay the
+                        -- existing row's immutable provenance keys (agent_id +
+                        -- consolidation derived_from / consolidated_from_agents)
+                        -- on top of EXCLUDED so they survive the merge.
+                        (EXCLUDED.metadata || (
+                            SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                            FROM jsonb_each(memories.metadata) AS prov(k, v)
+                            WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                        ))
                     ELSE memories.metadata
                 END,
                 -- v0.7.0 Task 1/8 — recursion depth takes max so the reflection
@@ -10368,6 +12563,18 @@ impl MemoryStore for PostgresStore {
                              AND EXCLUDED.id > memories.id)
                         THEN COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id)
                     ELSE memories.mentioned_entity_id
+                END,
+                -- v0.8.0 Pillar 2 (#1709) — newer-wins on lifecycle_state
+                -- (sqlite insert_if_newer parity): a peer that advanced a
+                -- Goal open→done replicates that state; a stale push keeps
+                -- the local lifecycle. Transition legality was enforced at
+                -- the originating update site.
+                lifecycle_state = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
+                        THEN EXCLUDED.lifecycle_state
+                    ELSE memories.lifecycle_state
                 END
             RETURNING id",
         )
@@ -10398,12 +12605,153 @@ impl MemoryStore for PostgresStore {
         .bind(memory.persona_version)
         .bind(memory.version)
         .bind(mentioned_entity_id.as_deref())
+        .bind(memory.lifecycle_state.as_str())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
 
         row.try_get::<String, _>("id")
             .map_err(|e| to_store_err(READ_RETURNED_ID, e))
+    }
+
+    async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
+        // pushed row must clear the same pre-write governance hook as a
+        // locally-authored write.
+        consult_governance_pre_write_pg(inbound)?;
+
+        // v0.8.0 Pillar-3 (#1709 / #224) — read the existing row BY id
+        // (bypassing the scope=private visibility gate: this is the
+        // federation reconciliation path, not a tenant-facing read; the
+        // federation allowlist + peer-attestation gate enforce
+        // cross-tenant isolation upstream), merge field-wise via the SAME
+        // pure `crate::models::merge_memory` Rust reconciler the sqlite
+        // path uses (no per-adapter merge SQL → no merge drift), then
+        // persist the full merged row by id inside a transaction. If no
+        // row matches by id, fall through to `apply_remote_memory` (the
+        // postgres `insert_if_newer` twin) for the fresh-insert +
+        // (title, namespace) dedup-upsert LWW path.
+        let existing_row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+            .bind(&inbound.id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("merge_inbound select by id", e))?;
+
+        let Some(row) = existing_row else {
+            // No row by this id — defer to the unchanged LWW path.
+            return self.apply_remote_memory(ctx, inbound).await;
+        };
+
+        let existing = Self::row_to_memory(&row)?;
+        // #1719 item 3a — neutralize the untrusted inbound's self-asserted
+        // `metadata.attest_level` to `claimed` before merge (identical to
+        // the sqlite `db::merge_inbound` boundary, no per-backend drift) so
+        // a forged peer cannot win the attested-identity LWW tiebreak by
+        // self-asserting a verified level.
+        let sanitized = crate::models::sanitize_inbound_attestation(inbound);
+        // #1755 item 3b — cap a relayed row's post-dated `updated_at` (the
+        // primary LWW key) to a freshness ceiling (identical to the sqlite
+        // `db::merge_inbound` boundary, no per-backend drift) so an enrolled
+        // relay cannot win the merge by stamping a far-future timestamp.
+        let prepared = crate::models::clamp_inbound_updated_at(
+            sanitized,
+            &chrono::Utc::now().to_rfc3339(),
+            crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS,
+        );
+        let merged = crate::models::merge_memory(&existing, &prepared);
+
+        // Encode the JSON-shaped columns the same way the
+        // `apply_remote_memory` insert path does.
+        let created_at = parse_rfc3339_required(&merged.created_at)?;
+        let updated_at = parse_rfc3339_required(&merged.updated_at)?;
+        let last_accessed_at = parse_rfc3339_opt(merged.last_accessed_at.as_deref());
+        let expires_at = parse_rfc3339_opt(merged.effective_expires_at().as_deref());
+        let tags_json =
+            serde_json::to_value(&merged.tags).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("tags", e),
+            })?;
+        let citations_json =
+            serde_json::to_string(&merged.citations).map_err(|e| StoreError::IntegrityFailed {
+                detail: serialize_err("citations", e),
+            })?;
+        let source_span_json = match &merged.source_span {
+            Some(span) => {
+                Some(
+                    serde_json::to_string(span).map_err(|e| StoreError::IntegrityFailed {
+                        detail: serialize_err(COL_SOURCE_SPAN, e),
+                    })?,
+                )
+            }
+            None => None,
+        };
+        let confidence_signals_json = match &merged.confidence_signals {
+            Some(s) => Some(
+                serde_json::to_string(s).map_err(|e| StoreError::IntegrityFailed {
+                    detail: serialize_err(COL_CONFIDENCE_SIGNALS, e),
+                })?,
+            ),
+            None => None,
+        };
+        let confidence_decayed_at = parse_rfc3339_opt(merged.confidence_decayed_at.as_deref());
+        let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&merged);
+
+        // Full-row UPDATE by id — every column is written verbatim from
+        // the already-resolved merged row (NO CASE / GREATEST / COALESCE
+        // re-application; `merge_memory` resolved every field). Wrapped in
+        // a transaction so the read-merge-write is atomic.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("merge_inbound begin tx", e))?;
+        sqlx::query(
+            "UPDATE memories SET
+                tier = $2, namespace = $3, title = $4, content = $5, tags = $6,
+                priority = $7, confidence = $8, source = $9, access_count = $10,
+                created_at = $11, updated_at = $12, last_accessed_at = $13,
+                expires_at = $14, metadata = $15, reflection_depth = $16,
+                memory_kind = $17, citations = $18, source_uri = $19,
+                source_span = $20, confidence_source = $21, confidence_signals = $22,
+                confidence_decayed_at = $23, entity_id = $24, persona_version = $25,
+                version = $26, mentioned_entity_id = $27, lifecycle_state = $28
+             WHERE id = $1",
+        )
+        .bind(&merged.id)
+        .bind(merged.tier.as_str())
+        .bind(&merged.namespace)
+        .bind(&merged.title)
+        .bind(&merged.content)
+        .bind(&tags_json)
+        .bind(merged.priority)
+        .bind(merged.confidence)
+        .bind(&merged.source)
+        .bind(merged.access_count)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(last_accessed_at)
+        .bind(expires_at)
+        .bind(&merged.metadata)
+        .bind(merged.reflection_depth)
+        .bind(merged.memory_kind.as_str())
+        .bind(&citations_json)
+        .bind(merged.source_uri.as_ref())
+        .bind(source_span_json.as_deref())
+        .bind(merged.confidence_source.as_str())
+        .bind(confidence_signals_json.as_deref())
+        .bind(confidence_decayed_at)
+        .bind(merged.entity_id.as_ref())
+        .bind(merged.persona_version)
+        .bind(merged.version)
+        .bind(mentioned_entity_id.as_deref())
+        .bind(merged.lifecycle_state.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
+
+        Ok(merged.id)
     }
 
     async fn apply_remote_link(
@@ -10502,6 +12850,11 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?
             .rows_affected();
+        if rows_affected > 0 {
+            // #1783 — federation tombstone-apply hard-deletes the row;
+            // clean its AGE projection too (best-effort, own-tx — pool-direct).
+            self.unproject_memory_ids_best_effort(&[id]).await;
+        }
         Ok(rows_affected > 0)
     }
 
@@ -10840,9 +13193,36 @@ impl MemoryStore for PostgresStore {
 
     async fn clear_namespace_standard(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         namespace: &str,
     ) -> StoreResult<bool> {
+        // #1777 — owner gate (parity with the MCP/sqlite #929 mirror). Clearing a
+        // namespace's governance standard disarms the delete/write/promote gates
+        // protecting every memory in the namespace, so it must be owner-gated
+        // like SET. The standard memory's owner is `metadata->>'agent_id'`;
+        // refuse a clear by a different named agent (admin/bypass + unowned pass).
+        if !ctx.bypass_visibility {
+            let recorded_owner: Option<String> = sqlx::query_scalar(
+                "SELECT m.metadata->>'agent_id' FROM namespace_meta nm \
+                 JOIN memories m ON m.id = nm.standard_id WHERE nm.namespace = $1",
+            )
+            .bind(namespace)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("clear_namespace_standard owner pre-fetch", e))?
+            .flatten();
+            if let Some(owner) = recorded_owner
+                && !owner.is_empty()
+                && owner != "system"
+                && owner != ctx.effective_principal()
+            {
+                return Err(StoreError::PermissionDenied {
+                    action: "clear_namespace_standard".to_string(),
+                    target: namespace.to_string(),
+                    reason: format!("caller does not own this namespace standard (owner: {owner})"),
+                });
+            }
+        }
         let rows_affected = sqlx::query("DELETE FROM namespace_meta WHERE namespace = $1")
             .bind(namespace)
             .execute(&self.pool)
@@ -11114,6 +13494,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -11280,6 +13661,19 @@ impl MemoryStore for PostgresStore {
         let pattern_like = pattern.map(|p| format!("%{p}%"));
         let now = chrono::Utc::now().to_rfc3339();
 
+        // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
+        // the #1026 fix). Pre-fix the archive INSERT and the DELETE each ran on
+        // a SEPARATE pooled connection in autocommit, so a crash,
+        // statement_timeout, pool-checkout failure, OR an ordinary concurrent
+        // write landing between them could leave the archived-set and
+        // deleted-set diverging → a row DELETEd that the archive-SELECT never
+        // captured = irrecoverable loss. One tx pins both to the same snapshot.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("forget begin tx", e))?;
+
         if archive {
             // Insert matching rows into archived_memories before deletion.
             sqlx::query(
@@ -11292,7 +13686,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -11301,7 +13695,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -11316,27 +13710,80 @@ impl MemoryStore for PostgresStore {
             .bind(tier_str.as_deref())
             .bind(pattern_like.as_deref())
             .bind(parse_rfc3339_required(&now)?)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("forget archive copy", e))?;
         }
 
-        let res = sqlx::query(
+        // #1771 (5-agent vote 4d3ea1c5) — snapshot the to-be-deleted
+        // memories' `memory_links` into `archived_memory_links` BEFORE the
+        // cascade `DELETE FROM memories` reaps them (FK `ON DELETE
+        // CASCADE`). Reuse the IDENTICAL forget predicate as a victim
+        // subquery so the snapshot and the delete pin to the same row set
+        // inside this one tx; idempotent via the PK `ON CONFLICT`. Postgres
+        // twin of the SQLite `archive_links_for_memory` snapshot.
+        sqlx::query(
+            "INSERT INTO archived_memory_links (
+                 source_id, target_id, relation, created_at, valid_from,
+                 valid_until, observed_by, signature, attest_level, archived_at
+             )
+             SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                    ml.valid_from, ml.valid_until, ml.observed_by, ml.signature,
+                    ml.attest_level, now()
+             FROM memory_links ml
+             WHERE ml.source_id IN (
+                       SELECT id FROM memories
+                       WHERE ($1::text IS NULL OR namespace = $1)
+                         AND ($2::text IS NULL OR tier = $2)
+                         AND ($3::text IS NULL
+                              OR title ILIKE $3
+                              OR content ILIKE $3))
+                OR ml.target_id IN (
+                       SELECT id FROM memories
+                       WHERE ($1::text IS NULL OR namespace = $1)
+                         AND ($2::text IS NULL OR tier = $2)
+                         AND ($3::text IS NULL
+                              OR title ILIKE $3
+                              OR content ILIKE $3))
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+        )
+        .bind(namespace)
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("forget snapshot links", e))?;
+
+        // #1783 — RETURNING id so the deleted set is known for AGE
+        // unprojection in THIS tx (the projection commits atomically with
+        // the cascade delete; ghost edges never appear).
+        let deleted: Vec<(String,)> = sqlx::query_as(
             "DELETE FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
                     OR title ILIKE $3
-                    OR content ILIKE $3)",
+                    OR content ILIKE $3)
+             RETURNING id",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
         .bind(pattern_like.as_deref())
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| to_store_err("forget delete", e))?;
 
-        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (id,) in &deleted {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("forget commit tx", e))?;
+
+        Ok(deleted.len())
     }
 
     async fn consolidate(
@@ -11486,6 +13933,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -11529,15 +13977,15 @@ impl MemoryStore for PostgresStore {
                 source = EXCLUDED.source,
                 access_count = EXCLUDED.access_count,
                 updated_at = EXCLUDED.updated_at,
-                metadata = CASE
-                    WHEN memories.metadata ? 'agent_id'
-                        THEN jsonb_set(
-                            EXCLUDED.metadata,
-                            '{agent_id}',
-                            memories.metadata -> 'agent_id'
-                        )
-                    ELSE EXCLUDED.metadata
-                END
+                metadata = (EXCLUDED.metadata || (
+                    -- #1784 — preserve immutable provenance keys (agent_id +
+                    -- consolidation derived_from / consolidated_from_agents)
+                    -- from the existing row (existing-wins) so a re-consolidation
+                    -- onto a colliding (title, namespace) can't drop provenance.
+                    SELECT COALESCE(jsonb_object_agg(prov.k, prov.v), '{}'::jsonb)
+                    FROM jsonb_each(memories.metadata) AS prov(k, v)
+                    WHERE prov.k IN ('agent_id', 'derived_from', 'consolidated_from_agents')
+                ))
                 -- reflection_depth intentionally not surfaced here: the
                 -- consolidate path mints a fresh memory and the DB column
                 -- DEFAULT 0 applies. The UPSERT branch preserves the
@@ -11588,6 +14036,11 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("consolidate delete source", e))?;
+            // #1783 — remove the merged-away source's AGE projection in
+            // this tx so kg_query/find_paths don't keep a ghost edge to it.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
         }
 
         tx.commit()
@@ -11622,7 +14075,7 @@ impl MemoryStore for PostgresStore {
         // metadata — peer-origin, signing agent, depth — never content),
         // so fetch the raw row directly rather than through the
         // visibility-gated `get`.
-        let row = sqlx::query("SELECT * FROM memories WHERE id = $1")
+        let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -11708,6 +14161,1087 @@ impl MemoryStore for PostgresStore {
         Ok(out)
     }
 
+    async fn record_recall_observation(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+        agent_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> StoreResult<usize> {
+        // #1705 — delegates to the inherent twin (no longer dead code).
+        self.recall_observation_insert(recall_id, candidates, agent_id, namespace)
+            .await
+    }
+
+    async fn mark_recall_consumed(
+        &self,
+        recall_id: &str,
+        cited_memory_ids: &[String],
+        consumed_by: &str,
+        consuming_agent: Option<&str>,
+    ) -> StoreResult<usize> {
+        // #1705 — postgres twin of `crate::observations::mark_consumed_guarded`.
+        // Idempotent: only flips rows still `consumed = FALSE`; the
+        // `(agent_id IS NULL OR agent_id = $5)` guard rejects cross-agent
+        // recall_id replay (NULL → unbound legacy row flips for any caller).
+        if cited_memory_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin mark_recall_consumed tx", e))?;
+        let mut flipped: usize = 0;
+        for mid in cited_memory_ids {
+            let n = sqlx::query(
+                "UPDATE recall_observations
+                    SET consumed = TRUE, consumed_at = $1, consumed_by_memory_id = $2
+                  WHERE recall_id = $3 AND memory_id = $4 AND consumed = FALSE
+                    AND (agent_id IS NULL OR agent_id = $5)",
+            )
+            .bind(now)
+            .bind(consumed_by)
+            .bind(recall_id)
+            .bind(mid)
+            .bind(consuming_agent)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("mark recall_observation consumed", e))?
+            .rows_affected();
+            flipped += usize::try_from(n).unwrap_or(0);
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit mark_recall_consumed tx", e))?;
+        Ok(flipped)
+    }
+
+    async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        // #1705 — inlined (avoids the inherent same-name collision).
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
+        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("recall_observation_gc (trait)", e))?
+            .rows_affected();
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_id: &str,
+        claim_unowned: bool,
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        // v0.8.0 #1709/#1720 WS-B B2 — postgres twin of
+        // `crate::storage::reown`. `metadata` is JSONB; `jsonb_set` on
+        // the single `{agent_id}` path preserves every other key, and
+        // the `agent_id_idx` STORED generated column re-projects the new
+        // owner automatically. `to_id` is validated identically so a
+        // malformed owner can never be written on either backend.
+        crate::validate::validate_agent_id(to_id).map_err(|e| StoreError::InvalidInput {
+            detail: format!("reown: invalid --to agent_id: {e}"),
+        })?;
+
+        // Default: rows already carrying an `agent_id` (the JSONB `?`
+        // key-exists operator + a non-empty text projection).
+        // `--claim-unowned`: every row in the namespace.
+        let owner_filter = if claim_unowned {
+            ""
+        } else {
+            " AND metadata ? 'agent_id' AND COALESCE(metadata ->> 'agent_id', '') != ''"
+        };
+
+        let matched: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM memories WHERE namespace = $1{owner_filter}"
+        ))
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("reown count", e))?;
+        let matched = usize::try_from(matched).unwrap_or(usize::MAX);
+
+        if dry_run {
+            return Ok(crate::storage::ReownReport {
+                matched,
+                rewritten: 0,
+                dry_run: true,
+            });
+        }
+
+        let result = sqlx::query(&format!(
+            "UPDATE memories \
+             SET metadata = jsonb_set(metadata, '{{agent_id}}', to_jsonb($2::text)) \
+             WHERE namespace = $1{owner_filter}"
+        ))
+        .bind(namespace)
+        .bind(to_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("reown update", e))?;
+        let rewritten = usize::try_from(result.rows_affected()).unwrap_or(usize::MAX);
+
+        Ok(crate::storage::ReownReport {
+            matched,
+            rewritten,
+            dry_run: false,
+        })
+    }
+
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns stored as TEXT (parity with sqlite).
+        sqlx::query(
+            "INSERT INTO actions \
+                (id, namespace, kind, state, title, payload, priority, agent_id, \
+                 claimed_by, vector_clock, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&action.id)
+        .bind(&action.namespace)
+        .bind(&action.kind)
+        .bind(action.state.as_str())
+        .bind(&action.title)
+        .bind(action.payload.to_string())
+        .bind(action.priority)
+        .bind(&action.agent_id)
+        .bind(&action.claimed_by)
+        .bind(action.vector_clock.to_string())
+        .bind(action.metadata.to_string())
+        .bind(action.created_at)
+        .bind(action.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_create", e))?;
+        Ok(action.id.clone())
+    }
+
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_get", e))?
+            .as_ref()
+            .map(pg_row_to_action)
+            .transpose()
+    }
+
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin action_transition tx", e))?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("action_transition select", e))?;
+        let Some(cs) = current else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let from = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+        if !from.can_transition_to(to) {
+            return Err(StoreError::InvalidInput {
+                detail: crate::actions::illegal_transition_detail(from, to),
+            });
+        }
+        sqlx::query(
+            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 WHERE id = $4",
+        )
+        .bind(to.as_str())
+        .bind(claimed_by)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("action_transition update", e))?;
+        let row = sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition refetch", e))?;
+        let action = pg_row_to_action(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit action_transition", e))?;
+        Ok(action)
+    }
+
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        from: crate::models::ActionState,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        use crate::actions::CasOutcome;
+        // Reject illegal edges before locking the row (mirrors the sqlite
+        // free-fn order in `crate::actions::transition_cas`).
+        if !from.can_transition_to(to) {
+            return Ok(CasOutcome::Illegal { from, to });
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin action_transition_cas tx", e))?;
+        // `FOR UPDATE` locks the row for the compare-and-swap window so a
+        // concurrent transition cannot slip between the read and the write.
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT state FROM actions WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("action_transition_cas select", e))?;
+        let Some(cs) = current else {
+            // tx rolls back on drop — nothing was written.
+            return Ok(CasOutcome::NotFound);
+        };
+        let cur = crate::models::ActionState::from_str(&cs).unwrap_or_default();
+        if cur != from {
+            // Lost the CAS — local state has moved past `from`. Safe no-op.
+            return Ok(CasOutcome::StateMismatch { current: cur });
+        }
+        sqlx::query(
+            "UPDATE actions SET state = $1, claimed_by = $2, updated_at = $3 WHERE id = $4",
+        )
+        .bind(to.as_str())
+        .bind(claimed_by)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("action_transition_cas update", e))?;
+        let row = sqlx::query(PG_ACTION_SELECT_BY_ID)
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("action_transition_cas refetch", e))?;
+        let action = pg_row_to_action(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit action_transition_cas", e))?;
+        Ok(CasOutcome::Applied(action))
+    }
+
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        state: Option<crate::models::ActionState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions WHERE TRUE",
+        );
+        if let Some(ns) = namespace {
+            qb.push(" AND namespace = ").push_bind(ns.to_string());
+        }
+        if let Some(st) = state {
+            qb.push(" AND state = ").push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(" ORDER BY updated_at DESC LIMIT ").push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_list", e))?;
+        rows.iter().map(pg_row_to_action).collect()
+    }
+
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        from_action: &str,
+        to_action: &str,
+        edge_type: crate::models::EdgeType,
+        now: i64,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO action_edges (from_action, to_action, edge_type, created_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (from_action, to_action, edge_type) DO NOTHING",
+        )
+        .bind(from_action)
+        .bind(to_action)
+        .bind(edge_type.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_add_edge", e))?;
+        Ok(())
+    }
+
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT from_action, to_action, edge_type, created_at FROM action_edges \
+              WHERE from_action = $1 OR to_action = $1 ORDER BY created_at ASC",
+        )
+        .bind(action_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("action_edges_for", e))?;
+        rows.iter()
+            .map(|r| {
+                let g = |k: &str, e: sqlx::Error| to_store_err(k, e);
+                let et: String = r.try_get("edge_type").map_err(|e| g("edge.edge_type", e))?;
+                Ok(crate::models::ActionEdge {
+                    from_action: r.try_get("from_action").map_err(|e| g("edge.from", e))?,
+                    to_action: r.try_get("to_action").map_err(|e| g("edge.to", e))?,
+                    edge_type: crate::models::EdgeType::from_str(&et)
+                        .unwrap_or(crate::models::EdgeType::Sibling),
+                    created_at: r
+                        .try_get(crate::models::field_names::CREATED_AT)
+                        .map_err(|e| g("edge.created_at", e))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        let sql = format!(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions a WHERE {} \
+              ORDER BY a.priority DESC, a.created_at ASC LIMIT $2",
+            pg_frontier_where_tail()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(namespace)
+            .bind(lim)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_frontier", e))?;
+        rows.iter().map(pg_row_to_action).collect()
+    }
+
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let owner_clause = if agent_id.is_some() {
+            " AND (a.agent_id = $2 OR a.agent_id IS NULL)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT id, namespace, kind, state, title, payload, priority, agent_id, \
+                    claimed_by, vector_clock, metadata, created_at, updated_at \
+               FROM actions a WHERE {}{owner_clause} \
+              ORDER BY a.priority DESC, a.created_at ASC LIMIT 1",
+            pg_frontier_where_tail()
+        );
+        let mut q = sqlx::query(&sql).bind(namespace);
+        if let Some(a) = agent_id {
+            q = q.bind(a);
+        }
+        q.fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("action_next", e))?
+            .as_ref()
+            .map(pg_row_to_action)
+            .transpose()
+    }
+
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin lease_acquire tx", e))?;
+        let existing: Option<(String, i64)> =
+            sqlx::query_as("SELECT holder, expires_at FROM leases WHERE action_id = $1 FOR UPDATE")
+                .bind(action_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("lease_acquire select", e))?;
+        if let Some((h, exp)) = existing
+            && exp > now
+            && h != holder
+        {
+            return Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            });
+        }
+        sqlx::query(
+            "INSERT INTO leases (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+             VALUES ($1, $2, $3, $4, $3) \
+             ON CONFLICT (action_id) DO UPDATE SET holder = EXCLUDED.holder, \
+                acquired_at = EXCLUDED.acquired_at, expires_at = EXCLUDED.expires_at, \
+                heartbeat_at = EXCLUDED.heartbeat_at",
+        )
+        .bind(action_id)
+        .bind(holder)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("lease_acquire upsert", e))?;
+        let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("lease_acquire refetch", e))?;
+        let lease = pg_row_to_lease(&row)?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit lease_acquire", e))?;
+        Ok(lease)
+    }
+
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let n = sqlx::query(
+            "UPDATE leases SET expires_at = $1, heartbeat_at = $2 \
+              WHERE action_id = $3 AND holder = $4",
+        )
+        .bind(expires_at)
+        .bind(now)
+        .bind(action_id)
+        .bind(holder)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("lease_renew", e))?
+        .rows_affected();
+        if n == 0 {
+            return Err(StoreError::NotFound {
+                id: action_id.to_string(),
+            });
+        }
+        let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_renew refetch", e))?;
+        pg_row_to_lease(&row)
+    }
+
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        let n = sqlx::query("DELETE FROM leases WHERE action_id = $1 AND holder = $2")
+            .bind(action_id)
+            .bind(holder)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_release", e))?
+            .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        sqlx::query(PG_LEASE_SELECT_BY_ID)
+            .bind(action_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_get", e))?
+            .as_ref()
+            .map(pg_row_to_lease)
+            .transpose()
+    }
+
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let res = sqlx::query("DELETE FROM leases WHERE expires_at <= $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("lease_sweep_expired", e))?;
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+    }
+
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        signal: &crate::models::Signal,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
+        // #1709 Pillar 1 — JSON columns (body, reference_ids) stored as TEXT
+        // (parity with sqlite); signature/sender_pubkey are BYTEA. Mirror
+        // `link_signed`: sign a clone when a signing keypair is present, else
+        // persist verbatim (unsigned).
+        let (to_store, attest) = match keypair {
+            Some(kp) if kp.can_sign() => {
+                let mut signed = signal.clone();
+                crate::signals::sign_into(&mut signed, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("signal sign failed: {e:#}"),
+                    }
+                })?;
+                (signed, crate::models::AttestLevel::SelfSigned.as_str())
+            }
+            _ => (
+                signal.clone(),
+                crate::models::AttestLevel::Unsigned.as_str(),
+            ),
+        };
+        sqlx::query(
+            "INSERT INTO signals \
+                (id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                 in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                 delivered_at, read_at, acknowledged_at, signature, sender_pubkey) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+        )
+        .bind(&to_store.id)
+        .bind(&to_store.namespace)
+        .bind(&to_store.from_agent)
+        .bind(&to_store.to_agent)
+        .bind(&to_store.subject)
+        .bind(to_store.body.to_string())
+        .bind(to_store.signal_type.as_str())
+        .bind(&to_store.in_reply_to)
+        .bind(&to_store.correlation_id)
+        .bind(to_store.reference_ids.to_string())
+        .bind(to_store.created_at)
+        .bind(to_store.expires_at)
+        .bind(to_store.delivered_at)
+        .bind(to_store.read_at)
+        .bind(to_store.acknowledged_at)
+        .bind(&to_store.signature)
+        .bind(&to_store.sender_pubkey)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_send", e))?;
+        Ok(attest)
+    }
+
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        sqlx::query(PG_SIGNAL_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("signal_get", e))?
+            .as_ref()
+            .map(pg_row_to_signal)
+            .transpose()
+    }
+
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_agent: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                    in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                    delivered_at, read_at, acknowledged_at, signature, sender_pubkey \
+               FROM signals WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(agent) = to_agent {
+            qb.push(" AND (to_agent = ")
+                .push_bind(agent.to_string())
+                .push(" OR to_agent IS NULL)");
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(" ORDER BY created_at DESC LIMIT ").push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("signal_inbox", e))?;
+        rows.iter().map(pg_row_to_signal).collect()
+    }
+
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let rows = sqlx::query(
+            "SELECT id, namespace, from_agent, to_agent, subject, body, signal_type, \
+                    in_reply_to, correlation_id, reference_ids, created_at, expires_at, \
+                    delivered_at, read_at, acknowledged_at, signature, sender_pubkey \
+               FROM signals WHERE correlation_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(correlation_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_thread", e))?;
+        rows.iter().map(pg_row_to_signal).collect()
+    }
+
+    async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        let res = sqlx::query(
+            "UPDATE signals SET acknowledged_at = $1 WHERE id = $2 AND acknowledged_at IS NULL",
+        )
+        .bind(now)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("signal_ack", e))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns (condition, metadata) stored as TEXT
+        // (parity with sqlite); signature/resolver_pubkey are BYTEA, persisted
+        // verbatim (empty for an unattested checkpoint).
+        sqlx::query(
+            "INSERT INTO checkpoints \
+                (id, namespace, title, condition_type, condition, state, created_by, \
+                 resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                 created_at, deadline_at, resolved_at, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+        )
+        .bind(&cp.id)
+        .bind(&cp.namespace)
+        .bind(&cp.title)
+        .bind(cp.condition_type.as_str())
+        .bind(cp.condition.to_string())
+        .bind(cp.state.as_str())
+        .bind(&cp.created_by)
+        .bind(&cp.resolved_by)
+        .bind(&cp.resolution)
+        .bind(&cp.resolution_note)
+        .bind(&cp.signature)
+        .bind(&cp.resolver_pubkey)
+        .bind(cp.created_at)
+        .bind(cp.deadline_at)
+        .bind(cp.resolved_at)
+        .bind(cp.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("checkpoint_create", e))?;
+        Ok(cp.id.clone())
+    }
+
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        sqlx::query(PG_CHECKPOINT_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_get", e))?
+            .as_ref()
+            .map(pg_row_to_checkpoint)
+            .transpose()
+    }
+
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                    resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                    created_at, deadline_at, resolved_at, metadata \
+               FROM checkpoints WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_list", e))?;
+        rows.iter().map(pg_row_to_checkpoint).collect()
+    }
+
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        state: crate::models::CheckpointState,
+        resolved_by: &str,
+        resolution: Option<&str>,
+        resolution_note: Option<&str>,
+        resolved_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let row = sqlx::query(
+            "UPDATE checkpoints SET state = $1, resolved_by = $2, resolution = $3, \
+                resolution_note = $4, resolved_at = $5 WHERE id = $6 \
+             RETURNING id, namespace, title, condition_type, condition, state, created_by, \
+                       resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                       created_at, deadline_at, resolved_at, metadata",
+        )
+        .bind(state.as_str())
+        .bind(resolved_by)
+        .bind(resolution)
+        .bind(resolution_note)
+        .bind(resolved_at)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("checkpoint_resolve", e))?;
+        let Some(mut cp) = row.as_ref().map(pg_row_to_checkpoint).transpose()? else {
+            return Ok(None);
+        };
+        // Sign the resolved row's canonical RESOLUTION + persist the
+        // attestation columns when a signing keypair is supplied — mirroring
+        // the sqlite free-fn (`crate::checkpoints::resolve`) and the
+        // `signal_send` signed path.
+        if let Some(kp) = keypair {
+            if kp.can_sign() {
+                crate::checkpoints::sign_resolution_into(&mut cp, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("checkpoint resolution sign failed: {e:#}"),
+                    }
+                })?;
+                sqlx::query(
+                    "UPDATE checkpoints SET signature = $1, resolver_pubkey = $2 WHERE id = $3",
+                )
+                .bind(&cp.signature)
+                .bind(&cp.resolver_pubkey)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("checkpoint_resolve sign-persist", e))?;
+            }
+        }
+        Ok(Some(cp))
+    }
+
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        condition_type: Option<crate::models::ConditionType>,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                    resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                    created_at, deadline_at, resolved_at, metadata \
+               FROM checkpoints WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(ct) = condition_type {
+            qb.push(" AND condition_type = ")
+                .push_bind(ct.as_str().to_string());
+        }
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("checkpoint_query", e))?;
+        rows.iter().map(pg_row_to_checkpoint).collect()
+    }
+
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        // #1709 Pillar 1 — JSON columns (template, parameters, metadata)
+        // stored as TEXT (parity with sqlite); signature/signer_pubkey are
+        // BYTEA, persisted verbatim (empty for an unfrozen Draft routine).
+        sqlx::query(
+            "INSERT INTO routines \
+                (id, namespace, name, template, parameters, state, created_by, \
+                 created_at, frozen_at, signature, signer_pubkey, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(&r.id)
+        .bind(&r.namespace)
+        .bind(&r.name)
+        .bind(r.template.to_string())
+        .bind(r.parameters.to_string())
+        .bind(r.state.as_str())
+        .bind(&r.created_by)
+        .bind(r.created_at)
+        .bind(r.frozen_at)
+        .bind(&r.signature)
+        .bind(&r.signer_pubkey)
+        .bind(r.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_create", e))?;
+        Ok(r.id.clone())
+    }
+
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        sqlx::query(PG_ROUTINE_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_get", e))?
+            .as_ref()
+            .map(pg_row_to_routine)
+            .transpose()
+    }
+
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::RoutineState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, namespace, name, template, parameters, state, created_by, \
+                    created_at, frozen_at, signature, signer_pubkey, metadata \
+               FROM routines WHERE namespace = ",
+        );
+        qb.push_bind(namespace.to_string());
+        if let Some(st) = state {
+            qb.push(crate::checkpoints::SQL_AND_STATE_EQ)
+                .push_bind(st.as_str().to_string());
+        }
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::checkpoints::SQL_ORDER_BY_CREATED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_list", e))?;
+        rows.iter().map(pg_row_to_routine).collect()
+    }
+
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        frozen_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        // Only flip a Draft → Frozen (set frozen_at on the transition); an
+        // already-frozen routine keeps its original frozen_at. The UPDATE is a
+        // no-op on a frozen / missing row, so RETURNING yields no row in those
+        // cases — fall back to a by-id fetch so an already-frozen routine
+        // still returns Some (idempotent), and a truly-missing id → None.
+        let updated = sqlx::query(
+            "UPDATE routines SET state = $1, frozen_at = $2 \
+             WHERE id = $3 AND state = $4 \
+             RETURNING id, namespace, name, template, parameters, state, created_by, \
+                       created_at, frozen_at, signature, signer_pubkey, metadata",
+        )
+        .bind(crate::models::RoutineState::Frozen.as_str())
+        .bind(frozen_at)
+        .bind(id)
+        .bind(crate::models::RoutineState::Draft.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_freeze", e))?;
+        let frozen = match updated {
+            Some(row) => pg_row_to_routine(&row)?,
+            // No Draft row updated — either already frozen (return it) or
+            // absent (None). Disambiguate via a by-id fetch.
+            None => {
+                let Some(existing) = self.routine_get(_ctx, id).await? else {
+                    return Ok(None);
+                };
+                existing
+            }
+        };
+        // Sign the frozen template's FREEZE-ATTESTATION + persist the attestation
+        // columns when a signing keypair is supplied — done after the freeze
+        // UPDATE so the signable view reads the final frozen surface. Mirrors the
+        // sqlite free-fn (`crate::routines::routine_freeze`) signed path.
+        let mut frozen = frozen;
+        if let Some(kp) = keypair {
+            if kp.can_sign() {
+                crate::routines::sign_freeze_into(&mut frozen, kp).map_err(|e| {
+                    StoreError::IntegrityFailed {
+                        detail: format!("routine freeze sign failed: {e:#}"),
+                    }
+                })?;
+                sqlx::query("UPDATE routines SET signature = $1, signer_pubkey = $2 WHERE id = $3")
+                    .bind(&frozen.signature)
+                    .bind(&frozen.signer_pubkey)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("routine_freeze sign-persist", e))?;
+            }
+        }
+        Ok(Some(frozen))
+    }
+
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        sqlx::query(
+            "INSERT INTO routine_runs \
+                (id, routine_id, namespace, arguments, state, created_action_ids, \
+                 started_at, finished_at, error, metadata) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&run.id)
+        .bind(&run.routine_id)
+        .bind(&run.namespace)
+        .bind(run.arguments.to_string())
+        .bind(run.state.as_str())
+        .bind(run.created_action_ids.to_string())
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(&run.error)
+        .bind(run.metadata.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_run_create", e))?;
+        Ok(run.id.clone())
+    }
+
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        sqlx::query(PG_ROUTINE_RUN_SELECT_BY_ID)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_run_get", e))?
+            .as_ref()
+            .map(pg_row_to_routine_run)
+            .transpose()
+    }
+
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        routine_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, routine_id, namespace, arguments, state, created_action_ids, \
+                    started_at, finished_at, error, metadata \
+               FROM routine_runs WHERE routine_id = ",
+        );
+        qb.push_bind(routine_id.to_string());
+        let lim = i64::try_from(limit).unwrap_or(i64::MAX);
+        qb.push(crate::routines::SQL_ORDER_BY_STARTED_DESC_LIMIT)
+            .push_bind(lim);
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("routine_runs_for", e))?;
+        rows.iter().map(pg_row_to_routine_run).collect()
+    }
+
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        run_id: &str,
+        state: crate::models::RoutineRunState,
+        finished_at: Option<i64>,
+        created_action_ids: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        // COALESCE-style partial update: each optional column is overwritten
+        // only when the corresponding argument is `Some`, so a state-only
+        // advance never clobbers a previously-set column. RETURNING yields the
+        // updated row, or no row when the id is absent (→ None).
+        let action_ids_json = created_action_ids.map(std::string::ToString::to_string);
+        let row = sqlx::query(
+            "UPDATE routine_runs SET \
+                state = $1, \
+                finished_at = COALESCE($2, finished_at), \
+                created_action_ids = COALESCE($3, created_action_ids), \
+                error = COALESCE($4, error) \
+             WHERE id = $5 \
+             RETURNING id, routine_id, namespace, arguments, state, created_action_ids, \
+                       started_at, finished_at, error, metadata",
+        )
+        .bind(state.as_str())
+        .bind(finished_at)
+        .bind(action_ids_json)
+        .bind(error)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("routine_run_set_state", e))?;
+        row.as_ref().map(pg_row_to_routine_run).transpose()
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         // #1026 (CRITICAL, 2026-05-21): wrap archive-INSERT + live-DELETE
         // in a single transaction. Pre-#1026 each statement auto-committed
@@ -11735,7 +15269,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -11744,7 +15278,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 ON CONFLICT (id) DO UPDATE SET
@@ -11757,12 +15291,25 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("gc archive copy", e))?;
         }
 
-        let res =
-            sqlx::query("DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1")
-                .bind(now)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("gc delete", e))?;
+        // #1783 — RETURNING id so the TTL-evicted set is known for AGE
+        // unprojection in THIS tx. gc is the most common delete path; the
+        // v70 "don't snapshot auto-eviction" restore-rationale does NOT
+        // transfer to a SECONDARY query index — a gc-evicted memory still
+        // leaves a ghost :Memory node/edges that kg_query would return.
+        let evicted: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
+             RETURNING id",
+        )
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("gc delete", e))?;
+
+        if matches!(self.kg_backend, KgBackend::Age) {
+            for (id,) in &evicted {
+                unproject_memory_from_age(&mut tx, id).await?;
+            }
+        }
 
         tx.commit()
             .await
@@ -11776,7 +15323,132 @@ impl MemoryStore for PostgresStore {
         .execute(&self.pool)
         .await;
 
-        Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
+        Ok(evicted.len())
+    }
+
+    async fn size_gc(
+        &self,
+        namespace: &str,
+        max_corpus_bytes: i64,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        // v0.8.0 Pillar-2.5 (#1709) — corpus byte-cap eviction, the
+        // postgres twin of `crate::storage::size_gc`. Same metric
+        // (`SUM(length(title)+length(content)+length(metadata))` over the
+        // live rows in `namespace`), same lowest-value-first eviction
+        // order, same archive-before-delete restorability. Deterministic +
+        // LLM-free. A non-positive cap is a no-op.
+        if max_corpus_bytes <= 0 {
+            return Ok(0);
+        }
+
+        let mut corpus: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(\
+                 length(title) + length(content) + length(metadata::text)), 0)::bigint \
+             FROM memories WHERE namespace = $1",
+        )
+        .bind(namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("size_gc corpus sum", e))?;
+
+        if corpus <= max_corpus_bytes {
+            return Ok(0);
+        }
+
+        let mut evicted = 0usize;
+        while corpus > max_corpus_bytes {
+            // Lowest-value victim: least-durable tier first, then lowest
+            // priority / access_count / last_accessed_at. NULLS FIRST on
+            // last_accessed_at so never-accessed rows evict first.
+            let victim: Option<(String, i64)> = sqlx::query_as(
+                "SELECT id, \
+                     (length(title) + length(content) + length(metadata::text))::bigint \
+                 FROM memories WHERE namespace = $1 \
+                 ORDER BY CASE tier \
+                     WHEN 'short' THEN 0 WHEN 'mid' THEN 1 WHEN 'long' THEN 2 ELSE 3 END ASC, \
+                 priority ASC, access_count ASC, last_accessed_at ASC NULLS FIRST \
+                 LIMIT 1",
+            )
+            .bind(namespace)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("size_gc next victim", e))?;
+
+            let Some((id, row_bytes)) = victim else {
+                break;
+            };
+
+            // One transaction per victim: archive-INSERT + live-DELETE, the
+            // same atomicity contract `run_gc` holds per-#1026 so a crash
+            // mid-flow never leaves a row in both tables.
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("size_gc begin tx", e))?;
+
+            if archive {
+                sqlx::query(
+                    "INSERT INTO archived_memories (
+                        id, tier, namespace, title, content, tags, priority, confidence,
+                        source, access_count, created_at, updated_at, last_accessed_at,
+                        expires_at, archived_at, archive_reason, metadata,
+                        embedding, embedding_dim, original_tier, original_expires_at,
+                        reflection_depth, atomised_into, atom_of, memory_kind,
+                        entity_id, persona_version, citations, source_uri, source_span,
+                        confidence_source, confidence_signals, confidence_decayed_at,
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                    )
+                    SELECT id, tier, namespace, title, content, tags, priority, confidence,
+                           source, access_count, created_at, updated_at, last_accessed_at,
+                           expires_at, now(), 'size_gc', metadata,
+                           embedding, embedding_dim, tier, expires_at,
+                           reflection_depth, atomised_into, atom_of, memory_kind,
+                           entity_id, persona_version, citations, source_uri, source_span,
+                           confidence_source, confidence_signals, confidence_decayed_at,
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                    FROM memories
+                    WHERE id = $1
+                    ON CONFLICT (id) DO UPDATE SET
+                        archived_at = EXCLUDED.archived_at,
+                        archive_reason = EXCLUDED.archive_reason",
+                )
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("size_gc archive copy", e))?;
+            }
+
+            sqlx::query("DELETE FROM memories WHERE id = $1")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("size_gc delete victim", e))?;
+
+            // #1783 — remove the evicted victim's AGE projection in this tx.
+            if matches!(self.kg_backend, KgBackend::Age) {
+                unproject_memory_from_age(&mut tx, &id).await?;
+            }
+
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("size_gc commit", e))?;
+
+            evicted += 1;
+            corpus -= row_bytes;
+        }
+
+        // Best-effort cleanup of namespace_meta dangling references, same
+        // shape as run_gc's trailing sweep.
+        let _ = sqlx::query(
+            "DELETE FROM namespace_meta \
+             WHERE standard_id NOT IN (SELECT id FROM memories)",
+        )
+        .execute(&self.pool)
+        .await;
+
+        Ok(evicted)
     }
 
     async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
@@ -11835,7 +15507,7 @@ impl MemoryStore for PostgresStore {
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -11851,7 +15523,9 @@ impl MemoryStore for PostgresStore {
                    COALESCE(confidence_source, 'caller_provided'),
                    confidence_signals, confidence_decayed_at,
                    mentioned_entity_id,
-                   COALESCE(version, 1)
+                   COALESCE(version, 1),
+                   COALESCE(lifecycle_state, 'open'),
+                   encrypted_envelope
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
@@ -11860,7 +15534,35 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
 
-        sqlx::query("DELETE FROM archived_memories WHERE id = $1")
+        // #1771 (5-agent vote 4d3ea1c5) — re-insert this memory's preserved
+        // `archived_memory_links` edges back into `memory_links`, AFTER the
+        // memory row is restored above and within the same tx. Only edges
+        // whose BOTH endpoints currently exist in `memories` are restored —
+        // `memory_links` carries an `ON DELETE CASCADE` FK on both
+        // endpoints, so an edge whose OTHER endpoint is permanently gone
+        // would be rejected (and is correctly skipped here). Idempotent via
+        // the PK `ON CONFLICT`. Postgres twin of the SQLite
+        // `restore_links_for_memory` re-insert.
+        sqlx::query(
+            "INSERT INTO memory_links (
+                 source_id, target_id, relation, created_at, valid_from,
+                 valid_until, observed_by, signature, attest_level
+             )
+             SELECT aml.source_id, aml.target_id, aml.relation, aml.created_at,
+                    aml.valid_from, aml.valid_until, aml.observed_by,
+                    aml.signature, aml.attest_level
+             FROM archived_memory_links aml
+             WHERE (aml.source_id = $1 OR aml.target_id = $1)
+               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.source_id)
+               AND EXISTS (SELECT 1 FROM memories m WHERE m.id = aml.target_id)
+             ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive_restore restore links", e))?;
+
+        sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
             .bind(id)
             .execute(&mut *tx)
             .await
@@ -11987,7 +15689,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version
+                    mentioned_entity_id, version, encrypted_envelope
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -11996,7 +15698,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version
+                       mentioned_entity_id, version, encrypted_envelope
                 FROM memories WHERE id = $3
                 ON CONFLICT (id) DO UPDATE SET
                     archived_at = EXCLUDED.archived_at,
@@ -12008,6 +15710,28 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids insert", e))?;
+            // #1771 (5-agent vote 4d3ea1c5) — snapshot this memory's
+            // `memory_links` into `archived_memory_links` BEFORE the
+            // same-tx cascade delete reaps them (FK `ON DELETE CASCADE`).
+            // Postgres twin of the SQLite `archive_links_for_memory`
+            // snapshot wired into `archive_memory_no_tx`. Idempotent via
+            // the PK `ON CONFLICT`.
+            sqlx::query(
+                "INSERT INTO archived_memory_links (
+                     source_id, target_id, relation, created_at, valid_from,
+                     valid_until, observed_by, signature, attest_level, archived_at
+                 )
+                 SELECT ml.source_id, ml.target_id, ml.relation, ml.created_at,
+                        ml.valid_from, ml.valid_until, ml.observed_by,
+                        ml.signature, ml.attest_level, now()
+                 FROM memory_links ml
+                 WHERE ml.source_id = $1 OR ml.target_id = $1
+                 ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_by_ids snapshot links", e))?;
             sqlx::query(SQL_DELETE_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
@@ -12094,6 +15818,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         self.store(ctx, &mem).await
     }
@@ -12253,6 +15978,27 @@ impl MemoryStore for PostgresStore {
 
         match approver {
             crate::models::ApproverType::Human => {
+                // #1793 (5-agent vote 4d3ea1c5) — UNCONDITIONALLY harden the
+                // Human arm (the DEFAULT) on the postgres approval surface: the
+                // requester may not self-approve their own Human-gated action,
+                // and the approver must be a REGISTERED agent (mirroring the
+                // Consensus arm #216). Unlike the sqlite #1787 fix this is NOT
+                // opt-in-keyed: the postgres SAL is reachable only via the
+                // inherently multi-tenant HTTP daemon (MCP stdio is sqlite-only),
+                // where the process-wide AI_MEMORY_AGENT_ID the sqlite opt-in
+                // keys on is unset (so an opt-in gate would never fire) and the
+                // per-request X-Agent-Id approver is a distinct authenticated
+                // identity — there is no single-operator self-lock to avoid.
+                if approver_agent_id == pa.requested_by {
+                    return Ok(super::ApproveOutcome::Rejected(
+                        crate::errors::msg::SELF_APPROVAL_REFUSED.to_string(),
+                    ));
+                }
+                if !self.is_registered_agent(approver_agent_id).await? {
+                    return Ok(super::ApproveOutcome::Rejected(format!(
+                        "Human approver '{approver_agent_id}' is not a registered agent"
+                    )));
+                }
                 let ok = self
                     .pending_decide(ctx, pending_id, true, approver_agent_id)
                     .await?;
@@ -12553,7 +16299,7 @@ impl MemoryStore for PostgresStore {
             super::GovernedAction::Promote => crate::models::GovernedAction::Promote,
             super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
         };
-        let decision = match level {
+        let mut decision = match level {
             GovernanceLevel::Any => GovernanceDecision::Allow,
             GovernanceLevel::Registered => {
                 if registered_agent_check {
@@ -12606,6 +16352,27 @@ impl MemoryStore for PostgresStore {
                 }
             }
         };
+
+        // #1720 C — per-namespace `required_scope` (refuse-only, fail-closed).
+        // Mirrors the sqlite `enforce_governance` Store path via the shared
+        // `required_scope_refusal` helper so the semantics + message cannot
+        // drift between adapters. Only fires when the write-level decision was
+        // `Allow`; computed into `decision` BEFORE the Advisory/Enforce branch
+        // so advisory logs-and-allows and enforce blocks.
+        if matches!(action, super::GovernedAction::Store)
+            && matches!(decision, GovernanceDecision::Allow)
+            && let Some(required) = policy.core.required_scope
+            && let Some(refusal) = crate::governance::required_scope_refusal(
+                required,
+                payload,
+                model_action,
+                policy.core.write.clone(),
+                agent_id,
+                namespace,
+            )
+        {
+            decision = GovernanceDecision::Deny(refusal);
+        }
 
         if mode == PermissionsMode::Advisory {
             // Drop the tx (no writes); advisory mode is read-only.
@@ -12743,6 +16510,78 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("read (agent, namespace) agent_quotas row", e))?;
 
         row_to_quota_status(&row)
+    }
+
+    async fn check_memory_quota(
+        &self,
+        ctx: &CallerContext,
+        namespace: &str,
+        additional_count: i64,
+        additional_bytes: i64,
+    ) -> StoreResult<()> {
+        // #1795 (5-agent vote 4d3ea1c5) — the postgres tenant-handler quota
+        // enforcement seam. store/store_batch/consolidate only RECORD usage;
+        // this READ+compare runs in the 3 tenant handlers BEFORE the write.
+        // The charged principal is the caller's agent_id (the same id the
+        // record path stamps via resolve_quota_agent_id, since the tenant
+        // handlers stamp metadata.agent_id = caller). Empty/anonymous is
+        // uncharged, mirroring the sqlite handler's skip-on-empty.
+        let agent_id = ctx.agent_id.as_str();
+        if agent_id.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        // Day-rolled effective memory count: a stale-day row counts as 0,
+        // reusing the SAME `date_trunc('day', day_started_at) =
+        // date_trunc('day', $now)` idiom as `record_memory_quota_in_tx` (the
+        // single write-path day-roll source of truth). Storage bytes are
+        // cumulative (NOT day-rolled), matching the record fn.
+        let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+            "SELECT \
+                 CASE WHEN date_trunc('day', day_started_at) = date_trunc('day', $3) \
+                      THEN current_memories_today ELSE 0 END, \
+                 max_memories_per_day, \
+                 current_storage_bytes, \
+                 max_storage_bytes \
+             FROM agent_quotas WHERE agent_id = $1 AND namespace = $2",
+        )
+        .bind(agent_id)
+        .bind(namespace)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("check_memory_quota read agent_quotas", e))?;
+
+        // No row yet (first write for this agent+ns) → effective 0 against the
+        // compiled/operator defaults the record path would seed.
+        let (effective_memories, max_memories, current_bytes, max_bytes) = row.unwrap_or((
+            0,
+            quota_defaults().max_memories_per_day,
+            0,
+            quota_defaults().max_storage_bytes,
+        ));
+
+        if effective_memories.saturating_add(additional_count) > max_memories {
+            return Err(StoreError::QuotaExceeded {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: crate::quotas::QuotaLimit::MemoriesPerDay
+                    .as_str()
+                    .to_string(),
+                current: effective_memories,
+                max: max_memories,
+            });
+        }
+        if current_bytes.saturating_add(additional_bytes) > max_bytes {
+            return Err(StoreError::QuotaExceeded {
+                agent_id: agent_id.to_string(),
+                namespace: namespace.to_string(),
+                limit: crate::quotas::QuotaLimit::StorageBytes.as_str().to_string(),
+                current: current_bytes,
+                max: max_bytes,
+            });
+        }
+        Ok(())
     }
 
     async fn quota_status_list(&self) -> StoreResult<Vec<QuotaStatus>> {
@@ -13382,6 +17221,321 @@ impl MemoryStore for PostgresStore {
         Ok(one == 1)
     }
 
+    /// #1393 sub-unit 2 — see the trait doc. Postgres twin of the SQLite
+    /// path: one tx — `SELECT ... FOR UPDATE` the current kind, refuse
+    /// `reflection`/`persona` (mirror the upsert CASE), no-op when unchanged,
+    /// `UPDATE` kind + bump `version`, then append the `memory.reclassified`
+    /// `signed_event` in the SAME tx (the #1552 parity requirement).
+    async fn reclassify_memory_kind(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        let new_kind_str = new_kind.as_str();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("reclassify_memory_kind begin", e))?;
+        let old_kind: Option<String> =
+            sqlx::query_scalar("SELECT memory_kind FROM memories WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("reclassify_memory_kind select", e))?;
+        let Some(old_kind) = old_kind else {
+            return Ok(false);
+        };
+        if old_kind == crate::models::MemoryKind::Reflection.as_str()
+            || old_kind == crate::models::MemoryKind::Persona.as_str()
+            || old_kind == new_kind_str
+        {
+            return Ok(false);
+        }
+        let changed = sqlx::query(
+            "UPDATE memories SET memory_kind = $1, version = version + 1 \
+             WHERE id = $2 AND memory_kind NOT IN ('reflection', 'persona')",
+        )
+        .bind(new_kind_str)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("reclassify_memory_kind update", e))?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now();
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            "memory.reclassified".to_string(),
+            now.to_rfc3339(),
+        );
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("reclassify_memory_kind append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("reclassify_memory_kind commit", e))?;
+        Ok(true)
+    }
+
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit (postgres
+    /// twin of the sqlite [`crate::storage::undo_in_place_edit`]). Reads the
+    /// `archive_reason='in_place_edit'` snapshot (#1725, SAME id) and
+    /// re-applies its restorable fields to the live row through the inherent
+    /// [`Self::update_with_expected_version`] path — DELIBERATELY no raw
+    /// `DELETE` of the live row (a delete would cascade-reap the 15
+    /// `ON DELETE CASCADE` children). The apply auto-snapshots the CURRENT
+    /// content as a fresh `in_place_edit`, so undo is reversible (redo = undo
+    /// again).
+    ///
+    /// Dual-ownership fail-closed: when `ctx` resolves a non-bypass caller,
+    /// BOTH the live row's `metadata.agent_id` AND the snapshot's
+    /// `metadata.agent_id` must strict-equal it. Admin/operator
+    /// (`bypass_visibility`) skips the gate.
+    ///
+    /// `dry_run` returns the before/after diff with `applied=false`, writing
+    /// NOTHING. No `in_place_edit` snapshot → `applied=false`, before ==
+    /// after. DELIBERATELY does NOT restore `lifecycle_state` (the update
+    /// path doesn't set it; transitions are governed by #1726). CLI-ONLY by
+    /// deliberate security design (no MCP tool / HTTP route) — see the trait
+    /// doc.
+    async fn undo_in_place_edit(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        dry_run: bool,
+    ) -> StoreResult<crate::store::UndoOutcome> {
+        let caller: Option<&str> = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
+
+        // (a) Load the live row's version + title + content (decrypted) +
+        // owner. NotFound when absent.
+        let live_row: Option<(i64, String, String, serde_json::Value, Option<Vec<u8>>)> =
+            sqlx::query_as(
+                "SELECT version, title, content, metadata, encrypted_envelope \
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("undo: read live row", e))?;
+        let Some((live_version, live_title, live_content_raw, live_meta, live_env)) = live_row
+        else {
+            return Err(StoreError::NotFound { id: id.to_string() });
+        };
+        let live_owner = live_meta
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let live_content = match live_env {
+            None => live_content_raw,
+            Some(bytes) => crate::encryption::open_content(&bytes, live_owner).map_err(|e| {
+                StoreError::IntegrityFailed {
+                    detail: format!("undo: decrypt failed for live memory {id}: {e}"),
+                }
+            })?,
+        };
+
+        // (b) Read the in_place_edit snapshot, if any (content decrypted).
+        let snap_row: Option<(
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            i32,
+            f64,
+            Option<String>,
+            serde_json::Value,
+            Option<String>,
+            Option<Vec<u8>>,
+        )> = sqlx::query_as(
+            "SELECT title, content, tier, namespace, tags, priority, confidence, \
+                    expires_at::text, metadata, source_uri, encrypted_envelope \
+             FROM archived_memories \
+             WHERE id = $1 AND archive_reason = $2",
+        )
+        .bind(id)
+        .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("undo: read in_place_edit snapshot", e))?;
+
+        // (c) Dual-ownership fail-closed (BEFORE any write / diff return).
+        if let Some(caller) = caller {
+            if live_owner != caller {
+                return Err(StoreError::PermissionDenied {
+                    action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                    target: id.to_string(),
+                    reason: format!(
+                        "undo_in_place_edit denied: caller {caller} is not the owner of memory {id}"
+                    ),
+                });
+            }
+            if let Some(snap) = &snap_row {
+                let snap_owner = snap
+                    .8
+                    .get("agent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if snap_owner != caller {
+                    return Err(StoreError::PermissionDenied {
+                        action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                        target: id.to_string(),
+                        reason: format!(
+                            "undo_in_place_edit denied: caller {caller} is not the owner of the \
+                             in_place_edit snapshot for memory {id}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // (d) No snapshot → nothing to undo. before == after.
+        let Some((
+            snap_title,
+            snap_content_raw,
+            snap_tier,
+            snap_ns,
+            snap_tags_json,
+            snap_priority,
+            snap_confidence,
+            snap_expires_at,
+            snap_meta,
+            snap_source_uri,
+            snap_env,
+        )) = snap_row
+        else {
+            return Ok(crate::store::UndoOutcome {
+                applied: false,
+                id: id.to_string(),
+                before_version: live_version,
+                after_version: None,
+                before_title: live_title.clone(),
+                after_title: live_title,
+                before_content: live_content.clone(),
+                after_content: live_content,
+            });
+        };
+        let snap_owner = snap_meta
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let snap_content = match snap_env {
+            None => snap_content_raw,
+            Some(bytes) => crate::encryption::open_content(&bytes, snap_owner).map_err(|e| {
+                StoreError::IntegrityFailed {
+                    detail: format!("undo: decrypt failed for snapshot of memory {id}: {e}"),
+                }
+            })?,
+        };
+
+        // (e) Dry-run: return the diff, write NOTHING.
+        if dry_run {
+            return Ok(crate::store::UndoOutcome {
+                applied: false,
+                id: id.to_string(),
+                before_version: live_version,
+                after_version: None,
+                before_title: live_title,
+                after_title: snap_title,
+                before_content: live_content,
+                after_content: snap_content,
+            });
+        }
+
+        // (f) Apply via the inherent in-place update path (auto-snapshots the
+        // CURRENT content as a fresh in_place_edit → reversible). Pin
+        // expected_version so a concurrent writer can't be clobbered.
+        // DELIBERATELY does NOT pass lifecycle_state (see method doc).
+        let snap_tags: Vec<String> = serde_json::from_value(snap_tags_json).unwrap_or_default();
+        let patch = UpdatePatch {
+            title: Some(snap_title.clone()),
+            content: Some(snap_content.clone()),
+            tier: Tier::from_str(&snap_tier),
+            namespace: Some(snap_ns),
+            tags: Some(snap_tags),
+            priority: Some(snap_priority),
+            confidence: Some(snap_confidence),
+            metadata: Some(snap_meta),
+            source_uri: snap_source_uri,
+            expires_at: snap_expires_at,
+            lifecycle_state: None,
+        };
+        let after_version = self
+            .update_with_expected_version(ctx, id, patch, Some(live_version))
+            .await?;
+
+        // Append the destructive-update audit row, mirroring the postgres
+        // reclassify signed-event idiom.
+        let now = chrono::Utc::now();
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.undo_in_place_edit|{id}|{live_version}|{after_version}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            caller
+                .unwrap_or(crate::identity::sentinels::AI_OPERATOR)
+                .to_string(),
+            crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
+            now.to_rfc3339(),
+        );
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("undo: begin audit tx", e))?;
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("undo: append signed_event", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("undo: commit audit tx", e))?;
+
+        Ok(crate::store::UndoOutcome {
+            applied: true,
+            id: id.to_string(),
+            before_version: live_version,
+            after_version: Some(after_version),
+            before_title: live_title,
+            after_title: snap_title,
+            before_content: live_content,
+            after_content: snap_content,
+        })
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         // Mirrors the SQLite adapter's `db::stats` shape; postgres has
         // no on-disk file path so `db_size_bytes` reports the size of
@@ -13498,6 +17652,20 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("find_by_title_namespace", e))?;
         Ok(id)
+    }
+
+    async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
+        // Read the stored pgvector `embedding` column for `id`. The outer
+        // Option is "row exists?"; the inner is "embedding non-NULL?" (a
+        // keyword-tier / never-embedded / store-time-skipped row is NULL).
+        // Both collapse to `None`, matching SQLite's `db::get_embedding`.
+        let v: Option<Option<pgvector::Vector>> =
+            sqlx::query_scalar("SELECT embedding FROM memories WHERE id = $1 LIMIT 1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("get_embedding", e))?;
+        Ok(v.flatten().map(|vec| vec.to_vec()))
     }
 
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
@@ -13910,6 +18078,7 @@ impl MemoryStore for PostgresStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let written_id = self.store(ctx, &mem).await?;
         let created = prior.is_none();
@@ -15643,6 +19812,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -17877,23 +22047,120 @@ mod tests {
         let unique = uuid::Uuid::new_v4();
         let pid = format!("pending-{unique}");
         let ns = format!("fxc2b5-approve-{unique}");
+        // #1793 — the Human arm now refuses self-approval + unregistered
+        // approvers, so the action's requester and its approver must differ,
+        // and the approver must be a registered agent.
         sqlx::query(
             "INSERT INTO pending_actions \
              (id, action_type, namespace, memory_id, requested_by, payload, status, requested_at, approvals) \
-             VALUES ($1, 'store', $2, NULL, 'ai:sal-test', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
+             VALUES ($1, 'store', $2, NULL, 'ai:sal-requester', '{}'::jsonb, 'pending', NOW(), '[]'::jsonb)",
         )
         .bind(&pid)
         .bind(&ns)
         .execute(&store.pool)
         .await
         .expect("insert pending");
+        let approver = format!("ai:sal-approver-{unique}");
+        store
+            .register_agent(
+                &ctx,
+                &crate::models::AgentRegistration {
+                    agent_id: approver.clone(),
+                    agent_type: "nhi".to_string(),
+                    capabilities: vec!["read".to_string()],
+                    registered_at: chrono::Utc::now().to_rfc3339(),
+                    last_seen_at: chrono::Utc::now().to_rfc3339(),
+                },
+            )
+            .await
+            .expect("register approver");
         // approve_with_approver_type alias must produce the same outcome
         // as governance_approve_with_consensus for the Human approver
         // (no namespace policy ⇒ Human default).
         let outcome = store
-            .approve_with_approver_type(&ctx, &pid, "ai:sal-test")
+            .approve_with_approver_type(&ctx, &pid, &approver)
             .await
             .expect("approve_with_approver_type");
         assert!(matches!(outcome, crate::store::ApproveOutcome::Approved));
+    }
+
+    /// #1771 (5-agent vote 4d3ea1c5) — postgres parity for the SQLite
+    /// `archive_memory_then_restore_preserves_links_1771` test. Archiving a
+    /// memory via `archive_by_ids` snapshots its `memory_links` into
+    /// `archived_memory_links` BEFORE the cascade delete reaps them, and
+    /// `archive_restore` re-inserts every preserved edge whose both
+    /// endpoints exist. Gated on `AI_MEMORY_TEST_POSTGRES_URL`; skips
+    /// cleanly when unset so the default offline `cargo test` flow is
+    /// unaffected. CI's Postgres-gate sets the env and runs this for real.
+    #[tokio::test]
+    async fn archive_restore_preserves_links_pg_1771() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let unique = uuid::Uuid::new_v4();
+        let ns = format!("amlinks-1771-{unique}");
+        let a_id = format!("aml-a-{unique}");
+        let b_id = format!("aml-b-{unique}");
+        let a = sample_memory(&a_id, &ns, "aml-a", "edge endpoint a");
+        let b = sample_memory(&b_id, &ns, "aml-b", "edge endpoint b");
+        store.store(&ctx, &a).await.expect("store a");
+        store.store(&ctx, &b).await.expect("store b");
+
+        // Create the A -> B edge.
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+
+        // Sanity: A has the edge before archiving.
+        let before = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor before");
+        assert!(
+            before
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "A should have the A->B edge before archive"
+        );
+
+        // Archive A (explicit archive-by-id path) — the cascade delete
+        // reaps the edge from `memory_links`, but the snapshot must have
+        // preserved it into `archived_memory_links` in the same tx.
+        let moved = store
+            .archive_by_ids(&ctx, std::slice::from_ref(&a_id), Some("test-1771"))
+            .await
+            .expect("archive_by_ids");
+        assert_eq!(moved, 1, "exactly one memory archived");
+
+        // Restore A — the preserved edge must be re-inserted because both
+        // endpoints (A restored, B never archived) currently exist.
+        let restored = store
+            .archive_restore(&ctx, &a_id)
+            .await
+            .expect("archive_restore");
+        assert!(restored, "archive_restore must report success");
+
+        let after = store
+            .get_links_for_anchor(&a_id)
+            .await
+            .expect("get_links_for_anchor after");
+        assert!(
+            after
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "A->B edge must be preserved across archive_by_ids + archive_restore"
+        );
     }
 }

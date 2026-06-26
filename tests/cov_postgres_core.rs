@@ -78,6 +78,7 @@ fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     }
 }
 
@@ -210,6 +211,7 @@ async fn update_all_patch_fields() {
         source_uri: Some("doc:cov4".to_string()),
         expires_at: None,
         namespace: None,
+        lifecycle_state: None,
     };
     store.update(&ctx, &id, patch).await.expect("update");
     let got = store.get(&ctx, &id).await.unwrap();
@@ -267,6 +269,66 @@ async fn update_with_expected_version_conflict_and_success() {
 }
 
 #[tokio::test]
+async fn update_enforces_lifecycle_transition_1726() {
+    // #1726 — postgres twin of the sqlite `trait_update_threads_lifecycle_state_1726`
+    // test: the SAL `update` path must enforce the lifecycle transition
+    // machine via `patch.lifecycle_state`. Legal open→active persists; illegal
+    // open→done (skips active) is rejected with the typed
+    // `StoreError::InvalidTransition` (→ HTTP 409). Skips without a live pg.
+    use ai_memory::models::LifecycleState;
+    use ai_memory::store::MemoryStore;
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:cov4");
+    let ns = uid("cov-lc");
+
+    // Legal: open -> active.
+    let legal_id = uid("lc-legal");
+    store
+        .store(&ctx, &mem(&legal_id, &ns, "lc-legal", "lifecycle pg body"))
+        .await
+        .unwrap();
+    let legal = UpdatePatch {
+        lifecycle_state: Some(LifecycleState::Active),
+        ..UpdatePatch::default()
+    };
+    store
+        .update(&ctx, &legal_id, legal)
+        .await
+        .expect("open->active");
+    assert_eq!(
+        store.get(&ctx, &legal_id).await.unwrap().lifecycle_state,
+        LifecycleState::Active,
+        "a legal transition through the pg trait update path must persist"
+    );
+
+    // Illegal: open -> done on a fresh row.
+    let illegal_id = uid("lc-illegal");
+    store
+        .store(
+            &ctx,
+            &mem(&illegal_id, &ns, "lc-illegal", "lifecycle pg body two"),
+        )
+        .await
+        .unwrap();
+    let illegal = UpdatePatch {
+        lifecycle_state: Some(LifecycleState::Done),
+        ..UpdatePatch::default()
+    };
+    let res = store.update(&ctx, &illegal_id, illegal).await;
+    assert!(
+        matches!(res, Err(StoreError::InvalidTransition { .. })),
+        "open->done must be rejected with InvalidTransition, got: {res:?}"
+    );
+    assert_eq!(
+        store.get(&ctx, &illegal_id).await.unwrap().lifecycle_state,
+        LifecycleState::Open,
+        "a rejected transition must leave the pg row untouched"
+    );
+}
+
+#[tokio::test]
 async fn delete_nonexistent_returns_not_found() {
     use ai_memory::store::MemoryStore;
     let Some(store) = connect().await else {
@@ -302,22 +364,16 @@ async fn list_by_namespace_prefix_groups_children() {
         .store(&ctx, &mem(&id_b, &child_b, "beta mem", "body"))
         .await
         .unwrap();
-    // Bounded read-retry: under `--test-threads=2` against a shared
-    // persistent DB the sqlx pool can momentarily lag a just-committed
-    // write; the uuid-unique root means only these two children can ever
-    // match, so retry until both appear (or give up after a few tries
-    // and let the assertion fail loudly).
-    let mut listed = Vec::new();
-    for _ in 0..5 {
-        listed = store
-            .list_by_namespace_prefix(&ctx, &root, 50)
-            .await
-            .expect("prefix list");
-        if listed.iter().any(|m| m.id == id_a) && listed.iter().any(|m| m.id == id_b) {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // `store()` commits synchronously (tx.commit().await before returning),
+    // so a single read sees both committed rows — no retry needed. (An
+    // earlier version retried on a read-after-write theory; the real cause of
+    // the historical flake was a collation bug in `list_by_namespace_prefix`
+    // — see `list_by_namespace_prefix_collation_boundary_pins_byte_range`
+    // below — now fixed at the query layer with `~>=~`/`~<~`.)
+    let listed = store
+        .list_by_namespace_prefix(&ctx, &root, 50)
+        .await
+        .expect("prefix list");
     assert!(
         listed.iter().any(|m| m.id == id_a),
         "prefix must surface child alpha"
@@ -325,6 +381,54 @@ async fn list_by_namespace_prefix_groups_children() {
     assert!(
         listed.iter().any(|m| m.id == id_b),
         "prefix must surface child beta"
+    );
+}
+
+/// v0.8.0 #1709 SHIP-HARDEN — DETERMINISTIC regression pin for the
+/// `list_by_namespace_prefix` collation bug. The root namespace's last byte
+/// is forced to `'9'`, whose byte-incremented upper bound is `':'`. Under a
+/// non-C (glibc `en_US.utf8`) database collation — the CI image + most stock
+/// postgres deployments — `<root>/alpha` collates AFTER `':'`, so the pre-fix
+/// `WHERE namespace >= $1 AND namespace < $2` predicate SILENTLY EXCLUDED the
+/// child (the production data-loss bug; intermittent in the random-uuid test
+/// above at ~1/16). The fix uses byte-ordered `~>=~`/`~<~`. This test fails on
+/// the pre-fix query on any non-C DB and passes on the fix regardless of
+/// collation, so it deterministically pins the byte-range semantics.
+#[tokio::test]
+async fn list_by_namespace_prefix_collation_boundary_pins_byte_range() {
+    use ai_memory::store::MemoryStore;
+    let Some(store) = connect().await else {
+        return;
+    };
+    let ctx = CallerContext::for_agent("ai:cov4");
+    // Unique, but last byte forced to '9' (upper bound ':' — the glibc
+    // punctuation-reweight boundary that drops `/alpha` under linguistic
+    // collation).
+    let root = format!("cov-coll-{}9", uuid::Uuid::new_v4().simple());
+    let child_a = format!("{root}/alpha");
+    let child_b = format!("{root}/beta");
+    let id_a = uid("c1");
+    let id_b = uid("c2");
+    store
+        .store(&ctx, &mem(&id_a, &child_a, "coll alpha", "body"))
+        .await
+        .unwrap();
+    store
+        .store(&ctx, &mem(&id_b, &child_b, "coll beta", "body"))
+        .await
+        .unwrap();
+    let listed = store
+        .list_by_namespace_prefix(&ctx, &root, 50)
+        .await
+        .expect("prefix list");
+    assert!(
+        listed.iter().any(|m| m.id == id_a),
+        "byte-range must surface `/alpha` even when the prefix ends in '9' \
+         under a non-C collation (collation-bug regression pin)"
+    );
+    assert!(
+        listed.iter().any(|m| m.id == id_b),
+        "byte-range must surface `/beta` for a '9'-terminated prefix"
     );
 }
 
@@ -579,4 +683,320 @@ async fn export_memories_and_links_and_verify() {
 
     let report = store.verify(&ctx, &a).await.expect("verify");
     assert_eq!(report.memory_id, a);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// consolidate (#1747 slice-3c1) — the pg consolidate path the store-backed
+// curator ConsolidationPass depends on. Closes the cov_postgres_core
+// consolidate coverage hole flagged by the 5-agent vote (4d3ea1c5).
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn consolidate_merges_and_hard_deletes_sources() {
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-consolidate");
+    let ns = uid("cons-ns");
+    let a = uid("a");
+    let b = uid("b");
+    let dup = "kubernetes rolling canary deploy strategy notes pg consolidate";
+    store
+        .store(&ctx, &mem(&a, &ns, "t1", dup))
+        .await
+        .expect("store a");
+    store
+        .store(&ctx, &mem(&b, &ns, "t2", dup))
+        .await
+        .expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] pg",
+            "merged summary",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-consolidate",
+        )
+        .await
+        .expect("consolidate");
+
+    // The consolidated row exists; both sources were hard-deleted (get →
+    // NotFound). `MemoryStore::get` returns the row or errors, not an Option.
+    store
+        .get(&ctx, &new_id)
+        .await
+        .expect("consolidated row must exist");
+    assert!(
+        store.get(&ctx, &a).await.is_err(),
+        "source a hard-deleted (get → NotFound)"
+    );
+    assert!(
+        store.get(&ctx, &b).await.is_err(),
+        "source b hard-deleted (get → NotFound)"
+    );
+}
+
+/// #1784 — consolidation provenance (metadata.derived_from +
+/// consolidated_from_agents) must survive a later metadata-overwriting
+/// `update`. Pre-#1784 the postgres update CASE preserved only agent_id,
+/// so a patch that re-supplied `metadata` silently dropped the provenance
+/// pointer (which can't be reconstructed — the sources are hard-deleted).
+#[tokio::test]
+async fn consolidate_provenance_survives_metadata_update_pg_1784() {
+    use ai_memory::store::{CallerContext, MemoryStore, UpdatePatch};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-1784");
+    let ns = uid("prov-1784-ns");
+    let a = uid("a");
+    let b = uid("b");
+    store
+        .store(&ctx, &mem(&a, &ns, "p1", "prov src one 1784"))
+        .await
+        .expect("store a");
+    store
+        .store(&ctx, &mem(&b, &ns, "p2", "prov src two 1784"))
+        .await
+        .expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] prov 1784",
+            "merged",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-1784",
+        )
+        .await
+        .expect("consolidate");
+
+    // Provenance recorded on the consolidated row.
+    let got = store.get(&ctx, &new_id).await.expect("consolidated row");
+    let derived = got.metadata["derived_from"]
+        .as_array()
+        .expect("derived_from array");
+    assert!(
+        derived.iter().any(|v| v == &serde_json::json!(a))
+            && derived.iter().any(|v| v == &serde_json::json!(b)),
+        "derived_from carries both source ids: {:?}",
+        got.metadata
+    );
+    assert!(
+        got.metadata["consolidated_from_agents"]
+            .as_array()
+            .is_some_and(|x| !x.is_empty()),
+        "consolidated_from_agents present: {:?}",
+        got.metadata
+    );
+
+    // A metadata UPDATE that OMITS the provenance keys must NOT drop them.
+    let patch = UpdatePatch {
+        metadata: Some(serde_json::json!({ "note": "patched" })),
+        ..UpdatePatch::default()
+    };
+    store.update(&ctx, &new_id, patch).await.expect("update");
+
+    let after = store.get(&ctx, &new_id).await.expect("re-read");
+    assert_eq!(after.metadata["note"], "patched", "the patch key applied");
+    let derived_after = after.metadata["derived_from"]
+        .as_array()
+        .expect("#1784: derived_from must survive the metadata update");
+    assert!(
+        derived_after.iter().any(|v| v == &serde_json::json!(a))
+            && derived_after.iter().any(|v| v == &serde_json::json!(b)),
+        "#1784: derived_from survives the metadata update: {:?}",
+        after.metadata
+    );
+    assert!(
+        after.metadata["consolidated_from_agents"]
+            .as_array()
+            .is_some_and(|x| !x.is_empty()),
+        "#1784: consolidated_from_agents survives the update: {:?}",
+        after.metadata
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────
+// reverse_rollback_entry_store (#1748 slice-3c2) — postgres-backed
+// reversal of a consolidation: the store-backed `curator --rollback`
+// path. Postgres twin of the SQLite `reverse_consolidation_restores_
+// originals` / the autonomy `reverse_rollback_entry_store_*_sqlite`
+// unit tests. Decision provenance: 5-agent vote 4d3ea1c5 → Option B
+// (free async fn over &dyn MemoryStore; memory ed85b972).
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn reverse_rollback_restores_consolidated_sources_pg() {
+    use ai_memory::autonomy::{RollbackEntry, reverse_rollback_entry_store};
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let ctx = CallerContext::for_admin("ai:cov-rollback");
+    let ns = uid("rb-ns");
+    let a = uid("a");
+    let b = uid("b");
+    let dup = "kubernetes rolling canary deploy strategy notes pg rollback";
+    let mem_a = mem(&a, &ns, "rb-t1", dup);
+    let mem_b = mem(&b, &ns, "rb-t2", dup);
+    store.store(&ctx, &mem_a).await.expect("store a");
+    store.store(&ctx, &mem_b).await.expect("store b");
+
+    let new_id = store
+        .consolidate(
+            &ctx,
+            &[a.clone(), b.clone()],
+            "[consolidated] pg rollback",
+            "merged summary",
+            &ns,
+            &Tier::Mid,
+            "ai-memory curator (autonomy)",
+            "ai:cov-rollback",
+        )
+        .await
+        .expect("consolidate");
+
+    // Post-consolidation: summary present, both sources hard-deleted.
+    store.get(&ctx, &new_id).await.expect("summary present");
+    assert!(store.get(&ctx, &a).await.is_err(), "a gone pre-reverse");
+    assert!(store.get(&ctx, &b).await.is_err(), "b gone pre-reverse");
+
+    // Reverse through the SAL trait — what `--rollback --store-url
+    // postgres://…` now dispatches to (#1748).
+    let entry = RollbackEntry::Consolidate {
+        originals: vec![mem_a, mem_b],
+        result_id: new_id.clone(),
+    };
+    let applied = reverse_rollback_entry_store(&store, &ctx, &entry)
+        .await
+        .expect("reverse");
+    assert!(applied, "summary existed → reverse applied");
+
+    // Originals restored; summary removed.
+    store.get(&ctx, &a).await.expect("a restored");
+    store.get(&ctx, &b).await.expect("b restored");
+    assert!(
+        store.get(&ctx, &new_id).await.is_err(),
+        "consolidated summary removed after reverse"
+    );
+
+    // Idempotent: a second reverse is a no-op (summary already gone).
+    let again = reverse_rollback_entry_store(&store, &ctx, &entry)
+        .await
+        .expect("reverse again");
+    assert!(!again, "summary already removed → no-op");
+
+    // Cleanup.
+    let _ = store.delete(&ctx, &a).await;
+    let _ = store.delete(&ctx, &b).await;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// recover_turn_idempotent (#1693) — postgres L2 transcript-recovery
+// parity. Proves a postgres-backed daemon can rehydrate from host
+// transcripts (the gap #1693 closes): a turn writes a memory + dedup row
+// on first recovery, and a re-recovery is an idempotent no-op (dedup_hit,
+// no duplicate memory). The postgres twin of the sqlite recover path.
+// ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn recover_turn_idempotent_writes_then_dedups_pg() {
+    use ai_memory::models::RecoverTurnWrite;
+    use ai_memory::store::{CallerContext, MemoryStore};
+    let Some(store) = connect().await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    // `for_admin` (bypass_visibility) so the post-write `get` reads the row
+    // regardless of the `mem()` helper's hardcoded `agent_id` — this test
+    // validates the recover idempotency contract, not the visibility gate.
+    let ctx = CallerContext::for_admin("ai:cov-recover");
+    let ns = uid("rec-ns");
+    let mid = uid("rec-mem");
+    let norm_sha = format!("recnorm-{}", uuid::Uuid::new_v4()).into_bytes();
+    let raw_sha = format!("recraw-{}", uuid::Uuid::new_v4()).into_bytes();
+    let sid = uid("sess");
+
+    let write = RecoverTurnWrite {
+        memory: mem(
+            &mid,
+            &ns,
+            "L2 recovered user turn pg",
+            "operator directive recovered on pg",
+        ),
+        normalized_sha256: norm_sha.clone(),
+        raw_sha256: raw_sha.clone(),
+        host_kind: "claude-code".to_string(),
+        transcript_path: "/host/transcript.jsonl".to_string(),
+        host_session_id: Some(sid.clone()),
+        host_turn_index: Some(7),
+        recovered_at_ms: 1_700_000_000_000,
+    };
+
+    // First recovery → writes the memory + dedup row.
+    let r1 = store
+        .recover_turn_idempotent(&ctx, &write)
+        .await
+        .expect("first recover_turn");
+    assert!(!r1.dedup_hit, "first recovery is a fresh write");
+    store
+        .get(&ctx, &r1.memory_id)
+        .await
+        .expect("recovered memory exists");
+
+    // Re-recovery (same (sid,tix)) → idempotent no-op.
+    let r2 = store
+        .recover_turn_idempotent(&ctx, &write)
+        .await
+        .expect("second recover_turn");
+    assert!(
+        r2.dedup_hit,
+        "re-recovery dedups on (host_session_id, host_turn_index)"
+    );
+    assert_eq!(
+        r2.memory_id, r1.memory_id,
+        "same memory id returned, no duplicate"
+    );
+
+    // Sha-only dedup path: a write with no (sid,tix) but the same normalized
+    // sha must also dedup to the existing row.
+    let sha_only = RecoverTurnWrite {
+        memory: mem(
+            &uid("rec-mem2"),
+            &ns,
+            "L2 recovered user turn pg 2",
+            "different title same sha",
+        ),
+        normalized_sha256: norm_sha.clone(),
+        raw_sha256: raw_sha.clone(),
+        host_kind: "claude-code".to_string(),
+        transcript_path: "/host/transcript.jsonl".to_string(),
+        host_session_id: None,
+        host_turn_index: None,
+        recovered_at_ms: 1_700_000_000_001,
+    };
+    let r3 = store
+        .recover_turn_idempotent(&ctx, &sha_only)
+        .await
+        .expect("sha-only recover_turn");
+    assert!(
+        r3.dedup_hit,
+        "re-recovery dedups on content sha when (sid,tix) absent"
+    );
+    assert_eq!(r3.memory_id, r1.memory_id);
+
+    // Cleanup.
+    let _ = store.delete(&ctx, &r1.memory_id).await;
 }

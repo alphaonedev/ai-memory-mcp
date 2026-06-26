@@ -1,0 +1,11 @@
+# ai-memory PgBouncer auth template (v0.8.0 Pillar-4 4.B, #1736).
+#
+# Format: "<user>" "<md5-hash-or-plaintext>"
+# For auth_type=md5 the second field is: 'md5' + md5(password + username).
+# Generate without echoing the password into shell history, e.g.:
+#   PW=...; printf 'md5%s\n' "$(printf '%s%s' "$PW" ai_memory | md5sum | cut -d' ' -f1)"
+#
+# The smoke-test stack (docker-compose.yml) injects this from POSTGRES_PASSWORD;
+# in production, render this file from your secret store (mode 0400) — do NOT
+# commit a real credential. Replace the placeholder below.
+"ai_memory" "md5REPLACE_WITH_MD5_OF_PASSWORD_PLUS_USERNAME"

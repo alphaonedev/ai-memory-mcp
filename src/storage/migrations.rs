@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 57).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 70).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -37,6 +37,11 @@ pub(crate) const SELECT_SCHEMA_VERSION_SQL: &str =
 /// migration arms (one spelling; pm-v3.1 hardcoded-literal gate,
 /// #1558 wave 4).
 const PRAGMA_TABLE_INFO_MEMORIES: &str = "PRAGMA table_info(memories)";
+
+/// Column-existence probe for the `archived_memories` table — one
+/// spelling shared by the v49 / v63 / v64 archive-mirror migration
+/// arms (pm-v3.1 hardcoded-literal gate).
+const PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES: &str = "PRAGMA table_info(archived_memories)";
 
 /// Tracing target for the sqlite migration ladder (the
 /// `store::postgres` `TRACE_TARGET` precedent — one named const, no
@@ -149,7 +154,15 @@ CREATE TABLE IF NOT EXISTS memories (
     -- CONFLICT envelope when the stored value has drifted from the
     -- caller's expected. Legacy rows land at `version = 1` via the
     -- SQL DEFAULT clause; subsequent updates bump monotonically.
-    version               BIGINT NOT NULL DEFAULT 1
+    version               BIGINT NOT NULL DEFAULT 1,
+    -- v0.8.0 Pillar 2 (#1709, schema v64) — typed-cognition lifecycle
+    -- state. `open` for every legacy row (SQL DEFAULT) and every fresh
+    -- store that omits the field. Transitions
+    -- (open → active → blocked/done/abandoned) are enforced at the
+    -- write boundary by `models::LifecycleState::can_transition_to`,
+    -- not a SQL CHECK, so a future state needs no migration. Mirrors
+    -- `models::Memory::lifecycle_state`.
+    lifecycle_state       TEXT NOT NULL DEFAULT 'open'
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -238,9 +251,36 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- v23 RAISE-trigger validation to a column-level invariant. Closed
     -- taxonomy mirrors `crate::validate::VALID_RELATIONS`. v36 (WT-1-A)
     -- extended the closed set with `derives_from` for atomisation
-    -- provenance edges (atom -> parent).
-    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
+    -- provenance edges (atom -> parent). v63 (v0.8.0 Pillar-2 typed
+    -- cognition, #1709) extended it with `decomposes_into` / `depends_on`
+    -- / `advances` for the Goal/Plan/Step wiring relations.
+    CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
+
+-- v70 (#1771) — edge-preservation snapshot table. Mirrors memory_links
+-- columns but carries NO `REFERENCES memories(id)` FK (it is an archive
+-- table, like archived_memories itself) plus an `archived_at` stamp. The
+-- explicit/recovery-expected delete paths snapshot a memory's edges here
+-- BEFORE the cascade DELETE so restore can re-insert them. Also created by
+-- migration v70 for upgrading DBs; carried inline here so a fresh bootstrap
+-- that applies SCHEMA has it even before the ladder runs.
+CREATE TABLE IF NOT EXISTS archived_memory_links (
+    source_id    TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    relation     TEXT NOT NULL DEFAULT 'related_to',
+    created_at   TEXT NOT NULL,
+    valid_from   TEXT,
+    valid_until  TEXT,
+    observed_by  TEXT,
+    signature    BLOB,
+    attest_level TEXT,
+    archived_at  TEXT NOT NULL,
+    PRIMARY KEY (source_id, target_id, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
+    ON archived_memory_links(source_id);
+CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
+    ON archived_memory_links(target_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -596,6 +636,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 //       `idx_memories_expires` + USE TEMP B-TREE FOR ORDER BY
 //       (P1-measured 141 ms -> 0.06 ms at 100k rows). Pure additive
 //       CREATE INDEX IF NOT EXISTS — fully idempotent.
+//
+//   * v63 — #1709 (v0.8.0 Pillar-2 Typed Cognition). Extend the closed
+//       `memory_links.relation` CHECK taxonomy with `decomposes_into`
+//       (parent -> child structural), `depends_on` (sibling ordering /
+//       prerequisite), and `advances` (child -> ancestor progress) so
+//       the Goal/Plan/Step MemoryKind vocabulary can be wired into a
+//       typed plan graph. 6 -> 9 relations. SQLite has no column-level
+//       `ADD CONSTRAINT CHECK`, so this is a full-table-rebuild on
+//       `memory_links` (the same dance as v33's 0027 + v36's
+//       `MIGRATION_V36_REBUILD_LINKS_SQL`). The rebuild SQL
+//       (`0053_v63_memory_links_typed_cognition_relations.sql`) is
+//       gated behind an `existing_sql.contains('decomposes_into')`
+//       idempotency probe so fresh installs (the bootstrap SCHEMA ships
+//       the 9-relation CHECK inline) and replays skip it. Pre-existing
+//       link rows are preserved verbatim — the extension only widens
+//       the accepted set.
+//
+//   * v67 = #1720 A1 (v0.8.0 Workstream-A) — index `metadata.target_agent_id`
+//       so the A2 owner-keyed `private` visibility clause can resolve
+//       inbox/share rows via `agent_id_idx = ?caller OR
+//       target_agent_id_idx = ?caller` as a real two-column index
+//       lookup rather than a per-row json-extract scan. Mirrors the v14
+//       `agent_id_idx` precedent exactly: a probe-then-add VIRTUAL
+//       generated column (`json_extract(metadata, '$.target_agent_id')`
+//       guarded by `json_valid(metadata)`) plus
+//       `idx_memories_target_agent_id`. ADD COLUMN of a VIRTUAL
+//       generated column is in-place — it spends no row bytes and does
+//       NOT rebuild the table, so the `memories` CHECK triggers + every
+//       existing index survive. This unit ONLY adds the column + index;
+//       the visibility-predicate change itself is A2 (separate). Postgres
+//       twin (`migrate_v67`) uses a STORED generated column because
+//       Postgres has no VIRTUAL generated columns.
 /// Current schema tip — the single source of truth for the sqlite
 /// schema version. The literal lives HERE and nowhere else on the
 /// sqlite side; every migration arm/gate/stamp/meta entry references
@@ -603,7 +675,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 57;
+const CURRENT_SCHEMA_VERSION: i64 = 70;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1081,6 +1153,48 @@ const MIGRATION_V55_SQLITE: &str =
 // `CREATE INDEX IF NOT EXISTS` — fully idempotent + replay-safe.
 const MIGRATION_V56_SQLITE: &str =
     include_str!("../../migrations/sqlite/0047_v56_list_composite_indexes.sql");
+// v0.8.0 Pillar 1 (#1709) — coordination-substrate foundation tables
+// (actions / action_edges / leases). Additive CREATE TABLE/INDEX IF NOT
+// EXISTS — replay-safe.
+const MIGRATION_V59_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0049_v59_action_substrate.sql");
+// v0.8.0 Pillar 1 (#1709) — signed-signals storage foundation table
+// (`signals`). Additive CREATE TABLE/INDEX IF NOT EXISTS — replay-safe.
+const MIGRATION_V60_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0050_v60_signed_signals.sql");
+// v0.8.0 Pillar 1 (#1709) — attested-checkpoints storage foundation table
+// (`checkpoints`). Additive CREATE TABLE/INDEX IF NOT EXISTS — replay-safe.
+const MIGRATION_V61_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0051_v61_attested_checkpoints.sql");
+// v0.8.0 Pillar 1 (#1709) — routines storage foundation tables
+// (`routines` / `routine_runs`). Additive CREATE TABLE/INDEX IF NOT
+// EXISTS — replay-safe.
+const MIGRATION_V62_SQLITE: &str = include_str!("../../migrations/sqlite/0052_v62_routines.sql");
+// v0.8.0 Pillar 2 (#1709) — typed-cognition relation taxonomy extension.
+// Full-table-rebuild of `memory_links` adding `decomposes_into` /
+// `depends_on` / `advances` to the closed `relation` CHECK (6 -> 9).
+// Mirrors the v33 (0027) and v36 (MIGRATION_V36_REBUILD_LINKS_SQL)
+// rebuild dance exactly; the only delta is the extended CHECK clause.
+const MIGRATION_V63_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0053_v63_memory_links_typed_cognition_relations.sql");
+
+// v0.8.0 #1709 — RESTORE the memory_links (attest_level, signature)
+// atomicity triggers that the v63 (0053) memory_links full-table-rebuild
+// silently dropped (a SQLite `DROP TABLE` drops all attached triggers;
+// the v63 recreation block restored relation + attest_level but missed
+// the 0037 signature pair). Idempotent DROP IF EXISTS + CREATE; postgres
+// is unaffected (its #902 signature CHECK survived the in-place swap).
+const MIGRATION_V65_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0054_v65_restore_memory_links_signature_triggers.sql");
+
+// v0.8.0 §22 PE-5 (#697) — extend the governance_rules.severity CHECK
+// (refuse/warn/log → +escalate) for the Decision::Escalate verdict
+// primitive. Full-table rebuild (SQLite cannot ALTER a CHECK in
+// place); preserves all signed-rule rows + columns and recreates both
+// indexes. Postgres ships no governance_rules table, so its v66 arm is
+// a version-stamp no-op.
+const MIGRATION_V66_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0055_v66_governance_rules_escalate_severity.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2170,7 +2284,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let mut stmt = conn.prepare(PRAGMA_TABLE_INFO_MEMORIES)?;
             let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
             for col in cols {
-                if col?.as_str() == "encrypted_envelope" {
+                if col?.as_str() == field_names::ENCRYPTED_ENVELOPE {
                     has_envelope = true;
                 }
             }
@@ -2260,7 +2374,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // the v4 arm on the next replay, or by the operator's
             // baseline schema if they're using SCHEMA directly.
             let existing: std::collections::HashSet<String> = conn
-                .prepare("PRAGMA table_info(archived_memories)")?
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
                 .query_map([], |r| r.get::<_, String>(1))?
                 .collect::<rusqlite::Result<_>>()?;
             if existing.is_empty() {
@@ -2464,7 +2578,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // ladders (fresh v0 replay or any v4+ deployment) always
             // have the table.
             let has_archive_table: bool = conn
-                .prepare("PRAGMA table_info(archived_memories)")?
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
                 .query_map([], |r| r.get::<_, String>(1))?
                 .next()
                 .is_some();
@@ -2490,9 +2604,351 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         // is nothing to precompute on this backend — the per-matched-
         // row tsvector recompute the postgres arm eliminates never
         // existed here. No DDL; the unconditional stamp below records
-        // CURRENT_SCHEMA_VERSION (= 57) so the lockstep pin holds
-        // (the inverse of the v55 arm, where SQLite added an index and
-        // postgres stamped a no-op).
+        // CURRENT_SCHEMA_VERSION so the lockstep pin holds (the inverse
+        // of the v55 arm, where SQLite added an index and postgres
+        // stamped a no-op).
+
+        if version < 58 {
+            // v0.8.0 #1705 — recall_observations identity binding:
+            // additive nullable `agent_id` + `namespace` columns (+ their
+            // indexes) so the ledger SAL-parity work stamps the recalling
+            // agent + namespace and rejects cross-agent recall_id replay.
+            // SQLite has no `ADD COLUMN IF NOT EXISTS`, so probe each
+            // column for replay-safety; probe the table first because
+            // synthetic fixtures may stamp a version without replaying
+            // the 0038 table-create (the v56 archived_memories precedent).
+            let cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(recall_observations)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v58: recall_observations table absent (test fixture); \
+                     skipping identity columns"
+                );
+            } else {
+                if !cols.contains("agent_id") {
+                    conn.execute(
+                        "ALTER TABLE recall_observations ADD COLUMN agent_id TEXT",
+                        [],
+                    )?;
+                }
+                if !cols.contains("namespace") {
+                    conn.execute(
+                        "ALTER TABLE recall_observations ADD COLUMN namespace TEXT",
+                        [],
+                    )?;
+                }
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id \
+                     ON recall_observations(agent_id)",
+                    [],
+                )?;
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace \
+                     ON recall_observations(namespace)",
+                    [],
+                )?;
+            }
+        }
+
+        if version < 59 {
+            // v0.8.0 Pillar 1 (#1709) — distributed coordination substrate
+            // foundation: additive `actions` / `action_edges` / `leases`
+            // tables (state machine + typed DAG + lease/heartbeat). Pure
+            // `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
+            conn.execute_batch(MIGRATION_V59_SQLITE)?;
+        }
+
+        if version < 60 {
+            // v0.8.0 Pillar 1 (#1709) — signed-signals storage foundation:
+            // additive `signals` table (typed, Ed25519-signed inter-agent
+            // messages). Pure `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
+            conn.execute_batch(MIGRATION_V60_SQLITE)?;
+        }
+
+        if version < 61 {
+            // v0.8.0 Pillar 1 (#1709) — attested-checkpoints storage
+            // foundation: additive `checkpoints` table (conditional
+            // coordination gates with Ed25519-attested resolution). Pure
+            // `CREATE TABLE/INDEX IF NOT EXISTS` — replay-safe.
+            conn.execute_batch(MIGRATION_V61_SQLITE)?;
+        }
+
+        if version < 62 {
+            // v0.8.0 Pillar 1 (#1709) — routines storage foundation:
+            // additive `routines` / `routine_runs` tables (parameterised
+            // action+edge templates + their per-argument-binding
+            // materialisations). Pure `CREATE TABLE/INDEX IF NOT EXISTS`
+            // — replay-safe.
+            conn.execute_batch(MIGRATION_V62_SQLITE)?;
+        }
+
+        if version < 63 {
+            // v0.8.0 Pillar 2 (#1709) — typed-cognition relation
+            // taxonomy extension. Full-table-rebuild of `memory_links`
+            // adding `decomposes_into` / `depends_on` / `advances` to
+            // the closed `relation` CHECK clause (6 -> 9). SQLite has no
+            // `ALTER TABLE ADD CONSTRAINT CHECK` for a column-level
+            // CHECK, so we rebuild — the same dance as the v33 (0027)
+            // and v36 (`MIGRATION_V36_REBUILD_LINKS_SQL`) extensions.
+            //
+            // Idempotency probe: the rebuild runs only when
+            // `memory_links` exists AND its declared SQL does not yet
+            // carry the extended taxonomy. Fresh installs (the bootstrap
+            // SCHEMA already ships the 9-relation CHECK inline) and a
+            // previous run of this migration both leave the
+            // `decomposes_into` substring present, so the rebuild is
+            // skipped — mirrors the v36 `existing_sql.contains(...)`
+            // probe.
+            let memory_links_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'memory_links')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if memory_links_exists {
+                let existing_sql: String = conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_master \
+                         WHERE type = 'table' AND name = 'memory_links'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let needs_rebuild = !existing_sql
+                    .contains(crate::models::MemoryLinkRelation::DecomposesInto.as_str());
+                if needs_rebuild {
+                    // Full rebuild: table CHECK is still the pre-v63
+                    // 6-relation set. The migration SQL also drops the
+                    // stale v23 relation RAISE triggers (see below).
+                    conn.execute_batch(MIGRATION_V63_SQLITE)?;
+                } else {
+                    // Fresh install / replay: the table already carries
+                    // the 9-relation CHECK inline from the bootstrap
+                    // SCHEMA, so no rebuild is needed — BUT the legacy
+                    // v23 RAISE triggers (`memory_links_ck_relation_*`,
+                    // migration 0023) can still be present from the v23
+                    // ladder arm, and they enforce the OLD six-relation
+                    // set with a `RAISE(ABORT, ...)`. Left in place they
+                    // would refuse `decomposes_into` / `depends_on` /
+                    // `advances` even though the column CHECK admits
+                    // them. Drop them so the column-level CHECK is the
+                    // sole relation gate post-v63 (matches the rebuild
+                    // path, which drops them too).
+                    conn.execute_batch(
+                        "DROP TRIGGER IF EXISTS memory_links_ck_relation_ins; \
+                         DROP TRIGGER IF EXISTS memory_links_ck_relation_upd;",
+                    )?;
+                }
+            }
+        }
+
+        if version < 64 {
+            // v0.8.0 Pillar 2 (#1709) — typed-cognition `lifecycle_state`
+            // column on `memories` (and the `archived_memories` mirror so
+            // archive → restore is lossless for the full v0.8.0 shape).
+            // Additive `TEXT NOT NULL DEFAULT 'open'`; SQLite has no
+            // `ADD COLUMN IF NOT EXISTS`, so each ALTER is gated by a
+            // column-existence probe (the reflection_depth / memory_kind
+            // precedent) — fully idempotent + replay-safe.
+            let has_lifecycle_state = conn
+                .prepare("SELECT lifecycle_state FROM memories LIMIT 0")
+                .is_ok();
+            if !has_lifecycle_state {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'open'",
+                    [],
+                )?;
+            }
+            // archived_memories mirror — nullable so already-archived
+            // legacy rows stay valid (the v49 lossless-archive precedent).
+            // Defensive: skip when the table doesn't exist (test fixtures
+            // that stamp a version past v4 without applying the v4 CREATE).
+            let archived_cols: std::collections::HashSet<String> = conn
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if archived_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v64: archived_memories table does not exist (test fixture or \
+                     deployment-without-archive); skipping lifecycle_state mirror"
+                );
+            } else if !archived_cols.contains(field_names::LIFECYCLE_STATE) {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN lifecycle_state TEXT",
+                    [],
+                )?;
+            }
+        }
+
+        if version < 65 {
+            // v0.8.0 #1709 — restore the memory_links (attest_level,
+            // signature) atomicity triggers dropped by the v63 (0053)
+            // full-table-rebuild. Idempotent (DROP IF EXISTS + CREATE);
+            // bodies byte-identical to migration 0037. Closes the
+            // #810/#813 phantom-signed regression. Postgres unaffected —
+            // its #902 signature CHECK survived the in-place relation swap,
+            // so the postgres v65 arm is a version-stamp no-op.
+            conn.execute_batch(MIGRATION_V65_SQLITE)?;
+        }
+
+        if version < 66 {
+            // v66 = v0.8.0 §22 PE-5 (#697) — extend the
+            // governance_rules.severity CHECK (refuse/warn/log →
+            // +escalate) for the Decision::Escalate verdict primitive.
+            // Full-table rebuild (SQLite cannot ALTER a CHECK in
+            // place): create governance_rules_new with the widened
+            // CHECK + the same 11-column set, INSERT..SELECT every row
+            // explicitly (preserving the signed-rule signature +
+            // attest_level columns), DROP the old table, RENAME, then
+            // recreate BOTH indexes (idx_governance_rules_kind_enabled
+            // + idx_governance_rules_namespace). governance_rules has
+            // no triggers. Postgres ships no governance_rules table so
+            // its v66 arm is a version-stamp no-op.
+            //
+            // Guarded on table existence: `governance_rules` is
+            // migration-only (NOT in the bootstrap SCHEMA const), so a
+            // DB stamped past v30 that never actually ran the v30
+            // CREATE (e.g. a test seeded from SCHEMA then version-
+            // stamped, or a legacy snapshot) has no table to rebuild.
+            // The v30 arm creates it for every real upgrade / fresh-DB
+            // path before this arm runs; if it is genuinely absent the
+            // rebuild is correctly a no-op (no rows, hence no
+            // `escalate` value, to admit).
+            let has_governance_rules = conn
+                .prepare("SELECT 1 FROM governance_rules LIMIT 0")
+                .is_ok();
+            if has_governance_rules {
+                conn.execute_batch(MIGRATION_V66_SQLITE)?;
+            }
+        }
+
+        if version < 67 {
+            // v67 = #1720 A1 (v0.8.0 Workstream-A) — index
+            // `metadata.target_agent_id` for the A2 owner-keyed `private`
+            // visibility clause (`agent_id_idx = ?caller OR
+            // target_agent_id_idx = ?caller`). Mirrors the v14
+            // `agent_id_idx` arm exactly: a probe-then-add VIRTUAL
+            // generated column plus a conventional B-tree index.
+            //
+            // The expression is guarded by `json_valid(metadata)` so rows
+            // with legacy / corrupt metadata stay writable (SQLite
+            // evaluates generated-column expressions on every write that
+            // touches the source column, and an uncaught `json_extract`
+            // failure would turn every corrupt-row write into a
+            // constraint error). NULL on rows whose metadata omits
+            // `target_agent_id` (non-inbox / non-share rows).
+            //
+            // ADD COLUMN of a VIRTUAL generated column is IN-PLACE — it
+            // spends no row bytes and does NOT rebuild the table, so the
+            // `memories` CHECK triggers + every existing index survive.
+            // This unit ONLY adds the column + index; the
+            // visibility-predicate change itself is A2 (separate).
+            let has_target_agent_id_idx: bool = conn
+                .prepare("SELECT target_agent_id_idx FROM memories LIMIT 0")
+                .is_ok();
+            if !has_target_agent_id_idx {
+                conn.execute(
+                    "ALTER TABLE memories ADD COLUMN target_agent_id_idx TEXT \
+                     GENERATED ALWAYS AS (\
+                         CASE WHEN json_valid(metadata) \
+                         THEN json_extract(metadata, '$.target_agent_id') \
+                         ELSE NULL END\
+                     ) VIRTUAL",
+                    [],
+                )?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id \
+                 ON memories(target_agent_id_idx)",
+                [],
+            )?;
+        }
+
+        if version < 68 {
+            // v68 = #228 / #1728 (v0.8.0 encryption wire-up, Commit A) —
+            // mirror the `encrypted_envelope` column onto
+            // `archived_memories` so archiving an encrypted memory
+            // (in_place_edit / supersede / GC) carries the ciphertext
+            // envelope into the archive and archive → restore round-trips
+            // it losslessly (the v49 lossless-archive precedent). Without
+            // this, an archived encrypted row would retain only the
+            // `content` placeholder and the ciphertext would be
+            // permanently unrecoverable. Additive + nullable; this lands
+            // BEFORE encryption is wired into the write paths (Commit B),
+            // so in steady state today every value is NULL. Postgres
+            // mirrors via `migrate_v68`. Guarded on table existence
+            // (a test fixture may stamp a version without the v4 CREATE).
+            let archived_cols: std::collections::HashSet<String> = conn
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if archived_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v68: archived_memories table absent (test fixture / archive-less \
+                     deployment); skipping encrypted_envelope mirror"
+                );
+            } else if !archived_cols.contains(field_names::ENCRYPTED_ENVELOPE) {
+                conn.execute(
+                    "ALTER TABLE archived_memories ADD COLUMN encrypted_envelope BLOB",
+                    [],
+                )?;
+            }
+        }
+
+        // v69 (#1735, Pillar-4 4.C: kg_projection_outbox) is a SQLite NO-OP.
+        // The outbox backs the staggered AGE cold-path, and Apache AGE is
+        // Postgres-only — SQLite has no graph backend (find_paths always
+        // reads the relational recursive-CTE), so there is no projection to
+        // defer and no table to create here. Postgres applies it via
+        // `PostgresStore::migrate_v69`. The unconditional stamp below moves
+        // the SQLite schema to v69 so both adapters share the logical number.
+
+        if version < 70 {
+            // v70 = #1771 (v0.8.0, 5-agent vote 4d3ea1c5) — `archived_memory_links`
+            // edge-preservation snapshot table. archive-then-delete copies only
+            // the memory ROW into `archived_memories`; the same-tx cascade
+            // `DELETE FROM memories` reaps the row's `memory_links`
+            // (FK `ON DELETE CASCADE`), so a `restore_archived` brought the row
+            // back with an EMPTY edge graph. This table is the snapshot
+            // destination: the explicit/recovery-expected delete paths (`forget`,
+            // `forget_for_caller`, `archive_memory_no_tx`) copy the memory's
+            // edges here BEFORE the DELETE, and `restore_archived` /
+            // `restore_archived_for_caller` re-insert the preserved edges whose
+            // both endpoints still exist.
+            //
+            // PURE ADDITIVE `CREATE TABLE IF NOT EXISTS` — NO full-table rebuild.
+            // (A rebuild silently drops every trigger — the project's hard lesson,
+            // v63→v65.) Mirrors `memory_links` columns but carries NO
+            // `REFERENCES memories(id)` FK (it is an archive table, like
+            // `archived_memories` itself) plus an `archived_at` stamp. Also added
+            // inline to the bootstrap `SCHEMA` const so fresh DBs have it.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS archived_memory_links (
+                    source_id    TEXT NOT NULL,
+                    target_id    TEXT NOT NULL,
+                    relation     TEXT NOT NULL DEFAULT 'related_to',
+                    created_at   TEXT NOT NULL,
+                    valid_from   TEXT,
+                    valid_until  TEXT,
+                    observed_by  TEXT,
+                    signature    BLOB,
+                    attest_level TEXT,
+                    archived_at  TEXT NOT NULL,
+                    PRIMARY KEY (source_id, target_id, relation)
+                );
+                CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
+                    ON archived_memory_links(source_id);
+                CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
+                    ON archived_memory_links(target_id);",
+            )?;
+        }
 
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
@@ -2702,6 +3158,59 @@ mod tests {
     }
 
     #[test]
+    fn v67_target_agent_id_idx_projects_metadata_target_agent_id() {
+        // #1720 A1 — the v67 VIRTUAL generated column must project
+        // `metadata.target_agent_id` so the A2 owner-keyed `private`
+        // visibility clause can resolve inbox/share rows via the
+        // `idx_memories_target_agent_id` index. Verify on a fully
+        // migrated DB: a row WITH the key projects it; a row WITHOUT the
+        // key projects NULL (non-inbox / non-share rows).
+        let conn = fresh_db_via_migrate();
+
+        // Row carrying metadata.target_agent_id (an inbox / share row).
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, \
+             created_at, updated_at, metadata) \
+             VALUES ('m_inbox', 'short', 'ns', 'inbox_title', 'c', \
+             '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z', \
+             '{\"target_agent_id\":\"ai:bob\"}')",
+            [],
+        )
+        .expect("insert inbox row");
+
+        // Row with no target_agent_id key (an ordinary memory).
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, \
+             created_at, updated_at, metadata) \
+             VALUES ('m_plain', 'short', 'ns', 'plain_title', 'c', \
+             '2026-06-17T00:00:00Z', '2026-06-17T00:00:00Z', \
+             '{\"agent_id\":\"ai:alice\"}')",
+            [],
+        )
+        .expect("insert plain row");
+
+        // The generated column projects the key for the inbox row.
+        let projected: Option<String> = conn
+            .query_row(
+                "SELECT target_agent_id_idx FROM memories WHERE id = 'm_inbox'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("select target_agent_id_idx for inbox row");
+        assert_eq!(projected.as_deref(), Some("ai:bob"));
+
+        // The generated column is NULL for the row without the key.
+        let plain: Option<String> = conn
+            .query_row(
+                "SELECT target_agent_id_idx FROM memories WHERE id = 'm_plain'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("select target_agent_id_idx for plain row");
+        assert_eq!(plain, None);
+    }
+
+    #[test]
     fn current_schema_version_matches_module_docstring() {
         // v0.7.0 refactor PR-1 (#793) — schema-pins SSOT.
         //
@@ -2741,6 +3250,266 @@ mod tests {
             super::current_schema_version_for_tests(),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn v63_rebuild_preserves_links_and_accepts_typed_cognition_relations() {
+        // v0.8.0 Pillar-2 (#1709) — the load-bearing risk: the v63
+        // full-table-rebuild of `memory_links` must preserve every
+        // pre-existing row AND begin accepting the three typed-cognition
+        // relations. We build a pre-v63 (6-relation CHECK) `memory_links`
+        // table directly, seed two memories + a `related_to` link, stamp
+        // the DB at v62, then run the migrate ladder and assert:
+        //   (a) the seeded link survives the rebuild verbatim, and
+        //   (b) a fresh `decomposes_into` link inserts cleanly post-v63.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        // The full SCHEMA already ships the v63 (9-relation) memory_links
+        // shape, so drop it and recreate the pre-v63 form to exercise the
+        // rebuild rather than the idempotent skip path.
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+        conn.execute_batch(
+            "DROP TABLE memory_links;
+             CREATE TABLE memory_links (
+                 source_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 target_id    TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+                 relation     TEXT NOT NULL DEFAULT 'related_to',
+                 created_at   TEXT NOT NULL,
+                 valid_from   TEXT,
+                 valid_until  TEXT,
+                 observed_by  TEXT,
+                 signature    BLOB,
+                 attest_level TEXT,
+                 PRIMARY KEY (source_id, target_id, relation),
+                 CHECK (relation IN ('related_to', 'supersedes', 'contradicts',
+                                     'derived_from', 'reflects_on', 'derives_from'))
+             );",
+        )
+        .expect("recreate pre-v63 memory_links");
+
+        // Seed two memories so the FK-constrained link can reference them.
+        let now = "2026-06-16T00:00:00Z";
+        for (id, title) in [("src-1", "source"), ("tgt-1", "target")] {
+            conn.execute(
+                "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at) \
+                 VALUES (?1, 'long', 'v63-test', ?2, 'body', ?3, ?3)",
+                params![id, title, now],
+            )
+            .expect("seed memory");
+        }
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES ('src-1', 'tgt-1', 'related_to', ?1)",
+            params![now],
+        )
+        .expect("seed pre-v63 link");
+
+        // Stamp the DB at v62 so the migrate ladder runs the v63 arm.
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (62)", [])
+            .expect("stamp v62");
+
+        super::migrate(&conn).expect("migrate to v63 succeeds");
+
+        // (final) version reached the tip.
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) the pre-existing link survived the rebuild verbatim.
+        let surviving: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links \
+                 WHERE source_id = 'src-1' AND target_id = 'tgt-1' AND relation = 'related_to'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count surviving link");
+        assert_eq!(
+            surviving, 1,
+            "v63 rebuild must preserve the pre-existing related_to link"
+        );
+
+        // (b) a new decomposes_into link inserts cleanly under the
+        // extended CHECK.
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES ('src-1', 'tgt-1', ?1, ?2)",
+            params![
+                crate::models::MemoryLinkRelation::DecomposesInto.as_str(),
+                now
+            ],
+        )
+        .expect("decomposes_into link must insert cleanly post-v63");
+
+        // And the rebuild re-created the relation index the rebuild drops.
+        let rel_index_present: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_links_relation')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("probe idx_links_relation");
+        assert!(
+            rel_index_present,
+            "v63 rebuild must recreate idx_links_relation"
+        );
+    }
+
+    #[test]
+    fn v66_rebuild_preserves_governance_rules_and_accepts_escalate_severity() {
+        // §22 PE-5 (#697) — the load-bearing risk: the v66 full-table
+        // rebuild of `governance_rules` must preserve every
+        // pre-existing row + every column (including the OPERATOR-SIGNED
+        // signature + attest_level data — a dropped signed-rule row or
+        // column is a security regression), recreate BOTH indexes, AND
+        // begin accepting the new `escalate` severity. We build a
+        // pre-v66 (3-value severity CHECK) governance_rules table with
+        // its two indexes, seed a signed rule, stamp the DB at v65, run
+        // the migrate ladder, and assert:
+        //   (a) the seeded row survives the rebuild verbatim (all
+        //       columns, incl. signature + attest_level),
+        //   (b) the pre-v66 CHECK would have REJECTED 'escalate',
+        //   (c) post-v66 an 'escalate' row inserts cleanly,
+        //   (d) both indexes were recreated.
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(SCHEMA).expect("apply SCHEMA");
+
+        // The pre-v66 governance_rules shape (3-value severity CHECK).
+        conn.execute_batch(
+            "CREATE TABLE governance_rules (
+                 id            TEXT PRIMARY KEY,
+                 kind          TEXT NOT NULL,
+                 matcher       TEXT NOT NULL,
+                 severity      TEXT NOT NULL CHECK (severity IN ('refuse', 'warn', 'log')),
+                 reason        TEXT NOT NULL,
+                 namespace     TEXT NOT NULL DEFAULT '_global',
+                 created_by    TEXT NOT NULL,
+                 created_at    INTEGER NOT NULL,
+                 enabled       INTEGER NOT NULL DEFAULT 1,
+                 signature     BLOB,
+                 attest_level  TEXT NOT NULL DEFAULT 'unsigned'
+             );
+             CREATE INDEX idx_governance_rules_kind_enabled
+                 ON governance_rules (kind, enabled);
+             CREATE INDEX idx_governance_rules_namespace
+                 ON governance_rules (namespace);",
+        )
+        .expect("recreate pre-v66 governance_rules");
+
+        // (b) pre-v66 the CHECK must REJECT 'escalate'.
+        let pre_escalate = conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, created_by, created_at) \
+             VALUES ('E0', 'bash', '{}', 'escalate', 'x', 'test', 0)",
+            [],
+        );
+        assert!(
+            pre_escalate.is_err(),
+            "pre-v66 CHECK must reject the 'escalate' severity"
+        );
+
+        // Seed a signed operator rule (refuse severity + a 64-byte
+        // signature + operator_signed attest_level) to prove the
+        // rebuild preserves signed-rule security columns.
+        let sig = vec![0xABu8; 64];
+        conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, namespace, created_by, created_at, \
+              enabled, signature, attest_level) \
+             VALUES ('R001', 'filesystem_write', '{\"glob\":\"/tmp/**\"}', 'refuse', \
+                     'no /tmp', 'secure', 'operator', 42, 1, ?1, 'operator_signed')",
+            params![sig],
+        )
+        .expect("seed signed pre-v66 rule");
+
+        // Stamp at v65 so the migrate ladder runs the v66 arm.
+        conn.execute("DELETE FROM schema_version", [])
+            .expect("clear schema_version");
+        conn.execute("INSERT INTO schema_version (version) VALUES (65)", [])
+            .expect("stamp v65");
+
+        super::migrate(&conn).expect("migrate to v66 succeeds");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        // (a) the signed row survived verbatim — every column intact.
+        let (kind, matcher, severity, reason, namespace, created_by, created_at, enabled, attest): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT kind, matcher, severity, reason, namespace, created_by, created_at, \
+                        enabled, attest_level FROM governance_rules WHERE id = 'R001'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .expect("signed rule must survive the v66 rebuild");
+        assert_eq!(kind, "filesystem_write");
+        assert_eq!(matcher, "{\"glob\":\"/tmp/**\"}");
+        assert_eq!(severity, "refuse");
+        assert_eq!(reason, "no /tmp");
+        assert_eq!(namespace, "secure");
+        assert_eq!(created_by, "operator");
+        assert_eq!(created_at, 42);
+        assert_eq!(enabled, 1);
+        assert_eq!(attest, "operator_signed");
+
+        // The signature BLOB survived byte-for-byte.
+        let surviving_sig: Vec<u8> = conn
+            .query_row(
+                "SELECT signature FROM governance_rules WHERE id = 'R001'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("signature column must survive");
+        assert_eq!(
+            surviving_sig, sig,
+            "signed-rule signature must be preserved"
+        );
+
+        // (c) post-v66 an 'escalate' row inserts cleanly.
+        conn.execute(
+            "INSERT INTO governance_rules \
+             (id, kind, matcher, severity, reason, created_by, created_at) \
+             VALUES ('E001', 'bash', '{\"command_substring\":\"sudo\"}', 'escalate', \
+                     'human review', 'operator', 7)",
+            [],
+        )
+        .expect("'escalate' severity must insert cleanly post-v66");
+
+        // (d) both indexes were recreated by the rebuild.
+        for idx in [
+            "idx_governance_rules_kind_enabled",
+            "idx_governance_rules_namespace",
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'index' AND name = ?1)",
+                    params![idx],
+                    |r| r.get(0),
+                )
+                .expect("probe index");
+            assert!(present, "v66 rebuild must recreate {idx}");
+        }
     }
 
     #[test]
@@ -3410,6 +4179,12 @@ mod tests {
         assert!(index_exists(&conn, "idx_memories_list_order"));
         assert!(index_exists(&conn, "idx_memories_ns_list_order"));
         assert!(index_exists(&conn, "idx_archived_ns_archived_at"));
+        // v67 (#1720 A1) — target_agent_id_idx VIRTUAL generated column +
+        // its index. The legacy v1 schema has neither, so their presence
+        // here proves the v67 migration arm actually ran. Mirrors the v14
+        // agent_id_idx proof shape above.
+        assert!(column_exists(&conn, "memories", "target_agent_id_idx"));
+        assert!(index_exists(&conn, "idx_memories_target_agent_id"));
     }
 
     #[test]

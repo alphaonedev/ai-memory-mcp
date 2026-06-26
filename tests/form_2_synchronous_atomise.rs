@@ -198,6 +198,7 @@ fn make_policy(mode: Option<AutoAtomiseMode>, enable_legacy_flag: bool) -> Gover
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         atomisation: AtomisationPolicy {
             auto_atomise: if enable_legacy_flag { Some(true) } else { None },

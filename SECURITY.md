@@ -6,12 +6,33 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 
 | Version    | Supported |
 |------------|-----------|
+| v0.8.x     | ✅ Active  |
 | v0.7.x     | ✅ Active  |
 | v0.6.4     | ✅ Active (LTS through v1.0 ship) |
 | v0.6.3.1   | ⚠️  Security fixes only |
 | v0.6.3 and earlier | ❌ End of life |
 
 When v1.0 ships (Q2 2027), only the two most recent minor versions receive security fixes.
+
+## v0.8.0 secure-default changes (BREAKING) — operator action may be required
+
+v0.8.0 flips several defaults to fail-closed/secure postures. Operators upgrading from v0.7.x must review these:
+
+| Change | New default | Migration |
+|--------|-------------|-----------|
+| **#1794** `ai-memory sync` validates peer TLS certs | was accept-any → now CA-validated | pass `--ca-cert <pem>` for self-signed peers, or `--insecure-skip-server-verify` to opt out |
+| **#1789** Federation requires peer enrollment | unset is now strict (was permissive) | enroll peers, or set `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0` during rollout |
+| **#1780** `import`/`mine` default `--on-conflict version` | no more silent `(title,namespace)` clobber | pass `--on-conflict overwrite` to restore old behavior |
+| **#1774** Consolidation requires embeddings on both sides | prevents destructive Jaccard-only merges | ensure embedder configured before consolidating |
+| **#1734** Mandatory-hook presence enforcement | opt-in via `AI_MEMORY_HOOKS_ENFORCE_MODE=enforce` (+ `[hooks].required_events`) | default `off` = byte-unchanged; missing required hook → `503` only under `enforce` |
+| **#1796** HTTP Human-arm approval gate | self-approval + unregistered approver now **unconditionally** blocked on the HTTP surface | register a distinct approver; never self-approve Human-gated actions |
+| **#1718** Federated action-state transitions require an inner per-transition signature | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1` (fail-closed) | set `=0` for heterogeneous-rollout windows |
+
+**Known posture notes (by design — not vulnerabilities):**
+- **Store-path agent attestation is permissive by default** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → unsigned writes land `attest_level="claimed"`). A deprecation WARN ships now; the default flips to fail-closed in v0.9 (#1751). Multi-agent operators should set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` early. `metadata.agent_id` is a *claimed* identity — do not use it for authorization decisions without attestation.
+- **At-rest content encryption (#228)** is wired on both backends but **off by default** (verbatim plaintext); enable with `AI_MEMORY_ENCRYPT_AT_REST=1` on a sqlcipher build. It is fail-closed on read when enabled without a key.
+- **The curator daemon reads across all tenants** (`bypass_visibility`, admin-class) to perform background maintenance (reflect/consolidate/decay). Treat curator credentials as root-equivalent; it is C8-allowlist-gated in CI but is a privileged in-process actor.
+- **Namespace governance is allow-on-silence (#1569)**: a namespace with no configured standard defaults to `write/promote: Any`. `enforce` permissions mode does nothing until you install rules / namespace standards. Configure explicit standards for production / multi-tenant namespaces.
 
 ## Reporting a vulnerability
 
@@ -98,6 +119,7 @@ ai-memory uses:
 - **SHA-256** for payload hash chains (via the `sha2` crate)
 - **TLS 1.3** for federation transport (rustls)
 - **HMAC-SHA256** for subscription + approval API auth
+- **ChaCha20-Poly1305** (AEAD) + **X25519**/**HKDF** for at-rest content encryption (#228, opt-in via `AI_MEMORY_ENCRYPT_AT_REST`)
 
 Cryptographic protocol issues are HIGH severity at minimum. Implementation issues (timing leaks, side-channel, weak randomness) are also HIGH or CRITICAL severity.
 
@@ -107,4 +129,4 @@ Per [`ROADMAP.md`](ROADMAP.md) §15: ai-memory is Apache 2.0 forever. Security f
 
 ---
 
-Last updated: 2026-05-13.
+Last updated: 2026-06-24 (v0.8.0 secure-default changes + at-rest encryption crypto entry).

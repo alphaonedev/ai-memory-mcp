@@ -45,7 +45,7 @@ Run the HTTP daemon directly in the foreground:
 ai-memory --db /path/to/ai-memory.db serve
 ```
 
-The daemon listens on `127.0.0.1:9077` by default and exposes 89 HTTP route registrations (75 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The daemon listens on `127.0.0.1:9077` by default and exposes 91 HTTP route registrations (77 unique URL paths) (canonical count on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Systemd (Production HTTP Daemon)
 
@@ -139,7 +139,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
 | `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
-| `autonomous` | full 74-entry surface (v0.7.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
+| `autonomous` | full 100-entry surface (v0.8.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
 subcommands (`mcp`, `store`, `recall`, etc.):
@@ -632,11 +632,11 @@ profile is active.
 
 | Profile | Advertised tools | Use when |
 |---|---|---|
-| `core` (default) | **7 + bootstrap at v0.7.0** (the original 5 + `memory_load_family` + `memory_smart_load`) | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
+| `core` (default) | **7 + bootstrap at v0.8.0** (the original 5 + `memory_load_family` + `memory_smart_load`) | Eager-loading harnesses where every kilobyte of `tools/list` schema costs input tokens (Claude Desktop / Codex CLI / Grok CLI / Gemini CLI). |
 | `graph` | core + Graph family | Agents that walk `memory_link` / `memory_get_links` / `memory_kg_query` / `memory_find_paths` / `memory_verify` / `memory_replay` / the entity + taxonomy tools. |
 | `admin` | core + Lifecycle + Governance families | Operator sessions doing `memory_pending_*`, `memory_check_agent_action`, `memory_rule_list`, agent registration, lifecycle ops. |
 | `power` | core + Power family | Smart/autonomous tier deployments that want `memory_consolidate`, `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, `memory_check_duplicate`, `memory_inbox`, the subscription-reliability tools, etc. always available. |
-| `full` | every family — **74 advertised entries at v0.7.0** (73 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
+| `full` | every family — **100 advertised entries at v0.8.0** (99 callable memory tools + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)) | Pre-v0.6.4 behavior 1:1, plus v0.7/v0.8 additions. Canonical count asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. |
 
 **v0.7 core additions:** `memory_load_family(family)` and `memory_smart_load(intent)` live in the Core family, so every named profile (all of which include core) advertises them. They register additional families at runtime without restarting the MCP server — preferred over re-launching with a wider `--profile` for short-lived expansions. The pinned phrasings the agent sees for these recovery paths live in [`v0.7/canonical-phrasings.md`](v0.7/canonical-phrasings.md).
 
@@ -650,7 +650,7 @@ The `--profile` flag **must** be passed in the MCP args — `config.toml` has no
 
 ## Hooks (v0.7+)
 
-The hook pipeline (Track G of `attested-cortex`) adds **25 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
+The hook pipeline (Track G of `attested-cortex`) adds **27 lifecycle events** at every memory operation point, turning the substrate into a programmable extension surface. 20 baseline events (PreStore/PostStore/PreRecall/PostRecall/PreSearch/PostSearch/PreDelete/PostDelete/PrePromote/PostPromote/PreLink/PostLink/PreConsolidate/PostConsolidate/PreGovernanceDecision/PostGovernanceDecision/OnIndexEviction/PreArchive/PreTranscriptStore/PostTranscriptStore) plus 5 v0.7.0 additions (PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback) plus 2 v0.8.0 Pillar-1 #1709 additions (PreSignalSend, PostSignalAck). Authoritative enum: `src/hooks/events.rs::HookEvent`. Hooks are **default off** — a v0.7 install with no `~/.config/ai-memory/hooks.toml` behaves identically to v0.6.4.
 
 ```toml
 # ~/.config/ai-memory/hooks.toml
@@ -1023,8 +1023,8 @@ registration itself landed earlier as Task 1.3.
 1. Explicit caller value (`--agent-id`, MCP `agent_id` tool param, or
    `metadata.agent_id` embedded in an MCP store request)
 2. `AI_MEMORY_AGENT_ID` environment variable
-3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<hostname>:pid-<pid>`
-4. `host:<hostname>:pid-<pid>-<uuid8>` (stable for the process's lifetime)
+3. (MCP only) `initialize.clientInfo.name` → `ai:<client>@<hostname>` (durable, pid-free since #1720)
+4. `host:<hostname>` (durable host-scoped default, pid-free since #1720)
 5. `anonymous:pid-<pid>-<uuid8>` (only when hostname is unavailable)
 
 **HTTP daemon (request-scoped, no process-level default):**
@@ -1044,11 +1044,14 @@ through a **separate, narrower** ladder:
 1. `AI_MEMORY_AGENT_ID` environment variable (when set + shape-valid)
 2. `None` — trust-all, single-tenant read posture
 
-The pid-synthesized `ai:<client>@<host>:pid-<pid>` clientInfo identity is
-**deliberately NOT** used for the read-path visibility caller: it embeds
-the live PID, so it can never equal the `metadata.agent_id` an *earlier*
-process wrote, which would make every prior-session private row invisible
-to its own owner. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
+The synthesized `ai:<client>@<hostname>` / `host:<hostname>` clientInfo /
+host identities are **deliberately NOT** used for the read-path visibility
+caller: historically (pre-#1720 B1) they embedded the live PID, so they
+could never equal the `metadata.agent_id` an *earlier* process wrote, which
+would make every prior-session private row invisible to its own owner.
+#1720 B1 makes those *write*-side stamps durable + pid-free, but this read
+ladder still resolves the caller from `AI_MEMORY_AGENT_ID` only — durable
+stamps make a future enforced-read opt-in safe, they do not flip filtering on. When `AI_MEMORY_AGENT_ID` is set, the read tools drop
 cross-agent `scope=private` rows (rows owned by a different agent and not
 shared/targeted at the caller) before they reach the wire; collective and
 caller-owned rows always pass. When it is unset, the read path keeps the
@@ -1108,9 +1111,9 @@ These are written by the server; treat as read-only in queries:
 
 ### Operational warnings
 
-- **Default identities leak infrastructure.** When no explicit `agent_id` is
-  set, memories are stamped `host:<hostname>:pid-<pid>-<uuid8>`, exposing the
-  host's name and the running PID. For multi-tenant databases or any scenario
+- **Default identities expose the hostname.** When no explicit `agent_id` is
+  set, memories are stamped `host:<hostname>` (durable, pid-free since #1720),
+  exposing the host's name. For multi-tenant databases or any scenario
   where the DB is shared outside its origin host, require callers to set
   `AI_MEMORY_AGENT_ID` or `--agent-id` explicitly. See [#198] for tracked work
   on a config-level opt-out.
@@ -1174,7 +1177,7 @@ All write paths go through the validation layer (`validate.rs`):
 - Tags: max 50 tags, each max 128 bytes
 - Priority: 1-10
 - Confidence: 0.0-1.0, finite
-- Relations: whitelist — six at v0.7.0 (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from)
+- Relations: whitelist — nine at v0.8.0 (related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into, depends_on, advances)
 - IDs: max 128 bytes, no null bytes
 - Timestamps: valid RFC3339
 - TTL: positive, max 1 year
@@ -1358,7 +1361,7 @@ Both are cleaned up on graceful shutdown (the daemon runs `PRAGMA wal_checkpoint
 
 Maximum request body size: **2 MiB** (`HTTP_BODY_LIMIT_BYTES` in `src/lib.rs`).
 
-The HTTP daemon exposes **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
+The HTTP daemon exposes **91 production `.route(...)` registrations / 77 unique URL paths** at v0.8.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`. The table below lists the high-traffic surfaces — see [`docs/API_REFERENCE.md`](API_REFERENCE.md) for the complete enumeration):
 
 | Method | Path | Description |
 |--------|------|-------------|

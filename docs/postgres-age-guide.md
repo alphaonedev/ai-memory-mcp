@@ -1,4 +1,4 @@
-# PostgreSQL + Apache AGE operator guide (ai-memory v0.7.0)
+# PostgreSQL + Apache AGE operator guide (ai-memory v0.8.0)
 
 > **Audience.** Operators running `ai-memory` who want PostgreSQL as the
 > live storage backend, with Apache AGE for graph queries and pgvector
@@ -36,9 +36,10 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v57** as of v0.7.0
-(`CURRENT_SCHEMA_VERSION = 57` on both ladders) — every feature that
-works on sqlite works on postgres.
+The two backends have **schema parity at v70** as of v0.8.0
+(`CURRENT_SCHEMA_VERSION = 70` on both ladders — the postgres upgrade
+ladder ends at `migrate_v70()`) — every feature that works on sqlite
+works on postgres.
 
 ## Prerequisites
 
@@ -47,7 +48,7 @@ works on sqlite works on postgres.
 | PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
 | pgvector | **0.8.2** (canonical) | Faster HNSW. SSOT: `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
-| ai-memory | v0.7.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
+| ai-memory | v0.8.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 ### Bundled Dockerfile (Apache AGE + pgvector on PG18, #1065)
 
@@ -189,7 +190,8 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v57 as a side effect. The `vector` (pgvector) extension is
+   schema v70 (ending at `migrate_v70()`) as a side effect. The
+   `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
 2. If the `age` extension is installed, additionally bootstraps the
@@ -206,7 +208,7 @@ What it does (see `src/cli/schema_init.rs`):
    afterwards; `embedding_dim_migrated: true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 57`) or the `--json` report.
+   `schema_version: 70`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -624,7 +626,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v57 means `ai-memory migrate` sqlite → postgres
+Schema parity at v70 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both
@@ -680,13 +682,48 @@ is **not** at least 30% faster than CTE p95 on the canonical 1k-entity
 on the **same** postgres host — comparing AGE-on-postgres to
 CTE-on-sqlite is a different question and not the speedup we claim.
 
+### AGE projection mode (sync vs deferred) — #1735
+
+Postgres link writes project edges into the AGE `memory_graph` so Cypher
+traversals see them. `AI_MEMORY_AGE_PROJECTION_MODE` selects the posture
+(postgres-only; SQLite ignores it):
+
+- `sync` (default) runs the inline `project_link_into_age` Cypher MERGE
+  inside the link-write transaction — byte-identical to the
+  pre-#1735 behaviour.
+- `deferred` enqueues a `kg_projection_outbox` row (schema v69) in the
+  same transaction as the relational `memory_links` INSERT and skips the
+  inline MERGE; a cold drainer worker (spawned by `serve`, with a
+  drain-once boot-recovery pass plus an interval loop) projects the
+  pending rows into `memory_graph` out-of-band, taking the synchronous
+  AGE round-trips off the link-write hot path. Failed projections retry
+  up to `MAX_AGE_PROJECTION_ATTEMPTS` then quarantine.
+
+Under `deferred`, postgres `find_paths` routes through the
+always-current relational recursive-CTE so reads stay read-your-own-write
+correct during the projection window; `kg_query` / `kg_timeline` may
+observe a bounded staleness window until the drainer catches up.
+Observability: `ai_memory_age_projection_{pending_depth,failed_total,quarantined_total}`.
+Resolved via `AppConfig::resolve_storage()` (env > `[storage].age_projection_mode`
+> compiled `sync`).
+
 ### Connection pool
 
-The postgres adapter uses sqlx's connection pool. The v0.7.0 default
-is min=2, max=16, idle-timeout=10min. For high-fanout multi-tenant
-deployments, raise `max` to 32-64; for single-daemon deployments the
-defaults are appropriate. Pool size is exposed via `AI_MEMORY_PG_POOL_MAX`
-and `AI_MEMORY_PG_POOL_MIN` env vars.
+The postgres adapter uses sqlx's connection pool. The defaults are
+min=2, max=16, with a 30-second connection-acquire timeout. For
+high-fanout multi-tenant deployments, raise `max` to 32-64; for
+single-daemon deployments the defaults are appropriate. Pool sizing and
+the acquire timeout are exposed via three env vars (each resolved by
+`AppConfig::resolve_pg_pool()`, env > `[storage]`-adjacent config field
+> compiled default):
+
+| Env var | Default | Effect |
+|---|---|---|
+| `AI_MEMORY_PG_POOL_MAX` | `16` (`DEFAULT_MAX_CONNECTIONS`) | `PgPoolOptions::max_connections` ceiling |
+| `AI_MEMORY_PG_POOL_MIN` | `2` (`DEFAULT_MIN_CONNECTIONS`) | `PgPoolOptions::min_connections` warm floor |
+| `AI_MEMORY_PG_ACQUIRE_TIMEOUT_SECS` | `30` (`DEFAULT_ACQUIRE_TIMEOUT_SECS`) | `PgPoolOptions::acquire_timeout`, whole seconds |
+
+Non-positive / unparseable values fall through to the compiled default.
 
 ## Troubleshooting
 
@@ -703,8 +740,8 @@ bootstrap.
 ### Old postgres schema version detected
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
-run `ai-memory schema-init --store-url postgres://…` with the v0.7.0
-binary — opening the store applies the upgrade ladder to v57
+run `ai-memory schema-init --store-url postgres://…` with the v0.8.0
+binary — opening the store applies the upgrade ladder to v70
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 
@@ -743,7 +780,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v57 | v57 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v70 | v70 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |

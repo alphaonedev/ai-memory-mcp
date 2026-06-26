@@ -1,13 +1,19 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! v0.7.0 (issue #228) — E2E memory content encryption at rest.
+//! v0.7.0 (issue #228) — per-node at-rest memory content encryption.
 //!
-//! This module is the substrate primitive for end-to-end encryption of
-//! memory `content` columns at rest. It pairs a per-agent X25519 ECDH
-//! keypair with ChaCha20-Poly1305 AEAD encryption so a single recipient
-//! (an agent identified by `agent_id`) can decrypt content encrypted to
-//! its public key.
+//! This module is the substrate primitive for **per-node at-rest** encryption
+//! of memory `content` columns. It pairs a per-agent X25519 ECDH keypair with
+//! ChaCha20-Poly1305 AEAD encryption so a single recipient (an agent
+//! identified by `agent_id`) can decrypt content encrypted to its public key.
+//!
+//! **NOT end-to-end across federation (#1809):** the at-rest envelope is not a
+//! wire field — federation catch-up (`memories_updated_since`) decrypts
+//! `content` and the receiving peer re-seals under its own per-node key, so a
+//! federated peer holds plaintext transiently at apply time (the wire itself is
+//! TLS/mTLS-protected + enrolled-peer-gated). True cross-peer end-to-end
+//! encryption is a separate (v0.9) design — this primitive is per-node at-rest.
 //!
 //! ## Wire shape
 //!
@@ -33,11 +39,19 @@
 //!
 //! ## Key lifecycle
 //!
-//! Keypairs live in-memory only by default (per-process cache). A
-//! follow-up issue will add on-disk persistence under
-//! `[`crate::identity::keypair`]`-style files; today the in-memory
-//! cache is sufficient for the encrypt → store → recall → decrypt round
-//! trip exercised by `tests/encryption_at_rest.rs`.
+//! Each per-agent X25519 keypair is **persisted to disk** under the
+//! resolved key directory ([`crate::identity::keypair::default_key_dir`],
+//! honoring `AI_MEMORY_KEY_DIR`) as `<agent_id>.x25519.pub` (mode 0644)
+//! and `<agent_id>.x25519.priv` (mode 0600), mirroring the Ed25519
+//! signing keystore. [`get_or_create_keypair`] is therefore
+//! cache → load-from-disk → generate-and-save: the in-memory cache is a
+//! hot path, NOT the source of truth. This is load-bearing for at-rest
+//! encryption — without on-disk persistence a daemon restart would clear
+//! the cache and mint a fresh key, leaving every previously-encrypted
+//! `encrypted_envelope` permanently undecryptable (silent data loss).
+//! On Unix the `.priv` is refused at load time if its mode grants any
+//! group/other access (`mode & 0o077 != 0`), matching the keystore's
+//! S4-LOW1 guard.
 //!
 //! ## Activation
 //!
@@ -58,6 +72,8 @@ use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use x25519_dalek::{PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroize;
@@ -193,23 +209,157 @@ fn keypair_cache() -> &'static Mutex<HashMap<String, Keypair>> {
     &crate::runtime_context::RuntimeContext::global().keypair_cache
 }
 
-/// Look up the per-agent X25519 [`Keypair`], generating + caching it on
-/// first call. Subsequent calls for the same `agent_id` return clones
-/// of the cached entry, so plaintext encrypt + recall + decrypt within
-/// a single process always round-trips through the same recipient
-/// secret.
+/// On-disk filename suffix for the X25519 PUBLIC key (mode 0644).
+/// Distinct from the Ed25519 keystore's `.pub` so the two key systems
+/// never collide for the same `agent_id`.
+const X25519_PUB_SUFFIX: &str = ".x25519.pub";
+/// On-disk filename suffix for the X25519 SECRET key (mode 0600).
+const X25519_PRIV_SUFFIX: &str = ".x25519.priv";
+/// X25519 secret/public key length in bytes (both are 32).
+const X25519_KEY_LEN: usize = 32;
+
+/// Resolve the directory used to persist per-agent X25519 keypairs.
+/// Production resolves the platform key directory (honoring
+/// `AI_MEMORY_KEY_DIR`); test builds use a process-wide ephemeral
+/// tempdir so the unit suite never reads or writes the real key store.
+#[cfg(not(test))]
+fn keypair_persist_dir() -> Result<PathBuf> {
+    crate::identity::keypair::default_key_dir()
+}
+
+#[cfg(test)]
+fn keypair_persist_dir() -> Result<PathBuf> {
+    use std::sync::OnceLock;
+    static TEST_KEY_DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    Ok(TEST_KEY_DIR
+        .get_or_init(|| tempfile::tempdir().expect("create ephemeral x25519 test key dir"))
+        .path()
+        .to_path_buf())
+}
+
+/// `(pub_path, priv_path)` for `agent_id` under `dir`.
+fn x25519_key_paths(agent_id: &str, dir: &Path) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{agent_id}{X25519_PUB_SUFFIX}")),
+        dir.join(format!("{agent_id}{X25519_PRIV_SUFFIX}")),
+    )
+}
+
+/// Persist `kp` to `dir`: the public key at mode 0644 and the secret at
+/// mode 0600 (Unix), reusing the Ed25519 keystore's mode-aware writer.
+fn save_keypair_to_disk(kp: &Keypair, dir: &Path) -> Result<()> {
+    let (pub_path, priv_path) = x25519_key_paths(&kp.agent_id, dir);
+    crate::identity::keypair::ensure_parent(&pub_path)?;
+    crate::identity::keypair::ensure_parent(&priv_path)?;
+    crate::identity::keypair::write_with_mode(&pub_path, kp.public.as_bytes(), 0o644)
+        .with_context(|| format!("writing x25519 public key {}", pub_path.display()))?;
+    let mut secret_bytes = kp.secret.to_bytes();
+    let write_res = crate::identity::keypair::write_with_mode(&priv_path, &secret_bytes, 0o600)
+        .with_context(|| format!("writing x25519 private key {}", priv_path.display()));
+    secret_bytes.zeroize();
+    write_res
+}
+
+/// Load `agent_id`'s X25519 keypair from `dir`. Returns `Ok(None)` when
+/// no `.x25519.priv` exists yet (first run for this agent). On Unix a
+/// `.priv` whose mode grants group/other access is refused (mirrors the
+/// Ed25519 keystore's S4-LOW1 load-time guard) rather than silently used.
+fn load_keypair_from_disk(agent_id: &str, dir: &Path) -> Result<Option<Keypair>> {
+    let (_pub_path, priv_path) = x25519_key_paths(agent_id, dir);
+
+    // #1790 finding 2 — open the file ONCE, fstat the handle for the
+    // perms check, then read from the SAME handle. The pre-#1790 form did
+    // `fs::metadata(path)` then `fs::read(path)` — two path lookups, so the
+    // key file could be swapped in the window between the check and the
+    // read (TOCTOU). Opening once closes that re-open window; behaviour is
+    // otherwise unchanged (a missing `.priv` is still `Ok(None)`, an
+    // insecure mode is still refused).
+    let mut f = match fs::File::open(&priv_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(e))
+                .with_context(|| format!("reading x25519 private key {}", priv_path.display()));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat x25519 private key {}", priv_path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(anyhow!(
+                "x25519 private key {} has insecure mode {mode:o}; refusing to load. \
+                 Restore with: chmod 0600 {}",
+                priv_path.display(),
+                priv_path.display()
+            ));
+        }
+    }
+
+    let mut priv_bytes = Vec::new();
+    {
+        use std::io::Read;
+        f.read_to_end(&mut priv_bytes)
+            .with_context(|| format!("reading x25519 private key {}", priv_path.display()))?;
+    }
+    if priv_bytes.len() != X25519_KEY_LEN {
+        let actual = priv_bytes.len();
+        priv_bytes.zeroize();
+        return Err(anyhow!(
+            "x25519 private key {} has {actual} bytes, expected {X25519_KEY_LEN}",
+            priv_path.display()
+        ));
+    }
+    let mut arr = [0u8; X25519_KEY_LEN];
+    arr.copy_from_slice(&priv_bytes);
+    priv_bytes.zeroize();
+    let secret = StaticSecret::from(arr);
+    arr.zeroize();
+    // Derive the public key from the secret so a tampered/stale `.pub`
+    // file can never desynchronize the pair.
+    let public = PublicKey::from(&secret);
+    Ok(Some(Keypair {
+        agent_id: agent_id.to_string(),
+        public,
+        secret,
+    }))
+}
+
+/// Look up the per-agent X25519 [`Keypair`], resolving it from (in order)
+/// the in-memory cache, the on-disk keystore, or a freshly-generated and
+/// persisted pair. See the module-level "Key lifecycle" note: disk
+/// persistence is load-bearing so encrypted rows survive a restart.
 ///
 /// # Errors
-/// * Returns `Err` only when the internal mutex is poisoned (a callee
-///   panic in another thread while the lock was held). This is a
-///   process-fatal condition; callers may treat it as such.
+/// * The keypair cache mutex is poisoned (process-fatal).
+/// * The key directory cannot be resolved, or a disk read/write fails
+///   (fail-closed: the caller must NOT fall back to an unpersisted key).
 pub fn get_or_create_keypair(agent_id: &str) -> Result<Keypair> {
+    let dir =
+        keypair_persist_dir().context("resolving the key directory for x25519 keypair storage")?;
+    get_or_create_keypair_in(agent_id, &dir)
+}
+
+/// Directory-explicit core of [`get_or_create_keypair`]. Holds the cache
+/// lock across the load/generate/save so two threads racing on the same
+/// fresh `agent_id` cannot persist divergent keys.
+pub(crate) fn get_or_create_keypair_in(agent_id: &str, dir: &Path) -> Result<Keypair> {
     let cache = keypair_cache();
     let mut guard = cache
         .lock()
         .map_err(|e| anyhow!("encryption keypair cache mutex poisoned: {e}"))?;
     if let Some(kp) = guard.get(agent_id) {
         return Ok(kp.clone());
+    }
+    // Cache miss — prefer a persisted keypair so ciphertext written before
+    // a restart stays decryptable. Only mint + persist when none exists.
+    if let Some(kp) = load_keypair_from_disk(agent_id, dir)? {
+        guard.insert(agent_id.to_string(), kp.clone());
+        return Ok(kp);
     }
     let secret = StaticSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
@@ -218,6 +368,7 @@ pub fn get_or_create_keypair(agent_id: &str) -> Result<Keypair> {
         public,
         secret,
     };
+    save_keypair_to_disk(&kp, dir)?;
     guard.insert(agent_id.to_string(), kp.clone());
     Ok(kp)
 }
@@ -366,9 +517,118 @@ pub fn encryption_enabled(config_flag: Option<bool>) -> bool {
     )
 }
 
+/// #228 Commit B — seal a memory's plaintext content for at-rest storage.
+///
+/// Returns `Some((envelope_bytes, placeholder))` when at-rest encryption
+/// is enabled AND `content` is non-empty; `None` otherwise (the caller
+/// stores `content` verbatim and leaves `encrypted_envelope` NULL — the
+/// byte-identical default path). Content-only: title / tags / metadata
+/// stay plaintext and are NOT routed through here.
+///
+/// The returned `placeholder` is the empty string — the `content` column
+/// holds it while the ciphertext lives in `encrypted_envelope`. Reads
+/// recover the plaintext via [`open_content`], gated on envelope
+/// presence (never on [`encryption_enabled`]) so rows written while
+/// encryption was on remain readable after the flag is toggled off.
+///
+/// Fail-closed: keypair-resolution errors propagate, and an enabled gate
+/// over a memory with no `agent_id` to key encryption to is refused
+/// rather than silently storing plaintext.
+///
+/// # Errors
+/// * Returns `Err` when encryption is enabled, `content` is non-empty,
+///   but `agent_id` is empty — there is no recipient key to seal to.
+/// * Returns `Err` when the per-agent keypair cannot be
+///   resolved/persisted, or when the AEAD encrypt call fails.
+pub(crate) fn seal_content(content: &str, agent_id: &str) -> Result<Option<(Vec<u8>, String)>> {
+    if !encryption_enabled(None) || content.is_empty() {
+        return Ok(None);
+    }
+    if agent_id.is_empty() {
+        return Err(anyhow!(
+            "at-rest encryption enabled but memory has no agent_id to key encryption to (fail-closed)"
+        ));
+    }
+    let kp = get_or_create_keypair(agent_id)?;
+    let env = encrypt(content, &kp.public)?;
+    Ok(Some((env.to_bytes(), String::new())))
+}
+
+/// #228 Commit B — decrypt an at-rest envelope back to plaintext content.
+///
+/// Gated by the CALLER on envelope PRESENCE (a non-NULL
+/// `encrypted_envelope` BLOB / BYTEA), NOT on [`encryption_enabled`], so
+/// rows written while encryption was on stay readable after the flag is
+/// toggled off. The plaintext `content` column then carries the empty
+/// placeholder; the recovered value here is the source of truth.
+///
+/// # Errors
+/// * Returns `Err` when the envelope bytes don't parse (truncated /
+///   unknown version), or when AEAD authentication / decryption fails
+///   (tampered ciphertext, wrong recipient key, missing keypair). The
+///   caller maps this to a fail-closed read error — never substitutes
+///   the placeholder for the plaintext.
+pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<String> {
+    let env = Envelope::from_bytes(envelope_bytes)?;
+    let kp = get_or_create_keypair(agent_id)?;
+    decrypt(&env, &kp.secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clear the process-wide keypair cache to model a daemon restart:
+    /// the in-memory cache is gone and only the on-disk keys remain.
+    fn clear_keypair_cache() {
+        keypair_cache().lock().expect("cache lock").clear();
+    }
+
+    #[test]
+    fn decrypt_survives_keypair_cache_clear_via_disk_persistence() {
+        // #228 Part 1 — the per-agent X25519 keypair persists to disk, so
+        // clearing the cache (a modeled restart) still decrypts rows
+        // encrypted before the restart. Without persistence the cleared
+        // cache would mint a fresh key and every prior ciphertext would be
+        // permanently undecryptable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = "persist-restart-agent";
+        let kp1 = get_or_create_keypair_in(agent, dir.path()).expect("generate + persist");
+        let env = encrypt("survives a restart", &kp1.public).expect("encrypt");
+
+        clear_keypair_cache(); // modeled restart — cache gone
+
+        let kp2 = get_or_create_keypair_in(agent, dir.path()).expect("load from disk");
+        assert_eq!(
+            kp1.secret.to_bytes(),
+            kp2.secret.to_bytes(),
+            "#228: the keypair MUST round-trip from disk after a cache clear"
+        );
+        let recovered = decrypt(&env, &kp2.secret).expect("decrypt after restart");
+        assert_eq!(recovered, "survives a restart");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keypair_disk_load_refuses_world_readable_private_key() {
+        // #228 Part 1 — load-time mode-bit enforcement (Unix): a loosened
+        // `.x25519.priv` is refused, not silently used (mirrors the
+        // Ed25519 keystore's S4-LOW1 guard).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = "lax-mode-agent";
+        let _kp = get_or_create_keypair_in(agent, dir.path()).expect("persist");
+        clear_keypair_cache();
+        let priv_path = dir.path().join(format!("{agent}{X25519_PRIV_SUFFIX}"));
+        std::fs::set_permissions(&priv_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen priv mode");
+        let err = get_or_create_keypair_in(agent, dir.path())
+            .expect_err("a world-readable .priv must be refused");
+        assert!(
+            format!("{err}").contains("insecure mode"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn keypair_round_trip_returns_same_secret() {
@@ -521,5 +781,48 @@ mod tests {
         } else {
             unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
         }
+    }
+
+    // --- #228 Commit B — seal_content / open_content helpers ---
+
+    #[test]
+    fn seal_content_returns_none_when_encryption_disabled() {
+        // #228 Commit B — the default (encryption-off) path: seal_content
+        // is a no-op so the caller stores content verbatim with a NULL
+        // envelope (byte-identical to pre-wiring behaviour). This test is
+        // hermetic — it never sets the env var, relying on the default
+        // disabled gate. (The env-mutating `encryption_enabled_*` test
+        // restores the var, but to avoid cross-test ordering coupling we
+        // assert disabled-by-default explicitly when the var is unset.)
+        if encryption_enabled(None) {
+            // Another test left the var set in this process; skip rather
+            // than assert a false negative. The env-guarded integration
+            // suite (tests/encryption_at_rest.rs) covers the enabled path.
+            return;
+        }
+        let sealed = seal_content("plaintext content", "agent-seal-off").expect("seal");
+        assert!(
+            sealed.is_none(),
+            "encryption disabled => seal_content must return None (verbatim store)"
+        );
+    }
+
+    #[test]
+    fn open_content_round_trips_via_process_test_key() {
+        // #228 Commit B — open_content recovers the plaintext from an
+        // envelope sealed to the agent's per-process test keypair.
+        // open_content resolves the agent key through
+        // `get_or_create_keypair`, which in cfg(test) reads the
+        // process-wide ephemeral test key dir. To stay hermetic we:
+        //   1. populate the cache for the agent (first call mints+caches),
+        //   2. build the envelope with THAT keypair's public key,
+        //   3. assert open_content(bytes, agent) recovers the plaintext.
+        let agent = "open-content-roundtrip-agent";
+        let kp = get_or_create_keypair(agent).expect("seed keypair");
+        let plaintext = "round-trip via open_content — #228 Commit B";
+        let env = encrypt(plaintext, &kp.public).expect("encrypt");
+        let bytes = env.to_bytes();
+        let recovered = open_content(&bytes, agent).expect("open_content");
+        assert_eq!(recovered, plaintext);
     }
 }

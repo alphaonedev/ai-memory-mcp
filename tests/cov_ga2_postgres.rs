@@ -113,6 +113,7 @@ fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     }
 }
 
@@ -458,7 +459,7 @@ async fn recall_observation_insert_dedup_and_gc() {
     // First insert writes one row (the (recall_id, memory_id) pkey
     // collapses the two retriever rows into one ON CONFLICT DO NOTHING).
     let written = store
-        .recall_observation_insert(&recall_id, &candidates)
+        .recall_observation_insert(&recall_id, &candidates, None, None)
         .await
         .expect("recall_observation_insert");
     assert_eq!(
@@ -468,14 +469,14 @@ async fn recall_observation_insert_dedup_and_gc() {
 
     // Re-insert the same candidates → all conflict → zero new rows.
     let again = store
-        .recall_observation_insert(&recall_id, &candidates)
+        .recall_observation_insert(&recall_id, &candidates, None, None)
         .await
         .expect("recall_observation_insert idempotent");
     assert_eq!(again, 0, "re-insert is a full ON CONFLICT no-op");
 
     // Empty-candidate slice is an early-return no-op (no tx opened).
     let empty = store
-        .recall_observation_insert(&recall_id, &[])
+        .recall_observation_insert(&recall_id, &[], None, None)
         .await
         .expect("recall_observation_insert empty");
     assert_eq!(empty, 0);
@@ -750,8 +751,7 @@ async fn via_store_dispatcher_rejects_non_postgres_store() {
     }
     // Build a non-postgres trait object (the sqlite adapter) and confirm
     // the dispatcher refuses it rather than panicking on the downcast.
-    let tmp = std::env::temp_dir(); // unused; sqlite store uses an in-proc path
-    let _ = tmp;
+    // (No scratch dir needed — the sqlite store below uses an in-proc path.)
     // A fresh in-memory-equivalent sqlite store is the cheapest non-pg
     // MemoryStore. If construction is unavailable in this build, the
     // BackendUnavailable arm is still covered by the production handler

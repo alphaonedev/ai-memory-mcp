@@ -32,7 +32,8 @@ use crate::federation::signing as fed_signing;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::federation_receive::{
-    SyncPushBody, attribute_agent_for_quota, check_sender_clock_skew, next_utc_midnight,
+    ATTESTATION_TRACE_TARGET, SyncPushBody, apply_inbound_write_attestation,
+    check_sender_clock_skew, extract_peer_id, next_utc_midnight, resolve_inbound_attribution,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -41,7 +42,7 @@ use crate::validate;
 #[allow(clippy::too_many_lines)]
 pub(super) async fn sync_push_via_store(
     app: AppState,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: SyncPushBody,
 ) -> Response {
     if let Err(e) = validate::validate_agent_id(&body.sender_agent_id) {
@@ -73,6 +74,10 @@ pub(super) async fn sync_push_via_store(
         // #1566 / #1579 B1 — shipped-vector array, the largest
         // per-element payload on this surface (sqlite-twin parity).
         || body.embeddings.len() > cap
+        // #1718 — signals subcollection (sqlite-twin parity).
+        || body.signals.len() > cap
+        // #1718 — action_transitions subcollection (sqlite-twin parity).
+        || body.action_transitions.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -97,6 +102,14 @@ pub(super) async fn sync_push_via_store(
     // v0.7.0 S6-LOW2 — observability-only sender_clock skew detection
     // (parity with the sqlite path).
     check_sender_clock_skew(&body.sender_agent_id, &body);
+
+    // #1464 (v0.8.0, P0) — per-memory authorship gate inputs (parity with
+    // the sqlite path). The outer `sync_push` already verified the body
+    // signature (#791) + sender↔x-peer-id attestation (#238) before
+    // dispatching here, so the peer-id + allowlist are the authority for
+    // gating each row's claimed `metadata.agent_id`.
+    let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+    let attest_cfg = crate::federation::peer_attestation::PeerAttestationConfig::from_env();
 
     // #1566 / #1579 B1 — embed-once-replicate-vector + ack-after-commit
     // (sqlite-twin parity; see `federation_receive::sync_push`). The
@@ -143,21 +156,86 @@ pub(super) async fn sync_push_via_store(
         // the postgres path consults the same `app.db` connection the
         // sqlite path uses. F7 closure (#639) — federation receive
         // never bypasses the cap that the equivalent HTTP POST sees.
-        let attribute_agent = attribute_agent_for_quota(&body.sender_agent_id, mem);
-        let bytes_estimate =
-            i64::try_from(mem.title.len() + mem.content.len() + mem.metadata.to_string().len())
-                .unwrap_or(i64::MAX);
+        // #1464 (v0.8.0, P0) — build the row first, then gate its quota +
+        // ownership attribution (sqlite-twin parity). `resolve_governance_policy`
+        // is async on the store, so resolve it before taking the quota lock.
+        let local_cap = app
+            .store
+            .resolve_governance_policy(&mem.namespace)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::models::GovernancePolicy::default)
+            .effective_max_reflection_depth();
+        let mut to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
+            mem,
+            &body.sender_agent_id,
+            local_cap,
+        );
+        // #1464 — capture the originally-claimed author BEFORE attribution
+        // may rewrite it (sqlite-twin parity), so the content-attestation
+        // step can skip rows re-attributed to the sender.
+        let original_claim = to_insert
+            .metadata
+            .get(crate::META_KEY_AGENT_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let attribute_agent = resolve_inbound_attribution(
+            &mut to_insert,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        );
+        // #1464 (v0.8.0) — per-write CONTENT attestation (postgres twin of
+        // the sqlite receive path). Verify any presented
+        // `metadata.write_signature` against the attributed author's enrolled
+        // key → `agent_attested` vs `claimed`; reject forged, or (strict,
+        // opt-in) an unsigned honored third-party claim. The enrolled-key
+        // lookup resolves through the SAL `agent_pubkey` trait method so both
+        // backends behave identically.
+        let bound_pubkey = app
+            .store
+            .agent_pubkey(&attribute_agent)
+            .await
+            .ok()
+            .flatten();
+        if let Err(e) = apply_inbound_write_attestation(
+            &mut to_insert,
+            &attribute_agent,
+            &body.sender_agent_id,
+            original_claim.as_deref(),
+            bound_pubkey.as_deref(),
+            crate::federation::receive_auth::require_write_sig_enabled(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                memory_id = %to_insert.id,
+                attribute_agent = %attribute_agent,
+                sender = %body.sender_agent_id,
+                error = %e,
+                "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
+            );
+            skipped += 1;
+            continue;
+        }
+        let bytes_estimate = i64::try_from(
+            to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
+        )
+        .unwrap_or(i64::MAX);
         {
             let conn = app.db.lock().await;
             // v0.7.0 #1156 — charge against the per-namespace
             // accounting row on the postgres-receive path too.
-            match crate::quotas::check_and_record(
+            // #1544 — storage-bytes-only charge on the postgres receive
+            // path too (see federation_receive.rs for the full rationale:
+            // replication != authorship; the daily write-count charge
+            // caused a cross-tenant DoS + the 429 DLQ storm). 5-agent vote
+            // (memory 4d3ea1c5).
+            match crate::quotas::check_and_record_storage_only(
                 &conn.0,
                 &attribute_agent,
                 &mem.namespace,
-                crate::quotas::QuotaOp::Memory {
-                    bytes: bytes_estimate,
-                },
+                bytes_estimate,
             ) {
                 Ok(()) => {}
                 Err(crate::quotas::QuotaCheckError::Quota(q)) => {
@@ -208,33 +286,11 @@ pub(super) async fn sync_push_via_store(
                 }
             }
         }
-        // v0.7.0 L2-2 — reflection origin stamping (postgres parity).
-        //
-        // #961 (SAL boundary cleanup, 2026-05-21): pre-fix this branch
-        // used `GovernancePolicy::default().effective_max_reflection_depth()`
-        // because `resolve_governance_policy` was thought to be
-        // sqlite-only. As of Wave-3 the SAL trait method is wired on
-        // both `SqliteStore` (`src/store/sqlite.rs::687`) and
-        // `PostgresStore` (`src/store/postgres.rs::8795`), so we now
-        // honour operator-set per-namespace caps on inbound federation
-        // pushes the same way sqlite does in
-        // `federation_receive.rs::sync_push`. Best-effort: a backend
-        // error (`Err(_)`) or absent policy (`Ok(None)`) falls back to
-        // the compiled-in default so a transient backend hiccup doesn't
-        // refuse legitimate reflection-bearing pushes.
-        let local_cap = app
-            .store
-            .resolve_governance_policy(&mem.namespace)
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::models::GovernancePolicy::default)
-            .effective_max_reflection_depth();
-        let to_insert = crate::federation::reflection_bookkeeping::stamp_reflection_origin(
-            mem,
-            &body.sender_agent_id,
-            local_cap,
-        );
+        // (`local_cap`, `to_insert` + the #1464 attribution gate were
+        // resolved above the quota gate — honouring operator-set
+        // per-namespace reflection caps via the SAL `resolve_governance_policy`
+        // (both backends) and applying any per-memory re-attribution — so
+        // the exact persisted row is stored here.)
         match app.store.apply_remote_memory(&ctx, &to_insert).await {
             Ok(applied_id) => {
                 applied += 1;
@@ -310,14 +366,14 @@ pub(super) async fn sync_push_via_store(
                 {
                     let conn = app.db.lock().await;
                     // #1156 — refund on the same `(agent_id,
-                    // namespace)` row check_and_record incremented.
-                    let _ = crate::quotas::refund_op(
+                    // namespace)` row check_and_record_storage_only
+                    // incremented (#1544 — storage-bytes only; the daily
+                    // write-count is never charged on receive).
+                    let _ = crate::quotas::refund_storage_only(
                         &conn.0,
                         &attribute_agent,
                         &mem.namespace,
-                        crate::quotas::QuotaOp::Memory {
-                            bytes: bytes_estimate,
-                        },
+                        bytes_estimate,
                     );
                 }
                 tracing::warn!("sync_push: apply_remote_memory failed for {}: {e}", mem.id);
@@ -456,6 +512,169 @@ pub(super) async fn sync_push_via_store(
         + body.namespace_meta.len()
         + body.namespace_meta_clears.len();
 
+    // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
+    // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
+    // sqlite-twin parity. The #1544 storage-bytes quota lives on the SQLite
+    // metadata DB even on postgres-backed daemons (same as the memories loop
+    // above), so it is charged via `app.db` before the trait write.
+    let mut signals_applied = 0usize;
+    for sig in &body.signals {
+        if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let bytes = i64::try_from(sig.body.to_string().len()).unwrap_or(i64::MAX);
+        {
+            let lock = app.db.lock().await;
+            if let Err(e) = crate::quotas::check_and_record_storage_only(
+                &lock.0,
+                &sig.from_agent,
+                &sig.namespace,
+                bytes,
+            ) {
+                tracing::warn!(
+                    "sync_push(store): signal {} refused by storage quota: {e}",
+                    sig.id
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+        match app.store.apply_remote_signal(&ctx, sig).await {
+            Ok(_) => signals_applied += 1,
+            Err(crate::store::StoreError::InvalidInput { .. }) => {
+                tracing::warn!(
+                    "sync_push(store): signal {} refused (invalid signature)",
+                    sig.id
+                );
+                skipped += 1;
+            }
+            Err(e) => {
+                tracing::warn!("sync_push(store): signal apply failed for {}: {e}", sig.id);
+                skipped += 1;
+            }
+        }
+    }
+
+    // #1718 — action transitions round-trip via the SAL trait. FAIL-CLOSED
+    // authorization (sqlite-twin parity): each op is authorized against the
+    // attested actor's enrolled key + best-effort local lease before the atomic
+    // compare-and-swap on the expected `from_state`. No storage quota — a
+    // transition mutates existing action state, not net-new storage.
+    let mut action_transitions_applied = 0usize;
+    let require_tx_sig = crate::federation::receive_auth::require_transition_sig_enabled();
+    for op in &body.action_transitions {
+        if validate::validate_id(&op.action_id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let local = match app.store.action_get(&ctx, &op.action_id).await {
+            Ok(Some(a)) => a,
+            Ok(None) => {
+                noop += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sync_push(store): action get failed for {}: {e}",
+                    op.action_id
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        if body.dry_run {
+            noop += 1;
+            continue;
+        }
+        let enrolled = op
+            .claimed_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let lease_holder = app
+            .store
+            .lease_get(&ctx, &op.action_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|l| l.holder);
+        let signable = crate::identity::sign::SignableTransition {
+            action_id: &op.action_id,
+            namespace: &local.namespace,
+            from_state: op.from_state.as_str(),
+            to_state: op.to_state.as_str(),
+            claimed_by: op.claimed_by.as_deref(),
+            nonce: &op.nonce,
+            created_at: op.updated_at,
+        };
+        match crate::federation::receive_auth::authorize_remote_transition(
+            &signable,
+            &op.signature,
+            enrolled.as_ref(),
+            lease_holder.as_deref(),
+            require_tx_sig,
+        ) {
+            crate::federation::receive_auth::TransitionAuthz::Accept => {
+                // #1805 — per-transition nonce anti-replay (postgres twin of the
+                // sqlite federation_receive path). The signed transition nonce
+                // was never recorded; record it in the per-peer nonce cache and
+                // refuse a replay (a captured signed op re-wrapped in a fresh
+                // envelope replays through CAS on a cyclic/ABA edge). Empty
+                // nonce = unsigned op → not gated. Rides #1718 / 4d3ea1c5.
+                if !op.nonce.is_empty() {
+                    use base64::Engine as _;
+                    let nstr = base64::engine::general_purpose::STANDARD.encode(&op.nonce);
+                    if matches!(
+                        app.federation_nonce_cache
+                            .record_and_check(peer_header_owned.as_deref().unwrap_or(""), &nstr),
+                        crate::identity::replay::ReplayDecision::Replay
+                    ) {
+                        tracing::warn!(
+                            target: crate::federation::SIGNING_TRACE_TARGET,
+                            action_id = %op.action_id,
+                            "sync_push(store): replayed action-transition nonce refused (#1805)"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                }
+                match app
+                    .store
+                    .action_transition_cas(
+                        &ctx,
+                        &op.action_id,
+                        op.from_state,
+                        op.to_state,
+                        op.claimed_by.as_deref(),
+                        op.updated_at,
+                    )
+                    .await
+                {
+                    Ok(crate::actions::CasOutcome::Applied(_)) => action_transitions_applied += 1,
+                    Ok(_) => noop += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push(store): action transition {} cas failed: {e}",
+                            op.action_id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    "sync_push(store): action transition {} refused ({verdict:?})",
+                    op.action_id
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // #1566 / #1579 B1 — ack-after-commit: the response (the sender's
     // quorum ack) returns now; rows still needing a locally-computed
     // vector are embedded by this detached task.
@@ -467,6 +686,8 @@ pub(super) async fn sync_push_via_store(
             "applied": applied,
             "deleted": deleted,
             "links_applied": links_applied,
+            "signals_applied": signals_applied,
+            "action_transitions_applied": action_transitions_applied,
             "noop": noop,
             "skipped": skipped,
             (crate::handlers::QUOTA_REFUSED_FIELD): quota_refused,
@@ -864,27 +1085,30 @@ pub(super) fn verify_signature_or_reject(
         }
         (None, None) => {
             // v0.7.0 #1088 (SR-1 #3, MEDIUM) — fail-CLOSED on
-            // unenrolled-peer attribution spoofing when the operator
-            // opts in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
-            // Default-off at v0.7.0 so existing zero-config peers keep
-            // working; v0.8 will flip the secure default. Companion
-            // env var to `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (the
-            // permissive escape hatch on the SAME arm post-#1056).
-            if require_peer_enrollment_enabled() {
+            // unenrolled-peer attribution spoofing. v0.8.0 #1789 flipped
+            // the secure default ON: enrollment is REQUIRED by default,
+            // and the companion escape hatch
+            // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` opens a rollout
+            // window that accepts unenrolled peers on this SAME arm.
+            // 5-agent vote (memory `4d3ea1c5`) fixed the flip.
+            if require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled() {
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
-                    "sync_push: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                    "sync_push: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
-                                     X-Peer-Id without an enrolled key (#1088). Enroll \
-                                     the peer's Ed25519 key via the operator workflow, \
-                                     or unset the env var to revert to permissive.",
+                            "note": "Federation requires peer enrollment by default at \
+                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
+                                     key is refused. Enroll the peer's key via the operator \
+                                     workflow, or set AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 \
+                                     to revert to v0.7.x permissive, OR set \
+                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
+                                     unenrolled peers during a rollout window.",
                         })),
                     )
                         .into_response(),
@@ -900,16 +1124,55 @@ pub(super) fn verify_signature_or_reject(
     }
 }
 
-/// v0.7.0 #1088 — `true` when the operator has opted into the
-/// stricter zero-config federation posture by setting
-/// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`. Returns `false`
-/// (default permissive) otherwise. Honored by both
+/// v0.8.0 #1789 — `true` when peer-enrollment is required (the v0.8
+/// **secure default**). UNSET — or any non-falsy value — returns `true`:
+/// federation refuses an `X-Peer-Id` without an enrolled Ed25519 key.
+/// An explicit falsy value (`0` / `false` / `no` / `off`, case-insensitive,
+/// trimmed) returns `false`, reverting to the v0.7.x permissive posture
+/// where unenrolled peers are accepted. Honored by both
 /// `verify_signature_or_reject` and `verify_get_signature_or_reject`
-/// so the `(None, None)` arm fails closed on both surfaces when the
-/// operator enables it.
+/// so the `(None, None)` arm fails closed on both surfaces by default.
+///
+/// History: at v0.7.0 (#1088) this defaulted OFF (permissive) and only
+/// `1`/`true` opted IN to strict enforcement. v0.8.0 (#1789) flipped the
+/// secure default ON; the companion escape hatch
+/// `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` (`allow_unenrolled_peers_enabled`)
+/// preserves a rollout opt-out. The 5-agent vote (memory `4d3ea1c5`)
+/// fixed this flip.
 fn require_peer_enrollment_enabled() -> bool {
-    std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    match std::env::var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT") {
+        Ok(v) => {
+            let t = v.trim();
+            // Explicit falsy values revert to v0.7.x permissive; everything
+            // else (including the truthy `1`/`true`/`yes`/`on` and any other
+            // non-empty string) keeps the v0.8 secure default ON.
+            !(t.eq_ignore_ascii_case("0")
+                || t.eq_ignore_ascii_case("false")
+                || t.eq_ignore_ascii_case("no")
+                || t.eq_ignore_ascii_case("off"))
+        }
+        // UNSET → secure default ON (#1789).
+        Err(_) => true,
+    }
+}
+
+/// v0.8.0 #1789 — companion permissive escape hatch (env #44).
+/// Returns `true` when `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS` is truthy
+/// (`1` / `true` / `yes` / `on`, case-insensitive, trimmed), `false`
+/// otherwise (the default). When enabled it accepts unenrolled peers on
+/// the `(None, None)` arm even though enrollment is required by the v0.8
+/// secure default — the rollout window opt-out so the #1789 flip is not a
+/// hard break with no escape. Honored by both `verify_signature_or_reject`
+/// and `verify_get_signature_or_reject`.
+fn allow_unenrolled_peers_enabled() -> bool {
+    std::env::var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS")
+        .map(|v| {
+            let t = v.trim();
+            t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        })
         .unwrap_or(false)
 }
 
@@ -1133,21 +1396,31 @@ pub(super) fn verify_get_signature_or_reject(
         }
         (None, None) => {
             // v0.7.0 #1088 — same fail-CLOSED arm as
-            // `verify_signature_or_reject`. Honors the operator
-            // opt-in via `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1`.
-            if require_peer_enrollment_enabled() {
+            // `verify_signature_or_reject`. v0.8.0 #1789 flipped the
+            // secure default ON: enrollment is REQUIRED by default, and
+            // the companion escape hatch
+            // `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` opens a rollout
+            // window that accepts unenrolled peers on this SAME arm.
+            // 5-agent vote (memory `4d3ea1c5`) fixed the flip.
+            if require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled() {
                 tracing::warn!(
                     target: crate::federation::SIGNING_TRACE_TARGET,
                     peer_id = %peer_id.unwrap_or(""),
-                    "sync_since: refusing unenrolled peer-id (AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 #1088)"
+                    "sync_since: refusing unenrolled peer-id (peer enrollment required, v0.8 secure default #1789)"
                 );
                 return Some(
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({
                             "error": "peer_not_enrolled",
-                            "note": "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1 refuses \
-                                     X-Peer-Id without an enrolled key on /sync/since (#1088).",
+                            "note": "Federation requires peer enrollment by default at \
+                                     v0.8 (#1789): X-Peer-Id without an enrolled Ed25519 \
+                                     key is refused on /sync/since. Enroll the peer's key \
+                                     via the operator workflow, or set \
+                                     AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0 to revert to \
+                                     v0.7.x permissive, OR set \
+                                     AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 to allow \
+                                     unenrolled peers during a rollout window.",
                         })),
                     )
                         .into_response(),
@@ -1196,8 +1469,8 @@ mod verify_arm_tests {
     //! with synthetic headers rather than going through the router.
 
     use super::{
-        canonical_get_bytes, require_peer_enrollment_enabled, verify_get_signature_or_reject,
-        verify_signature_or_reject,
+        allow_unenrolled_peers_enabled, canonical_get_bytes, require_peer_enrollment_enabled,
+        verify_get_signature_or_reject, verify_signature_or_reject,
     };
     use crate::federation::signing::{
         ED25519_PREFIX, REQUIRE_NONCE_ENV, REQUIRE_SIG_ENV, SIGNATURE_HEADER,
@@ -1206,12 +1479,13 @@ mod verify_arm_tests {
     use axum::http::{HeaderMap, HeaderValue};
     use base64::Engine as _;
 
+    // #1789 — delegate to the ONE crate-level `fed_env_test_lock` so the
+    // strict enrollment tests here serialise against the permissive
+    // opt-back guard the `tests` module's `http_sync_*` handler tests use.
+    // A second independent lock would not serialise the two test sets,
+    // letting a parallel run leak the flipped enrollment env across them.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::handlers::fed_env_test_lock()
     }
 
     fn sig_header_value() -> HeaderValue {
@@ -1232,10 +1506,15 @@ mod verify_arm_tests {
     fn require_peer_enrollment_env_arms() {
         let _g = env_lock();
         // SAFETY: env mutation under the test-scoped lock.
+        // v0.8.0 #1789 — UNSET is now the SECURE DEFAULT (strict), the
+        // inverse of the v0.7.0 permissive default.
         unsafe {
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
-        assert!(!require_peer_enrollment_enabled(), "unset → permissive");
+        assert!(
+            require_peer_enrollment_enabled(),
+            "unset → strict (v0.8 secure default #1789)"
+        );
         unsafe {
             std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
         }
@@ -1246,6 +1525,71 @@ mod verify_arm_tests {
         assert!(require_peer_enrollment_enabled(), "true → strict");
         unsafe {
             std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+    }
+
+    #[test]
+    fn require_peer_enrollment_falsy_opt_out() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — explicit falsy values revert to v0.7.x permissive.
+        // SAFETY: env mutation under the test-scoped lock.
+        for falsy in ["0", "false", "FALSE", "no", "No", "off", "OFF", " off "] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", falsy);
+            }
+            assert!(
+                !require_peer_enrollment_enabled(),
+                "{falsy:?} → permissive (falsy opt-out)"
+            );
+        }
+        // Truthy + any other non-falsy string keeps the secure default ON.
+        for truthy in ["1", "true", "yes", "on", "anything-else"] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", truthy);
+            }
+            assert!(
+                require_peer_enrollment_enabled(),
+                "{truthy:?} → strict (non-falsy)"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+        }
+    }
+
+    #[test]
+    fn allow_unenrolled_peers_env_arms() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — companion escape hatch (#44). Default false;
+        // truthy 1/true/yes/on enables it.
+        // SAFETY: env mutation under the test-scoped lock.
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        assert!(
+            !allow_unenrolled_peers_enabled(),
+            "unset → escape hatch closed"
+        );
+        for truthy in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " on "] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", truthy);
+            }
+            assert!(
+                allow_unenrolled_peers_enabled(),
+                "{truthy:?} → escape hatch open"
+            );
+        }
+        for non_truthy in ["0", "false", "no", "off", "garbage"] {
+            unsafe {
+                std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", non_truthy);
+            }
+            assert!(
+                !allow_unenrolled_peers_enabled(),
+                "{non_truthy:?} → escape hatch closed"
+            );
+        }
+        unsafe {
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
     }
 
@@ -1282,35 +1626,69 @@ mod verify_arm_tests {
     }
 
     #[test]
-    fn push_none_none_permissive_when_not_strict() {
+    fn push_none_none_permissive_when_falsy_opt_out() {
         let _g = env_lock();
+        // v0.8.0 #1789 — UNSET is now strict, so the permissive arm is
+        // reached by an explicit falsy opt-out. (Preserved-intent: this
+        // test still pins that the (None,None) arm CAN allow.)
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
-            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
-        // No sig, no enrolled key, not strict → allow-with-WARN (None).
+        // No sig, no enrolled key, falsy opt-out → allow-with-WARN (None).
         let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         }
-        assert!(out.is_none(), "(None,None) permissive arm must allow");
+        assert!(
+            out.is_none(),
+            "(None,None) permissive arm must allow under falsy opt-out"
+        );
     }
 
     #[test]
-    fn push_none_none_strict_refuses_1088() {
+    fn push_none_none_permissive_when_escape_hatch() {
         let _g = env_lock();
+        // v0.8.0 #1789 — escape hatch: enrollment required by default but
+        // AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 allows unenrolled peers
+        // during a rollout window.
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
-            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
         }
         let cache = FederationNonceCache::default();
         let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
         unsafe {
             std::env::remove_var(REQUIRE_SIG_ENV);
-            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
-        let resp = out.expect("#1088 strict must refuse unenrolled peer");
+        assert!(
+            out.is_none(),
+            "(None,None) escape-hatch arm must allow during rollout"
+        );
+    }
+
+    #[test]
+    fn push_none_none_strict_refuses_by_default_1789() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — UNSET is the secure default; refuses with no
+        // opt-out set. The escape hatch is explicitly removed so the
+        // strict path is deterministic.
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_signature_or_reject(&HeaderMap::new(), b"{}", Some("unenrolled"), &cache);
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+        }
+        let resp = out.expect("#1789 secure default must refuse unenrolled peer");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
@@ -1367,6 +1745,7 @@ mod verify_arm_tests {
         unsafe {
             std::env::set_var(REQUIRE_SIG_ENV, "1");
             std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "1");
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
         }
         let cache = FederationNonceCache::default();
         let out = verify_get_signature_or_reject(
@@ -1383,6 +1762,34 @@ mod verify_arm_tests {
         }
         let resp = out.expect("#1088 strict must refuse on GET path");
         assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn get_none_none_escape_hatch_allows_1789() {
+        let _g = env_lock();
+        // v0.8.0 #1789 — escape hatch on the GET surface mirrors push.
+        unsafe {
+            std::env::set_var(REQUIRE_SIG_ENV, "1");
+            std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
+            std::env::set_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS", "1");
+        }
+        let cache = FederationNonceCache::default();
+        let out = verify_get_signature_or_reject(
+            "GET",
+            "/api/v1/sync/since",
+            "limit=10",
+            &HeaderMap::new(),
+            Some("unenrolled"),
+            &cache,
+        );
+        unsafe {
+            std::env::remove_var(REQUIRE_SIG_ENV);
+            std::env::remove_var("AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS");
+        }
+        assert!(
+            out.is_none(),
+            "escape hatch must allow unenrolled peer on GET during rollout"
+        );
     }
 }
 

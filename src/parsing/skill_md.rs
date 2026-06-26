@@ -55,7 +55,7 @@ struct RawFrontmatter {
     composes_with_reflections: Vec<RawComposesEntry>,
     /// Catch-all for unknown top-level keys in the frontmatter YAML.
     #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_yaml::Value>,
+    extra: std::collections::HashMap<String, serde_yaml_ng::Value>,
 }
 
 /// Raw deserialization shape for a single `composes_with_reflections`
@@ -182,7 +182,7 @@ pub fn parse(source: &str) -> Result<SkillManifest, String> {
     // -----------------------------------------------------------------------
     // Deserialize frontmatter
     // -----------------------------------------------------------------------
-    let raw: RawFrontmatter = serde_yaml::from_str(yaml_str)
+    let raw: RawFrontmatter = serde_yaml_ng::from_str(yaml_str)
         .map_err(|e| format!("SKILL.md frontmatter YAML parse error: {e}"))?;
 
     // -----------------------------------------------------------------------

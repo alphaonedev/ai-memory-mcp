@@ -87,6 +87,7 @@ fn call(conn: &rusqlite::Connection, source_id: &str, target_id: &str) -> Value 
             "source_id": source_id,
             "target_id": target_id,
         }),
+        None,
     )
     .expect("handle_find_paths Ok")
 }

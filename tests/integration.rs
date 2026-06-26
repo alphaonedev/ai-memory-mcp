@@ -233,10 +233,25 @@ fn wait_child_bounded(
     }
 }
 
+/// #1713 — project-local scratch DB root (no files under /tmp; CLAUDE.md
+/// hard rule). One fresh uuid-named DB per call under the gitignored
+/// `.local-runs/` tree.
+fn integration_scratch_root() -> std::path::PathBuf {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".local-runs")
+        .join("integration");
+    std::fs::create_dir_all(&root).ok();
+    root
+}
+
+fn integration_scratch_db(infix: &str) -> std::path::PathBuf {
+    integration_scratch_root().join(format!("ai-memory-{infix}-{}.db", uuid::Uuid::new_v4()))
+}
+
 #[test]
 fn test_cli_store_and_recall() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-cli-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("cli-test");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store
@@ -357,8 +372,7 @@ fn test_cli_store_and_recall() {
 #[test]
 fn test_deduplication() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-dedup-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("dedup-test");
 
     // Store same title+namespace twice
     for content in ["first version", "second version"] {
@@ -400,8 +414,7 @@ fn test_deduplication() {
 #[test]
 fn test_gc_removes_expired() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-gc-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("gc-test");
 
     // Store a short-term memory (6h TTL) — we can't easily test real expiry,
     // but we can verify gc runs without error
@@ -438,8 +451,7 @@ fn test_gc_removes_expired() {
 fn test_content_size_limit() {
     use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-size-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("size-test");
 
     let huge_content = "x".repeat(70_000);
     // Pipe huge content via stdin (-c -) to avoid Windows' ~8191-char argv
@@ -475,9 +487,8 @@ fn test_content_size_limit() {
 #[test]
 fn test_import_export_roundtrip() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db1 = dir.join(format!("ai-memory-export-{}.db", uuid::Uuid::new_v4()));
-    let db2 = dir.join(format!("ai-memory-import-{}.db", uuid::Uuid::new_v4()));
+    let db1 = integration_scratch_db("export");
+    let db2 = integration_scratch_db("import");
 
     // Store in db1
     let output = cmd(binary)
@@ -544,8 +555,7 @@ fn test_import_export_roundtrip() {
 #[test]
 fn test_reject_empty_title() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-title-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-title");
 
     let output = cmd(binary)
         .args([
@@ -567,8 +577,7 @@ fn test_reject_empty_title() {
 #[test]
 fn test_reject_bad_source() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-source-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-source");
 
     let output = cmd(binary)
         .args([
@@ -592,8 +601,7 @@ fn test_reject_bad_source() {
 #[test]
 fn test_reject_bad_namespace() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-ns-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-ns");
 
     let output = cmd(binary)
         .args([
@@ -621,8 +629,7 @@ fn test_reject_bad_namespace() {
 fn test_reject_oversized_content() {
     use std::io::Write;
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-size-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-size");
 
     let huge = "x".repeat(70_000);
     // Pipe via stdin (-c -) for Windows argv-length compatibility.
@@ -657,8 +664,7 @@ fn test_reject_oversized_content() {
 #[test]
 fn test_reject_bad_priority() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-prio-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-prio");
 
     let output = cmd(binary)
         .args([
@@ -698,8 +704,7 @@ fn test_reject_bad_priority() {
 #[test]
 fn test_reject_bad_confidence() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-val-conf-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("val-conf");
 
     let output = cmd(binary)
         .args([
@@ -741,8 +746,7 @@ fn test_reject_bad_confidence() {
 #[test]
 fn test_recall_priority_order() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-order-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("order");
 
     for (title, priority) in [
         ("alpha recall test", "2"),
@@ -807,8 +811,7 @@ fn test_recall_priority_order() {
 #[test]
 fn test_ttl_assignment() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ttl-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ttl");
 
     // Store short-term
     let output = cmd(binary)
@@ -893,11 +896,7 @@ fn test_ttl_assignment() {
 #[test]
 fn test_auto_promotion() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-promote-auto-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("promote-auto");
 
     // Store a mid-term memory
     let output = cmd(binary)
@@ -962,8 +961,7 @@ fn test_auto_promotion() {
 #[test]
 fn test_forget_by_pattern() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-forget-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("forget");
 
     // Store 3 memories, 2 with "ephemeral" in content
     for (title, content) in [
@@ -1038,8 +1036,7 @@ fn test_forget_by_pattern() {
 #[test]
 fn test_namespace_isolation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-nsiso-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("nsiso");
 
     // Store in ns-a
     let output = cmd(binary)
@@ -1110,8 +1107,7 @@ fn test_namespace_isolation() {
 #[test]
 fn test_link_creation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-link-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("link");
 
     // Store two memories
     let output = cmd(binary)
@@ -1190,8 +1186,7 @@ fn test_link_creation() {
 #[test]
 fn test_consolidation() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-consol-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("consol");
 
     let mut ids = Vec::new();
     for (title, content) in [
@@ -1281,8 +1276,7 @@ fn test_consolidation() {
 #[test]
 fn test_promote_command() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-promote-cmd-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("promote-cmd");
 
     let output = cmd(binary)
         .args([
@@ -1329,8 +1323,7 @@ fn test_promote_command() {
 #[test]
 fn test_namespaces_command() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-cmd-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-cmd");
 
     // Store in two namespaces
     for (ns, title) in [("ns-alpha", "alpha mem"), ("ns-beta", "beta mem")] {
@@ -1375,8 +1368,7 @@ fn test_namespaces_command() {
 #[test]
 fn test_unicode_handling() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-unicode-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("unicode");
 
     let output = cmd(binary)
         .args([
@@ -1424,8 +1416,7 @@ fn test_unicode_handling() {
 #[test]
 fn test_boundary_priority_min() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-pmin-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-pmin");
 
     let output = cmd(binary)
         .args([
@@ -1450,8 +1441,7 @@ fn test_boundary_priority_min() {
 #[test]
 fn test_boundary_priority_max() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-pmax-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-pmax");
 
     let output = cmd(binary)
         .args([
@@ -1476,8 +1466,7 @@ fn test_boundary_priority_max() {
 #[test]
 fn test_boundary_confidence_zero() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-c0-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-c0");
 
     let output = cmd(binary)
         .args([
@@ -1502,8 +1491,7 @@ fn test_boundary_confidence_zero() {
 #[test]
 fn test_boundary_confidence_one() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-c1-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-c1");
 
     let output = cmd(binary)
         .args([
@@ -1528,8 +1516,7 @@ fn test_boundary_confidence_one() {
 #[test]
 fn test_boundary_max_title_length() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-bnd-tlen-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("bnd-tlen");
 
     let long_title = "a".repeat(512);
     let output = cmd(binary)
@@ -1555,8 +1542,7 @@ fn test_boundary_max_title_length() {
 #[test]
 fn test_export_includes_links() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-explink-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("explink");
 
     // Store two memories
     let output = cmd(binary)
@@ -1631,9 +1617,8 @@ fn test_export_includes_links() {
 #[test]
 fn test_import_roundtrip_count_match() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db1 = dir.join(format!("ai-memory-irt-src-{}.db", uuid::Uuid::new_v4()));
-    let db2 = dir.join(format!("ai-memory-irt-dst-{}.db", uuid::Uuid::new_v4()));
+    let db1 = integration_scratch_db("irt-src");
+    let db2 = integration_scratch_db("irt-dst");
 
     // Store 3 memories in db1
     for i in 0..3 {
@@ -1704,8 +1689,7 @@ fn test_import_roundtrip_count_match() {
 #[test]
 fn test_update_via_cli() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-update-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("update");
 
     let output = cmd(binary)
         .args([
@@ -1760,8 +1744,7 @@ fn test_update_via_cli() {
 #[test]
 fn test_stats_accuracy() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-statsacc-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("statsacc");
 
     let count = 5;
     for i in 0..count {
@@ -1803,8 +1786,7 @@ fn test_stats_accuracy() {
 #[test]
 fn test_gc_preserves_long_term() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-gckeep-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("gckeep");
 
     // Store short-term and long-term
     let output = cmd(binary)
@@ -1872,8 +1854,7 @@ fn test_gc_preserves_long_term() {
 #[test]
 fn test_search_with_since_future() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-since-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("since");
 
     let output = cmd(binary)
         .args([
@@ -1922,8 +1903,7 @@ fn test_search_with_since_future() {
 #[test]
 fn test_health_endpoint() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-health-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("health");
 
     // Find a free port
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1975,34 +1955,21 @@ fn test_health_endpoint() {
 #[test]
 fn test_mcp_initialize() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-init-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-init");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_initialize",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2019,34 +1986,21 @@ fn test_mcp_initialize() {
 #[test]
 fn test_mcp_tools_list() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-tools-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-tools");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_tools_list",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2111,26 +2065,24 @@ fn test_mcp_tools_list() {
 #[test]
 fn test_mcp_store_and_recall() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-store-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-store");
 
     // Send store then recall in sequence
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"MCP test memory","content":"This was stored via MCP protocol","tier":"long","priority":8}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"MCP test"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"MCP test memory","content":"This was stored via MCP protocol","tier":"long","priority":8}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"MCP test"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_and_recall",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -2162,34 +2114,21 @@ fn test_mcp_store_and_recall() {
 #[test]
 fn test_mcp_invalid_jsonrpc_version() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-ver-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-ver");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"1.0","id":1,"method":"initialize","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"1.0","id":1,"method":"initialize","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_invalid_jsonrpc_version",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2206,24 +2145,22 @@ fn test_mcp_invalid_jsonrpc_version() {
 #[test]
 fn test_mcp_unknown_tool() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-unk-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-unk");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"nonexistent_tool","arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nonexistent_tool","arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_unknown_tool",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2252,24 +2189,22 @@ fn test_mcp_unknown_tool() {
 #[test]
 fn test_mcp_missing_tool_name() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-noname-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-noname");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_missing_tool_name",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2286,24 +2221,22 @@ fn test_mcp_missing_tool_name() {
 #[test]
 fn test_mcp_stats() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-stats-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-stats");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_stats","arguments":{{}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_stats","arguments":{}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_stats",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2318,34 +2251,21 @@ fn test_mcp_stats() {
 #[test]
 fn test_mcp_prompts_list() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-prompts-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-prompts");
 
-    let output = cmd(binary)
-        .args([
+    let requests =
+        vec![r#"{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}}"#.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(
-                    stdin,
-                    r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{{}}}}"#
-                )
-                .ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_prompts_list",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2363,27 +2283,23 @@ fn test_mcp_prompts_list() {
 #[test]
 fn test_mcp_prompts_get_recall_first() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-prompt-get-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-prompt-get");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{{"name":"recall-first"}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"recall-first"}}"#
+            .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_prompts_get_recall_first",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let resp: serde_json::Value =
@@ -2411,28 +2327,23 @@ fn test_mcp_prompts_get_recall_first() {
 #[test]
 fn test_mcp_recall_default_toon() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-toon-def-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-toon-def");
 
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"TOON default test","content":"Testing.","tier":"long","namespace":"test"}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"TOON test","namespace":"test"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"TOON default test","content":"Testing.","tier":"long","namespace":"test"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"TOON test","namespace":"test"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_recall_default_toon",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2461,8 +2372,7 @@ fn test_mcp_recall_default_toon() {
 
 #[test]
 fn test_cli_validate_id_rejects_invalid() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-validate-id-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("validate-id");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // delete with empty/whitespace ID
@@ -2497,11 +2407,7 @@ fn test_cli_validate_id_rejects_invalid() {
 
 #[test]
 fn test_tier_downgrade_rejected() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-tier-downgrade-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("tier-downgrade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a long-term memory
@@ -2555,11 +2461,7 @@ fn test_tier_downgrade_rejected() {
 
 #[test]
 fn test_tier_upgrade_allowed() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-tier-upgrade-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("tier-upgrade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a short-term memory
@@ -2602,8 +2504,7 @@ fn test_tier_upgrade_allowed() {
 
 #[test]
 fn test_duplicate_title_no_self_contradiction() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-selfref-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("selfref");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a memory
@@ -2655,8 +2556,7 @@ fn test_duplicate_title_no_self_contradiction() {
 
 #[test]
 fn test_promote_clears_expires_at() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-promote-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("promote");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a short-term memory (has expires_at)
@@ -2727,11 +2627,7 @@ fn test_version_flag_matches_cargo_pkg_version() {
 #[test]
 #[allow(clippy::too_many_lines)] // sequential CLI scenario, splitting hurts readability
 fn test_namespace_auto_detect_parent() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-ns-autoparent-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("ns-autoparent");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store parent namespace standard
@@ -2785,35 +2681,24 @@ fn test_namespace_auto_detect_parent() {
     let child_set = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_namespace_set_standard","arguments":{{"namespace":"myproject-tests","id":"{child_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         parent_set,
         child_set,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"myproject-tests","format":"json"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"myproject-tests","format":"json"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_namespace_auto_detect_parent",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2854,8 +2739,7 @@ fn test_namespace_auto_detect_parent() {
 
 #[test]
 fn test_mcp_namespace_standard_auto_prepend() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-auto-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-auto");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a standard memory
@@ -2904,34 +2788,23 @@ fn test_mcp_namespace_standard_auto_prepend() {
     let set_standard = format!(
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_namespace_set_standard","arguments":{{"namespace":"test-ns","id":"{std_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         set_standard,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"test-ns","format":"json"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"rules","namespace":"test-ns","format":"json"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_namespace_standard_auto_prepend",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -2974,8 +2847,7 @@ fn test_mcp_namespace_standard_auto_prepend() {
 
 #[test]
 fn test_namespace_standard_cascade_on_delete() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-ns-cascade-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("ns-cascade");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store and set as standard
@@ -3007,35 +2879,24 @@ fn test_namespace_standard_cascade_on_delete() {
     let delete_mem = format!(
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_delete","arguments":{{"id":"{std_id}"}}}}}}"#,
     );
-    let mcp_input = format!(
-        "{}\n{}\n{}\n{}\n",
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string(),
         set_standard,
         delete_mem,
-        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_namespace_get_standard","arguments":{"namespace":"cascade-ns"}}}"#,
-    );
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_namespace_get_standard","arguments":{"namespace":"cascade-ns"}}}"#.to_string(),
+    ];
 
-    let output = cmd(binary)
-        .args([
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
             "--profile",
             "full",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(mcp_input.as_bytes()).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_namespace_standard_cascade_on_delete",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
@@ -3062,26 +2923,24 @@ fn test_namespace_standard_cascade_on_delete() {
 #[test]
 fn test_mcp_store_with_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-mcp-meta-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("mcp-meta");
 
     // Store with metadata, then recall in JSON format to verify it persists
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Metadata MCP test","content":"Testing metadata via MCP","tier":"long","metadata":{{"agent_id":"claude-test","session":42}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Metadata MCP test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Metadata MCP test","content":"Testing metadata via MCP","tier":"long","metadata":{"agent_id":"claude-test","session":42}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Metadata MCP test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_with_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3110,29 +2969,24 @@ fn test_mcp_store_with_metadata() {
 #[test]
 fn test_mcp_update_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-upd-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-upd");
 
     // Store with initial metadata
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Update meta test","content":"Initial content","tier":"long","metadata":{{"version":1}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Update meta test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Update meta test","content":"Initial content","tier":"long","metadata":{"version":1}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Update meta test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_update_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3145,22 +2999,25 @@ fn test_mcp_update_metadata() {
     let id = store_data["id"].as_str().unwrap();
 
     // Update metadata via a second MCP session, then get to verify
-    let output2 = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"version":2,"updated":true}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{id}"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests2 = vec![
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"version":2,"updated":true}}}}}}}}"#
+        ),
+        format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_get","arguments":{{"id":"{id}"}}}}}}"#
+        ),
+    ];
+    let output2 = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests2,
+        "test_mcp_update_metadata",
+    );
 
     let stdout2 = String::from_utf8_lossy(&output2.stdout);
     let lines2: Vec<&str> = stdout2.trim().lines().collect();
@@ -3187,38 +3044,33 @@ fn test_mcp_update_metadata() {
 #[test]
 fn test_mcp_store_invalid_metadata_defaults_to_empty() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-inv-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-inv");
 
     // Store with metadata as array (invalid — should default to {})
     // Then store with metadata as string (invalid — should default to {})
     // Then store with metadata as null (invalid — should default to {})
     // Verify all three have empty metadata
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                // metadata as array
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Array meta","content":"test","tier":"long","metadata":[1,2,3]}}}}}}"#).ok();
-                // metadata as string
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"String meta","content":"test","tier":"long","metadata":"not an object"}}}}}}"#).ok();
-                // metadata as null
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Null meta","content":"test","tier":"long","metadata":null}}}}}}"#).ok();
-                // Recall all to verify
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"memory_list","arguments":{{"format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        // metadata as array
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Array meta","content":"test","tier":"long","metadata":[1,2,3]}}}"#.to_string(),
+        // metadata as string
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"String meta","content":"test","tier":"long","metadata":"not an object"}}}"#.to_string(),
+        // metadata as null
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Null meta","content":"test","tier":"long","metadata":null}}}"#.to_string(),
+        // Recall all to verify
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_store_invalid_metadata_defaults_to_empty",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3249,10 +3101,16 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
         let meta = mem["metadata"]
             .as_object()
             .unwrap_or_else(|| panic!("metadata must be an object, got: {}", mem["metadata"]));
-        assert_eq!(
-            meta.len(),
-            1,
-            "invalid input metadata should reduce to just agent_id, got: {meta:?}"
+        // #1757 — handle_store also stamps the system-managed per-memory
+        // vector clock (`version_vector`); the assertion is that NO caller
+        // metadata survived (only the system-injected agent_id + clock).
+        let caller_keys: Vec<&String> = meta
+            .keys()
+            .filter(|k| k.as_str() != "agent_id" && k.as_str() != "version_vector")
+            .collect();
+        assert!(
+            caller_keys.is_empty(),
+            "invalid input metadata should reduce to just agent_id (+ system version_vector), got: {meta:?}"
         );
         assert!(
             meta.contains_key("agent_id"),
@@ -3271,31 +3129,26 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
 #[test]
 fn test_mcp_dedup_replaces_metadata() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!(
-        "ai-memory-mcp-meta-dup-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_path = integration_scratch_db("mcp-meta-dup");
 
     // Store with metadata v1, then store same title+namespace with metadata v2
     // The MCP dedup path goes through db::update, not db::insert upsert
-    let output = cmd(binary)
-        .args(["--db", db_path.to_str().unwrap(), "mcp", "--profile", "full"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Dedup meta test","content":"first","tier":"long","namespace":"test","metadata":{{"version":1}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_store","arguments":{{"title":"Dedup meta test","content":"second","tier":"long","namespace":"test","metadata":{{"version":2,"extra":"added"}}}}}}}}"#).ok();
-                writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_recall","arguments":{{"context":"Dedup meta test","namespace":"test","format":"json"}}}}}}"#).ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+    let requests = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Dedup meta test","content":"first","tier":"long","namespace":"test","metadata":{"version":1}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"Dedup meta test","content":"second","tier":"long","namespace":"test","metadata":{"version":2,"extra":"added"}}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"Dedup meta test","namespace":"test","format":"json"}}}"#.to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+        ]),
+        &requests,
+        "test_mcp_dedup_replaces_metadata",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -3319,8 +3172,7 @@ fn test_mcp_dedup_replaces_metadata() {
 
 #[test]
 fn test_cli_prefix_id_resolution() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-prefix-test-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("prefix-test");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Store a memory
@@ -3423,7 +3275,7 @@ fn test_cli_prefix_id_resolution() {
 
 /// Helper: fresh DB path for each test.
 fn fresh_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-agentid-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("agentid")
 }
 
 /// Helper: extract `metadata.agent_id` from a stored-memory JSON payload.
@@ -3487,16 +3339,30 @@ fn test_agentid_default_is_nhi_prefixed() {
     assert!(output.status.success());
     let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let id = agent_id_of(&stored);
-    // One of: host:<sanitized-hostname>:pid-<pid>-<uuid8>
-    //      or anonymous:pid-<pid>-<uuid8>
+    // v0.8.0 #1720 B1 — the default CLI stamp is one of:
+    //   host:<sanitized-hostname>            (DURABLE, pid-free)
+    //   anonymous:pid-<pid>-<uuid8>          (ephemeral fallback when
+    //                                         the hostname is unavailable)
+    // The host form is now PID-FREE + durable: a pid suffix would change
+    // every process restart and orphan scope=private rows owned by the
+    // old id once enforced-read multi-agent mode is opted into (the
+    // owner-lockout trap B1/B2/B3 close). Only the anonymous fallback
+    // keeps the ephemeral pid discriminator.
     assert!(
         id.starts_with("host:") || id.starts_with("anonymous:"),
         "expected NHI-prefixed default, got: {id}"
     );
-    assert!(
-        id.contains(":pid-"),
-        "expected pid discriminator, got: {id}"
-    );
+    if let Some(host) = id.strip_prefix("host:") {
+        assert!(
+            !host.contains("pid-"),
+            "durable host stamp must be pid-free (#1720 B1), got: {id}"
+        );
+    } else {
+        assert!(
+            id.starts_with("anonymous:pid-"),
+            "anonymous fallback keeps the ephemeral pid discriminator, got: {id}"
+        );
+    }
     let _ = std::fs::remove_file(&db_path);
 }
 
@@ -3821,8 +3687,9 @@ fn test_mcp_update_preserves_agent_id() {
         r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"memory_update","arguments":{{"id":"{id}","metadata":{{"agent_id":"attacker","side_field":"ok"}}}}}}}}"#,
     );
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req2];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -3830,21 +3697,10 @@ fn test_mcp_update_preserves_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req2}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_mcp_update_preserves_agent_id",
+    );
 
     // 3. Parse the MCP response and assert provenance held.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3878,7 +3734,8 @@ fn test_mcp_update_preserves_agent_id() {
 fn test_import_restamps_agent_id_by_default() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let forge_path = std::env::temp_dir().join(format!("forge-{}.json", uuid::Uuid::new_v4()));
+    let forge_path =
+        integration_scratch_root().join(format!("forge-{}.json", uuid::Uuid::new_v4()));
 
     let forged = serde_json::json!({
         "memories": [{
@@ -3943,7 +3800,8 @@ fn test_import_restamps_agent_id_by_default() {
 fn test_import_trust_source_preserves_agent_id() {
     let db_path = fresh_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let forge_path = std::env::temp_dir().join(format!("backup-{}.json", uuid::Uuid::new_v4()));
+    let forge_path =
+        integration_scratch_root().join(format!("backup-{}.json", uuid::Uuid::new_v4()));
 
     let backup = serde_json::json!({
         "memories": [{
@@ -4151,7 +4009,7 @@ fn test_mine_stamps_caller_agent_id() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Minimal Claude conversations.json the miner can parse.
-    let mine_dir = std::env::temp_dir().join(format!("mine-{}", uuid::Uuid::new_v4()));
+    let mine_dir = integration_scratch_root().join(format!("mine-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&mine_dir).unwrap();
     // Claude's format is JSONL (one conversation object per line, no outer array).
     let conv_path = mine_dir.join("conversations.jsonl");
@@ -4263,8 +4121,9 @@ fn test_agentid_visible_in_recall_response() {
     let req1 = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let req2 = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"context":"DistinctiveRecallToken","format":"json"}}}"#;
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req2.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4272,21 +4131,10 @@ fn test_agentid_visible_in_recall_response() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req2}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_agentid_visible_in_recall_response",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let last_line = stdout.trim().lines().last().unwrap();
@@ -4348,8 +4196,9 @@ fn test_agentid_visible_in_toon_and_json() {
     let req_toon = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"toon"}}}"#;
     let req_json = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"memory_list","arguments":{"format":"json"}}}"#;
 
-    let output = cmd(binary)
-        .args([
+    let requests = vec![req1.to_string(), req_toon.to_string(), req_json.to_string()];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4357,22 +4206,10 @@ fn test_agentid_visible_in_toon_and_json() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                writeln!(stdin, "{req1}").ok();
-                writeln!(stdin, "{req_toon}").ok();
-                writeln!(stdin, "{req_json}").ok();
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .expect("failed to run mcp");
+        ]),
+        &requests,
+        "test_agentid_visible_in_toon_and_json",
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.trim().lines().collect();
@@ -4409,7 +4246,7 @@ fn test_agentid_visible_in_toon_and_json() {
 // ---------------------------------------------------------------------------
 
 fn fresh_agent_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-agentreg-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("agentreg")
 }
 
 fn register_via_cli(
@@ -4641,33 +4478,13 @@ fn test_agents_list_uses_reserved_namespace() {
 
 #[test]
 fn test_mcp_agent_register_and_list() {
-    use std::io::Write;
     let db_path = fresh_agent_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let stdin = child.stdin.as_mut().unwrap();
     let init = serde_json::json!({
         "jsonrpc":"2.0","id":1,"method":"initialize",
         "params":{"clientInfo":{"name":"test-suite","version":"1.0"}}
     });
-    writeln!(stdin, "{init}").unwrap();
-
     let reg = serde_json::json!({
         "jsonrpc":"2.0","id":2,"method":"tools/call",
         "params":{
@@ -4679,17 +4496,25 @@ fn test_mcp_agent_register_and_list() {
             }
         }
     });
-    writeln!(stdin, "{reg}").unwrap();
-
     let list = serde_json::json!({
         "jsonrpc":"2.0","id":3,"method":"tools/call",
         "params":{"name":"memory_agent_list","arguments":{}}
     });
-    writeln!(stdin, "{list}").unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
+    let requests = vec![init.to_string(), reg.to_string(), list.to_string()];
 
-    let output = child.wait_with_output().unwrap();
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_mcp_agent_register_and_list",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
@@ -4721,7 +4546,7 @@ fn test_mcp_agent_register_and_list() {
 // ---------------------------------------------------------------------------
 
 fn fresh_followup_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-followup-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("followup")
 }
 
 #[test]
@@ -4754,13 +4579,25 @@ fn test_196_cli_store_echoes_agent_id() {
 
 #[test]
 fn test_196_mcp_store_echoes_resolved_agent_id() {
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .env_remove("AI_MEMORY_AGENT_ID")
-        .args([
+    let requests = vec![
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"clientInfo":{"name":"echo-test","version":"1"}}
+        })
+        .to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_store","arguments":{
+                "title":"echo-mcp","content":"hi","agent_id":"mcp-echo"
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).env_remove("AI_MEMORY_AGENT_ID").args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4768,36 +4605,10 @@ fn test_196_mcp_store_echoes_resolved_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":1,"method":"initialize",
-            "params":{"clientInfo":{"name":"echo-test","version":"1"}}
-        })
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_store","arguments":{
-                "title":"echo-mcp","content":"hi","agent_id":"mcp-echo"
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_196_mcp_store_echoes_resolved_agent_id",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -4860,12 +4671,19 @@ fn test_197_cli_search_rejects_invalid_agent_id_filter() {
 
 #[test]
 fn test_197_mcp_list_rejects_invalid_agent_id_filter() {
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{"agent_id":"alice bob"}}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4873,31 +4691,10 @@ fn test_197_mcp_list_rejects_invalid_agent_id_filter() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_list","arguments":{"agent_id":"alice bob"}}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_197_mcp_list_rejects_invalid_agent_id_filter",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -4949,7 +4746,6 @@ fn test_198_anonymize_env_skips_host_fallback() {
 fn test_199_toon_compact_surfaces_agent_id() {
     // Build a minimal response object and render via the library's TOON path
     // by exercising `memory_list` through the MCP surface with format=toon_compact.
-    use std::io::Write;
     let db_path = fresh_followup_db();
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
@@ -4973,8 +4769,18 @@ fn test_199_toon_compact_surfaces_agent_id() {
         .unwrap();
     assert!(seed.status.success());
 
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_list","arguments":{
+                "namespace":"toon-ns","format":"toon_compact"
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -4982,33 +4788,10 @@ fn test_199_toon_compact_surfaces_agent_id() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_list","arguments":{
-                "namespace":"toon-ns","format":"toon_compact"
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_199_toon_compact_surfaces_agent_id",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5031,7 +4814,7 @@ fn test_199_toon_compact_surfaces_agent_id() {
 // ---------------------------------------------------------------------------
 
 fn fresh_scope_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-scope-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("scope")
 }
 
 /// Seed a memory with an explicit scope + namespace.
@@ -5097,30 +4880,128 @@ fn recall_as_agent(
         .collect()
 }
 
+/// v0.8.0 #1720 A2-A6: seed a private/typed-scope memory with an
+/// EXPLICIT owner (`metadata.agent_id`). Owner-keyed `scope=private`
+/// visibility (the security fix in 15e0504f) means the owner id — not
+/// the namespace — decides who can read the row, so the scope tests
+/// must control the owner per-row.
+fn seed_owned(
+    binary: &str,
+    db_path: &std::path::Path,
+    namespace: &str,
+    title: &str,
+    scope: &str,
+    owner: &str,
+) {
+    let out = cmd(binary)
+        .env_remove("AI_MEMORY_AGENT_ID")
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--agent-id",
+            owner,
+            "--json",
+            "store",
+            "-n",
+            namespace,
+            "-T",
+            title,
+            "-c",
+            "content",
+            "-t",
+            "long",
+            "--scope",
+            scope,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "seed failed for {title}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// v0.8.0 #1720 A3: recall as a concrete OWNER. The read-path
+/// visibility caller is resolved from `AI_MEMORY_AGENT_ID`
+/// (`identity::resolve_read_visibility_caller`), DISTINCT from the
+/// `--as-agent` namespace (which only drives the team/unit/org subtree
+/// arms). `--as-agent` is still passed so visibility filtering is
+/// engaged (an unset `as_agent` disables filtering entirely); the owner
+/// id is what gates the `scope=private` arm.
+fn recall_as_owner(
+    binary: &str,
+    db_path: &std::path::Path,
+    as_agent: &str,
+    context: &str,
+    owner: &str,
+) -> Vec<String> {
+    let out = cmd(binary)
+        .env("AI_MEMORY_AGENT_ID", owner)
+        .args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "--json",
+            "recall",
+            context,
+            "--as-agent",
+            as_agent,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "recall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["memories"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .filter_map(|m| m["title"].as_str().map(str::to_string))
+        .collect()
+}
+
 #[test]
-fn test_scope_private_visible_only_in_exact_namespace() {
+fn test_scope_private_visible_only_to_owner() {
+    // v0.8.0 #1720 A2-A6: scope=private is OWNER-keyed, not
+    // namespace-keyed. The owner sees their own private rows; a
+    // different owner sees none — regardless of namespace co-residency.
+    // (Pre-#1720 a same-namespace `--as-agent` principal could read
+    // another agent's private rows — the cross-tenant leak 15e0504f
+    // closed. This test previously asserted that leaking behavior.)
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(
+    // agent-1 owns priv-self; agent-2 owns priv-other (same subtree).
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-1",
         "priv-self",
         "private",
+        "agent-1",
     );
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-2",
-        "priv-sibling",
+        "priv-other",
         "private",
+        "agent-2",
     );
-    seed_scoped(bin, &db, "alphaone/eng/platform", "priv-parent", "private");
 
-    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "priv");
-    assert!(titles.contains(&"priv-self".to_string()));
-    assert!(!titles.contains(&"priv-sibling".to_string()));
-    assert!(!titles.contains(&"priv-parent".to_string()));
+    // The owner (agent-1) sees its own private row, not agent-2's —
+    // even though both live under the same namespace subtree.
+    let titles = recall_as_owner(bin, &db, "alphaone/eng/platform/agent-1", "priv", "agent-1");
+    assert!(
+        titles.contains(&"priv-self".to_string()),
+        "owner must see its own private row; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"priv-other".to_string()),
+        "a different owner's private row must stay hidden; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
@@ -5202,13 +5083,19 @@ fn test_scope_collective_always_visible() {
 
 #[test]
 fn test_scope_missing_treated_as_private() {
+    // A row stored WITHOUT an explicit scope defaults to private, so it
+    // is governed by the #1720 owner-keyed gate: visible to its owner,
+    // hidden from a different owner.
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    // seed WITHOUT scope (legacy-style)
+    // seed WITHOUT --scope (legacy-style) but WITH explicit owners.
     cmd(bin)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args([
             "--db",
             db.to_str().unwrap(),
+            "--agent-id",
+            "agent-1",
             "store",
             "-n",
             "alphaone/eng/platform/agent-1",
@@ -5222,14 +5109,17 @@ fn test_scope_missing_treated_as_private() {
         .output()
         .unwrap();
     cmd(bin)
+        .env_remove("AI_MEMORY_AGENT_ID")
         .args([
             "--db",
             db.to_str().unwrap(),
+            "--agent-id",
+            "agent-2",
             "store",
             "-n",
             "alphaone/eng/platform/agent-2",
             "-T",
-            "legacy-at-sibling",
+            "legacy-at-other",
             "-c",
             "legacy",
             "-t",
@@ -5238,9 +5128,22 @@ fn test_scope_missing_treated_as_private() {
         .output()
         .unwrap();
 
-    let titles = recall_as_agent(bin, &db, "alphaone/eng/platform/agent-1", "legacy");
-    assert!(titles.contains(&"legacy-at-self".to_string()));
-    assert!(!titles.contains(&"legacy-at-sibling".to_string()));
+    // Owner agent-1 sees its own scopeless (→private) row, not agent-2's.
+    let titles = recall_as_owner(
+        bin,
+        &db,
+        "alphaone/eng/platform/agent-1",
+        "legacy",
+        "agent-1",
+    );
+    assert!(
+        titles.contains(&"legacy-at-self".to_string()),
+        "owner sees its own scopeless(→private) row; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"legacy-at-other".to_string()),
+        "scopeless row defaults to private → hidden from a different owner; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
@@ -5272,25 +5175,33 @@ fn test_scope_no_as_agent_returns_all() {
 }
 
 #[test]
-fn test_scope_search_respects_as_agent() {
+fn test_scope_search_respects_owner() {
+    // The FTS `search` read path applies the same #1720 owner-keyed
+    // scope=private gate as recall: the owner finds its own private
+    // rows; a different owner's private rows stay out of the results.
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-1",
         "search-my",
         "private",
+        "agent-1",
     );
-    seed_scoped(
+    seed_owned(
         bin,
         &db,
         "alphaone/eng/platform/agent-2",
         "search-neighbor",
         "private",
+        "agent-2",
     );
 
+    // Authenticate as owner agent-1 via AI_MEMORY_AGENT_ID (the read-path
+    // visibility caller); --as-agent engages filtering.
     let out = cmd(bin)
+        .env("AI_MEMORY_AGENT_ID", "agent-1")
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -5310,25 +5221,45 @@ fn test_scope_search_respects_as_agent() {
         .iter()
         .filter_map(|m| m["title"].as_str().map(str::to_string))
         .collect();
-    assert!(titles.contains(&"search-my".to_string()));
-    assert!(!titles.contains(&"search-neighbor".to_string()));
+    assert!(
+        titles.contains(&"search-my".to_string()),
+        "owner finds its own private row in search; got {titles:?}"
+    );
+    assert!(
+        !titles.contains(&"search-neighbor".to_string()),
+        "a different owner's private row must not surface in search; got {titles:?}"
+    );
     let _ = std::fs::remove_file(&db);
 }
 
 #[test]
-fn test_scope_flat_namespace_only_sees_exact_match_plus_collective() {
+fn test_scope_flat_namespace_owner_sees_own_private_plus_collective() {
     let db = fresh_scope_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    seed_scoped(bin, &db, "global", "flat-private", "private");
-    seed_scoped(bin, &db, "other", "flat-elsewhere", "private");
-    seed_scoped(bin, &db, "global", "flat-team-at-self", "team");
-    seed_scoped(bin, &db, "shared", "flat-collective", "collective");
+    // agent-1 owns flat-private; agent-2 owns flat-elsewhere. Team +
+    // collective rows' owner is irrelevant (those arms are not
+    // owner-keyed).
+    seed_owned(bin, &db, "global", "flat-private", "private", "agent-1");
+    seed_owned(bin, &db, "other", "flat-elsewhere", "private", "agent-2");
+    seed_owned(bin, &db, "global", "flat-team-at-self", "team", "agent-1");
+    seed_owned(
+        bin,
+        &db,
+        "shared",
+        "flat-collective",
+        "collective",
+        "agent-1",
+    );
 
-    let titles = recall_as_agent(bin, &db, "global", "flat");
+    let titles = recall_as_owner(bin, &db, "global", "flat", "agent-1");
+    // Owner sees its own private row (#1720 owner-keyed)...
     assert!(titles.contains(&"flat-private".to_string()));
+    // ...but not a different owner's private row.
     assert!(!titles.contains(&"flat-elsewhere".to_string()));
+    // Collective is always visible.
     assert!(titles.contains(&"flat-collective".to_string()));
     // Flat agent has no parent; team-scope with no team_prefix → invisible
+    // (team arm stays namespace-keyed, unaffected by #1720).
     assert!(!titles.contains(&"flat-team-at-self".to_string()));
     let _ = std::fs::remove_file(&db);
 }
@@ -5384,7 +5315,7 @@ fn test_scope_invalid_as_agent_rejected() {
 // ---------------------------------------------------------------------------
 
 fn fresh_inherit_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-inherit-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("inherit")
 }
 
 /// Seed a standard memory in a namespace, then `set_standard` it.
@@ -5395,8 +5326,6 @@ fn seed_standard(
     title: &str,
     content: &str,
 ) -> String {
-    use std::io::Write;
-
     let out = cmd(binary)
         .args([
             "--db",
@@ -5423,31 +5352,8 @@ fn seed_standard(
     let id = v["id"].as_str().unwrap().to_string();
 
     // Set via MCP (CLI doesn't expose set_namespace_standard)
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_set_standard","arguments":{
@@ -5455,11 +5361,21 @@ fn seed_standard(
                 "id": id,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let _ = child.wait_with_output();
+        .to_string(),
+    ];
+    let _ = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "seed_standard",
+    );
     id
 }
 
@@ -5469,32 +5385,8 @@ fn get_standard_inherit(
     db_path: &std::path::Path,
     namespace: &str,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
-            "--db",
-            db_path.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_namespace_get_standard","arguments":{
@@ -5502,11 +5394,21 @@ fn get_standard_inherit(
                 "inherit": true,
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
+            "--db",
+            db_path.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "get_standard_inherit",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5602,8 +5504,6 @@ fn test_inherit_preserves_3_level_flat_behavior() {
 
 #[test]
 fn test_inherit_recall_auto_prepends_chain() {
-    use std::io::Write;
-
     // session_start / recall should already inject the chain when namespace is set.
     let db = fresh_inherit_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -5631,31 +5531,8 @@ fn test_inherit_recall_auto_prepends_chain() {
         .unwrap();
 
     // Invoke recall via MCP and look for standards[]
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":2,"method":"tools/call",
             "params":{"name":"memory_recall","arguments":{
@@ -5664,11 +5541,21 @@ fn test_inherit_recall_auto_prepends_chain() {
                 "format": "json"
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
+            "--db",
+            db.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_inherit_recall_auto_prepends_chain",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5738,8 +5625,6 @@ fn test_inherit_deep_namespace_8_levels() {
 
 #[test]
 fn test_inherit_default_omits_chain() {
-    use std::io::Write;
-
     // Without inherit=true, the old single-namespace response shape is used.
     let db = fresh_inherit_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -5747,8 +5632,18 @@ fn test_inherit_default_omits_chain() {
     seed_standard(bin, &db, "alphaone", "org-only", "org");
 
     // get_standard with inherit=false (default) must return single-object shape
-    let mut child = cmd(bin)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"memory_namespace_get_standard","arguments":{
+                "namespace": "alphaone",
+            }}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
             "--db",
             db.to_str().unwrap(),
             "mcp",
@@ -5756,33 +5651,10 @@ fn test_inherit_default_omits_chain() {
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name":"memory_namespace_get_standard","arguments":{
-                "namespace": "alphaone",
-            }}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "test_inherit_default_omits_chain",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -5802,7 +5674,7 @@ fn test_inherit_default_omits_chain() {
 // ---------------------------------------------------------------------------
 
 fn fresh_vpromote_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-vpromote-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("vpromote")
 }
 
 fn seed_memory_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
@@ -6030,7 +5902,7 @@ fn test_vpromote_flat_namespace_cannot_promote() {
 // ---------------------------------------------------------------------------
 
 fn fresh_gov_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-gov-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("gov")
 }
 
 fn store_std_mem(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) -> String {
@@ -6062,9 +5934,16 @@ fn mcp_call(
     name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -6072,31 +5951,10 @@ fn mcp_call(
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name": name, "arguments": args}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_call",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     let resp: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -6177,9 +6035,16 @@ fn mcp_call_raw(
     name: &str,
     args: &serde_json::Value,
 ) -> serde_json::Value {
-    use std::io::Write;
-    let mut child = cmd(binary)
-        .args([
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name": name, "arguments": args}
+        })
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(binary).args([
             "--db",
             db_path.to_str().unwrap(),
             "mcp",
@@ -6187,31 +6052,10 @@ fn mcp_call_raw(
             "full",
             "--tier",
             "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({
-            "jsonrpc":"2.0","id":2,"method":"tools/call",
-            "params":{"name": name, "arguments": args}
-        })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        ]),
+        &requests,
+        "mcp_call_raw",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     serde_json::from_str(lines[1]).unwrap()
@@ -6360,7 +6204,7 @@ fn test_governance_legacy_memory_defaults_not_mutated() {
 // ---------------------------------------------------------------------------
 
 fn fresh_enforce_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-enforce-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("enforce")
 }
 
 /// Set a governance policy on a namespace. Seeds the standard memory under
@@ -6990,7 +6834,7 @@ fn test_enforce_mcp_pending_tools() {
 // ---------------------------------------------------------------------------
 
 fn fresh_approver_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-approver-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("approver")
 }
 
 fn queue_store(
@@ -7546,7 +7390,7 @@ fn test_visibility_wildcard_underscore_smuggling_blocked() {
 // ---------------------------------------------------------------------------
 
 fn fresh_budget_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-budget-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("budget")
 }
 
 fn store_sized(binary: &str, db_path: &std::path::Path, title: &str, content: &str, priority: i32) {
@@ -7754,42 +7598,13 @@ fn test_budget_touch_only_surviving() {
 
 #[test]
 fn test_budget_mcp_tool_schema_and_response() {
-    use std::io::Write;
     let db = fresh_budget_db();
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     store_sized(bin, &db, "mcp-target", "mcp budget test content", 5);
 
-    let mut child = cmd(bin)
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "mcp",
-            "--profile",
-            "full",
-            "--tier",
-            "keyword",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdin = child.stdin.as_mut().unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}})
-    )
-    .unwrap();
-    writeln!(
-        stdin,
-        "{}",
+    let requests = vec![
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}).to_string(),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}).to_string(),
         serde_json::json!({
             "jsonrpc":"2.0","id":3,"method":"tools/call",
             "params":{"name":"memory_recall","arguments":{
@@ -7798,11 +7613,21 @@ fn test_budget_mcp_tool_schema_and_response() {
                 "format":"json"
             }}
         })
-    )
-    .unwrap();
-    stdin.flush().unwrap();
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
+        .to_string(),
+    ];
+    let output = drive_mcp_bounded(
+        cmd(bin).args([
+            "--db",
+            db.to_str().unwrap(),
+            "mcp",
+            "--profile",
+            "full",
+            "--tier",
+            "keyword",
+        ]),
+        &requests,
+        "test_budget_mcp_tool_schema_and_response",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
 
@@ -7871,7 +7696,7 @@ fn test_budget_mcp_tool_schema_and_response() {
 // ---------------------------------------------------------------------------
 
 fn fresh_hier_recall_db() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("ai-memory-hier-{}.db", uuid::Uuid::new_v4()))
+    integration_scratch_db("hier")
 }
 
 fn store_at(binary: &str, db_path: &std::path::Path, namespace: &str, title: &str) {
@@ -8192,7 +8017,7 @@ fn test_cli_sync_dry_run_writes_nothing() {
     // v0.6.0 GA Phase 3 foundation: --dry-run must classify new/update/noop
     // and NOT mutate either side of the sync. Uses today's timestamp-aware
     // merge semantics; the richer CRDT-lite preview lands with Task 3a.1.
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let local_db = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
     let remote_db = dir.join(format!("ai-memory-sync-remote-{}.db", uuid::Uuid::new_v4()));
     let bin = env!("CARGO_BIN_EXE_ai-memory");
@@ -8346,7 +8171,7 @@ fn test_sync_daemon_mesh_propagates_memory_between_peers() {
     // 4. Within a few cycles (interval=1s), db_A should contain a copy of
     //    the memory. This is the cross-machine / no-cloud knowledge mesh.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db_a = dir.join(format!("ai-memory-mesh-a-{}.db", uuid::Uuid::new_v4()));
     let db_b = dir.join(format!("ai-memory-mesh-b-{}.db", uuid::Uuid::new_v4()));
 
@@ -8513,7 +8338,7 @@ fn test_serve_native_tls_health_probe() {
     // Layer 1 — `ai-memory serve --tls-cert ... --tls-key ...` must serve
     // the health endpoint over HTTPS (self-signed cert, --insecure probe).
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db = dir.join(format!("ai-memory-tls-{}.db", uuid::Uuid::new_v4()));
     let Some((cert_path, key_path)) = gen_self_signed_cert(&dir) else {
         eprintln!("skipping: openssl not available on PATH");
@@ -8643,7 +8468,7 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
     // must succeed. A second daemon presenting an unknown cert must be
     // rejected at the TLS handshake.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
+    let dir = integration_scratch_root();
     let db_a = dir.join(format!("ai-memory-mtls-a-{}.db", uuid::Uuid::new_v4()));
     let db_b = dir.join(format!("ai-memory-mtls-b-{}.db", uuid::Uuid::new_v4()));
 
@@ -8777,6 +8602,13 @@ fn test_serve_mtls_fingerprint_allowlist_accepts_only_known_peer() {
             peer_a_cert.to_str().unwrap(),
             "--client-key",
             peer_a_key.to_str().unwrap(),
+            // #1794 — this test's posture IS the mTLS-allowlist compensating
+            // control (the SERVER pins the CLIENT cert); the server presents a
+            // self-signed test cert, so opt into accept-any server-cert
+            // verification explicitly now that CA validation is the secure
+            // default. (Server-cert validation is orthogonal to what this test
+            // asserts — client-cert allowlisting.)
+            "--insecure-skip-server-verify",
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -8847,11 +8679,7 @@ fn test_child_guard_kills_daemon_on_assert_panic() {
     // it in a ChildGuard, force a panic, catch the unwind, then verify
     // via `kill -0` that the spawned PID is gone.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-childguard-regression-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("childguard-regression");
     let port = free_port();
 
     // The PID is captured before the panic so the post-unwind block
@@ -8913,8 +8741,7 @@ fn test_serve_rejects_half_tls_config() {
     // Layer 1 — clap's `requires = "tls_key"` must reject `--tls-cert`
     // without `--tls-key` at arg-parse time.
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!("ai-memory-tls-half-{}.db", uuid::Uuid::new_v4()));
+    let db = integration_scratch_db("tls-half");
     let out = cmd(bin)
         .args([
             "--db",
@@ -9028,7 +8855,7 @@ fn curl_post(
     // Spill body to a temp file to avoid Windows CreateProcess argv overflow
     // (ERROR_FILENAME_EXCED_RANGE / OS error 206) on bulk POSTs >~32 KB.
     let payload_path =
-        std::env::temp_dir().join(format!("ai-memory-curl-{}.json", uuid::Uuid::new_v4()));
+        integration_scratch_root().join(format!("ai-memory-curl-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
@@ -9106,6 +8933,12 @@ fn install_federation_legacy_bypass() {
         unsafe {
             std::env::set_var("AI_MEMORY_FED_TRUST_BODY_AGENT_ID", "1");
             std::env::set_var("AI_MEMORY_FED_SYNC_TRUST_PEER", "1");
+            // #1789 — v0.8 flipped peer enrollment to the secure default
+            // (strict). This helper restores the pre-v0.7.0 permissive
+            // posture for the in-process suite, so opt back out of the
+            // enrollment requirement too (the per-issue g_issue_239_* /
+            // 978 binaries pin the strict default in their own processes).
+            std::env::set_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", "0");
         }
     });
 }
@@ -9367,8 +9200,7 @@ struct DaemonGuard {
 impl DaemonGuard {
     fn spawn() -> Self {
         let bin = env!("CARGO_BIN_EXE_ai-memory");
-        let dir = std::env::temp_dir();
-        let db = dir.join(format!("ai-memory-http-parity-{}.db", uuid::Uuid::new_v4()));
+        let db = integration_scratch_db("http-parity");
         let port = free_port();
         // `cmd()` already injects `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`
         // and `AI_MEMORY_FED_SYNC_TRUST_PEER=1` so the legacy posture
@@ -9835,11 +9667,7 @@ fn http_archive_by_ids_end_to_end_moves_row_from_active_to_archive() {
 fn spawn_leader(quorum_writes: usize, peer_urls: &[String]) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
     for attempt in 1..=3u8 {
-        let dir = std::env::temp_dir();
-        let db = dir.join(format!(
-            "ai-memory-http-parity-leader-{}.db",
-            uuid::Uuid::new_v4()
-        ));
+        let db = integration_scratch_db("http-parity-leader");
         let port = free_port();
         let mut args: Vec<String> = vec![
             "--db".into(),
@@ -10876,8 +10704,7 @@ fn http_namespace_standard_meta_fans_out() {
 
 #[test]
 fn test_curator_autonomy_end_to_end_cycle() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-curator-e2e-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("curator-e2e");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Seed the database with intentionally-tagable memories
@@ -11330,11 +11157,7 @@ fn spawn_leader_with_timeout(
     timeout_ms: u64,
 ) -> DaemonGuard {
     let bin = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-http-parity-leader-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("http-parity-leader");
     let port = free_port();
     let mut args: Vec<String> = vec![
         "--db".into(),
@@ -11381,8 +11204,8 @@ fn curl_put(
         args.push("-H".into());
         args.push(format!("x-agent-id: {id}"));
     }
-    let payload_path =
-        std::env::temp_dir().join(format!("ai-memory-curl-put-{}.json", uuid::Uuid::new_v4()));
+    let payload_path = integration_scratch_root()
+        .join(format!("ai-memory-curl-put-{}.json", uuid::Uuid::new_v4()));
     std::fs::write(&payload_path, body.to_string()).unwrap();
     args.push("--data-binary".into());
     args.push(format!("@{}", payload_path.display()));
@@ -12337,8 +12160,7 @@ fn test_cli_smoke_subcommand_help() {
 #[test]
 #[allow(clippy::too_many_lines)] // CLI smoke matrix exercises 30+ subcommands sequentially
 fn test_cli_smoke_canonical_paths() {
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-cli-smoke-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("cli-smoke");
     let binary = env!("CARGO_BIN_EXE_ai-memory");
 
     // Tier 2: canonical happy-path invocations
@@ -12501,7 +12323,8 @@ fn test_cli_smoke_canonical_paths() {
     assert!(pending_output.status.success(), "pending list failed");
 
     // 18. backup: backup the database
-    let backup_dir = dir.join(format!("ai-memory-backup-{}", uuid::Uuid::new_v4()));
+    let backup_dir =
+        integration_scratch_root().join(format!("ai-memory-backup-{}", uuid::Uuid::new_v4()));
     let backup_output = cmd_output_or_panic(
         binary,
         &[
@@ -12924,8 +12747,7 @@ const FAILURE_CASES: &[FailureCase] = &[
 #[test]
 fn test_cli_failure_matrix() {
     let binary = env!("CARGO_BIN_EXE_ai-memory");
-    let dir = std::env::temp_dir();
-    let db_path = dir.join(format!("ai-memory-failure-{}.db", uuid::Uuid::new_v4()));
+    let db_path = integration_scratch_db("failure");
     let db_str = db_path.to_str().unwrap();
 
     // Test each failure case
@@ -13057,8 +12879,7 @@ async fn test_daemon_cmd_serve_responds_to_health_then_terminates() {
     // the production HTTP path of main.rs::serve (lines 1326-1338 of
     // v0.6.3). The shared `build_router` keeps the route table identical
     // to the production daemon.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!("ai-memory-serve-test-{}.db", uuid::Uuid::new_v4()));
+    let db = integration_scratch_db("serve-test");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -13136,9 +12957,8 @@ async fn test_daemon_cmd_sync_daemon_pulls_then_terminates() {
     // Drives a real peer (an in-process serve_http_with_shutdown) so the
     // pull/push round-trips exercise the production handlers + db sync
     // state code paths.
-    let dir = std::env::temp_dir();
-    let db_peer = dir.join(format!("ai-memory-sync-peer-{}.db", uuid::Uuid::new_v4()));
-    let db_local = dir.join(format!("ai-memory-sync-local-{}.db", uuid::Uuid::new_v4()));
+    let db_peer = integration_scratch_db("sync-peer");
+    let db_local = integration_scratch_db("sync-local");
 
     // Initialise the local DB so the sync_cycle's `db::open` calls find a
     // valid file. The schema is created on first open.
@@ -13228,11 +13048,7 @@ async fn test_daemon_cmd_curator_daemon_cycles_then_terminates() {
     // run_daemon's interval is clamped to 60s minimum, but its shutdown
     // poll fires every 500ms, so we observe clean termination within
     // ~500ms regardless.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-curator-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("curator-test");
     {
         let _ = ai_memory::db::open(&db).unwrap();
     }
@@ -13297,11 +13113,7 @@ async fn test_daemon_serve_http_with_shutdown_future_runs_with_custom_cleanup() 
     // that does nontrivial async work (a tokio sleep + observable side
     // effect via an AtomicBool) before resolving, and confirm the helper
     // runs the future and returns gracefully.
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-serve-future-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("serve-future-test");
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
 
@@ -13387,15 +13199,8 @@ async fn test_daemon_sync_with_shutdown_using_client_accepts_custom_client() {
     // We pass a custom client (non-default timeout, distinct user-agent)
     // and confirm at least one cycle runs against an in-process peer
     // and shutdown is honored.
-    let dir = std::env::temp_dir();
-    let db_peer = dir.join(format!(
-        "ai-memory-sync-client-peer-{}.db",
-        uuid::Uuid::new_v4()
-    ));
-    let db_local = dir.join(format!(
-        "ai-memory-sync-client-local-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db_peer = integration_scratch_db("sync-client-peer");
+    let db_local = integration_scratch_db("sync-client-local");
     {
         let _ = ai_memory::db::open(&db_local).unwrap();
     }
@@ -13506,11 +13311,7 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
     // var once per binary so the resolver lands on `CompiledDefault`
     // and the no-construct short-circuit (lines 4121-4127) fires.
     common::ensure_no_config_env();
-    let dir = std::env::temp_dir();
-    let db = dir.join(format!(
-        "ai-memory-curator-prim-test-{}.db",
-        uuid::Uuid::new_v4()
-    ));
+    let db = integration_scratch_db("curator-prim-test");
     {
         let _ = ai_memory::db::open(&db).unwrap();
     }
@@ -13526,7 +13327,8 @@ async fn test_daemon_curator_with_primitives_runs_with_dry_run_config() {
             true, // dry_run
             Vec::new(),
             Vec::new(),
-            None, // llm — keyword-only path, no LLM (#1440)
+            false, // compaction_enabled (#1749) — default off
+            None,  // llm — keyword-only path, no LLM (#1440)
             shutdown_for_daemon,
         )
         .await

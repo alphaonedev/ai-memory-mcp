@@ -121,6 +121,10 @@
           "title": {
             "description": "Short title",
             "type": "string"
+          },
+          "lifecycle_state": {
+            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
+            "type": "string"
           }
         },
         "required": [
@@ -770,8 +774,8 @@
       "name": "memory_promote"
     },
     {
-      "description": "Bulk delete memories matching a pattern, namespace, or tier (archives first).",
-      "docs": "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every whitespace-separated token must match (#1601). Archives first (recover via memory_archive_restore). dry_run previews the matched rows (id/title/namespace/tier, capped + truncated flag); live runs return deleted_ids (same cap).",
+      "description": "Bulk delete memories matching a pattern, namespace, or tier (archived first when archive-on-gc is on, else permanent).",
+      "docs": "Bulk delete by pattern/namespace/tier. Pattern uses AND semantics: every whitespace-separated token must match (#1601). When archive-on-gc is enabled (the default) matched rows are archived first, so recovery via memory_archive_restore is one call; when archive-on-gc is disabled this is a permanent hard-delete with no recoverable copy (the response's `archived` field reports which happened). dry_run previews the matched rows (id/title/namespace/tier, capped + truncated flag); live runs return deleted_ids (same cap).",
       "inputSchema": {
         "properties": {
           "dry_run": {
@@ -873,6 +877,10 @@
             "type": "string"
           },
           "title": {
+            "type": "string"
+          },
+          "lifecycle_state": {
+            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
             "type": "string"
           }
         },
@@ -1039,7 +1047,7 @@
             "type": "string"
           },
           "depth": {
-            "description": "v0.7.0 #1325 — caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
+            "description": "v0.7.0 #1325 \u2014 caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
             "type": "integer"
           },
           "metadata": {
@@ -2290,7 +2298,7 @@
             "type": "string"
           },
           "role": {
-            "description": "Speaker classification — `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
+            "description": "Speaker classification \u2014 `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
             "type": "string"
           },
           "timestamp_iso": {
@@ -2311,6 +2319,804 @@
         "type": "object"
       },
       "name": "memory_capture_turn"
+    },
+    {
+      "description": "Create a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): insert a pending coordination action into the action DAG.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_create`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {
+            "default": null
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "payload": {
+            "default": null
+          },
+          "priority": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "namespace",
+          "title"
+        ],
+        "title": "ActionCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_action_create"
+    },
+    {
+      "description": "Fetch a coordination action by id (#1709).",
+      "docs": "Pillar 1 (#1709): return one coordination action by id, or null when absent.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_get`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ActionGetRequest",
+        "type": "object"
+      },
+      "name": "memory_action_get"
+    },
+    {
+      "description": "State-guarded transition of a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): move an action to a new state if the transition is legal.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_transition`.",
+        "properties": {
+          "claimed_by": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "to": {
+            "description": "Target state name (`pending` / `claimed` / `in_progress` / `done` / `failed` / `abandoned`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "to"
+        ],
+        "title": "ActionTransitionRequest",
+        "type": "object"
+      },
+      "name": "memory_action_transition"
+    },
+    {
+      "description": "List coordination actions by namespace/state (#1709).",
+      "docs": "Pillar 1 (#1709): query the action DAG, filtered by namespace/state, newest-first.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "default": null,
+            "description": "Optional state-name filter.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ActionListRequest",
+        "type": "object"
+      },
+      "name": "memory_action_list"
+    },
+    {
+      "description": "Add a typed DAG edge between two coordination actions (#1709).",
+      "docs": "Pillar 1 (#1709): insert a typed dependency edge into the action DAG.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_add_edge`.",
+        "properties": {
+          "edge_type": {
+            "description": "Edge kind (`requires` / `unlocks` / `blocks` / `gated_by` / `sibling`).",
+            "type": "string"
+          },
+          "from_action": {
+            "type": "string"
+          },
+          "to_action": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "edge_type",
+          "from_action",
+          "to_action"
+        ],
+        "title": "ActionAddEdgeRequest",
+        "type": "object"
+      },
+      "name": "memory_action_add_edge"
+    },
+    {
+      "description": "List DAG edges for a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): return every typed edge touching an action.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_edges`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ActionEdgesRequest",
+        "type": "object"
+      },
+      "name": "memory_action_edges"
+    },
+    {
+      "description": "Acquire a single-holder lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_acquire`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "default": null,
+            "description": "Lease lifetime in seconds (default 60). `expires_at` is computed internally as `now + ttl_secs`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseAcquireRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_acquire"
+    },
+    {
+      "description": "Heartbeat-renew an owned lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_renew`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "default": null,
+            "description": "New lease lifetime in seconds (default 60). `expires_at` is computed internally as `now + ttl_secs`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseRenewRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_renew"
+    },
+    {
+      "description": "Release an owned lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): release an owned lease; reports whether a row was removed.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_release`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "title": "LeaseReleaseRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_release"
+    },
+    {
+      "description": "Read the lease on a coordination action (#1709).",
+      "docs": "Pillar 1 (#1709): return the lease on an action, or null when none is held.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_get`.",
+        "properties": {
+          "action_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id"
+        ],
+        "title": "LeaseGetRequest",
+        "type": "object"
+      },
+      "name": "memory_lease_get"
+    },
+    {
+      "description": "Send a typed, optionally Ed25519-signed inter-agent signal (#1709).",
+      "docs": "Pillar 1 (#1709): create a signal; self-signed when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_send`.",
+        "properties": {
+          "body": {
+            "default": null
+          },
+          "correlation_id": {
+            "default": null,
+            "description": "Correlation id grouping a thread of signals.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_agent": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "default": null,
+            "description": "Threads a `response` back onto its `request` signal id.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "reference_ids": {
+            "default": null,
+            "description": "JSON array of related signal / memory ids."
+          },
+          "signal_type": {
+            "default": null,
+            "description": "Signal kind (`authorize` / `notify` / `request` / `response` / `broadcast`). Defaults to `notify`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "to_agent": {
+            "default": null,
+            "description": "Recipient agent id. Omit for a namespace-wide broadcast.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_agent",
+          "namespace",
+          "subject"
+        ],
+        "title": "SignalSendRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_send"
+    },
+    {
+      "description": "Read one signal by id, mark it read, and report verify status (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a signal, stamp read_at, and verify its Ed25519 signature.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_read`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SignalReadRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_read"
+    },
+    {
+      "description": "List signals for a namespace/recipient \u2014 direct + broadcast (#1709).",
+      "docs": "Pillar 1 (#1709): the recipient inbox \u2014 direct messages plus namespace broadcasts, newest-first.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_inbox`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "to_agent": {
+            "default": null,
+            "description": "Recipient agent id. When set, returns direct messages to this agent plus namespace broadcasts; when omitted, returns every signal in the namespace.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "SignalInboxRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_inbox"
+    },
+    {
+      "description": "List a signal correlation thread, oldest-first (#1709).",
+      "docs": "Pillar 1 (#1709): return every signal sharing a correlation_id in thread order.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_thread`.",
+        "properties": {
+          "correlation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "correlation_id"
+        ],
+        "title": "SignalThreadRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_thread"
+    },
+    {
+      "description": "Acknowledge a signal by id (#1709).",
+      "docs": "Pillar 1 (#1709): stamp acknowledged_at on a signal; reports whether this call set it.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_ack`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SignalAckRequest",
+        "type": "object"
+      },
+      "name": "memory_signal_ack"
+    },
+    {
+      "description": "Create a pending attested-checkpoint coordination gate (#1709).",
+      "docs": "Pillar 1 (#1709): create a checkpoint in the pending state, gated on an external condition.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_create`.",
+        "properties": {
+          "condition": {
+            "default": null,
+            "description": "JSON condition spec for the gate. Defaults to `{}`."
+          },
+          "condition_type": {
+            "default": null,
+            "description": "Condition type (`approval` / `external_signal` / `condition_predicate` / `deadline`). Defaults to `approval`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "default": null,
+            "description": "Agent id that created the checkpoint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deadline_at": {
+            "default": null,
+            "description": "Epoch-seconds deadline after which the checkpoint may expire.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": null,
+            "description": "Arbitrary JSON metadata. Defaults to `{}`."
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "title"
+        ],
+        "title": "CheckpointCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_create"
+    },
+    {
+      "description": "Resolve a checkpoint (resolved/rejected), Ed25519-attested when signing (#1709).",
+      "docs": "Pillar 1 (#1709): resolve a checkpoint; the resolution self-signs when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_resolve`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "resolution": {
+            "default": null,
+            "description": "Structured resolution payload (free-form string).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution_note": {
+            "default": null,
+            "description": "Human-readable note explaining the resolution.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "type": "string"
+          },
+          "state": {
+            "description": "Resolution state \u2014 one of `resolved` / `rejected`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resolved_by",
+          "state"
+        ],
+        "title": "CheckpointResolveRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_resolve"
+    },
+    {
+      "description": "Query checkpoints by namespace/condition_type/state, newest-first (#1709).",
+      "docs": "Pillar 1 (#1709): list a namespace's checkpoints, optionally narrowed by condition_type and state.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_query`.",
+        "properties": {
+          "condition_type": {
+            "default": null,
+            "description": "Narrow to a single condition type when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "default": null,
+            "description": "Narrow to a single lifecycle state when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "CheckpointQueryRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_query"
+    },
+    {
+      "description": "Fetch a checkpoint by id and verify its attested resolution (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a checkpoint and verify its Ed25519 attested-resolution signature.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_verify`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "CheckpointVerifyRequest",
+        "type": "object"
+      },
+      "name": "memory_checkpoint_verify"
+    },
+    {
+      "description": "Create a draft routine \u2014 a parameterised action+edge template (#1709).",
+      "docs": "Pillar 1 (#1709): create a routine in the draft state from a JSON template with `{{parameter}}` placeholders; freeze it before it can be run.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_create`.",
+        "properties": {
+          "created_by": {
+            "default": null,
+            "description": "Agent id that created the routine.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": null,
+            "description": "Arbitrary JSON metadata. Defaults to `{}`."
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parameters": {
+            "default": null,
+            "description": "JSON array of declared parameter names. Defaults to `[]`."
+          },
+          "template": {
+            "default": null,
+            "description": "JSON action+edge declarations carrying `{{parameter}}` placeholders. Defaults to `{}`."
+          }
+        },
+        "required": [
+          "name",
+          "namespace"
+        ],
+        "title": "RoutineCreateRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_create"
+    },
+    {
+      "description": "Freeze a routine (draft -> frozen), Ed25519-attested when signing (#1709).",
+      "docs": "Pillar 1 (#1709): freeze a routine into its immutable regulatory-hold form; the frozen template self-signs when a signing keypair is available.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_freeze`.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "RoutineFreezeRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_freeze"
+    },
+    {
+      "description": "Run a frozen routine \u2014 materialise its template into action rows (#1709).",
+      "docs": "Pillar 1 (#1709): materialise a frozen routine under a concrete argument binding into first-class action+edge rows; a malformed template records the run as failed rather than panicking.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_run`.",
+        "properties": {
+          "arguments": {
+            "description": "Concrete `{{param}} -> value` bindings substituted into the template."
+          },
+          "routine_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "routine_id"
+        ],
+        "title": "RoutineRunRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_run"
+    },
+    {
+      "description": "Fetch a routine run by id, with its state and created action ids (#1709).",
+      "docs": "Pillar 1 (#1709): fetch a routine run by id; the run field is null when no row matches.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_status`.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "RoutineStatusRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_status"
+    },
+    {
+      "description": "List a namespace's routines by state, newest-first (#1709).",
+      "docs": "Pillar 1 (#1709): list a namespace's routines, optionally narrowed by lifecycle state, newest-first.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_list`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "default": null,
+            "description": "Narrow to a single lifecycle state (`draft` / `frozen`) when set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "RoutineListRequest",
+        "type": "object"
+      },
+      "name": "memory_routine_list"
+    },
+    {
+      "description": "Rank the UNBLOCKED coordination-action frontier (#1709).",
+      "docs": "Pillar 1 (#1709 \u00a711.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_frontier`.",
+        "properties": {
+          "limit": {
+            "default": null,
+            "description": "Max rows to return (default 20).",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "ActionFrontierRequest",
+        "type": "object"
+      },
+      "name": "memory_action_frontier"
+    },
+    {
+      "description": "Return the top UNBLOCKED coordination action to do next (#1709).",
+      "docs": "Pillar 1 (#1709 \u00a711.4): the single highest-ranked unblocked action; optionally narrowed to the caller's owned/unowned work.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_next`.",
+        "properties": {
+          "agent_id": {
+            "default": null,
+            "description": "When set, narrow the candidate set to actions with no owner OR owned by this agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "title": "ActionNextRequest",
+        "type": "object"
+      },
+      "name": "memory_action_next"
     }
   ],
   "toolsVersion": "2026-05-06"

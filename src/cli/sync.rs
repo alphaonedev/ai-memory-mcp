@@ -57,6 +57,13 @@ pub struct SyncDaemonArgs {
     /// **DANGEROUS** — accepts any server cert without validation.
     #[arg(long, default_value_t = false)]
     pub insecure_skip_server_verify: bool,
+    /// #1794 — path to a PEM CA certificate to trust for peer server-cert
+    /// validation (self-signed / private-CA peers). Mirrors the quorum
+    /// client's `--quorum-ca-cert`. Without it, peers are validated against
+    /// the bundled public webpki roots (the secure default). Mutually
+    /// exclusive with `--insecure-skip-server-verify`.
+    #[arg(long, conflicts_with = "insecure_skip_server_verify")]
+    pub ca_cert: Option<PathBuf>,
 }
 
 /// NHI: restamp `metadata.agent_id` to the caller's id, preserving the
@@ -81,6 +88,31 @@ fn restamp_agent_id(mem: &mut models::Memory, caller_id: &str) {
                 serde_json::Value::String(orig),
             );
         }
+    }
+}
+
+/// #1794 — build the optional reqwest mTLS client identity from the
+/// `--client-cert` / `--client-key` PEM pair (both-or-neither). Shared by the
+/// CA-validated and accept-any sync TLS arms (the pinning arm threads the cert
+/// through `build_rustls_pinning_client_config` instead).
+fn sync_client_identity(
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
+) -> Result<Option<reqwest::Identity>> {
+    match (client_cert, client_key) {
+        (Some(cert), Some(key)) => {
+            let cert_pem =
+                std::fs::read(cert).map_err(|e| anyhow::anyhow!("read --client-cert: {e}"))?;
+            let key_pem =
+                std::fs::read(key).map_err(|e| anyhow::anyhow!("read --client-key: {e}"))?;
+            let mut pem = cert_pem;
+            pem.extend_from_slice(b"\n");
+            pem.extend_from_slice(&key_pem);
+            let identity = reqwest::Identity::from_pem(&pem)
+                .map_err(|e| anyhow::anyhow!("build mTLS identity: {e}"))?;
+            Ok(Some(identity))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -406,25 +438,71 @@ pub async fn run_daemon(
         );
     }
 
-    let client = if let (Some(cert_path), Some(key_path)) = (&args.client_cert, &args.client_key) {
-        let rustls_config = tls::build_rustls_client_config(cert_path, key_path).await?;
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .use_preconfigured_tls(rustls_config);
-        if args.insecure_skip_server_verify {
-            tracing::warn!(
-                "sync-daemon: --insecure-skip-server-verify set with --client-cert — \
-                 peer server certificates will NOT be validated; peer authenticates us \
-                 via mTLS allowlist (compensating control). Do NOT use in production."
-            );
-            builder = builder.danger_accept_invalid_certs(true);
+    // #1794 (5-agent vote 4d3ea1c5) — the CLI sync outbound-TLS posture now
+    // mirrors the production quorum client (federation/peer.rs): the SECURE
+    // DEFAULT is normal CA validation (reqwest's bundled webpki roots + an
+    // optional --ca-cert for self-signed peers), NOT the prior accept-any
+    // `DangerousAnyServerVerifier`. Precedence: pinning > insecure-opt-out >
+    // CA-validate (see `tls::select_sync_tls_mode`).
+    let pins = tls::peer_fingerprint_map_from_env()?;
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    builder = match tls::select_sync_tls_mode(args.insecure_skip_server_verify, pins.is_some()) {
+        tls::SyncTlsMode::Pinning => {
+            // #1678/#1794 — per-host server-cert pinning, fail-closed for
+            // unpinned hosts, carrying the optional mTLS client identity.
+            let pinning_config = tls::build_rustls_pinning_client_config(
+                pins.expect("pins present in Pinning mode"),
+                args.client_cert.as_deref(),
+                args.client_key.as_deref(),
+            )?;
+            builder.use_preconfigured_tls(pinning_config)
         }
-        builder.build()?
-    } else {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?
+        tls::SyncTlsMode::AcceptAny => {
+            // --insecure-skip-server-verify (gated above on a client cert):
+            // accept ANY server cert. Loud, explicit opt-out only.
+            tracing::warn!(
+                "sync-daemon: --insecure-skip-server-verify set — peer server certificates \
+                 will NOT be validated; peer authenticity relies entirely on the peer pinning \
+                 our mTLS client cert. Do NOT use on hostile networks."
+            );
+            let mut b = builder.use_rustls_tls().danger_accept_invalid_certs(true);
+            if let Some(id) =
+                sync_client_identity(args.client_cert.as_deref(), args.client_key.as_deref())?
+            {
+                b = b.identity(id);
+            }
+            b
+        }
+        tls::SyncTlsMode::CaValidated => {
+            // Secure default — CA-validate the peer (bundled webpki roots +
+            // optional --ca-cert). Mirrors federation/peer.rs's quorum client.
+            let mut b = builder.use_rustls_tls();
+            if let Some(ca_path) = &args.ca_cert {
+                let ca_pem = tokio::fs::read(ca_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read --ca-cert: {e}"))?;
+                // reqwest::Certificate::from_pem accepts a marker-less file as
+                // an empty chain — pre-flight the PEM marker so a non-PEM path
+                // errors loudly (mirrors the --quorum-ca-cert strict check).
+                if !ca_pem.windows(11).any(|w| w == b"-----BEGIN ") {
+                    anyhow::bail!(
+                        "parse --ca-cert: input at {} contains no PEM `-----BEGIN ` marker",
+                        ca_path.display()
+                    );
+                }
+                let ca = reqwest::Certificate::from_pem(&ca_pem)
+                    .map_err(|e| anyhow::anyhow!("parse --ca-cert: {e}"))?;
+                b = b.add_root_certificate(ca);
+            }
+            if let Some(id) =
+                sync_client_identity(args.client_cert.as_deref(), args.client_key.as_deref())?
+            {
+                b = b.identity(id);
+            }
+            b
+        }
     };
+    let client = builder.build()?;
 
     tracing::info!(
         "sync-daemon: local_agent_id={local_agent_id} peers={peers:?} interval={interval}s",
@@ -560,6 +638,37 @@ mod tests {
     }
 
     #[test]
+    fn ca_cert_conflicts_with_insecure_skip_1794() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: SyncDaemonArgs,
+        }
+        // #1794 — --ca-cert and --insecure-skip-server-verify are contradictory
+        // (validate vs accept-any) → clap must REJECT them together at parse.
+        let conflict = TestCli::try_parse_from([
+            "x",
+            "--peers",
+            "https://p",
+            "--insecure-skip-server-verify",
+            "--ca-cert",
+            "/tmp/ca.pem",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "--ca-cert + --insecure-skip-server-verify must conflict at parse"
+        );
+        // --ca-cert alone parses + populates the field.
+        let ok = TestCli::try_parse_from(["x", "--peers", "https://p", "--ca-cert", "/tmp/ca.pem"])
+            .expect("--ca-cert alone must parse");
+        assert_eq!(ok.args.ca_cert.as_deref(), Some(Path::new("/tmp/ca.pem")));
+        // Default: neither flag set.
+        let plain = TestCli::try_parse_from(["x", "--peers", "https://p"]).expect("plain parse");
+        assert!(plain.args.ca_cert.is_none() && !plain.args.insecure_skip_server_verify);
+    }
+
+    #[test]
     fn test_restamp_agent_id_preserves_original() {
         let mut mem = models::Memory {
             id: "m1".to_string(),
@@ -588,6 +697,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         restamp_agent_id(&mut mem, "local-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "local-agent");
@@ -626,6 +736,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         restamp_agent_id(&mut mem, "same-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "same-agent");
@@ -644,6 +755,7 @@ mod tests {
             client_cert: None,
             client_key: None,
             insecure_skip_server_verify: false,
+            ca_cert: None,
         };
         let res = run_daemon(&db, args, Some("test-agent")).await;
         assert!(res.is_err());
@@ -662,6 +774,7 @@ mod tests {
             client_cert: None,
             client_key: None,
             insecure_skip_server_verify: true,
+            ca_cert: None,
         };
         let res = run_daemon(&db, args, Some("test-agent")).await;
         assert!(res.is_err());
@@ -872,6 +985,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         drop(conn);
@@ -914,6 +1028,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         restamp_agent_id(&mut mem, "caller-agent");
         assert_eq!(mem.metadata["agent_id"].as_str().unwrap(), "caller-agent");

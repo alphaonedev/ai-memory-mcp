@@ -810,6 +810,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
     }
@@ -1241,6 +1242,7 @@ mod tests {
                 approver: ApproverType::Human,
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             export: ExportPolicy {
                 auto_export_reflections_to_filesystem: Some(true),

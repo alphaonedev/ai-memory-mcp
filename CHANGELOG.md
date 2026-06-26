@@ -5,6 +5,708 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-06-25 — `distributed-coordination` (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
+
+In progress on `release/v0.8.0`. Schema advances v57 → **v67** (additive: actions /
+action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
+routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
+6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
+v64; the `memory_links` signature-trigger restore at v65; the
+`governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
+for the §22 PE-5 `Decision::Escalate` verdict at v66; the
+`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **100 MCP tools** at `--profile full` and
+**27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
+lifecycle surface adds only permissive optional fields to the existing
+`memory_store` / `memory_update` request structs).
+
+### Breaking / secure-default changes
+
+- **[#1794](https://github.com/alphaonedev/ai-memory-mcp/issues/1794) — `ai-memory sync` now CA-validates
+  peer server certificates by default (was accept-ANY).** The CLI sync outbound-HTTPS path previously
+  used `DangerousAnyServerVerifier` — it accepted ANY peer server certificate, relying solely on the
+  peer pinning our mTLS client cert as the compensating control (MITM-able on a hostile network where
+  the peer doesn't pin us). It now mirrors the production quorum client (`federation/peer.rs`): the
+  **secure default is normal CA validation** against the bundled public webpki roots, with precedence
+  `AI_MEMORY_FED_PEER_FINGERPRINTS` pinning (fail-closed for unpinned hosts) > `--insecure-skip-server-verify`
+  (the explicit accept-any opt-out, still gated on an mTLS client cert) > a new `--ca-cert <pem>`
+  (trust a self-signed / private-CA peer, mirroring `--quorum-ca-cert`) > default CA validation.
+  `--insecure-skip-server-verify` and `--ca-cert` are mutually exclusive (clap conflict). **Migration:**
+  an existing `ai-memory sync` against a SELF-SIGNED peer over mTLS with no flag will now fail the TLS
+  handshake — add `--ca-cert <peer-ca.pem>` (recommended) or `--insecure-skip-server-verify` to restore
+  it. Routed through reqwest-native TLS (`use_rustls_tls` + `Identity` + `add_root_certificate`) — zero
+  new dependencies. Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Overturns the
+  prior #1678 CLI-accept-any posture. Code anchors: `src/tls.rs`, `src/cli/sync.rs`.
+
+- **[#1780](https://github.com/alphaonedev/ai-memory-mcp/issues/1780) — `import` / `mine` no longer
+  silently clobber a distinct same-title memory.** Both CLI write paths previously inserted via the
+  legacy silent-merge upsert (`ConflictMode::Merge`), so a `(title, namespace)` collision with a
+  DISTINCT existing memory silently overwrote it — a data-loss footgun (e.g. two mined conversations
+  that truncate to the same 100-char title would clobber each other). **Behavior change:** the new
+  `--on-conflict {error|merge|version}` flag governs the collision disposition on both `ai-memory
+  import` and `ai-memory mine`, **defaulting to `version`** — a colliding row is auto-suffixed
+  (`title (2)`, `title (3)`, …) until a free slot is found, so the import completes losslessly and
+  both rows persist (never a clobber). `--on-conflict merge` restores the prior idempotent-upsert
+  behavior (re-import a trusted backup without creating suffixed duplicates); `--on-conflict error`
+  refuses each colliding row with a typed `CONFLICT` diagnostic, leaves the existing memory untouched,
+  and continues the import (the error is collected per-row, never an abort). Root cause also fixed:
+  `mine` now populates `source_uri` with `<source-tag>:<conversation-id>` so distinct conversations
+  that share a truncated title remain distinguishable by provenance. Wires the existing
+  `db::insert_with_conflict(conn, mem, ConflictMode)` primitive. Design fixed by the 5-agent
+  adversarial vote (memory `4d3ea1c5`). Code anchor: `src/cli/io.rs`.
+
+- **[#1789](https://github.com/alphaonedev/ai-memory-mcp/issues/1789) — federation now requires peer enrollment by default.**
+  `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` flipped its default OFF → **ON** (env-table row #43):
+  inbound `/sync/push` and `/sync/since` now refuse an `X-Peer-Id` that has no enrolled Ed25519
+  key (and no valid `X-Memory-Sig`) with `401 peer_not_enrolled` — the v0.8 secure default,
+  closing the v0.7.0 zero-config unenrolled-peer attribution-spoofing window. **Migration:**
+  enroll each peer's Ed25519 key via the operator workflow; OR revert to the v0.7.x permissive
+  posture with `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=0` (any falsy value: `0`/`false`/`no`/`off`);
+  OR keep accepting unenrolled peers during a rollout window with the now-WIRED escape hatch
+  `AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1` (env-table row #44 — previously documented but inert,
+  wired by this change so the flip is not a hard break with no opt-out). The combined gate is
+  `require_peer_enrollment_enabled() && !allow_unenrolled_peers_enabled()` at both
+  `/sync/push` and `/sync/since`. Design fixed by the 5-agent adversarial vote (memory `4d3ea1c5`).
+  Code anchor: `src/handlers/federation_signing_check.rs`.
+
+- **[#1774](https://github.com/alphaonedev/ai-memory-mcp/issues/1774) — consolidation now requires a
+  stored embedding on BOTH sides of a pair.** Consolidation clustering merges a candidate pair only
+  when it passes **BOTH** the Jaccard pre-filter **AND** the cosine gate; the cosine gate now requires
+  a stored embedding on each side. When either side lacks a stored embedding (keyword-tier /
+  never-embedded / oversize-skip rows, no embedder wired, or an embed failure) the pair **no longer
+  merges**. This closes a destructive false-positive-merge gap: previously an un-embedded pair could
+  merge-and-delete on lexical Jaccard overlap **alone**, bypassing the cosine safety gate — and two
+  distinct memories can share high Jaccard (e.g. templated content), so lexical overlap is not a safe
+  basis for a destructive op. **Behavior change:** un-embedded / keyword-tier corpora no longer
+  auto-consolidate; deployments that want consolidation must run the embedder. This mirrors the
+  substrate's skip-on-missing-embedding posture for the other destructive path
+  (`proactive_conflict_check` filters `embedding IS NOT NULL`). **No config knob** is added. Affects
+  both the autonomy Pass-1 consolidator (`crate::autonomy::find_consolidation_clusters`) and the SAL
+  `ConsolidationPass` (`crate::curator::cluster::pair_merges`, `ConsolidationClustering`), kept
+  byte-consistent. Design fixed by the 5-agent adversarial vote (memory `4d3ea1c5`). Code anchors:
+  `src/curator/cluster.rs`, `src/autonomy.rs`, `src/curator/compaction.rs`.
+
+### Added
+
+- **#1734 (PE-1) — mandatory-hook *presence* enforcement (required-event → fail-closed).**
+  Per-hook `FailMode::Open|Closed` already fails closed when a configured hook errors/times out, but an
+  **absent or disabled** hook yields an empty `HookChain` whose `fire` returns `Allow` from its terminal
+  arm — so an operator relying on a pre-write governance/policy hook got **silently no enforcement** if
+  that hook was missing (`FailMode` can never fire on an empty chain). PE-1 closes this presence gap with
+  a tri-state mode + an explicit required-event declaration: `AI_MEMORY_HOOKS_ENFORCE_MODE` /
+  `[hooks].enforce_mode` (`off`|`advisory`|`enforce`, default `off`, resolver ladder env > config > off,
+  mirroring `AI_MEMORY_PERMISSIONS_MODE`) + `[hooks].required_events` (default **empty** — an empty set is
+  a hard no-op **even under `enforce`**, the self-DOS guard, since most daemons run zero hooks). The pure,
+  unit-tested dispatch-layer helper `hooks::enforce_required_event_presence` (checked **around**, never
+  inside, `HookChain::fire`) returns `Deny{code:503}` under `enforce` when a required event has no enabled
+  hook (and `effective_fail_mode` forces required-event hooks to `Closed` so a present-but-fail-open hook
+  can't defeat enforce); `advisory` WARNs (`hooks.enforce.violation`) + allows. Only pre-* mutation/
+  governance events are eligible (`PreStore`/`PreDelete`/`PrePromote`/`PreLink`/`PreConsolidate`/
+  `PreGovernanceDecision`/`PreReflect`); an ineligible entry is dropped with a WARN. **Default `off` is
+  byte-identical to pre-#1734** (regression-pinned). Discoverability: boot banner (silent when `off`) +
+  `ai-memory doctor --hooks` pre-flight ("`PreStore`: REQUIRED but NO enabled hook → WILL DENY"). Design
+  resolved by the 5-agent adversarial vote (memory `4d3ea1c5`); explicitly **not** an `EnforceProfile`
+  type, a parallel enforce engine, a new `ChainResult` variant, or `RuleEngine` integration. Env-table row
+  #83 + `tests/config_precedence.rs` pin. Code anchors: `src/hooks/enforce.rs`, `src/config.rs`
+  (`resolve_hooks_enforce_mode`, `resolve_required_events`), `src/cli/doctor.rs`, `src/daemon_runtime.rs`.
+- **#1714 (Pillar-1) — MCP `memory_signal_ack` now fires the `PostSignalAck` hook (first MCP hook-event wire-in).**
+  The synchronous MCP stdio dispatch held no `HookChain` handle, so no `HookEvent` fired from MCP-driven
+  coordination operations. This wires the highest-value POST coordination event — `PostSignalAck` — through
+  the existing #1729 `SignalHooks` plumbing to the async hook chain via a best-effort observer
+  (`hooks::spawn_post_event_observer`, the runtime-independent sibling of `spawn_eviction_observer`: it owns
+  a self-contained current-thread runtime because the MCP loop runs on a `spawn_blocking` thread with no
+  entered runtime). **Inert by default:** the bridge sink is installed only when the operator has configured
+  a `post_signal_ack` `[[hook]]`; with none configured, dispatch is byte-identical to before (no observer
+  thread spawned). **POST-only:** the async observer drains after the op returned, so it cannot carry a
+  pre-event's deny/modify — `pre_signal_send` *enforcement* over MCP needs a synchronous in-dispatch chain
+  and is tracked as #1752. Coordination observability remains durably available regardless via the
+  `signed_events` audit chain (every signal/checkpoint/routine op emits a `coordination.*` row, e.g.
+  `coordination_audit::emit(SIGNAL_ACK, …)`, pinned by `send_emits_signed_events_audit_row_1714`); the hook
+  bridge adds real-time push to operator-configured subscribers. Decision: 5-agent vote (memory `aa50550b`).
+  Code anchors: `src/hooks/chain.rs` (`spawn_post_event_observer`), `src/mcp/mod.rs`
+  (`build_mcp_signal_hooks`, `dispatch_memory_signal_ack`, serve-init wiring in `run_mcp_server`).
+- **#1464 (P0 security) — agent-attestation v0.8 hardening: deprecation WARN for the permissive store default.**
+  Post-#626 Layer-3 follow-up. The federation receive-path forge hole (an enrolled peer claiming
+  another agent's authorship → wrong quota/ownership) was **already closed** earlier on this branch
+  by the per-memory authorship gate (`resolve_inbound_attribution`, commit `4985ee0e`): an
+  unauthorized relayed `metadata.agent_id` claim is rewritten to the sender and stamped
+  `attest_level = "claimed"`. This change adds the **store-path secure-default deprecation WARN**:
+  when `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is unset (permissive default) and an unsigned direct
+  CLI/MCP/HTTP write lands `claimed`, the substrate warns **once per process** that v0.9 will flip
+  the store-path default to require attestation (tracked: #1751), with `store --sign` /
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` as the early opt-in. The WARN is deliberately scoped to
+  the **store path** and does not imply it hardens the federation boundary (the receive path attests
+  via the peer-authorship allowlist, not this flag). **Honest scoping (5-agent vote, UNANIMOUS
+  Option A, memory `45a27602`):** the issue's "thread the synced-write signature through
+  `stamp_attestation`" premise was inaccurate — `SyncPushBody.memories` carries no per-memory agent
+  signature on the wire, so per-write *cryptographic* attestation of synced memories (upgrade
+  `claimed→agent_attested`) needs a federation wire-protocol extension and is tracked under Pillar-3
+  CRDT #1719 (item-3: thread attestation into `merge_inbound`); the v0.8.0 default-flip was
+  deferred to v0.9 (#1751) because flipping now would `403` every unsigned writer with no migration
+  path while curator/autonomy self-writes bypass the gate entirely. Code anchors:
+  `src/identity/attest.rs` (`should_warn_permissive_default`, `warn_permissive_attestation_default_once`),
+  `docs/SECURITY.md` threat-model item 3.
+- **#1750 (Pillar-2.5) — `cosine_threshold` is now live config; size-GC eviction gated on `enabled`.**
+  Closes the two `CompactionConfig` knob hazards the #1749 5-agent vote (`1817bc8f`) scoped out.
+  (1) **`cosine_threshold` was dead config** — `ConsolidationClustering::new()` hardcoded the 0.75
+  default and `CompactionConfig.cosine_threshold` had no consumer (#1691-class). It is now threaded
+  into the live clusterer via `ConsolidationPass::with_cosine_threshold` at both production sites
+  (`cli/curator.rs` store-backed sweep + `curator/mod.rs::run_consolidation_pass`) and exposed via
+  `[curator.compaction].cosine_threshold` + `AppConfig::resolve_compaction_cosine_threshold()`
+  (env `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` > config > `0.75`; a parseable `f32` in `(0.0, 1.0]`
+  wins, out-of-range/unparseable falls through). (2) **`max_corpus_bytes` size-GC was a decoupled
+  hard-delete trigger** — `run_size_gc_pass` gated only on `max_corpus_bytes.is_some() && !dry_run`,
+  NOT on `enabled`. It now additionally requires `compaction.enabled` (defensive: `max_corpus_bytes`
+  stays out of operator config this slice, so size-GC remains inert in production until explicitly
+  exposed). Per the #1750 5-agent vote (`a9b2fe09`, 3-A/2-B), when `max_corpus_bytes` is eventually
+  exposed it gets its own dedicated `[curator.size_gc]` switch rather than riding under
+  `[curator.compaction]`. Tests: cosine resolver unit + precedence (`tests/config_precedence.rs`) +
+  size-GC `cap-without-enabled` no-op test; the 3 existing size-GC tests now set `enabled: true`.
+  Env-table rows #81 (updated) / #82. **Deferred to #1488 4.D:** reconciling the `CapabilityCompaction`
+  "planned" marker to reflect runtime compaction state needs `AppConfig` threaded through the
+  capabilities overlay chain (an envelope change) — tracked there, not in this slice. Code anchors:
+  `src/curator/compaction.rs`, `src/curator/mod.rs`, `src/cli/curator.rs`, `src/config.rs`.
+- **#1748 (Pillar-2.5 slice-3c2) — store-backed (postgres) `curator --rollback` reversal.**
+  `ai-memory curator --rollback <id>` / `--rollback-last N` now reverses consolidations the
+  store-backed (postgres) curator wrote (slice-3c1, #1747). Previously the reversal was
+  rusqlite-bound (`autonomy::reverse_rollback_entry` over a `Connection`) and the `--rollback`
+  arm dispatched **before** the `--store-url` branch, so `--rollback --store-url postgres://…`
+  silently no-op'd on the local SQLite file — an irreversible hard-DELETE behind a
+  reversible-looking API. Added `autonomy::reverse_rollback_entry_store`, a backend-agnostic
+  free async fn over the `MemoryStore` trait (`find_by_title_namespace` collision-guard →
+  reinsert originals → delete summary), and a `run_store_backed_rollback` CLI path dispatched on
+  `--store-url` (mirroring `run_store_backed_sweep`). Covers all three `RollbackEntry` variants
+  (Consolidate / Forget / PriorityAdjust). The slice-3c1 runtime WARN is removed now that
+  reversal works on postgres. Guardrails (from the 5-agent vote `4d3ea1c5` → Option B, memory
+  `ed85b972`): a `(title,namespace)` collision guard refuses to clobber a different occupant
+  (the trait `store` is an UPSERT); originals are reinserted **before** the summary is deleted
+  (fail-safe ordering). **Atomicity:** the SAL `begin_transaction` is postgres-internal only
+  (SQLite returns `UnsupportedCapability`), so the free fn cannot wrap the multi-write in one
+  transaction — the non-atomic window is exact parity with the rusqlite path (also non-atomic),
+  minimised by the reinsert-before-delete ordering. Tests: deterministic `SqliteStore` round-trip
+  + collision-abort unit tests (`src/autonomy.rs`) and a gated `sal-postgres` round-trip
+  (`tests/cov_postgres_core.rs`, the postgres twin of the SQLite
+  `reverse_consolidation_restores_originals`). Code anchors: `src/autonomy.rs`
+  (`reverse_rollback_entry_store`), `src/cli/curator.rs` (`run_store_backed_rollback`, dispatch in
+  `run`, WARN removed from `store_backed_consolidation_sweep`).
+- **#1749 (Pillar-2.5 activation) — `[curator.compaction].enabled` is now operator-configurable.**
+  The curator's Pillar-2.5 consolidation gate (`CompactionConfig.enabled`) was hardcoded
+  `default()` (false) at every production build site, leaving the whole shipped consolidation
+  pillar (3b1/3b2a/3b2b/3c1) dormant. It now resolves from operator config via
+  `AppConfig::resolve_compaction_enabled()` — ladder `AI_MEMORY_COMPACTION_ENABLED` env >
+  `[curator.compaction].enabled` > compiled `false` — threaded into `CuratorConfig.compaction`
+  at every site (`cli/curator.rs` `run` + `run_store_backed_sweep`, and
+  `daemon_runtime.rs::run_curator_daemon_with_primitives` via a primitive param resolved by its
+  caller). Default stays **false (opt-in)**; enabling makes the SAL `ConsolidationPass` the live
+  consolidator (hard-DELETE merge of near-duplicates, suppressing autonomy Pass-1). Strengthens
+  the Pillar-2.5 §2.4 *improvable* property by making the pipeline reachable. **Reversibility:**
+  consolidations are operator-reversible via `curator --rollback` on **sqlite** (#1745) **and
+  postgres** (the SAL-port landed in #1748; the earlier runtime WARN is gone). Scoped to
+  `enabled` only this slice — the clustering `cosine_threshold`
+  (currently unwired into the pass) and the size-GC `max_corpus_bytes` (an independent eviction
+  trigger) are intentionally left at defaults and tracked as a follow-up, per the 5-agent crossroads
+  vote (memory `4d3ea1c5`). Tests: resolver precedence (`tests/config_precedence.rs`) + config-field
+  resolution + build-site coverage. Env-table row #81. Code anchors: `src/config.rs`
+  (`resolve_compaction_enabled`, `CuratorCompactionSection`, `ENV_COMPACTION_ENABLED`),
+  `src/cli/curator.rs` (`curator_compaction_config`), `src/daemon_runtime.rs`.
+- **#1747 (Pillar-2.5 slice-3c1) — consolidation on the store-backed (postgres) curator tick.**
+  The SAL `ConsolidationPass` now runs on the postgres / `--store-url` curator path
+  (`cli/curator.rs::store_backed_consolidation_sweep`), the backend-agnostic twin of the
+  reflection sweep, called from both the `--once` and `--daemon` arms **before** reflection
+  (dedup, then reflect over survivors — avoids dangling `reflects_on` edges). It iterates
+  non-reserved namespaces via `MemoryStore::list_namespaces`, re-applies the same
+  `needs_curation` filter + `max_ops_per_cycle` cap the sqlite path uses, and runs the pass
+  real (respecting `dry_run`); a missing LLM folds into the report rather than aborting the
+  daemon. Gated on `compaction.enabled` (default false → no-op). Strengthens the Pillar-2.5
+  §2.4 *improvable* property to backend parity (consolidation no longer sqlite-only). Tests:
+  always-on `SqliteStore` sweep tests (enabled-folds / disabled-noop / no-LLM) + a gated
+  `sal-postgres` `consolidate` integration test (closes the cov_postgres_core hole). Gated by
+  the 5-agent crossroads vote (memory `4d3ea1c5`). **Caveat (tracked as #1748):** on postgres,
+  the operator-reversible rollback rows the pass writes are NOT yet reachable by
+  `ai-memory curator --rollback` (that path is rusqlite-bound) — a runtime WARN is emitted and
+  the SAL-port is slice-3c2. **Note:** `compaction.enabled` is not yet operator-configurable
+  (hardcoded default at all CLI/daemon call sites) — the config wire-up that activates
+  Pillar-2.5 consolidation in production is tracked separately. Code anchors:
+  `src/cli/curator.rs`, `src/curator/candidates.rs` (`needs_curation` → `pub(crate)`).
+- **#1746 (Pillar-2.5 slice-3b2b) — SAL `ConsolidationPass` is the live consolidator (cutover).**
+  When `[curator].compaction.enabled` (default `false` → byte-unchanged), `curator::run_once`
+  now makes the backend-agnostic SAL `ConsolidationPass` the live memory-consolidator and
+  suppresses the legacy `autonomy::run_autonomy_passes` Pass-1 (forget-superseded + priority
+  feedback still run). Both are driven from a **single** `compaction.enabled` predicate so they
+  can never double-consolidate or zero-consolidate. The SAL pass's counts fold into the cycle's
+  `report.autonomy.{clusters_formed,memories_consolidated,rollback_entries_written}` so the
+  `_curator/reports` self-report stays accurate, with SAL-specific
+  `compaction_pass_{clusters_eligible,rolled_back}` surfaced on `CuratorReport`. Strengthens the
+  Pillar-2.5 §2.4 *improvable* property (consolidation routes through the unified, backend-agnostic
+  SAL path) while preserving §2.3 *stoppable*/reversible: consolidations remain operator-reversible
+  via `curator --rollback` (rollback parity landed in #1745) and the consolidated row's `source`
+  label is held byte-stable across the cutover. Gated by the mandatory 5-agent crossroads vote
+  (memory `4d3ea1c5`), which re-sequenced the work (#1745 rollback-parity prerequisite first) and
+  confirmed clustering membership parity via a new equivalence test. Code anchors:
+  `src/curator/mod.rs` (`run_once`, `run_consolidation_pass`),
+  `src/autonomy.rs::run_autonomy_passes` (`skip_consolidation`),
+  `src/curator/compaction.rs::ConsolidationPass`. Prereqs: #1741 (clustering parity), #1743
+  (stored-embedding source parity), #1745 (rollback parity). Postgres-curator consolidation
+  parity is tracked as the follow-on slice-3c.
+- **#1735 (Pillar-4 4.C) — staggered AGE cold-path for postgres link writes (opt-in).**
+  `AI_MEMORY_AGE_PROJECTION_MODE=deferred` (default `sync` = byte-identical) takes the
+  ~6 synchronous Apache-AGE Cypher round-trips (`LOAD age`, `create_graph`, node+edge
+  `MERGE`) off the link-write hot path. Under `deferred`, `PostgresStore::link_internal`
+  enqueues a `kg_projection_outbox` row (schema **v69**) in the **same transaction** as the
+  relational `memory_links` INSERT instead of the inline MERGE; a supervised cold drainer
+  (`drain_kg_projection_outbox` + `spawn_drainer`, drain-once boot-recovery + interval loop)
+  projects pending rows into `memory_graph` out-of-band, with bounded retry → quarantine
+  (`MAX_AGE_PROJECTION_ATTEMPTS=100`) mirroring the federation push-DLQ. Postgres `find_paths`
+  routes through the always-current relational recursive-CTE under `deferred` so reads stay
+  read-your-own-write correct during the projection window (`kg_query`/`kg_timeline` observe a
+  bounded staleness window until the drainer catches up). New metrics
+  `ai_memory_age_projection_{pending_depth,failed_total,quarantined_total}`. Postgres-only
+  (AGE is postgres-only); SQLite stamps v69 as a no-op. Mechanism resolved by the mandatory
+  5-agent crossroads vote (memory 4d3ea1c5); the transactional-outbox + supervised-drainer +
+  CTE-fallback design composes the existing push-DLQ and deferred-audit precedents.
+- **#1733 (Pillar-4 4.A) — HTTP admission control (in-flight-request load-shedding).**
+  The axum daemon can now bound concurrent in-flight requests: when
+  `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or `[limits].max_inflight_requests`) is a positive
+  `n`, the daemon admits at most `n` concurrent requests and sheds the rest with a typed
+  `503` (`{"error":"server_overloaded","code":"OVERLOADED","max_inflight":n}` +
+  `Retry-After: 1`) instead of degrading or OOMing under a thundering herd. Implemented as a
+  custom `Arc<Semaphore>` + `try_acquire_owned` middleware (mirrors the existing 504-timeout
+  layer; no new tower features), applied OUTERMOST so rejection precedes the timeout future /
+  body decode / handler work, with the permit RAII-released on every exit path. `/health`,
+  `/metrics`, `/api/v1/metrics` are EXEMPT so liveness/readiness probes + Prometheus scrapes
+  survive overload (an unexempted cap would let the orchestrator kill an overloaded node,
+  amplifying the outage). **Opt-in** — unset / `0` / garbage leaves the layer uncomposed
+  (concurrency behaviour byte-identical to before). Shed events increment the
+  `ai_memory_admission_shed_total` Prometheus counter + a sampled WARN. Resolver ladder
+  `env > [limits] > compiled default 0`; seeded at boot via `crate::set_max_inflight_requests`.
+  Mechanism + posture resolved by the mandatory 5-agent crossroads vote (memory 4d3ea1c5).
+  Behavioural tests (`src/lib.rs::admission_control_1733_tests`: over-cap shed + typed-503
+  wire shape, `/health` exempt, cap=0 disabled) + precedence pin (`tests/config_precedence.rs`).
+- **#1720 A — owner-keyed `scope=private` visibility (cross-tenant leak closed, both adapters).**
+  The three divergent `scope=private` read predicates (recall / search / list) are collapsed
+  onto ONE owner-keyed canonical check: a private row is visible to a caller iff
+  `metadata.agent_id == caller` OR `metadata.target_agent_id == caller` (the inbox carve-out),
+  NOT namespace-keyed. Closes a confirmed cross-tenant private-memory leak on the recall + search
+  paths. sqlite enforces it via `storage::visibility_clause` (`src/storage/mod.rs`) +
+  the `scope_idx` / `agent_id_idx` / `target_agent_id_idx` generated columns (schema v67);
+  the postgres predicates are owner-keyed to match. The canonical owner check is
+  `crate::visibility::is_visible_to_caller` (`src/visibility.rs`). Admin / curator
+  `bypass_visibility` trusts-all on recall + search (A7). Leak + bypass regression tests on
+  both backends (`tests/visibility_private_leak_1720.rs`,
+  `tests/sqlite_admin_bypass_visibility_a7_1720.rs`).
+- **#1720 B — durable agent identity + safe enforced-multi-agent opt-in.**
+  B1: the `resolve_agent_id` owner-stamp fallbacks (MCP `clientInfo` + host) are now pid-free +
+  durable (`ai:<client>@<host>`, `host:<host>`) so ownership survives process restarts (the Op-0
+  posture; `process_discriminator()` still backs only the ephemeral `anonymous:` principals).
+  B2: the new `ai-memory reown` CLI rewrites `metadata.agent_id` across a namespace
+  (`--dry-run` / `--claim-unowned`, both adapters). B3: a boot-time owner-lockout guard
+  (`storage::lockout::count_private_rows_hidden_from` + `identity::enforce_owner_lockout_guard`)
+  WARNs — or refuses under `AI_MEMORY_REQUIRE_OWNED_ROWS` — when `AI_MEMORY_AGENT_ID` is set but
+  pre-existing private rows are owned by a different / pid-suffixed / unowned id, naming
+  `ai-memory reown` as the fix.
+- **#1720 D — curator reflections stamped explicit `collective` scope.**
+  Curator-written reflections (`ReflectionPass::summarize`) now carry an explicit `collective`
+  scope instead of the accidental default-private-owned-by-curator (which leaked under trust-all
+  and went operator-invisible under enforcement); the owner stays the curator for attribution.
+  The read posture (D1) is decided + documented: the curator keeps its `bypass_visibility` read
+  for substrate maintenance under the single-operator default.
+- **#1720 C — per-namespace `required_scope` (refuse-only) governance knob, both adapters + SDK parity.**
+  A new `CorePolicy.required_scope: Option<MemoryScope>` knob (rides in the existing
+  `metadata.governance` blob; no schema migration). When a namespace standard pins it, a
+  `Store` whose effective scope (`metadata.scope`; absent ⇒ `private`) does not match is
+  REFUSED at the CorePolicy governance gate — fail-closed, refuse-only (the gate never
+  coerces the write). Enforced on BOTH backends (sqlite `storage::enforce_governance` +
+  postgres `PostgresStore::enforce_governance_action`), honoring the existing
+  Advisory(warn-only)/Enforce(block) `permissions.mode` handling. Python SDK
+  `GovernancePolicy` gains `required_scope: str | None`.
+- **§22 Policy-Engine V08-PE-5 — `Decision::Escalate` governance verdict primitive**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
+  epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).
+  A new severity-based human-escalation verdict, produced by a new `escalate`
+  rule severity. The agent-action engine (`src/governance/agent_action.rs`)
+  gains `Severity::Escalate` (wire string `"escalate"`) and
+  `Decision::Escalate { rule_id, reason }` (serde
+  `{"decision":"escalate", rule_id, reason}`); a matched `escalate` rule
+  returns it (escalation terminal arm, mirroring refusal-wins). **Fails
+  closed:** `Decision::is_allowed()` is restructured to an explicit
+  `Allow | Warn` allow-list (NOT `!is_refusal()`) so an unresolved Escalate
+  does NOT permit the action; new `is_blocking()` (`Refuse | Escalate`) +
+  `is_escalation()` predicates are added, and the two L1-6 governance
+  pre-write hook sites (storage pre-write + wire_check) gained an Escalate
+  arm that blocks the action (`Err`) and chain-logs it via the deferred
+  audit queue (which now gates on `is_blocking`). Schema **v66** extends the
+  sqlite `governance_rules.severity` CHECK (`refuse`/`warn`/`log` →
+  `+escalate`) via a full-table rebuild that preserves every signed-rule row
+  + column + both indexes; postgres ships no `governance_rules` table so its
+  v66 arm is a version-stamp no-op (literal 66). **No MCP tool-count change.**
+  `// #697 PE-5 follow-on:` the escalation QUEUE persistence + timeout-sweep
+  + the PE-5 profile auto-install (PE-1+PE-3+PE-4) are NOT in this primitive —
+  they are the next PE-5 unit.
+- **§22 Policy-Engine V08-PE-8 — `ai-memory verify-audit-trail` CLI**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709),
+  epic [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).
+  New CLI `ai-memory verify-audit-trail [--since <ts>] [--json]` walks the
+  append-only `signed_events` V-4 cross-row hash chain end-to-end (reusing
+  `signed_events::verify_chain` — no reimplemented crypto), inventories any
+  monotonic-`sequence` gaps, and reports an `AuditTrailReport`
+  (`total_events` / `chain_intact` / `first_break_sequence` /
+  `sequence_gaps` / `head_sequence`). `--since` is timestamp-scoped and
+  boundary-correct (the first in-window row's `prev_hash` is checked
+  against its real out-of-window predecessor, never a false break). Exits
+  non-zero on any break or gap (CI-scriptable). §2.5 attested / §2.3
+  stoppable. CLI subcommand count 80→81 (82→83 sal).
+- **Pillar-2.5 compaction — size-GC (corpus byte-cap eviction)**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709)). The
+  curator now evicts under byte pressure: when a namespace's live corpus
+  (`SUM(length(title)+length(content)+length(metadata))` over its
+  non-archived rows — the same byte metric the K8 write quota uses) exceeds
+  a configured cap, the lowest-value memories are evicted (archived-before-
+  deleted, so **restorable**) one at a time until the corpus is back under
+  cap. Eviction order is a pure, deterministic SQL ranking — least-durable
+  tier first (`short` → `mid` → `long`), then `priority` / `access_count` /
+  `last_accessed_at` ascending — so a high-priority, frequently-accessed,
+  long-tier row is evicted last, only if still over cap. **No LLM on the
+  eviction path.** Surface: the `crate::storage::size_gc` free-fn, the
+  `MemoryStore::size_gc` SAL trait method on BOTH the sqlite (delegate) and
+  postgres (sqlx-native, per-victim transactional archive+delete mirroring
+  `run_gc`'s #1026 atomicity) adapters, the new `CompactionConfig.max_corpus_bytes`
+  config knob (`Option<i64>`, default `None` = disabled, opt-in via
+  `[curator.compaction]`), and the curator `run_once` wiring (gated on
+  `compaction.max_corpus_bytes.is_some()` && `!dry_run`; best-effort
+  per-namespace, errors land in `report.errors`) with the new
+  `CuratorReport.memories_evicted_size_gc` counter. **No schema change**
+  (reuses the existing `memories` / `archived_memories` columns + the
+  archive-before-delete path) and **no MCP tool-count change**. Victims
+  carry `archive_reason = 'size_gc'`, distinct from TTL-GC's `'ttl_expired'`.
+- **Pillar-1 coordination substrate** — typed actions with a state machine +
+  typed DAG edges + single-holder heartbeat leases + an hourly lease-sweeper
+  (`crate::actions`, `MemoryStore::{action_*,lease_*}`, 8 MCP tools); signed
+  signals (`crate::signals`, Ed25519 over canonical content, 5 MCP tools +
+  `pre_signal_send`/`post_signal_ack` hook events — now load-bearing, see
+  below); attested checkpoints
+  (`crate::checkpoints`, Ed25519-attested resolution = separation-of-duties,
+  4 MCP tools). All on both the sqlite and postgres SAL adapters.
+- **Pillar-1 signal coordination hooks wired** ([#1729](https://github.com/alphaonedev/ai-memory-mcp/issues/1729), the last
+  Pillar-1 residual). `HookEvent::PreSignalSend` / `PostSignalAck` shipped at
+  v0.8.0-dev declared + classified but had **zero fire sites**, the
+  `SignalDelta`/`SignalAck` payloads were undefined, and the signal handlers
+  never invoked any hook. Now: `SignalDelta` (writable; `from_agent`/`id`
+  provenance-immutable) + `SignalAck` (read-only) are defined
+  (`src/hooks/events.rs`); `handle_signal_send_with_hooks` fires `PreSignalSend`
+  **before signing** (so a `Modify` rewrite is reflected in the
+  Ed25519-signed bytes) honoring `Allow`/`Modify`/`Deny`/`AskUser`
+  (`AskUser` is fail-closed on the sync MCP path); `handle_signal_ack_with_hooks`
+  fires `PostSignalAck` (notify-only) after the ack stamp commits. Wired via an
+  in-substrate sync-callback bundle `SignalHooks` (mirroring the `ReflectHooks`
+  precedent — the handlers are synchronous and run on the MCP stdio loop's
+  `spawn_blocking` thread with no tokio runtime, so the async wire-level
+  `HookChain` cannot be `.await`-ed there; the daemon-side chain bridge is the
+  separate [#1714](https://github.com/alphaonedev/ai-memory-mcp/issues/1714) gap). Thin `handle_signal_send`/`handle_signal_ack`
+  shims preserve the pre-#1729 signatures (zero caller churn). MCP-only surface
+  (no HTTP/CLI signal route). Tests pin Deny-refuses-insert, Modify-rewrites-
+  and-persists, AskUser-fail-closed, and post-fires-once (no re-fire on a no-op
+  re-ack).
+- **Engine-level read-action gating** ([#1730](https://github.com/alphaonedev/ai-memory-mcp/issues/1730),
+  PE-2 / §5.5 / #697 Phase-6). Memory reads were never governance-evaluated or
+  audited — only writes / wire-actions were, so a confidentiality rule could not
+  deny a read. New `AgentAction::Read { surface, namespace?, query? }` variant +
+  `read_action` wire kind + a `match_read` matcher (`surface` / `namespace`
+  globs + `query_substring`; an explicit `{"all":true}` blanket; an empty matcher
+  matches nothing, so an operator typo can't lock out every read). A shared
+  `gate_read` / `gate_read_surface` helper is wired into all five MCP read
+  surfaces — `recall` / `search` / `list` / `get` / `session_start` — so a
+  matched `refuse` / `escalate` rule denies the read with the standard
+  governance-refusal wire shape and the decision lands in `signed_events`
+  alongside writes. Design via the deterministic **5-agent vote (4d3ea1c5)**
+  (tripped T1 new public variant + T3 new gate): (a) **zero-config fast-path** —
+  with no enabled `read_action` rules the gate returns immediately (no eval, no
+  audit), keeping the recall hot path free (a per-read `signed_events` INSERT
+  would turn every read into a serialized WAL write); (b) **best-effort,
+  non-fatal audit** — an append failure logs and the read proceeds (read
+  availability is never coupled to audit-sink liveness); (c) **fail-CLOSED** on a
+  matched `refuse`/`escalate` verdict AND on a rule-load error, honoring
+  `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR` (the same knob the write pre-hook
+  uses). **Scope:** sqlite-MCP-only — `governance_rules` + `check_agent_action`
+  are `rusqlite::Connection`-bound (same posture as signals/actions) and the MCP
+  stdio path is sqlite-only (#1675); HTTP/postgres reads route through the SAL
+  `app.store` (no raw Connection) and are out of scope for this gate. Tests: 8
+  `gate_read` unit tests (refuse / escalate-blocks / warn-allows / fast-path /
+  surface-narrow / namespace-narrow / empty-matcher-no-blanket / audit-row) + 2
+  parity tests (every read surface gated; fast-path passes with no rules).
+- **Crash-durable deferred-audit queue** ([#1732](https://github.com/alphaonedev/ai-memory-mcp/issues/1732),
+  PE-4 / §5.6 / #697 Phase-6). The deferred-audit queue was an in-memory
+  `mpsc`: a SIGKILL before the supervised drainer processed a submitted
+  governance refusal LOST it (`signed_events_dlq` only covers an append
+  FAILURE after the drainer has the event, not the pre-drain window). Added
+  a `DeferredAuditJournal` — an append-only, fsync-per-record shadow file
+  (`<db>.deferred-audit.journal`, mode 0600; frame =
+  `[u32-LE len][canonical_bytes][32-byte sha256]`). `DeferredAuditQueue::submit`
+  now durably journals each refusal BEFORE the mpsc send, and
+  `recover_deferred_audit` replays un-drained records into `signed_events`
+  at boot (then truncates). Design via the deterministic **5-agent vote
+  (4d3ea1c5)** (tripped T4 on-disk format): a journal **file** was chosen
+  over a sqlite pending-table because `submit` fires inside `storage::insert`
+  holding the substrate's `BEGIN IMMEDIATE` write lock — a second connection
+  writing the same DB would self-deadlock; a raw file append touches no
+  `Connection`. Replay is **idempotent** (dedup on the deterministic
+  `payload_hash`, since the sink stamps a random `id`) so a crash between the
+  pre-crash drainer's append and the SIGKILL never double-appends the hash
+  chain; a torn trailing frame (crash mid-append) is detected (short-read or
+  sha256 mismatch) and discarded. Boot recovery is **replay-all-then-go-live**,
+  wired into BOTH the `serve` and `mcp` boot paths (the MCP stdio path has no
+  shutdown drain, so durability + boot recovery is its only safety net).
+  Tests pin crash-recovery, torn-record-discard, and idempotent-replay.
+- **Pillar-2 typed-cognition link relations** — the closed
+  `memory_links.relation` CHECK taxonomy extends 6 → 9 with `decomposes_into`
+  (parent → child structural: a Goal decomposes_into Plans, a Plan
+  decomposes_into Steps), `depends_on` (sibling ordering / prerequisite: a Step
+  depends_on another Step), and `advances` (child → ancestor progress: a Step
+  advances a Plan/Goal) so the Goal/Plan/Step `MemoryKind` vocabulary can be
+  wired into a typed plan graph. Schema v63 on both adapters (sqlite
+  full-table-rebuild migration `0053`, postgres `migrate_v63` CHECK-extend);
+  `MemoryLinkRelation` + `validate::VALID_RELATIONS` carry the matching set.
+- **Pillar-2 promote-as-typed-state-machine** — a first-class
+  `memories.lifecycle_state` column (schema v64, additive
+  `TEXT NOT NULL DEFAULT 'open'` on both adapters; the `archived_memories`
+  mirror keeps archive → restore lossless) that makes the already-shipped
+  Goal/Plan/Step `MemoryKind`s load-bearing. The `models::LifecycleState`
+  enum (`open` → `active` → `blocked`/`done`/`abandoned`; `done`/`abandoned`
+  terminal) provides a proven transition machine
+  (`LifecycleState::can_transition_to`, mirroring `ActionState`). The
+  `Memory` struct grows to **27 fields** (the 27th is `lifecycle_state`,
+  `#[serde(default)]` → `Open` for legacy rows). The column is load-bearing,
+  not inert: `memory_store` accepts an optional initial `lifecycle_state`
+  (validated), and a `lifecycle_state` transition target is enforced against
+  the stored state (`current.can_transition_to(new)`) across **all three
+  surfaces** — MCP `memory_update`, HTTP `PUT /api/v1/memories/{id}`, and the
+  SAL `MemoryStore::update` path (via `UpdatePatch.lifecycle_state`) — on
+  **both backends**. The gate is centralised in the storage primitive
+  (#1726): sqlite `storage::set_lifecycle_state` and its postgres twin
+  `PostgresStore::apply_lifecycle_patch` SELECT the current state and reject
+  an illegal edge (e.g. `open → done`, or any move out of a terminal) with a
+  typed `InvalidTransition` → HTTP **409 CONFLICT** (byte-parity error detail
+  on both adapters); a legal edge persists and bumps the optimistic-
+  concurrency `version`, and a request equal to the stored state is an
+  idempotent no-op. No new MCP tool and no tool-count change (the additions
+  are permissive optional fields on the existing store / update request
+  structs). Schema v64 on both adapters (sqlite probe-then-add ALTER,
+  postgres `migrate_v64` stamping the literal 64 for crash-safety).
+- **§2.5 attested — read-time attested-provenance surfacing**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709), reframed
+  from #1715). `memory_recall` now composes provenance at read from already-merged
+  signed evidence rather than treating the stored confidence scalar as truth.
+  Anchors: `src/mcp/tools/recall.rs::decorate_memory_many` (batched O(1)
+  link-attestation prefetch — was O(K) per-row `get_links`),
+  `recall.rs::provenance_tier` (composes `confidence_source` + the
+  `recall.rs::attest_rank` ladder → `signed_peer` > `curator_derived` >
+  `self_signed` > `unsigned_caller`), `recall.rs::insert_confidence_filter_meta`
+  (non-silent `confidence_tier` filter → `meta.confidence_filtered_out` +
+  `meta.had_filtered_candidates`), `recall.rs::scheduled_validity` (deterministic
+  recompute from the `Memory::effective_expires_at` anchor, quantized to a
+  `SECS_PER_HOUR` as-of bucket, under `AI_MEMORY_CONFIDENCE_DECAY`), and
+  `session_start` routed through `decorate_memory_many` for uniform decoration
+  across MCP / HTTP / session_start. All composition is **decoration-only**: the
+  stored `m.confidence` ranking term (`src/storage/mod.rs` recall `ORDER BY`) is
+  untouched, no read-path DB round-trip is added, no LLM runs on the read path,
+  and the recall determinism invariant (`tests/bias_displacement_invariants_2_6.rs`,
+  id-ranking byte-equality) holds.
+- **§11.4.C — vLLM first-class backend alias**
+  ([#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709); reconciles
+  doc-drift defect [#1677](https://github.com/alphaonedev/ai-memory-mcp/issues/1677)).
+  `AI_MEMORY_LLM_BACKEND=vllm` (and the embeddings sibling
+  `AI_MEMORY_EMBED_BACKEND=vllm`) are now a dedicated alias that pre-fills the
+  OpenAI-compatible base URL to `http://localhost:8000/v1` (vLLM's default
+  `--port 8000` + `/v1` route mount), instead of requiring the generic
+  `openai-compatible` backend plus an explicit `AI_MEMORY_LLM_BASE_URL`.
+  Keyless by default like `lmstudio` — a Bearer token may still be supplied via
+  `AI_MEMORY_LLM_API_KEY` for a secured deployment. Anchors:
+  `src/llm.rs::BACKEND_VLLM` (the 16th vendor alias), the
+  `src/llm.rs::default_base_url_for_alias` + `src/llm.rs::alias_api_key_env_vars`
+  arms, the `doctor` "Valid values:" enumeration, and the embed surface for free
+  via `src/config.rs::resolve_embeddings` → `is_api_embed_backend` (everything
+  but `ollama`) → the shared `default_base_url_for_alias`. Pins:
+  `default_base_url_for_alias_covers_all_16_aliases_1067`,
+  `alias_api_key_env_vars_per_alias_pins_1067`,
+  `resolve_embeddings_1709_vllm_alias_default_base_url`. The in-process
+  candle/mistralrs GPU backend remains v0.8.x-deferred per ROADMAP §11.4.C (the
+  `src/inference/mod.rs::GpuBackend` phase labels are corrected here to say so —
+  #1677). **No schema change. No MCP tool-count change.**
+- **#1722 — coordination-substrate `signed_events` audit observability (full Pillar-1 coverage).**
+  Every coordination state-mutation (signal send/ack, action create/transition/add_edge, lease
+  acquire/renew/release, checkpoint create/resolve, routine create/freeze/run) appends a
+  tamper-evident `coordination.<op>` row to the append-only `signed_events` V-4 chain through one
+  shared best-effort writer (`crate::coordination_audit::emit`, 13 event-type slugs SSOT). Emitted
+  AFTER the op commits (append failure WARN-logged, never fails the op); payload hash commits to
+  the op's identity; daemon-signed when an audit key is installed. Per-handler actor attribution
+  (success-arm only). Commits a6f94854, 934989ca.
+- **#1670 — `SqliteStore::capabilities()` advertises `ATOMIC_MULTI_WRITE`.** Wire-honesty fix
+  (#302 item 6 / #1052 family): the bit is genuinely held — `reflect` / `consolidate` / bulk-insert
+  run as a single `BEGIN IMMEDIATE … COMMIT` atom with ROLLBACK on mid-failure. `TRANSACTIONS`
+  stays withheld (the SAL adapter exposes no caller-facing `begin_transaction` handle). At parity
+  with `PostgresStore` on `ATOMIC_MULTI_WRITE`. Capability-bit↔runtime cross-check test. Commit 14cdd6ce.
+
+### Fixed
+
+- **[#1793](https://github.com/alphaonedev/ai-memory-mcp/issues/1793) — PostgresStore Human-arm approval
+  now refuses self-approval + unregistered approvers (HTTP-path parity with #1787).** The
+  `ApproverType::Human` arm of `PostgresStore::governance_approve_with_consensus` (the DEFAULT approver
+  type) accepted ANY `approver_agent_id` with no requester≠approver check and no registration check, so
+  on the HTTP/postgres approval surface the REQUESTER of a Human-gated pending action could self-approve
+  it, defeating human-in-the-loop (the Consensus arm was already hardened per #216; the Human arm was
+  not). The fix UNCONDITIONALLY (a) refuses `approver == pa.requested_by` (`SELF_APPROVAL_REFUSED`) and
+  (b) requires the approver to be a registered agent (mirroring the Consensus arm). Unlike the sqlite
+  #1787 fix this is NOT opt-in-keyed: the 5-agent adversarial vote (memory `4d3ea1c5`) established that
+  the postgres SAL is reachable only via the inherently multi-tenant HTTP daemon (MCP stdio is
+  sqlite-only), where the process-wide `AI_MEMORY_AGENT_ID` the sqlite opt-in keys on is unset (so an
+  opt-in gate would never fire) and the per-request `X-Agent-Id` approver is a distinct authenticated
+  identity — there is no single-operator self-lock to avoid. No schema change. Code anchor:
+  `src/store/postgres.rs`. (Sibling finding: the sqlite-*backed* HTTP daemon has the analogous
+  opt-in-off-on-HTTP gap — tracked separately as #1796.)
+
+- **[#1796](https://github.com/alphaonedev/ai-memory-mcp/issues/1796) — the sqlite-backed HTTP daemon
+  now refuses Human-arm self-approval + unregistered approvers (sqlite-side sibling of #1793).** On a
+  sqlite-backed `ai-memory serve` (the default without `--store-url postgres://`) the `ApproverType::Human`
+  self-approval reject + registered-approver gate added by #1787 to `db::approve_with_approver_type` was
+  opt-in-keyed on `resolve_read_visibility_caller().is_some()` (the process `AI_MEMORY_AGENT_ID`). The
+  multi-tenant HTTP daemon uses per-request `X-Agent-Id` and sets no process `AI_MEMORY_AGENT_ID`, so the
+  gate NEVER fired there and a requester could self-approve their own Human-gated pending action — the
+  same human-in-the-loop bypass #1793 closed for postgres. The 5-agent adversarial vote (memory
+  `4d3ea1c5`, decision memory `7016624d`) resolved the mechanism: a new `pub enum ApproveSurface { Http,
+  LocalOperator }` (no `Default`) is threaded into `db::approve_with_approver_type`, keeping enforcement
+  canonical in the storage fn. The `Http` surface (both HTTP approve handlers + the SAL trait delegates,
+  for parity with the postgres trait impl) enforces UNCONDITIONALLY; the `LocalOperator` surface (MCP/stdio
+  + CLI single-operator) keeps the `AI_MEMORY_AGENT_ID` opt-in so the lone operator is never self-locked
+  out of approving their own action. No schema change. Code anchors: `src/storage/mod.rs`,
+  `src/handlers/{governance,approvals}.rs`, `src/store/sqlite.rs`, `src/mcp/tools/pending.rs`,
+  `src/cli/agents.rs`.
+
+- **[#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795) — PostgresStore now ENFORCES the
+  per-agent daily memory-count quota (it previously only recorded it).** On a postgres-backed daemon
+  the per-agent daily write quota (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was a silent no-op on EVERY tenant
+  write path — `store`/`store_batch`/`consolidate` increment the counter but never compared it to the
+  cap or rejected, and `create_memory_postgres` never called any quota check (the sqlite path enforces
+  at the handler via `quotas::check_and_record`, which the postgres data path doesn't use). So an agent
+  could author unlimited memories/day on postgres. This was surfaced by the #1788 5-agent vote as a
+  distinct, broader defect than the bulk/consolidate-only #1788. The 5-agent adversarial vote (memory
+  `4d3ea1c5`) chose a new tenant-only SAL `check_memory_quota(ctx, namespace, additional_count,
+  additional_bytes)` method (day-roll-aware read + compare → `StoreError::QuotaExceeded` → 429), called
+  by exactly the 3 postgres tenant handlers (`create_memory_postgres`, the `bulk_create` postgres branch
+  with partial-fill, the `consolidate_memories` postgres branch) BEFORE their store write — NOT inside
+  `store`/`store_batch` (which are shared with the EXEMPT federation-receive / migrate / CLI / curator
+  paths, plus `consolidate` is a separate method `store`-flag enforcement couldn't reach). The day-roll
+  reuses the same `date_trunc('day', day_started_at)` idiom as `record_memory_quota_in_tx`. A small
+  check-then-record TOCTOU (bounded by pool concurrency) is accepted for a soft daily cap. No schema
+  change. Code anchors: `src/store/mod.rs`, `src/store/postgres.rs`, `src/handlers/{create,power_consolidation,memories_query,postgres_gate}.rs`.
+
+- **[#1788](https://github.com/alphaonedev/ai-memory-mcp/issues/1788) — `bulk_create` + `consolidate`
+  now charge the per-agent daily write quota (sqlite).** The per-agent daily write quota
+  (`AI_MEMORY_MAX_MEMORIES_PER_DAY`) was enforced on the single-write handlers but ABSENT from the
+  bulk-create surface (`POST /api/v1/memories/bulk`) and the consolidate surfaces (HTTP
+  `POST /api/v1/consolidate` + MCP `memory_consolidate`), so a caller could loop 1000-item bulk POSTs
+  to author unlimited memories. The 5-agent adversarial vote (memory `4d3ea1c5`) confirmed the charge
+  belongs at the **handler layer**, NOT the SAL `store`/`store_batch` trait — that trait is shared
+  with federation-receive (storage-bytes-only per #1544), migration, the CLI (operator-as-actor), and
+  the curator/autonomy `ConsolidationPass`, all of which must stay exempt. `bulk_create` now charges
+  `check_and_record` per row with **partial-fill** semantics (over-cap rows land in `errors[]` and are
+  not persisted, consistent with the handler's existing per-row validation/governance error model;
+  refund on insert failure); `consolidate` charges 1 (it mints a net-new attributable memory) on the
+  tenant HTTP + MCP surfaces, leaving the curator path exempt. Empty/anonymous principals are skipped,
+  mirroring single writes. **Note:** a broader, distinct finding surfaced during this work — PostgresStore
+  never *enforces* the daily memory-count cap on any write path (it only *records*) — is tracked as
+  [#1795](https://github.com/alphaonedev/ai-memory-mcp/issues/1795). No schema change. Code anchors:
+  `src/handlers/memories_query.rs`, `src/handlers/power_consolidation.rs`, `src/mcp/tools/consolidate.rs`.
+
+- **[#1784](https://github.com/alphaonedev/ai-memory-mcp/issues/1784) — consolidation provenance
+  (`metadata.derived_from` / `consolidated_from_agents`) is now immutable and survives a metadata
+  overwrite.** `consolidate` records the merged source ids on `metadata.derived_from` (and source
+  authors on `consolidated_from_agents`) rather than navigable `memory_links` edges — deliberately,
+  because a real edge to a source would be FK `ON DELETE CASCADE`-killed the instant `consolidate`
+  hard-deletes that source (the sources are never archived, so the pointer is inherently
+  non-navigable by design — a genuine impossibility, not a gap). The bug was that only `agent_id`
+  was protected across a metadata whole-object overwrite, so a later `memory_update` or a re-store
+  /re-consolidation that didn't re-supply these keys **silently dropped the provenance** (and it
+  cannot be reconstructed — the sources are gone). Both provenance keys are now preserved
+  (existing-wins, exactly like `agent_id`) at every metadata-overwrite site on both backends: the
+  caller-layer `crate::identity::preserve_provenance_keys` helper (the generalized
+  `preserve_agent_id`, used by the MCP/HTTP/CLI update + store-dedup paths), the postgres in-SQL
+  `update` / upsert / federation-merge arms (a `jsonb ||` provenance overlay), and the sqlite in-SQL
+  upsert / newer-wins-merge arms (a `json_patch` overlay that — unlike the prior `json_set` —
+  preserves the nested array values). The stale `consolidate` doc-comment (which claimed it "creates
+  links from new → old") is corrected. No schema change; existing `derived_from` rows keep working
+  and now survive updates. Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Code
+  anchors: `src/identity/mod.rs`, `src/storage/mod.rs`, `src/store/postgres.rs`.
+
+- **[#1783](https://github.com/alphaonedev/ai-memory-mcp/issues/1783) — AGE knowledge-graph
+  projection is now cleaned on hard-delete (no more ghost edges).** `project_link_into_age` was
+  MERGE-only — it never issued a Cypher DELETE — so when a memory was hard-deleted (`delete` /
+  `forget` / `consolidate` / `run_gc` / `size_gc` / `apply_remote_deletion`, all of which
+  cascade-delete `memory_links` relationally via `ON DELETE CASCADE`), the Apache-AGE projection
+  `memory_graph` kept the orphaned `(:Memory)` node + its incident edges, so `kg_query` /
+  `find_paths` over the AGE backend returned ghost edges to a row that no longer existed (a stale
+  SECONDARY index; relational truth + the `find_paths` recursive-CTE fallback were always correct).
+  A new `unproject_memory_from_age` helper issues the mirror `MATCH (n:Memory {id}) DETACH DELETE n`
+  (best-effort under the same `#1542`/`#1640` SAVEPOINT + AGE-runtime-tolerance posture as the link
+  projection; idempotent — a never-projected memory no-ops) at all six hard-delete sites, in the
+  surrounding tx where one exists (atomic) and a short own-tx on the two pool-direct paths. The
+  cold drainer (`drain_kg_projection_outbox`) gains an existence-guard that SKIPs any pending
+  projection whose `memory_links` row was deleted between enqueue and drain — so a deferred-mode
+  ADD can never RESURRECT a node the delete removed, **without a schema migration** (the relational
+  table is the source of truth). Postgres+AGE only; SQLite/CTE backends have no projection to clean.
+  Design resolved by the 5-agent adversarial vote (memory `4d3ea1c5`). Code anchor:
+  `src/store/postgres.rs`; tests: `tests/pillar4_4d_age_unprojection_on_delete_1783.rs`.
+
+- **#1781 — `schema-init --embedding-dim` refuses a destructive embedding-dim conversion by
+  default.** On a column-dim mismatch the postgres `migrate_embedding_dim` path DROPs the HNSW
+  index, NULLs every `memories` / `archived_memories` embedding, and ALTERs the column —
+  previously with no emptiness check, so re-running `ai-memory schema-init --embedding-dim` with
+  the wrong/default dim against a populated corpus silently NULLed every embedding (semantic
+  recall degraded to keyword-only until a full re-embed). The conversion now REFUSES with a typed
+  error when stored embeddings exist, printing how many would be NULLed, unless `--force-reembed`
+  is passed (the explicit escape hatch; precedent: #1785 DROP-confirm). The #877 daemon
+  auto-migrate path is unchanged — it passes `force = true` because enabling auto-migrate is the
+  operator's explicit opt-in.
+  The path-form handler used the sqlite-only `State<Db>` extractor + a raw rusqlite call, so the
+  postgres route-gate 501'd it even though the SAL `get_namespace_standard` was implemented. Now
+  delegates to the SAL-backed query-string handler (both backends, same response shape) + added to
+  the postgres-gate allowlist. Commit 2a1c39e2.
+- **#1713 — flaky MCP-subprocess test deadlock.** ~24 integration tests collected a spawned
+  `ai-memory mcp` child with raw unbounded `child.wait_with_output()`; under parallel load a wedged
+  child hung the whole integration binary (a 1728s hang). Routed every raw MCP spawn through the
+  existing 60s-deadline `drive_mcp_bounded` driver (kill-and-panic-on-expiry) — a silent hang
+  becomes a fast, loud failure. Commit 87c30241.
+- **#1721 — test scratch DBs moved off `/tmp` → gitignored `.local-runs/`.** Completed the
+  `std::env::temp_dir()` → project-local sweep (CLAUDE.md no-`/tmp` hard rule): 73 sites in
+  `tests/integration.rs` + ~9 across other test files, behavior-neutral. Commit 522621e8.
+
+### Final pre-tag security review (5-agent, 2-round) + NHI dogfood findings
+
+- **#1804 (HIGH) — `kg_timeline` cross-tenant private-title leak.** Per-target visibility
+  filter added on all three read paths (MCP + HTTP sqlite/postgres): `kg_timeline` now drops
+  any event whose target memory is not visible to the caller, closing a leak where a
+  multi-tenant caller could read a victim's `scope=private` metadata by rooting a link at it.
+  Commit d3b87a2d.
+- **#1805 — federated action-transition replay.** Per-transition nonce recorded so a replayed
+  `/sync/push` action-state transition is refused. Commit c3087e33.
+- **#1806 / #1808 / #1809 — lease TTL bound, `verify_strict`, federation E2E docs.** Commit 2abeac68.
+- **#1807 — coordination create-path quota + payload-size bound.** `memory_action_create` /
+  `memory_signal_send` / `memory_checkpoint_create` now validate metadata size (64 KiB cap) and
+  charge the creator's per-namespace storage quota. Commit aa030f1d.
+- **#1810 — CI ubuntu `Check` disk-exhaustion.** Free `.ghcup` + docker images before the test
+  compile. Commit bcccf1be.
+- **#1811 — Claude Code PreToolUse governance hook could not enforce.** The installer wrote a
+  `type:mcp_tool` hook that (a) errored `kind is required` (no `input`) and (b) structurally
+  cannot block — an mcp_tool hook's `isError`/non-decision response is non-blocking per the
+  Claude Code hooks contract. Replaced with a `type:command` wrapper
+  (`ai-memory governance check-action --from-pretool-stdin`) that emits
+  `hookSpecificOutput.permissionDecision=deny` so a substrate Refuse actually blocks. Operators
+  upgrade with `ai-memory install claude-code --hook pretool --apply --force`. 5-agent vote
+  `4d3ea1c5`. Commits c7452681 + ef3c17f9.
+- **#1812 — `memory_link` silently dropped off-taxonomy relations.** A well-formed but
+  non-taxonomy relation (e.g. `frobnicate`) passed the permissive `validate_relation` but was
+  silently dropped by the closed-taxonomy `CHECK` under `INSERT OR IGNORE`, while the tool
+  falsely returned `linked:true`. Tightened `validate_relation` to the closed 9-relation set
+  (aligning it with the `CHECK`, the `MemoryLinkRelation` enum, and the HTTP handler). 5-agent
+  vote `4d3ea1c5`. Commit d7d43d55.
+
 ## [0.7.1] — 2026-06-15
 
 Hardening patch line over v0.7.0 (`attested-cortex`). A 26-task,

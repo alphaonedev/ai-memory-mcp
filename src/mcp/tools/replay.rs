@@ -372,6 +372,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
     }
@@ -496,6 +497,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mid = db::insert(&conn, &mem).expect("insert alice memory");
         let t = transcripts::store(&conn, "alice-ns", "alice-only transcript content", None)
@@ -565,6 +567,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let mid = db::insert(&conn, &mem).expect("insert alice memory");
         let t = transcripts::store(&conn, "alice-ns-1571", "alice transcript 1571", None)

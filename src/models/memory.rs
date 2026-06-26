@@ -27,6 +27,14 @@ const KIND_REFLECTION: &str = "reflection";
 /// `memory_kind TEXT` column — no schema migration is required
 /// because the column has no CHECK constraint. Old rows with no
 /// kind read as `Observation` (the SQL `DEFAULT 'observation'`).
+///
+/// v0.8.0 Pillar 2 (#1709) — typed-cognition extension. The
+/// `Goal | Plan | Step` variants give the substrate first-class
+/// vocabulary for an agent's typed cognition: a `Goal` is a desired
+/// end-state, a `Plan` is the ordered strategy to reach it, and a
+/// `Step` is one executable unit within that plan. Like the Form-6
+/// variants they serialize as snake_case strings on the same
+/// `memory_kind TEXT` column with no migration required.
 /// A future-schema variant a binary doesn't recognise reads as
 /// `Observation` via the `unwrap_or_default()` chain in
 /// `row_to_memory` (forward-compat).
@@ -87,6 +95,23 @@ pub enum MemoryKind {
     /// rationale / alternatives, but the variant lands now so
     /// callers can start typing decisions.
     Decision,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: a desired
+    /// end-state / objective the agent is working toward. Distinct
+    /// from `Decision` (a committed choice) in that a `Goal` names the
+    /// target, not the path to it; a `Plan` enumerates that path and a
+    /// `Step` is one executable unit within it.
+    Goal,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: an ordered strategy
+    /// to reach a `Goal`. A `Plan` decomposes an objective into the
+    /// sequence of `Step`s the agent intends to execute; downstream
+    /// readers can filter to plans to reconstruct an agent's intended
+    /// course of action.
+    Plan,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition: a single executable
+    /// unit within a `Plan`. The finest-grained typed-cognition atom —
+    /// one actionable item whose completion advances the parent `Plan`
+    /// toward its `Goal`.
+    Step,
 }
 
 impl MemoryKind {
@@ -104,6 +129,9 @@ impl MemoryKind {
             Self::Event => "event",
             Self::Conversation => "conversation",
             Self::Decision => "decision",
+            Self::Goal => "goal",
+            Self::Plan => "plan",
+            Self::Step => "step",
         }
     }
 
@@ -123,6 +151,9 @@ impl MemoryKind {
             "event" => Some(Self::Event),
             "conversation" => Some(Self::Conversation),
             "decision" => Some(Self::Decision),
+            "goal" => Some(Self::Goal),
+            "plan" => Some(Self::Plan),
+            "step" => Some(Self::Step),
             _ => None,
         }
     }
@@ -143,6 +174,9 @@ impl MemoryKind {
             Self::Event,
             Self::Conversation,
             Self::Decision,
+            Self::Goal,
+            Self::Plan,
+            Self::Step,
         ]
     }
 
@@ -199,6 +233,116 @@ impl MemoryKind {
 }
 
 impl std::fmt::Display for MemoryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// v0.8.0 Pillar 2 (#1709) — typed-cognition lifecycle state stored on the
+/// `memories.lifecycle_state` column (schema v64).
+///
+/// The already-shipped Goal/Plan/Step [`MemoryKind`]s (commit 466a7c96)
+/// gain a first-class lifecycle here: an agent can mark a Goal
+/// `open → active → done`, a Plan `active → blocked → active → done`, etc.
+/// The legal transition graph is enforced by
+/// [`LifecycleState::can_transition_to`] at the write boundary (the MCP
+/// `memory_update` path), NOT a SQL CHECK — so a future state needs no
+/// migration (mirrors [`crate::models::action::ActionState`]).
+///
+/// Transition graph:
+/// `open → {active, abandoned}`,
+/// `active → {blocked, done, abandoned}`,
+/// `blocked → {active, abandoned}`,
+/// terminal `done` / `abandoned` accept no outbound edge (and there are
+/// no self-loops).
+///
+/// `Open` is the initial state for every memory (the SQL
+/// `DEFAULT 'open'` on the column handles the backfill contract for rows
+/// that pre-date the v64 migration; new inserts that omit the field also
+/// land at `Open`). An unrecognised value from a future schema read by an
+/// older binary falls back to `Open` via the `unwrap_or_default()` chain
+/// in `row_to_memory` (forward-compat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    /// Initial / default — created, not yet being worked.
+    #[default]
+    Open,
+    /// Actively being worked toward completion.
+    Active,
+    /// Stalled on an external dependency / gate. Re-entrant to `Active`.
+    Blocked,
+    /// Completed successfully (terminal).
+    Done,
+    /// Withdrawn before completion (terminal).
+    Abandoned,
+}
+
+impl LifecycleState {
+    /// Column-wire string (matches the SQL `DEFAULT 'open'` value).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// Parse the column-wire string. Returns `None` on unrecognised values
+    /// so callers can fall back to `Open` (forward-compat with future
+    /// variants that land in a newer DB on an older binary).
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "active" => Some(Self::Active),
+            "blocked" => Some(Self::Blocked),
+            "done" => Some(Self::Done),
+            "abandoned" => Some(Self::Abandoned),
+            _ => None,
+        }
+    }
+
+    /// Enumerate every variant in declaration order. Used by the
+    /// transition-enforcement error message + the capabilities surface.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Open,
+            Self::Active,
+            Self::Blocked,
+            Self::Done,
+            Self::Abandoned,
+        ]
+    }
+
+    /// Terminal states accept no outbound transition.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Abandoned)
+    }
+
+    /// Whether `self → to` is a legal lifecycle transition. No self-loops;
+    /// terminals (`Done` / `Abandoned`) go nowhere.
+    #[must_use]
+    pub fn can_transition_to(self, to: Self) -> bool {
+        matches!(
+            (self, to),
+            (Self::Open, Self::Active)
+                | (Self::Open, Self::Abandoned)
+                | (Self::Active, Self::Blocked)
+                | (Self::Active, Self::Done)
+                | (Self::Active, Self::Abandoned)
+                | (Self::Blocked, Self::Active)
+                | (Self::Blocked, Self::Abandoned)
+        )
+    }
+}
+
+impl std::fmt::Display for LifecycleState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -582,13 +726,26 @@ pub struct Memory {
     /// pre-v45 federation peers / JSON payloads deserialising cleanly.
     #[serde(default = "default_memory_version")]
     pub version: i64,
+    /// v0.8.0 Pillar 2 (#1709) — typed-cognition lifecycle state. Stored on
+    /// `memories.lifecycle_state TEXT NOT NULL DEFAULT 'open'` (schema v64).
+    /// `Open` for every legacy / pre-v64 row (SQL default) and every fresh
+    /// store that omits the field; transitions are enforced on
+    /// `memory_update` via [`LifecycleState::can_transition_to`].
+    ///
+    /// `#[serde(default)]` ensures round-trips with pre-v64 federation peers
+    /// (and JSON payloads) that don't yet emit the field — missing → `Open`,
+    /// matching the SQL `DEFAULT 'open'`.
+    #[serde(default)]
+    pub lifecycle_state: LifecycleState,
 }
 
 impl Memory {
     /// Total number of declared `pub <name>: <type>` fields on the
-    /// `Memory` struct at v0.7.0. SSOT for the "26-field struct at
-    /// v0.7.0 (was 15 at v0.6.x)" narrative in CLAUDE.md / README.md /
-    /// ROADMAP.md / release-notes. Adding or removing a field requires
+    /// `Memory` struct. SSOT for the "27-field struct at v0.8.0
+    /// (26 at v0.7.0, was 15 at v0.6.x)" narrative in CLAUDE.md /
+    /// README.md / ROADMAP.md / release-notes — the 27th field is the
+    /// v0.8.0 Pillar-2 (#1709) `lifecycle_state` column.
+    /// Adding or removing a field requires
     /// bumping this const in the same commit, OR the parity test pin
     /// at `tests/memory_field_count_invariant.rs` fails the build.
     ///
@@ -596,7 +753,7 @@ impl Memory {
     /// (Memory shape drift), mirrors the
     /// `MemoryLinkRelation::COUNT` + `EXPECTED_CLI_SUBCOMMANDS_*`
     /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
-    pub const FIELD_COUNT: usize = 26;
+    pub const FIELD_COUNT: usize = 27;
 
     /// v0.7.0 #1466 — the `expires_at` value a fresh store must persist.
     /// An explicit value the caller supplied wins; otherwise a non-`Long`
@@ -911,6 +1068,7 @@ impl Default for Memory {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: default_memory_version(),
+            lifecycle_state: LifecycleState::Open,
         }
     }
 }
@@ -995,8 +1153,9 @@ pub struct CreateMemory {
     /// v0.7.x Form 6 (#1385) — Batman-taxonomy memory-kind selector for
     /// the new row. Accepts any [`MemoryKind`] wire token
     /// (`observation` | `reflection` | `persona` | `concept` | `entity`
-    /// | `claim` | `relation` | `event` | `conversation` | `decision`).
-    /// Unknown values are silently ignored (treated as omission) for
+    /// | `claim` | `relation` | `event` | `conversation` | `decision`
+    /// | `goal` | `plan` | `step`). Unknown values are silently
+    /// ignored (treated as omission) for
     /// forward-compat with future variants, mirroring the MCP
     /// `memory_store` `params["kind"]` contract at
     /// `src/mcp/tools/store/validation.rs:207-213`. Absent / unknown
@@ -1107,6 +1266,16 @@ pub struct UpdateMemory {
     /// cross-tenant write hijack with forged provenance.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// v0.8.0 Pillar 2 (#1726) — opt-in lifecycle transition target
+    /// (`open` / `active` / `blocked` / `done` / `abandoned`). `None` leaves
+    /// the stored `lifecycle_state` untouched; a supplied value is validated
+    /// (`validate_lifecycle_state`) and the transition legality is enforced
+    /// against the stored state (`LifecycleState::can_transition_to`) in the
+    /// update path — an illegal edge returns HTTP 409, a legal one persists
+    /// and bumps the optimistic-concurrency `version`. A request equal to the
+    /// stored state is an idempotent no-op.
+    #[serde(default)]
+    pub lifecycle_state: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1916,10 +2085,28 @@ mod tests {
             ("event", MemoryKind::Event),
             ("conversation", MemoryKind::Conversation),
             ("decision", MemoryKind::Decision),
+            ("goal", MemoryKind::Goal),
+            ("plan", MemoryKind::Plan),
+            ("step", MemoryKind::Step),
         ] {
             assert_eq!(MemoryKind::from_str(s), Some(v));
             assert_eq!(v.as_str(), s);
             assert_eq!(format!("{v}"), s);
+        }
+    }
+
+    #[test]
+    fn memory_kind_pillar2_goal_plan_step_round_trip() {
+        // v0.8.0 Pillar 2 (#1709) — the typed-cognition cluster
+        // round-trips as_str ↔ from_str and is covered by all().
+        for (s, v) in [
+            ("goal", MemoryKind::Goal),
+            ("plan", MemoryKind::Plan),
+            ("step", MemoryKind::Step),
+        ] {
+            assert_eq!(MemoryKind::from_str(s), Some(v));
+            assert_eq!(v.as_str(), s);
+            assert!(MemoryKind::all().contains(&v));
         }
     }
 
@@ -1933,11 +2120,16 @@ mod tests {
     #[test]
     fn memory_kind_all_enumerates_in_declaration_order() {
         let all = MemoryKind::all();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 13);
         assert_eq!(all[0], MemoryKind::Observation);
         assert_eq!(all[1], MemoryKind::Reflection);
         assert_eq!(all[2], MemoryKind::Persona);
         assert_eq!(all[9], MemoryKind::Decision);
+        // v0.8.0 Pillar 2 (#1709) — the typed-cognition cluster lands
+        // after the Form-6 vocabulary, in declaration order.
+        assert_eq!(all[10], MemoryKind::Goal);
+        assert_eq!(all[11], MemoryKind::Plan);
+        assert_eq!(all[12], MemoryKind::Step);
     }
 
     #[test]
@@ -1987,6 +2179,98 @@ mod tests {
     fn memory_kind_serialises_to_snake_case() {
         let v = serde_json::to_value(MemoryKind::Conversation).unwrap();
         assert_eq!(v, serde_json::Value::String("conversation".to_string()));
+    }
+
+    // --- v0.8.0 Pillar 2 (#1709) LifecycleState (schema v64) ---
+
+    #[test]
+    fn lifecycle_state_round_trips_every_variant_string() {
+        for s in [
+            LifecycleState::Open,
+            LifecycleState::Active,
+            LifecycleState::Blocked,
+            LifecycleState::Done,
+            LifecycleState::Abandoned,
+        ] {
+            assert_eq!(LifecycleState::from_str(s.as_str()), Some(s));
+        }
+    }
+
+    #[test]
+    fn lifecycle_state_from_str_returns_none_for_unknown() {
+        assert_eq!(LifecycleState::from_str("bogus"), None);
+        assert_eq!(LifecycleState::from_str(""), None);
+        assert_eq!(LifecycleState::from_str("OPEN"), None);
+    }
+
+    #[test]
+    fn lifecycle_state_default_is_open() {
+        assert_eq!(LifecycleState::default(), LifecycleState::Open);
+    }
+
+    #[test]
+    fn lifecycle_state_all_enumerates_in_declaration_order() {
+        assert_eq!(
+            LifecycleState::all(),
+            &[
+                LifecycleState::Open,
+                LifecycleState::Active,
+                LifecycleState::Blocked,
+                LifecycleState::Done,
+                LifecycleState::Abandoned,
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_state_is_terminal_only_done_and_abandoned() {
+        assert!(LifecycleState::Done.is_terminal());
+        assert!(LifecycleState::Abandoned.is_terminal());
+        assert!(!LifecycleState::Open.is_terminal());
+        assert!(!LifecycleState::Active.is_terminal());
+        assert!(!LifecycleState::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn lifecycle_state_transition_matrix_is_enforced() {
+        use LifecycleState::{Abandoned, Active, Blocked, Done, Open};
+        // Legal edges.
+        assert!(Open.can_transition_to(Active));
+        assert!(Open.can_transition_to(Abandoned));
+        assert!(Active.can_transition_to(Blocked));
+        assert!(Active.can_transition_to(Done));
+        assert!(Active.can_transition_to(Abandoned));
+        assert!(Blocked.can_transition_to(Active));
+        assert!(Blocked.can_transition_to(Abandoned));
+        // Illegal: skipping active.
+        assert!(!Open.can_transition_to(Done));
+        assert!(!Open.can_transition_to(Blocked));
+        // Illegal: no self-loops.
+        assert!(!Open.can_transition_to(Open));
+        assert!(!Active.can_transition_to(Active));
+        assert!(!Blocked.can_transition_to(Blocked));
+        // Illegal: terminals go nowhere.
+        for to in LifecycleState::all() {
+            assert!(!Done.can_transition_to(*to), "done -> {to} must be illegal");
+            assert!(
+                !Abandoned.can_transition_to(*to),
+                "abandoned -> {to} must be illegal"
+            );
+        }
+        // Illegal: blocked cannot jump straight to done (must re-activate).
+        assert!(!Blocked.can_transition_to(Done));
+    }
+
+    #[test]
+    fn lifecycle_state_serialises_to_snake_case() {
+        let v = serde_json::to_value(LifecycleState::Abandoned).unwrap();
+        assert_eq!(v, serde_json::Value::String("abandoned".to_string()));
+    }
+
+    #[test]
+    fn memory_default_lifecycle_state_is_open() {
+        let m = Memory::default();
+        assert_eq!(m.lifecycle_state, LifecycleState::Open);
     }
 
     #[test]

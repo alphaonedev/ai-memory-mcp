@@ -48,6 +48,12 @@ pub const ALLOWED_TOOLS: &str = "allowed_tools";
 pub const ARCHIVED_AT: &str = "archived_at";
 /// `archive_reason` — wire/row field name.
 pub const ARCHIVE_REASON: &str = "archive_reason";
+/// #1725 (v0.8.0) — the `archive_reason` VALUE stamped on the
+/// immediately-prior content snapshot captured before a lossless
+/// in-place content edit (the default update path archives the old
+/// content under the SAME memory_id, no fork). Shared SSOT so the
+/// sqlite + postgres backends and the parity test agree on the marker.
+pub const ARCHIVE_REASON_IN_PLACE_EDIT: &str = "in_place_edit";
 /// `atomisation_archived_at` — wire/row field name.
 pub const ATOMISATION_ARCHIVED_AT: &str = "atomisation_archived_at";
 /// `atom_count` — wire/row field name.
@@ -60,6 +66,21 @@ pub const ATOM_OF: &str = "atom_of";
 pub const MENTIONED_ENTITY_ID: &str = "mentioned_entity_id";
 /// `attest_level` — wire/row field name.
 pub const ATTEST_LEVEL: &str = "attest_level";
+/// `write_signature` — optional `metadata` key carrying a base64 detached
+/// Ed25519 per-write content signature over the #626 [`SignableWrite`]
+/// envelope (`agent_id + namespace + title + kind + created_at +
+/// sha256(content)`). Read on the federation receive path (#1464) to verify
+/// relayed content against the claimed author's enrolled key and upgrade the
+/// row from `attest_level=claimed` to `agent_attested`. Additive, free-form;
+/// absent on legacy/unsigned peers (sender-side emit is the tracked v0.9
+/// half). `SignableWrite` excludes `metadata`, so the signature is stable
+/// even as this key is added to the map.
+///
+/// [`SignableWrite`]: crate::identity::sign::SignableWrite
+pub const WRITE_SIGNATURE: &str = "write_signature";
+/// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
+/// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
+pub const VERSION_VECTOR: &str = "version_vector";
 /// `budget_tokens` — wire/row field name.
 pub const BUDGET_TOKENS: &str = "budget_tokens";
 /// `by_namespace` — wire/row field name.
@@ -88,6 +109,8 @@ pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
 pub const CONSOLIDATED: &str = "consolidated";
 /// `content_sha256` — wire/row field name.
 pub const CONTENT_SHA256: &str = "content_sha256";
+/// `correlation_id` — wire/row field name.
+pub const CORRELATION_ID: &str = "correlation_id";
 /// `created_at` — wire/row field name.
 pub const CREATED_AT: &str = "created_at";
 /// `created_by` — wire/row field name.
@@ -156,6 +179,13 @@ pub const IS_REFLECTION: &str = "is_reflection";
 pub const KEY_SOURCE: &str = "key_source";
 /// `last_accessed_at` — wire/row field name.
 pub const LAST_ACCESSED_AT: &str = "last_accessed_at";
+/// `lifecycle_state` — wire/row field name (v0.8.0 Pillar 2 #1709, schema v64).
+pub const LIFECYCLE_STATE: &str = "lifecycle_state";
+/// `encrypted_envelope` — wire/row field name (#228 at-rest content
+/// encryption, schema v44 sqlite / v68 postgres). The BLOB/BYTEA column
+/// carrying the sealed [`crate::encryption::Envelope`] ciphertext when at-rest
+/// encryption is enabled; NULL on every legacy + encryption-off row.
+pub const ENCRYPTED_ENVELOPE: &str = "encrypted_envelope";
 /// `last_seen_at` — wire/row field name.
 pub const LAST_SEEN_AT: &str = "last_seen_at";
 /// `latency_ms` — wire/row field name.

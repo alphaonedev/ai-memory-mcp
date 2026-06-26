@@ -1,0 +1,2 @@
+# 4.D harness writes per-step latency samples here at runtime (Docker host).
+.local-runs/

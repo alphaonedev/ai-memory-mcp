@@ -74,7 +74,7 @@ Your AI assistant uses these tools automatically during conversations. You can a
 
 ## MCP Tool Reference
 
-This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **At v0.7.0 the surface advertises 74 entries at `--profile full`** (73 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
+This section documents the MCP tools with their exact parameter schemas, example requests, and response formats. **At v0.8.0 the surface advertises 100 entries at `--profile full`** (99 callable "memory tools" + the always-on `memory_capabilities` bootstrap — both numbers are intentional; see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862) for the disambiguation). Default `--profile core` exposes 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities`. Canonical counts on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html) and asserted by `Profile::full().expected_tool_count()` in `src/profile.rs`. All tools are invoked via JSON-RPC 2.0 using method `tools/call` with the tool name in `params.name` and tool parameters in `params.arguments`.
 
 All responses are wrapped in the MCP content envelope:
 
@@ -567,7 +567,7 @@ Create a link between two memories.
 |------|------|----------|---------|-------------|
 | `source_id` | string | Yes | -- | Source memory ID |
 | `target_id` | string | Yes | -- | Target memory ID |
-| `relation` | string | No | `"related_to"` | Relation type (six at v0.7.0): `"related_to"`, `"supersedes"`, `"contradicts"`, `"derived_from"`, `"reflects_on"`, `"derives_from"` |
+| `relation` | string | No | `"related_to"` | Relation type (nine at v0.8.0): `"related_to"`, `"supersedes"`, `"contradicts"`, `"derived_from"`, `"reflects_on"`, `"derives_from"`, `"decomposes_into"`, `"depends_on"`, `"advances"` |
 
 **Example request:**
 
@@ -646,7 +646,7 @@ Get all links for a memory (both directions -- where the memory is source or tar
 }
 ```
 
-Relations accepted by `memory_link` and surfaced by `memory_get_links` (six at v0.7.0; was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation).
+Relations accepted by `memory_link` and surfaced by `memory_get_links` (nine at v0.8.0; six at v0.7.0; was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on` (recursive-learning Task 1/8), `derives_from` (WT-1-A atomisation), `decomposes_into`, `depends_on`, `advances`.
 
 ---
 
@@ -1315,8 +1315,8 @@ The identity that ends up in `metadata.agent_id` is resolved in order:
 1. The explicit value you passed (flag, env var, MCP param, or HTTP body field)
 2. `AI_MEMORY_AGENT_ID` environment variable
 3. (MCP server only) the MCP client's `initialize.clientInfo.name` →
-   `ai:<client>@<hostname>:pid-<pid>`
-4. `host:<hostname>:pid-<pid>-<uuid8>` — a collision-free host-qualified default
+   `ai:<client>@<hostname>` (durable, pid-free since #1720)
+4. `host:<hostname>` — a durable host-qualified default (pid-free since #1720)
 5. `anonymous:pid-<pid>-<uuid8>` — last-resort fallback if hostname lookup fails
 
 For the **HTTP API**, the precedence within a single request is:
@@ -1398,11 +1398,12 @@ trust boundary, not a per-write agent signature) and this permissive default
 posture — both tracked for v0.8 hardening under
 [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464).
 
-### Default leaks hostname + PID
+### Default exposes the hostname
 
-The auto-generated `host:<hostname>:pid-<pid>-<uuid8>` default exposes your
-hostname and process id. When exporting / syncing / sharing a DB externally,
-pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that leakage. Tracking issue
+The auto-generated `host:<hostname>` default exposes your hostname (it is
+durable + pid-free since #1720; only the `anonymous:pid-…` fallback still
+carries a process id). When exporting / syncing / sharing a DB externally,
+pass `--agent-id` or `AI_MEMORY_AGENT_ID` to scrub that exposure. Tracking issue
 #198 covers an opt-out config flag.
 
 ## Zero Token Cost
@@ -1672,7 +1673,7 @@ Link two memories with a typed relation.
 |------|-------|------|---------|-------------|
 | (positional 1) | | string | required | Source memory ID |
 | (positional 2) | | string | required | Target memory ID |
-| `--relation` | `-r` | string | `related_to` | Relation type (six at v0.7.0): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from` |
+| `--relation` | `-r` | string | `related_to` | Relation type (nine at v0.8.0): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances` |
 
 ---
 
@@ -1913,9 +1914,9 @@ Connect related memories with typed relations:
 ai-memory link <source-id> <target-id> --relation supersedes
 ```
 
-Valid relation types (six at v0.7.0): `related_to` (default),
+Valid relation types (nine at v0.8.0): `related_to` (default),
 `supersedes`, `contradicts`, `derived_from`, `reflects_on`,
-`derives_from`.
+`derives_from`, `decomposes_into`, `depends_on`, `advances`.
 
 - `related_to` (default) -- general association
 - `supersedes` -- this memory replaces the other
@@ -1923,6 +1924,9 @@ Valid relation types (six at v0.7.0): `related_to` (default),
 - `derived_from` -- this memory was created from the other (consolidation provenance)
 - `reflects_on` -- a reflection points at the source it synthesised from (recursive learning)
 - `derives_from` -- an atom points at the long-form parent it was decomposed from (WT-1 atomisation)
+- `decomposes_into` -- a parent breaks down into children (Goal → Plan → Step; parent → child) (v0.8.0 typed cognition)
+- `depends_on` -- an ordering/prerequisite edge between siblings (a Step that waits → the Step it waits on) (v0.8.0 typed cognition)
+- `advances` -- a child contributes progress toward an ancestor (Step → Plan/Goal) (v0.8.0 typed cognition)
 
 When you `get` a memory, its links are shown alongside it:
 

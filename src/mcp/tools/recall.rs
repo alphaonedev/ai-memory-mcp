@@ -275,66 +275,6 @@ pub async fn handle_recall_with_pre_recall_hook(
     )
 }
 
-/// v0.7.0 Gap 7 (#890) — Tier-3 recall-row decoration.
-///
-/// Serialise a `(Memory, score)` pair into the JSON shape the recall
-/// response surfaces. When `verbose_provenance` is true (the default
-/// since v0.7.0), the row carries the full provenance audit trail —
-/// derived `confidence_tier`, derived `freshness_state`, and the
-/// `latest_link_attest_level` lookup over `memory_links`. Plain serde
-/// already round-trips the substrate-side columns (`confidence`,
-/// `source`, `source_uri`, `access_count`, `last_accessed_at`), so
-/// the additional decoration is the *derived* half.
-///
-/// Token-budget contract: the verbose decoration adds at most ~120
-/// bytes per row (3 short snake_case keys + 3 short snake_case
-/// values). The token-budget guards (`tests/token_budget_guard.rs`)
-/// pin the catalog totals; the per-row decoration grows with `count`
-/// not catalog size, so the guards remain accurate.
-///
-/// v0.7.x (#1155) — exposed as `pub(crate)` so the HTTP recall handler
-/// at `src/handlers/recall.rs` can apply the same verbose-decoration
-/// shape under operator opt-in via the `Accept-Provenance: verbose`
-/// HTTP header. MCP wire default is `verbose_provenance=true`
-/// (set inline at `handle_recall_dto`); HTTP default is
-/// `verbose_provenance=false` for v0.6.x wire-shape backwards compat
-/// (consumers opt in via header).
-pub(crate) fn decorate_memory(
-    mem: &Memory,
-    score: f64,
-    verbose_provenance: bool,
-    conn: &rusqlite::Connection,
-) -> Value {
-    let mut val = serde_json::to_value(mem).unwrap_or_default();
-    let Some(obj) = val.as_object_mut() else {
-        return val;
-    };
-    obj.insert(
-        "score".to_string(),
-        json!(
-            (score * crate::SCORE_DISPLAY_ROUND_FACTOR).round() / crate::SCORE_DISPLAY_ROUND_FACTOR
-        ),
-    );
-    if !verbose_provenance {
-        return val;
-    }
-    // Gap 7 (#890) — derived confidence tier (Gap 4 enum).
-    obj.insert(
-        "confidence_tier".to_string(),
-        json!(mem.confidence_tier().as_str()),
-    );
-    // Gap 7 — derived freshness_state from expires_at + last_accessed_at.
-    obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
-    // Gap 7 — latest link attest level. Best-effort: a SQL error here
-    // collapses to None so a corrupt links row doesn't break the
-    // recall response.
-    let latest_attest = latest_link_attest_level(conn, &mem.id);
-    if let Some(level) = latest_attest {
-        obj.insert("latest_link_attest_level".to_string(), json!(level));
-    }
-    val
-}
-
 /// v0.7.0 Gap 7 (#890) — derive a coarse freshness state from
 /// substrate-side timestamps.
 ///
@@ -371,34 +311,6 @@ pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
     }
 }
 
-/// v0.7.0 Gap 7 (#890) — return the strongest attestation level
-/// across every link incident on `memory_id`. `peer_attested >
-/// self_signed > unsigned`. Returns `None` when no links exist.
-/// Best-effort: a SQL error returns `None` so the recall row keeps
-/// its remaining decoration.
-pub(crate) fn latest_link_attest_level(
-    conn: &rusqlite::Connection,
-    memory_id: &str,
-) -> Option<String> {
-    let links = db::get_links(conn, memory_id).ok()?;
-    let mut best: Option<AttestLevel> = None;
-    for link in &links {
-        let Some(level_str) = link.attest_level.as_deref() else {
-            continue;
-        };
-        let Some(level) = AttestLevel::from_str(level_str) else {
-            continue;
-        };
-        let candidate_rank = attest_rank(level);
-        match best {
-            None => best = Some(level),
-            Some(curr) if candidate_rank > attest_rank(curr) => best = Some(level),
-            _ => {}
-        }
-    }
-    best.map(|l| l.as_str().to_string())
-}
-
 const fn attest_rank(level: AttestLevel) -> u8 {
     // v0.7.0 #1430 fix: new SignedByPeer (L4 capture_turn) + DaemonSigned
     // (governance audit) variants ranked alongside the original 3.
@@ -421,11 +333,155 @@ const fn attest_rank(level: AttestLevel) -> u8 {
     }
 }
 
+/// v0.8.0 #1709 §2.5 T1 (C1a) — the ordered provenance-tier vocabulary
+/// surfaced as the recall-row `provenance_tier` decoration. These are
+/// the SSOT wire strings for [`provenance_tier`]; defining them once
+/// keeps the ≥3-site literal-duplication ratchet
+/// (`scripts/check-hardcoded-literals.sh`) green and makes the ordered
+/// set greppable. Ordering (strongest → weakest):
+/// `signed_peer` > `curator_derived` > `self_signed` > `unsigned_caller`.
+const PROVENANCE_TIER_SIGNED_PEER: &str = "signed_peer";
+const PROVENANCE_TIER_CURATOR_DERIVED: &str = "curator_derived";
+const PROVENANCE_TIER_SELF_SIGNED: &str = "self_signed";
+const PROVENANCE_TIER_UNSIGNED_CALLER: &str = "unsigned_caller";
+
+/// v0.8.0 #1709 §2.5 T1 (C1a) — map a row's already-fetched provenance
+/// signals to one ordered `provenance_tier` decoration string. PURE:
+/// no DB query, no LLM — it reads only the row's
+/// [`ConfidenceSource`](crate::models::ConfidenceSource) and the
+/// strongest incident link-attestation already resolved into the batch
+/// `attest_map` by [`latest_link_attest_level_many`] (passed here as the
+/// parsed [`AttestLevel`], or `None` when no link is incident).
+///
+/// This tier is **decoration only** — it is NOT a ranking key; recall
+/// ordering is untouched (the `m.confidence * 2.0` SQL term and the
+/// reranker remain the sole rank inputs).
+///
+/// Ordered mapping (strongest first; the match is evaluated top-down so
+/// a stronger arm always wins):
+///   1. attest is `SignedByPeer` / `PeerAttested` (the strongest
+///      attestation tier — an external pubkey enrollment + verified
+///      signature) → `signed_peer`.
+///   2. else `confidence_source` is engine-derived
+///      (`CuratorDerived` — atomiser/persona; `AutoDerived` — Form-5
+///      derive engine; `Calibrated` — calibration sweep) → the value
+///      was computed by the substrate, not asserted by a caller →
+///      `curator_derived`.
+///   3. else attest is `SelfSigned` / `DaemonSigned` (a writer-local /
+///      substrate-self signature) → `self_signed`.
+///   4. else → `unsigned_caller` (caller-provided / compiled-default /
+///      decayed value with no link attestation — the lowest-trust
+///      bucket).
+const fn provenance_tier(
+    confidence_source: crate::models::ConfidenceSource,
+    attest: Option<AttestLevel>,
+) -> &'static str {
+    use crate::models::ConfidenceSource;
+    match (attest, confidence_source) {
+        (Some(AttestLevel::SignedByPeer | AttestLevel::PeerAttested), _) => {
+            PROVENANCE_TIER_SIGNED_PEER
+        }
+        (
+            _,
+            ConfidenceSource::CuratorDerived
+            | ConfidenceSource::AutoDerived
+            | ConfidenceSource::Calibrated,
+        ) => PROVENANCE_TIER_CURATOR_DERIVED,
+        (Some(AttestLevel::SelfSigned | AttestLevel::DaemonSigned), _) => {
+            PROVENANCE_TIER_SELF_SIGNED
+        }
+        _ => PROVENANCE_TIER_UNSIGNED_CALLER,
+    }
+}
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — as-of QUANTIZATION bucket (seconds)
+/// for the [`scheduled_validity`] recompute. Quantizing the wall clock to
+/// the nearest hour floor is what makes the decoration DETERMINISTIC: two
+/// recalls that land in the same hour bucket compute a byte-identical
+/// `scheduled_validity` from the same `(anchor, created_at, as_of)` triple,
+/// so the §2.6 Invariant-1 determinism property holds at the decoration
+/// surface (the decoration is never a ranking key, but it must still be
+/// stable for the same input bucket). Reuses the crate-level
+/// [`crate::SECS_PER_HOUR`] const — NO inline `3600`.
+const VALIDITY_AS_OF_BUCKET_SECS: i64 = crate::SECS_PER_HOUR;
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — the "expiring" cutoff as a fraction
+/// of the scheduled-validity window remaining. When the remaining lifetime
+/// (`anchor - as_of`) is at or below this fraction of the total scheduled
+/// window (`anchor - created_at`) — but still positive — the row maps to
+/// `expiring` rather than `valid`. Named const so the threshold is a single
+/// greppable knob (no inline magic number).
+const SCHEDULED_VALIDITY_EXPIRING_FRACTION: f64 = 0.2;
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — the ordered `scheduled_validity`
+/// vocabulary surfaced as a recall-row decoration. SSOT wire strings for
+/// [`scheduled_validity`]; defined once so the ≥3-site literal-duplication
+/// ratchet (`scripts/check-hardcoded-literals.sh`) stays green and the
+/// ordered set is greppable. Ordering (most life remaining → none):
+/// `valid` > `expiring` > `expired`.
+const SCHEDULED_VALIDITY_VALID: &str = "valid";
+const SCHEDULED_VALIDITY_EXPIRING: &str = "expiring";
+const SCHEDULED_VALIDITY_EXPIRED: &str = "expired";
+
+/// v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic scheduled-fact validity
+/// recomputed from the memory's ANCHOR. PURE: no DB query, no LLM, no
+/// learned model, branch-free over the parsed inputs. The recompute is a
+/// pure function of stored fields + a QUANTIZED as-of bucket, so two reads
+/// over the same `(anchor, created_at, as_of-bucket)` produce a
+/// byte-identical result.
+///
+/// "Scheduled-fact" / "anchor" mapping: there is no dedicated anchor column
+/// on [`Memory`]. The scheduled-validity HORIZON is
+/// [`Memory::effective_expires_at`](crate::models::Memory::effective_expires_at)
+/// — the explicit `expires_at` when set, else `created_at + tier TTL — and
+/// the validity START is `created_at`. The window is `[created_at, anchor)`.
+///
+/// `anchor` and `created_at` are RFC3339 strings (the on-row wire form);
+/// `as_of_secs` is the QUANTIZED unix-second as-of bucket from
+/// [`VALIDITY_AS_OF_BUCKET_SECS`]. Mapping:
+///   * `as_of >= anchor`                                  → `expired`
+///   * unparsable inputs / non-positive window            → `expired`
+///     (fail-closed: a row we cannot reason about is treated as past its
+///     scheduled validity rather than asserted `valid`)
+///   * remaining-fraction `(anchor - as_of)/(anchor - created_at)`
+///     at or below [`SCHEDULED_VALIDITY_EXPIRING_FRACTION`]              → `expiring`
+///   * else                                               → `valid`
+///
+/// This is **decoration only** — never a ranking key, never written back,
+/// `m.confidence` untouched. Mirrors [`freshness_state`]'s pure style but
+/// QUANTIZED (freshness_state stays un-quantized; this is the new
+/// deterministic-anchor field).
+fn scheduled_validity(anchor: &str, created_at: &str, as_of_secs: i64) -> &'static str {
+    let Ok(anchor_dt) = chrono::DateTime::parse_from_rfc3339(anchor) else {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    };
+    let Ok(start_dt) = chrono::DateTime::parse_from_rfc3339(created_at) else {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    };
+    let anchor_secs = anchor_dt.timestamp();
+    let start_secs = start_dt.timestamp();
+    let total = anchor_secs - start_secs;
+    let remaining = anchor_secs - as_of_secs;
+    if remaining <= 0 || total <= 0 {
+        return SCHEDULED_VALIDITY_EXPIRED;
+    }
+    // Both are positive i64 second counts; the ratio is in (0.0, 1.0].
+    #[allow(clippy::cast_precision_loss)]
+    let remaining_fraction = remaining as f64 / total as f64;
+    if remaining_fraction <= SCHEDULED_VALIDITY_EXPIRING_FRACTION {
+        SCHEDULED_VALIDITY_EXPIRING
+    } else {
+        SCHEDULED_VALIDITY_VALID
+    }
+}
+
 /// FX-4 / PERF-2 (2026-05-26) — batched lookup of the strongest
 /// attestation level across every link incident on each `memory_id`
-/// in `ids`. Replaces the per-row [`latest_link_attest_level`] call
-/// that the HTTP recall handler used to issue under the DB mutex
-/// (one round-trip per row × N rows = N round-trips under the lock).
+/// in `ids`. v0.8.0 #1709 §2.5 T0 — this is now the SOLE attestation
+/// decoration path; the per-row `latest_link_attest_level` lookup it
+/// replaced (one round-trip per row × N rows = N round-trips under
+/// the lock) was removed once the MCP recall path joined the HTTP
+/// path on the batched decorator.
 /// One `IN(...)` SQL emit covers the batch; the map is keyed by
 /// `memory_id` and only entries with a non-`None` level land in it.
 /// Best-effort: a SQL error returns an empty map so the recall
@@ -517,20 +573,21 @@ pub(crate) fn latest_link_attest_level_many(
     out
 }
 
-/// FX-4 / PERF-2 (2026-05-26) — batched front-end for
-/// [`decorate_memory`] used by the HTTP recall handler. Resolves
-/// the verbose-decoration link-attestation lookup for every memory
-/// in one SQL round-trip via [`latest_link_attest_level_many`]
-/// instead of N round-trips. Returns one `Value` per `(mem, score)`
-/// in input order so the caller can splice it straight into the
-/// response payload.
+/// FX-4 / PERF-2 (2026-05-26) — batched recall-row decorator used by
+/// both the HTTP recall handler and (v0.8.0 #1709 §2.5 T0) the MCP
+/// recall path. Resolves the verbose-decoration link-attestation
+/// lookup for every memory in one SQL round-trip via
+/// [`latest_link_attest_level_many`] instead of N round-trips.
+/// Returns one `Value` per `(mem, score)` in input order so the
+/// caller can splice it straight into the response payload.
 ///
-/// Per-row pure fields (`confidence_tier`, `freshness_state`, the
-/// serialised `Memory` body, and the rounded `score`) match the
-/// shape that [`decorate_memory`] produces — the only structural
-/// difference is that the attestation lookup is amortised across
-/// the batch. The verbose-OFF path is identical to the legacy
-/// per-row shape (no DB queries) and is short-circuited here.
+/// Per-row fields (`confidence_tier`, `freshness_state`, the
+/// serialised `Memory` body, the rounded `score`, and — under
+/// verbose — `latest_link_attest_level`) are byte-identical to the
+/// legacy per-row decorator this replaced; the only structural
+/// difference is that the attestation lookup is amortised across the
+/// batch. The verbose-OFF path emits the bare serde body + rounded
+/// `score` (no DB queries) and is short-circuited here.
 pub fn decorate_memory_many(
     rows: &[(Memory, f64)],
     verbose_provenance: bool,
@@ -556,6 +613,15 @@ pub fn decorate_memory_many(
     }
     let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
     let attest_map = latest_link_attest_level_many(conn, &ids);
+    // v0.8.0 #1709 §2.5 T4 (D1-anchor) — read the process-wide decay flag
+    // ONCE for the whole batch and quantize the wall clock to the as-of
+    // bucket ONCE, so every row in this recall decorates against the same
+    // deterministic `as_of`. Read pattern matches the rest of the codebase
+    // (`crate::confidence::decay::decay_enabled` is the canonical
+    // `AI_MEMORY_CONFIDENCE_DECAY=1` accessor).
+    let decay_enabled = crate::confidence::decay::decay_enabled();
+    let validity_as_of_secs =
+        (chrono::Utc::now().timestamp() / VALIDITY_AS_OF_BUCKET_SECS) * VALIDITY_AS_OF_BUCKET_SECS;
     rows.iter()
         .map(|(mem, score)| {
             let mut val = serde_json::to_value(mem).unwrap_or_default();
@@ -574,8 +640,40 @@ pub fn decorate_memory_many(
                 json!(mem.confidence_tier().as_str()),
             );
             obj.insert("freshness_state".to_string(), json!(freshness_state(mem)));
+            // v0.8.0 #1709 §2.5 T1 (C1a) — the strongest incident
+            // attestation already resolved into `attest_map` (one
+            // batched IN(...) emit, no per-row query). Re-parse the
+            // wire string back to the typed `AttestLevel` so the
+            // provenance mapping stays exhaustive over the enum.
+            let attest_level = attest_map
+                .get(&mem.id)
+                .and_then(|s| AttestLevel::from_str(s));
             if let Some(level) = attest_map.get(&mem.id) {
                 obj.insert("latest_link_attest_level".to_string(), json!(level));
+            }
+            // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier decoration
+            // composed PURELY from already-fetched data (the row's
+            // confidence_source + the batched attest level). No new DB
+            // query, no LLM. Decoration only — NOT a ranking key.
+            obj.insert(
+                "provenance_tier".to_string(),
+                json!(provenance_tier(mem.confidence_source, attest_level)),
+            );
+            // v0.8.0 #1709 §2.5 T4 (D1-anchor) — deterministic
+            // scheduled-fact validity recomputed from the row's ANCHOR
+            // (`effective_expires_at`), emitted ONLY when confidence-decay
+            // is enabled AND the row has an anchor. No anchor (long-tier,
+            // no explicit expiry) or decay-off ⇒ field absent (no noise).
+            // Decoration only — never a ranking key, never written back.
+            if decay_enabled && let Some(anchor) = mem.effective_expires_at() {
+                obj.insert(
+                    "scheduled_validity".to_string(),
+                    json!(scheduled_validity(
+                        &anchor,
+                        &mem.created_at,
+                        validity_as_of_secs
+                    )),
+                );
             }
             val
         })
@@ -593,6 +691,8 @@ fn record_recall_observations(
     recall_id: &str,
     memories_json: &[Value],
     retriever: &str,
+    agent_id: Option<&str>,
+    namespace: Option<&str>,
 ) {
     if !observations::table_exists(conn) {
         return;
@@ -622,13 +722,43 @@ fn record_recall_observations(
             });
         }
     }
-    if let Err(e) = observations::record_recall(conn, recall_id, &candidates) {
+    if let Err(e) =
+        observations::record_recall_with_identity(conn, recall_id, &candidates, agent_id, namespace)
+    {
         tracing::warn!(
             target: "observations",
             recall_id = %recall_id,
             "record_recall failed (non-fatal): {e}"
         );
     }
+}
+
+/// v0.8.0 #1709 §2.5 T3 (A2) — make the `confidence_tier` recall filter
+/// NON-SILENT. When a caller requests a tier filter and the recall comes
+/// back with `count:0`, the bare count cannot distinguish "no memory at
+/// all matched the query" from "candidates matched but every one was
+/// below the requested tier bar". This helper surfaces that distinction
+/// in the response `meta`:
+///
+/// - `confidence_filtered_out`: how many candidates the tier filter
+///   dropped at this path's filter site (BEFORE − AFTER).
+/// - `had_filtered_candidates`: `confidence_filtered_out > 0`.
+///
+/// Centralizing the two field-name string literals here keeps them at a
+/// single production site (the hardcoded-literal ratchet treats a
+/// ≥10-char literal repeated across ≥3 sites as a magic value); all three
+/// recall resp-build branches call this one function. Only invoked when
+/// the caller actually requested a tier filter — unfiltered recalls get
+/// no new meta keys (zero noise). Decoration only: `meta` is never a
+/// ranking key, so determinism is unaffected.
+fn insert_confidence_filter_meta(resp: &mut Value, filtered_out: usize) {
+    let meta = resp
+        .as_object_mut()
+        .expect("recall response is always a JSON object")
+        .entry("meta".to_string())
+        .or_insert_with(|| json!({}));
+    meta["confidence_filtered_out"] = json!(filtered_out);
+    meta["had_filtered_candidates"] = json!(filtered_out > 0);
 }
 
 /// #967 — JSON-bag entry kept as a thin wrapper around
@@ -682,6 +812,29 @@ pub fn handle_recall_caller(
     recall_scope: Option<&crate::config::RecallScope>,
     caller: Option<&str>,
 ) -> Result<Value, String> {
+    // v0.8.0 PE-2 (#1730) — read-action governance gate. The zero-config
+    // fast-path inside gate_read keeps the recall hot path free when no
+    // read_action rules are configured; a matched refuse/escalate rule
+    // denies the recall with the standard governance-refusal wire shape.
+    let actor = caller
+        .or_else(|| params["agent_id"].as_str())
+        .unwrap_or_default();
+    crate::governance::agent_action::gate_read_surface(
+        conn,
+        actor,
+        "recall",
+        params["namespace"].as_str(),
+        params["context"]
+            .as_str()
+            .or_else(|| params["query"].as_str()),
+    )
+    .map_err(|r| {
+        crate::governance::deny_message(
+            "recall",
+            crate::governance::DenyGate::Governance,
+            &r.reason,
+        )
+    })?;
     let req = RecallRequest::from_mcp_params(params)?;
     handle_recall_dto(
         conn,
@@ -763,10 +916,20 @@ pub fn handle_recall_dto(
     // the derived fields the substrate computes here.
     let scored_memories =
         |results: Vec<(Memory, f64)>, conn: &rusqlite::Connection| -> Vec<Value> {
-            results
-                .into_iter()
-                .map(|(mem, score)| decorate_memory(&mem, score, verbose_provenance, conn))
-                .collect()
+            // v0.8.0 #1709 §2.5 T0 — route the MCP recall path through the
+            // batched decorator. The pre-T0 per-row `decorate_memory` loop
+            // issued one `latest_link_attest_level` (→ `get_links`) query
+            // PER row under verbose provenance — O(K) DB round-trips over
+            // the top-K. `decorate_memory_many` does a single
+            // `latest_link_attest_level_many` IN(...) prefetch over the
+            // whole batch and decorates each row identically (same per-row
+            // JSON: score + confidence_tier + freshness_state +
+            // latest_link_attest_level under verbose; bare score otherwise),
+            // so the output Vec stays byte-identical while collapsing K
+            // attestation queries into one. The top-K is already a
+            // materialised `Vec<(Memory, f64)>` (bounded to the limit), so
+            // we pass it by reference with no extra allocation.
+            decorate_memory_many(&results, verbose_provenance, conn)
         };
 
     // v0.7.0 Gap 4 (#887) — filter `(Memory, f64)` candidates by the
@@ -1037,6 +1200,8 @@ pub fn handle_recall_dto(
                     // SQL push-down already constrained the set; we
                     // keep it for the `has_citations` axis only.
                     source_uri_prefix.as_deref(),
+                    // v0.8.0 #1720 A3 — owner-keyed visibility caller.
+                    caller,
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1049,7 +1214,12 @@ pub fn handle_recall_dto(
                 if let Some(ce) = reranker {
                     let ce_reranked = ce.rerank(context, results);
                     let ce_reranked = apply_kinds_filter(ce_reranked, kinds_filter.as_deref());
+                    // v0.8.0 #1709 §2.5 T3 (A2) — capture before/after the
+                    // tier filter so the response can report how many
+                    // candidates were dropped for being below the bar.
+                    let ce_before = ce_reranked.len();
                     let ce_reranked = apply_confidence_tier_filter(ce_reranked);
+                    let confidence_filtered_out = ce_before - ce_reranked.len();
                     let ce_reranked = apply_visibility_filter(ce_reranked);
                     // v0.7.0 (issue #518) — session recency boost.
                     let ce_reranked = crate::reranker::apply_session_recency_boost(
@@ -1063,6 +1233,8 @@ pub fn handle_recall_dto(
                         &recall_id,
                         &memories,
                         crate::models::RECALL_MODE_HYBRID_RERANK,
+                        caller,
+                        namespace,
                     );
                     let mut resp = json!({
                         "recall_id": recall_id,
@@ -1072,12 +1244,18 @@ pub fn handle_recall_dto(
                     });
                     decorate_budget(&mut resp, &outcome);
                     attach_meta(&mut resp, "hybrid", &telemetry);
+                    if confidence_tier_filter.is_some() {
+                        insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+                    }
                     super::inject_namespace_standard(conn, namespace, &mut resp);
                     return Ok(resp);
                 }
 
                 let results = apply_kinds_filter(results, kinds_filter.as_deref());
+                // v0.8.0 #1709 §2.5 T3 (A2) — before/after the tier filter.
+                let confidence_before = results.len();
                 let results = apply_confidence_tier_filter(results);
+                let confidence_filtered_out = confidence_before - results.len();
                 let results = apply_visibility_filter(results);
                 // v0.7.0 (issue #518) — session recency boost (no
                 // cross-encoder branch).
@@ -1087,7 +1265,9 @@ pub fn handle_recall_dto(
                     session_tracker,
                 );
                 let memories = scored_memories(results, conn);
-                record_recall_observations(conn, &recall_id, &memories, "hybrid");
+                record_recall_observations(
+                    conn, &recall_id, &memories, "hybrid", caller, namespace,
+                );
                 let mut resp = json!({
                     "recall_id": recall_id,
                     "memories": memories,
@@ -1096,6 +1276,9 @@ pub fn handle_recall_dto(
                 });
                 decorate_budget(&mut resp, &outcome);
                 attach_meta(&mut resp, "hybrid", &telemetry);
+                if confidence_tier_filter.is_some() {
+                    insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+                }
                 super::inject_namespace_standard(conn, namespace, &mut resp);
                 return Ok(resp);
             }
@@ -1127,6 +1310,8 @@ pub fn handle_recall_dto(
         include_archived,
         // v0.7.0 Cluster-A PERF-3 — see hybrid branch above.
         source_uri_prefix.as_deref(),
+        // v0.8.0 #1720 A3 — owner-keyed visibility caller.
+        caller,
     )
     .map_err(|e| e.to_string())?;
     let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1135,7 +1320,10 @@ pub fn handle_recall_dto(
         source_uri_prefix.as_deref(),
     );
     let results = apply_kinds_filter(results, kinds_filter.as_deref());
+    // v0.8.0 #1709 §2.5 T3 (A2) — before/after the tier filter.
+    let confidence_before = results.len();
     let results = apply_confidence_tier_filter(results);
+    let confidence_filtered_out = confidence_before - results.len();
     let results = apply_visibility_filter(results);
     // v0.7.0 (issue #518) — session recency boost on the keyword-only
     // fallback branch as well, so the contract is uniform regardless
@@ -1146,7 +1334,7 @@ pub fn handle_recall_dto(
         session_tracker,
     );
     let memories = scored_memories(results, conn);
-    record_recall_observations(conn, &recall_id, &memories, "keyword");
+    record_recall_observations(conn, &recall_id, &memories, "keyword", caller, namespace);
     let mut resp = json!({
         "recall_id": recall_id,
         "memories": memories,
@@ -1155,6 +1343,9 @@ pub fn handle_recall_dto(
     });
     decorate_budget(&mut resp, &outcome);
     attach_meta(&mut resp, "keyword_only", &telemetry);
+    if confidence_tier_filter.is_some() {
+        insert_confidence_filter_meta(&mut resp, confidence_filtered_out);
+    }
     super::inject_namespace_standard(conn, namespace, &mut resp);
     Ok(resp)
 }
@@ -1211,6 +1402,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1809,5 +2001,286 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("context"));
+    }
+
+    // v0.8.0 #1709 §2.5 T1 (C1a) — provenance_tier mapping covers all
+    // four ordered output tiers from the (ConfidenceSource × attest)
+    // signal pair, evaluated strongest-arm-first.
+    #[test]
+    fn provenance_tier_maps_all_four_tiers() {
+        use crate::models::ConfidenceSource;
+
+        // 1. signed_peer — strongest attestation wins regardless of
+        //    confidence_source (here a caller-provided value still maps
+        //    to signed_peer because a peer signature is present).
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::SignedByPeer)
+            ),
+            "signed_peer"
+        );
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::PeerAttested)
+            ),
+            "signed_peer"
+        );
+
+        // 2. curator_derived — engine-derived confidence_source with no
+        //    peer attestation. All three engine-derived variants map here.
+        assert_eq!(
+            provenance_tier(ConfidenceSource::CuratorDerived, None),
+            "curator_derived"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::AutoDerived, None),
+            "curator_derived"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Calibrated, None),
+            "curator_derived"
+        );
+
+        // 3. self_signed — writer-local / daemon-self signature, no peer
+        //    attestation, and not engine-derived.
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CallerProvided,
+                Some(AttestLevel::SelfSigned)
+            ),
+            "self_signed"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Default, Some(AttestLevel::DaemonSigned)),
+            "self_signed"
+        );
+
+        // 4. unsigned_caller — lowest-trust bucket: caller-provided /
+        //    compiled-default / decayed value with no (or unsigned) link
+        //    attestation.
+        assert_eq!(
+            provenance_tier(ConfidenceSource::CallerProvided, None),
+            "unsigned_caller"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Default, Some(AttestLevel::Unsigned)),
+            "unsigned_caller"
+        );
+        assert_eq!(
+            provenance_tier(ConfidenceSource::Decayed, None),
+            "unsigned_caller"
+        );
+
+        // Ordering invariant: a peer attestation outranks an
+        // engine-derived confidence_source (arm 1 before arm 2).
+        assert_eq!(
+            provenance_tier(
+                ConfidenceSource::CuratorDerived,
+                Some(AttestLevel::PeerAttested)
+            ),
+            "signed_peer"
+        );
+        // And an engine-derived source outranks a self-signed
+        // attestation (arm 2 before arm 3).
+        assert_eq!(
+            provenance_tier(ConfidenceSource::AutoDerived, Some(AttestLevel::SelfSigned)),
+            "curator_derived"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // v0.8.0 #1709 §2.5 T4 (D1-anchor) — scheduled_validity decoration
+    // -------------------------------------------------------------------
+
+    /// Process-wide serial guard for the env-mutating `scheduled_validity`
+    /// decorator tests, so toggling `AI_MEMORY_CONFIDENCE_DECAY` in one
+    /// test never races another test in this binary reading the flag.
+    fn decay_env_lock() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    // PURE-function unit tests — no env, no DB, fully deterministic.
+
+    #[test]
+    fn scheduled_validity_fresh_anchor_is_valid() {
+        // created at t=0, anchor 100h out, as_of right at the start ⇒ full
+        // window remaining ⇒ valid.
+        let created = "2026-01-01T00:00:00+00:00";
+        let start = chrono::DateTime::parse_from_rfc3339(created)
+            .unwrap()
+            .timestamp();
+        let anchor = (chrono::DateTime::parse_from_rfc3339(created).unwrap()
+            + chrono::Duration::hours(100))
+        .to_rfc3339();
+        assert_eq!(scheduled_validity(&anchor, created, start), "valid");
+    }
+
+    #[test]
+    fn scheduled_validity_near_anchor_is_expiring() {
+        // 100h window; as_of leaves only 10h (10% <= 20% cutoff) ⇒ expiring.
+        let created = "2026-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor_dt = created_dt + chrono::Duration::hours(100);
+        let anchor = anchor_dt.to_rfc3339();
+        let as_of = (anchor_dt - chrono::Duration::hours(10)).timestamp();
+        assert_eq!(scheduled_validity(&anchor, created, as_of), "expiring");
+    }
+
+    #[test]
+    fn scheduled_validity_at_or_past_anchor_is_expired() {
+        let created = "2026-01-01T00:00:00+00:00";
+        let created_dt = chrono::DateTime::parse_from_rfc3339(created).unwrap();
+        let anchor_dt = created_dt + chrono::Duration::hours(100);
+        let anchor = anchor_dt.to_rfc3339();
+        // exactly at the anchor (remaining == 0) ⇒ expired.
+        assert_eq!(
+            scheduled_validity(&anchor, created, anchor_dt.timestamp()),
+            "expired"
+        );
+        // past the anchor ⇒ expired.
+        assert_eq!(
+            scheduled_validity(
+                &anchor,
+                created,
+                (anchor_dt + chrono::Duration::hours(1)).timestamp()
+            ),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn scheduled_validity_unparsable_or_degenerate_fails_closed_to_expired() {
+        // unparsable anchor / created ⇒ expired (fail-closed).
+        assert_eq!(
+            scheduled_validity("not-a-date", "2026-01-01T00:00:00+00:00", 0),
+            "expired"
+        );
+        assert_eq!(
+            scheduled_validity("2026-01-01T00:00:00+00:00", "nope", 0),
+            "expired"
+        );
+        // non-positive window (anchor == created) ⇒ expired.
+        let same = "2026-01-01T00:00:00+00:00";
+        let ts = chrono::DateTime::parse_from_rfc3339(same)
+            .unwrap()
+            .timestamp();
+        assert_eq!(scheduled_validity(same, same, ts - 1), "expired");
+    }
+
+    #[test]
+    fn scheduled_validity_is_deterministic_within_an_as_of_bucket() {
+        // Two evaluations with the SAME quantized as-of bucket are
+        // byte-identical — the §2.6 determinism property at the decoration
+        // surface. (The pure fn already guarantees this; this pins it.)
+        let created = "2026-01-01T00:00:00+00:00";
+        let anchor = (chrono::DateTime::parse_from_rfc3339(created).unwrap()
+            + chrono::Duration::hours(50))
+        .to_rfc3339();
+        let raw_now = chrono::Utc::now().timestamp();
+        let bucket = (raw_now / VALIDITY_AS_OF_BUCKET_SECS) * VALIDITY_AS_OF_BUCKET_SECS;
+        let a = scheduled_validity(&anchor, created, bucket);
+        let b = scheduled_validity(&anchor, created, bucket);
+        assert_eq!(a, b, "same as-of bucket ⇒ identical scheduled_validity");
+    }
+
+    // Decorator integration — env-gated + anchor-gated emission.
+
+    fn mem_with_expiry(title: &str, expires_at: Option<&str>) -> Memory {
+        let mut m = make_mem(title, "scheduled validity decoration content", "sv");
+        // Short tier so a None expires_at still backfills an anchor via
+        // effective_expires_at (created_at + 6h); Long tier has no TTL so
+        // it is the "no anchor" case.
+        m.tier = Tier::Short;
+        m.expires_at = expires_at.map(str::to_string);
+        m
+    }
+
+    #[test]
+    fn decorate_emits_scheduled_validity_only_when_decay_on_and_anchor_present() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+
+        // Anchor in the far future (explicit expires_at) ⇒ valid when on.
+        let future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let rows = vec![(mem_with_expiry("sv-valid", Some(&future)), 1.0_f64)];
+
+        // Flag OFF ⇒ field ABSENT.
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+        let off = decorate_memory_many(&rows, true, &conn);
+        assert!(
+            off[0]
+                .as_object()
+                .unwrap()
+                .get("scheduled_validity")
+                .is_none(),
+            "decay flag OFF ⇒ no scheduled_validity field"
+        );
+
+        // Flag ON + anchor present ⇒ field PRESENT and == "valid".
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let on = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            on[0].get("scheduled_validity").and_then(|v| v.as_str()),
+            Some("valid"),
+            "decay ON + future anchor ⇒ scheduled_validity=valid"
+        );
+
+        // Determinism: a second decorate in the same as-of hour bucket is
+        // byte-identical for the scheduled_validity field.
+        let on2 = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            on[0].get("scheduled_validity"),
+            on2[0].get("scheduled_validity"),
+            "two reads in the same as-of bucket ⇒ identical scheduled_validity"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+    }
+
+    #[test]
+    fn decorate_scheduled_validity_expired_for_past_anchor() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let rows = vec![(mem_with_expiry("sv-expired", Some(&past)), 1.0_f64)];
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let out = decorate_memory_many(&rows, true, &conn);
+        assert_eq!(
+            out[0].get("scheduled_validity").and_then(|v| v.as_str()),
+            Some("expired"),
+            "past anchor ⇒ scheduled_validity=expired"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
+    }
+
+    #[test]
+    fn decorate_no_scheduled_validity_when_no_anchor() {
+        let _g = decay_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = fresh_conn();
+        // Long tier + no explicit expiry ⇒ effective_expires_at is None ⇒
+        // no anchor ⇒ field absent even with decay ON.
+        let mut m = make_mem("sv-no-anchor", "no anchor content", "sv");
+        m.tier = Tier::Long;
+        m.expires_at = None;
+        let rows = vec![(m, 1.0_f64)];
+        unsafe { std::env::set_var(crate::confidence::decay::ENV_DECAY, "1") };
+        let out = decorate_memory_many(&rows, true, &conn);
+        assert!(
+            out[0]
+                .as_object()
+                .unwrap()
+                .get("scheduled_validity")
+                .is_none(),
+            "no anchor (long tier, no expiry) ⇒ no scheduled_validity field"
+        );
+        unsafe { std::env::remove_var(crate::confidence::decay::ENV_DECAY) };
     }
 }

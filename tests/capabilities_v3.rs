@@ -610,7 +610,7 @@ fn cap_v3_a3_allowlist_on_agent_denied_callable_now_false() {
 // memory_skill_get, memory_skill_resource, memory_skill_export.)
 // ---------------------------------------------------------------------------
 #[test]
-fn cap_v3_response_carries_tools_array_with_73_entries() {
+fn cap_v3_response_carries_tools_array_with_full_profile_entries() {
     let tier_config = semantic_tier();
     let conn = fresh_conn();
     let val = handle_capabilities_with_conn_v3(
@@ -1042,6 +1042,7 @@ fn cap_v3_k5_rule_summary_single_policy_carries_one_entry() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -1117,6 +1118,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
             approver: ApproverType::Agent("maintainer".to_string()),
             inherit: false,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };
@@ -1128,6 +1130,7 @@ fn cap_v3_k5_rule_summary_multiple_policies_lex_ordered() {
             approver: ApproverType::Consensus(3),
             inherit: true,
             max_reflection_depth: None,
+            required_scope: None,
         },
         ..Default::default()
     };

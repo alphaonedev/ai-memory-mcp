@@ -53,6 +53,48 @@
 //! - `export_pub` emits URL-safe, no-padding base64 of the public
 //!   key bytes — short enough to paste into a Slack message or a
 //!   peer's allowlist file.
+//!
+//! # Key lifecycle & rotation (#1679)
+//!
+//! The at-rest keypair lifecycle has four phases:
+//!
+//! 1. **Generate** — [`generate`] mints a fresh Ed25519 keypair from the
+//!    platform CSPRNG. [`ensure_keypair`] auto-generates one at first
+//!    `serve` startup (idempotent — a restart never regenerates).
+//! 2. **Persist** — [`save`] writes `<id>.priv` mode `0o600` and
+//!    `<id>.pub` mode `0o644`. [`load`] enforces the `0o600` private-key
+//!    mode at load time (S4-LOW1) and warns on drift.
+//! 3. **Rotate** — [`rotate`] (surfaced via `ai-memory identity generate
+//!    --force`) replaces the active keypair, but FIRST archives the
+//!    **prior public key** to a timestamped sibling
+//!    `<id>.pub.<unix_secs>` (mode `0o644`). This preserves the
+//!    verification anchor for historical `signed_events` signed with the
+//!    rotated-out key — the pre-#1679 `--force` path overwrote the
+//!    `.pub` in place and destroyed that anchor irrecoverably. The old
+//!    **private** key is intentionally NOT archived: it is destroyed by
+//!    the overwrite (forward security — a retired signing key never signs
+//!    again, so keeping a copy is pure attack surface).
+//! 4. **Out of scope** — hardware-backed storage (TPM / HSM / KMS /
+//!    Secure Enclave) is the commercial AgenticMem™ boundary documented
+//!    above; revocation lists and a key-id-stamped multi-key
+//!    signed-events verifier are not implemented in the OSS crate.
+//!
+//! ## Verifying signed_events across a rotation
+//!
+//! The audit chain has two independent properties. The **cross-row hash
+//! chain** (`signed_events` integrity / tamper-evidence) is
+//! key-independent — it survives rotation untouched and remains the
+//! authoritative "has the log been tampered with?" signal. The **per-row
+//! Ed25519 signature** (authenticity) is key-bound: the verifier resolves
+//! the single *current* daemon key, so after a rotation, rows signed with
+//! the prior key surface as `signature_failures` under the new key. This
+//! is **expected** (a rotated key), NOT tamper. To re-verify those
+//! historical signatures, `ai-memory identity import` the archived
+//! `<id>.pub.<unix_secs>` anchor and check against it out-of-band. A
+//! verifier that auto-walks the archived-key set per row is a deliberate,
+//! separable additive follow-up (adjudicated by the #1679 5-agent vote
+//! `4d3ea1c5` — not built here to avoid a key-id schema change on the
+//! append-only attested table for a rarely-rotating OSS daemon).
 
 use std::fs;
 use std::io;
@@ -264,6 +306,91 @@ pub fn save_public_only(keypair: &AgentKeypair, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Path of `agent_id`'s public-key file under `dir`. Single home for the
+/// `<agent_id>.pub` shape so the literal is not scattered (pm-v3.1 lint).
+fn agent_pub_path(dir: &Path, agent_id: &str) -> PathBuf {
+    dir.join(format!("{agent_id}{PUB_SUFFIX}"))
+}
+
+/// #1679 — outcome of a [`rotate`] call.
+#[derive(Debug)]
+pub struct RotateOutcome {
+    /// Path the prior PUBLIC key was archived to — a timestamped
+    /// sibling `<agent_id>.pub.<unix_secs>` written mode `0o644`. The
+    /// archived public key is the retained verification anchor: an
+    /// operator can `identity import` it to verify historical
+    /// `signed_events` made with the rotated-out key.
+    pub archived_pub: PathBuf,
+    /// Path of the newly-active public key (`<agent_id>.pub`).
+    pub new_pub: PathBuf,
+}
+
+/// #1679 — rotate the daemon/agent Ed25519 signing keypair SAFELY.
+///
+/// Generates a fresh keypair and makes it the active
+/// `<agent_id>.{pub,priv}` — but FIRST archives the existing PUBLIC key
+/// to a timestamped sibling `<agent_id>.pub.<unix_secs>` (mode `0o644`)
+/// so rotation does **not** silently destroy the verification anchor for
+/// historical `signed_events` signed with the old key. Without this, the
+/// pre-#1679 `--force` path overwrote the `.pub` in place and the prior
+/// public key — the only thing that can verify those old rows' Ed25519
+/// signatures — was gone forever.
+///
+/// The old PRIVATE key is deliberately **not** archived: the subsequent
+/// [`save`] overwrites `<agent_id>.priv` in place, destroying the
+/// rotated-out signing key. That is the forward-secure posture — a
+/// retired signing key never needs to sign again, so retaining a copy on
+/// disk would add attack surface with zero verification benefit. The
+/// archived `.pub` is non-secret (mode `0o644`).
+///
+/// Requires an existing `<agent_id>.pub`; for first-time creation use
+/// [`generate`] + [`save`] instead.
+///
+/// Note (see the module-level "Key lifecycle & rotation" section): the
+/// single-key signed-events verifier does NOT automatically consume the
+/// archived key, so after a rotation, historical SIGNED rows surface as
+/// `signature_failures` under the new key — expected (rotated key), not
+/// tamper; the cross-row hash chain remains the authoritative
+/// tamper-evidence bit. Cross-rotation auto-verification is a documented
+/// additive follow-up, not built here (5-agent vote `4d3ea1c5`).
+///
+/// # Errors
+///
+/// - no current `<agent_id>.pub` to rotate;
+/// - archive write, new-key generation, or save failure.
+pub fn rotate(agent_id: &str, dir: &Path) -> Result<RotateOutcome> {
+    validate::validate_agent_id_shape(agent_id)?;
+    let pub_path = agent_pub_path(dir, agent_id);
+    if !pub_path.exists() {
+        bail!(
+            "no existing keypair to rotate for {agent_id} at {} — use `identity generate` \
+             for first-time creation",
+            pub_path.display()
+        );
+    }
+    // Read the current public-key bytes (the verification anchor) and
+    // archive them to a timestamped, PUBLIC-ONLY sibling BEFORE the new
+    // key overwrites the live files.
+    let old_pub = fs::read(&pub_path)
+        .with_context(|| format!("reading current public key {}", pub_path.display()))?;
+    let ts = chrono::Utc::now().timestamp();
+    let archived_pub = dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts}"));
+    ensure_parent(&archived_pub)?;
+    write_with_mode(&archived_pub, &old_pub, 0o644)
+        .with_context(|| format!("archiving prior public key to {}", archived_pub.display()))?;
+
+    // Generate + persist the new keypair. `save` overwrites the old
+    // `.pub`/`.priv` in place — destroying the rotated-out PRIVATE key
+    // (forward security). The archived `.pub` above is the only retained
+    // trace of the prior identity.
+    let new_kp = generate(agent_id)?;
+    save(&new_kp, dir)?;
+    Ok(RotateOutcome {
+        archived_pub,
+        new_pub: pub_path,
+    })
+}
+
 /// Load `agent_id`'s keypair from `dir`.
 ///
 /// The public file must exist (errors otherwise). The private file is
@@ -295,7 +422,7 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
     // [`crate::validate::validate_agent_id`] (which rejects reserved
     // names) before reaching here.
     validate::validate_agent_id_shape(agent_id)?;
-    let pub_path = dir.join(format!("{agent_id}{PUB_SUFFIX}"));
+    let pub_path = agent_pub_path(dir, agent_id);
     let priv_path = dir.join(format!("{agent_id}{PRIV_SUFFIX}"));
 
     let pub_bytes = fs::read(&pub_path)
@@ -320,14 +447,23 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
     // v0.7.0 S4-LOW1 — refuse to load a `.priv` whose Unix mode bits
     // grant any group/other access. Only fire when the file exists;
     // a missing `.priv` is a valid public-only load and the mode
-    // check is irrelevant there. Done as a pre-flight before
-    // `fs::read` so we never even map the bytes into memory for a
-    // world-readable key.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        match fs::metadata(&priv_path) {
-            Ok(meta) => {
+    // check is irrelevant there.
+    //
+    // #1790 finding 2 — open the file ONCE and perform the perms check on
+    // that handle (`f.metadata()` = fstat), then read the bytes from the
+    // SAME handle. The pre-#1790 form did `fs::metadata(path)` then
+    // `fs::read(path)` — two path lookups, so a key file could be swapped
+    // (perms-OK decoy → real key, or vice versa) in the window between the
+    // check and the read (TOCTOU). Opening once closes that re-open window;
+    // behaviour is otherwise unchanged.
+    let private = match fs::File::open(&priv_path) {
+        Ok(mut f) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = f
+                    .metadata()
+                    .with_context(|| format!("stat private key {}", priv_path.display()))?;
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
                     bail!(
@@ -339,19 +475,10 @@ pub fn load(agent_id: &str, dir: &Path) -> Result<AgentKeypair> {
                     );
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Public-only load — fall through; the inner match
-                // below will surface the same NotFound path.
-            }
-            Err(e) => {
-                return Err(anyhow!(e))
-                    .with_context(|| format!("stat private key {}", priv_path.display()));
-            }
-        }
-    }
-
-    let private = match fs::read(&priv_path) {
-        Ok(mut priv_bytes) => {
+            use std::io::Read;
+            let mut priv_bytes = Vec::new();
+            f.read_to_end(&mut priv_bytes)
+                .with_context(|| format!("reading private key {}", priv_path.display()))?;
             if priv_bytes.len() != SECRET_KEY_LEN {
                 let actual_len = priv_bytes.len();
                 // #1258 — zeroize the (wrong-length) buffer before the
@@ -574,7 +701,7 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
     // [`crate::validate::validate_agent_id`].
     validate::validate_agent_id_shape(agent_id)?;
 
-    let pub_path = dir.join(format!("{agent_id}{PUB_SUFFIX}"));
+    let pub_path = agent_pub_path(dir, agent_id);
     if pub_path.exists() {
         // Idempotent: do NOT regenerate. A daemon restart must keep
         // the operator's existing key.
@@ -603,7 +730,7 @@ pub fn ensure_keypair(agent_id: &str, dir: &Path, disabled: bool) -> Result<Ensu
 /// write fails with `ENOENT`. For a plain (slash-free) `agent_id` the
 /// file parent IS `dir`, so this is behaviourally identical to the old
 /// `create_dir_all(dir)`.
-fn ensure_parent(path: &Path) -> Result<()> {
+pub(crate) fn ensure_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating key directory {}", parent.display()))?;
@@ -619,7 +746,7 @@ fn ensure_parent(path: &Path) -> Result<()> {
 //           with write permission. Triggering EACCES / ENOSPC / EIO
 //           in unit tests requires kernel-level fault injection.
 #[cfg(unix)]
-fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     // Best-effort remove first so a previous, possibly stricter mode
     // on the same name doesn't block an `open` with `create_new`.
@@ -636,7 +763,7 @@ fn write_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
+pub(crate) fn write_with_mode(path: &Path, bytes: &[u8], _mode: u32) -> io::Result<()> {
     // Windows/non-Unix: mode bits don't apply. The file inherits the
     // parent directory ACL. Hardware-backed key storage on Windows is
     // out of OSS scope — see the AgenticMem commercial layer.
@@ -702,6 +829,80 @@ mod tests {
         let msg = b"hello world";
         let sig = loaded.private.as_ref().unwrap().sign(msg);
         assert!(kp.public.verify(msg, &sig).is_ok());
+    }
+
+    // ----- #1679 safe key rotation -----------------------------------
+
+    /// #1679 — rotation archives the OLD public key (the verification
+    /// anchor) before activating a new key, and copies NO private-key
+    /// material. Timestamp-agnostic: asserts on the path `rotate`
+    /// returns, never a literal timestamp.
+    #[test]
+    fn rotate_archives_old_pub_and_activates_new_key() {
+        let dir = tmp_dir();
+        let old = generate("alice").unwrap();
+        save(&old, dir.path()).unwrap();
+        let old_pub_bytes = old.public.to_bytes();
+
+        let outcome = rotate("alice", dir.path()).expect("rotate");
+
+        // Archived path exists and decodes to the OLD public key.
+        assert!(outcome.archived_pub.exists(), "archived .pub must exist");
+        let archived = fs::read(&outcome.archived_pub).unwrap();
+        assert_eq!(
+            archived.as_slice(),
+            old_pub_bytes.as_slice(),
+            "archived bytes must be the prior public key"
+        );
+        // Filename is a `<id>.pub.<ts>` sibling (no timestamp literal).
+        let name = outcome.archived_pub.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("alice.pub."), "archive name = {name}");
+
+        // The active key is NEW, loadable, and can sign.
+        let active = load("alice", dir.path()).unwrap();
+        assert_ne!(
+            active.public.to_bytes(),
+            old_pub_bytes,
+            "rotated-in key must differ from the old key"
+        );
+        assert!(active.can_sign(), "rotated-in key must sign");
+
+        // NO private-key material was archived (forward security).
+        let stray_priv = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_str().is_some_and(|n| n.contains(".priv.")));
+        assert!(!stray_priv, "rotation must NOT copy private-key material");
+
+        // `list` ignores the archived file (not a spurious live key).
+        let listed = list(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1, "only the live key is listed");
+        assert_eq!(listed[0].agent_id, "alice");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotate_archived_pub_is_world_readable_not_secret() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir();
+        save(&generate("alice").unwrap(), dir.path()).unwrap();
+        let outcome = rotate("alice", dir.path()).expect("rotate");
+        let mode = fs::metadata(&outcome.archived_pub)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "archived .pub is the non-secret 0644 anchor");
+    }
+
+    #[test]
+    fn rotate_refuses_when_no_existing_key() {
+        let dir = tmp_dir();
+        let err = rotate("ghost", dir.path()).expect_err("must refuse with no existing key");
+        assert!(
+            err.to_string().contains("no existing keypair"),
+            "unexpected error: {err}"
+        );
     }
 
     // #1514 — a SPIFFE-style slashed agent_id nests the key files under

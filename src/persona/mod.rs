@@ -407,6 +407,7 @@ impl<'a> PersonaGenerator<'a> {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
 
         // #1688 — the persona write is documented as atomic (see the "atomic
@@ -968,6 +969,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
     }
@@ -1058,6 +1060,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(&conn, &mem).unwrap();
         assert_eq!(next_version(&conn, "alice", "team/alpha").unwrap(), 2);
@@ -1197,6 +1200,7 @@ mod tests {
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             ids.push(db::insert(conn, &mem).unwrap());
         }

@@ -160,10 +160,21 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Wave-3 Continuation 2 — federation push/pull (Phase 8).
         ("POST", super::routes::SYNC_PUSH) => true,
         ("GET", super::routes::SYNC_SINCE) => true,
+        // #1718 — coordination action-transition write surface. Routes through
+        // the SAL trait on postgres (`action_get` + `action_transition_cas`),
+        // so the gate permits it to reach the handler's postgres path.
+        ("POST", p) if actions_transition_path(p) => true,
+        // #1718 — signal send write surface (SAL `signal_send` on postgres).
+        ("POST", super::routes::SIGNALS) => true,
         // Wave-3 Continuation 2 — governance write paths (Phase 11).
         ("POST", p) if pending_decide_path(p) => true,
         ("POST", p) if namespace_standard_post_path(p) => true,
         ("DELETE", p) if namespace_standard_delete_path(p) => true,
+        // #1655 — path-form GET /api/v1/namespaces/{ns}/standard is now
+        // SAL-backed (delegates to get_namespace_standard_qs → the postgres
+        // `get_namespace_standard` arm), so it no longer 501s on postgres.
+        // Same path shape as the POST/DELETE arms above.
+        ("GET", p) if namespace_standard_post_path(p) => true,
         ("POST", super::routes::NAMESPACES) => true,
         ("DELETE", super::routes::NAMESPACES) => true,
         // Wave-3 Continuation 3 — lifecycle write paths (Phase 13/14/16/17/18/19).
@@ -299,6 +310,18 @@ fn agents_pubkey_path(p: &str) -> bool {
         return false;
     };
     rest.strip_suffix("/pubkey")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// #1718 — matches `POST /api/v1/actions/{id}/transition` (the coordination
+/// action-transition write surface), where `{id}` is a single non-empty,
+/// non-slash path segment.
+#[cfg(feature = "sal")]
+fn actions_transition_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix("/api/v1/actions/") else {
+        return false;
+    };
+    rest.strip_suffix("/transition")
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
@@ -603,6 +626,30 @@ pub async fn postgres_route_gate(
 #[must_use]
 pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
     use crate::store::StoreError;
+    // #1795 — over-quota tenant write → 429 with the full QUOTA_EXCEEDED
+    // envelope (code/limit/current/max/agent_id), byte-parity with the
+    // sqlite handler path's quota breach (src/handlers/create.rs).
+    if let StoreError::QuotaExceeded {
+        agent_id,
+        namespace: _,
+        limit,
+        current,
+        max,
+    } = &e
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                "error": e.to_string(),
+                "limit": limit,
+                "current": current,
+                "max": max,
+                "agent_id": agent_id,
+            })),
+        )
+            .into_response();
+    }
     let (status, msg) = match &e {
         StoreError::NotFound { .. } => (StatusCode::NOT_FOUND, "not found".to_string()),
         StoreError::Conflict { .. } => (
@@ -621,6 +668,13 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
         // CONFLICT with the canonical LINK_CYCLE_ERR_PREFIX message,
         // byte-parity with the sqlite branch in handlers/links.rs.
         StoreError::LinkRefused { .. } => (
+            StatusCode::CONFLICT,
+            sanitize_store_err_message(&e.to_string()),
+        ),
+        // #1726 — an illegal lifecycle transition is a state conflict (409),
+        // byte-parity with the sqlite branch's `InvalidTransition` mapping in
+        // handlers/memories.rs.
+        StoreError::InvalidTransition { .. } => (
             StatusCode::CONFLICT,
             sanitize_store_err_message(&e.to_string()),
         ),
@@ -899,6 +953,26 @@ mod transport_postgres_gate_tests {
         assert!(postgres_endpoint_supported(
             &Method::POST,
             crate::handlers::routes::MEMORY_RECALL_OBSERVATIONS
+        ));
+    }
+
+    #[test]
+    fn postgres_gate_passes_namespace_standard_path_form_1655() {
+        // #1655 — the path-form GET /api/v1/namespaces/{ns}/standard now
+        // delegates to the SAL-backed qs handler, so the gate must pass it
+        // on postgres (pre-#1655 it fell through to the 501 default). POST /
+        // DELETE on the same path shape were already supported.
+        assert!(postgres_endpoint_supported(
+            &Method::GET,
+            "/api/v1/namespaces/team-eng/standard"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::POST,
+            "/api/v1/namespaces/team-eng/standard"
+        ));
+        assert!(postgres_endpoint_supported(
+            &Method::DELETE,
+            "/api/v1/namespaces/team-eng/standard"
         ));
     }
 
@@ -1529,6 +1603,14 @@ mod transport_postgres_gate_tests {
         let r = store_err_to_response(StoreError::LinkRefused {
             detail: "link refused: reflection cycle: a --reflects_on--> b would close a cycle"
                 .to_string(),
+        });
+        assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
+
+        // #1726 — an illegal lifecycle transition maps to 409 CONFLICT.
+        let r = store_err_to_response(StoreError::InvalidTransition {
+            detail:
+                "CONFLICT: illegal lifecycle transition for memory x: open -> done is not permitted"
+                    .to_string(),
         });
         assert_eq!(r.status(), axum::http::StatusCode::CONFLICT);
 

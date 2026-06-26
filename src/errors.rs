@@ -105,11 +105,22 @@ pub mod msg {
     pub const PENDING_ACTION_NOT_FOUND_OR_DECIDED: &str =
         "pending action not found or already decided";
 
+    // ---- quota -----------------------------------------------------------------
+    /// Sanitized 500 body when the quota substrate read/charge itself fails
+    /// (distinct from a `QUOTA_EXCEEDED` 429). #1788 hoisted this to a const
+    /// after the bulk + consolidate charge sites pushed it past 3 production
+    /// occurrences (the pm-v3.1 hardcoded-literal ratchet).
+    pub const QUOTA_CHECK_FAILED: &str = "quota check failed";
+
     // ---- governance ------------------------------------------------------------
     pub const GOVERNANCE_REQUIRES_APPROVAL: &str = "governance requires approval";
     pub const GOVERNANCE_CHECK_FAILED: &str = "governance check failed";
     pub const CONSENSUS_NOT_REACHED: &str = "consensus threshold not yet reached";
     pub const DECISION_WRITE_FAILED: &str = "decision write failed";
+    /// #1787 — the requester of a Human-gated pending action may not approve
+    /// it themselves (enforced only under the multi-tenant opt-in).
+    pub const SELF_APPROVAL_REFUSED: &str =
+        "self-approval refused: the requester cannot approve their own Human-gated pending action";
 
     // ---- ownership / identity ---------------------------------------------------
     pub const CALLER_NOT_SOURCE_MEMORY_OWNER: &str = "caller does not own this source memory";
@@ -120,6 +131,11 @@ pub mod msg {
     pub const AGENT_ID_QUERY_MISMATCH: &str =
         "agent_id query parameter does not match authenticated caller";
     pub const INVALID_OR_MISSING_SIGNATURE: &str = "invalid or missing X-AI-Memory-Signature";
+    /// #1786 — MCP mutation owner-gate refusal (delete / update / promote /
+    /// link). The single SSOT so the gate message is one named const across all
+    /// four MCP mutation handlers (the HTTP twin lives in
+    /// `handlers::parity::require_caller_owns_memory`).
+    pub const CALLER_DOES_NOT_OWN_MEMORY: &str = "caller does not own this memory";
 
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =
@@ -303,6 +319,7 @@ mod arch_9_slug_tests {
                 capability: "c".into(),
             },
             StoreError::IntegrityFailed { detail: "d".into() },
+            StoreError::InvalidTransition { detail: "d".into() },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -314,6 +331,7 @@ mod arch_9_slug_tests {
             CONFLICT,
             STORE_UNSUPPORTED_CAPABILITY,
             STORE_OPERATION_FAILED,
+            CONFLICT,
             DATABASE_ERROR,
         ];
         for (got, want) in variants.iter().zip(expected.iter()) {

@@ -38,6 +38,12 @@
               "null"
             ]
           },
+          "lifecycle_state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {
             "additionalProperties": true,
             "type": [
@@ -743,6 +749,626 @@
         "type": "object"
       },
       "name": "memory_share"
+    },
+    {
+      "description": "Create a coordination action",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": "string"
+          },
+          "metadata": {},
+          "namespace": {
+            "type": "string"
+          },
+          "payload": {},
+          "priority": {
+            "default": 0,
+            "format": "int64",
+            "type": "integer"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "namespace",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_create"
+    },
+    {
+      "description": "Fetch a coordination action by",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_get"
+    },
+    {
+      "description": "State-guarded transition of a",
+      "inputSchema": {
+        "properties": {
+          "claimed_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "to"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_transition"
+    },
+    {
+      "description": "List coordination actions by",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_action_list"
+    },
+    {
+      "description": "Add a typed DAG edge between",
+      "inputSchema": {
+        "properties": {
+          "edge_type": {
+            "type": "string"
+          },
+          "from_action": {
+            "type": "string"
+          },
+          "to_action": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "edge_type",
+          "from_action",
+          "to_action"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_add_edge"
+    },
+    {
+      "description": "List DAG edges for a",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_edges"
+    },
+    {
+      "description": "Rank the UNBLOCKED",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_frontier"
+    },
+    {
+      "description": "Return the top UNBLOCKED",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_action_next"
+    },
+    {
+      "description": "Acquire a single-holder lease",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_acquire"
+    },
+    {
+      "description": "Heartbeat-renew an owned lease",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          },
+          "ttl_secs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_renew"
+    },
+    {
+      "description": "Release an owned lease on a",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          },
+          "holder": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id",
+          "holder"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_release"
+    },
+    {
+      "description": "Read the lease on a",
+      "inputSchema": {
+        "properties": {
+          "action_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lease_get"
+    },
+    {
+      "description": "Send a typed, optionally",
+      "inputSchema": {
+        "properties": {
+          "body": {},
+          "correlation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_agent": {
+            "type": "string"
+          },
+          "in_reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "reference_ids": {},
+          "signal_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject": {
+            "type": "string"
+          },
+          "to_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "from_agent",
+          "namespace",
+          "subject"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_send"
+    },
+    {
+      "description": "Read one signal by id, mark it",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_read"
+    },
+    {
+      "description": "List signals for a",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "to_agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_inbox"
+    },
+    {
+      "description": "List a signal correlation",
+      "inputSchema": {
+        "properties": {
+          "correlation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "correlation_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_thread"
+    },
+    {
+      "description": "Acknowledge a signal by id",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_signal_ack"
+    },
+    {
+      "description": "Create a pending",
+      "inputSchema": {
+        "properties": {
+          "condition": {},
+          "condition_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deadline_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "namespace": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "namespace",
+          "title"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_create"
+    },
+    {
+      "description": "Resolve a checkpoint",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolved_by": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "resolved_by",
+          "state"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_resolve"
+    },
+    {
+      "description": "Query checkpoints by",
+      "inputSchema": {
+        "properties": {
+          "condition_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_query"
+    },
+    {
+      "description": "Fetch a checkpoint by id and",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_checkpoint_verify"
+    },
+    {
+      "description": "Create a draft routine — a",
+      "inputSchema": {
+        "properties": {
+          "created_by": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {},
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "parameters": {},
+          "template": {}
+        },
+        "required": [
+          "name",
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_create"
+    },
+    {
+      "description": "Freeze a routine (draft ->",
+      "inputSchema": {
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_freeze"
+    },
+    {
+      "description": "Run a frozen routine —",
+      "inputSchema": {
+        "properties": {
+          "arguments": {},
+          "routine_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "arguments",
+          "routine_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_run"
+    },
+    {
+      "description": "Fetch a routine run by id, with",
+      "inputSchema": {
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_status"
+    },
+    {
+      "description": "List a namespace's routines by",
+      "inputSchema": {
+        "properties": {
+          "limit": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "namespace"
+        ],
+        "type": "object"
+      },
+      "name": "memory_routine_list"
     },
     {
       "description": "Scan",

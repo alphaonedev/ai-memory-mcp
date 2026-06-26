@@ -66,7 +66,55 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 
 /// QUAL-6 ceiling: 81 sites at v2-review time + slack for in-batch
 /// additions. Tighten in lockstep with handler-family migration.
-const QUAL_6_CEILING: usize = 90;
+///
+/// 2026-06-16 — raised 90 → 96 for the v0.8.0 #1709 Pillar-1
+/// coordination handler family in `src/mcp/tools/action.rs`: the 8
+/// `memory_action_*` + `memory_lease_*` MCP handlers each return
+/// `Result<Value, String>` to match the uniform `McpTool` dispatch
+/// contract (`DispatchFn = fn(&ToolDispatchCtx) -> Result<Value,
+/// String>`) that every one of the ~81 existing handlers already
+/// uses. Adopting `MemoryError`/anyhow for this family alone would
+/// make it inconsistent with the established surface and require
+/// changing the shared dispatch signature — a separate migration, not
+/// a per-tool choice. Net acknowledged addition: +6 (4 lease handlers
+/// landed this batch; +2 slack).
+///
+/// 2026-06-16 — raised 96 → 101 for the v0.8.0 #1709 Pillar-1
+/// signed-signal handler family in `src/mcp/tools/signal.rs`: the 5
+/// `memory_signal_*` MCP handlers (send/read/inbox/thread/ack) each
+/// return `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease family above. Net
+/// acknowledged addition: +5.
+///
+/// 2026-06-16 — raised 101 → 105 for the v0.8.0 #1709 Pillar-1
+/// attested-checkpoint handler family in `src/mcp/tools/checkpoint.rs`:
+/// the 4 `memory_checkpoint_*` MCP handlers (create/resolve/query/verify)
+/// each return `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease/signal families above.
+/// Net acknowledged addition: +4.
+///
+/// 2026-06-16 — raised 105 → 110 for the v0.8.0 #1709 Pillar-1 routine
+/// handler family in `src/mcp/tools/routine.rs`: the 5 `memory_routine_*`
+/// MCP handlers (create/freeze/run/status/list) each return
+/// `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease/signal/checkpoint
+/// families above. Net acknowledged addition: +5.
+///
+/// 2026-06-16 — raised 110 → 112 for the v0.8.0 #1709 §11.4 Pillar-1
+/// FRONTIER surface in `src/mcp/tools/action.rs`: the 2 new
+/// `memory_action_frontier` + `memory_action_next` MCP handlers each
+/// return `Result<Value, String>` for the same uniform `McpTool`
+/// dispatch-contract reason as the action/lease/signal families above.
+/// Net acknowledged addition: +2.
+///
+/// 2026-06-22 — raised 112 → 114 for the #1718 Commit C3 MCP→HTTP
+/// federation-forward bridge in `src/mcp/tools/store/transport.rs`: the 2 new
+/// `forward_action_transition_to_http` + `forward_signal_send_to_http` helpers
+/// each return `Result<Value, String>` to match the established
+/// `forward_store_to_http` (#318) forward-family contract (the value flows
+/// straight back into the `Result<Value, String>` MCP dispatch envelope).
+/// Net acknowledged addition: +2.
+const QUAL_6_CEILING: usize = 114;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in
@@ -91,7 +139,17 @@ const QUAL_6_CEILING: usize = 90;
 /// MUST match the trait signature. These 3 sites are test-only and
 /// unavoidable; no new production string-error contract was added
 /// (the trait pre-existed). Net acknowledged addition: +3.
-const QUAL_7_CEILING: usize = 29;
+///
+/// 2026-06-20 (#1544) — raised 29 → 33 for the new
+/// `FederationDlqSink::note_dlq_throttled` method (refresh `last_error`
+/// without bumping `attempt_count` on a 429 throttle). It MUST match the
+/// trait's existing `Result<(), String>` convention — the same documented
+/// closure-framework carve-out as `mark_dlq_row_replayed` /
+/// `bump_dlq_attempt` above — so the trait decl + the sqlite + postgres +
+/// test-mock impls add 4 sites. No new error contract; the legacy String
+/// shape is required for signature parity with the pre-existing trait.
+/// Net acknowledged addition: +4.
+const QUAL_7_CEILING: usize = 33;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {

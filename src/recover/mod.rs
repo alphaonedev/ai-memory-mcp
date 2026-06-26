@@ -36,6 +36,14 @@ use serde::{Deserialize, Serialize};
 
 pub use transcript_paths::{HostKind, resolve_transcript};
 
+/// Tag stamped on every memory L2-recovered from a host transcript
+/// (see [`recover_from_transcript`]). The #1393 curator
+/// transcript-classify pass scans for this tag to find recovered
+/// `Observation` memories that are candidates for LLM reclassification.
+/// SSOT for the literal so the recover write-site and the curator scan
+/// filter can never drift.
+pub const RECOVERED_FROM_TRANSCRIPT_TAG: &str = "recovered-from-transcript";
+
 /// Per-call recovery report. Doubles as the JSON wire shape for
 /// `ai-memory recover-previous-session --json` and as the MCP-tool
 /// return shape; field names + serialization order are the wire
@@ -434,6 +442,137 @@ pub fn recover_from_transcript(
     Ok(report)
 }
 
+/// #1693 — postgres-capable L2 transcript recovery. The SAL-routed sibling of
+/// [`recover_from_transcript`]: resolves + parses the host transcript the same
+/// way, but runs the watermark fast-path and the per-turn idempotent write
+/// through the [`crate::store::MemoryStore`] trait
+/// ([`agent_max_created_at`](crate::store::MemoryStore::agent_max_created_at)
+/// + [`recover_turn_idempotent`](crate::store::MemoryStore::recover_turn_idempotent)),
+/// so a postgres-backed daemon rehydrates from host transcripts identically to
+/// the sqlite path — closing the L2 backend-parity gap (#1693). Same graceful
+/// failure semantics: only store resolution would be a hard error; every later
+/// failure folds into `report.errors`.
+#[cfg(feature = "sal")]
+pub async fn recover_from_transcript_store(
+    store: &dyn crate::store::MemoryStore,
+    opts: &RecoverOpts,
+) -> Result<RecoverReport, RecoverError> {
+    use parsers::TranscriptParser;
+    use parsers::claude_code_jsonl::ClaudeCodeJsonlParser;
+
+    let mut timer = RecoverTimer::new();
+    let schema_version = crate::storage::migrations::current_schema_version();
+    let mut report = RecoverReport::new(opts.host, schema_version);
+    let ctx = crate::store::CallerContext::for_agent(&opts.agent_id);
+
+    // Step 1 — resolve the transcript (identical to the sqlite path).
+    let path = match opts.transcript_override.clone() {
+        Some(p) => Some(p),
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            match resolve_transcript(opts.host, &cwd) {
+                Ok(p) => p,
+                Err(e) => {
+                    report.errors.push(format!("path resolve failed: {e}"));
+                    None
+                }
+            }
+        }
+    };
+    let Some(path) = path else {
+        report.elapsed_ms_resolve_path = timer.phase_lap();
+        report.elapsed_ms = timer.overall_ms();
+        return Ok(report);
+    };
+    report.transcript_path = Some(path.clone());
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok());
+    report.elapsed_ms_resolve_path = timer.phase_lap();
+
+    // Step 2 — watermark fast-path via the store (the SAL twin of the sqlite
+    // `MAX(created_at) WHERE agent_id_idx` query).
+    let watermark = store
+        .agent_max_created_at(&opts.agent_id)
+        .await
+        .ok()
+        .flatten();
+    report.elapsed_ms_dedup_query = timer.phase_lap();
+    if let (Some(mtime), Some(w)) = (mtime, watermark.as_deref()) {
+        if let Ok(wdt) = chrono::DateTime::parse_from_rfc3339(w) {
+            let mtime_dt: chrono::DateTime<chrono::Utc> = mtime.into();
+            if mtime_dt <= wdt.with_timezone(&chrono::Utc) {
+                report.fast_path_hit = true;
+                report.elapsed_ms = timer.overall_ms();
+                return Ok(report);
+            }
+        }
+    }
+
+    // Step 3 — parse.
+    let since = opts.since_iso.clone();
+    let turns = match ClaudeCodeJsonlParser.parse(&path, since.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            report.errors.push(format!("parse failed: {e}"));
+            report.elapsed_ms = timer.overall_ms();
+            return Ok(report);
+        }
+    };
+    report.lines_total = u32::try_from(turns.len()).unwrap_or(u32::MAX);
+    report.elapsed_ms_parse = timer.phase_lap();
+
+    // Step 4 — per-turn idempotent write through the trait. The trait method
+    // performs the dual dedup internally, so `dedup_hit` drives the skip
+    // accounting (no separate pre-probe needed).
+    let namespace = opts
+        .namespace
+        .clone()
+        .unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
+    let host_kind = opts.host.as_str().to_string();
+
+    for turn in turns {
+        if usize::try_from(report.lines_atomised).unwrap_or(usize::MAX) >= opts.limit {
+            report.lines_skipped_limit += 1;
+            continue;
+        }
+        let sha_bytes = hex::decode(turn.normalized_sha256_hex())
+            .or_else(|_| hex::decode(&turn.line_sha256_hex))
+            .unwrap_or_default();
+        if sha_bytes.is_empty() {
+            report.errors.push(format!(
+                "skipping turn with malformed sha256: {}",
+                turn.line_sha256_hex
+            ));
+            continue;
+        }
+        if opts.dry_run {
+            report.lines_atomised += 1;
+            continue;
+        }
+        let write =
+            prepare_recover_turn_write(&turn, &sha_bytes, &namespace, &host_kind, &path, opts);
+        match store.recover_turn_idempotent(&ctx, &write).await {
+            Ok(res) if res.dedup_hit => report.lines_skipped_dedup += 1,
+            Ok(res) => {
+                report.lines_atomised += 1;
+                report.memories_created.push(res.memory_id);
+            }
+            Err(e) => report
+                .errors
+                .push(format!("recover_turn_idempotent failed: {e}")),
+        }
+    }
+    if opts.quiet && report.memories_created.len() > QUIET_MEMORY_ID_PREVIEW_CAP {
+        report
+            .memories_created
+            .truncate(QUIET_MEMORY_ID_PREVIEW_CAP);
+    }
+    report.elapsed_ms_writes = timer.phase_lap();
+    report.elapsed_ms = timer.overall_ms();
+    Ok(report)
+}
+
 /// Stable wire string for a parsed turn's role. Delegates to the
 /// [`parsers::TurnRole::as_str`] SSOT shared with the #1573
 /// normalized dedup hash.
@@ -480,21 +619,20 @@ fn find_existing_dedup(
     .unwrap_or(None)
 }
 
-/// Write one recovered transcript turn as an `observation` memory plus
-/// its `transcript_line_dedup` row under a single BEGIN IMMEDIATE
-/// transaction. Mirrors the L4 storage transaction in
-/// `src/mcp/tools/capture_turn.rs::handle_capture_turn`: on any failure
-/// the transaction rolls back so an orphaned memory can never exist
-/// without its dedup row.
-fn write_recovered_turn(
-    conn: &rusqlite::Connection,
+/// #1693 — build the backend-agnostic [`crate::models::RecoverTurnWrite`] for
+/// one recovered transcript turn: the L2 `observation` memory + its dual dedup
+/// shas + host/session identity. Pure (no DB); shared by the sqlite sync
+/// [`write_recovered_turn`] and the postgres-capable async
+/// [`recover_from_transcript_store`] so the per-turn memory shape lives in
+/// exactly one place across both backends.
+fn prepare_recover_turn_write(
     turn: &parsers::ParsedTurn,
     sha_bytes: &[u8],
     namespace: &str,
     host_kind: &str,
     transcript_path: &Path,
     opts: &RecoverOpts,
-) -> Result<String, String> {
+) -> crate::models::RecoverTurnWrite {
     use crate::models::{Memory, MemoryKind, Tier};
 
     let role = role_label(turn.role);
@@ -524,7 +662,7 @@ fn write_recovered_turn(
 
     let mut tags = vec![
         "captured-via-l2".to_string(),
-        "recovered-from-transcript".to_string(),
+        RECOVERED_FROM_TRANSCRIPT_TAG.to_string(),
         format!("host:{host_kind}"),
         format!("role:{role}"),
     ];
@@ -572,47 +710,40 @@ fn write_recovered_turn(
         ..Memory::default()
     };
 
-    conn.execute_batch(crate::storage::connection::SQL_BEGIN_IMMEDIATE)
-        .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
-
-    let tx_result = (|| -> Result<String, String> {
-        let inserted_id =
-            crate::storage::insert(conn, &mem).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
-        let recovered_at_ms = chrono::Utc::now().timestamp_millis();
-        // #1573 — `sha_bytes` is the normalized-content hash and the
-        // session/turn identity columns are populated when the host
-        // format provided them, so future recoveries (and the L4
-        // capture path) can dedup on the canonical composite key.
-        conn.execute(
-            "INSERT INTO transcript_line_dedup \
-             (sha256, memory_id, host_kind, transcript_path, \
-              host_session_id, host_turn_index, recovered_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                sha_bytes,
-                inserted_id,
-                host_kind,
-                transcript_path.display().to_string(),
-                turn.host_session_id,
-                turn.host_turn_index,
-                recovered_at_ms,
-            ],
-        )
-        .map_err(|e| format!("DEDUP_INSERT_FAILED: {e}"))?;
-        Ok(inserted_id)
-    })();
-
-    match tx_result {
-        Ok(memory_id) => {
-            conn.execute_batch(crate::storage::connection::SQL_COMMIT)
-                .map_err(|e| format!("TX_COMMIT_FAILED: {e}"))?;
-            Ok(memory_id)
-        }
-        Err(e) => {
-            let _ = conn.execute_batch(crate::storage::connection::SQL_ROLLBACK);
-            Err(e)
-        }
+    crate::models::RecoverTurnWrite {
+        memory: mem,
+        // `normalized_sha256` is `sha_bytes` (the #1573 normalized-content
+        // hash the caller computed); the raw-line hash is recovered from the
+        // turn for the dual-key dedup probe.
+        normalized_sha256: sha_bytes.to_vec(),
+        raw_sha256: hex::decode(&turn.line_sha256_hex).unwrap_or_else(|_| sha_bytes.to_vec()),
+        host_kind: host_kind.to_string(),
+        transcript_path: transcript_path.display().to_string(),
+        host_session_id: turn.host_session_id.clone(),
+        host_turn_index: turn.host_turn_index,
+        recovered_at_ms: chrono::Utc::now().timestamp_millis(),
     }
+}
+
+/// Write one recovered transcript turn as an `observation` memory plus its
+/// `transcript_line_dedup` row. #1693 — routes through the
+/// [`crate::storage::recover_turn_idempotent`] SSOT (the same logic
+/// `SqliteStore`'s SAL trait method delegates to, and the postgres adapter
+/// mirrors), so the dedup-probe + atomic memory+dedup transaction lives in
+/// exactly one place. On any failure the transaction rolls back so an
+/// orphaned memory can never exist without its dedup row.
+fn write_recovered_turn(
+    conn: &rusqlite::Connection,
+    turn: &parsers::ParsedTurn,
+    sha_bytes: &[u8],
+    namespace: &str,
+    host_kind: &str,
+    transcript_path: &Path,
+    opts: &RecoverOpts,
+) -> Result<String, String> {
+    let write =
+        prepare_recover_turn_write(turn, sha_bytes, namespace, host_kind, transcript_path, opts);
+    crate::storage::recover_turn_idempotent(conn, &write).map(|r| r.memory_id)
 }
 
 /// Errors that escape [`recover_from_transcript`]. Most failure
@@ -707,6 +838,31 @@ mod tests {
         assert_eq!(first.lines_atomised, 2);
         let second = recover_from_transcript(&db, &opts).unwrap();
         // Same transcript content -> every line dedup-skipped, nothing new.
+        assert_eq!(second.lines_atomised, 0);
+        assert_eq!(second.lines_skipped_dedup, 2);
+        assert!(second.memories_created.is_empty());
+    }
+
+    /// #1693 — the SAL store path (`recover_from_transcript_store`) recovers
+    /// turns through `MemoryStore::recover_turn_idempotent` and is idempotent
+    /// on re-run, identically to the sqlite `recover_from_transcript` path.
+    /// Covers the async store entry on the `SqliteStore` adapter (which
+    /// delegates to the same SSOT the postgres adapter mirrors).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_path_recovers_and_dedups_sqlite() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1, USER_LINE_2]);
+        let store = crate::store::sqlite::SqliteStore::open(&db).expect("open store");
+        let opts = base_opts(transcript, "ai:test:store");
+
+        let first = recover_from_transcript_store(&store, &opts).await.unwrap();
+        assert_eq!(first.lines_atomised, 2, "errors: {:?}", first.errors);
+        assert_eq!(first.memories_created.len(), 2);
+
+        // Re-run → every line dedup-skipped (idempotent), nothing new.
+        let second = recover_from_transcript_store(&store, &opts).await.unwrap();
         assert_eq!(second.lines_atomised, 0);
         assert_eq!(second.lines_skipped_dedup, 2);
         assert!(second.memories_created.is_empty());

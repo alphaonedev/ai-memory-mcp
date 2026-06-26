@@ -406,6 +406,460 @@ pub fn sign_write(keypair: &AgentKeypair, write: &SignableWrite<'_>) -> Result<V
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableSignal + sign_signal
+// ---------------------------------------------------------------------------
+//
+// Mirrors the `SignableLink` / `SignablePersona` / `SignableWrite` shapes: a
+// single, audited surface for the IMMUTABLE fields a signal signature commits
+// to, encoded via RFC 8949 §4.2.1 deterministic CBOR. The mutable lifecycle
+// columns (`delivered_at`, `read_at`, `acknowledged_at`, `expires_at`) are
+// deliberately EXCLUDED — they are stamped after the signal is sent, so
+// committing to them would invalidate the signature on first delivery. The
+// JSON body is hashed (SHA-256) BEFORE entering the envelope so the signed
+// payload stays bounded (32 bytes) regardless of body length — the same bound
+// `SignablePersona` / `SignableWrite` use for `body_md_sha256` /
+// `content_sha256`.
+
+/// The immutable fields a signal signature commits to.
+///
+/// Decoupled from [`crate::models::Signal`] on purpose: the signed bundle pins
+/// exactly the identity-bearing surface of a signal (who, where, what subject,
+/// what payload, what type, what threading, when) WITHOUT the mutable delivery
+/// lifecycle columns — so the verifier can re-derive the bytes directly from a
+/// persisted row at any lifecycle stage, and the canonical encoder has a
+/// single audited shape to commit to.
+///
+/// `body_sha256` is the SHA-256 of the UTF-8 bytes of the signal body's
+/// canonical JSON string (`Signal::body.to_string()`). Hashing it before
+/// signing keeps the canonical payload bounded regardless of body length — a
+/// multi-kilobyte JSON payload would otherwise dominate the signed envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableSignal<'a> {
+    /// The signal's id (UUIDv4). Pinned so a signature minted for one signal
+    /// cannot be replayed onto another.
+    pub id: &'a str,
+    /// Namespace the signal was sent within.
+    pub namespace: &'a str,
+    /// Sending agent. The identity-bearing field the signature attests: the
+    /// signer held the keypair bound to this `from_agent`.
+    pub from_agent: &'a str,
+    /// Recipient agent, or `None` for a namespace broadcast.
+    pub to_agent: Option<&'a str>,
+    /// Free-text subject line.
+    pub subject: &'a str,
+    /// SHA-256 (32 bytes) over the signal body's canonical JSON string's
+    /// UTF-8 bytes. Bounds the signed payload size.
+    pub body_sha256: &'a [u8; 32],
+    /// Canonical signal-type spelling (`SignalType::as_str`). Pinned so a
+    /// signature minted for one type cannot be replayed onto another.
+    pub signal_type: &'a str,
+    /// Threads a `response` back onto its `request`, or `None`.
+    pub in_reply_to: Option<&'a str>,
+    /// Groups a signal into a conversation thread, or `None`.
+    pub correlation_id: Option<&'a str>,
+    /// Epoch-seconds creation timestamp. Inside the signed surface so a
+    /// captured signature cannot be replayed to back- or forward-date a
+    /// signal.
+    pub created_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable signal fields.
+///
+/// The encoded shape is a CBOR map keyed by the field names below. Map keys
+/// are emitted in sort order (per RFC 8949 §4.2.1 "Core Deterministic
+/// Encoding"), `Option::None` is encoded as CBOR `null`, `created_at` as a
+/// CBOR integer, and the body hash as CBOR `bytes`. Encoding the same
+/// `SignableSignal` twice (or on a different host) produces identical bytes —
+/// the precondition Ed25519 needs.
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, but surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_signal(s: &SignableSignal<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("id", ciborium::Value::Text(s.id.to_string()));
+    map.insert("namespace", ciborium::Value::Text(s.namespace.to_string()));
+    map.insert(
+        "from_agent",
+        ciborium::Value::Text(s.from_agent.to_string()),
+    );
+    map.insert("to_agent", text_or_null(s.to_agent));
+    map.insert("subject", ciborium::Value::Text(s.subject.to_string()));
+    map.insert(
+        "body_sha256",
+        ciborium::Value::Bytes(s.body_sha256.to_vec()),
+    );
+    map.insert(
+        "signal_type",
+        ciborium::Value::Text(s.signal_type.to_string()),
+    );
+    map.insert("in_reply_to", text_or_null(s.in_reply_to));
+    map.insert(field_names::CORRELATION_ID, text_or_null(s.correlation_id));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Integer(ciborium::value::Integer::from(s.created_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableSignal")?;
+    Ok(out)
+}
+
+/// Sign `signal` with `keypair`'s private key.
+///
+/// Encodes the signal via [`canonical_cbor_signal`], then runs Ed25519 over the
+/// resulting bytes. Returns the 64-byte signature, ready to drop into the
+/// `signature` BLOB column on the `signals` table.
+///
+/// # Errors
+///
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_signal(keypair: &AgentKeypair, signal: &SignableSignal<'_>) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign signal",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_signal(signal)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1718) — SignableTransition + sign_transition
+// (end-to-end author attestation for FEDERATED action-state transitions)
+// ---------------------------------------------------------------------------
+
+/// The fields a federated action-state TRANSITION signature commits to — the
+/// end-to-end author attestation answering "which attested actor drove THIS
+/// action from `from_state` to `to_state`, with what nonce, when" (#1718 H2).
+///
+/// Decoupled from [`crate::models::Action`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableCheckpointResolution`]): the full `Action`
+/// carries mutable columns (`title`, `payload`, `priority`, `metadata`,
+/// `vector_clock`) the transition attestation deliberately does NOT bind. The
+/// signature commits to the immutable transition surface only, so a captured
+/// signature cannot be replayed onto a different action, edge, actor, or
+/// timestamp, and the receiver can re-derive the bytes from the wire op
+/// without the full `Action` shape. `nonce` binds the signature to a single
+/// delivery so a captured `(bytes, sig)` pair cannot be replayed under a fresh
+/// nonce without the private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableTransition<'a> {
+    /// The action's id (UUIDv4). Pinned so a signature minted for one action
+    /// cannot be replayed onto another.
+    pub action_id: &'a str,
+    /// Namespace the action lives in.
+    pub namespace: &'a str,
+    /// Expected current state (canonical `ActionState::as_str`). Pinned so a
+    /// signature for one edge (e.g. `pending -> claimed`) cannot be replayed as
+    /// a different edge.
+    pub from_state: &'a str,
+    /// Target state (canonical `ActionState::as_str`).
+    pub to_state: &'a str,
+    /// The attested actor the transition claims (e.g. the lease holder), or
+    /// `None`. The receiver persists THIS attested value, never a peer-supplied
+    /// claimed field.
+    pub claimed_by: Option<&'a str>,
+    /// Per-delivery anti-replay nonce.
+    pub nonce: &'a [u8],
+    /// Epoch seconds of the transition.
+    pub created_at: i64,
+}
+
+/// Canonical CBOR bytes for a [`SignableTransition`]. Field order is
+/// normalised by the `BTreeMap` key-sort at encode time (same determinism
+/// contract as [`canonical_cbor_signal`]), so producer and verifier commit to
+/// byte-identical bytes regardless of struct-literal field order.
+///
+/// # Errors
+/// Returns the `ciborium` encode error on a pathological serialization
+/// failure.
+pub fn canonical_cbor_transition(t: &SignableTransition<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("action_id", ciborium::Value::Text(t.action_id.to_string()));
+    map.insert("namespace", ciborium::Value::Text(t.namespace.to_string()));
+    map.insert(
+        "from_state",
+        ciborium::Value::Text(t.from_state.to_string()),
+    );
+    map.insert("to_state", ciborium::Value::Text(t.to_state.to_string()));
+    map.insert("claimed_by", text_or_null(t.claimed_by));
+    map.insert("nonce", ciborium::Value::Bytes(t.nonce.to_vec()));
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Integer(ciborium::value::Integer::from(t.created_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableTransition")?;
+    Ok(out)
+}
+
+/// Sign a [`SignableTransition`] with `keypair`'s private key, returning the
+/// 64-byte Ed25519 signature. Verified inbound by
+/// [`crate::identity::verify::verify_transition`].
+///
+/// # Errors
+/// Returns an error when `keypair` is public-only (`can_sign() == false`) or
+/// the CBOR encode fails.
+pub fn sign_transition(
+    keypair: &AgentKeypair,
+    transition: &SignableTransition<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign transition",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_transition(transition)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableCheckpointResolution + sign_checkpoint_resolution
+// ---------------------------------------------------------------------------
+
+/// The fields a checkpoint *resolution* signature commits to — the
+/// separation-of-duties attestation answering "who resolved this checkpoint,
+/// to what, when".
+///
+/// Decoupled from [`crate::models::Checkpoint`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableLink`]): the full `Checkpoint` carries
+/// mutable-before-resolution columns (`condition`, `metadata`, `deadline_at`,
+/// …) that the resolution attestation deliberately does NOT bind. The
+/// signature commits to the *immutable-once-resolved* surface only, so a
+/// verifier can re-derive the bytes from a resolved row without dragging the
+/// entire `Checkpoint` shape, and a captured signature cannot be replayed onto
+/// a different checkpoint, resolver, verdict, or timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableCheckpointResolution<'a> {
+    /// The checkpoint's id (UUIDv4). Pinned so a signature minted for one
+    /// checkpoint cannot be replayed onto another.
+    pub checkpoint_id: &'a str,
+    /// Namespace the checkpoint was created within.
+    pub namespace: &'a str,
+    /// The resolved lifecycle state spelling (`CheckpointState::as_str` — e.g.
+    /// `"resolved"` / `"rejected"`). Pinned so a signature minted for one
+    /// verdict cannot be replayed onto another.
+    pub state: &'a str,
+    /// The resolving agent — the identity-bearing field the signature attests:
+    /// the signer held the keypair bound to this `resolved_by`.
+    pub resolved_by: &'a str,
+    /// Free-text resolution verdict, or `None`.
+    pub resolution: Option<&'a str>,
+    /// Epoch-seconds resolution timestamp. Inside the signed surface so a
+    /// captured signature cannot be replayed to back- or forward-date a
+    /// resolution.
+    pub resolved_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable
+/// checkpoint-resolution fields.
+///
+/// Same construction discipline as [`canonical_cbor_signal`]: a
+/// `BTreeMap<&str, ciborium::Value>` so map-key order is enforced at build
+/// time, `Option` lifted via [`text_or_null`] so the key set is fixed across
+/// rows, and `resolved_at` encoded as a CBOR `Integer`.
+///
+/// # Errors
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_checkpoint_resolution(
+    r: &SignableCheckpointResolution<'_>,
+) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "checkpoint_id",
+        ciborium::Value::Text(r.checkpoint_id.to_string()),
+    );
+    map.insert("namespace", ciborium::Value::Text(r.namespace.to_string()));
+    map.insert("state", ciborium::Value::Text(r.state.to_string()));
+    map.insert(
+        "resolved_by",
+        ciborium::Value::Text(r.resolved_by.to_string()),
+    );
+    map.insert("resolution", text_or_null(r.resolution));
+    map.insert(
+        "resolved_at",
+        ciborium::Value::Integer(ciborium::value::Integer::from(r.resolved_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out)
+        .context("CBOR encode SignableCheckpointResolution")?;
+    Ok(out)
+}
+
+/// Sign a checkpoint resolution with `keypair`'s private key.
+///
+/// Encodes the resolution via [`canonical_cbor_checkpoint_resolution`], then
+/// runs Ed25519 over the resulting bytes. Returns the 64-byte signature, ready
+/// to drop into the `signature` BLOB column on `checkpoints`.
+///
+/// # Errors
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_checkpoint_resolution(
+    keypair: &AgentKeypair,
+    resolution: &SignableCheckpointResolution<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign checkpoint resolution",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_checkpoint_resolution(resolution)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.0 Pillar-1 (#1709) — SignableRoutineFreeze + sign_routine_freeze
+// ---------------------------------------------------------------------------
+
+/// The fields a routine *freeze* signature commits to — the regulatory-hold
+/// FREEZE-ATTESTATION answering "this exact immutable template was frozen by X
+/// at T".
+///
+/// Decoupled from [`crate::models::Routine`] on purpose (same rationale as
+/// [`SignableSignal`] / [`SignableCheckpointResolution`]): a frozen routine is
+/// immutable, so the signature commits to the *frozen* surface only — the
+/// routine's identity (`routine_id` / `namespace` / `name`), the content of its
+/// template + parameters (each hashed to 32 bytes so the signed payload stays
+/// bounded regardless of JSON length — the same bound `SignableSignal` uses for
+/// `body_sha256`), and the freeze timestamp. The mutable lifecycle column
+/// `state` is excluded because the freeze attestation is meaningful only for a
+/// `frozen` row. A captured signature cannot be replayed onto a different
+/// routine, a tampered template, or a back-/forward-dated freeze.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableRoutineFreeze<'a> {
+    /// The routine's id (UUIDv4). Pinned so a signature minted for one routine
+    /// cannot be replayed onto another.
+    pub routine_id: &'a str,
+    /// Namespace the routine lives within.
+    pub namespace: &'a str,
+    /// The routine's name.
+    pub name: &'a str,
+    /// SHA-256 (32 bytes) over the canonical template JSON string's UTF-8
+    /// bytes. Bounds the signed payload size and binds the exact frozen
+    /// template — any template tamper after freeze breaks verification.
+    pub template_sha256: &'a [u8; 32],
+    /// SHA-256 (32 bytes) over the canonical parameters JSON string's UTF-8
+    /// bytes. Binds the exact frozen parameter set.
+    pub parameters_sha256: &'a [u8; 32],
+    /// Epoch-seconds freeze timestamp. Inside the signed surface so a captured
+    /// signature cannot be replayed to back- or forward-date a freeze.
+    pub frozen_at: i64,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable routine-freeze
+/// fields.
+///
+/// Same construction discipline as [`canonical_cbor_signal`]: a
+/// `BTreeMap<&str, ciborium::Value>` sorts the keys by construction, both
+/// SHA-256 hashes encode as CBOR `bytes`, and `frozen_at` encodes as a CBOR
+/// integer. Encoding the same `SignableRoutineFreeze` twice (or on a different
+/// host) produces identical bytes — the precondition Ed25519 needs.
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, surfaced as a `Result` so
+/// callers don't have to choose between panicking and silently signing a
+/// truncated payload.
+pub fn canonical_cbor_routine_freeze(r: &SignableRoutineFreeze<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "routine_id",
+        ciborium::Value::Text(r.routine_id.to_string()),
+    );
+    map.insert("namespace", ciborium::Value::Text(r.namespace.to_string()));
+    map.insert("name", ciborium::Value::Text(r.name.to_string()));
+    map.insert(
+        "template_sha256",
+        ciborium::Value::Bytes(r.template_sha256.to_vec()),
+    );
+    map.insert(
+        "parameters_sha256",
+        ciborium::Value::Bytes(r.parameters_sha256.to_vec()),
+    );
+    map.insert(
+        "frozen_at",
+        ciborium::Value::Integer(ciborium::value::Integer::from(r.frozen_at)),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableRoutineFreeze")?;
+    Ok(out)
+}
+
+/// Sign a routine freeze with `keypair`'s private key.
+///
+/// Encodes the freeze attestation via [`canonical_cbor_routine_freeze`], then
+/// runs Ed25519 over the resulting bytes. Returns the 64-byte signature, ready
+/// to drop into the `signature` BLOB column on the `routines` table.
+///
+/// # Errors
+/// - `keypair.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced for
+///   completeness).
+pub fn sign_routine_freeze(
+    keypair: &AgentKeypair,
+    freeze: &SignableRoutineFreeze<'_>,
+) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign routine freeze",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_routine_freeze(freeze)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1415,390 @@ mod tests {
         let a = canonical_cbor_persona(&v1).expect("encode v1");
         let b = canonical_cbor_persona(&v2).expect("encode v2");
         assert_ne!(a, b);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableSignal + sign_signal
+    // -----------------------------------------------------------------
+
+    fn signal_fixture<'a>(body: &'a [u8; 32]) -> SignableSignal<'a> {
+        SignableSignal {
+            id: "sig-001",
+            namespace: "team/alpha",
+            from_agent: "ai:curator",
+            to_agent: Some("ai:planner"),
+            subject: "deploy approval",
+            body_sha256: body,
+            signal_type: "request",
+            in_reply_to: None,
+            correlation_id: Some("corr-7"),
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_signal_is_deterministic() {
+        // Three distinct permutations of the SignableSignal literal must
+        // collapse to identical bytes because the BTreeMap key-sort runs at
+        // encode time. Catches a regression where a future refactor swaps the
+        // BTreeMap for a HashMap or drops the explicit sort.
+        let body = body_hash_fixture(0x30);
+        let id = "sig-001";
+        let namespace = "team/alpha";
+        let from_agent = "ai:curator";
+        let to_agent = Some("ai:planner");
+        let subject = "deploy approval";
+        let signal_type = "request";
+        let in_reply_to: Option<&str> = None;
+        let correlation_id = Some("corr-7");
+        let created_at = 1_700_000_000_i64;
+
+        let perm1 = SignableSignal {
+            id,
+            namespace,
+            from_agent,
+            to_agent,
+            subject,
+            body_sha256: &body,
+            signal_type,
+            in_reply_to,
+            correlation_id,
+            created_at,
+        };
+        let perm2 = SignableSignal {
+            created_at,
+            correlation_id,
+            in_reply_to,
+            signal_type,
+            body_sha256: &body,
+            subject,
+            to_agent,
+            from_agent,
+            namespace,
+            id,
+        };
+        let perm3 = SignableSignal {
+            subject,
+            id,
+            created_at,
+            namespace,
+            body_sha256: &body,
+            signal_type,
+            from_agent,
+            correlation_id,
+            to_agent,
+            in_reply_to,
+        };
+
+        let b1 = canonical_cbor_signal(&perm1).expect("encode perm1");
+        let b2 = canonical_cbor_signal(&perm2).expect("encode perm2");
+        let b3 = canonical_cbor_signal(&perm3).expect("encode perm3");
+        assert_eq!(b1, b2);
+        assert_eq!(b2, b3);
+        assert_eq!(b1, canonical_cbor_signal(&perm1).expect("re-encode"));
+    }
+
+    #[test]
+    fn canonical_cbor_signal_differs_on_field_change() {
+        let body = body_hash_fixture(0x31);
+        let base = signal_fixture(&body);
+        // Flip the subject — a different subject must produce different bytes.
+        let altered = SignableSignal {
+            subject: "deploy rejection",
+            ..base.clone()
+        };
+        let a = canonical_cbor_signal(&base).expect("encode base");
+        let b = canonical_cbor_signal(&altered).expect("encode altered");
+        assert_ne!(a, b, "different subject must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_signal_differs_on_body_hash_change() {
+        let body = body_hash_fixture(0x32);
+        let base = signal_fixture(&body);
+        let other = body_hash_fixture(0x88);
+        let altered = SignableSignal {
+            body_sha256: &other,
+            ..base.clone()
+        };
+        let a = canonical_cbor_signal(&base).expect("encode base");
+        let b = canonical_cbor_signal(&altered).expect("encode altered");
+        assert_ne!(a, b, "different body hash must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_signal_handles_all_optionals_none() {
+        let body = body_hash_fixture(0x33);
+        let signal = SignableSignal {
+            id: "s",
+            namespace: "n",
+            from_agent: "a",
+            to_agent: None,
+            subject: "subj",
+            body_sha256: &body,
+            signal_type: "broadcast",
+            in_reply_to: None,
+            correlation_id: None,
+            created_at: 0,
+        };
+        let bytes = canonical_cbor_signal(&signal).expect("encode");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes, canonical_cbor_signal(&signal).expect("re-encode"));
+    }
+
+    #[test]
+    fn sign_signal_round_trip() {
+        let kp = keypair::generate("ai:curator").expect("generate");
+        let body = body_hash_fixture(0x34);
+        let signal = signal_fixture(&body);
+        let sig_bytes = sign_signal(&kp, &signal).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_signal(&signal).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_signal_refuses_public_only_keypair() {
+        let kp = keypair::generate("ai:curator").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "ai:curator".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let body = body_hash_fixture(0x35);
+        let signal = signal_fixture(&body);
+        let err = sign_signal(&pub_only, &signal).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_signal_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's signature must not verify
+        // under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let body = body_hash_fixture(0x36);
+        let signal = signal_fixture(&body);
+        let sig_bytes = sign_signal(&alice, &signal).unwrap();
+        let payload = canonical_cbor_signal(&signal).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableCheckpointResolution
+    // -----------------------------------------------------------------
+
+    fn resolution_fixture() -> SignableCheckpointResolution<'static> {
+        SignableCheckpointResolution {
+            checkpoint_id: "cp-001",
+            namespace: "_cp",
+            state: "resolved",
+            resolved_by: "agent-approver",
+            resolution: Some("approved"),
+            resolved_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_checkpoint_resolution_differs_on_field_change() {
+        // Any change in the signed surface must change the byte output —
+        // otherwise a resolution could be silently re-attributed or its
+        // verdict flipped under a stale signature.
+        let base = resolution_fixture();
+        let mut altered = base.clone();
+        altered.state = "rejected";
+        let a = canonical_cbor_checkpoint_resolution(&base).expect("encode base");
+        let b = canonical_cbor_checkpoint_resolution(&altered).expect("encode altered");
+        assert_ne!(a, b, "different state must produce different bytes");
+
+        // And the resolver field is bound too.
+        let mut altered_by = base.clone();
+        altered_by.resolved_by = "agent-impostor";
+        let c = canonical_cbor_checkpoint_resolution(&altered_by).expect("encode altered_by");
+        assert_ne!(a, c, "different resolved_by must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_checkpoint_resolution_handles_none_resolution() {
+        let r = SignableCheckpointResolution {
+            checkpoint_id: "c",
+            namespace: "n",
+            state: "rejected",
+            resolved_by: "a",
+            resolution: None,
+            resolved_at: 0,
+        };
+        let bytes = canonical_cbor_checkpoint_resolution(&r).expect("encode");
+        assert!(!bytes.is_empty());
+        // Two encodes still match (byte-stable).
+        assert_eq!(
+            bytes,
+            canonical_cbor_checkpoint_resolution(&r).expect("re-encode")
+        );
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_round_trip() {
+        let kp = keypair::generate("agent-approver").expect("generate");
+        let r = resolution_fixture();
+        let sig_bytes = sign_checkpoint_resolution(&kp, &r).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_checkpoint_resolution(&r).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_refuses_public_only_keypair() {
+        let kp = keypair::generate("agent-approver").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "agent-approver".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let err = sign_checkpoint_resolution(&pub_only, &resolution_fixture()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_checkpoint_resolution_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's resolution signature must not
+        // verify under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let r = resolution_fixture();
+        let sig_bytes = sign_checkpoint_resolution(&alice, &r).unwrap();
+        let payload = canonical_cbor_checkpoint_resolution(&r).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.8.0 Pillar-1 (#1709) — SignableRoutineFreeze
+    // -----------------------------------------------------------------
+
+    fn routine_freeze_fixture<'a>(
+        template: &'a [u8; 32],
+        parameters: &'a [u8; 32],
+    ) -> SignableRoutineFreeze<'a> {
+        SignableRoutineFreeze {
+            routine_id: "rt-001",
+            namespace: "_rt",
+            name: "deploy",
+            template_sha256: template,
+            parameters_sha256: parameters,
+            frozen_at: 1_700_000_500,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_routine_freeze_differs_on_field_change() {
+        // Any change in the frozen surface must change the byte output —
+        // otherwise a freeze could be silently re-attributed or its template
+        // swapped under a stale signature.
+        let template = body_hash_fixture(0x40);
+        let parameters = body_hash_fixture(0x41);
+        let base = routine_freeze_fixture(&template, &parameters);
+        let altered = SignableRoutineFreeze {
+            name: "rollback",
+            ..base.clone()
+        };
+        let a = canonical_cbor_routine_freeze(&base).expect("encode base");
+        let b = canonical_cbor_routine_freeze(&altered).expect("encode altered");
+        assert_ne!(a, b, "different name must produce different bytes");
+
+        // The template hash is bound too — a tampered template breaks the bytes.
+        let other_template = body_hash_fixture(0x99);
+        let altered_template = SignableRoutineFreeze {
+            template_sha256: &other_template,
+            ..base.clone()
+        };
+        let c = canonical_cbor_routine_freeze(&altered_template).expect("encode altered_template");
+        assert_ne!(a, c, "different template hash must produce different bytes");
+
+        // And the freeze timestamp is bound.
+        let altered_at = SignableRoutineFreeze {
+            frozen_at: 1_700_009_999,
+            ..base.clone()
+        };
+        let d = canonical_cbor_routine_freeze(&altered_at).expect("encode altered_at");
+        assert_ne!(a, d, "different frozen_at must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_routine_freeze_is_byte_stable() {
+        let template = body_hash_fixture(0x42);
+        let parameters = body_hash_fixture(0x43);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let bytes = canonical_cbor_routine_freeze(&r).expect("encode");
+        assert!(!bytes.is_empty());
+        assert_eq!(
+            bytes,
+            canonical_cbor_routine_freeze(&r).expect("re-encode"),
+            "deterministic CBOR must be byte-stable"
+        );
+    }
+
+    #[test]
+    fn sign_routine_freeze_round_trip() {
+        let kp = keypair::generate("agent-author").expect("generate");
+        let template = body_hash_fixture(0x44);
+        let parameters = body_hash_fixture(0x45);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig_bytes = sign_routine_freeze(&kp, &r).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let payload = canonical_cbor_routine_freeze(&r).expect("encode");
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&payload, &sig).expect("verify");
+    }
+
+    #[test]
+    fn sign_routine_freeze_refuses_public_only_keypair() {
+        let kp = keypair::generate("agent-author").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "agent-author".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let template = body_hash_fixture(0x46);
+        let parameters = body_hash_fixture(0x47);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let err = sign_routine_freeze(&pub_only, &r).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_routine_freeze_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — Alice's freeze signature must not
+        // verify under Bob's public key.
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let template = body_hash_fixture(0x48);
+        let parameters = body_hash_fixture(0x49);
+        let r = routine_freeze_fixture(&template, &parameters);
+        let sig_bytes = sign_routine_freeze(&alice, &r).unwrap();
+        let payload = canonical_cbor_routine_freeze(&r).unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&payload, &sig).is_err());
     }
 }

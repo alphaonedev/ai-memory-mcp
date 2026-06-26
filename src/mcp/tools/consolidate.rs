@@ -115,7 +115,26 @@ pub(super) fn handle_consolidate(
     let explicit_agent_id = params["agent_id"].as_str();
     let consolidator_agent_id = crate::identity::resolve_agent_id(explicit_agent_id, mcp_client)
         .map_err(|e| e.to_string())?;
-    let new_id = db::consolidate(
+    // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write quota
+    // for the one net-new consolidated memory. consolidate is a tenant-facing
+    // authoring write (it mints a fresh attributable row), so it is gated like
+    // memory_store; the curator/autonomy ConsolidationPass (SAL + for_admin
+    // ai:curator) is intentionally exempt. Refund if the write fails. Skip
+    // empty principals, mirroring the single-write store path.
+    let consolidate_quota_op = crate::quotas::QuotaOp::Memory {
+        bytes: i64::try_from(title.len() + summary.len()).unwrap_or(i64::MAX),
+    };
+    if !consolidator_agent_id.is_empty() {
+        if let Err(e) = crate::quotas::check_and_record(
+            conn,
+            &consolidator_agent_id,
+            namespace,
+            consolidate_quota_op,
+        ) {
+            return Err(e.to_string());
+        }
+    }
+    let new_id = match db::consolidate(
         conn,
         &ids,
         title,
@@ -124,8 +143,22 @@ pub(super) fn handle_consolidate(
         &Tier::Long,
         crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
-    )
-    .map_err(|e| e.to_string())?;
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            if !consolidator_agent_id.is_empty() {
+                if let Err(re) = crate::quotas::refund_op(
+                    conn,
+                    &consolidator_agent_id,
+                    namespace,
+                    consolidate_quota_op,
+                ) {
+                    crate::quotas::log_refund_op_failed(&consolidator_agent_id, &re);
+                }
+            }
+            return Err(e.to_string());
+        }
+    };
 
     // Generate embedding for the consolidated memory (#52)
     if let Some(emb) = embedder {
@@ -329,6 +362,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).expect("insert")
     }

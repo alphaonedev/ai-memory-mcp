@@ -251,21 +251,39 @@ proposed actions dispatch as Claude Code normally would.
 ### What the hook does
 
 Claude Code's [`PreToolUse`](https://docs.claude.com/en/docs/claude-code/hooks)
-hook surface (`type=mcp_tool`) lets the harness invoke an MCP tool
-before a matching tool dispatch and gate on the response. The installer
+hook fires before a matching tool dispatch and can BLOCK it. The installer
 scopes the managed entry with `matcher: "Bash|Edit|Write"` — the
 agent-external action surface the rule engine models (the Claude Code
 `matcher` is a regex over the tool name, so `Edit` also covers
-`MultiEdit` / `NotebookEdit`). The ai-memory hook calls
-`memory_check_agent_action` with a JSON-RPC payload of the proposed
-action (kind=`bash` for the Bash tool, kind=`filesystem_write` for
-Edit / Write) and honours the returned `decision`:
+`MultiEdit` / `NotebookEdit`). The managed entry is a **`type:command`**
+hook that runs `ai-memory governance check-action --from-pretool-stdin`:
+the wrapper reads the PreToolUse event off stdin, maps the proposed tool
+to a substrate action (kind=`bash`/`command` for the Bash tool,
+kind=`filesystem_write`/`path` for Edit / Write / MultiEdit /
+NotebookEdit), evaluates the rules engine, and emits the Claude Code
+decision contract (`hookSpecificOutput.permissionDecision`) so a Refuse
+actually blocks:
+
+> **Why `type:command`, not `type:mcp_tool` ([#1811](https://github.com/alphaonedev/ai-memory-mcp/issues/1811)).**
+> A `type:mcp_tool` hook *cannot enforce*. Per the Claude Code hooks
+> contract, an mcp_tool hook whose tool returns `isError:true` (e.g. the
+> old "kind is required" failure) "produces a non-blocking error and
+> execution continues", and a tool response that is not the harness
+> decision JSON is "shown as plain text" — so the substrate
+> `{"decision":{"decision":"refuse"}}` never blocked the tool. The
+> `--from-pretool-stdin` wrapper owns the contract translation in-binary
+> (it emits `permissionDecision:"deny"` on a Refuse), restoring real
+> enforcement. The cost is a shell fork + a PATH dependence on
+> `ai-memory`. Decision recorded via the 5-agent crossroads vote
+> (`4d3ea1c5`).
+
+The wrapper honours the returned `decision`:
 
 | `decision` | Harness behaviour |
 |---|---|
-| `allow` | Tool dispatches normally. No operator-visible signal. |
-| `warn` | Tool dispatches normally + the warning row lands in `signed_events` (audit chain). The agent sees the `reason` in the tool's response context. |
-| `refuse` | Tool dispatch is BLOCKED. The agent sees `reason` + `rule_id` in the response context and must reroute (operator-approval workflow lives in K10, separate surface). |
+| `allow` | Wrapper emits nothing (exit 0). Tool dispatches normally. |
+| `warn` | Wrapper emits `permissionDecision:"ask"` (+ `reason`/`rule_id`) — the harness surfaces the warning to the human for confirmation. The warning row also lands in `signed_events` (audit chain). |
+| `refuse` / `escalate` | Wrapper emits `permissionDecision:"deny"` (+ `reason`/`rule_id`). Tool dispatch is BLOCKED; the agent must reroute (operator-approval workflow lives in K10, separate surface). |
 
 Because the managed matcher is scoped to `Bash|Edit|Write`, the `Read`
 tool, `WebFetch`, and `mcp__`-prefixed tools are NOT gated by the managed

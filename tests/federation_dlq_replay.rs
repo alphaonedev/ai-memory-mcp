@@ -198,7 +198,7 @@ async fn broadcast_fanout_failure_enqueues_dlq_row() {
     };
     let peer_url = spawn_mock_peer(peer.clone()).await;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 500);
 
     let mem = sample_memory("dlq-mem-001");
@@ -248,7 +248,7 @@ async fn replay_drains_dlq_when_peer_recovers() {
     };
     let peer_url = spawn_mock_peer(peer.clone()).await;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 500);
 
     // Step 1: peer down, write fails, DLQ row lands.
@@ -323,7 +323,7 @@ async fn dlq_dedupes_repeated_failures_via_unique_index() {
     };
     let peer_url = spawn_mock_peer(peer.clone()).await;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 500);
 
     let mem = sample_memory("dlq-mem-003");
@@ -359,7 +359,7 @@ async fn dlq_dedupes_repeated_failures_via_unique_index() {
 async fn quarantined_head_does_not_starve_take_batch_1578() {
     use ai_memory::federation::push_dlq::MAX_REPLAY_ATTEMPTS;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
 
     // Oldest row: already at the quarantine ceiling.
     sink.enqueue_push_failure("mem-quarantined", "peer-x", &serde_json::json!({}), "boom")
@@ -409,7 +409,7 @@ async fn adaptive_batch_drains_backlog_beyond_fixed_64_in_one_tick_1579b5() {
     };
     let peer_url = spawn_mock_peer(peer.clone()).await;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 2000);
 
     // Preload a backlog comfortably above the legacy fixed batch.
@@ -509,7 +509,7 @@ async fn broadcast_with_embedding_ships_vector_in_push_body_1566() {
     };
     let peer_url = spawn_mock_peer(peer.clone()).await;
     let (_tmp, db) = fresh_dlq_db();
-    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()));
+    let sink: Arc<dyn FederationDlqSink> = Arc::new(SqliteDlqSink::new(db.clone()).await.unwrap());
     let cfg = build_cfg_with_sink(&peer_url, sink.clone(), 2000);
 
     // (a) With a shipped embedding → `embeddings` array in the body.

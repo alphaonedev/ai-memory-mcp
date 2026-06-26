@@ -493,6 +493,7 @@ async fn schema_init_sqlite_enumerates_and_reports() {
         store_url: url.clone(),
         json: true,
         embedding_dim: 768,
+        force_reembed: false,
     };
     run(&args, &mut out).await.expect("schema-init sqlite run");
 
@@ -537,6 +538,7 @@ async fn schema_init_sqlite_human_render() {
         store_url: url,
         json: false,
         embedding_dim: 384,
+        force_reembed: false,
     };
     run(&args, &mut out)
         .await
@@ -568,6 +570,7 @@ async fn schema_init_unrecognised_scheme_bails() {
         store_url: "nosql://nope".to_string(),
         json: false,
         embedding_dim: 384,
+        force_reembed: false,
     };
     let err = run(&args, &mut out).await.expect_err("must reject");
     assert!(
@@ -606,6 +609,7 @@ async fn schema_init_postgres_enumerates_live_catalog() {
         store_url: url.clone(),
         json: true,
         embedding_dim: 384,
+        force_reembed: false,
     };
     run(&args, &mut out)
         .await

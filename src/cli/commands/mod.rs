@@ -43,6 +43,10 @@ pub mod recall_observations;
 // backend/model's vectors; per-row #1595 failure isolation).
 pub mod reembed;
 pub mod replay;
+// #1727 (v0.8.0) — CLI-ONLY NON-DESTRUCTIVE undo of an in-place edit.
+// No MCP tool / HTTP route by deliberate security design (5-agent
+// UNANIMOUS vote, memory `ff23ddcd`).
+pub mod undo_edit;
 // v0.7.0 ARCH-3 / FX-C3 (batch2) — closing the 16 remaining
 // applicable deferrals from the FX-12 audit. Each module wires a
 // thin clap arg-parser + output formatter that dispatches into the

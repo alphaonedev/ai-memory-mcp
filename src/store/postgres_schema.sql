@@ -93,6 +93,17 @@ CREATE TABLE IF NOT EXISTS memories (
     agent_id_idx      TEXT GENERATED ALWAYS AS (
         metadata ->> 'agent_id'
     ) STORED,
+    -- v0.8.0 #1720 A1 — generated column indexing metadata.target_agent_id
+    -- so the A2 owner-keyed `private` visibility clause resolves inbox /
+    -- share rows via `agent_id_idx = ?caller OR target_agent_id_idx =
+    -- ?caller` as a real index lookup rather than a json-extract scan.
+    -- Mirrors SQLite migration v67 (a VIRTUAL generated column there;
+    -- STORED here because Postgres has no VIRTUAL generated columns).
+    -- Fresh schemas carry this inline; existing schemas pick it up via
+    -- migrate_v67().
+    target_agent_id_idx TEXT GENERATED ALWAYS AS (
+        metadata ->> 'target_agent_id'
+    ) STORED,
     -- v0.7.0 M15 — schema v30: enforce that metadata is a JSON object.
     -- The two generated columns above silently project NULL when
     -- metadata is anything else (array / scalar / NULL), which masks
@@ -175,6 +186,20 @@ CREATE TABLE IF NOT EXISTS memories (
     -- Fresh schemas carry this inline; existing schemas pick it up via
     -- migrate_v42().
     version               BIGINT NOT NULL DEFAULT 1,
+    -- v0.8.0 Pillar 2 (schema v64, #1709) — typed-cognition lifecycle
+    -- state. `open` for every legacy row (DEFAULT) and every fresh store
+    -- that omits the field; transitions are enforced at the write
+    -- boundary by `models::LifecycleState::can_transition_to`, not a SQL
+    -- CHECK. Fresh schemas carry it inline; existing schemas pick it up
+    -- via migrate_v64().
+    lifecycle_state       TEXT NOT NULL DEFAULT 'open',
+    -- v0.7.0 (#228) / v0.8.0 (#1728, schema v68 pg) — at-rest content
+    -- encryption envelope (X25519 + ChaCha20-Poly1305). NULL unless
+    -- [encryption].at_rest is enabled; `content` carries a placeholder
+    -- when this is non-NULL. The sqlite twin landed at v44; the postgres
+    -- column lands at v68 — fresh schemas carry it inline here, existing
+    -- schemas pick it up via migrate_v68().
+    encrypted_envelope    BYTEA,
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -209,6 +234,9 @@ CREATE INDEX IF NOT EXISTS memories_scope_idx_idx ON memories (scope_idx);
 -- v0.6.0 / Ultrareview #342 — agent_id_idx (generated column) + created_at.
 CREATE INDEX IF NOT EXISTS idx_memories_agent_id ON memories (agent_id_idx);
 CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories (created_at);
+-- v0.8.0 #1720 A1 — target_agent_id_idx (generated column) for the A2
+-- owner-keyed `private` visibility clause. Mirrors SQLite migration v67.
+CREATE INDEX IF NOT EXISTS idx_memories_target_agent_id ON memories (target_agent_id_idx);
 -- v0.6.3.1 P2 / G4 — partial index on embedding_dim for hot-spot doctor
 -- queries and the per-namespace "first write establishes dim" check.
 CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim
@@ -328,8 +356,13 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- closed set with `derives_from` for atomisation provenance edges
     -- and re-pinned the constraint under the `_wt1a` suffix so the
     -- 0017 migration can detect the upgraded form via pg_constraint.
+    -- v0.8.0 Pillar-2 (schema v63 both adapters, #1709) extended the
+    -- closed set with the Goal/Plan/Step typed-cognition wiring
+    -- relations `decomposes_into` / `depends_on` / `advances` (kept
+    -- under the same `_wt1a` constraint name; `migrate_v63` re-adds it
+    -- on upgrade).
     CONSTRAINT memory_links_relation_check_wt1a
-        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from'))
+        CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
 
 CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links (source_id);
@@ -407,11 +440,46 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     confidence_signals    TEXT,
     confidence_decayed_at TEXT,
     mentioned_entity_id   TEXT,
-    version               BIGINT
+    version               BIGINT,
+    -- v0.8.0 Pillar 2 (schema v64, #1709) — lifecycle_state mirror so
+    -- archive → restore is lossless. Nullable on legacy archived rows.
+    lifecycle_state       TEXT,
+    -- v0.8.0 (#228 / #1728, schema v68) — encrypted_envelope mirror so
+    -- archiving an encrypted memory carries the ciphertext into the
+    -- archive and archive → restore round-trips it losslessly. Nullable;
+    -- NULL until at-rest encryption is wired into the write paths.
+    encrypted_envelope    BYTEA
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);
 CREATE INDEX IF NOT EXISTS archived_memories_archived_at_idx ON archived_memories (archived_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- archived_memory_links — v70 (#1771) edge-preservation snapshot.
+-- Mirrors memory_links columns but carries NO `REFERENCES memories(id)`
+-- FK (it is an archive table, like archived_memories itself) plus an
+-- `archived_at` stamp. The explicit/recovery-expected delete paths
+-- snapshot a memory's edges here BEFORE the cascade DELETE so restore can
+-- re-insert them. SQLite wires snapshot/restore this commit; the postgres
+-- snapshot/restore wiring is a tracked follow-up — this table is created
+-- on both backends now for adapter-schema consistency. Fresh installs get
+-- it inline here; upgraded installs via PostgresStore::migrate_v70.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS archived_memory_links (
+    source_id    TEXT NOT NULL,
+    target_id    TEXT NOT NULL,
+    relation     TEXT NOT NULL DEFAULT 'related_to',
+    created_at   TIMESTAMPTZ NOT NULL,
+    valid_from   TIMESTAMPTZ,
+    valid_until  TIMESTAMPTZ,
+    observed_by  TEXT,
+    signature    BYTEA,
+    attest_level TEXT,
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_id, target_id, relation)
+);
+CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx ON archived_memory_links (source_id);
+CREATE INDEX IF NOT EXISTS archived_memory_links_target_idx ON archived_memory_links (target_id);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- namespace_meta — namespace standard / policy (Tasks 1.6–1.8).
@@ -703,6 +771,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
     WHERE replayed_at IS NULL;
 
 -- ─────────────────────────────────────────────────────────────────────
+-- kg_projection_outbox — staggered AGE cold-path projection queue
+-- (v0.8.0 Pillar-4 4.C, schema v69, #1735; Postgres-only — AGE is
+-- Postgres-only). Mirrors `PostgresStore::migrate_v69`. When
+-- `AI_MEMORY_AGE_PROJECTION_MODE=deferred`, `link_internal` enqueues a
+-- pending-projection row here in the SAME tx as the relational
+-- `memory_links` INSERT instead of running the synchronous inline AGE
+-- MERGE; the cold drainer worker projects pending rows into
+-- `memory_graph` out-of-band (eventually consistent; find_paths stays
+-- correct via the always-current relational recursive-CTE). Default
+-- `AI_MEMORY_AGE_PROJECTION_MODE=sync` leaves this table unused.
+-- `projected_at IS NULL` marks a pending row (mirrors
+-- `federation_push_dlq.replayed_at`); quarantine is by `attempt_count`
+-- threshold in the drainer's take-query.
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS kg_projection_outbox (
+    id             BIGSERIAL PRIMARY KEY,
+    source_id      TEXT NOT NULL,
+    target_id      TEXT NOT NULL,
+    relation       TEXT NOT NULL,
+    attempt_count  INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    projected_at   TIMESTAMPTZ NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_kg_projection_outbox_pending
+    ON kg_projection_outbox(created_at)
+    WHERE projected_at IS NULL;
+
+-- ─────────────────────────────────────────────────────────────────────
 -- subscription_events / subscription_dlq — A2A correlation IDs, ACK
 -- semantics, retry, and dead-letter queue (v0.7.0 K6, schema v27).
 --
@@ -801,6 +899,10 @@ CREATE TABLE IF NOT EXISTS recall_observations (
     observed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     consumed_at            TIMESTAMPTZ NULL,
     consumed_by_memory_id  TEXT        NULL REFERENCES memories(id) ON DELETE CASCADE,
+    -- v0.8.0 #1705 — identity binding (recalling agent + namespace); see
+    -- migrate_v58. Existing schemas pick these up via migrate_v58().
+    agent_id               TEXT        NULL,
+    namespace              TEXT        NULL,
     PRIMARY KEY (recall_id, memory_id)
 );
 
@@ -810,6 +912,10 @@ CREATE INDEX IF NOT EXISTS idx_recall_observations_memory_id
     ON recall_observations(memory_id);
 CREATE INDEX IF NOT EXISTS idx_recall_observations_observed_at
     ON recall_observations(observed_at);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id
+    ON recall_observations(agent_id);
+CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace
+    ON recall_observations(namespace);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- F6 Gap 1 (v0.7.0) — SAL knowledge-graph SQL views.
@@ -922,3 +1028,151 @@ LANGUAGE SQL STABLE PARALLEL SAFE AS $$
     FROM walk
     WHERE depth >= 1
 $$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — distributed coordination substrate foundation.
+-- actions (state machine) + action_edges (typed dependency DAG) + leases
+-- (lease/heartbeat). Mirrors migrations/sqlite/0049_v59_action_substrate.sql.
+-- Fresh schemas carry these inline; existing schemas pick them up via
+-- migrate_v59().
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS actions (
+    id           TEXT        NOT NULL PRIMARY KEY,
+    namespace    TEXT        NOT NULL,
+    kind         TEXT        NOT NULL,
+    state        TEXT        NOT NULL DEFAULT 'pending',
+    title        TEXT        NOT NULL DEFAULT '',
+    payload      TEXT        NOT NULL DEFAULT '{}',
+    priority     BIGINT      NOT NULL DEFAULT 5,
+    agent_id     TEXT,
+    claimed_by   TEXT,
+    vector_clock TEXT        NOT NULL DEFAULT '{}',
+    metadata     TEXT        NOT NULL DEFAULT '{}',
+    created_at   BIGINT      NOT NULL,
+    updated_at   BIGINT      NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_actions_ns_state ON actions(namespace, state);
+CREATE INDEX IF NOT EXISTS idx_actions_state_priority ON actions(state, priority DESC);
+
+CREATE TABLE IF NOT EXISTS action_edges (
+    from_action TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+    to_action   TEXT   NOT NULL REFERENCES actions(id) ON DELETE CASCADE,
+    edge_type   TEXT   NOT NULL,
+    created_at  BIGINT NOT NULL,
+    PRIMARY KEY (from_action, to_action, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_action_edges_to ON action_edges(to_action);
+
+CREATE TABLE IF NOT EXISTS leases (
+    action_id    TEXT   NOT NULL PRIMARY KEY REFERENCES actions(id) ON DELETE CASCADE,
+    holder       TEXT   NOT NULL,
+    acquired_at  BIGINT NOT NULL,
+    expires_at   BIGINT NOT NULL,
+    heartbeat_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — signed-signals storage foundation. signals
+-- (typed, Ed25519-signed inter-agent messages). Mirrors
+-- migrations/sqlite/0050_v60_signed_signals.sql. Fresh schemas carry this
+-- inline; existing schemas pick it up via migrate_v60(). Epoch columns are
+-- BIGINT, the Ed25519 signature/sender_pubkey columns are BYTEA, and
+-- `reference_ids` is renamed from the ROADMAP's `references` (SQL reserved
+-- word).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS signals (
+    id              TEXT NOT NULL PRIMARY KEY,
+    namespace       TEXT NOT NULL,
+    from_agent      TEXT NOT NULL,
+    to_agent        TEXT,                          -- NULL = broadcast within namespace
+    subject         TEXT NOT NULL,
+    body            TEXT NOT NULL,                 -- JSON-typed payload
+    signal_type     TEXT NOT NULL,                 -- authorize|notify|request|response|broadcast
+    in_reply_to     TEXT REFERENCES signals(id),
+    correlation_id  TEXT,
+    reference_ids   TEXT   NOT NULL DEFAULT '[]',  -- JSON array; renamed from ROADMAP `references` (reserved word)
+    created_at      BIGINT NOT NULL,
+    expires_at      BIGINT,
+    delivered_at    BIGINT,
+    read_at         BIGINT,
+    acknowledged_at BIGINT,
+    signature       BYTEA  NOT NULL,               -- Ed25519 over canonical content
+    sender_pubkey   BYTEA  NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_namespace ON signals(namespace, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_to_agent ON signals(to_agent, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signals_correlation ON signals(correlation_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — attested-checkpoints storage foundation.
+-- checkpoints (conditional coordination gates whose resolution is
+-- Ed25519-attested). Mirrors migrations/sqlite/0051_v61_attested_checkpoints.sql.
+-- Fresh schemas carry this inline; existing schemas pick it up via
+-- migrate_v61(). Epoch columns are BIGINT, the Ed25519 signature/
+-- resolver_pubkey columns are BYTEA (nullable — populated only once a
+-- checkpoint resolves).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id              TEXT NOT NULL PRIMARY KEY,
+    namespace       TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    condition_type  TEXT NOT NULL,                 -- approval|external_signal|condition_predicate|deadline
+    condition       TEXT   NOT NULL DEFAULT '{}',  -- JSON condition spec
+    state           TEXT NOT NULL,                 -- pending|resolved|rejected|expired
+    created_by      TEXT NOT NULL,
+    resolved_by     TEXT,
+    resolution      TEXT,
+    resolution_note TEXT,
+    signature       BYTEA,                          -- Ed25519 over the canonical resolution (attested)
+    resolver_pubkey BYTEA,
+    created_at      BIGINT NOT NULL,
+    deadline_at     BIGINT,
+    resolved_at     BIGINT,
+    metadata        TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_ns_state ON checkpoints(namespace, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_condition_type ON checkpoints(condition_type);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_deadline ON checkpoints(deadline_at);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- #1709 (v0.8.0 Pillar 1) — routines storage foundation. routines
+-- (parameterised action+edge templates that can be frozen into an
+-- immutable, regulatory-hold form) + routine_runs (one materialisation of
+-- a routine under a concrete argument binding). Mirrors
+-- migrations/sqlite/0052_v62_routines.sql. Fresh schemas carry these
+-- inline; existing schemas pick them up via migrate_v62(). Epoch columns
+-- are BIGINT, the Ed25519 freeze-attestation signature/signer_pubkey
+-- columns are BYTEA (nullable — populated only once a routine is frozen).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS routines (
+    id            TEXT NOT NULL PRIMARY KEY,
+    namespace     TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    template      TEXT NOT NULL,                 -- JSON: action + edge declarations w/ {{parameter}} placeholders
+    parameters    TEXT   NOT NULL DEFAULT '[]',  -- JSON array of declared parameter names
+    state         TEXT NOT NULL,                 -- draft | frozen (frozen = immutable, regulatory hold)
+    created_by    TEXT NOT NULL,
+    created_at    BIGINT NOT NULL,
+    frozen_at     BIGINT,
+    signature     BYTEA,                          -- future freeze-attestation (caller-provided/empty for now)
+    signer_pubkey BYTEA,
+    metadata      TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_routines_ns_state ON routines(namespace, state, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routines_name ON routines(name);
+
+CREATE TABLE IF NOT EXISTS routine_runs (
+    id                 TEXT NOT NULL PRIMARY KEY,
+    routine_id         TEXT NOT NULL REFERENCES routines(id),
+    namespace          TEXT NOT NULL,
+    arguments          TEXT   NOT NULL DEFAULT '{}',  -- JSON: {{parameter}} -> value bindings for this run
+    state              TEXT NOT NULL,                 -- pending | running | completed | failed
+    created_action_ids TEXT   NOT NULL DEFAULT '[]',  -- JSON array of action ids this run materialized
+    started_at         BIGINT NOT NULL,
+    finished_at        BIGINT,
+    error              TEXT,
+    metadata           TEXT   NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_routine_runs_ns_state ON routine_runs(namespace, state);

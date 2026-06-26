@@ -1645,9 +1645,15 @@ mod tests {
     /// (`is_transient_spawn_errno` always returns `false` when
     /// `cfg(unix)` is off).
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue_1207_spawn_retry_first_attempt_succeeds() {
-        let started = Instant::now();
+        // #1762 — measure on tokio's VIRTUAL clock (start_paused) so the
+        // "no backoff" assertion is deterministic: only `tokio::time::sleep`
+        // advances virtual time, and the real `spawn(/bin/true)` syscall —
+        // which on a loaded macOS runner routinely exceeds 10ms of wall-clock
+        // — does NOT. Under start_paused the no-backoff path leaves virtual
+        // elapsed at exactly 0.
+        let started = tokio::time::Instant::now();
         let child = spawn_with_transient_retry(|| {
             Command::new(if std::path::Path::new("/bin/true").exists() {
                 "/bin/true"
@@ -1664,8 +1670,8 @@ mod tests {
         .expect("first-attempt spawn should succeed");
         // Reap the child to keep the test hermetic.
         drop(child);
-        // No backoff sleeps fired — well under the 10ms first-step
-        // ladder entry.
+        // No backoff sleeps fired → zero virtual time elapsed (< the 10ms
+        // first ladder step).
         assert!(
             started.elapsed() < Duration::from_millis(10),
             "first-attempt success must not pay any backoff"
@@ -1675,9 +1681,12 @@ mod tests {
     /// A non-transient errno (ENOENT — missing binary) MUST surface
     /// immediately without retries.
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue_1207_spawn_retry_non_transient_errno_surfaces_immediately() {
-        let started = Instant::now();
+        // #1762 — virtual clock so the "no backoff" assertion is immune to
+        // real spawn-syscall wall-clock on loaded CI runners (see
+        // `issue_1207_spawn_retry_first_attempt_succeeds`).
+        let started = tokio::time::Instant::now();
         let err = spawn_with_transient_retry(|| {
             Command::new("/nonexistent/path/to/binary-xyz-1207")
                 .stdin(Stdio::null())
@@ -1690,7 +1699,7 @@ mod tests {
         .expect_err("spawn of /nonexistent should fail");
         assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
         // Should NOT have paid any backoff sleeps — fail-fast on
-        // non-transient errno.
+        // non-transient errno → zero virtual time elapsed.
         assert!(
             started.elapsed() < Duration::from_millis(10),
             "non-transient errno must surface immediately, took {:?}",
@@ -1708,7 +1717,7 @@ mod tests {
     /// gate is `Once`-initialized. We use a `Mutex` to serialize
     /// against other tests in this module that might race.
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue_1207_spawn_retry_recovers_from_transient_eagain() {
         // This test exercises the retry loop by passing a closure
         // that returns a synthesized EAGAIN on its first two calls,
@@ -1718,7 +1727,11 @@ mod tests {
         // direct control is the more honest unit test for the loop.
         use std::cell::Cell;
         let attempt_count: Cell<u32> = Cell::new(0);
-        let started = Instant::now();
+        // #1762 — virtual clock (start_paused): the 2 real backoff sleeps
+        // (10ms + 50ms) auto-advance virtual time by EXACTLY 60ms, so the
+        // bounds below are deterministic (no CI scheduler jitter) and the
+        // test runs in ~0 wall-clock instead of paying 60ms of real sleep.
+        let started = tokio::time::Instant::now();
         let child = spawn_with_transient_retry(|| {
             let n = attempt_count.get();
             attempt_count.set(n + 1);
@@ -1745,9 +1758,9 @@ mod tests {
             3,
             "closure called 3 times (2 EAGAIN + 1 success)"
         );
-        // Paid 10ms + 50ms = 60ms of backoff. Allow generous slop for
-        // CI scheduler jitter (especially under cargo's parallel
-        // test load — the EXACT condition this fix targets).
+        // Paid 10ms + 50ms = 60ms of backoff. On the virtual clock this is
+        // EXACT (auto-advanced by the two sleeps), so the bounds hold
+        // deterministically regardless of real CI scheduler load.
         let elapsed = started.elapsed();
         assert!(
             elapsed >= Duration::from_millis(55),
@@ -1763,8 +1776,12 @@ mod tests {
     /// Guarantees the helper doesn't loop forever AND that operators
     /// still see the precise errno when the kernel never recovers.
     #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn issue_1207_spawn_retry_exhaustion_surfaces_last_error() {
+        // #1762 — virtual clock: auto-advances through the full 10+50+200+
+        // 1000ms ladder instantly instead of paying 1.26s of real sleep,
+        // cutting suite wall-clock (a contributor to the macOS slowness that
+        // breeds spawn-timing flakes). No timing assertion here; speed only.
         use std::cell::Cell;
         let attempt_count: Cell<u32> = Cell::new(0);
         let err = spawn_with_transient_retry(|| {

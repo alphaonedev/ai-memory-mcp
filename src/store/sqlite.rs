@@ -58,17 +58,43 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+// #1709 Pillar 1 — the actions SELECT column list + row mapping live in
+// `crate::actions` (shared with the MCP `memory_action_*` handlers, which hold
+// a bare Connection). Referenced below as `crate::actions::{ACTION_SELECT_SQL,
+// row_to_action}`.
+
+// #1709 Pillar 1 — the `leases` SELECT column list + row mapping + the four
+// lease operations live in `crate::actions` (shared with the MCP
+// `memory_lease_*` handlers, which hold a bare Connection). Referenced below
+// as `crate::actions::{LEASE_SELECT_BY_ID_SQL, row_to_lease, lease_*}`.
+
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
     fn capabilities(&self) -> Capabilities {
-        // TRANSACTIONS + ATOMIC_MULTI_WRITE are NOT advertised because
-        // the adapter does not currently expose `begin_transaction()`
-        // — the trait default returns `UnsupportedCapability`. Honesty
-        // here matters: capability bits must match runtime behaviour
-        // (issue #302 item 6). Re-add these two flags once a real
-        // transaction handle is wired through the mutex-guarded
-        // `rusqlite::Connection`.
-        Capabilities::FULLTEXT | Capabilities::DURABLE | Capabilities::STRONG_CONSISTENCY
+        // #1670 — the two transaction-related bits mean DIFFERENT things;
+        // sqlite honestly holds one but not the other:
+        //
+        // * ATOMIC_MULTI_WRITE ("atomic multi-row writes ... under one
+        //   transaction") IS advertised: every multi-write op on this
+        //   adapter runs as a single `BEGIN IMMEDIATE … COMMIT` atom with
+        //   ROLLBACK on any mid-failure — `reflect` (src/storage/reflect.rs),
+        //   `consolidate` + the bulk-insert / archive+insert paths
+        //   (src/storage/mod.rs). A partial multi-row write can never
+        //   commit, so the property the bit names genuinely holds.
+        // * TRANSACTIONS ("adapter supports `begin_transaction` for
+        //   multi-op atomicity") is WITHHELD: the SAL adapter exposes no
+        //   caller-facing `begin_transaction()` handle (the trait default
+        //   returns `UnsupportedCapability`), so a caller cannot compose
+        //   its OWN multi-op atomic unit. Re-add this bit only once a real
+        //   transaction handle is wired through the mutex-guarded
+        //   `rusqlite::Connection`.
+        //
+        // Capability bits must match runtime behaviour (#302 item 6 /
+        // #1052 wire-honesty); conflating these two was the bug #1670 fixed.
+        Capabilities::FULLTEXT
+            | Capabilities::DURABLE
+            | Capabilities::STRONG_CONSISTENCY
+            | Capabilities::ATOMIC_MULTI_WRITE
     }
 
     /// v0.7.0.1 S75 — read `MAX(version)` from the live SQLite
@@ -105,6 +131,34 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<CaptureTurnResult> {
         let conn = self.state.lock().await;
         db::capture_turn_idempotent(&conn, write).map_err(box_err)
+    }
+
+    /// #1693 — L2 transcript-recovery idempotent write. Delegates to the
+    /// sqlite SSOT `db::recover_turn_idempotent`, which the sync recover path
+    /// also calls, so the dual-dedup lookup + atomic two-row transaction
+    /// lives in exactly one place.
+    async fn recover_turn_idempotent(
+        &self,
+        _ctx: &CallerContext,
+        write: &crate::models::RecoverTurnWrite,
+    ) -> StoreResult<crate::models::RecoverTurnResult> {
+        let conn = self.state.lock().await;
+        db::recover_turn_idempotent(&conn, write).map_err(box_err)
+    }
+
+    /// #1693 — L2 recovery fast-path watermark (indexed
+    /// `MAX(created_at) WHERE agent_id_idx`). Mirrors the inline sqlite query
+    /// the sync `recover_from_transcript` uses.
+    async fn agent_max_created_at(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT MAX(created_at) FROM memories WHERE agent_id_idx = ?1",
+                rusqlite::params![agent_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None);
+        Ok(v)
     }
 
     async fn get(&self, ctx: &CallerContext, id: &str) -> StoreResult<Memory> {
@@ -153,11 +207,27 @@ impl MemoryStore for SqliteStore {
             None,
         )
         .map_err(box_err)?;
-        if found {
-            Ok(())
-        } else {
-            Err(StoreError::NotFound { id: id.to_string() })
+        if !found {
+            return Err(StoreError::NotFound { id: id.to_string() });
         }
+        // #1726 — apply an optional lifecycle transition through the
+        // self-validating storage primitive (SELECT-current →
+        // can_transition_to → typed InvalidTransition). A request equal to
+        // the stored state is an idempotent no-op; an illegal edge surfaces
+        // as `StoreError::InvalidTransition` → HTTP 409, byte-parity with the
+        // postgres twin.
+        if let Some(target) = patch.lifecycle_state {
+            db::set_lifecycle_state(&conn, id, target).map_err(|e| {
+                e.downcast_ref::<crate::storage::InvalidTransition>()
+                    .map_or_else(
+                        || box_err(&e),
+                        |it| StoreError::InvalidTransition {
+                            detail: it.to_string(),
+                        },
+                    )
+            })?;
+        }
+        Ok(())
     }
 
     async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
@@ -261,6 +331,28 @@ impl MemoryStore for SqliteStore {
         // SAL-level contract so adapters with FTS paths that lack the
         // generated column (or where the column trails the metadata
         // update by a transaction window) still fail-closed.
+        // v0.8.0 #1720 A3 — owner-keyed scope=private SQL caller; mirror
+        // the #910 post-filter principal (`effective_principal`).
+        // v0.8.0 #1720 A7 — on a BYPASS read (admin/migrate/federation
+        // catchup/GC) we BOTH pass `vis_caller=None` AND drop `as_agent`.
+        // The A2 owner-keyed `visibility_clause` only trust-alls via the
+        // `?private_ph IS NULL` sentinel, and `private_ph` is bound from
+        // `compute_visibility_prefixes(as_agent)` — so a bypass ctx that
+        // carries `as_agent=Some(..)` would bind a NON-null `private_ph`,
+        // the sentinel would NOT fire, and the owner-keyed private arm
+        // would be false (caller is NULL) — excluding every private row
+        // from an admin who is supposed to read everything. Forcing
+        // `as_agent=None` on bypass fires the sentinel → trust-all,
+        // matching the postgres adapter, whose recall/search/recall_hybrid
+        // bind `caller=NULL` on bypass and trust-all via `$N::text IS NULL`
+        // REGARDLESS of `as_agent`. `as_agent` ONLY feeds visibility
+        // scoping; `filter.namespace` scopes the query independently
+        // (separate `db::search` argument), so dropping it here is safe.
+        let (vis_caller, vis_as_agent) = if ctx.bypass_visibility {
+            (None, None)
+        } else {
+            (Some(ctx.effective_principal()), ctx.as_agent.as_deref())
+        };
         let rows = db::search(
             &conn,
             query,
@@ -272,8 +364,9 @@ impl MemoryStore for SqliteStore {
             until.as_deref(),
             tags_first,
             filter.agent_id.as_deref(),
-            ctx.as_agent.as_deref(),
+            vis_as_agent,
             false,
+            vis_caller,
         )
         .map_err(box_err)?;
         // #910 SAL-level scope=private gate — see trait docstring +
@@ -467,6 +560,14 @@ impl MemoryStore for SqliteStore {
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
+    async fn merge_inbound(&self, _ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // v0.8.0 Pillar-3 (#1709 / #224) — delegate to the sqlite
+        // free-fn, which does the atomic read-by-id → `merge_memory` →
+        // full-row write (else `insert_if_newer` fall-through).
+        let conn = self.state.lock().await;
+        db::merge_inbound(&conn, inbound).map_err(box_err)
+    }
+
     async fn apply_remote_link(
         &self,
         _ctx: &CallerContext,
@@ -495,6 +596,26 @@ impl MemoryStore for SqliteStore {
         let until = filter.until.map(|d| d.to_rfc3339());
         let limit = if filter.limit == 0 { 10 } else { filter.limit };
         let scoring = crate::config::ResolvedScoring::default();
+        // v0.8.0 #1720 A3 — owner-keyed scope=private visibility caller
+        // for the SQL `visibility_clause` private arm. Use the same
+        // resolved principal the #910 post-filter below applies
+        // (`effective_principal` = `as_agent` when set, else `agent_id`)
+        // so the SQL gate and the Rust post-filter agree.
+        // v0.8.0 #1720 A7 — on a BYPASS read also drop `as_agent` so the
+        // `?private_ph IS NULL` sentinel in `visibility_clause` fires and
+        // trust-alls (admin sees every private row). See the matching
+        // comment in `search()` above for the full rationale; without
+        // this a bypass ctx carrying `as_agent=Some(..)` binds a non-null
+        // `private_ph`, the sentinel never fires, and the owner-keyed
+        // private arm excludes every private row from the admin. Matches
+        // postgres recall/recall_hybrid (caller=NULL on bypass → trust-all
+        // regardless of as_agent). `filter.namespace` still scopes the
+        // query independently of `as_agent`.
+        let (vis_caller, vis_as_agent) = if ctx.bypass_visibility {
+            (None, None)
+        } else {
+            (Some(ctx.effective_principal()), ctx.as_agent.as_deref())
+        };
         let results = if let Some(qe) = query_embedding {
             db::recall_hybrid(
                 &conn,
@@ -508,7 +629,7 @@ impl MemoryStore for SqliteStore {
                 None, // vector_index threaded by the caller from AppState
                 crate::SECS_PER_HOUR,
                 crate::SECS_PER_DAY,
-                ctx.as_agent.as_deref(),
+                vis_as_agent,
                 None,
                 &scoring,
                 false,
@@ -518,6 +639,7 @@ impl MemoryStore for SqliteStore {
                 // the URI prefix via the dedicated argument on the
                 // direct db::recall call.
                 None,
+                vis_caller,
             )
             .map_err(box_err)?
             .0
@@ -532,10 +654,11 @@ impl MemoryStore for SqliteStore {
                 until.as_deref(),
                 crate::SECS_PER_HOUR,
                 crate::SECS_PER_DAY,
-                ctx.as_agent.as_deref(),
+                vis_as_agent,
                 None,
                 false,
                 None,
+                vis_caller,
             )
             .map_err(box_err)?
             .0
@@ -743,9 +866,450 @@ impl MemoryStore for SqliteStore {
             .map_err(box_err)
     }
 
+    async fn record_recall_observation(
+        &self,
+        recall_id: &str,
+        candidates: &[(String, String, i64, f64)],
+        agent_id: Option<&str>,
+        namespace: Option<&str>,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let cands: Vec<crate::observations::Candidate<'_>> = candidates
+            .iter()
+            .map(
+                |(memory_id, retriever, rank, score)| crate::observations::Candidate {
+                    memory_id,
+                    retriever,
+                    rank: *rank,
+                    score: *score,
+                },
+            )
+            .collect();
+        crate::observations::record_recall_with_identity(
+            &conn, recall_id, &cands, agent_id, namespace,
+        )
+        .map_err(box_err)
+    }
+
+    async fn mark_recall_consumed(
+        &self,
+        recall_id: &str,
+        cited_memory_ids: &[String],
+        consumed_by: &str,
+        consuming_agent: Option<&str>,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let refs: Vec<&str> = cited_memory_ids.iter().map(String::as_str).collect();
+        crate::observations::mark_consumed_guarded(
+            &conn,
+            recall_id,
+            &refs,
+            consumed_by,
+            consuming_agent,
+        )
+        .map_err(box_err)
+    }
+
+    async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1))).to_rfc3339();
+        crate::observations::gc::prune_before(&conn, &cutoff).map_err(box_err)
+    }
+
+    async fn reown(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_id: &str,
+        claim_unowned: bool,
+        dry_run: bool,
+    ) -> StoreResult<crate::storage::ReownReport> {
+        let conn = self.state.lock().await;
+        crate::storage::reown(&conn, namespace, to_id, claim_unowned, dry_run).map_err(box_err)
+    }
+
+    async fn action_create(
+        &self,
+        _ctx: &CallerContext,
+        action: &crate::models::Action,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::actions::create(&conn, action).map_err(box_err)
+    }
+
+    async fn action_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::get(&conn, id).map_err(box_err)
+    }
+
+    async fn action_transition(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::models::Action> {
+        let conn = self.state.lock().await;
+        match crate::actions::transition(&conn, id, to, claimed_by, now).map_err(box_err)? {
+            crate::actions::TransitionOutcome::NotFound => {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+            crate::actions::TransitionOutcome::Illegal { from, to } => {
+                Err(StoreError::InvalidInput {
+                    detail: crate::actions::illegal_transition_detail(from, to),
+                })
+            }
+            crate::actions::TransitionOutcome::Updated(a) => Ok(a),
+        }
+    }
+
+    async fn action_transition_cas(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        from: crate::models::ActionState,
+        to: crate::models::ActionState,
+        claimed_by: Option<&str>,
+        now: i64,
+    ) -> StoreResult<crate::actions::CasOutcome> {
+        let conn = self.state.lock().await;
+        crate::actions::transition_cas(&conn, id, from, to, claimed_by, now).map_err(box_err)
+    }
+
+    async fn action_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: Option<&str>,
+        state: Option<crate::models::ActionState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::list(&conn, namespace, state, limit).map_err(box_err)
+    }
+
+    async fn action_add_edge(
+        &self,
+        _ctx: &CallerContext,
+        from_action: &str,
+        to_action: &str,
+        edge_type: crate::models::EdgeType,
+        now: i64,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        crate::actions::add_edge(&conn, from_action, to_action, edge_type, now).map_err(box_err)
+    }
+
+    async fn action_edges_for(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Vec<crate::models::ActionEdge>> {
+        let conn = self.state.lock().await;
+        crate::actions::edges_for(&conn, action_id).map_err(box_err)
+    }
+
+    async fn action_frontier(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::frontier(&conn, namespace, limit).map_err(box_err)
+    }
+
+    async fn action_next(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        agent_id: Option<&str>,
+    ) -> StoreResult<Option<crate::models::Action>> {
+        let conn = self.state.lock().await;
+        crate::actions::next_action(&conn, namespace, agent_id).map_err(box_err)
+    }
+
+    async fn lease_acquire(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let conn = self.state.lock().await;
+        match crate::actions::lease_acquire(&conn, action_id, holder, now, expires_at)
+            .map_err(box_err)?
+        {
+            crate::actions::LeaseAcquire::Conflict => Err(StoreError::Conflict {
+                id: action_id.to_string(),
+            }),
+            crate::actions::LeaseAcquire::Acquired(l) => Ok(l),
+        }
+    }
+
+    async fn lease_renew(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> StoreResult<crate::models::Lease> {
+        let conn = self.state.lock().await;
+        crate::actions::lease_renew(&conn, action_id, holder, now, expires_at)
+            .map_err(box_err)?
+            .ok_or(StoreError::NotFound {
+                id: action_id.to_string(),
+            })
+    }
+
+    async fn lease_release(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+        holder: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::actions::lease_release(&conn, action_id, holder).map_err(box_err)
+    }
+
+    async fn lease_get(
+        &self,
+        _ctx: &CallerContext,
+        action_id: &str,
+    ) -> StoreResult<Option<crate::models::Lease>> {
+        let conn = self.state.lock().await;
+        crate::actions::lease_get(&conn, action_id).map_err(box_err)
+    }
+
+    async fn lease_sweep_expired(&self, now: i64) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        crate::actions::sweep_expired_leases(&conn, now).map_err(box_err)
+    }
+
+    async fn signal_send(
+        &self,
+        _ctx: &CallerContext,
+        signal: &crate::models::Signal,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<&'static str> {
+        // #1709 Pillar 1 — mirror `link_signed`: sign a clone when a signing
+        // keypair is present, else persist the signal verbatim (unsigned).
+        let conn = self.state.lock().await;
+        match keypair {
+            Some(kp) if kp.can_sign() => {
+                let mut signed = signal.clone();
+                crate::signals::sign_into(&mut signed, kp).map_err(box_err)?;
+                crate::signals::insert(&conn, &signed).map_err(box_err)?;
+                Ok(crate::models::AttestLevel::SelfSigned.as_str())
+            }
+            _ => {
+                crate::signals::insert(&conn, signal).map_err(box_err)?;
+                Ok(crate::models::AttestLevel::Unsigned.as_str())
+            }
+        }
+    }
+
+    async fn signal_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::get(&conn, id).map_err(box_err)
+    }
+
+    async fn signal_inbox(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        to_agent: Option<&str>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::list_inbox(&conn, namespace, to_agent, limit).map_err(box_err)
+    }
+
+    async fn signal_thread(
+        &self,
+        _ctx: &CallerContext,
+        correlation_id: &str,
+    ) -> StoreResult<Vec<crate::models::Signal>> {
+        let conn = self.state.lock().await;
+        crate::signals::thread(&conn, correlation_id).map_err(box_err)
+    }
+
+    async fn signal_ack(&self, _ctx: &CallerContext, id: &str, now: i64) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::signals::mark_acked(&conn, id, now).map_err(box_err)
+    }
+
+    async fn checkpoint_create(
+        &self,
+        _ctx: &CallerContext,
+        cp: &crate::models::Checkpoint,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::insert(&conn, cp).map_err(box_err)
+    }
+
+    async fn checkpoint_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::get(&conn, id).map_err(box_err)
+    }
+
+    async fn checkpoint_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::list(&conn, namespace, state, limit).map_err(box_err)
+    }
+
+    async fn checkpoint_resolve(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        state: crate::models::CheckpointState,
+        resolved_by: &str,
+        resolution: Option<&str>,
+        resolution_note: Option<&str>,
+        resolved_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::resolve(
+            &conn,
+            id,
+            state,
+            resolved_by,
+            resolution,
+            resolution_note,
+            resolved_at,
+            keypair,
+        )
+        .map_err(box_err)
+    }
+
+    async fn checkpoint_query(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        condition_type: Option<crate::models::ConditionType>,
+        state: Option<crate::models::CheckpointState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Checkpoint>> {
+        let conn = self.state.lock().await;
+        crate::checkpoints::query(&conn, namespace, condition_type, state, limit).map_err(box_err)
+    }
+
+    async fn routine_create(
+        &self,
+        _ctx: &CallerContext,
+        r: &crate::models::Routine,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_insert(&conn, r).map_err(box_err)
+    }
+
+    async fn routine_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_get(&conn, id).map_err(box_err)
+    }
+
+    async fn routine_list(
+        &self,
+        _ctx: &CallerContext,
+        namespace: &str,
+        state: Option<crate::models::RoutineState>,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_list(&conn, namespace, state, limit).map_err(box_err)
+    }
+
+    async fn routine_freeze(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+        frozen_at: i64,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<Option<crate::models::Routine>> {
+        let conn = self.state.lock().await;
+        crate::routines::routine_freeze(&conn, id, frozen_at, keypair).map_err(box_err)
+    }
+
+    async fn routine_run_create(
+        &self,
+        _ctx: &CallerContext,
+        run: &crate::models::RoutineRun,
+    ) -> StoreResult<String> {
+        let conn = self.state.lock().await;
+        crate::routines::run_insert(&conn, run).map_err(box_err)
+    }
+
+    async fn routine_run_get(
+        &self,
+        _ctx: &CallerContext,
+        id: &str,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::run_get(&conn, id).map_err(box_err)
+    }
+
+    async fn routine_runs_for(
+        &self,
+        _ctx: &CallerContext,
+        routine_id: &str,
+        limit: usize,
+    ) -> StoreResult<Vec<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::runs_for(&conn, routine_id, limit).map_err(box_err)
+    }
+
+    async fn routine_run_set_state(
+        &self,
+        _ctx: &CallerContext,
+        run_id: &str,
+        state: crate::models::RoutineRunState,
+        finished_at: Option<i64>,
+        created_action_ids: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<crate::models::RoutineRun>> {
+        let conn = self.state.lock().await;
+        crate::routines::run_set_state(&conn, run_id, state, finished_at, created_action_ids, error)
+            .map_err(box_err)
+    }
+
     async fn run_gc(&self, archive: bool) -> StoreResult<usize> {
         let conn = self.state.lock().await;
         db::gc(&conn, archive).map_err(box_err)
+    }
+
+    async fn size_gc(
+        &self,
+        namespace: &str,
+        max_corpus_bytes: i64,
+        archive: bool,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::size_gc(&conn, namespace, max_corpus_bytes, archive).map_err(box_err)
     }
 
     async fn archive_restore(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
@@ -829,8 +1393,18 @@ impl MemoryStore for SqliteStore {
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
-        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
-            .map_err(box_err)?;
+        // #1796 (5-agent vote 4d3ea1c5) — the SAL trait is the store-backed
+        // (multi-tenant daemon) surface; enforce the Human-arm self-approval
+        // gate UNCONDITIONALLY for behavioural parity with the postgres trait
+        // impl (`governance_approve_with_consensus`, #1793). The single-operator
+        // opt-in lives only on the MCP/CLI free-fn direct callers.
+        let outcome = db::approve_with_approver_type(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)?;
         // Translate the db-layer ApproveOutcome → SAL ApproveOutcome.
         let sal_outcome = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
@@ -1199,6 +1773,105 @@ impl MemoryStore for SqliteStore {
         db::health_check(&conn).map_err(box_err)
     }
 
+    /// #1393 sub-unit 2 — see the trait doc. One `BEGIN`/`COMMIT`: read the
+    /// current kind, refuse `reflection`/`persona` (mirror the upsert CASE),
+    /// no-op when already the target, `UPDATE` kind + bump `version`, then
+    /// append the `memory.reclassified` `signed_event` in the SAME tx so the
+    /// audit is atomic with the write.
+    async fn reclassify_memory_kind(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        new_kind: crate::models::MemoryKind,
+    ) -> StoreResult<bool> {
+        let mut conn = self.state.lock().await;
+        let tx = conn.transaction().map_err(box_err)?;
+        let old_kind: Option<String> = tx
+            .query_row(
+                "SELECT memory_kind FROM memories WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(box_err)?;
+        let Some(old_kind) = old_kind else {
+            return Ok(false);
+        };
+        let new_kind_str = new_kind.as_str();
+        // Protection: never clobber a reflection/persona kind (mirror the
+        // upsert-CASE invariant in crate::storage); no-op when unchanged.
+        if old_kind == crate::models::MemoryKind::Reflection.as_str()
+            || old_kind == crate::models::MemoryKind::Persona.as_str()
+            || old_kind == new_kind_str
+        {
+            return Ok(false);
+        }
+        let changed = tx
+            .execute(
+                "UPDATE memories SET memory_kind = ?1, version = version + 1 \
+                 WHERE id = ?2 AND memory_kind NOT IN ('reflection', 'persona')",
+                rusqlite::params![new_kind_str, id],
+            )
+            .map_err(box_err)?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        let ph = crate::signed_events::payload_hash(
+            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            "memory.reclassified".to_string(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        crate::signed_events::append_signed_event_no_tx(&tx, &event).map_err(box_err)?;
+        tx.commit().map_err(box_err)?;
+        Ok(true)
+    }
+
+    /// #1727 (v0.8.0) — NON-DESTRUCTIVE undo of an in-place edit. Delegates
+    /// to the sqlite reference free fn [`db::undo_in_place_edit`]. The caller
+    /// is resolved from `ctx`: an admin/operator context
+    /// (`bypass_visibility`) passes `None` (dual-ownership gate skipped),
+    /// otherwise the effective principal enforces the strict-equality gate
+    /// on BOTH the live row and the snapshot. CLI-ONLY by deliberate
+    /// security design (no MCP tool / HTTP route) — see the trait doc.
+    async fn undo_in_place_edit(
+        &self,
+        ctx: &CallerContext,
+        id: &str,
+        dry_run: bool,
+    ) -> StoreResult<crate::store::UndoOutcome> {
+        let caller = if ctx.bypass_visibility {
+            None
+        } else {
+            Some(ctx.effective_principal())
+        };
+        let conn = self.state.lock().await;
+        db::undo_in_place_edit(&conn, id, caller, dry_run).map_err(|e| {
+            // Downcast the storage-layer typed errors to the SAL envelope so
+            // a not-found surfaces as NotFound and an ownership rejection as
+            // PermissionDenied (mirrors the InvalidTransition downcast above).
+            if let Some(se) = e.downcast_ref::<crate::storage::StorageError>() {
+                match se {
+                    crate::storage::StorageError::MemoryNotFound { .. } => {
+                        return StoreError::NotFound { id: id.to_string() };
+                    }
+                    crate::storage::StorageError::LinkPermissionDenied { reason } => {
+                        return StoreError::PermissionDenied {
+                            action: crate::store::UNDO_IN_PLACE_EDIT_ACTION.to_string(),
+                            target: id.to_string(),
+                            reason: reason.clone(),
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            box_err(e)
+        })
+    }
+
     async fn stats(&self) -> StoreResult<crate::models::Stats> {
         let conn = self.state.lock().await;
         db::stats(&conn, &self.path).map_err(box_err)
@@ -1228,6 +1901,11 @@ impl MemoryStore for SqliteStore {
     ) -> StoreResult<Option<String>> {
         let conn = self.state.lock().await;
         db::find_by_title_namespace(&conn, title, namespace).map_err(box_err)
+    }
+
+    async fn get_embedding(&self, _ctx: &CallerContext, id: &str) -> StoreResult<Option<Vec<f32>>> {
+        let conn = self.state.lock().await;
+        db::get_embedding(&conn, id).map_err(box_err)
     }
 
     async fn next_versioned_title(&self, base_title: &str, namespace: &str) -> StoreResult<String> {
@@ -1323,6 +2001,7 @@ impl MemoryStore for SqliteStore {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
@@ -1356,8 +2035,17 @@ impl MemoryStore for SqliteStore {
         approver_agent_id: &str,
     ) -> StoreResult<super::ApproveOutcome> {
         let conn = self.state.lock().await;
-        let outcome = db::approve_with_approver_type(&conn, pending_id, approver_agent_id)
-            .map_err(box_err)?;
+        // #1796 (5-agent vote 4d3ea1c5) — store-backed (multi-tenant) surface;
+        // enforce the Human-arm gate UNCONDITIONALLY for parity with the
+        // postgres trait impl (#1793). MCP/CLI single-operator opt-in lives on
+        // the free-fn direct callers only.
+        let outcome = db::approve_with_approver_type(
+            &conn,
+            pending_id,
+            approver_agent_id,
+            db::ApproveSurface::Http,
+        )
+        .map_err(box_err)?;
         let sal = match outcome {
             db::ApproveOutcome::Approved => super::ApproveOutcome::Approved,
             db::ApproveOutcome::Pending { votes, quorum } => {
@@ -1527,6 +2215,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         }
     }
 
@@ -1635,6 +2324,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trait_update_threads_lifecycle_state_1726() {
+        // #1726 — the SAL `update` path enforces the lifecycle transition
+        // machine via `patch.lifecycle_state`. Legal `open → active` persists;
+        // illegal `open → done` (skips active) is rejected with the typed
+        // `StoreError::InvalidTransition` (→ HTTP 409). Pre-#1726 the gate had
+        // zero callers and any edge was silently written.
+        use crate::models::LifecycleState;
+        let store = fresh_store();
+        let ctx = CallerContext::for_agent("alice");
+
+        // Legal: open -> active.
+        let m = test_memory("lc-1726-legal", "lifecycle trait fixture body");
+        store.store(&ctx, &m).await.expect("store legal");
+        let legal = UpdatePatch {
+            lifecycle_state: Some(LifecycleState::Active),
+            ..Default::default()
+        };
+        store
+            .update(&ctx, &m.id, legal)
+            .await
+            .expect("open->active");
+        assert_eq!(
+            store.get(&ctx, &m.id).await.expect("get").lifecycle_state,
+            LifecycleState::Active,
+            "a legal transition through the trait update path must persist"
+        );
+
+        // Illegal: open -> done on a fresh row.
+        let m2 = test_memory("lc-1726-illegal", "lifecycle trait fixture body two");
+        store.store(&ctx, &m2).await.expect("store illegal");
+        let illegal = UpdatePatch {
+            lifecycle_state: Some(LifecycleState::Done),
+            ..Default::default()
+        };
+        let err = store
+            .update(&ctx, &m2.id, illegal)
+            .await
+            .expect_err("open->done must be rejected");
+        assert!(
+            matches!(err, StoreError::InvalidTransition { .. }),
+            "expected StoreError::InvalidTransition, got: {err:?}"
+        );
+        assert_eq!(
+            store.get(&ctx, &m2.id).await.expect("get").lifecycle_state,
+            LifecycleState::Open,
+            "a rejected transition must leave the row untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn roundtrip_store_get() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
@@ -1669,10 +2408,72 @@ mod tests {
         // happens above this layer via crate::hnsw, not inside the
         // adapter.
         assert!(!caps.contains(Capabilities::NATIVE_VECTOR));
-        // TRANSACTIONS + ATOMIC_MULTI_WRITE are NOT set — the adapter
-        // doesn't expose `begin_transaction()` (#302 item 6 fix).
+        // #1670 — TRANSACTIONS stays WITHHELD (no caller-facing
+        // `begin_transaction()` handle), but ATOMIC_MULTI_WRITE IS set:
+        // the adapter's multi-write ops run as a single BEGIN IMMEDIATE
+        // atom. The two bits name different properties; sqlite holds one.
         assert!(!caps.contains(Capabilities::TRANSACTIONS));
-        assert!(!caps.contains(Capabilities::ATOMIC_MULTI_WRITE));
+        assert!(caps.contains(Capabilities::ATOMIC_MULTI_WRITE));
+    }
+
+    /// #1670 — capability-bit ↔ runtime cross-check (extends the #1052
+    /// wire-honesty family): the adapter advertises ATOMIC_MULTI_WRITE, and
+    /// a multi-row write that fails partway genuinely leaves NO partial
+    /// commit. `consolidate` over one real + one missing id errors, and the
+    /// `BEGIN IMMEDIATE` ROLLBACK must mean the merged row never lands —
+    /// proving the advertised property at runtime, not just on the wire.
+    #[tokio::test]
+    async fn atomic_multi_write_bit_matches_consolidate_rollback_1670() {
+        let store = fresh_store();
+        assert!(
+            store
+                .capabilities()
+                .contains(Capabilities::ATOMIC_MULTI_WRITE),
+            "ATOMIC_MULTI_WRITE must be advertised"
+        );
+        let ctx = CallerContext::for_agent("ai:consolidator");
+        // Seed one real source (test_memory lands in the `sal-test` ns).
+        let real = store
+            .store(&ctx, &test_memory("src-a", "content a"))
+            .await
+            .expect("seed store");
+        let ns_filter = Filter {
+            namespace: Some("sal-test".to_string()),
+            limit: 100,
+            ..Default::default()
+        };
+        let before = store
+            .list(&ctx, &ns_filter)
+            .await
+            .expect("list before")
+            .len();
+
+        // One valid + one MISSING id → the BEGIN IMMEDIATE block must roll
+        // back, so the `merged` row is never committed.
+        let res = store
+            .consolidate(
+                &ctx,
+                &[real, "does-not-exist".to_string()],
+                "merged",
+                "summary",
+                "sal-test",
+                &Tier::Long,
+                "test",
+                "ai:consolidator",
+            )
+            .await;
+        assert!(res.is_err(), "consolidate over a missing id must error");
+
+        let after = store.list(&ctx, &ns_filter).await.expect("list after");
+        assert_eq!(
+            before,
+            after.len(),
+            "ATOMIC_MULTI_WRITE: a partially-failed consolidate must leave NO new row"
+        );
+        assert!(
+            !after.iter().any(|m| m.title == "merged"),
+            "the rolled-back `merged` consolidation row must not exist"
+        );
     }
 
     #[tokio::test]
@@ -3110,7 +3911,7 @@ mod tests {
         let ctx = CallerContext::for_agent("alice");
         let pid = {
             let conn = store.state.lock().await;
-            db::queue_pending_action(
+            let pid = db::queue_pending_action(
                 &conn,
                 GovernedAction::Store,
                 "ns-approve-alias",
@@ -3118,7 +3919,13 @@ mod tests {
                 "alice",
                 &serde_json::json!({"title":"t","content":"c"}),
             )
-            .expect("queue")
+            .expect("queue");
+            // #1787 — the Human arm now gates under the multi-tenant opt-in
+            // (reject self-approval + require a registered approver). Register
+            // the (non-requester) approver so this test is deterministic
+            // regardless of a leaked AI_MEMORY_AGENT_ID from a concurrent test.
+            db::register_agent(&conn, "approver", "ai:generic", &[]).ok();
+            pid
         };
         let outcome = store
             .approve_with_approver_type(&ctx, &pid, "approver")
@@ -3148,7 +3955,16 @@ mod tests {
                 &memory_payload,
             )
             .expect("queue");
-            db::approve_with_approver_type(&conn, &pid, "alice").expect("approve");
+            // #1787 — register a non-requester approver ("alice" is the
+            // requester here) so the Human-arm opt-in gate (reject self-approval
+            // + require a registered approver) cannot reject this approval under
+            // a leaked AI_MEMORY_AGENT_ID from a concurrent test.
+            db::register_agent(&conn, "approver", "ai:generic", &[]).ok();
+            // #1796 — Http surface enforces unconditionally; a registered
+            // non-requester approver ("approver" != requester "alice") approves
+            // deterministically regardless of any leaked AI_MEMORY_AGENT_ID.
+            db::approve_with_approver_type(&conn, &pid, "approver", db::ApproveSurface::Http)
+                .expect("approve");
             pid
         };
         let executed = store

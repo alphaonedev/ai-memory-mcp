@@ -4,20 +4,20 @@
 
 `ai-memory` is an AI-agnostic memory management system built as a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 74 advertised entries at `--profile full` (73 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
+1. **MCP tool server** -- stdio JSON-RPC server exposing 100 advertised entries at `--profile full` (99 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
-3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 89 route registrations / 75 unique URL paths at v0.7.0 (completely AI-agnostic)
+3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 91 route registrations / 77 unique URL paths at v0.8.0 (completely AI-agnostic)
 
 **Key architectural features:** Zero token cost (no context loaded until recall), TOON compact default response format (79% smaller than JSON), MCP prompts capability (`recall-first` behavioral rules + `memory-workflow` reference card), 4 feature tiers with optional local LLMs via Ollama, true dedup on title+namespace, 6-factor recall scoring with score field in responses.
 
 All three interfaces share the same storage layer (`src/storage/`, exposed as the `db` alias) and validation layer (`validate.rs`). The daemon adds automatic garbage collection (every 30 minutes) and graceful shutdown with WAL checkpointing.
 
 ```
-main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (82 subcommands at v0.7.x with --features sal-postgres, 80 in the default build)
+main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now lives in daemon_runtime.rs (85 subcommands at v0.8.0 with --features sal, 83 in the default build)
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
-models/            -- Data structures: Memory (26 fields at v0.7.0), MemoryLink (6 relations at v0.7.0), MemoryKind (Batman Form-6 vocab), Citation/SourceSpan (Form-4), query types, constants
+models/            -- Data structures: Memory (27 fields at v0.8.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
-storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 57)
+storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 70)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs incl. the tool_names const module), per-tool handlers under tools/, JSON-RPC wire-constant SSOT (mcp/jsonrpc.rs, #1558 batch 3 — version tag, reserved error codes, method names), tool-call param-name SSOT (mcp/param_names.rs), notification handling
 identity/          -- NHI identity: keypair storage (keypair.rs — DAEMON_KEYPAIR_LABEL), reserved-principal sentinel SSOT (sentinels.rs, #1558 batch 2 — DAEMON_PRINCIPAL, ANONYMOUS_INVALID, …; validate::RESERVED_AGENT_IDS is built from these), attestation (attest.rs), signing/verification (sign.rs/verify.rs), replay protection (replay.rs)
@@ -63,20 +63,20 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`). Lives in `src/daemon_runtime.rs` (W6 refactor moved it off `src/main.rs`).
-- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.7.x the enum carries **82 unique variants** under `--features sal` (80 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=80` / `EXPECTED_CLI_SUBCOMMANDS_SAL=82` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), and the #1389 L2 `RecoverPreviousSession`. Run `ai-memory --help` for the live list.
+- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.8.0-dev the enum carries **85 unique variants** under `--features sal` (83 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `EXPECTED_CLI_SUBCOMMANDS_SAL=85` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), the #1389 L2 `RecoverPreviousSession`, the v0.8.0 #1720 B2 `Reown` + PE-8 `VerifyAuditTrail`, and the v0.8.0 #1727 `UndoEdit` (non-destructive in-place-edit undo). Run `ai-memory --help` for the live list.
 - `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
 - `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
 - `ListArgs` includes `--offset` flag for pagination
 - `auto_namespace()` -- detects namespace from git remote URL or directory name
 - `human_age()` -- formats ISO timestamps as "2h ago", "3d ago" for CLI output
-- `serve()` -- starts the Axum server with all routes (**89 production `.route(...)` registrations / 75 unique URL paths at v0.7.0** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
+- `serve()` -- starts the Axum server with all routes (**91 production `.route(...)` registrations / 77 unique URL paths at v0.8.0** — includes `POST /memories/{id}/promote`, the 4 archive endpoints, namespace-standard endpoints, webhook subscription endpoints, KG endpoints, approval-SSE, quota status, link-verify, capture_turn, share, skills, the 14 #1111 MCP-parity paths, federation sync), spawns GC task, handles graceful shutdown via SIGINT with WAL checkpoint
 - `cmd_*()` functions -- one per CLI command, each opens the DB directly
 
 ### `src/models/`
 
 - `Tier` enum (`Short`, `Mid`, `Long`) with TTL defaults: 6h, 7d, none
-- `Memory` struct -- the core data type with **26 fields at v0.7.0** (was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration), and `version` (schema v45 — Gap-1 optimistic concurrency for `memory_update`). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
-- `MemoryLink` struct -- typed directional links between memories. **Six relation variants at v0.7.0** (was four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`. Carries v0.7 temporal-validity (`valid_from`, `valid_until`, `observed_by`) and attestation (`signature`, `attest_level`, `signed_at`) columns.
+- `Memory` struct -- the core data type with **27 fields at v0.8.0** (26 at v0.7.0, was 15 at v0.6.x): adds `reflection_depth` (Task 1/8), `memory_kind` (Batman Form-6 vocabulary), `entity_id` + `persona_version` (QW-2), `citations` + `source_uri` + `source_span` (Form-4 fact provenance), `confidence_source` + `confidence_signals` + `confidence_decayed_at` (Form-5 calibration), `version` (schema v45 — Gap-1 optimistic concurrency for `memory_update`), and `lifecycle_state` (schema v64 — v0.8.0 Pillar-2 #1709 typed-cognition state machine: `open`→`active`→`blocked`/`done`/`abandoned`, transitions enforced on `memory_update`). Extensible `metadata` JSON column still present. Canonical truth in `src/models/memory.rs`.
+- `MemoryLink` struct -- typed directional links between memories. **Nine relation variants at v0.8.0** (six at v0.7.0, four at v0.6.x): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Carries v0.7 temporal-validity (`valid_from`, `valid_until`, `observed_by`) and attestation (`signature`, `attest_level`, `signed_at`) columns.
 - Request types: `CreateMemory`, `UpdateMemory`, `SearchQuery`, `ListQuery`, `RecallQuery`, `RecallBody`, `LinkBody`, `ForgetQuery`, `ConsolidateBody`, `ImportBody`
 - Response types: `Stats`, `TierCount`, `NamespaceCount`
 - `TtlConfig` struct -- per-tier TTL overrides loaded from `config.toml` (`short_ttl_secs`, `mid_ttl_secs`, `long_ttl_secs`, `short_extend_secs`, `mid_extend_secs`)
@@ -85,9 +85,9 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 
 ### `src/mcp/`
 
-The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.7.0 the registry exposes 74 advertised entries at `--profile full`** (73 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
+The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **At v0.8.0 the registry exposes 100 advertised entries at `--profile full`** (99 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
 
-The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (74 canonical tool-name consts at v0.7.0 — extracted per #1187 / Wave-1 PR1, then +1 for `memory_capture_turn`; `tool_names::ALL.len()` is pinned against `Profile::full().expected_tool_count()`); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop; `src/mcp/jsonrpc.rs` is the JSON-RPC wire-constant SSOT (#1558 batch 3) and `src/mcp/param_names.rs` the tool-call param-name SSOT.
+The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (100 canonical tool-name consts at v0.8.0 — extracted per #1187 / Wave-1 PR1, then grown through the v0.7.x/v0.8.0 tool additions incl. `memory_capture_turn` and the #1709 coordination tools; `tool_names::ALL.len()` is pinned against `Profile::full().expected_tool_count()`); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop; `src/mcp/jsonrpc.rs` is the JSON-RPC wire-constant SSOT (#1558 batch 3) and `src/mcp/param_names.rs` the tool-call param-name SSOT.
 
 Post-v0.7.0 #987 (D1.6) the source-of-truth lives in `registered_tools()` — a single `Vec<RegisteredTool>` with one entry per `McpTool` impl. `tool_definitions()` is now a thin four-line view that iterates the vec and projects each row to the wire shape (`name`/`description`/`docs`/`inputSchema`). The hand-coded `json!({...})` macro that previously held every tool's schema verbatim is GONE.
 
@@ -131,7 +131,7 @@ Input validation for every write path. Called by CLI, HTTP handlers, and MCP han
 | `validate_id()` | Non-empty, max 128 bytes, no null bytes |
 | `validate_expires_at()` | Valid RFC3339, not in the past |
 | `validate_ttl_secs()` | Positive, max 1 year |
-| `validate_relation()` | Must be one of `VALID_RELATIONS` (six at v0.7.0): related_to, supersedes, contradicts, derived_from, reflects_on, derives_from |
+| `validate_relation()` | Must be one of `VALID_RELATIONS` (nine at v0.8.0): related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into, depends_on, advances |
 | `validate_confidence()` | Finite number, 0.0 to 1.0 |
 | `validate_priority()` | Integer, 1 to 10 |
 | `validate_create()` | Full validation for CreateMemory |
@@ -164,7 +164,7 @@ Structured error types for the HTTP API:
 
 ### `src/handlers/`
 
-All HTTP handlers for the **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
+All HTTP handlers for the **91 production `.route(...)` registrations / 77 unique URL paths** at v0.8.0 (canonical count from CLAUDE.md §Architecture; counted via `codegraph_search kind=route limit=100`). The pre-Wave-1 monolithic `src/handlers.rs` (~17.8k LOC) is GONE — split into `src/handlers/{mod,http,transport,federation_receive,hook_subscribers}.rs`. State is the `Db = Arc<Mutex<(Connection, PathBuf, ResolvedTtl, bool)>>` extractor defined in `src/handlers/transport.rs`. Each handler acquires the lock, validates input via `crate::validate::RequestValidator` (#966 Wave-2 Tier-C1), performs DB operations through the SAL `MemoryStore` trait (`src/store/`), and returns JSON.
 
 Key handlers:
 - `create_memory` / `bulk_create` -- memory creation with deduplication (bulk limited to 1,000 items)
@@ -246,11 +246,11 @@ Hybrid recall algorithm. Blends the FTS5 keyword score and the embedding cosine 
 
 ### `src/identity/`
 
-Non-Human Identity (NHI) resolution for `agent_id` (split from the former `src/identity.rs` into per-domain modules: `mod.rs`, `attest.rs`, `sign.rs`, `verify.rs`, `replay.rs`, plus the #1558 additions `sentinels.rs` — reserved caller identities / `RESERVED_AGENT_IDS` — and `keypair.rs` — `DAEMON_KEYPAIR_LABEL` + daemon signing-keypair load). Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>:pid-<pid>` (MCP), `host:<hostname>:pid-<pid>-<uuid8>` (CLI), `anonymous:req-<uuid8>` (HTTP per-request fallback). By default `agent_id` is a *claimed* identity, not attested; a write that presents a valid Ed25519 `signature` is upgraded to `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`).
+Non-Human Identity (NHI) resolution for `agent_id` (split from the former `src/identity.rs` into per-domain modules: `mod.rs`, `attest.rs`, `sign.rs`, `verify.rs`, `replay.rs`, plus the #1558 additions `sentinels.rs` — reserved caller identities / `RESERVED_AGENT_IDS` — and `keypair.rs` — `DAEMON_KEYPAIR_LABEL` + daemon signing-keypair load). Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>` (MCP), `host:<hostname>` (CLI) — both durable, pid-free since #1720 — and `anonymous:req-<uuid8>` (HTTP per-request fallback). By default `agent_id` is a *claimed* identity, not attested; a write that presents a valid Ed25519 `signature` is upgraded to `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`).
 
 ### `src/curator/`
 
-Autonomous curator daemon (v0.6.1; split from the former `src/curator.rs` into `mod.rs` + `pipeline.rs`, `candidates.rs`, `cluster.rs`, `compaction.rs`, `persist.rs`, `reflection_pass.rs`). Runs a periodic sweep over stored memories, invoking `auto_tag` and `detect_contradiction` via the configured LLM and persisting results into each memory's metadata. Complements the synchronous post-store hooks (#265). Hard cap on operations per cycle (default 100); skips internal `_`-prefixed namespaces; honours include/exclude lists; dry-run mode emits a report without touching rows; LLM errors are logged but never abort a cycle. Public API: `CuratorConfig`, `CuratorReport`, `run_once()`, `run_daemon()`.
+Autonomous curator daemon (v0.6.1; split from the former `src/curator.rs` into `mod.rs` + `pipeline.rs`, `candidates.rs`, `cluster.rs`, `compaction.rs`, `persist.rs`, `reflection_pass.rs`). Runs a periodic sweep over stored memories, invoking `auto_tag` and `detect_contradiction` via the configured LLM and persisting results into each memory's metadata. Complements the synchronous post-store hooks (#265). Hard cap on operations per cycle (default 100); skips internal `_`-prefixed namespaces; honours include/exclude lists; dry-run mode emits a report without touching rows; LLM errors are logged but never abort a cycle. v0.8.0 Pillar-2.5 (#1709) adds an LLM-free **size-GC pass**: when `CompactionConfig.max_corpus_bytes` (`Option<i64>`, default `None` = disabled) is set, each scanned namespace whose live corpus (`length(title)+length(content)+length(metadata)` summed) exceeds the cap has its lowest-value rows evicted (archived-before-deleted, restorable; least-durable tier then lowest priority/access_count/last_accessed_at first) until back under cap — pure deterministic SQL ranking, counted in `CuratorReport.memories_evicted_size_gc`, gated on `!dry_run`. Public API: `CuratorConfig`, `CuratorReport`, `run_once()`, `run_daemon()`.
 
 ### `src/autonomy.rs`
 
@@ -339,8 +339,9 @@ CREATE TABLE memory_links (
 );
 ```
 
-Relation types (six at v0.7.0): `related_to`, `supersedes`,
-`contradicts`, `derived_from`, `reflects_on`, `derives_from`. The
+Relation types (nine at v0.8.0): `related_to`, `supersedes`,
+`contradicts`, `derived_from`, `reflects_on`, `derives_from`,
+`decomposes_into`, `depends_on`, `advances`. The
 table shown above is the original core shape — at v0.7.0 each link row
 also carries the temporal-validity columns (`valid_from`,
 `valid_until`, `observed_by`) and attestation columns (`signature`,
@@ -419,7 +420,7 @@ The `config.rs` module defines 4 feature tiers that gate functionality:
 | `smart` | Yes | Yes | Adds LLM-backed expansion / auto-tag / contradiction detection |
 | `autonomous` | Yes | Yes | Adds cross-encoder reranking + autonomous behaviors |
 
-The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 74 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
+The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 100 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 
@@ -546,7 +547,7 @@ Base URL: `http://127.0.0.1:9077/api/v1`
 
 All responses are JSON. Error responses include `{"error": "message"}`. Database errors are sanitized -- clients receive `"Internal server error"` instead of raw SQLite error details.
 
-The HTTP API exposes **89 production `.route(...)` registrations / 75 unique URL paths** at v0.7.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
+The HTTP API exposes **91 production `.route(...)` registrations / 77 unique URL paths** at v0.8.0 (canonical count via codegraph `codegraph_search kind=route limit=100` filtered to `src/lib.rs` excluding the `#[cfg(test)]`-gated `/slow` route at line 996; multi-line-aware path extraction via `awk '/\.route\(/{in=1}in&&/"\/[^"]*"/{match($0,/"\/[^"]*"/);print substr($0,RSTART,RLENGTH);in=0}' src/lib.rs | sort -u`; v0.6.3.1 baseline of 50 and v0.6.3 baseline of 42 are frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)).
 
 ### Health Check
 
@@ -833,7 +834,7 @@ Global flags:
 
 ### `serve`
 
-Start the HTTP daemon (89 route registrations / 75 unique URL paths at v0.7.0).
+Start the HTTP daemon (91 route registrations / 77 unique URL paths at v0.8.0).
 
 ```bash
 ai-memory serve --host 127.0.0.1 --port 9077
@@ -841,7 +842,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 ### `mcp`
 
-Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. At v0.7.0, the `--profile full` surface advertises 74 entries (73 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap.
+Run as an MCP tool server over stdio. This is the primary integration path for any MCP-compatible AI client. At v0.8.0, the `--profile full` surface advertises 100 entries (99 callable memory tools + the always-on `memory_capabilities` bootstrap); the default `--profile core` ships 7 + the bootstrap.
 
 ```bash
 ai-memory mcp

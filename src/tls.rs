@@ -42,9 +42,25 @@
 //! must remain bit-for-bit identical at the call sites.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Env var naming a host→SHA-256 server-cert pin file for OUTBOUND
+/// federation TLS (#1678). When set, the outbound federation client(s)
+/// pin each peer's SERVER certificate by fingerprint per SNI host — the
+/// outbound mirror of the inbound `--mtls-allowlist` client-cert pinning.
+/// Federation file-path knobs in this crate are env-only (cf.
+/// `AI_MEMORY_FED_CRED_PATH` / `AI_MEMORY_FED_INVENTORY_PATH`); there is
+/// no clap flag. Unset / empty ⇒ pinning OFF (current behaviour, byte-
+/// identical path). See `load_peer_fingerprint_map`.
+pub const FED_PEER_FINGERPRINTS_ENV: &str = "AI_MEMORY_FED_PEER_FINGERPRINTS";
+
+/// Error-prefix label for the peer-fingerprint pin-file parser. Hoisted to
+/// a const so the no-hardcoded-literal gate sees one named site, not the
+/// same string scattered across the parser's bail arms.
+const PEER_FP_LABEL: &str = "peer fingerprint file";
 
 /// v0.7.0 H3 — pin the rustls protocol-version floor to TLS 1.2 with TLS 1.3
 /// preferred. Listed in descending preference order; rustls negotiates the
@@ -237,42 +253,291 @@ pub async fn load_fingerprint_allowlist(path: &Path) -> Result<HashSet<[u8; 32]>
         if line.is_empty() {
             continue;
         }
-        // Accept a leading `sha256:` marker for forward-compat with richer formats.
-        let hex_part = line.strip_prefix("sha256:").unwrap_or(line);
-        // Ultrareview #338: reject any non-hex, non-colon character —
-        // including embedded whitespace/tabs. Previously the parser
-        // stripped only `:` and relied on the length check to catch
-        // whitespace, but silent acceptance of copy-paste artefacts
-        // (e.g. soft-wraps producing internal spaces) would produce
-        // misleading parse errors further down rather than a clear
-        // "whitespace not allowed" signal. Keep it strict.
-        if let Some(bad) = hex_part
-            .chars()
-            .find(|c| !c.is_ascii_hexdigit() && *c != ':')
-        {
-            anyhow::bail!(
-                "mTLS allowlist line {}: unexpected character {:?} — \
-                 entries must be 64 hex chars with optional `:` separators",
-                lineno + 1,
-                bad
-            );
-        }
-        let hex_clean: String = hex_part.chars().filter(|c| *c != ':').collect();
-        if hex_clean.len() != 64 {
-            anyhow::bail!(
-                "mTLS allowlist line {}: expected 64 hex chars (optionally with `:` separators), got {}",
-                lineno + 1,
-                hex_clean.len()
-            );
-        }
-        let mut bytes = [0u8; 32];
-        for i in 0..32 {
-            bytes[i] = u8::from_str_radix(&hex_clean[i * 2..i * 2 + 2], 16)
-                .with_context(|| format!("mTLS allowlist line {}: invalid hex", lineno + 1))?;
-        }
+        let bytes = parse_fingerprint_token(line, "mTLS allowlist", lineno + 1)?;
         set.insert(bytes);
     }
     Ok(set)
+}
+
+/// Parse one SHA-256 fingerprint token into 32 raw bytes. Shared by the
+/// inbound mTLS client-cert allowlist parser and the outbound peer
+/// server-cert pin-map parser (#1678) so the strict-hex grammar lives in
+/// exactly one place. `label` is the caller's error-message prefix (e.g.
+/// `"mTLS allowlist"`) so each surface keeps its own wording.
+///
+/// Grammar: optional leading `sha256:` marker, then 64 case-insensitive
+/// hex chars with optional `:` separators. Ultrareview #338: any non-hex,
+/// non-colon character — including embedded whitespace/tabs — is rejected
+/// rather than silently stripped, so copy-paste artefacts fail loudly.
+fn parse_fingerprint_token(token: &str, label: &str, lineno: usize) -> Result<[u8; 32]> {
+    let hex_part = token.strip_prefix("sha256:").unwrap_or(token);
+    if let Some(bad) = hex_part
+        .chars()
+        .find(|c| !c.is_ascii_hexdigit() && *c != ':')
+    {
+        anyhow::bail!(
+            "{label} line {lineno}: unexpected character {bad:?} — \
+             entries must be 64 hex chars with optional `:` separators"
+        );
+    }
+    let hex_clean: String = hex_part.chars().filter(|c| *c != ':').collect();
+    if hex_clean.len() != 64 {
+        anyhow::bail!(
+            "{label} line {lineno}: expected 64 hex chars (optionally with `:` separators), got {}",
+            hex_clean.len()
+        );
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&hex_clean[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("{label} line {lineno}: invalid hex"))?;
+    }
+    Ok(bytes)
+}
+
+/// Normalise an operator-written host token into the canonical key used by
+/// `FingerprintPinServerVerifier`'s map. An IP literal is round-tripped
+/// through `std::net::IpAddr` (canonical form); a DNS name is lowercased.
+/// MUST match `server_name_host_key` on the lookup side — the round-trip
+/// is pinned by `peer_pin_host_key_round_trips`.
+fn normalize_host_key(raw: &str) -> String {
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        ip.to_string()
+    } else {
+        raw.to_ascii_lowercase()
+    }
+}
+
+/// Canonical host key for a rustls `ServerName`, matching `normalize_host_key`
+/// on the load side. Returns `None` for the `#[non_exhaustive]` variants we
+/// don't recognise so they route to the unpinned-host disposition rather
+/// than silently matching.
+fn server_name_host_key(server_name: &rustls::pki_types::ServerName<'_>) -> Option<String> {
+    match server_name {
+        rustls::pki_types::ServerName::DnsName(d) => Some(d.as_ref().to_ascii_lowercase()),
+        rustls::pki_types::ServerName::IpAddress(ip) => {
+            Some(std::net::IpAddr::from(*ip).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Parse a peer server-cert pin file: one `<host> <sha256-hex>` per line.
+/// `#` comments and blank lines are skipped; inline trailing `# …` comments
+/// are dropped (mirrors the allowlist parser). A host may appear on several
+/// lines to pin multiple acceptable fingerprints (rotation). Fail-closed:
+/// an empty result errors, because the pinning verifier rejects every
+/// unpinned host and an empty map would silently break ALL federation.
+pub fn load_peer_fingerprint_map(path: &Path) -> Result<HashMap<String, HashSet<[u8; 32]>>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {PEER_FP_LABEL} from {}", path.display()))?;
+    let mut map: HashMap<String, HashSet<[u8; 32]>> = HashMap::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let host = parts
+            .next()
+            .expect("non-empty line has at least one whitespace-delimited field");
+        let Some(fp_token) = parts.next() else {
+            anyhow::bail!(
+                "{PEER_FP_LABEL} line {lineno}: expected `<host> <sha256-hex>`, got only `{host}`"
+            );
+        };
+        if parts.next().is_some() {
+            anyhow::bail!(
+                "{PEER_FP_LABEL} line {lineno}: expected exactly two fields `<host> <sha256-hex>`"
+            );
+        }
+        let fp = parse_fingerprint_token(fp_token, PEER_FP_LABEL, lineno)?;
+        map.entry(normalize_host_key(host)).or_default().insert(fp);
+    }
+    if map.is_empty() {
+        anyhow::bail!(
+            "{PEER_FP_LABEL} {} contained no entries — peer-fingerprint pinning is \
+             fail-closed and would reject every peer; add `<host> <sha256-hex>` lines \
+             or unset {FED_PEER_FINGERPRINTS_ENV}",
+            path.display()
+        );
+    }
+    Ok(map)
+}
+
+/// Resolve the outbound peer server-cert pin map from
+/// `AI_MEMORY_FED_PEER_FINGERPRINTS`. `Ok(None)` ⇒ pinning OFF (env unset
+/// or empty), so callers leave the pre-#1678 client path byte-identical.
+pub fn peer_fingerprint_map_from_env() -> Result<Option<HashMap<String, HashSet<[u8; 32]>>>> {
+    let Some(raw) = std::env::var_os(FED_PEER_FINGERPRINTS_ENV) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(load_peer_fingerprint_map(&path)?))
+}
+
+/// Disposition for a peer host with NO pin entry (mixed-mode rollout).
+#[derive(Debug, Clone, Copy)]
+pub enum UnpinnedHostPolicy {
+    /// Reject the connection (fail-closed). Used on the production quorum
+    /// client (`federation/peer.rs`), whose pre-pin behaviour was CA
+    /// validation: once an operator opts in to pinning, every peer MUST be
+    /// pinned — an unknown host is refused rather than silently downgraded.
+    Reject,
+    /// Accept any server cert (no downgrade). Used on the `ai-memory sync`
+    /// CLI path whose pre-pin behaviour was ALREADY accept-any
+    /// (`DangerousAnyServerVerifier`); pinning only STRENGTHENS pinned hosts
+    /// there, so unpinned hosts keep the prior (no-worse) disposition.
+    AcceptAny,
+}
+
+/// Outbound mirror of [`FingerprintAllowlistVerifier`]: pins a federation
+/// peer's SERVER cert by SHA-256(DER), keyed per SNI host. Pin-only for a
+/// pinned host (ignores the CA chain — the pin IS the trust anchor, same
+/// SSH `known_hosts` model as the inbound verifier). A host with no pin
+/// entry is dispositioned by `unpinned`.
+///
+/// # Security — the pin is layered ON TOP of handshake-signature verification
+///
+/// `verify_tls12_signature` / `verify_tls13_signature` MUST delegate to the
+/// real `rustls::crypto::verify_tls1{2,3}_signature` (copied verbatim from
+/// [`DangerousAnyServerVerifier`]) and are NEVER stubbed. The fingerprint
+/// match alone is insufficient: a MITM could replay a captured pinned cert
+/// it does not hold the private key for, so the pin is an ADDITIONAL
+/// identity gate, never a replacement for proving cert ownership in the
+/// handshake. (#1678 — 5-agent vote 4d3ea1c5.)
+#[derive(Debug)]
+pub struct FingerprintPinServerVerifier {
+    pins: HashMap<String, HashSet<[u8; 32]>>,
+    unpinned: UnpinnedHostPolicy,
+}
+
+impl FingerprintPinServerVerifier {
+    #[must_use]
+    pub fn new(pins: HashMap<String, HashSet<[u8; 32]>>, unpinned: UnpinnedHostPolicy) -> Self {
+        Self { pins, unpinned }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for FingerprintPinServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let host = server_name_host_key(server_name);
+        if let Some(set) = host.as_deref().and_then(|h| self.pins.get(h)) {
+            use sha2::{Digest, Sha256};
+            let fp: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
+            return if allowlist_contains_ct(set, &fp) {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(format!(
+                    "peer server cert fingerprint {} not pinned for host {}",
+                    hex_short(&fp),
+                    host.as_deref().unwrap_or("<unknown>")
+                )))
+            };
+        }
+        match self.unpinned {
+            UnpinnedHostPolicy::AcceptAny => {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            UnpinnedHostPolicy::Reject => Err(rustls::Error::General(format!(
+                "peer server cert host {} is not pinned (peer-fingerprint pinning is \
+                 enabled and fail-closed); add its SHA-256 to {FED_PEER_FINGERPRINTS_ENV}",
+                host.as_deref().unwrap_or("<unknown>")
+            ))),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build a rustls `ClientConfig` that PINS peer server certs (#1678) for
+/// the production quorum client. Unpinned hosts are fail-closed
+/// ([`UnpinnedHostPolicy::Reject`]). Client-auth identity is attached when
+/// `cert`/`key` are supplied (mTLS is preserved); otherwise no client auth.
+/// CA roots (`--quorum-ca-cert`) are intentionally NOT consulted: under
+/// pinning the fingerprint replaces CA trust for pinned hosts, and unpinned
+/// hosts are refused regardless of CA.
+pub fn build_rustls_pinning_client_config(
+    pins: HashMap<String, HashSet<[u8; 32]>>,
+    client_cert_path: Option<&Path>,
+    client_key_path: Option<&Path>,
+) -> Result<rustls::ClientConfig> {
+    // Defensive: the daemon serve path may not have installed a process
+    // default provider before this build site. Idempotent — ignore the Err
+    // when one is already installed.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let verifier = Arc::new(FingerprintPinServerVerifier::new(
+        pins,
+        UnpinnedHostPolicy::Reject,
+    ));
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+    let config = match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            warn_if_key_perms_loose(key_path);
+            let cert_pem = std::fs::read(cert_path).with_context(|| {
+                format!("failed to read client cert from {}", cert_path.display())
+            })?;
+            let key_pem = std::fs::read(key_path).with_context(|| {
+                format!("failed to read client key from {}", key_path.display())
+            })?;
+            let certs = rustls_pki_pem_iter_certs(&cert_pem)?;
+            let key = rustls_pki_pem_parse_private_key(&key_pem)?;
+            builder
+                .with_client_auth_cert(certs, key)
+                .context("failed to build pinning rustls ClientConfig with client cert")?
+        }
+        _ => builder.with_no_client_auth(),
+    };
+    Ok(config)
 }
 
 pub fn rustls_pki_pem_iter_certs(
@@ -436,33 +701,98 @@ pub async fn build_rustls_client_config(
     let certs = rustls_pki_pem_iter_certs(&cert_pem)?;
     let key = rustls_pki_pem_parse_private_key(&key_pem)?;
 
-    // SAFETY: we accept any server cert because the server authenticates
-    // US via our client cert fingerprint (Layer 2's trust anchor), not
-    // via server-cert validation. Server-cert pinning is a Layer 2b
-    // refinement tracked in #224.
-    //
-    // v0.7.0 S6-LOW1 de-silencing: emit a once-per-process operator-visible
-    // warn so the disabled server-cert verification posture is observable in
-    // the daemon log rather than buried in the source. The compensating
-    // control (peer client-cert fingerprint pinning via `--mtls-allowlist`)
-    // is documented on `DangerousAnyServerVerifier`.
-    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-    WARN_ONCE.call_once(|| {
-        tracing::warn!(
-            target: "federation::tls",
-            "federation client TLS accepts ANY server certificate (server-cert \
-             verification is OFF); peer authenticity relies entirely on the peer \
-             fingerprint-pinning our client cert via --mtls-allowlist. Front the \
-             federation port with a server-cert-pinning reverse proxy on hostile \
-             networks. See docs/runbook/federation-tls.md (#224)."
-        );
-    });
+    // #1678 — Layer-2b server-cert pinning. When the operator sets
+    // `AI_MEMORY_FED_PEER_FINGERPRINTS`, pin peer SERVER certs by SNI host
+    // (mixed-mode: an unpinned host keeps the prior accept-any disposition
+    // on THIS CLI sync path, so pinning only strengthens pinned hosts and
+    // never downgrades). With pinning OFF the verifier + WARN below are
+    // byte-identical to the pre-#1678 path.
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        match peer_fingerprint_map_from_env()? {
+            Some(pins) => {
+                tracing::info!(
+                    target: "federation::tls",
+                    pinned_hosts = pins.len(),
+                    "federation client TLS: server-cert PINNING active (#1678); \
+                     unpinned hosts keep accept-any on the sync CLI path"
+                );
+                Arc::new(FingerprintPinServerVerifier::new(
+                    pins,
+                    UnpinnedHostPolicy::AcceptAny,
+                ))
+            }
+            None => {
+                // SAFETY: we accept any server cert because the server
+                // authenticates US via our client cert fingerprint (Layer 2's
+                // trust anchor), not via server-cert validation.
+                //
+                // v0.7.0 S6-LOW1 de-silencing: emit a once-per-process
+                // operator-visible warn so the disabled server-cert verification
+                // posture is observable in the daemon log rather than buried in
+                // the source. The compensating control (peer client-cert
+                // fingerprint pinning via `--mtls-allowlist`) is documented on
+                // `DangerousAnyServerVerifier`; the stronger control is now
+                // `AI_MEMORY_FED_PEER_FINGERPRINTS` (#1678).
+                static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                WARN_ONCE.call_once(|| {
+                    tracing::warn!(
+                        target: "federation::tls",
+                        "federation client TLS accepts ANY server certificate (server-cert \
+                         verification is OFF); peer authenticity relies entirely on the peer \
+                         fingerprint-pinning our client cert via --mtls-allowlist. Set \
+                         AI_MEMORY_FED_PEER_FINGERPRINTS to pin peer server certs (#1678), or \
+                         front the federation port with a server-cert-pinning reverse proxy on \
+                         hostile networks. See docs/runbook/federation-tls.md (#224)."
+                    );
+                });
+                Arc::new(DangerousAnyServerVerifier)
+            }
+        };
     let config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(DangerousAnyServerVerifier))
+        .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(certs, key)
         .context("failed to build rustls ClientConfig with client cert")?;
     Ok(config)
+}
+
+/// #1794 (5-agent vote 4d3ea1c5) — the outbound TLS verification mode the CLI
+/// `ai-memory sync` path selects for a peer connection. Precedence mirrors the
+/// production quorum client (`federation/peer.rs`): server-cert PINNING
+/// (`AI_MEMORY_FED_PEER_FINGERPRINTS`) wins; then the explicit
+/// `--insecure-skip-server-verify` accept-any opt-out; otherwise the secure
+/// default — normal CA validation (reqwest's bundled webpki roots, plus any
+/// `--ca-cert` the operator adds for a self-signed peer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTlsMode {
+    /// `AI_MEMORY_FED_PEER_FINGERPRINTS` set → per-host server-cert pinning,
+    /// fail-closed for unpinned hosts.
+    Pinning,
+    /// `--insecure-skip-server-verify` → accept ANY server cert (the explicit,
+    /// loud opt-out; gated on an mTLS client cert as the compensating control).
+    AcceptAny,
+    /// Secure default → CA-validate the peer server cert (bundled webpki roots
+    /// + optional `--ca-cert`).
+    CaValidated,
+}
+
+/// #1794 — resolve the CLI sync TLS verification mode. Pinning >
+/// insecure-opt-out > CA-validate (the secure default). `--ca-cert` does NOT
+/// change the mode (still `CaValidated`); it only adds an extra trusted root.
+/// Pure + total so the decision is unit-testable independently of the opaque
+/// rustls/reqwest config it drives.
+#[must_use]
+pub fn select_sync_tls_mode(
+    insecure_skip_server_verify: bool,
+    pinning_active: bool,
+) -> SyncTlsMode {
+    if pinning_active {
+        SyncTlsMode::Pinning
+    } else if insecure_skip_server_verify {
+        SyncTlsMode::AcceptAny
+    } else {
+        SyncTlsMode::CaValidated
+    }
 }
 
 /// `ServerCertVerifier` that accepts any peer certificate. Safe ONLY when
@@ -555,6 +885,20 @@ impl rustls::client::danger::ServerCertVerifier for DangerousAnyServerVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Shared serialization lock for any test that mutates the process-wide
+/// `AI_MEMORY_FED_PEER_FINGERPRINTS` env var. `env::set_var`/`remove_var`
+/// are process-global, so the `tls` unset-path test and the
+/// `federation::peer` build-pinning coverage test (different modules, same
+/// test binary) MUST take this lock or they race (the #5d4e3ca3 parallel-
+/// global-state flake class). Poison-tolerant: a panicking test still yields
+/// the guard so the next test isn't blocked.
+#[cfg(test)]
+pub(crate) fn fed_pin_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +1336,238 @@ mod tests {
         let dss = bogus_dss();
         let _ = verifier.verify_tls12_signature(b"bogus message", &cert, &dss);
         let _ = verifier.verify_tls13_signature(b"bogus message", &cert, &dss);
+    }
+
+    // -----------------------------------------------------------------------
+    // FingerprintPinServerVerifier (#1678) — outbound server-cert pinning.
+    // Mirror of the inbound FingerprintAllowlistVerifier tests above.
+    // -----------------------------------------------------------------------
+
+    fn server_name(host: &str) -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from(host.to_string()).unwrap()
+    }
+
+    /// Build a single-host pin map: `host` → SHA-256(`cert_bytes`).
+    fn pin_map(host: &str, cert_bytes: &[u8]) -> HashMap<String, HashSet<[u8; 32]>> {
+        use sha2::{Digest, Sha256};
+        let fp: [u8; 32] = Sha256::digest(cert_bytes).into();
+        let mut set = HashSet::new();
+        set.insert(fp);
+        let mut map = HashMap::new();
+        map.insert(normalize_host_key(host), set);
+        map
+    }
+
+    #[test]
+    fn pin_verifier_accepts_matching_fingerprint() {
+        use rustls::client::danger::ServerCertVerifier;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert_bytes = b"pinned peer server cert DER";
+        let verifier = FingerprintPinServerVerifier::new(
+            pin_map("peer.example", cert_bytes),
+            UnpinnedHostPolicy::Reject,
+        );
+        let cert = rustls::pki_types::CertificateDer::from(cert_bytes.to_vec());
+        let now = rustls::pki_types::UnixTime::now();
+        let res = verifier.verify_server_cert(&cert, &[], &server_name("peer.example"), &[], now);
+        assert!(res.is_ok(), "matching pinned fp must be accepted: {res:?}");
+    }
+
+    #[test]
+    fn pin_verifier_rejects_wrong_fingerprint_for_pinned_host() {
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = FingerprintPinServerVerifier::new(
+            pin_map("peer.example", b"the pinned cert"),
+            UnpinnedHostPolicy::AcceptAny,
+        );
+        // Different cert bytes for the SAME pinned host → must reject even
+        // though the fallthrough is AcceptAny (a pinned host is fail-closed).
+        let cert = rustls::pki_types::CertificateDer::from(b"an IMPOSTER cert".to_vec());
+        let now = rustls::pki_types::UnixTime::now();
+        let err = verifier
+            .verify_server_cert(&cert, &[], &server_name("peer.example"), &[], now)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not pinned for host"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pin_verifier_reject_policy_refuses_unpinned_host() {
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = FingerprintPinServerVerifier::new(
+            pin_map("peer.example", b"pinned cert"),
+            UnpinnedHostPolicy::Reject,
+        );
+        let cert = rustls::pki_types::CertificateDer::from(b"whatever".to_vec());
+        let now = rustls::pki_types::UnixTime::now();
+        let err = verifier
+            .verify_server_cert(&cert, &[], &server_name("other.example"), &[], now)
+            .unwrap_err();
+        assert!(err.to_string().contains("is not pinned"), "got: {err}");
+    }
+
+    #[test]
+    fn pin_verifier_acceptany_policy_passes_unpinned_host() {
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = FingerprintPinServerVerifier::new(
+            pin_map("peer.example", b"pinned cert"),
+            UnpinnedHostPolicy::AcceptAny,
+        );
+        let cert = rustls::pki_types::CertificateDer::from(b"unpinned-host cert".to_vec());
+        let now = rustls::pki_types::UnixTime::now();
+        let res = verifier.verify_server_cert(&cert, &[], &server_name("other.example"), &[], now);
+        assert!(
+            res.is_ok(),
+            "AcceptAny fallthrough must pass unpinned host: {res:?}"
+        );
+    }
+
+    /// CRITICAL (#1678 5-agent vote 4d3ea1c5): the pin verifier MUST do REAL
+    /// handshake-signature verification, never a stub. A stubbed
+    /// `verify_tls13_signature` returning Ok would accept a replayed pinned
+    /// cert the attacker never held the key for. Feed a bogus signature and
+    /// assert the method returns Err — proving it delegates to the real
+    /// ring-backed `rustls::crypto::verify_tls13_signature`.
+    #[test]
+    fn pin_verifier_signature_methods_are_not_stubbed() {
+        use rustls::client::danger::ServerCertVerifier;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let verifier =
+            FingerprintPinServerVerifier::new(HashMap::new(), UnpinnedHostPolicy::Reject);
+        assert!(!verifier.supported_verify_schemes().is_empty());
+        let cert = rustls::pki_types::CertificateDer::from(vec![0u8; 32]);
+        let dss = bogus_dss();
+        assert!(
+            verifier
+                .verify_tls12_signature(b"bogus", &cert, &dss)
+                .is_err(),
+            "verify_tls12_signature must REJECT a bogus signature (real crypto, not a stub)"
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(b"bogus", &cert, &dss)
+                .is_err(),
+            "verify_tls13_signature must REJECT a bogus signature (real crypto, not a stub)"
+        );
+    }
+
+    /// The v2 TOP_RISK: URL host → rustls `ServerName` must round-trip to the
+    /// same canonical key that `normalize_host_key` produces at load time,
+    /// for both DNS names (case-folded) and IP literals.
+    #[test]
+    fn peer_pin_host_key_round_trips() {
+        // DNS, mixed case → both sides lowercase.
+        assert_eq!(normalize_host_key("Peer.Example.COM"), "peer.example.com");
+        assert_eq!(
+            server_name_host_key(&server_name("Peer.Example.COM")).as_deref(),
+            Some("peer.example.com")
+        );
+        // IPv4 literal → identical canonical string on both sides.
+        assert_eq!(normalize_host_key("192.168.1.5"), "192.168.1.5");
+        assert_eq!(
+            server_name_host_key(&server_name("192.168.1.5")).as_deref(),
+            Some("192.168.1.5")
+        );
+    }
+
+    #[test]
+    fn peer_fingerprint_map_parses_host_and_fp() {
+        let fp_a = "a".repeat(64);
+        let fp_b = format!("{}:{}", "b".repeat(32), "b".repeat(32));
+        let body = format!(
+            "# comment line\n\
+             peer-one.example {fp_a}\n\
+             \n\
+             PEER-TWO.example sha256:{fp_b}   # inline note\n\
+             peer-one.example {}\n", // second fp for host one (rotation)
+            "c".repeat(64)
+        );
+        let tmp = write_tmp(&body);
+        let map = load_peer_fingerprint_map(tmp.path()).unwrap();
+        assert_eq!(map.len(), 2, "two distinct hosts");
+        assert_eq!(
+            map["peer-one.example"].len(),
+            2,
+            "host one has two pinned fps"
+        );
+        assert!(
+            map.contains_key("peer-two.example"),
+            "host key is lowercased"
+        );
+    }
+
+    #[test]
+    fn peer_fingerprint_map_empty_file_is_fail_closed_error() {
+        let tmp = write_tmp("# only comments\n\n   \n");
+        let err = load_peer_fingerprint_map(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("contained no entries"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn peer_fingerprint_map_rejects_missing_fingerprint_field() {
+        let tmp = write_tmp("peer-one.example\n");
+        let err = load_peer_fingerprint_map(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("expected"), "got: {err}");
+    }
+
+    #[test]
+    fn peer_fingerprint_map_rejects_extra_field() {
+        let body = format!("peer.example {} extra-junk\n", "a".repeat(64));
+        let tmp = write_tmp(&body);
+        let err = load_peer_fingerprint_map(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("exactly two fields"), "got: {err}");
+    }
+
+    #[test]
+    fn peer_fingerprint_env_unset_returns_none() {
+        let _g = super::fed_pin_env_lock();
+        // SAFETY: serialised via fed_pin_env_lock(); the only other writer of
+        // this var (the federation::peer build-pinning test) takes the same
+        // lock, so no concurrent reader observes the transient state.
+        unsafe {
+            std::env::remove_var(FED_PEER_FINGERPRINTS_ENV);
+        }
+        assert!(peer_fingerprint_map_from_env().unwrap().is_none());
+    }
+
+    #[test]
+    fn select_sync_tls_mode_precedence_1794() {
+        // Pinning wins over the insecure opt-out.
+        assert_eq!(select_sync_tls_mode(true, true), SyncTlsMode::Pinning);
+        assert_eq!(select_sync_tls_mode(false, true), SyncTlsMode::Pinning);
+        // Explicit insecure opt-out when pinning is off.
+        assert_eq!(select_sync_tls_mode(true, false), SyncTlsMode::AcceptAny);
+        // Secure default — CA validation.
+        assert_eq!(select_sync_tls_mode(false, false), SyncTlsMode::CaValidated);
+    }
+
+    #[test]
+    fn build_pinning_client_config_with_client_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls/valid_cert.pem");
+        let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/tls/valid_key_pkcs8.pem");
+        let cfg = build_rustls_pinning_client_config(
+            pin_map("peer.example", b"x"),
+            Some(cert.as_path()),
+            Some(key.as_path()),
+        )
+        .expect("pinning client config with client cert (mTLS identity) must build");
+        drop(cfg);
+    }
+
+    #[test]
+    fn build_pinning_client_config_without_client_cert() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = build_rustls_pinning_client_config(pin_map("peer.example", b"x"), None, None)
+            .expect("pinning client config with no client auth must build");
+        drop(cfg);
     }
 
     // -----------------------------------------------------------------------

@@ -49,6 +49,8 @@ const ALL_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent::PostReflect,
     HookEvent::PreCompaction,
     HookEvent::OnCompactionRollback,
+    HookEvent::PreSignalSend,
+    HookEvent::PostSignalAck,
 ];
 
 #[test]
@@ -65,35 +67,37 @@ fn arch_7_all_hook_events_classified_by_is_pre_event() {
 }
 
 #[test]
-fn arch_7_hook_event_count_matches_documented_25() {
-    // CLAUDE.md narrative at v0.7.0 documents "25 HookEvent
-    // variants". Mechanically pin the count so doc + code stay in
-    // lockstep. A future addition to `ALL_HOOK_EVENTS` should
+fn arch_7_hook_event_count_matches_documented_27() {
+    // CLAUDE.md narrative documents the HookEvent variant count
+    // (25 at v0.7.0; 27 at v0.8.0 after #1709 adds pre_signal_send +
+    // post_signal_ack). Mechanically pin the count so doc + code stay
+    // in lockstep. A future addition to `ALL_HOOK_EVENTS` should
     // come with a CLAUDE.md narrative bump and a count update here.
     assert_eq!(
         ALL_HOOK_EVENTS.len(),
-        25,
+        27,
         "ARCH-7 hook event count drift: ALL_HOOK_EVENTS has {} entries; \
-         expected 25 per the v0.7.0 CLAUDE.md / src/hooks/events.rs SSOT. \
+         expected 27 per the v0.8.0 CLAUDE.md / src/hooks/events.rs SSOT. \
          Update the test AND CLAUDE.md when adding a variant.",
         ALL_HOOK_EVENTS.len(),
     );
 }
 
 #[test]
-fn arch_7_pre_event_count_is_thirteen() {
-    // 13 pre-events: PreStore, PreRecall, PreSearch, PreDelete,
+fn arch_7_pre_event_count_is_fourteen() {
+    // 14 pre-events: PreStore, PreRecall, PreSearch, PreDelete,
     // PrePromote, PreLink, PreConsolidate, PreGovernanceDecision,
     // PreArchive, PreTranscriptStore, PreRecallExpand, PreReflect,
-    // PreCompaction. The remaining 12 are post-/on-class.
+    // PreCompaction, PreSignalSend (v0.8.0 #1709). The remaining 13
+    // are post-/on-class.
     let pre_count = ALL_HOOK_EVENTS
         .iter()
         .copied()
         .filter(|&ev| is_pre_event(ev))
         .count();
     assert_eq!(
-        pre_count, 13,
+        pre_count, 14,
         "ARCH-7 pre-event count drift: {pre_count} variants classify as pre-events; \
-         expected 13. If a new pre-event was added, bump this expectation in lockstep.",
+         expected 14. If a new pre-event was added, bump this expectation in lockstep.",
     );
 }

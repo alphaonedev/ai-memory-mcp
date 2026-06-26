@@ -1,4 +1,4 @@
-# ai-memory v0.7.0 — integration guide
+# ai-memory v0.8.0 — integration guide
 
 How to wire ai-memory to **any AI** — Claude, Cursor, ChatGPT,
 Continue.dev, generic MCP clients, and even AIs that don't speak MCP
@@ -19,13 +19,13 @@ server is how every modern AI client connects, because MCP — the
 Model Context Protocol — is the industry-standard plug for AI
 agents to talk to local tools. Any MCP-compatible client points at
 the binary, ai-memory boots a per-session process, and the AI now
-has 7 to 73 memory tools at its disposal (depending on the
+has 7 to 99 memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(89 route registrations / 75 unique URL paths at v0.7.0).
+(91 route registrations / 77 unique URL paths at v0.8.0).
 
 Every recipe below assumes the binary is on your `PATH`. If
-`ai-memory --version` doesn't print `0.7.0`, go back to
+`ai-memory --version` doesn't print `0.8.0`, go back to
 [`docs/install-quickstart.md`](install-quickstart.md) §3.
 
 ## 2. Claude Code (Anthropic)
@@ -75,6 +75,61 @@ memory on every conversation start), see
 
 > **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.md).
 
+### 2a. PreToolUse governance hook (gate every Bash / Edit / Write)
+
+The `--apply` recipe above installs the **SessionStart** hook (memory
+on every session boot). Claude Code also supports a **PreToolUse** hook
+that fires *before* a tool dispatches and can BLOCK it. ai-memory ships
+a second, independent installer verb that wires this up so every
+`Bash` / `Edit` / `Write` the model proposes is routed through the
+substrate rules engine first — refused actions never run:
+
+```bash
+# Preview (dry-run is the default — writes nothing):
+ai-memory install claude-code --hook pretool
+
+# Commit:
+ai-memory install claude-code --hook pretool --apply
+```
+
+This is **opt-in** and orthogonal to the SessionStart hook — install,
+uninstall, or skip either one independently. The managed entry is
+scoped with `matcher: "Bash|Edit|Write"` (the regex also covers
+`MultiEdit` / `NotebookEdit`); `Read`, `WebFetch`, and `mcp__*` tools
+are not gated.
+
+> **v0.8.0 form ([#1811](https://github.com/alphaonedev/ai-memory-mcp/issues/1811)) — `type:command`, not `type:mcp_tool`.**
+> The installed entry is a **`type:command`** hook that runs
+> `ai-memory governance check-action --from-pretool-stdin`. The wrapper
+> reads the PreToolUse event off stdin, maps the proposed tool to a
+> substrate action (`Bash` → `bash`, `Edit`/`Write` →
+> `filesystem_write`), evaluates the rules engine, and emits the Claude
+> Code decision contract (`hookSpecificOutput.permissionDecision`) so a
+> Refuse becomes `deny` and the tool is actually BLOCKED. The earlier
+> `type:mcp_tool` form *could not enforce* — per the hooks contract an
+> mcp_tool error is non-blocking and a non-decision tool response is
+> shown as plain text, so the refusal never blocked the call.
+
+> **Upgrading from a pre-#1811 install?** Re-run with `--force` to
+> replace the old (non-enforcing) managed entry:
+>
+> ```bash
+> ai-memory install claude-code --hook pretool --apply --force
+> ```
+>
+> `--force` is also required if you previously hand-scoped a
+> `PreToolUse` entry pointing at `memory_check_agent_action` to a
+> different matcher — the installer refuses to clobber it otherwise.
+
+The rules engine consults the operator-signed substrate rules
+(`ai-memory rules list` / `... enable <id> --sign`), which ship inert
+by design — nothing is refused until you sign and enable a rule. To
+remove the hook: `ai-memory install claude-code --hook pretool
+--uninstall --apply`. Full reference, the allow/warn/refuse decision
+table, and the operator keygen → sign → enable → smoke-test workflow:
+[`docs/integrations/claude-code.md`](integrations/claude-code.md)
+§"Substrate rules enforcement on every tool call".
+
 ## 3. Cursor
 
 ```bash
@@ -117,7 +172,7 @@ env-block recipe for smart / autonomous tiers:
 
 ## 4. ChatGPT Desktop
 
-**State of the world (v0.7.0):** ChatGPT Desktop does not currently
+**State of the world (v0.8.0):** ChatGPT Desktop does not currently
 ship native MCP-client support. The integration paths are (in order
 of operational simplicity):
 
@@ -237,11 +292,11 @@ command: ai-memory
 args:    ["mcp"]
 # optionally:
 #   ["--db", "/path/to/ai-memory.db", "mcp", "--tier", "semantic"]
-#   ["mcp", "--profile", "full"]  # advertise all 74 tools
+#   ["mcp", "--profile", "full"]  # advertise all 100 tools
 ```
 
 That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7
-tools by default and up to 73 with `--profile full`. Per-harness
+tools by default and up to 99 with `--profile full`. Per-harness
 copy-paste recipes live in [`docs/integrations/`](integrations/):
 **aider**, **claude-agent-sdk**, **cline**, **codex-cli**, **cody**,
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,
@@ -252,7 +307,7 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **89 route registrations / 75 unique URL paths at v0.7.0**
+ai-memory ships an HTTP/REST daemon with **91 route registrations / 77 unique URL paths at v0.8.0**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.
@@ -354,7 +409,7 @@ approval flow, and the recommended deployment topologies — see
 
 ## 10. Security defaults
 
-ai-memory v0.7.0 ships with secure defaults already on. **You do
+ai-memory v0.8.0 ships with secure defaults already on. **You do
 not have to configure these to get them.** Worth knowing about:
 
 - **Permissions enforced by default.** `permissions.mode = "enforce"`

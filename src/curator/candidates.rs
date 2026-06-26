@@ -74,7 +74,7 @@ pub(super) fn collect_candidates(conn: &Connection, cfg: &CuratorConfig) -> Resu
     })
 }
 
-pub(super) fn needs_curation(mem: &Memory, cfg: &CuratorConfig) -> bool {
+pub(crate) fn needs_curation(mem: &Memory, cfg: &CuratorConfig) -> bool {
     if mem.namespace.starts_with('_') {
         return false;
     }

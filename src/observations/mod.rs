@@ -132,6 +132,83 @@ pub fn mark_consumed(
     Ok(flipped)
 }
 
+/// #1705 — identity-stamping variant of [`record_recall`]: writes the
+/// v58 `agent_id` + `namespace` columns alongside each ledger row so the
+/// consume flip can reject cross-agent `recall_id` replay and derived
+/// utility is per-`(memory, namespace)` scoped. Used by the SAL trait
+/// write path. `INSERT OR IGNORE` keeps the same idempotency contract as
+/// [`record_recall`].
+///
+/// # Errors
+/// Returns the underlying `rusqlite::Error` on SQL failure.
+pub fn record_recall_with_identity(
+    conn: &Connection,
+    recall_id: &str,
+    candidates: &[Candidate<'_>],
+    agent_id: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<usize> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO recall_observations \
+                (recall_id, memory_id, retriever, rank, score, agent_id, namespace) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    let mut written = 0_usize;
+    for c in candidates {
+        written += stmt.execute(params![
+            recall_id,
+            c.memory_id,
+            c.retriever,
+            c.rank,
+            c.score,
+            agent_id,
+            namespace
+        ])?;
+    }
+    Ok(written)
+}
+
+/// #1705 — replay-guarded variant of [`mark_consumed`]: a row only flips
+/// when its stored `agent_id` is NULL (legacy / unbound) OR equals
+/// `consuming_agent`, so a replayed `recall_id` cited by a different
+/// agent cannot pump another agent's consumed signal. When
+/// `consuming_agent` is `None`, only unbound (NULL-`agent_id`) rows flip
+/// — the safe default for an unidentified caller. Otherwise identical to
+/// [`mark_consumed`] (idempotent; only flips rows still `consumed = 0`).
+///
+/// # Errors
+/// Returns the underlying `rusqlite::Error` on SQL failure.
+pub fn mark_consumed_guarded(
+    conn: &Connection,
+    recall_id: &str,
+    cited_memory_ids: &[&str],
+    consumed_by: &str,
+    consuming_agent: Option<&str>,
+) -> Result<usize> {
+    if cited_memory_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare_cached(
+        "UPDATE recall_observations \
+            SET consumed = 1, \
+                consumed_at = ?1, \
+                consumed_by_memory_id = ?2 \
+          WHERE recall_id = ?3 \
+            AND memory_id = ?4 \
+            AND consumed = 0 \
+            AND (agent_id IS NULL OR agent_id = ?5)",
+    )?;
+    let mut flipped = 0_usize;
+    for mid in cited_memory_ids {
+        flipped += stmt.execute(params![now, consumed_by, recall_id, mid, consuming_agent])?;
+    }
+    Ok(flipped)
+}
+
 /// One row of `recall_observations` as it travels over the read-side
 /// MCP `memory_recall_observations` tool. Mirrors the SQL columns 1:1
 /// plus a derived `consumed` boolean (the SQL column is an INTEGER
@@ -265,7 +342,17 @@ pub fn try_mark_consumed_from_params(
         return;
     };
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    if let Err(e) = mark_consumed(conn, &recall_id, &refs, consumed_by) {
+    // #1705 — the citing agent (this store/link request's `agent_id`) gates
+    // the flip via [`mark_consumed_guarded`]: a row only flips when its
+    // stamped `agent_id` is NULL (legacy / unbound) or equals this agent,
+    // so a replayed `recall_id` cited by a different agent cannot pump
+    // another agent's consumed signal.
+    let consuming_agent = params
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Err(e) = mark_consumed_guarded(conn, &recall_id, &refs, consumed_by, consuming_agent) {
         tracing::warn!(
             target: "observations",
             recall_id = %recall_id,
@@ -532,5 +619,61 @@ mod tests {
         // Consumed=false ⇒ the remaining two.
         let only_pending = list_observations(&conn, None, Some(false), None, None, 10).unwrap();
         assert_eq!(only_pending.len(), 2);
+    }
+
+    #[test]
+    fn guarded_consume_rejects_cross_agent_replay() {
+        // #1705 — record with an identity, then prove the guard: a
+        // different agent citing the recall_id flips nothing; the owning
+        // agent flips the row.
+        let conn = fresh();
+        seed_memory(&conn, "m1");
+        seed_memory(&conn, "consumer");
+        record_recall_with_identity(
+            &conn,
+            "r1",
+            &[Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            }],
+            Some("alice"),
+            Some("ns/a"),
+        )
+        .unwrap();
+
+        // Wrong agent → rejected (0 flipped), row stays unconsumed.
+        let replay = mark_consumed_guarded(&conn, "r1", &["m1"], "consumer", Some("bob")).unwrap();
+        assert_eq!(replay, 0, "cross-agent replay rejected");
+        assert_eq!(
+            list_observations(&conn, Some("r1"), Some(true), None, None, 10)
+                .unwrap()
+                .len(),
+            0,
+            "no consumed row after a rejected replay"
+        );
+
+        // Owning agent → flips.
+        let ok = mark_consumed_guarded(&conn, "r1", &["m1"], "consumer", Some("alice")).unwrap();
+        assert_eq!(ok, 1, "owning agent flips the row");
+
+        // Unbound (NULL agent_id) rows flip for any caller.
+        record_recall_with_identity(
+            &conn,
+            "r2",
+            &[Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.8,
+            }],
+            None,
+            None,
+        )
+        .unwrap();
+        let unbound =
+            mark_consumed_guarded(&conn, "r2", &["m1"], "consumer", Some("anyone")).unwrap();
+        assert_eq!(unbound, 1, "NULL-agent (unbound) row flips for any caller");
     }
 }

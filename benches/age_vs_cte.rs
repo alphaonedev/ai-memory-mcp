@@ -552,6 +552,9 @@ async fn insert_fixture(
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            // v0.8.0 Pillar 2 (#1709) — typed lifecycle state; bench
+            // fixtures default to the initial `Open`.
+            lifecycle_state: ai_memory::models::LifecycleState::Open,
         };
         store.store(&ctx, &mem).await?;
     }

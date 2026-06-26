@@ -345,6 +345,20 @@ pub async fn consolidate_memories(
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
         let ctx = crate::store::CallerContext::for_agent(&consolidator_agent_id);
+        // #1795 (5-agent vote 4d3ea1c5) — enforce the per-agent daily write
+        // quota for the one net-new consolidated memory on the postgres tenant
+        // path (the SAL `consolidate` only RECORDS). Mirrors the sqlite branch's
+        // `check_and_record` charge; the curator ConsolidationPass (for_admin)
+        // never reaches this handler.
+        let consolidate_quota_bytes =
+            i64::try_from(body.title.len() + summary.len()).unwrap_or(i64::MAX);
+        if let Err(e) = app
+            .store
+            .check_memory_quota(&ctx, &body.namespace, 1, consolidate_quota_bytes)
+            .await
+        {
+            return store_err_to_response(e);
+        }
         let new_id = match app
             .store
             .consolidate(
@@ -411,6 +425,45 @@ pub async fn consolidate_memories(
     }
 
     let lock = app.db.lock().await;
+    // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write quota
+    // for the one net-new consolidated memory. consolidate is a tenant-facing
+    // authoring write (mints a fresh attributable row), gated like the
+    // single-write create handler; the curator/autonomy ConsolidationPass
+    // (SAL + for_admin ai:curator) is intentionally exempt. Refund on failure.
+    let consolidate_quota_op = crate::quotas::QuotaOp::Memory {
+        bytes: i64::try_from(body.title.len() + summary.len()).unwrap_or(i64::MAX),
+    };
+    if !consolidator_agent_id.is_empty() {
+        if let Err(e) = crate::quotas::check_and_record(
+            &lock.0,
+            &consolidator_agent_id,
+            &body.namespace,
+            consolidate_quota_op,
+        ) {
+            return match e {
+                crate::quotas::QuotaCheckError::Quota(qe) => (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "code": crate::errors::error_codes::QUOTA_EXCEEDED,
+                        "error": qe.to_string(),
+                        "limit": qe.limit.as_str(),
+                        "current": qe.current,
+                        "max": qe.max,
+                        "agent_id": qe.agent_id,
+                    })),
+                )
+                    .into_response(),
+                crate::quotas::QuotaCheckError::Sql(se) => {
+                    tracing::error!("consolidate quota substrate error: {se}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": crate::errors::msg::QUOTA_CHECK_FAILED})),
+                    )
+                        .into_response()
+                }
+            };
+        }
+    }
     let consolidate_result = db::consolidate(
         &lock.0,
         &body.ids,
@@ -421,6 +474,18 @@ pub async fn consolidate_memories(
         crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
     );
+    // #1788 — refund the quota charge if the consolidate write failed (mirrors
+    // the single-write refund_op path). Best-effort; done inside the lock.
+    if consolidate_result.is_err() && !consolidator_agent_id.is_empty() {
+        if let Err(re) = crate::quotas::refund_op(
+            &lock.0,
+            &consolidator_agent_id,
+            &body.namespace,
+            consolidate_quota_op,
+        ) {
+            crate::quotas::log_refund_op_failed(&consolidator_agent_id, &re);
+        }
+    }
     // Read the newly consolidated memory back so we can fanout — must do
     // this inside the same lock window because db::consolidate deletes
     // the source rows as part of its transaction.

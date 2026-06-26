@@ -86,6 +86,7 @@ fn seed_embedded(conn: &rusqlite::Connection, title: &str, content: &str) -> Str
         confidence_signals: None,
         confidence_decayed_at: None,
         version: 1,
+        lifecycle_state: ai_memory::models::LifecycleState::Open,
     };
     let id = db::insert(conn, &mem).expect("seed insert must succeed");
     db::set_embedding(conn, &id, &[0.5_f32; SEED_DIM]).expect("seed embedding must land");

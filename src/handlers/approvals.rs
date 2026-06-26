@@ -305,7 +305,11 @@ pub async fn approval_decide(
     let pending_snapshot = db::get_pending_action(&lock.0, &id).ok().flatten();
     let outcome = match body.decision {
         crate::approvals::Decision::Approve => {
-            match db::approve_with_approver_type(&lock.0, &id, &agent_id) {
+            // #1796 (5-agent vote 4d3ea1c5) — HTTP approve surface enforces the
+            // Human-arm self-approval gate UNCONDITIONALLY regardless of backend
+            // (multi-tenant; no process AI_MEMORY_AGENT_ID to key the opt-in on).
+            match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http)
+            {
                 Ok(crate::db::ApproveOutcome::Approved) => {
                     let executed = db::execute_pending_action(&lock.0, &id);
                     match executed {

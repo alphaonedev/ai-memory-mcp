@@ -3,20 +3,35 @@
 
 use serde_json::Value;
 
+pub mod action;
 pub mod audit;
 pub mod capture_turn;
+pub mod checkpoint;
+pub mod crdt_merge;
+pub mod crdt_primitives;
 pub mod field_names;
 pub mod link;
 pub mod memory;
 pub mod namespace;
 pub mod recall_request;
 pub mod reflection;
+pub mod routine;
+pub mod signal;
 pub mod skill;
 pub mod tag;
 
 #[allow(unused_imports)]
+pub use action::*;
+#[allow(unused_imports)]
 pub use audit::*;
 pub use capture_turn::*;
+#[allow(unused_imports)]
+pub use checkpoint::*;
+pub use crdt_merge::{
+    clamp_inbound_updated_at, merge_memory, sanitize_inbound_attestation, stamp_version_vector,
+};
+#[allow(unused_imports)]
+pub use crdt_primitives::{OrSet, PnCounter};
 pub use link::*;
 pub use memory::*;
 pub use namespace::*;
@@ -24,6 +39,10 @@ pub use namespace::*;
 pub use recall_request::*;
 #[allow(unused_imports)]
 pub use reflection::*;
+#[allow(unused_imports)]
+pub use routine::*;
+#[allow(unused_imports)]
+pub use signal::*;
 #[allow(unused_imports)]
 pub use tag::*;
 
@@ -366,6 +385,7 @@ mod tests {
                 approver: ApproverType::Agent("maintainer".to_string()),
                 inherit: true,
                 max_reflection_depth: None,
+                required_scope: None,
             },
             ..Default::default()
         };
@@ -578,6 +598,7 @@ mod tests {
             confidence_signals: None,
             confidence_decayed_at: None,
             version: 1,
+            lifecycle_state: crate::models::LifecycleState::Open,
         };
         let json = serde_json::to_string(&m).unwrap();
         let back: Memory = serde_json::from_str(&json).unwrap();

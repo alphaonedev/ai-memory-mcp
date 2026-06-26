@@ -21,7 +21,7 @@
 //!     - alias values that pre-fill `AI_MEMORY_LLM_BASE_URL` for known vendors:
 //!       `xai`, `openai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`,
 //!       `mistral`, `groq`, `together`, `cerebras`, `openrouter`,
-//!       `fireworks`, `lmstudio`
+//!       `fireworks`, `lmstudio`, `vllm`
 //! - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-backend URL.
 //! - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for OpenAI-compatible
 //!   backends. Some aliases also accept per-vendor env vars as a
@@ -95,7 +95,12 @@ pub(crate) const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 /// `*_async` variants and skip the bridge entirely — the FX-D1
 /// surgical fix at `daemon_runtime::build_llm_client` does exactly
 /// this for the known callsite that surfaced the regression.
-fn block_on_local<F, Fut, T>(make_fut: F) -> T
+/// #1752 — exposed `pub(crate)` so the MCP `pre_signal_send` enforcement
+/// bridge (`src/mcp/mod.rs`) can drive the async `HookChain::fire` synchronously
+/// from the sync stdio dispatch through the SAME three-flavor bridge (the
+/// `spawn_blocking`-under-multi-thread case uses `block_in_place`, never a
+/// panicking `Handle::current().block_on`).
+pub(crate) fn block_on_local<F, Fut, T>(make_fut: F) -> T
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = T>,
@@ -189,6 +194,28 @@ where
 /// the codebase.
 pub const BACKEND_OLLAMA: &str = "ollama";
 
+/// v0.8.0 #1709 §11.4.C — canonical wire value for the dedicated vLLM
+/// backend alias. vLLM serves an OpenAI-compatible API (`POST
+/// /v1/chat/completions`, `POST /v1/embeddings`) on its default
+/// `--port 8000` mount, so a `vllm` alias is sugar over
+/// `openai-compatible` that pre-fills the base URL to
+/// `http://localhost:8000/v1` (mirroring how `lmstudio` pre-fills
+/// `http://localhost:1234/v1`). Keyless by default like `lmstudio` — a
+/// Bearer token can still be supplied via `AI_MEMORY_LLM_API_KEY` for a
+/// secured deployment. Centralised here for the same heterogeneous-NHI
+/// vendor-literal discipline as [`BACKEND_OLLAMA`] (#1067 / pm-v3.1);
+/// every site references this const, never the bare `"vllm"` literal.
+pub const BACKEND_VLLM: &str = "vllm";
+
+/// Placeholder model identifier for single-model OpenAI-compatible
+/// servers (LMStudio, vLLM) that serve whatever single model the
+/// process was launched with and ignore the request's `model` field.
+/// Centralised so the `lmstudio` + `vllm` default-model arms — in both
+/// [`LlmProvider::from_env`] (here) and
+/// `crate::config::default_model_for_alias` — share one definition
+/// (pm-v3.1 no-scattered-literal discipline / hardcoded-literal gate).
+pub const LOCAL_SERVER_MODEL_PLACEHOLDER: &str = "local-model";
+
 /// #1598 — OpenAI-compatible embeddings endpoint path suffix, appended
 /// to the resolved base URL (e.g. `https://openrouter.ai/api/v1`).
 /// Single source for the embed wire path across the client's two embed
@@ -219,6 +246,9 @@ pub(crate) fn default_base_url_for_alias(alias: &str) -> Option<&'static str> {
         "openrouter" => Some("https://openrouter.ai/api/v1"),
         "fireworks" => Some("https://api.fireworks.ai/inference/v1"),
         "lmstudio" => Some("http://localhost:1234/v1"),
+        // v0.8.0 #1709 §11.4.C — vLLM's OpenAI-compatible server
+        // defaults to `--port 8000` with the `/v1` OpenAI route mount.
+        BACKEND_VLLM => Some("http://localhost:8000/v1"),
         _ => None,
     }
 }
@@ -250,6 +280,12 @@ fn alias_api_key_env_vars(alias: &str) -> &'static [&'static str] {
         "cerebras" => &["CEREBRAS_API_KEY"],
         "openrouter" => &["OPENROUTER_API_KEY"],
         "fireworks" => &["FIREWORKS_API_KEY"],
+        // v0.8.0 #1709 §11.4.C — vLLM is keyless by default (same as
+        // `lmstudio`, which also resolves via the `_ => &[]` fallthrough);
+        // a token can still be supplied via `AI_MEMORY_LLM_API_KEY` for a
+        // secured deployment. The explicit arm pins the contract so the
+        // `alias_api_key_env_vars_per_alias_pins_1067` test asserts it.
+        BACKEND_VLLM => &[],
         _ => &[],
     }
 }
@@ -412,6 +448,32 @@ async fn read_capped_text(resp: reqwest::Response) -> String {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) => format!("<error body unavailable: {e}>"),
     }
+}
+
+/// #1393 — system prompt for [`OllamaClient::classify_kind`]. Constrains the
+/// model to a single lowercase kind word drawn from the Form-6
+/// [`crate::models::MemoryKind`] vocabulary, defaulting to `observation` when
+/// unsure so the classifier never invents a kind.
+const CLASSIFY_KIND_SYSTEM: &str = "You classify a memory into exactly ONE kind. \
+Reply with ONLY the single lowercase kind word and nothing else. Valid kinds: \
+observation, decision, claim, event, concept, entity, relation, conversation. \
+Use 'decision' for a choice / plan / commitment the author made; 'claim' for a \
+factual assertion; 'event' for a time-bounded happening; 'observation' for a \
+neutral note or a question. When unsure, reply 'observation'.";
+
+/// Build the per-memory classification user prompt (#1393).
+fn classify_kind_prompt(title: &str, content: &str) -> String {
+    format!("Title: {title}\nContent: {content}\n\nKind:")
+}
+
+/// #1393 — parse a classifier completion into a [`crate::models::MemoryKind`].
+/// Scans alphabetic tokens and returns the first that names a valid kind, so a
+/// chatty reply ("This is a decision.") still resolves. Returns `None` when no
+/// token names a kind — the caller then ABSTAINS (keeps the existing kind).
+pub(crate) fn parse_classified_kind(text: &str) -> Option<crate::models::MemoryKind> {
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|t| !t.is_empty())
+        .find_map(|tok| crate::models::MemoryKind::from_str(&tok.to_ascii_lowercase()))
 }
 
 /// #1603 — parse a batched OpenAI-compatible `/embeddings` response
@@ -615,7 +677,8 @@ impl OllamaClient {
     /// - `AI_MEMORY_LLM_BACKEND` — `ollama` (default) | `openai-compatible`
     ///   | one of the per-vendor aliases (`xai`, `openai`, `anthropic`,
     ///   `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`,
-    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`).
+    ///   `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio`,
+    ///   `vllm`).
     /// - `AI_MEMORY_LLM_BASE_URL` — overrides the default per-alias URL.
     /// - `AI_MEMORY_LLM_API_KEY` — Bearer auth secret for the
     ///   OpenAI-compatible path. Per-alias fallback env vars are also
@@ -660,7 +723,11 @@ impl OllamaClient {
                 "cerebras" => "llama-3.3-70b".to_string(),
                 "openrouter" => "openai/gpt-5".to_string(),
                 "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".to_string(),
-                "lmstudio" => "local-model".to_string(),
+                // v0.8.0 #1709 §11.4.C — vLLM, like LMStudio, serves
+                // whatever single model the server was launched with, so
+                // the shared placeholder is the sane default when the
+                // operator does not set `AI_MEMORY_LLM_MODEL`.
+                "lmstudio" | BACKEND_VLLM => LOCAL_SERVER_MODEL_PLACEHOLDER.to_string(),
                 _ => "gemma3:4b".to_string(),
             });
 
@@ -702,7 +769,7 @@ impl OllamaClient {
                          backend alias. Valid values: ollama, openai-compatible, \
                          openai, xai, anthropic, gemini, deepseek, kimi, qwen, \
                          mistral, groq, together, cerebras, openrouter, \
-                         fireworks, lmstudio"
+                         fireworks, lmstudio, vllm"
                     ));
                 };
                 let base_url = std::env::var("AI_MEMORY_LLM_BASE_URL")
@@ -1344,6 +1411,27 @@ impl OllamaClient {
     ///
     /// `num_predict` is hard-capped at 64 tokens regardless of model — defense
     /// in depth against unbounded chain-of-thought emissions on any model.
+    /// #1393 — classify a recovered transcript turn into a refined
+    /// [`crate::models::MemoryKind`] (the "decision-detector"). Returns `None`
+    /// to ABSTAIN — an unparseable / unrecognized completion leaves the
+    /// caller's existing kind untouched. Uses the generic [`Self::generate`]
+    /// completion with a constrained single-word classification prompt.
+    ///
+    /// # Errors
+    /// Propagates the underlying [`Self::generate`] error (circuit-breaker
+    /// open, governance refusal, transport / non-2xx / malformed response).
+    pub fn classify_kind(
+        &self,
+        title: &str,
+        content: &str,
+    ) -> Result<Option<crate::models::MemoryKind>> {
+        let out = self.generate(
+            &classify_kind_prompt(title, content),
+            Some(CLASSIFY_KIND_SYSTEM),
+        )?;
+        Ok(parse_classified_kind(&out))
+    }
+
     pub fn auto_tag(
         &self,
         title: &str,
@@ -2095,10 +2183,11 @@ mod tests {
     }
 
     /// v0.7.0 #1067 + #1113 — per-alias default base URL pin. Walks
-    /// every vendor alias the v0.7.0 LLM client advertises and asserts
-    /// `default_base_url_for_alias` returns the documented host.
+    /// every vendor alias the LLM client advertises and asserts
+    /// `default_base_url_for_alias` returns the documented host. v0.8.0
+    /// #1709 §11.4.C added the 16th alias (`vllm`).
     #[test]
-    fn default_base_url_for_alias_covers_all_15_aliases_1067() {
+    fn default_base_url_for_alias_covers_all_16_aliases_1067() {
         let cases: &[(&str, Option<&str>)] = &[
             ("openai", Some("https://api.openai.com/v1")),
             ("xai", Some("https://api.x.ai/v1")),
@@ -2125,6 +2214,7 @@ mod tests {
             ("openrouter", Some("https://openrouter.ai/api/v1")),
             ("fireworks", Some("https://api.fireworks.ai/inference/v1")),
             ("lmstudio", Some("http://localhost:1234/v1")),
+            (BACKEND_VLLM, Some("http://localhost:8000/v1")),
             ("openai-compatible", None),
             ("totally-unknown-vendor", None),
         ];
@@ -2158,6 +2248,7 @@ mod tests {
             ("fireworks", &["FIREWORKS_API_KEY"]),
             (BACKEND_OLLAMA, &[]),
             ("lmstudio", &[]),
+            (BACKEND_VLLM, &[]),
             ("openai-compatible", &[]),
             ("totally-unknown-vendor", &[]),
         ];
@@ -5322,5 +5413,49 @@ mod perf9_async_tests {
             .join()
             .unwrap();
         });
+    }
+}
+
+#[cfg(test)]
+mod classify_kind_parse_tests {
+    use super::parse_classified_kind;
+    use crate::models::MemoryKind;
+
+    #[test]
+    fn bare_kind_word_parses() {
+        assert_eq!(
+            parse_classified_kind("decision"),
+            Some(MemoryKind::Decision)
+        );
+        assert_eq!(
+            parse_classified_kind("observation"),
+            Some(MemoryKind::Observation)
+        );
+        assert_eq!(parse_classified_kind("claim"), Some(MemoryKind::Claim));
+        assert_eq!(parse_classified_kind("event"), Some(MemoryKind::Event));
+    }
+
+    #[test]
+    fn case_and_punctuation_tolerant() {
+        assert_eq!(
+            parse_classified_kind("Decision."),
+            Some(MemoryKind::Decision)
+        );
+        assert_eq!(parse_classified_kind("  CLAIM\n"), Some(MemoryKind::Claim));
+    }
+
+    #[test]
+    fn chatty_reply_resolves_first_kind_token() {
+        assert_eq!(
+            parse_classified_kind("This is a decision the author made."),
+            Some(MemoryKind::Decision)
+        );
+    }
+
+    #[test]
+    fn unrecognized_output_abstains() {
+        assert_eq!(parse_classified_kind("dunno"), None);
+        assert_eq!(parse_classified_kind(""), None);
+        assert_eq!(parse_classified_kind("42!!"), None);
     }
 }

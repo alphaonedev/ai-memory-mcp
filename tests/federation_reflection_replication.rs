@@ -264,6 +264,7 @@ fn three_peer_federation_depth_replication_and_cross_peer_refusal() {
             approver: ApproverType::Human,
             inherit: true,
             max_reflection_depth: Some(2),
+            required_scope: None,
         },
         ..Default::default()
     };

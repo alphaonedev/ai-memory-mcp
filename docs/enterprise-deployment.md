@@ -370,7 +370,7 @@ ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/
 ```
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
-plus the in-process upgrade ladder to schema v57 as a side effect. The
+plus the in-process upgrade ladder to schema v70 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
 bootstrap); `age` is opt-in — when installed, the verb additionally
 creates the AGE graph `memory_graph` via the idempotent
@@ -592,6 +592,12 @@ ceiling (§10.2). PgBouncer is the middleman that decouples the two.
   pools compose; see the reconciliation in §5.6.5.
 
 #### 5.6.3 Minimal `pgbouncer.ini`
+
+> **Copy-deployable templates (v0.8.0 Pillar-4 4.B, #1736):**
+> [`infra/pgbouncer/`](../infra/pgbouncer/) materializes this section into
+> runnable artifacts — `pgbouncer.ini`, `userlist.txt`, `role-defaults.sql`,
+> a `docker-compose.yml`, and a `smoke-test.sh` that proves an AGE cypher
+> transaction + the role-default timeouts survive transaction-mode pooling.
 
 `transaction` pooling mode is **REQUIRED** (rationale in §5.6.4):
 
@@ -1060,7 +1066,7 @@ Concurrent writes from different agents are merged via the substrate's
 CRDT-lite vector-clock merge (`src/federation/vector_clock.rs`). The
 v0.7.0 schema also carries a `version` column on the Memory struct
 (schema v45, Gap-1 optimistic concurrency for `memory_update`; field
-26 of the 26-field struct, `CLAUDE.md §"Data Model"`).
+26 of the 27-field struct, `CLAUDE.md §"Data Model"`).
 
 For the swarm topology:
 
@@ -1245,6 +1251,16 @@ This section consolidates the v0.7.0-relevant tuning that
 | T4 multi-rack (50–250 agents, 10M rows) | 8 | 32 GB | 500 GB | Primary + ≥1 sync replica |
 | T5 multi-DC (250–1000 agents, 50M rows) | 16 | 64 GB | 1 TB | Primary + sync + ≥1 async |
 | T6 multi-region (per region, 100M rows) | 16+ | 64+ GB | 2 TB+ | Per-region T5 |
+
+> **Agent counts are PROVISIONAL (v0.8.0 Pillar-4 4.D, #1737).** The
+> per-module agent ceilings in the table above (and the "1000 agents/module"
+> design default) are **conservative design figures, not benchmarked
+> guarantees** — the per-module bound is AGE write throughput on that module's
+> backbone (PgBouncer fixes connection fan-in, not AGE write concurrency). The
+> empirical per-module envelope **X** is measured by
+> [`infra/pillar4-envelope/`](../infra/pillar4-envelope/); these figures are
+> replaced with the measured X once it lands. Scale past one module's X by
+> composing **independent modules**, never by raising one daemon's caps.
 
 **Disk type matters.** Postgres + AGE on spinning rust is unsupported
 for production — NVMe SSD is the practical baseline. The HNSW index
@@ -1437,7 +1453,7 @@ Six surfaces, each load-bearing for different ops scenarios:
    for deep traces.
 4. **File logging** — opt-in via `[logging]` in `config.toml`.
    Rotating appender; off by default.
-5. **`ai-memory doctor`** — 7-section health dashboard run locally.
+5. **`ai-memory doctor`** — 10-section health dashboard run locally.
 6. **`ai-memory verify-signed-events-chain`** — V-4 chain integrity
    verification.
 
@@ -1480,10 +1496,11 @@ retry or hand-replicate.
 
 ### 12.4 `ai-memory doctor` — daily health check
 
-Schedule a daily cron and page on non-zero exit. The 7 sections —
-database integrity, schema version, retention drift, embedder
-availability, hook pipeline status, federation peer reachability,
-recent audit summary — cover the substrate's standard failure modes.
+Schedule a daily cron and page on non-zero exit. The 10 sections —
+storage integrity, index health, local recall, governance, federation
+sync skew, webhook/subscription pipeline, capabilities, reflection
+health, LLM reachability (#1146), and embeddings reachability (#1598) —
+cover the substrate's standard failure modes.
 
 ### 12.5 Alerting playbook
 

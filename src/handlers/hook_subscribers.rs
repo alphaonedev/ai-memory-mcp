@@ -394,6 +394,7 @@ async fn set_namespace_standard_inner(
                     confidence_signals: None,
                     confidence_decayed_at: None,
                     version: 1,
+                    lifecycle_state: crate::models::LifecycleState::Open,
                 };
                 match app.store.store(&ctx, &placeholder).await {
                     Ok(id) => id,
@@ -688,6 +689,7 @@ async fn set_namespace_standard_inner(
                 confidence_signals: None,
                 confidence_decayed_at: None,
                 version: 1,
+                lifecycle_state: crate::models::LifecycleState::Open,
             };
             match db::insert(&lock.0, &placeholder) {
                 Ok(id) => id,
@@ -805,21 +807,25 @@ pub struct NamespaceStandardQuery {
 }
 
 pub async fn get_namespace_standard(
-    State(state): State<Db>,
+    State(app): State<AppState>,
+    headers: HeaderMap,
     Path(ns): Path<String>,
     Query(q): Query<NamespaceStandardQuery>,
 ) -> impl IntoResponse {
-    let mut params = json!({"namespace": ns});
-    if let Some(inh) = q.inherit {
-        params["inherit"] = json!(inh);
-    }
-    let lock = state.lock().await;
-    let result = crate::mcp::handle_namespace_get_standard(&lock.0, &params);
-    drop(lock);
-    match result {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response(),
-    }
+    // #1655 — the path-form GET must work on BOTH backends. Delegate to the
+    // query-string handler, which already has the postgres SAL arm (via
+    // `app.store.get_namespace_standard`) AND the sqlite fallback, by
+    // injecting the path `{ns}` into the query shape. Pre-#1655 this handler
+    // used the sqlite-only `Db` extractor + a raw `handle_namespace_get_standard`
+    // rusqlite call, so the postgres gate 501'd the route on a postgres-backed
+    // daemon even though the SAL method the qs form uses was implemented.
+    let merged = NamespaceStandardQuery {
+        namespace: Some(ns),
+        inherit: q.inherit,
+    };
+    get_namespace_standard_qs(State(app), headers, Query(merged))
+        .await
+        .into_response()
 }
 
 pub async fn clear_namespace_standard(

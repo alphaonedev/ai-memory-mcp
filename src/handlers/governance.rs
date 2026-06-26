@@ -305,7 +305,11 @@ pub async fn approve_pending(
     }
 
     let lock = state.lock().await;
-    match db::approve_with_approver_type(&lock.0, &id, &agent_id) {
+    // #1796 (5-agent vote 4d3ea1c5) — the HTTP surface enforces the Human-arm
+    // self-approval reject + registered-approver requirement UNCONDITIONALLY
+    // (it is multi-tenant via per-request X-Agent-Id and sets no process
+    // AI_MEMORY_AGENT_ID, so the storage-layer env opt-in would never fire).
+    match db::approve_with_approver_type(&lock.0, &id, &agent_id, db::ApproveSurface::Http) {
         Ok(ApproveOutcome::Approved) => match db::execute_pending_action(&lock.0, &id) {
             Ok(memory_id) => {
                 // v0.6.2 (S34): fan out the decision AND the resulting

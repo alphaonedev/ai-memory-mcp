@@ -11,7 +11,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Integrations — every AI client, every IDE</title>
-<meta name="description" content="13 AI clients tested with ai-memory: Claude Code, ChatGPT, Cursor, Windsurf, Continue, Codex, Gemini CLI, Grok CLI, OpenClaw, Hermes Agent, Llama, and any MCP-compliant host.">
+<meta name="description" content="14 AI clients tested with ai-memory: Claude Code, ChatGPT, Cursor, Windsurf, Continue, Codex, Gemini CLI, Grok CLI, OpenClaw, Hermes Agent, Llama, and any MCP-compliant host.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/integrations.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -242,7 +242,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Every AI. Every IDE.</h1>
-  <p class="tagline">ai-memory speaks MCP — the open Model Context Protocol. Any compliant host autodiscovers all 74 tools at <code>--profile full</code> (7 at the default <code>--profile core</code>). <strong>Plug in once, share memory across every AI you use.</strong></p>
+  <p class="tagline">ai-memory speaks MCP — the open Model Context Protocol. Any compliant host autodiscovers all 100 tools at <code>--profile full</code> (7 at the default <code>--profile core</code>). <strong>Plug in once, share memory across every AI you use.</strong></p>
   <div class="pill-row">
     <span class="pill">14 clients tested</span>
     <span class="pill">3 tiers (first-class · supported · works-with-MCP)</span>
@@ -260,7 +260,7 @@ footer a{color:var(--text-muted)}
       <div class="summary-tile"><div class="num" style="color:var(--p1)">3</div><div class="lab">Tier 1 · first-class</div></div>
       <div class="summary-tile"><div class="num" style="color:var(--p2)">8</div><div class="lab">Tier 2 · supported</div></div>
       <div class="summary-tile"><div class="num" style="color:var(--p3)">3</div><div class="lab">Tier 3 · works-via-MCP</div></div>
-      <div class="summary-tile"><div class="num">74</div><div class="lab">Tools auto-discovered (--profile full)</div></div>
+      <div class="summary-tile"><div class="num">100</div><div class="lab">Tools auto-discovered (--profile full)</div></div>
     </div>
 
     <div class="client-grid">
@@ -277,12 +277,18 @@ footer a{color:var(--text-muted)}
         <p class="client-desc">Anthropic's official CLI. ai-memory runs as a stdio MCP subprocess; the <code>memory_session_start</code> hook fires every conversation start, returning recent-context-aware memories.</p>
         <pre class="client-config"><span class="cmt"># claude mcp add</span>
 <span class="key">claude mcp add</span> ai-memory <span class="str">--scope user</span> <span class="str">--transport stdio</span> <span class="str">-- ai-memory mcp --tier autonomous</span></pre>
+        <pre class="client-config"><span class="cmt"># SessionStart boot hook — inject relevant memory into the system prompt each session</span>
+<span class="key">ai-memory install claude-code</span> <span class="str">--apply</span></pre>
+        <p class="client-desc"><strong>Two installable hooks.</strong> The SessionStart boot hook (above) makes every session memory-aware. The optional <strong>PreToolUse governance hook</strong> routes every Bash / Edit / Write through the substrate rules engine and actually <strong>blocks</strong> refused actions — e.g. <code>rm -rf /</code>, writes to <code>/tmp</code>, or anything an operator-signed rule refuses. At v0.8.0 (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1811" style="color:var(--p1)">#1811</a>) it is an enforcing <code>type:command</code> wrapper (<code>ai-memory governance check-action --from-pretool-stdin</code>) that emits the Claude Code <code>permissionDecision=deny</code> on a Refuse, so the tool dispatch is genuinely halted (the older <code>type:mcp_tool</code> form could not block).</p>
+        <pre class="client-config"><span class="cmt"># PreToolUse governance hook — enforce operator-signed action rules (v0.8.0 #1811)</span>
+<span class="key">ai-memory install claude-code</span> <span class="str">--hook pretool</span> <span class="str">--apply</span></pre>
         <div class="client-meta-row">
           <span><span class="ok">✓</span> stdio</span>
           <span><span class="ok">✓</span> session_start hook</span>
-          <span><span class="ok">✓</span> all 74 tools (<code>--profile full</code>)</span>
+          <span><span class="ok">✓</span> PreToolUse governance hook (blocks refused actions)</span>
+          <span><span class="ok">✓</span> all 100 tools (<code>--profile full</code>)</span>
         </div>
-        <a class="client-link" href="./#claude-integration">Setup guide →</a>
+        <a class="client-link" href="integrations/claude-code.md">Setup guide →</a>
       </div>
 
       <div class="client tier1">
@@ -304,7 +310,7 @@ footer a{color:var(--text-muted)}
   }
 }</pre>
         <div class="client-meta-row">
-          <span><span class="ok">✓</span> tool count: 74 at --profile full / 7 at --profile core (v0.7.0)</span>
+          <span><span class="ok">✓</span> tool count: 100 at --profile full / 7 at --profile core (v0.8.0)</span>
           <span><span class="ok">✓</span> envFile support</span>
         </div>
       </div>
@@ -491,7 +497,7 @@ servers:
             <span class="client-tier t3">▸ TIER 3 · SPEC-CONFORMANT</span>
           </div>
         </div>
-        <p class="client-desc">Any host implementing the <a href="https://modelcontextprotocol.io" style="color:var(--p1)">Model Context Protocol</a> v2026-04 or later auto-discovers ai-memory tools — 74 advertised entries at <code>--profile full</code>, 7 at <code>--profile core</code>. No special integration required.</p>
+        <p class="client-desc">Any host implementing the <a href="https://modelcontextprotocol.io" style="color:var(--p1)">Model Context Protocol</a> v2026-04 or later auto-discovers ai-memory tools — 100 advertised entries at <code>--profile full</code>, 7 at <code>--profile core</code>. No special integration required.</p>
         <pre class="client-config"><span class="cmt"># Standard MCP launcher signature</span>
 ai-memory mcp [<span class="key">--tier</span> &lt;keyword|semantic|smart|autonomous&gt;]</pre>
       </div>
@@ -504,7 +510,7 @@ ai-memory mcp [<span class="key">--tier</span> &lt;keyword|semantic|smart|autono
             <span class="client-tier t3">▸ TIER 3 · DIY</span>
           </div>
         </div>
-        <p class="client-desc">Roll-your-own agents talk to the HTTP daemon. 89 routes (75 unique paths). Or implement an MCP host shim using the official spec libraries.</p>
+        <p class="client-desc">Roll-your-own agents talk to the HTTP daemon. 91 routes (77 unique paths). Or implement an MCP host shim using the official spec libraries.</p>
         <pre class="client-config"><span class="cmt"># Python example</span>
 import requests
 r = requests.post(<span class="str">"http://localhost:9077/api/v1/recall"</span>,
@@ -528,7 +534,7 @@ r = requests.post(<span class="str">"http://localhost:9077/api/v1/recall"</span>
         <li>Host sends JSON-RPC <code>initialize</code> with protocolVersion + clientInfo</li>
         <li>ai-memory responds with capabilities + serverInfo</li>
         <li>Host sends <code>tools/list</code></li>
-        <li>ai-memory responds with all 74 tool definitions at <code>--profile full</code> (name, description, JSON Schema) — 7 at the default <code>--profile core</code></li>
+        <li>ai-memory responds with all 100 tool definitions at <code>--profile full</code> (name, description, JSON Schema) — 7 at the default <code>--profile core</code></li>
         <li>Host registers the tools with its model, presents to user as available actions</li>
         <li>User says "remember that I prefer..." → host calls <code>tools/call memory_store ...</code></li>
         <li>ai-memory does the work, returns the result</li>
@@ -540,7 +546,7 @@ r = requests.post(<span class="str">"http://localhost:9077/api/v1/recall"</span>
 
 <footer>
   <div class="container">
-    <p>ai-memory-mcp · Apache 2.0 · v0.7.0 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="data-flow.html">Data Flow</a></p>
+    <p>ai-memory-mcp · Apache 2.0 · v0.8.0 · <a href="./">main</a> · <a href="at-a-glance.html">At a Glance</a> · <a href="feature-matrix.html">Feature Matrix</a> · <a href="data-flow.html">Data Flow</a></p>
   </div>
 </footer>
 

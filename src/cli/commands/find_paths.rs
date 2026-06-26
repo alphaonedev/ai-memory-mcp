@@ -85,7 +85,9 @@ pub fn cmd_find_paths(
         params[crate::models::field_names::INCLUDE_INVALIDATED] = json!(true);
     }
 
-    let envelope = crate::mcp::handle_find_paths(&conn, &params)
+    // #1800 — CLI is operator-as-actor (single-operator trust-all), so
+    // pass `None` for the visibility caller (no source-owner gate).
+    let envelope = crate::mcp::handle_find_paths(&conn, &params, None)
         .map_err(|e| anyhow::anyhow!("find-paths: {e}"))?;
 
     if args.json {
