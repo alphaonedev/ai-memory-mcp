@@ -7,7 +7,7 @@ layout: doc
 >
 > **Date:** 2026-06-15.
 >
-> **Status:** Reference material. Not a constraint. The moonshot synthesis ([`docs/strategy/moonshot-synthesis.md`](moonshot-synthesis.md)) and the seven §2 properties in [`ROADMAP.md`](../../ROADMAP.md) remain the authoritative anchors. Where DecentMem and the moonshot disagree, the moonshot wins.
+> **Status:** Reference material. Not a constraint. The moonshot synthesis ([`docs/strategy/moonshot-synthesis.md`](moonshot-synthesis.html)) and the seven §2 properties in [`ROADMAP.md`](../../ROADMAP.md) remain the authoritative anchors. Where DecentMem and the moonshot disagree, the moonshot wins.
 >
 > **Purpose.** Map ai-memory's substrate primitives to the decentralized-memory vocabulary of *Self-Evolving Multi-Agent Systems via Decentralized Memory* (Hao, Long, Zhao, arXiv:2605.22721) for readers familiar with the multi-agent-systems literature. This document does not derive the substrate's properties from DecentMem — those derive from the moonshot. DecentMem serves as a retrospective organizing lens.
 

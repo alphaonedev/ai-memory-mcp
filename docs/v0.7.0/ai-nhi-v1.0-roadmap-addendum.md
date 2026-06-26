@@ -6,7 +6,7 @@ layout: doc
 > **Authored from inside the substrate** by the AI NHI (Opus 4.7 + ai-memory v0.7.0)
 > on 2026-05-24, six weeks ahead of target v1.0 GA.
 >
-> **Companion to** [`rfc-nhi-viewpoint.md`](rfc-nhi-viewpoint.md) — that document
+> **Companion to** [`rfc-nhi-viewpoint.md`](rfc-nhi-viewpoint.html) — that document
 > is the *retrospective* AI NHI viewpoint on what v0.7.0 *is*. This document is
 > the *forward-looking* AI NHI viewpoint on what v0.7.0 *needs to become* to
 > reach 100% coverage across the three canonical reference architectures for AI
@@ -601,11 +601,11 @@ posture established in v0.7.0:
 
 ### v0.7.0 substrate documents referenced
 
-- [`docs/v0.7.0/rfc-nhi-viewpoint.md`](rfc-nhi-viewpoint.md) — retrospective AI NHI viewpoint
-- [`docs/v0.7.0/release-notes.md`](release-notes.md) — v0.7.0 release notes
-- [`docs/compliance/nsa-csi-mcp-security-mapping.md`](../compliance/nsa-csi-mcp-security-mapping.md) — NSA CSI MCP mapping
-- [`docs/compliance/honest-limitations.md`](../compliance/honest-limitations.md) — honest limitations companion
-- [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md) — recursive learning primer
+- [`docs/v0.7.0/rfc-nhi-viewpoint.md`](rfc-nhi-viewpoint.html) — retrospective AI NHI viewpoint
+- [`docs/v0.7.0/release-notes.md`](release-notes.html) — v0.7.0 release notes
+- [`docs/compliance/nsa-csi-mcp-security-mapping.md`](../compliance/nsa-csi-mcp-security-mapping.html) — NSA CSI MCP mapping
+- [`docs/compliance/honest-limitations.md`](../compliance/honest-limitations.html) — honest limitations companion
+- [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.html) — recursive learning primer
 - [`CLAUDE.md`](../../CLAUDE.md) — operator directives + v0.7.0 release gate
 
 ### Source-of-truth file references

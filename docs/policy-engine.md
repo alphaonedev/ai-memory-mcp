@@ -25,7 +25,7 @@ Cross-references throughout:
 - **#695** — PE-2 Claude Code PreToolUse harness hook installer (**merged at HEAD `12a7f29`**, commit `5392162`).
 - **#696** — PE-3 deferred audit-log queue (**merged at HEAD `12a7f29`**, commit `07b4957`).
 - **#697** — v0.8.0 100% Cryptographic Forensic Audit Trail closeout (epic).
-- [`positioning.md`](positioning.md) — category-level comparison of
+- [`positioning.md`](positioning.html) — category-level comparison of
   substrate-authority enforcement versus other agent-memory projects.
 
 ---
@@ -437,7 +437,7 @@ Substrate-visible action coverage at HEAD `c359e89`:
   persistent across daemon restart.
 
 Tracking: **#697** holds the v0.8.0 epic. The audit-trail coverage
-matrix at [`security/audit-trail-coverage.md`](./security/audit-trail-coverage.md)
+matrix at [`security/audit-trail-coverage.md`](./security/audit-trail-coverage.html)
 enumerates the same gaps from the audit-chain perspective.
 
 ---
@@ -506,7 +506,7 @@ other row is `warn!`-logged and skipped.
 
 The same matrix from the audit-chain side, with row shapes and
 verification examples, lives in
-[`security/audit-trail-coverage.md`](./security/audit-trail-coverage.md).
+[`security/audit-trail-coverage.md`](./security/audit-trail-coverage.html).
 
 ---
 

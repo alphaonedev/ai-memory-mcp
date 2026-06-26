@@ -12,7 +12,7 @@ boundary. The pattern is the same regardless of runtime: the front-end app
 or wrapper script prepends `ai-memory boot` output to the system message
 before the first request.
 
-> **Cross-reference — using a local model as ai-memory's own LLM backend.** This doc covers local models as the AI client (reading ai-memory boot output). For the inverse direction — ai-memory's smart / autonomous tier calling out to a local LMStudio / vLLM / llama.cpp server / Ollama endpoint for query expansion, auto-tag, etc. — see [`llm-backends.md`](llm-backends.md) §§ Ollama / LMStudio / Generic OpenAI-compatible (self-hosted). MCP env-block recipes cover the full matrix; shell exports do NOT reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+> **Cross-reference — using a local model as ai-memory's own LLM backend.** This doc covers local models as the AI client (reading ai-memory boot output). For the inverse direction — ai-memory's smart / autonomous tier calling out to a local LMStudio / vLLM / llama.cpp server / Ollama endpoint for query expansion, auto-tag, etc. — see [`llm-backends.md`](llm-backends.html) §§ Ollama / LMStudio / Generic OpenAI-compatible (self-hosted). MCP env-block recipes cover the full matrix; shell exports do NOT reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
 
 ## Or for the simple wrapper case — `ai-memory wrap`
 
@@ -36,7 +36,7 @@ the launcher case.
 ## LM Studio (HTTP API, OpenAI-compatible)
 
 LM Studio exposes an OpenAI-compat server on port 1234 by default. Use the
-[`openai-apps-sdk.md`](openai-apps-sdk.md) recipe with `base_url` set to
+[`openai-apps-sdk.md`](openai-apps-sdk.html) recipe with `base_url` set to
 `http://localhost:1234/v1`.
 
 ## Ollama (HTTP API)
@@ -70,7 +70,7 @@ resp = requests.post(
 ## vLLM / llama.cpp server
 
 Same OpenAI-compatible API as LM Studio. Use the
-[`openai-apps-sdk.md`](openai-apps-sdk.md) recipe with the appropriate
+[`openai-apps-sdk.md`](openai-apps-sdk.html) recipe with the appropriate
 `base_url`.
 
 ## Why no MCP recipe for local models
@@ -78,7 +78,7 @@ Same OpenAI-compatible API as LM Studio. Use the
 Most local-model front-ends (Open WebUI, AnythingLLM, Continue, etc.) talk
 to MCP differently. If you're using a front-end with first-class MCP
 support, see the relevant agent's recipe in this directory (e.g.
-[`continue.md`](continue.md)) — local models work the same way as cloud
+[`continue.md`](continue.html)) — local models work the same way as cloud
 models behind that front-end.
 
 If you're calling a runtime directly (Ollama HTTP, vLLM HTTP), there's no
@@ -87,6 +87,6 @@ prepend pattern shown above.
 
 ## Related
 
-- [`README.md`](README.md), Issue #487
-- [`openai-apps-sdk.md`](openai-apps-sdk.md) — the canonical
+- [`README.md`](README.html), Issue #487
+- [`openai-apps-sdk.md`](openai-apps-sdk.html) — the canonical
   OpenAI-compatible-API pattern.

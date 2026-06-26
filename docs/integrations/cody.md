@@ -5,7 +5,7 @@ layout: doc
 
 **Category 3 (programmatic).** 100% reliable when implemented.
 
-> **Cross-reference — using Cody as the AI client vs. running ai-memory's smart/autonomous tier behind Cody.** This doc covers Cody reading ai-memory boot output (Cody as client). For wiring an LLM backend to ai-memory's own smart/autonomous tier (which calls out to an LLM internally for query expansion, auto-tag, etc.), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` ([`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md)); the override path is the MCP env-block recipe in [`llm-backends.md`](llm-backends.md) (shell exports do NOT reach MCP-spawned subprocesses — [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
+> **Cross-reference — using Cody as the AI client vs. running ai-memory's smart/autonomous tier behind Cody.** This doc covers Cody reading ai-memory boot output (Cody as client). For wiring an LLM backend to ai-memory's own smart/autonomous tier (which calls out to an LLM internally for query expansion, auto-tag, etc.), the recommended path post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) is a `[llm]` section in `~/.config/ai-memory/config.toml` ([`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html)); the override path is the MCP env-block recipe in [`llm-backends.md`](llm-backends.html) (shell exports do NOT reach MCP-spawned subprocesses — [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)).
 
 [Cody](https://sourcegraph.com/cody) is Sourcegraph's AI coding
 assistant. It ships as VS Code / JetBrains extensions and a CLI
@@ -122,7 +122,7 @@ Cody support. The wrapper / API recipe above is the manual form.
 
 When using the wrapper script with the header preserved, the
 `ai-memory boot` status header appears in stdout / the chat
-transcript. The four headers documented in [`README.md`](README.md)
+transcript. The four headers documented in [`README.md`](README.html)
 tell `ok` / `info-empty` / `info-greenfield` / `warn-db` apart. For
 the programmatic API recipe, add a logging line after `boot_context()`
 returns — the empty string vs a populated payload is itself a
@@ -159,9 +159,9 @@ This recipe will be updated in place once the hook lands.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the universal
+- [`README.md`](README.html) — integration matrix and the universal
   primitive.
-- [`claude-agent-sdk.md`](claude-agent-sdk.md),
-  [`openai-apps-sdk.md`](openai-apps-sdk.md) — same prepend pattern
+- [`claude-agent-sdk.md`](claude-agent-sdk.html),
+  [`openai-apps-sdk.md`](openai-apps-sdk.html) — same prepend pattern
   for other programmatic SDKs.
 - Issue #487 — RCA + cross-files for the Cody hook request.

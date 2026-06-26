@@ -4,7 +4,7 @@ layout: doc
 # AI NHI Execution Prompt — v0.8.0 Remaining-Work Closeout (gauntlet-verified)
 ### Feed verbatim to the Claude Code CLI `/goal` loop driving EPIC #1709
 
-> **What this is.** The single load-bearing brief for the **remaining** v0.8.0 work — the genuinely-undone set, deconflicted against everything already shipped at `release/v0.8.0` HEAD by an 8-agent codegraph verification gauntlet (2026-06-17). Its first job is to **stop the loop redoing shipped work** (§2), its second is to close the verified residual in priority order (§5–§6). Source of truth: this doc + the #1709 body + `ROADMAP.md`. Companion kickoff: [`docs/v0.8.0/GOAL-EPIC-KICKOFF.md`](GOAL-EPIC-KICKOFF.md).
+> **What this is.** The single load-bearing brief for the **remaining** v0.8.0 work — the genuinely-undone set, deconflicted against everything already shipped at `release/v0.8.0` HEAD by an 8-agent codegraph verification gauntlet (2026-06-17). Its first job is to **stop the loop redoing shipped work** (§2), its second is to close the verified residual in priority order (§5–§6). Source of truth: this doc + the #1709 body + `ROADMAP.md`. Companion kickoff: [`docs/v0.8.0/GOAL-EPIC-KICKOFF.md`](GOAL-EPIC-KICKOFF.html).
 >
 > **Authority.** AI NHI is 100% autonomous on execution EXCEPT the release tag-cut + 5-channel publish (operator-gated). Only `alphaonedev`. No external code injection, ever. (CLAUDE.md sole-authority + commit/push policy govern.)
 

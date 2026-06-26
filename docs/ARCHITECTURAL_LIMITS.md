@@ -173,7 +173,7 @@ from a different peer) must wait at least `--interval` seconds, or
 read from the writing peer.
 
 Full design rationale + recovery procedures: see
-[`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.md).
+[`ADR-0003`](ADR-0003-kg-invalidation-eventual-consistency.html).
 
 ### 14. KG schema v15 is backward-incompatible across the federation — **Documented in v0.6.3**
 
@@ -190,9 +190,9 @@ Operators upgrading a federation mesh from v0.6.2 to v0.6.3 must:
 4. Bring all peers up — migration runs on first open
 5. Verify schema_version 15 on every peer before resuming writes
 
-See [`MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md)
+See [`MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.html)
 for the full procedure and
-[`ADR-0002`](ADR-0002-kg-schema-v15-backward-incompat.md) for the
+[`ADR-0002`](ADR-0002-kg-schema-v15-backward-incompat.html) for the
 design rationale.
 
 ## Use-case guidance

@@ -218,7 +218,7 @@ in `src/` outside doc comments.
    that didn't make it through the backfill — investigate
    immediately.
 4. **Pair with the forensic bundle** (L2-5,
-   [`docs/forensic-export.md`](forensic-export.md)) — the signed
+   [`docs/forensic-export.md`](forensic-export.html)) — the signed
    events table ships inside the bundle by default. Offline reviewers
    can re-verify the chain without DB access.
 
@@ -429,18 +429,18 @@ signatures that pins the audit story.
   `src/signed_events.rs`, which fails the build if any production
   UPDATE/DELETE call site against `signed_events` appears.
 
-See also: [`docs/MIGRATION_v0.7.md` §"Ed25519 attestation"](MIGRATION_v0.7.md#ed25519-attestation-opt-in),
-[`docs/v0.7.0/release-notes.md` §"Signed events V-4 closeout"](v0.7.0/release-notes.md),
+See also: [`docs/MIGRATION_v0.7.md` §"Ed25519 attestation"](MIGRATION_v0.7.html#ed25519-attestation-opt-in),
+[`docs/v0.7.0/release-notes.md` §"Signed events V-4 closeout"](v0.7.0/release-notes.html),
 the canonical inventory in
-[`docs/internal/v070-feature-inventory.md` §"Feature: Signed events V-4 closeout"](internal/v070-feature-inventory.md),
+[`docs/internal/v070-feature-inventory.md` §"Feature: Signed events V-4 closeout"](internal/v070-feature-inventory.html),
 the federation hardening layer that produces peer-write events on
-this chain at [`docs/federation.md`](federation.md), the K10 approvals
+this chain at [`docs/federation.md`](federation.html), the K10 approvals
 path whose decisions are recorded as `signed_events` rows at
-[`docs/k10-sse-approvals.md`](k10-sse-approvals.md), the
-forensic-bundle exporter at [`docs/forensic-export.md`](forensic-export.md),
+[`docs/k10-sse-approvals.md`](k10-sse-approvals.html), the
+forensic-bundle exporter at [`docs/forensic-export.md`](forensic-export.html),
 the hook pipeline whose gated writes generate signed-event rows at
-[`docs/hook-pipeline.md`](hook-pipeline.md), the K8 quotas substrate
+[`docs/hook-pipeline.md`](hook-pipeline.html), the K8 quotas substrate
 whose refusals are also audit events at
-[`docs/k8-quotas.md`](k8-quotas.md), and the sidechain transcripts
+[`docs/k8-quotas.md`](k8-quotas.html), and the sidechain transcripts
 whose store-events appear in the chain at
-[`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
+[`docs/sidechain-transcripts.md`](sidechain-transcripts.html).

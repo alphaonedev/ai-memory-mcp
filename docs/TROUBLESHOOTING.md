@@ -85,7 +85,7 @@ time too — a remote embedder whose endpoint starts failing flips
 2. If `config_source = compiled-default`, no operator embeddings
    config exists anywhere — set `AI_MEMORY_EMBED_BACKEND` or write
    an `[embeddings]` section
-   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html)).
 3. If `key_source = error(...)`, fix the referenced env var or key
    file perms (mode 0400 required for `api_key_file`).
 4. If the section carries a `gpu_policy` WARN, you resolved
@@ -196,7 +196,7 @@ backend is unreachable.
 2. If `config_source = compiled-default`, no operator LLM config is
    present anywhere. Either set `AI_MEMORY_LLM_BACKEND` (env) or
    write a `[llm]` section in `~/.config/ai-memory/config.toml`
-   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md)).
+   (see [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html)).
 3. If `key_source = error(...)`, the resolved API key
    (`api_key_env` / `api_key_file`) couldn't be read — fix the
    referenced env var or file perms (0400 required for

@@ -4,7 +4,7 @@ layout: doc
 # Global `~/.claude/CLAUDE.md` template
 
 **Belt-and-suspenders for category 1 (Claude Code).** The
-[claude-code.md](claude-code.md) SessionStart hook is the load-bearing
+[claude-code.md](claude-code.html) SessionStart hook is the load-bearing
 mechanism — text directives in CLAUDE.md alone are best-effort (see issue
 #487 layer 6). But a global CLAUDE.md helps in two cases:
 
@@ -57,7 +57,7 @@ overridden by a stronger directive in the system prompt.
 
 ## Related
 
-- [`claude-code.md`](claude-code.md) — the load-bearing SessionStart hook.
-- [`README.md`](README.md) — full integration matrix.
+- [`claude-code.md`](claude-code.html) — the load-bearing SessionStart hook.
+- [`README.md`](README.html) — full integration matrix.
 - Issue #487 — RCA explaining why text directives are belt-and-suspenders
   rather than a fix.

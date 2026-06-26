@@ -7,7 +7,7 @@ layout: doc
 
 [Roo Code](https://github.com/RooCodeInc/Roo-Code) (formerly Roo Cline)
 is a fork of Cline maintained by the Roo team. The recipe is
-**largely identical to [`cline.md`](cline.md)** — same MCP-server
+**largely identical to [`cline.md`](cline.html)** — same MCP-server
 registration shape, same custom-instructions surface — with the
 divergences noted below. If you have already installed the Cline
 recipe, you can copy the same MCP-server JSON across; only the config
@@ -52,7 +52,7 @@ identical to Cline's:
 prompting for permission on every call — required for a smooth boot
 path.
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — single source of truth across MCP / HTTP daemon / CLI / boot banner / doctor probe. Example: `backend = "xai"`, `model = "grok-4.3"`, `api_key_env = "XAI_API_KEY"` (the env-var name, not the literal key — inline keys are rejected at parse time). Export the named env var in your shell rc; the MCP config can stay minimal. **Override** path: extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL` — shell exports don't reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Full schema + per-vendor recipes: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) + [`llm-backends.md`](llm-backends.md).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Post-[#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) (v0.7.0) the **recommended** path is a `[llm]` section in `~/.config/ai-memory/config.toml` — single source of truth across MCP / HTTP daemon / CLI / boot banner / doctor probe. Example: `backend = "xai"`, `model = "grok-4.3"`, `api_key_env = "XAI_API_KEY"` (the env-var name, not the literal key — inline keys are rejected at parse time). Export the named env var in your shell rc; the MCP config can stay minimal. **Override** path: extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL` — shell exports don't reach MCP-spawned subprocesses ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Full schema + per-vendor recipes: [`../CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html) + [`llm-backends.md`](llm-backends.html).
 
 ## Part 2 — Custom Instructions (best-effort)
 
@@ -95,7 +95,7 @@ log on the first turn. If you don't, either MCP is not loading the
 server (check the Roo Code output panel in VS Code: View → Output →
 "Roo Code") or the directive is not being applied to the active mode.
 The `ai-memory boot` status-header diagnostic (see
-[`README.md`](README.md)) does not apply here because Roo Code's
+[`README.md`](README.html)) does not apply here because Roo Code's
 integration is MCP-only.
 
 ## Limitations
@@ -124,8 +124,8 @@ This recipe will be updated in place once the hook lands.
 
 ## Related
 
-- [`README.md`](README.md) — integration matrix and the universal
+- [`README.md`](README.html) — integration matrix and the universal
   primitive.
-- [`cline.md`](cline.md) — the upstream parent recipe; most of the
+- [`cline.md`](cline.html) — the upstream parent recipe; most of the
   shape is shared.
 - Issue #487 — RCA + cross-files for category-2 native-hook requests.

@@ -18,16 +18,16 @@ docs below.
 
 | Topic | Doc |
 |---|---|
-| **Operator how-to: activate Batman Mode end-to-end** | [`docs/batman-active-mode.md`](batman-active-mode.md) |
-| Migration path v0.6.4 → v0.7.0 permissions | [`docs/MIGRATION_v0.7.md` §"Permissions migration"](MIGRATION_v0.7.md#permissions-migration) |
-| 7th-form policy engine (substrate-authoritative rules) | [`docs/policy-engine.md`](policy-engine.md) |
-| Agent-action rule catalogue | [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.md) |
-| SSE approval channel + HMAC binding | [`docs/k10-sse-approvals.md`](k10-sse-approvals.md) |
-| Per-agent daily quotas (K8) | [`docs/k8-quotas.md`](k8-quotas.md) |
-| Audit-trail coverage map | [`docs/security/audit-trail-coverage.md`](security/audit-trail-coverage.md) |
-| Federation hardening (peer auth) | [`docs/federation.md`](federation.md) |
-| Signed-events V-4 chain (substrate audit) | [`docs/signed-events-v4.md`](signed-events-v4.md) |
-| Programmable lifecycle hooks | [`docs/hook-pipeline.md`](hook-pipeline.md) |
+| **Operator how-to: activate Batman Mode end-to-end** | [`docs/batman-active-mode.md`](batman-active-mode.html) |
+| Migration path v0.6.4 → v0.7.0 permissions | [`docs/MIGRATION_v0.7.md` §"Permissions migration"](MIGRATION_v0.7.html#permissions-migration) |
+| 7th-form policy engine (substrate-authoritative rules) | [`docs/policy-engine.md`](policy-engine.html) |
+| Agent-action rule catalogue | [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.html) |
+| SSE approval channel + HMAC binding | [`docs/k10-sse-approvals.md`](k10-sse-approvals.html) |
+| Per-agent daily quotas (K8) | [`docs/k8-quotas.md`](k8-quotas.html) |
+| Audit-trail coverage map | [`docs/security/audit-trail-coverage.md`](security/audit-trail-coverage.html) |
+| Federation hardening (peer auth) | [`docs/federation.md`](federation.html) |
+| Signed-events V-4 chain (substrate audit) | [`docs/signed-events-v4.md`](signed-events-v4.html) |
+| Programmable lifecycle hooks | [`docs/hook-pipeline.md`](hook-pipeline.html) |
 
 ## Three modes
 
@@ -169,7 +169,7 @@ ai-memory install claude-code --hook pretool --apply
   POST, hooks subprocess spawn, LLM HTTP), PE-2 ships the Claude Code
   PreToolUse hook installer, and `memory_check_agent_action` is the
   harness-consulted read surface — see
-  [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point
+  [`policy-engine.md`](policy-engine.html) §2 for the merged wire-point
   audit. **v0.8.0 update:** `AgentAction::Read` (wire `read_action`)
   shipped (#1730) and the mandatory-hook **presence** check shipped
   (#1734, `AI_MEMORY_HOOKS_ENFORCE_MODE` + `[hooks].required_events`);
@@ -181,5 +181,5 @@ ai-memory install claude-code --hook pretool --apply
   ([#1605](https://github.com/alphaonedev/ai-memory-mcp/issues/1605)).
 
 See [`docs/internal/v070-feature-inventory.md` §"K1/G1
-namespace-inheritance"](internal/v070-feature-inventory.md) for the
+namespace-inheritance"](internal/v070-feature-inventory.html) for the
 canonical track-K rollup.

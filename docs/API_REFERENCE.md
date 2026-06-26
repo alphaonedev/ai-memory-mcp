@@ -156,7 +156,7 @@ Status codes you'll commonly encounter:
   are **operator-tunable** via `[limits].max_memories_per_day` /
   `max_storage_bytes` / `max_links_per_day` (or the matching
   `AI_MEMORY_MAX_*` env vars). Defaults: 1000 memories/day, 100 MiB,
-  5000 links/day. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+  5000 links/day. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
 - No per-client rate limiting at the HTTP layer — all writes contend
   for a single `Mutex<Connection>`. Batch or throttle at the caller.
 
@@ -942,8 +942,8 @@ router in `src/lib.rs`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.md). MCP: `memory_quota_status`. |
-| `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.md). |
+| `POST` | `/api/v1/quota/status` | K8 quota status — read the calling agent's daily quota row. Auto-inserts a default row on first call. See [`docs/k8-quotas.md`](k8-quotas.html). MCP: `memory_quota_status`. |
+| `GET`  | `/api/v1/approvals/stream` | K10 SSE approval channel — server-sent events for pending-approval state changes. See [`docs/k10-sse-approvals.md`](k10-sse-approvals.html). |
 | `POST` | `/api/v1/approvals/{pending_id}` | K10 approval decide path — body `{"decision":"approve|deny","remember":"once|session|forever"}`, HMAC-gated via `X-AI-Memory-Signature`. |
 | `POST` | `/api/v1/auto_tag` | LLM auto-tag endpoint (v0.7 smart-tier surface; 503 when no LLM is configured). |
 | `POST` | `/api/v1/expand_query` | HTTP parity for the MCP `memory_expand_query` tool. |
@@ -988,7 +988,7 @@ MCP-only.
 
 The 31 MCP tools added since v0.6.4 are documented inline in
 `src/mcp/registry.rs` and enumerated in
-[`docs/MIGRATION_v0.7.md` §"New MCP tools"](MIGRATION_v0.7.md#new-mcp-tools).
+[`docs/MIGRATION_v0.7.md` §"New MCP tools"](MIGRATION_v0.7.html#new-mcp-tools).
 Highlights for HTTP-equivalent surfaces:
 
 | MCP tool | HTTP equivalent | Notes |

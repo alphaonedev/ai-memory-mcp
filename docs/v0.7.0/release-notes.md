@@ -518,9 +518,9 @@ test for that resolver.
 
 **Operator references.**
 
-- [`docs/CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.md) — canonical reference for every section + field.
-- [`docs/MIGRATION_v0.7.md` §"Provider-agnostic LLM backend"](../MIGRATION_v0.7.md#provider-agnostic-llm-backend-1067--1146) — recommended config-first path.
-- [`docs/ADMIN_GUIDE.md` §"LLM Backend Setup"](../ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — operator runbook.
+- [`docs/CONFIG_SCHEMA.md`](../CONFIG_SCHEMA.html) — canonical reference for every section + field.
+- [`docs/MIGRATION_v0.7.md` §"Provider-agnostic LLM backend"](../MIGRATION_v0.7.html#provider-agnostic-llm-backend-1067--1146) — recommended config-first path.
+- [`docs/ADMIN_GUIDE.md` §"LLM Backend Setup"](../ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers) — operator runbook.
 
 ## v0.7.0 mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068), Posture-1a 3-layer ship, 2026-05-21)
 
@@ -615,7 +615,7 @@ before the #1067 / #1068 substrate work.
   layers `postgresql-16-pgvector` on top via apt. The same
   Dockerfile.pg-age-vector pattern applies to any postgres+AGE
   deployment that needs the daemon's vector recall path — see
-  [`docs/postgres-age-guide.md`](../postgres-age-guide.md).
+  [`docs/postgres-age-guide.md`](../postgres-age-guide.html).
 
 Two additional CRITICAL items landed under commit
 [`71baf2956`](https://github.com/alphaonedev/ai-memory-mcp/commit/71baf2956)
@@ -1083,8 +1083,8 @@ to > 98%.
 - **AGE 1.5 + PG 16 cypher-binding harness fix** — test-side only;
   production code never hit it. Unblocks the parity test suite on
   AGE 1.5.0.
-- **Documentation** — operator how-to ([`docs/postgres-age-guide.md`](../postgres-age-guide.md))
-  and migration runbook ([`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md)).
+- **Documentation** — operator how-to ([`docs/postgres-age-guide.md`](../postgres-age-guide.html))
+  and migration runbook ([`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.html)).
 
 ### Wave-3 Continuation 6 — F7 closure + mTLS-validated cert posture
 
@@ -1108,7 +1108,7 @@ to > 98%.
   `tls_handshake` block on each scenario report captures min/mean/max
   handshake durations so operators can quantify the perf overhead of
   switching from plain HTTP. See [`docs/postgres-age-guide.md` §
-  HTTPS / mTLS configuration](../postgres-age-guide.md#https--mtls-configuration).
+  HTTPS / mTLS configuration](../postgres-age-guide.html#https--mtls-configuration).
 - **Test harness — per-agent client cert plumbing.**
   `Harness.client_cert_for(agent_id)` resolves
   `TLS_CLIENT_CERT_<stem>` / `TLS_CLIENT_KEY_<stem>` env vars per
@@ -1132,7 +1132,7 @@ proper rather than deferred to v0.8.0:
   `403 sender_agent_id_mismatch`; a missing header returns
   `403 peer_id_header_missing`. Legacy peers can opt in to pre-v0.7.0
   behaviour via `AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1`. See
-  [`docs/security/audit-trail-coverage.md` §9.1](../security/audit-trail-coverage.md#91-per-author-attestation-on-syncpush-v070-238).
+  [`docs/security/audit-trail-coverage.md` §9.1](../security/audit-trail-coverage.html#91-per-author-attestation-on-syncpush-v070-238).
 - **[#239](https://github.com/alphaonedev/ai-memory-mcp/issues/239)
   `/api/v1/sync/since` now applies a per-peer namespace allowlist**
   to the projection before returning rows. Default-deny posture for
@@ -1141,7 +1141,7 @@ proper rather than deferred to v0.8.0:
   `AI_MEMORY_FED_SYNC_TRUST_PEER=1`. Response envelope gains
   `excluded_for_scope: <count>` + `scope_status: …` for honest
   partial-view diagnostics. See
-  [`docs/security/audit-trail-coverage.md` §9.2](../security/audit-trail-coverage.md#92-per-peer-namespace-scope-on-syncsince-v070-239).
+  [`docs/security/audit-trail-coverage.md` §9.2](../security/audit-trail-coverage.html#92-per-peer-namespace-scope-on-syncsince-v070-239).
 
 **Cert-SAN extraction follow-up.** Today's mTLS substrate
 (`FingerprintAllowlistVerifier`) pins client certificates by SHA-256
@@ -1329,7 +1329,7 @@ The relevant CHANGELOG block sits under the same v0.7.0 heading
 ("v0.7.0 recursive-learning add-on"). Conceptual model, depth-cap
 rationale, directionality contract, and the
 `find_paths` chain-walk behaviour are written up in
-[`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md). The
+[`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.html). The
 reproducibility script is at
 [`scripts/reproduce-recursive-learning.sh`](../../scripts/reproduce-recursive-learning.sh) —
 a self-contained Bash demo that builds the release binary, inserts
@@ -1410,10 +1410,10 @@ handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit
 > closeout maps to postgres v33 since the postgres ladder ran one step
 > behind). The MCP tool count moves from 60 → 71 over the L2 wave + Batman Forms 1-6 + 7th-form + QW-1/2/3 closeout (the +8 over the original 63 narrative cover Forms/QW/L2 additions enumerated below); the
 > full reflection narrative lives in
-> [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md), the
-> Agent Skills surface in [`docs/agent-skills.md`](../agent-skills.md),
+> [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.html), the
+> Agent Skills surface in [`docs/agent-skills.md`](../agent-skills.html),
 > and the forensic-export surface in
-> [`docs/forensic-export.md`](../forensic-export.md).
+> [`docs/forensic-export.md`](../forensic-export.html).
 
 #### Schema and tool-surface deltas
 
@@ -1449,9 +1449,9 @@ handler. ([commit `fbf093c`](https://github.com/alphaonedev/ai-memory-mcp/commit
   `memory_check_agent_action` + `memory_rule_list` (7th-form / #691),
   `memory_export_reflection` (QW-1), `memory_persona` +
   `memory_persona_generate` (QW-2), `memory_offload` + `memory_deref`
-  (QW-3). See [`docs/agent-skills.md`](../agent-skills.md) for the
+  (QW-3). See [`docs/agent-skills.md`](../agent-skills.html) for the
   Skills per-tool wire surface; the canonical post-grand-slam
-  inventory lives in [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md).
+  inventory lives in [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.html).
 
 #### L1-6 substrate rules engine (issues [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691), [#693](https://github.com/alphaonedev/ai-memory-mcp/issues/693))
 
@@ -1494,7 +1494,7 @@ The v0.7.0 Option B substrate-authority foundation:
 **Audit-honest framing.** Substrate authority is a **foundation in
 v0.7.0, a complete cover in v0.8.0**. Operators evaluating the
 authority claim today should read
-[`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](../RECURSIVE_LEARNING.md#substrate-authority-claim--v070-option-b-foundation)
+[`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](../RECURSIVE_LEARNING.html#substrate-authority-claim--v070-option-b-foundation)
 alongside this section. Any "100% substrate authority" marketing
 that elides the wiring gap is inaccurate.
 
@@ -1506,7 +1506,7 @@ that elides the wiring gap is inaccurate.
 | L2-2 federation reflection coordination | [`0b1c9cc`](https://github.com/alphaonedev/ai-memory-mcp/commit/0b1c9cc) | [#667](https://github.com/alphaonedev/ai-memory-mcp/issues/667) | Cross-peer depth bookkeeping. Receivers stamp `metadata.reflection_origin = {peer_origin, original_depth, local_depth_at_arrival}` on import and enforce the **local** cap on derived writes — federation cannot launder depth. `memory_reflection_origin` MCP tool. |
 | L2-3 invalidation propagation | [`3f419be`](https://github.com/alphaonedev/ai-memory-mcp/commit/3f419be) | [#668](https://github.com/alphaonedev/ai-memory-mcp/issues/668) | A Reflection→Reflection `supersedes` edge fires the walker; one notification memory is written per dependent under `<dependent.namespace>/_invalidations`. **Notification, NOT cascade.** Cascade rollback is v0.8.0 Pillar 2.5. |
 | L2-4 transcript replay union | [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c) | [#669](https://github.com/alphaonedev/ai-memory-mcp/issues/669) | `memory_replay` on a reflection memory returns the **union** of transcripts reachable by walking `reflects_on` to the source observations. Caller controls the walk depth (`depth=N`); `depth=0` reproduces the pre-L2-4 shape. |
-| L2-5 forensic bundle | [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3) | [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670) | `ai-memory export-forensic-bundle` + `verify-forensic-bundle`: deterministic POSIX-ustar tar, byte-identical mod timestamp, operator-signed when keypair is on disk. AgenticMem Attest tier integration. See [`docs/forensic-export.md`](../forensic-export.md). |
+| L2-5 forensic bundle | [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3) | [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670) | `ai-memory export-forensic-bundle` + `verify-forensic-bundle`: deterministic POSIX-ustar tar, byte-identical mod timestamp, operator-signed when keypair is on disk. AgenticMem Attest tier integration. See [`docs/forensic-export.md`](../forensic-export.html). |
 | L2-6 reflection-as-skill | [`505c538`](https://github.com/alphaonedev/ai-memory-mcp/commit/505c538) | [#671](https://github.com/alphaonedev/ai-memory-mcp/issues/671) | `memory_skill_promote_from_reflection` promotes a reflection (depth ≥ 1) to a SKILL.md-format Agent Skill. Each `reflects_on` source becomes a `references/source_{i}.md` resource. Round-trip digest-identical to a hand-authored SKILL.md. Closes the recursive-learning loop. |
 | L2-7 skill composition | [`0966b57`](https://github.com/alphaonedev/ai-memory-mcp/commit/0966b57) | [#672](https://github.com/alphaonedev/ai-memory-mcp/issues/672) | `composes_with_reflections` SKILL.md frontmatter declares a skill's affinity for one or more reflection-bearing namespaces. `memory_skill_compositional_context` returns the body + bounded reflection set ranked by recency + recall_count. Per-namespace `max_reflection_depth` is the authoritative ceiling — composition cannot bypass the cap. |
 | L2-8 reflection-aware reranker boost | [`90291c0`](https://github.com/alphaonedev/ai-memory-mcp/commit/90291c0) | [#673](https://github.com/alphaonedev/ai-memory-mcp/issues/673) | Reranker applies `boost * (1 + per_depth_increment * min(depth, cap))` to `Reflection`-kind memories AFTER the cross-encoder blend. Defaults `1.2` / `0.05` / `3`. `boost = 1.0` is the documented kill-switch. |
@@ -1519,7 +1519,7 @@ branch as the substrate path for
 modules:
 
 - **7 MCP tools** in the `memory_skill_*` family. See
-  [`docs/agent-skills.md`](../agent-skills.md) for the per-tool
+  [`docs/agent-skills.md`](../agent-skills.html) for the per-tool
   wire surface.
 - **Round-trip digest guarantee** — register → export → re-register
   produces the identical SHA-256 digest. Survives transport,
@@ -1541,7 +1541,7 @@ bounded reflection context alongside the skill body.
 The L1-3 `verify-reflection-chain` and L2-5
 `export-forensic-bundle` / `verify-forensic-bundle` triad ships the
 procurement-grade evidence path. Full surface in
-[`docs/forensic-export.md`](../forensic-export.md). Headlines:
+[`docs/forensic-export.md`](../forensic-export.html). Headlines:
 
 - **Deterministic tar bundle.** Byte-identical mod timestamp.
 - **In-process POSIX ustar.** No `tar` crate dependency.
@@ -1593,7 +1593,7 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-
   [#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766),
   merged 2026-05-15). The
-  [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.md)
+  [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.html)
   audit at commit `53b4d39` found 0/6 forms cleanly IMPLEMENTED + 4
   partial + 2 absent. The Forms wave closed every gap to **all 7 forms
   IMPLEMENTED at HEAD `c9472c1`**:
@@ -1605,18 +1605,18 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   - **Form 2 (synchronous atomise-before-embed, issue [#755](https://github.com/alphaonedev/ai-memory-mcp/issues/755)).**
     `auto_atomise_mode = Synchronous` pre-store hook in
     `src/hooks/pre_store/auto_atomise.rs`. New `memory_atomise` MCP
-    tool. Doc: [`docs/atomisation.md`](../atomisation.md).
+    tool. Doc: [`docs/atomisation.md`](../atomisation.html).
   - **Form 3 (multi-step ingest orchestrator, issue [#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756)).**
     `memory_ingest_multistep` threads deterministic helpers (Jaccard
     overlap, FTS classifier) before prompt-cache-stable LLM stages.
     `src/multistep_ingest/{mod,executor,helpers,pipeline,cache}.rs`.
-    Doc: [`docs/multistep-ingest.md`](../multistep-ingest.md). Cookbook:
+    Doc: [`docs/multistep-ingest.md`](../multistep-ingest.html). Cookbook:
     [`cookbook/multistep-ingest/01-two-phase.sh`](../../cookbook/multistep-ingest/01-two-phase.sh).
   - **Form 4 (fact provenance, issue [#757](https://github.com/alphaonedev/ai-memory-mcp/issues/757)).**
     Citations + source-URI + atom-grain spans ride on existing
     `memory_store` / `memory_atomise` payloads. Schema migration
     `0032_v07_form4_provenance.sql`. Doc:
-    [`docs/provenance.md`](../provenance.md).
+    [`docs/provenance.md`](../provenance.html).
   - **Form 5 (auto-confidence + shadow calibration + freshness decay,
     issue [#758](https://github.com/alphaonedev/ai-memory-mcp/issues/758)).**
     `memory_calibrate_confidence` MCP tool +
@@ -1625,25 +1625,25 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
     `AI_MEMORY_CONFIDENCE_SHADOW_SAMPLE_RATE`,
     `AI_MEMORY_CONFIDENCE_DECAY`. Schema migration
     `0033_v07_form5_confidence_calibration.sql`. Doc:
-    [`docs/confidence-calibration.md`](../confidence-calibration.md).
+    [`docs/confidence-calibration.md`](../confidence-calibration.html).
   - **Form 6 (`MemoryKind` Batman vocabulary, issue [#759](https://github.com/alphaonedev/ai-memory-mcp/issues/759)).**
     10-variant `MemoryKind` enum (`Observation` default + 9 specific
     variants). Optional `auto_classify_kind` pre-store hook
     (`off | regex_only | regex_then_llm`). No CHECK constraint on
     `memories.memory_kind` — future variants land additively. Doc:
-    [`docs/memory-kind-vocab.md`](../memory-kind-vocab.md).
+    [`docs/memory-kind-vocab.md`](../memory-kind-vocab.html).
   - **7th-form (agent-EXTERNAL Layer-4 wiring, issue [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760);
     full cover at v0.8.0 per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)).**
     Option-B foundation: operator-keypair-signed seed rules
     `R001..R004`, `memory_check_agent_action` + `memory_rule_list`
     MCP tools, substrate `storage::insert` pre-write hook. Doc:
-    [`docs/policy-engine.md`](../policy-engine.md) +
-    [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.md).
+    [`docs/policy-engine.md`](../policy-engine.html) +
+    [`docs/governance/agent-action-rules.md`](../governance/agent-action-rules.html).
 - **QW (Tencent quick-wins).** Four QW items are referenced in the
   Tencent positioning work; **three carry code (QW-1/QW-2/QW-3); QW-4
   is a docs-only deliverable** (competitive positioning page +
   landscape comparison, no substrate or wire-surface change). Per
-  [`docs/internal/v070-ship-readiness-adrs.md` ADR-1](../internal/v070-ship-readiness-adrs.md#adr-1--qw-4-disposition-docs-only-no-code-feature).
+  [`docs/internal/v070-ship-readiness-adrs.md` ADR-1](../internal/v070-ship-readiness-adrs.html#adr-1--qw-4-disposition-docs-only-no-code-feature).
   - **QW-1** file-backed reflection chain export — `memory_export_reflection`
     + `auto_export_reflections_to_filesystem` namespace policy.
     Default destination `~/.ai-memory/reflections/<ns>/<id>.md`.
@@ -1651,14 +1651,14 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   - **QW-2** persona-as-artifact — `memory_persona` + `memory_persona_generate`,
     `MemoryKind::Persona` rows, `auto_persona_trigger_every_n_memories`
     + `auto_export_personas_to_filesystem` namespace policy. Doc:
-    [`docs/persona.md`](../persona.md). Cookbook: `cookbook/persona/`.
+    [`docs/persona.md`](../persona.html). Cookbook: `cookbook/persona/`.
   - **QW-3** context offload primitive — `memory_offload` + `memory_deref`
     move large tool outputs out of the agent context window into an
     addressable blob store with a background TTL sweep. Doc:
-    [`docs/context-offload.md`](../context-offload.md). Cookbook:
+    [`docs/context-offload.md`](../context-offload.html). Cookbook:
     `cookbook/context-offload/`.
   - **QW-4** *(docs-only — competitive positioning)* — Tencent
-    landscape page at [`docs/positioning.md`](../positioning.md).
+    landscape page at [`docs/positioning.md`](../positioning.html).
     Not a code feature; included for inventory completeness so a
     procurement reader counting "QW items shipped" against the
     Tencent analysis sees the same denominator.
@@ -1682,14 +1682,14 @@ folded into the v0.7.0 tag rather than slipping to v0.7.1:
   [`src/profile.rs`](../../src/profile.rs). The `memory_capabilities`
   bootstrap remains always-on regardless of profile.
 - **Six new operator-focused docs landed alongside this wave:**
-  [`docs/hook-pipeline.md`](../hook-pipeline.md),
-  [`docs/federation.md`](../federation.md),
-  [`docs/k8-quotas.md`](../k8-quotas.md),
-  [`docs/k10-sse-approvals.md`](../k10-sse-approvals.md),
-  [`docs/sidechain-transcripts.md`](../sidechain-transcripts.md),
-  [`docs/signed-events-v4.md`](../signed-events-v4.md).
+  [`docs/hook-pipeline.md`](../hook-pipeline.html),
+  [`docs/federation.md`](../federation.html),
+  [`docs/k8-quotas.md`](../k8-quotas.html),
+  [`docs/k10-sse-approvals.md`](../k10-sse-approvals.html),
+  [`docs/sidechain-transcripts.md`](../sidechain-transcripts.html),
+  [`docs/signed-events-v4.md`](../signed-events-v4.html).
 - **Canonical feature inventory.** The full post-grand-slam feature
-  truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.md)
+  truth lives at [`docs/internal/v070-feature-inventory.md`](../internal/v070-feature-inventory.html)
   (453 commits ahead of v0.6.4, +233,589/−23,541 lines, 74 MCP tools at
   release HEAD, 30 net-new since v0.6.4, 17 net-new `AI_MEMORY_*` env
   vars, 88 production HTTP route registrations (74 unique URL paths), 33+ sqlite migrations on disk + the in-
@@ -1775,10 +1775,10 @@ ai-memory forget --pattern 'PII:.*' --confirm-global
 
 ### From v0.6.4 (sqlite, switching to postgres)
 
-Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md):
+Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.html):
 
 1. Provision postgres + Apache AGE + pgvector per
-   [`docs/postgres-age-guide.md`](../postgres-age-guide.md).
+   [`docs/postgres-age-guide.md`](../postgres-age-guide.html).
 2. `ai-memory schema-init --store-url postgres://…`.
 3. `ai-memory migrate --from sqlite:///… --to postgres://… --dry-run`.
 4. Real migration; verify row counts + content fingerprint.
@@ -1800,16 +1800,16 @@ Follow [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md):
 
 ## Operator references
 
-- **Operator how-to:** [`docs/postgres-age-guide.md`](../postgres-age-guide.md)
-- **Migration runbook:** [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.md)
-- **Adapter-selection design:** [`docs/RUNBOOK-adapter-selection.md`](../RUNBOOK-adapter-selection.md)
+- **Operator how-to:** [`docs/postgres-age-guide.md`](../postgres-age-guide.html)
+- **Migration runbook:** [`docs/migration-v0.7.0-postgres.md`](../migration-v0.7.0-postgres.html)
+- **Adapter-selection design:** [`docs/RUNBOOK-adapter-selection.md`](../RUNBOOK-adapter-selection.html)
 - **What's new (visual):** [`docs/whats-new-v07.html`](../whats-new-v07.html)
-- **v0.7.0 → v0.6.4 surface delta:** [`docs/MIGRATION_v0.7.md`](../MIGRATION_v0.7.md)
-- **RFC (design rationale):** [`docs/v0.7/rfc-attested-cortex.md`](../v0.7/rfc-attested-cortex.md)
-- **Recursive learning primer:** [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.md)
-- **Agent Skills primer:** [`docs/agent-skills.md`](../agent-skills.md)
-- **Forensic export primer:** [`docs/forensic-export.md`](../forensic-export.md)
-- **Curator soak runbook:** [`docs/RUNBOOK-curator-soak.md`](../RUNBOOK-curator-soak.md)
+- **v0.7.0 → v0.6.4 surface delta:** [`docs/MIGRATION_v0.7.md`](../MIGRATION_v0.7.html)
+- **RFC (design rationale):** [`docs/v0.7/rfc-attested-cortex.md`](../v0.7/rfc-attested-cortex.html)
+- **Recursive learning primer:** [`docs/RECURSIVE_LEARNING.md`](../RECURSIVE_LEARNING.html)
+- **Agent Skills primer:** [`docs/agent-skills.md`](../agent-skills.html)
+- **Forensic export primer:** [`docs/forensic-export.md`](../forensic-export.html)
+- **Curator soak runbook:** [`docs/RUNBOOK-curator-soak.md`](../RUNBOOK-curator-soak.html)
 - **A2A campaign Pages:** https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
 - **Test Hub Pages:** https://alphaonedev.github.io/ai-memory-test-hub/
 
@@ -1886,7 +1886,7 @@ on 2026-05-18) and pre-merged into the v0.7.0 retag candidate:
 **Closed documentation-labeled issues** as part of this lane-5 sweep:
 
 - **#800** — operator how-to "Activate Batman Mode" — closed on
-  the v0.7.0 ship via [`docs/batman-active-mode.md`](../batman-active-mode.md).
+  the v0.7.0 ship via [`docs/batman-active-mode.md`](../batman-active-mode.html).
 - **#545** — `memory_capabilities` operational summary + per-tool
   `callable_now` — closed on the v0.7.0 ship via capabilities-v3
   (A1-A4 increments; `summary`, `to_describe_to_user`, `callable_now`,

@@ -8,26 +8,26 @@ layout: doc
 > Final base commit: `d17725c` (HEAD of `feat/v0.7.0-grand-slam` after
 > Cluster A-K fix PRs merge).
 > Companion docs:
-> [`v070-feature-inventory.md`](v070-feature-inventory.md) (post-grand-slam canonical inventory),
-> [`v070-review-synthesis.md`](v070-review-synthesis.md) (6-reviewer fix dispatch backlog),
-> [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.md) (7 operator-decision ADRs),
-> [`v070-accepted-debt.md`](v070-accepted-debt.md) (Cluster L triage),
-> [`batman-framework-audit.md`](batman-framework-audit.md) (with post-closeout section).
+> [`v070-feature-inventory.md`](v070-feature-inventory.html) (post-grand-slam canonical inventory),
+> [`v070-review-synthesis.md`](v070-review-synthesis.html) (6-reviewer fix dispatch backlog),
+> [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.html) (7 operator-decision ADRs),
+> [`v070-accepted-debt.md`](v070-accepted-debt.html) (Cluster L triage),
+> [`batman-framework-audit.md`](batman-framework-audit.html) (with post-closeout section).
 
 ## Initiative summary
 
 The v0.7.0 ship-readiness wave was triggered by the
-[Batman 6-form audit](batman-framework-audit.md) which found 0/6
+[Batman 6-form audit](batman-framework-audit.html) which found 0/6
 forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
 
-1. **Cataloguer** built [`v070-feature-inventory.md`](v070-feature-inventory.md)
+1. **Cataloguer** built [`v070-feature-inventory.md`](v070-feature-inventory.html)
    — 11 open questions + canonical feature truth (453 commits ahead of
    v0.6.4, +233,589/−23,541 lines, 74 MCP tools at release HEAD, 17
    net-new env vars, 73 HTTP routes total).
 2. **6 parallel reviewers** (security / correctness / performance /
    API-UX / docs / coverage) generated 111 raw findings → dedup'd to
    **41 unique fix items** + 14 INFO / accepted-debt — see
-   [`v070-review-synthesis.md`](v070-review-synthesis.md).
+   [`v070-review-synthesis.md`](v070-review-synthesis.html).
 3. **12 fix clusters (A-L)** dispatched in parallel: A (Form 4
    correctness), B (Form 1 synthesis security), C (signed-events chain),
    D (L1-6 fail-closed + IDOR), E (kind-filter + Skills parity),
@@ -37,7 +37,7 @@ forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
    audit / issue cleanup), L (operator-document-only — no PR).
 4. **All findings either closed by a sibling-cluster PR, deferred to
    v0.7-polish with an issue, or accepted as permanent operator-
-   defensible debt.** See [`v070-accepted-debt.md`](v070-accepted-debt.md).
+   defensible debt.** See [`v070-accepted-debt.md`](v070-accepted-debt.html).
 
 ## Final substrate state
 
@@ -56,7 +56,7 @@ forms cleanly IMPLEMENTED at the pre-wave HEAD. The closeout campaign:
   on `archived_memories` so archive → restore is lossless for the full
   v0.7.0 Memory shape (#1025).
 - **All 7 Batman forms IMPLEMENTED** at substrate-evidence level (see
-  [batman-framework-audit.md §POST-CLOSEOUT STATE](batman-framework-audit.md#post-closeout-state-2026-05-15)).
+  [batman-framework-audit.md §POST-CLOSEOUT STATE](batman-framework-audit.html#post-closeout-state-2026-05-15)).
 
 ## Test coverage delta
 
@@ -70,7 +70,7 @@ postgres-integration tests now run on every push (Cluster I — PR #773).
 
 ## Known accepted debt
 
-See [`v070-accepted-debt.md`](v070-accepted-debt.md) for the full
+See [`v070-accepted-debt.md`](v070-accepted-debt.html) for the full
 register. Rolled up: 6 already-fixed-by-sibling-cluster, 9
 deferred-to-v0.7-polish (each with a filed issue), 8
 accepted-permanent (documented in owning surface). API "net-zero
@@ -78,7 +78,7 @@ confirmations" (8 findings) require no action and are not counted.
 
 ## Open ADRs
 
-See [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.md) for
+See [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.html) for
 the full text. Rolled up:
 
 | ADR | Decision |

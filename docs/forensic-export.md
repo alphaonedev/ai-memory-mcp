@@ -14,12 +14,12 @@ layout: doc
 
 This page documents the operator-facing surface. The substrate
 contract for reflection chains sits in
-[`RECURSIVE_LEARNING.md`](RECURSIVE_LEARNING.md); the cryptographic
+[`RECURSIVE_LEARNING.md`](RECURSIVE_LEARNING.html); the cryptographic
 identity model sits in
-[`v0.7/rfc-attested-cortex.md`](v0.7/rfc-attested-cortex.md) §Track-H.
+[`v0.7/rfc-attested-cortex.md`](v0.7/rfc-attested-cortex.html) §Track-H.
 The category-level positioning (why procurement-grade attestation is
 a differentiator versus other agent-memory projects) lives in
-[`positioning.md`](positioning.md).
+[`positioning.md`](positioning.html).
 
 ## Three CLI verbs
 
@@ -320,8 +320,8 @@ diff <(jq 'del(.generated_at)' a.json) <(jq 'del(.generated_at)' b.json)
 - **Bundle builder:** [`src/forensic/bundle.rs`](../src/forensic/bundle.rs)
 - **Integration tests:** [`tests/forensic.rs`](../tests/forensic.rs), [`tests/forensic/`](../tests/forensic/)
 - **Substrate cross-references:**
-  - Reflection chain contract: [`RECURSIVE_LEARNING.md`](RECURSIVE_LEARNING.md)
-  - Skill bundle integration: [`agent-skills.md` §Cross-node interchange](agent-skills.md#cross-node-interchange-export-folder-round-trip)
+  - Reflection chain contract: [`RECURSIVE_LEARNING.md`](RECURSIVE_LEARNING.html)
+  - Skill bundle integration: [`agent-skills.md` §Cross-node interchange](agent-skills.html#cross-node-interchange-export-folder-round-trip)
   - Transcript replay union (L2-4): [`src/transcripts/`](../src/transcripts/)
 - **Issue tracker:** [#670](https://github.com/alphaonedev/ai-memory-mcp/issues/670)
 - **Commits:** L2-5 merge [`bb870b3`](https://github.com/alphaonedev/ai-memory-mcp/commit/bb870b3); L2-4 transcript-union merge [`a50b34c`](https://github.com/alphaonedev/ai-memory-mcp/commit/a50b34c)

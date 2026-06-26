@@ -24,11 +24,11 @@ phone" is no longer a research aspiration; it is a deployment target
 ai-memory has CI gates for.
 
 For the laptop / server install path, see
-[`docs/install-quickstart.md`](install-quickstart.md). For the
+[`docs/install-quickstart.md`](install-quickstart.html). For the
 mobile-runtime CI matrix, see
 [`.github/workflows/mobile-runtime.yml`](../.github/workflows/mobile-runtime.yml).
 For the reference architectures (which include a mobile-edge tier),
-see [`docs/reference-architectures.md`](reference-architectures.md).
+see [`docs/reference-architectures.md`](reference-architectures.html).
 
 ## 1. Why this matters
 
@@ -338,7 +338,7 @@ build and run but recall latency starts to dominate.
 For 1M+ memories on a Pi-class device, use the `--store-url
 postgres://...` SAL path to push the heavy storage off-device to
 a Postgres+AGE node on the same LAN (see
-[`docs/reference-architectures.md`](reference-architectures.md)
+[`docs/reference-architectures.md`](reference-architectures.html)
 topology 9 — mobile-edge tier).
 
 ## 7. IoT: RISC-V
@@ -473,7 +473,7 @@ The deployment pattern that works:
   (with HMAC + nonce per `AI_MEMORY_FED_REQUIRE_SIG=1` +
   `AI_MEMORY_FED_REQUIRE_NONCE=1`).
 - **Hub is a Tier-2 or Tier-3 node** (single server or rack-scale,
-  see [`docs/reference-architectures.md`](reference-architectures.md)).
+  see [`docs/reference-architectures.md`](reference-architectures.html)).
   The hub holds the durable archive + cross-device memory + the
   source-of-truth FTS5/HNSW for the fleet.
 - **Edge device pulls from the hub on demand** when local recall
@@ -482,7 +482,7 @@ The deployment pattern that works:
   `/sync/pull` route).
 
 This is the **mobile-edge tier** documented as topology 9 in
-[`docs/reference-architectures.md`](reference-architectures.md#topology-9).
+[`docs/reference-architectures.md`](reference-architectures.html#topology-9).
 
 ### Mobile-appropriate MCP / HTTP subset
 
@@ -568,7 +568,7 @@ the persistent memory + bounces queries to a regional hub when
 needed. The wearable itself stays a thin client. This is the
 canonical "edge of the edge" topology — three tiers (wearable →
 phone → regional hub) — described in
-[`docs/reference-architectures.md`](reference-architectures.md#topology-9).
+[`docs/reference-architectures.md`](reference-architectures.html#topology-9).
 
 ### E. Automotive head-unit / infotainment
 

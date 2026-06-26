@@ -23,10 +23,10 @@ from a reflection, and compose with reflection memories.
 
 This page is the engineering-precise primer. The narrative intro
 sits in the v0.7.0 release notes
-([`v0.7.0/release-notes.md`](v0.7.0/release-notes.md) §"Agent
+([`v0.7.0/release-notes.md`](v0.7.0/release-notes.html) §"Agent
 Skills"). The reflection-to-skill bridge is documented from the
 reflection side in
-[`RECURSIVE_LEARNING.md` §Reflection-as-skill](RECURSIVE_LEARNING.md#reflection-as-skill-l2-6-closing-the-loop).
+[`RECURSIVE_LEARNING.md` §Reflection-as-skill](RECURSIVE_LEARNING.html#reflection-as-skill-l2-6-closing-the-loop).
 
 ## What Agent Skills are
 
@@ -168,7 +168,7 @@ emit/parse cycles; resource order is normalised; whitespace is
 preserved verbatim. The guarantee survives transport across hosts,
 across operating systems, and across the v0.7.0 → v0.8.0 schema
 revisions documented in
-[`docs/MIGRATION_v0.7.md`](MIGRATION_v0.7.md).
+[`docs/MIGRATION_v0.7.md`](MIGRATION_v0.7.html).
 
 `memory_skill_export` appends one `skill.exported` row to the
 append-only `signed_events` audit table on every export, so a
@@ -233,7 +233,7 @@ an error, never a quiet fallback.
 
 The skill-level signature complements (does not replace) the
 forensic-bundle attestation described in
-[`forensic-export.md`](forensic-export.md). A skill embedded in a
+[`forensic-export.md`](forensic-export.html). A skill embedded in a
 forensic bundle gets re-attested at the bundle level *too* so the
 bundle itself is verifiable end-to-end.
 
@@ -248,8 +248,8 @@ bundle itself is verifiable end-to-end.
   - [`tests/skill_test.rs`](../tests/skill_test.rs) — register / list / get / resource / export round-trip
   - [`tests/skill_promote_test.rs`](../tests/skill_promote_test.rs) — reflection-to-skill promotion
   - [`tests/skill_composition_test.rs`](../tests/skill_composition_test.rs) — `composes_with_reflections`
-- **Forensic-bundle integration:** [`forensic-export.md`](forensic-export.md)
-- **Recursive-learning bridge:** [`RECURSIVE_LEARNING.md` §Reflection-as-skill](RECURSIVE_LEARNING.md#reflection-as-skill-l2-6-closing-the-loop)
+- **Forensic-bundle integration:** [`forensic-export.md`](forensic-export.html)
+- **Recursive-learning bridge:** [`RECURSIVE_LEARNING.md` §Reflection-as-skill](RECURSIVE_LEARNING.html#reflection-as-skill-l2-6-closing-the-loop)
 - **Issues:**
   - [#665](https://github.com/alphaonedev/ai-memory-mcp/issues/665) — L1-5 Agent Skills ingestion substrate
   - [#671](https://github.com/alphaonedev/ai-memory-mcp/issues/671) — L2-6 reflection-as-skill promote

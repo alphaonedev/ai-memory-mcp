@@ -116,7 +116,7 @@ Every hook returns a `HookDecision`
   with the `reason` string.
 - **`AskUser{prompt, options, default}`** — chain pauses pending an
   operator decision. Today the only consumer is the K10 SSE approval
-  loop ([`docs/k10-sse-approvals.md`](k10-sse-approvals.md)). The
+  loop ([`docs/k10-sse-approvals.md`](k10-sse-approvals.html)). The
   default is applied if the K10 sweeper expires the row before an
   operator answers.
 
@@ -344,16 +344,16 @@ hooks are NOT firing on a write path, set
 `RUST_LOG=ai_memory::hooks=debug` and confirm the absence of per-hook
 chain log lines on writes.
 
-See also: [`docs/MIGRATION_v0.7.md` §"Hook pipeline (opt-in)"](MIGRATION_v0.7.md#hook-pipeline-opt-in),
+See also: [`docs/MIGRATION_v0.7.md` §"Hook pipeline (opt-in)"](MIGRATION_v0.7.html#hook-pipeline-opt-in),
 the canonical inventory in
-[`docs/internal/v070-feature-inventory.md` §"Feature: Hook pipeline (Track G, 25 events)"](internal/v070-feature-inventory.md),
+[`docs/internal/v070-feature-inventory.md` §"Feature: Hook pipeline (Track G, 25 events)"](internal/v070-feature-inventory.html),
 the SSE approval pipeline that consumes `AskUser` decisions at
-[`docs/k10-sse-approvals.md`](k10-sse-approvals.md), the
+[`docs/k10-sse-approvals.md`](k10-sse-approvals.html), the
 transcript-store hook reference at
-[`docs/sidechain-transcripts.md`](sidechain-transcripts.md), the K8
+[`docs/sidechain-transcripts.md`](sidechain-transcripts.html), the K8
 quotas substrate that gates write events after hook decisions at
-[`docs/k8-quotas.md`](k8-quotas.md), the federation hardening that
+[`docs/k8-quotas.md`](k8-quotas.html), the federation hardening that
 applies the same hook chain to inbound peer writes at
-[`docs/federation.md`](federation.md), and the signed-events chain
+[`docs/federation.md`](federation.html), and the signed-events chain
 that records every governance-gated write at
-[`docs/signed-events-v4.md`](signed-events-v4.md).
+[`docs/signed-events-v4.md`](signed-events-v4.html).

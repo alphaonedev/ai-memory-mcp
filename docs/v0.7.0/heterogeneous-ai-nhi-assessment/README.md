@@ -14,29 +14,29 @@ A first-of-its-kind multi-evaluator, model-heterogeneous assessment of the v0.7.
 
 ai-memory v0.7.0 runs an LLM-agnostic reflection boundary by design. The substrate does not care which model wrote a reflection. This assessment exercises that property at the assessment layer itself — the decorrelated errors across three model families with different training distributions, RLHF lineage, and architectural priors are the entire methodological point. Same-model reflection re-introduces the echo-chamber problem this assessment exists to surface.
 
-See [`prompt.md`](./prompt.md) §0 for the full heterogeneity-as-design argument and the three computational facts that distinguish an NHI from a human reviewer.
+See [`prompt.md`](./prompt.html) §0 for the full heterogeneity-as-design argument and the three computational facts that distinguish an NHI from a human reviewer.
 
 ## Evaluator pool & reports
 
 | Evaluator | Provider | Report | Status |
 |---|---|---|---|
-| Claude Opus 4.7 (v1) | Anthropic | [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.md) | Phase 1 initial — 2026-05-24 |
-| Claude Opus 4.7 (v2) | Anthropic | [`report-claude-opus-4-7-v2.md`](./report-claude-opus-4-7-v2.md) | Phase 1 re-run — 2026-05-25 (isolated DB, curator LIVE) |
-| Claude Opus 4.7 (v3) | Anthropic | [`report-claude-opus-4-7-v3.md`](./report-claude-opus-4-7-v3.md) | **2026-05-28 re-run post-FX-12/FX-C3/ARCH-2 + ship-gate fixes, HEAD `be3347d70`; SHIP verdict; 22 probes, 15 LIVE; filed D-v3-1/2/3 + observation O-v3-1 (historical chain-break at seq=28 — substrate-correct)** |
-| GPT 5.5 | OpenAI | [`report-gpt-5-5.md`](./report-gpt-5-5.md) | Awaiting independent execution |
-| Grok 4.3 | xAI | [`report-grok-4-3.md`](./report-grok-4-3.md) | Awaiting independent execution |
+| Claude Opus 4.7 (v1) | Anthropic | [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.html) | Phase 1 initial — 2026-05-24 |
+| Claude Opus 4.7 (v2) | Anthropic | [`report-claude-opus-4-7-v2.md`](./report-claude-opus-4-7-v2.html) | Phase 1 re-run — 2026-05-25 (isolated DB, curator LIVE) |
+| Claude Opus 4.7 (v3) | Anthropic | [`report-claude-opus-4-7-v3.md`](./report-claude-opus-4-7-v3.html) | **2026-05-28 re-run post-FX-12/FX-C3/ARCH-2 + ship-gate fixes, HEAD `be3347d70`; SHIP verdict; 22 probes, 15 LIVE; filed D-v3-1/2/3 + observation O-v3-1 (historical chain-break at seq=28 — substrate-correct)** |
+| GPT 5.5 | OpenAI | [`report-gpt-5-5.md`](./report-gpt-5-5.html) | Awaiting independent execution |
+| Grok 4.3 | xAI | [`report-grok-4-3.md`](./report-grok-4-3.html) | Awaiting independent execution |
 
 | Synthesis | Author | Output |
 |---|---|---|
-| Phase 2 orchestrator pass | Claude Opus 4.7 (synthesizer-role, post-Phase 1) | [`synthesis.md`](./synthesis.md) — awaiting all three Phase 1 reports |
+| Phase 2 orchestrator pass | Claude Opus 4.7 (synthesizer-role, post-Phase 1) | [`synthesis.md`](./synthesis.html) — awaiting all three Phase 1 reports |
 
 ## Files in this directory
 
-- **[`prompt.md`](./prompt.md)** — the verbatim assessment prompt. Anchor for all three reports. The probe matrix (P1-P22 across 5 tiers) is concrete and code-path-anchored; the deliverable shape (§A-§I, ~2500-4000 words) is structured; the honesty discipline is load-bearing.
-- **[`report-claude-opus-4-7.md`](./report-claude-opus-4-7.md)** — Anthropic Claude Opus 4.7 evaluator report.
-- **[`report-gpt-5-5.md`](./report-gpt-5-5.md)** — OpenAI GPT 5.5 evaluator report.
-- **[`report-grok-4-3.md`](./report-grok-4-3.md)** — xAI Grok 4.3 evaluator report.
-- **[`synthesis.md`](./synthesis.md)** — orchestrator-pass synthesis after all three Phase 1 reports land.
+- **[`prompt.md`](./prompt.html)** — the verbatim assessment prompt. Anchor for all three reports. The probe matrix (P1-P22 across 5 tiers) is concrete and code-path-anchored; the deliverable shape (§A-§I, ~2500-4000 words) is structured; the honesty discipline is load-bearing.
+- **[`report-claude-opus-4-7.md`](./report-claude-opus-4-7.html)** — Anthropic Claude Opus 4.7 evaluator report.
+- **[`report-gpt-5-5.md`](./report-gpt-5-5.html)** — OpenAI GPT 5.5 evaluator report.
+- **[`report-grok-4-3.md`](./report-grok-4-3.html)** — xAI Grok 4.3 evaluator report.
+- **[`synthesis.md`](./synthesis.html)** — orchestrator-pass synthesis after all three Phase 1 reports land.
 
 ## Three-phase protocol
 

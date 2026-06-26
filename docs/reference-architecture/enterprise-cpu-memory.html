@@ -238,9 +238,9 @@ serving stack for airgapped sites — so no node runs Ollama anywhere.</p>
 (local Ollama embeddings on GPU-equipped nodes). A
 when-to-choose-which table lives on that page. The visual catalog of
 all deployment topologies is
-<a href="../reference-architectures.md"><code>docs/reference-architectures.md</code></a>;
+<a href="../reference-architectures.html"><code>docs/reference-architectures.md</code></a>;
 capacity / cost / SLA planning is
-<a href="../enterprise-deployment.md"><code>docs/enterprise-deployment.md</code></a>.</p>
+<a href="../enterprise-deployment.html"><code>docs/enterprise-deployment.md</code></a>.</p>
 <h2 id="topology">Topology</h2>
 <pre><code>                      federated mesh (N nodes, W-of-N quorum)
    ┌────────────────────────────────────────────────────────────────────┐
@@ -362,7 +362,7 @@ fleets): <code>AI_MEMORY_EMBED_BACKEND</code>, <code>AI_MEMORY_EMBED_BASE_URL</c
 <h2 id="federation-skeleton">Federation skeleton</h2>
 <p>Identical to the standard hardened mesh — this architecture changes
 only the embedder leg. Per
-<a href="../federation.md"><code>docs/federation.md</code></a>:</p>
+<a href="../federation.html"><code>docs/federation.md</code></a>:</p>
 <ul>
 <li><strong>Transport</strong> — TLS + mTLS fingerprint allowlist
   (<code>ai-memory serve --tls-cert … --tls-key …
@@ -429,13 +429,13 @@ models do not compare. Roll out a model change fleet-wide:
 <ul>
 <li><a href="enterprise-cpu-memory-gpu.html">CPU + Memory + GPU sibling architecture</a>
   — including the when-to-choose-which table.</li>
-<li><a href="../v0.7.0/release-notes.md"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
+<li><a href="../v0.7.0/release-notes.html"><code>docs/v0.7.0/release-notes.md</code> §"Substrate-native API embeddings"</a>
   — the #1598 change inventory.</li>
-<li><a href="../CONFIG_SCHEMA.md"><code>docs/CONFIG_SCHEMA.md</code></a> — full <code>[embeddings]</code>
+<li><a href="../CONFIG_SCHEMA.html"><code>docs/CONFIG_SCHEMA.md</code></a> — full <code>[embeddings]</code>
   field reference + resolver precedence.</li>
-<li><a href="../federation.md"><code>docs/federation.md</code></a> — mTLS / X-API-Key / peer
+<li><a href="../federation.html"><code>docs/federation.md</code></a> — mTLS / X-API-Key / peer
   attestation hardening; quorum tuning tables.</li>
-<li><a href="../enterprise-deployment.md"><code>docs/enterprise-deployment.md</code></a> —
+<li><a href="../enterprise-deployment.html"><code>docs/enterprise-deployment.md</code></a> —
   tier-by-tier capacity / cost / SLA planning.</li>
 </ul>
 </main>

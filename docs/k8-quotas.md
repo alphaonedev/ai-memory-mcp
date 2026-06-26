@@ -236,7 +236,7 @@ row.
   the substrate's last line of defense, not the first. A misbehaving
   agent that consumes its quota in 30 seconds will still consume its
   quota in 30 seconds. Pair K8 with K9 governance rules
-  ([`docs/governance.md`](governance.md)) to refuse the *kind* of
+  ([`docs/governance.md`](governance.html)) to refuse the *kind* of
   write that's pathological, not just the volume.
 
 - **Anti-pattern B: "Raise the cap whenever an agent complains."**
@@ -345,16 +345,16 @@ SET current_storage_bytes = (
 WHERE agent_id = '<id>';
 ```
 
-See also: [`docs/MIGRATION_v0.7.md` §"K8 quota tool"](MIGRATION_v0.7.md),
+See also: [`docs/MIGRATION_v0.7.md` §"K8 quota tool"](MIGRATION_v0.7.html),
 the canonical inventory in
-[`docs/internal/v070-feature-inventory.md` §"Feature: K8 quota status tool"](internal/v070-feature-inventory.md),
+[`docs/internal/v070-feature-inventory.md` §"Feature: K8 quota status tool"](internal/v070-feature-inventory.html),
 the K9 governance pipeline that complements quota with rule-based
-refusal at [`docs/governance.md`](governance.md), the SSE-approvals
+refusal at [`docs/governance.md`](governance.html), the SSE-approvals
 path that surfaces governance refusals to operators at
-[`docs/k10-sse-approvals.md`](k10-sse-approvals.md), the hook pipeline
+[`docs/k10-sse-approvals.md`](k10-sse-approvals.html), the hook pipeline
 that gates pre-write decisions before quota check at
-[`docs/hook-pipeline.md`](hook-pipeline.md), the federated peer that
+[`docs/hook-pipeline.md`](hook-pipeline.html), the federated peer that
 quota-checks inbound writes per-peer at
-[`docs/federation.md`](federation.md), and the signed-events chain
+[`docs/federation.md`](federation.html), and the signed-events chain
 that records each quota refusal as an auditable event at
-[`docs/signed-events-v4.md`](signed-events-v4.md).
+[`docs/signed-events-v4.md`](signed-events-v4.html).

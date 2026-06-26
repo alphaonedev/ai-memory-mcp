@@ -21,9 +21,9 @@ layout: doc
 QW-3 context-offload, QW-4 Tencent competitive positioning). The API-UX
 review (synthesis finding API-12 HIGH; review doc lives in the
 review-api-ux worktree and is summarised in
-[`v070-review-synthesis.md`](v070-review-synthesis.md)) and the
+[`v070-review-synthesis.md`](v070-review-synthesis.html)) and the
 feature inventory open question #9 both flagged that QW-4 has no
-corresponding code path — it is the [`docs/positioning.md`](../positioning.md)
+corresponding code path — it is the [`docs/positioning.md`](../positioning.html)
 + cookbook update that situates the substrate against TencentDB Agent
 Memory. The earlier "4 QW items shipped" framing overcounts by 1 if a
 reader interprets "shipped" as "code-evidence implemented".
@@ -77,12 +77,12 @@ defer to v0.7.0.1 doc-only release) OR block tag-cut on the full
 sweep.
 
 **Decision.** **Ship the 6 net-new docs in v0.7.0** (Cluster H landed
-[`docs/hook-pipeline.md`](../hook-pipeline.md),
-[`docs/federation.md`](../federation.md),
-[`docs/k8-quotas.md`](../k8-quotas.md),
-[`docs/k10-sse-approvals.md`](../k10-sse-approvals.md),
-[`docs/sidechain-transcripts.md`](../sidechain-transcripts.md), and
-[`docs/signed-events-v4.md`](../signed-events-v4.md) as MVPs of
+[`docs/hook-pipeline.md`](../hook-pipeline.html),
+[`docs/federation.md`](../federation.html),
+[`docs/k8-quotas.md`](../k8-quotas.html),
+[`docs/k10-sse-approvals.md`](../k10-sse-approvals.html),
+[`docs/sidechain-transcripts.md`](../sidechain-transcripts.html), and
+[`docs/signed-events-v4.md`](../signed-events-v4.html) as MVPs of
 200-500 lines each per the synthesis spec, merged via PR #768). The
 additional 12-20 hours of long-form expansion (operator tutorials,
 production tuning runbooks, full troubleshooting decision trees) is
@@ -200,7 +200,7 @@ becomes the project standard.
 All net-new error tokens MUST use UPPER_SNAKE. Existing
 lowercase.dotted tokens are preserved verbatim for backwards compat
 (no wire-rename) and documented as legacy in
-[`docs/API_REFERENCE.md`](../API_REFERENCE.md) §"Error code conventions"
+[`docs/API_REFERENCE.md`](../API_REFERENCE.html) §"Error code conventions"
 with a static alias table. A best-effort CI grep gate
 (`scripts/lint-error-codes.sh`) flags new lowercase.dotted tokens in
 PR diffs.
@@ -241,7 +241,7 @@ paths for backwards compatibility; add aliases
 `POST /api/v1/family/load` and `POST /api/v1/family/smart_load` as
 the preferred form going forward.** Both forms route to the same
 handler. The current paths are documented as legacy in
-[`docs/API_REFERENCE.md`](../API_REFERENCE.md); the alias forms
+[`docs/API_REFERENCE.md`](../API_REFERENCE.html); the alias forms
 are listed first as the recommended shape. No `Deprecation` header
 is set in v0.7.0 (additive only); a header may follow in v0.8.0
 after an external-consumer audit.
@@ -305,6 +305,6 @@ No cluster H-2 or F-2 sub-split was required.
   ID (API-5, PERF-5, etc.) so a future auditor can reconstruct the
   decision chain from the six review docs (kept in their respective
   reviewer worktrees; rolled-up references live in
-  [`v070-review-synthesis.md`](v070-review-synthesis.md)).
+  [`v070-review-synthesis.md`](v070-review-synthesis.html)).
 
 — Cold mountain.

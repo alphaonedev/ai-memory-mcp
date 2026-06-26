@@ -37,7 +37,7 @@ layout: doc
 >
 > **Provenance:** Companion to #800 (Batman Mode activation), PR #801
 > (Cracks 1-6 + Form 7 fix + tests),
-> [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.md)
+> [`docs/internal/batman-framework-audit.md`](../internal/batman-framework-audit.html)
 > (PR #753 audit). Same model class.
 
 ## Summary (TL;DR for procurement)
@@ -322,7 +322,7 @@ close.
   — Strategic IP: distilled hot-path model.
 - Issue [#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)
   — Recursive-learning primitive.
-- [`docs/batman-active-mode.md`](../batman-active-mode.md) — Operator
+- [`docs/batman-active-mode.md`](../batman-active-mode.html) — Operator
   how-to (issue #800).
 - `docs/internal/batman-framework-audit.md` — Original PR #753 audit.
 

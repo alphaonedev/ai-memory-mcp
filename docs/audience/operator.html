@@ -98,7 +98,7 @@ sudo dnf install ai-memory</code></pre>
   <h3>cargo (any platform with Rust 1.96+)</h3>
   <pre><code>cargo install ai-memory</code></pre>
 
-  <p>Full matrix (Windows, .deb manual install, Docker, source) is in <a href="../INSTALL.md">INSTALL.md</a>.</p>
+  <p>Full matrix (Windows, .deb manual install, Docker, source) is in <a href="../INSTALL.html">INSTALL.md</a>.</p>
 
   <h3>Supported platforms (v0.8.0)</h3>
   <p>Build + test gates run on:</p>
@@ -109,7 +109,7 @@ sudo dnf install ai-memory</code></pre>
     <li><strong>iOS</strong> aarch64 (cross-compile gate, #1068; <code>aarch64-apple-ios</code> + simulator slices via <code>ai-memory-ios.xcframework.tar.gz</code>)</li>
     <li><strong>Android</strong> aarch64, armv7, x86, x86_64 (cross-compile gate, #1068; <code>jniLibs/&lt;abi&gt;/</code> layout via <code>ai-memory-android.tar.gz</code>)</li>
   </ul>
-  <p>Mobile coverage is layered: every PR + push exercises <code>cargo check --target {aarch64-apple-ios,aarch64-linux-android}</code> (~80% bit-rot coverage), <code>release/**</code> push triggers iOS Simulator + Android emulator runtime tests on the scoped ~50-test mobile subset (FTS5+WAL, HNSW CPU recall, embedder CPU path, LLM TLS handshake). Details: <a href="../v0.7.0/release-notes.md">release-notes.md</a> + <code>tests/mobile/README.md</code> in the repo.</p>
+  <p>Mobile coverage is layered: every PR + push exercises <code>cargo check --target {aarch64-apple-ios,aarch64-linux-android}</code> (~80% bit-rot coverage), <code>release/**</code> push triggers iOS Simulator + Android emulator runtime tests on the scoped ~50-test mobile subset (FTS5+WAL, HNSW CPU recall, embedder CPU path, LLM TLS handshake). Details: <a href="../v0.7.0/release-notes.html">release-notes.md</a> + <code>tests/mobile/README.md</code> in the repo.</p>
 </section>
 
 <section class="wrap-mid">
@@ -162,7 +162,7 @@ max_page_size        = 1000              # list/bulk/sync page-size cap (OOM gua
 
   <p>Bind address, port, and TLS are <code>serve</code> flags, not config fields: <code>ai-memory serve --host 127.0.0.1 --port 9077 --tls-cert /etc/ai-memory/tls.crt --tls-key /etc/ai-memory/tls.key</code> (add <code>--mtls-allowlist</code> for fingerprint-pinned client certs). When <code>api_key</code> is set, clients authenticate with the <code>x-api-key</code> request header &mdash; the canonical surface; the legacy <code>?api_key=</code> query parameter is deprecated (it leaks into access logs and proxies; see #1574).</p>
 
-  <p>Every knob &mdash; including the full environment-variable table, secret-vs-config classification, and precedence regression tests &mdash; is enumerated in <a href="../ADMIN_GUIDE.md">ADMIN_GUIDE.md</a> and <a href="../CONFIG_SCHEMA.md">CONFIG_SCHEMA.md</a>.</p>
+  <p>Every knob &mdash; including the full environment-variable table, secret-vs-config classification, and precedence regression tests &mdash; is enumerated in <a href="../ADMIN_GUIDE.html">ADMIN_GUIDE.md</a> and <a href="../CONFIG_SCHEMA.html">CONFIG_SCHEMA.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -209,7 +209,7 @@ WantedBy=multi-user.target</code></pre>
     <li><strong>append-only audit chain</strong> &mdash; per-event Ed25519-signed records under the configured audit dir. Replayable via <code>ai-memory audit verify</code>.</li>
     <li><strong>capabilities v3</strong> &mdash; <code>GET /api/v1/capabilities</code> returns pre-computed calibration strings for monitoring tooling. Never includes secrets.</li>
   </ul>
-  <p>Full surface in <a href="../telemetry.md">telemetry.md</a> and <a href="../signed-events-v4.md">signed-events-v4.md</a>.</p>
+  <p>Full surface in <a href="../telemetry.html">telemetry.md</a> and <a href="../signed-events-v4.html">signed-events-v4.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -227,7 +227,7 @@ WantedBy=multi-user.target</code></pre>
 
   <div class="callout warn"><strong>Override authority warning.</strong> Anyone who sets <code>AI_MEMORY_OPERATOR_PUBKEY</code> controls rule signing. Lock down host access; keep the operator key offline when possible.</div>
 
-  <p>Full hardening checklist: <a href="../SECURITY.md">SECURITY.md</a>.</p>
+  <p>Full hardening checklist: <a href="../SECURITY.html">SECURITY.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -243,7 +243,7 @@ WantedBy=multi-user.target</code></pre>
   -v /var/lib/ai-memory:/data \
   ghcr.io/alphaonedev/ai-memory:0.8.0</code></pre>
 
-  <p>Per-issue context (#845 hardened entrypoint, never-leak invariant): <a href="../integrations/README.md">integrations/README.md</a>.</p>
+  <p>Per-issue context (#845 hardened entrypoint, never-leak invariant): <a href="../integrations/README.html">integrations/README.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -256,7 +256,7 @@ WantedBy=multi-user.target</code></pre>
     <li>Validate post-upgrade: <code>ai-memory stats &amp;&amp; ai-memory audit verify</code>.</li>
     <li>Rollback (#1576): there is no migration downgrade path &mdash; forward-only by design. Stop the daemon, reinstall the previous binary, restore the pre-migration snapshot over the live file, restart. Writes that landed between migration and rollback are lost with the restore; drain traffic first if they matter.</li>
   </ul>
-  <p>Version-to-version upgrade notes: <a href="../MIGRATION_v0.7.md">MIGRATION_v0.7.md</a>, <a href="../v0.7.0/release-notes.md">v0.7.0 release notes</a>.</p>
+  <p>Version-to-version upgrade notes: <a href="../MIGRATION_v0.7.html">MIGRATION_v0.7.md</a>, <a href="../v0.7.0/release-notes.html">v0.7.0 release notes</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -265,9 +265,9 @@ WantedBy=multi-user.target</code></pre>
   <p>Every release ships with a public test campaign directory under <code>docs/v0.7.0/test-campaign-YYYY-MM-DD/</code>. The latest release-gate-final campaign (2026-05-22) verifies the operator-facing surfaces &mdash; install, configure, deploy, observe, harden, upgrade &mdash; against tip <code>fd172f2cf</code> post-22-issue fix batch (#1120-#1141, no v0.8.0 deferrals).</p>
   <div class="next">
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest campaign index</strong><span class="desc">2026-05-22 &middot; SHIP-RECOMMENDED &middot; 7,321 PASS / 0 FAIL</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-non-technical.md"><strong>For non-technical readers</strong><span class="desc">Plain-English verdict + what it means for you</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">Risk, cost, comparison, roadmap</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, per-issue root-cause</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-non-technical.html"><strong>For non-technical readers</strong><span class="desc">Plain-English verdict + what it means for you</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.html"><strong>For decision-makers</strong><span class="desc">Risk, cost, comparison, roadmap</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.html"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, per-issue root-cause</span></a>
   </div>
 </section>
 
@@ -275,14 +275,14 @@ WantedBy=multi-user.target</code></pre>
   <div class="eyebrow-h2">Next</div>
   <h2>Where to go from here.</h2>
   <div class="next">
-    <a href="../ADMIN_GUIDE.md"><strong>Admin guide</strong><span class="desc">Full operator reference</span></a>
-    <a href="../SECURITY.md"><strong>Security posture</strong><span class="desc">Threat model + hardening</span></a>
-    <a href="../TROUBLESHOOTING.md"><strong>Troubleshooting</strong><span class="desc">Common errors</span></a>
-    <a href="../production-deployment.md"><strong>Production checklist</strong><span class="desc">Pre-flight before go-live</span></a>
-    <a href="../telemetry.md"><strong>Telemetry</strong><span class="desc">Metrics + tracing surface</span></a>
-    <a href="../signed-events-v4.md"><strong>Signed events</strong><span class="desc">Audit chain spec</span></a>
+    <a href="../ADMIN_GUIDE.html"><strong>Admin guide</strong><span class="desc">Full operator reference</span></a>
+    <a href="../SECURITY.html"><strong>Security posture</strong><span class="desc">Threat model + hardening</span></a>
+    <a href="../TROUBLESHOOTING.html"><strong>Troubleshooting</strong><span class="desc">Common errors</span></a>
+    <a href="../production-deployment.html"><strong>Production checklist</strong><span class="desc">Pre-flight before go-live</span></a>
+    <a href="../telemetry.html"><strong>Telemetry</strong><span class="desc">Metrics + tracing surface</span></a>
+    <a href="../signed-events-v4.html"><strong>Signed events</strong><span class="desc">Audit chain spec</span></a>
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest test campaign</strong><span class="desc">2026-05-22 SHIP-RECOMMENDED evidence</span></a>
-    <a href="../federation.md"><strong>Federation</strong><span class="desc">Multi-node sync</span></a>
+    <a href="../federation.html"><strong>Federation</strong><span class="desc">Multi-node sync</span></a>
     <a href="../reference-architecture/"><strong>Grand Slam reference architecture</strong><span class="desc">15-node, 3-region hive &middot; proven live (do-1461)</span></a>
     <a href="../reference-architecture/enterprise-cpu-memory.html"><strong>Enterprise &mdash; CPU+Memory nodes</strong><span class="desc">API embeddings (#1598) &middot; cloud or airgapped TEI/vLLM &middot; no Ollama</span></a>
     <a href="../reference-architecture/enterprise-cpu-memory-gpu.html"><strong>Enterprise &mdash; CPU+Memory+GPU nodes</strong><span class="desc">Local Ollama embeddings on GPU nodes &middot; operator GPU policy</span></a>

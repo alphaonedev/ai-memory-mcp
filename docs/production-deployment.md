@@ -5,7 +5,7 @@ layout: doc
 
 **Audience:** operators standing up `ai-memory` for real workloads — single-instance, hub-spoke teams, or W-of-N federations. **Reading time:** 10 minutes.
 
-This guide collects the must-do steps for a hardened deployment. It assumes you have the binary on disk (`brew install alphaonedev/tap/ai-memory`, `cargo install ai-memory`, `sudo dpkg -i ai-memory_<ver>_<arch>.deb` from the GH release, COPR `dnf install ai-memory`, or `docker pull ghcr.io/alphaonedev/ai-memory:latest`) and a host with persistent storage. For the threat model and disclosure policy see [`SECURITY.md`](../SECURITY.md). For telemetry and observability see [`telemetry.md`](telemetry.md).
+This guide collects the must-do steps for a hardened deployment. It assumes you have the binary on disk (`brew install alphaonedev/tap/ai-memory`, `cargo install ai-memory`, `sudo dpkg -i ai-memory_<ver>_<arch>.deb` from the GH release, COPR `dnf install ai-memory`, or `docker pull ghcr.io/alphaonedev/ai-memory:latest`) and a host with persistent storage. For the threat model and disclosure policy see [`SECURITY.md`](../SECURITY.md). For telemetry and observability see [`telemetry.md`](telemetry.html).
 
 ---
 
@@ -75,7 +75,7 @@ curl -H "x-api-key: $KEY" http://127.0.0.1:9077/api/v1/stats   # supported
 curl "http://127.0.0.1:9077/api/v1/stats?api_key=$KEY"         # deprecated — logs capture it
 ```
 
-mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*` only (they have already cleared a stronger gate; see [`federation.md`](federation.md)).
+mTLS-authenticated federation peers bypass the api-key check on `/api/v1/sync/*` only (they have already cleared a stronger gate; see [`federation.md`](federation.html)).
 
 ---
 
@@ -107,7 +107,7 @@ Backup cadence target: hourly snapshots, 48-hour rotation, weekly off-host trans
 
 Migrations are forward-only and run automatically on the first daemon start after an upgrade. There is no offline migration step. The substrate refuses to start against a database newer than the binary expects (downgrade refusal) and progresses through every intermediate version on upgrade — never skips.
 
-**Forward-only is by design; snapshot-restore is the rollback** ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576)). Before any schema-mutating upgrade runs, the binary automatically snapshots the live SQLite file as a sibling of the database: `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak` (`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`). The snapshot is produced with `VACUUM INTO` — transactionally consistent, folds pending WAL frames, inherits the source's SQLCipher keying — and the migration refuses to mutate the schema if the snapshot fails. To roll back: stop the daemon, reinstall the previous binary, copy the `.pre-migration-…bak` snapshot over the live DB file (removing stale `-wal`/`-shm` siblings), and start. See [`ADMIN_GUIDE.md` §Migration](ADMIN_GUIDE.md) for the step-by-step procedure.
+**Forward-only is by design; snapshot-restore is the rollback** ([#1576](https://github.com/alphaonedev/ai-memory-mcp/issues/1576)). Before any schema-mutating upgrade runs, the binary automatically snapshots the live SQLite file as a sibling of the database: `<db-file>.pre-migration-v<FROM>-to-v<TO>-<token>.bak` (`snapshot_before_migration` / `PRE_MIGRATION_BACKUP_INFIX` in `src/storage/migrations.rs`). The snapshot is produced with `VACUUM INTO` — transactionally consistent, folds pending WAL frames, inherits the source's SQLCipher keying — and the migration refuses to mutate the schema if the snapshot fails. To roll back: stop the daemon, reinstall the previous binary, copy the `.pre-migration-…bak` snapshot over the live DB file (removing stale `-wal`/`-shm` siblings), and start. See [`ADMIN_GUIDE.md` §Migration](ADMIN_GUIDE.html) for the step-by-step procedure.
 
 There is no offline dry-run preview for the schema ladder itself (the existing `ai-memory migrate --dry-run` in `--features sal` builds is the *cross-backend copy tool*, not a schema-migration preview). The recommended workflow on a major-version upgrade is:
 
@@ -128,7 +128,7 @@ Out-of-the-box observability lands in three places:
 - **File logging.** Opt-in via `[logging]` in `config.toml` (path, rotation size, retention days, `structured = true` for JSON). Routes to a rotating appender; off by default.
 - **`ai-memory doctor`.** A 10-section health dashboard run locally at v0.7.x: Storage / Index / Recall / Governance / Sync / Webhook / Capabilities / Reflection Health / LLM Reachability (#1146) / Embeddings Reachability (#1598). Nothing leaves the host except the opt-in reachability probes against your configured LLM / embedding backends.
 
-Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 25 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.md)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.md).
+Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc. — 25 lifecycle events, see [`hook-pipeline.md`](hook-pipeline.html)) are the supported extension surface for routing events to a SIEM, paging an operator, or short-circuiting writes. See [`docs/integrations/`](integrations/) and [`telemetry.md`](telemetry.html).
 
 ---
 
@@ -138,7 +138,7 @@ Hooks (`pre_store`, `post_store`, `post_recall`, `pre_governance_decision`, etc.
 
 **Hub-spoke (team).** One PostgreSQL+AGE hub, N spoke agents pushing federated memories on a schedule. The hub is the source of truth for cross-agent recall; spokes hold their own local SQLite for offline work. mTLS allowlist on the hub names every spoke; spokes have an allowlist of one entry (the hub).
 
-**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.md); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. CRDT-based eventual consistency by default; opt-in MVCC strict-consistency mode ships in v1.0.
+**W-of-N federation.** Three or more peers, each holding its own SQLite, mesh-federating writes with a quorum commit requiring the local write plus W−1 peer acknowledgements within `--quorum-timeout-ms` before the write returns OK (per [`ADR-0001`](ADR-0001-quorum-replication.html); per-message Ed25519 signing rides on `AI_MEMORY_FED_REQUIRE_SIG`). Default 2000 ms assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 ms — the do-1461 reference deployment uses 8000 (#1565). Resolves the "any single operator can rewrite history" problem. CRDT-based eventual consistency by default; opt-in MVCC strict-consistency mode ships in v1.0.
 
 Sizing guide (Apple M2, 16 GB, SQLite reference):
 
@@ -198,7 +198,7 @@ config's `env:` block. Copy-pasteable per-backend recipes (Ollama,
 LMStudio, vLLM, llama.cpp server, xAI, OpenAI, Anthropic, Gemini,
 DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter,
 Fireworks) + multi-agent / multi-DC / fleet considerations:
-[`integrations/llm-backends.md`](integrations/llm-backends.md).
+[`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 Fleet rollout pattern (systemd):
 
@@ -240,11 +240,11 @@ macOS launchd (curator daemon) pattern:
 ```
 
 The full curator plist (ProgramArguments, KeepAlive, ProcessType) lives
-in [`batman-active-mode.md` § Making it permanent](batman-active-mode.md#making-it-permanent).
+in [`batman-active-mode.md` § Making it permanent](batman-active-mode.html#making-it-permanent).
 
 For multi-DC deployments with regional cloud LLM endpoints, override
 the per-alias default URL with `AI_MEMORY_LLM_BASE_URL`. See
-[`integrations/llm-backends.md` § Multi-DC / multi-region](integrations/llm-backends.md#multi-dc--multi-region--regional-cloud-endpoints).
+[`integrations/llm-backends.md` § Multi-DC / multi-region](integrations/llm-backends.html#multi-dc--multi-region--regional-cloud-endpoints).
 
 ---
 
@@ -276,7 +276,7 @@ Rollback: stop the daemon, restore the pre-upgrade snapshot, downgrade the binar
 ## See also
 
 - [`SECURITY.md`](../SECURITY.md) — threat model, disclosure policy
-- [`telemetry.md`](telemetry.md) — what the binary emits, where it goes, what it does not do
-- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — SQLite-to-Postgres migration
-- [`RUNBOOK-chaos-campaign.md`](RUNBOOK-chaos-campaign.md) — operator drill for partition + power-loss recovery
+- [`telemetry.md`](telemetry.html) — what the binary emits, where it goes, what it does not do
+- [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) — SQLite-to-Postgres migration
+- [`RUNBOOK-chaos-campaign.md`](RUNBOOK-chaos-campaign.html) — operator drill for partition + power-loss recovery
 - [`../cookbook/production-deployment/01-secure-bootstrap.sh`](../cookbook/production-deployment/01-secure-bootstrap.sh) — runnable end-to-end demo of Sections 2-4 + 7

@@ -13,9 +13,9 @@ layout: doc
 > `ai-memory serve` continues to work exactly as it did in v0.6.x. The
 > postgres path is opt-in.
 >
-> See also: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
+> See also: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html)
 > for the sqlite → postgres migration runbook, and
-> [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.md) for
+> [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.html) for
 > the adapter-selection design notes.
 
 ## Why postgres+AGE
@@ -810,8 +810,8 @@ parity test is the gate that prevents it.
 
 - Apache AGE 1.7.0 docs: https://age.apache.org/
 - pgvector 0.8.2 docs: https://github.com/pgvector/pgvector
-- ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.md)
+- ai-memory v0.7.0 release notes: [`v0.7.0/release-notes.md`](v0.7.0/release-notes.html)
 - A2A campaign Pages: https://alphaonedev.github.io/ai-memory-a2a-v0.7.0/
-- Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.md)
-- Migration runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md)
+- Adapter-selection design: [`RUNBOOK-adapter-selection.md`](RUNBOOK-adapter-selection.html)
+- Migration runbook: [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html)
 - F6 issue (in-flight Wave 1 closure): https://github.com/alphaonedev/ai-memory-mcp/issues/646

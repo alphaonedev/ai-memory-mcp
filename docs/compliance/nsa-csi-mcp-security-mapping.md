@@ -7,7 +7,7 @@ layout: doc
 **Date:** 2026-05-23.
 **ai-memory version:** v0.7.0 (sqlite + postgres schema **v57**, lockstep).
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json) (27 capabilities, every claim codegraph-verified at commit `4add7a8528d4c16d696b391ec6e2890269669a84`).
-**Companion document:** [`docs/compliance/honest-limitations.md`](honest-limitations.md) — what the substrate does NOT defend against.
+**Companion document:** [`docs/compliance/honest-limitations.md`](honest-limitations.html) — what the substrate does NOT defend against.
 
 **Reference document:** *Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation*, National Security Agency, Cybersecurity Information, U/OO/6030316-26 | PP-26-1834, May 2026, Version 1.0.
 
@@ -120,7 +120,7 @@ The NSA document recommends MCP servers validate every parameter at every wire e
 
 ### 4.4 Constrain and sandbox tool execution (NSA recommendation d)
 
-The NSA document recommends sandboxing tool execution to limit blast radius. ai-memory's substrate-level sandboxing composes the Track G hook pipeline with its `Allow / Modify / Deny / AskUser` decision contract (default-off; `~/.config/ai-memory/hooks.toml` is the operator-controlled allowlist); per-namespace `standard_policy` memory pointers landed by Batman Mode Crack 1 (#800) so each namespace may carry its own governance policy; and the K9 permissions engine consulted on every write that proposes an agent-EXTERNAL action. Process-level sandboxing (containerisation, seccomp, OS-level isolation) is operator-deployment territory; the substrate publishes recommendations in the [`docs/compliance/honest-limitations.md`](honest-limitations.md) §"Mitigations the substrate recommends".
+The NSA document recommends sandboxing tool execution to limit blast radius. ai-memory's substrate-level sandboxing composes the Track G hook pipeline with its `Allow / Modify / Deny / AskUser` decision contract (default-off; `~/.config/ai-memory/hooks.toml` is the operator-controlled allowlist); per-namespace `standard_policy` memory pointers landed by Batman Mode Crack 1 (#800) so each namespace may carry its own governance policy; and the K9 permissions engine consulted on every write that proposes an agent-EXTERNAL action. Process-level sandboxing (containerisation, seccomp, OS-level isolation) is operator-deployment territory; the substrate publishes recommendations in the [`docs/compliance/honest-limitations.md`](honest-limitations.html) §"Mitigations the substrate recommends".
 
 ### 4.5 Sign and verify MCP messages (NSA recommendation e)
 
@@ -153,16 +153,16 @@ The NSA document cites five real-world incident classes plus the specific CVE-20
 **Posture:** out_of_scope at the substrate; consumer_responsibility at the messaging-platform layer. The substrate provides per-row provenance attribution (so a memory written via a WhatsApp-bridge MCP client is attributable to that client), but the substrate does not mediate WhatsApp's message-transport security. Consumers wiring messaging-platform agents to ai-memory must apply the platform's own session-security gates.
 
 ### 5.5 Poisoning output for downstream automation
-**Posture:** structurally_addressed via Seven-Gap Gap 7 verbose-provenance recall decoration; tightened by v0.7.x #1155 (`Accept-Provenance` capability negotiation). The substrate exposes Form 4 citations, Form 5 ConfidenceTier, and Form 6 MemoryKind on every verbose recall envelope; downstream consumers may weight signals by these provenance tags before applying outputs. Honest framing: substrate exposes; consumer must read. A downstream LLM that ignores ConfidenceTier and treats every recall result as ground truth bypasses the substrate's defense; that failure mode is documented in [`honest-limitations.md`](honest-limitations.md).
+**Posture:** structurally_addressed via Seven-Gap Gap 7 verbose-provenance recall decoration; tightened by v0.7.x #1155 (`Accept-Provenance` capability negotiation). The substrate exposes Form 4 citations, Form 5 ConfidenceTier, and Form 6 MemoryKind on every verbose recall envelope; downstream consumers may weight signals by these provenance tags before applying outputs. Honest framing: substrate exposes; consumer must read. A downstream LLM that ignores ConfidenceTier and treats every recall result as ground truth bypasses the substrate's defense; that failure mode is documented in [`honest-limitations.md`](honest-limitations.html).
 
 ### 5.6 CVE-2025-49596 RCE in MCP-Inspector
-**Posture:** structurally_addressed by `substrate_native_verify_family`. ai-memory ships three substrate-native inspection subcommands (`ai-memory verify-reflection-chain`, `verify-signed-events-chain`, `verify-forensic-bundle`) that do NOT use Anthropic's separate MCP-Inspector toolchain. Substrate operators using these verifiers are not vulnerable to CVE-2025-49596. Operators running the separate MCP-Inspector against ai-memory inherit that tool's vulnerabilities; [`honest-limitations.md`](honest-limitations.md) §"Mitigations the substrate recommends" calls this out explicitly.
+**Posture:** structurally_addressed by `substrate_native_verify_family`. ai-memory ships three substrate-native inspection subcommands (`ai-memory verify-reflection-chain`, `verify-signed-events-chain`, `verify-forensic-bundle`) that do NOT use Anthropic's separate MCP-Inspector toolchain. Substrate operators using these verifiers are not vulnerable to CVE-2025-49596. Operators running the separate MCP-Inspector against ai-memory inherit that tool's vulnerabilities; [`honest-limitations.md`](honest-limitations.html) §"Mitigations the substrate recommends" calls this out explicitly.
 
 ---
 
 ## 6. Honest limitations
 
-The substrate addresses the NSA-enumerated concerns structurally but does NOT defend against every threat class. Operator responsibility, deployment-layer concerns, and genuine substrate boundaries are documented separately in [`docs/compliance/honest-limitations.md`](honest-limitations.md). Federal procurement reviewers should read both documents in sequence — the mapping (this document) and the limitations companion — to form a complete picture of substrate coverage.
+The substrate addresses the NSA-enumerated concerns structurally but does NOT defend against every threat class. Operator responsibility, deployment-layer concerns, and genuine substrate boundaries are documented separately in [`docs/compliance/honest-limitations.md`](honest-limitations.html). Federal procurement reviewers should read both documents in sequence — the mapping (this document) and the limitations companion — to form a complete picture of substrate coverage.
 
 The limitations document is part of ai-memory v0.7.0's procurement-grade evidence pair and follows the substrate's honesty discipline established in the v0.6.3.1 capabilities-v2 honesty patch. No marketing language, no aspirational coverage claims, no fabricated quotes from the NSA document.
 

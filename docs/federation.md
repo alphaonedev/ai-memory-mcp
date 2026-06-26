@@ -9,7 +9,7 @@ layout: doc
 > short-lived credential** system that replaces O(N²) manual `.pub`
 > enrollment with O(1) "trust the CA" — the enterprise zero-touch trust
 > capability that scales a fleet from 1 to ~1,000,000 agents — is
-> documented in **[`docs/federation-identity.md`](federation-identity.md)**.
+> documented in **[`docs/federation-identity.md`](federation-identity.html)**.
 > The two layers compose: mTLS is the transport boundary, zero-touch
 > credentials are the application identity carried *inside* it.
 
@@ -60,7 +60,7 @@ When set, every endpoint except `/api/v1/health` requires the
 `?api_key=` query-parameter form is deprecated at v0.7.0 and slated
 for v0.8 rejection; see
 [#1574](https://github.com/alphaonedev/ai-memory-mcp/issues/1574) and
-[`production-deployment.md` §3b](production-deployment.md).) When the
+[`production-deployment.md` §3b](production-deployment.html).) When the
 mTLS allowlist is enforced, the `/api/v1/sync/*` federation endpoints
 bypass the API-key check ([#702](https://github.com/alphaonedev/ai-memory-mcp/issues/702)
 — the peer has already cleared a stronger transport-layer gate, and
@@ -357,7 +357,7 @@ one author no longer 429-stalls into the DLQ (the daily write-count
 quota remains the control on the AUTHORING node's write path).
 Quarantined rows are never silently dropped; no CLI drain
 surface ships at v0.7.0 — the data-layer drain procedure lives in
-[`docs/TROUBLESHOOTING.md` §federation-push-DLQ](TROUBLESHOOTING.md).
+[`docs/TROUBLESHOOTING.md` §federation-push-DLQ](TROUBLESHOOTING.html).
 
 **Reflection-depth interop.** When peers run different
 `max_reflection_depth` settings, the `enforce_local_cap_on_derived`
@@ -412,7 +412,7 @@ Operator procedure:
    re-adding both the fingerprint AND the attestation row.
 6. **Audit the signed_events chain** with
    `ai-memory verify-signed-events-chain` (see
-   [`docs/signed-events-v4.md`](signed-events-v4.md)) over the window
+   [`docs/signed-events-v4.md`](signed-events-v4.html)) over the window
    the revoked peer had access. Tamper detection on the chain bounds
    the blast radius.
 
@@ -488,7 +488,7 @@ production daemon will refuse the same attack shapes.
   dead column — v0.7.0 fills it via the Ed25519 attestation
   track (H1-H6). Inbound federation re-verifies link signatures via
   `POST /api/v1/links/verify`; see
-  [`docs/signed-events-v4.md`](signed-events-v4.md) for the V-4
+  [`docs/signed-events-v4.md`](signed-events-v4.html) for the V-4
   audit chain that records each verification outcome.
 - The peer attestation work (#238) added body-vs-header claim
   cross-checking. The scope-filter work (#239) added per-peer
@@ -496,20 +496,20 @@ production daemon will refuse the same attack shapes.
   test binaries.
 
 See also: the **zero-touch CA-rooted trust** companion at
-[`docs/federation-identity.md`](federation-identity.md) (the O(1)
+[`docs/federation-identity.md`](federation-identity.html) (the O(1)
 credential system layered on top of this hardening),
-[`docs/MIGRATION_v0.7.md` §"Federation hardening"](MIGRATION_v0.7.md#federation-hardening),
+[`docs/MIGRATION_v0.7.md` §"Federation hardening"](MIGRATION_v0.7.html#federation-hardening),
 the canonical inventory in
-[`docs/internal/v070-feature-inventory.md` §"Feature: Federation hardening"](internal/v070-feature-inventory.md),
+[`docs/internal/v070-feature-inventory.md` §"Feature: Federation hardening"](internal/v070-feature-inventory.html),
 the V-4 audit chain that records peer-write events at
-[`docs/signed-events-v4.md`](signed-events-v4.md), the governance
+[`docs/signed-events-v4.md`](signed-events-v4.html), the governance
 pipeline that consumes federated rule writes at
-[`docs/governance.md`](governance.md), the hook pipeline that fires
+[`docs/governance.md`](governance.html), the hook pipeline that fires
 on every inbound peer write at
-[`docs/hook-pipeline.md`](hook-pipeline.md), the K8 quotas substrate
+[`docs/hook-pipeline.md`](hook-pipeline.html), the K8 quotas substrate
 that gates inbound peer writes per claimed agent_id at
-[`docs/k8-quotas.md`](k8-quotas.md), the K10 SSE approvals path that
+[`docs/k8-quotas.md`](k8-quotas.html), the K10 SSE approvals path that
 streams federated approval requests at
-[`docs/k10-sse-approvals.md`](k10-sse-approvals.md), and the sidechain
+[`docs/k10-sse-approvals.md`](k10-sse-approvals.html), and the sidechain
 transcripts whose decompression cap protects against peer zstd-bomb
-DOS at [`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
+DOS at [`docs/sidechain-transcripts.md`](sidechain-transcripts.html).

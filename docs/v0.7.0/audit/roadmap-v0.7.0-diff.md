@@ -4,7 +4,7 @@ layout: doc
 # ROADMAP.md ↔ v0.7.0 Source Reconciliation Diff
 
 **Branch:** `release/v0.7.0` · **Tracking issue:** [#1448](https://github.com/alphaonedev/ai-memory-mcp/issues/1448)
-**Inputs:** [`v0.7.0-capability-audit.md`](./v0.7.0-capability-audit.md) (Doc 1, source-verified) ×
+**Inputs:** [`v0.7.0-capability-audit.md`](./v0.7.0-capability-audit.html) (Doc 1, source-verified) ×
 [`../../../ROADMAP.md`](../../../ROADMAP.md) (1096 lines, 2026-05-27 revision).
 
 This is **Document 2 of 3**. It classifies every release-bearing ROADMAP item against
@@ -203,4 +203,4 @@ corrects the drift the DONE verification surfaced.
 
 ---
 
-*Generated for #1448. Companion to [`v0.7.0-capability-audit.md`](./v0.7.0-capability-audit.md).*
+*Generated for #1448. Companion to [`v0.7.0-capability-audit.md`](./v0.7.0-capability-audit.html).*

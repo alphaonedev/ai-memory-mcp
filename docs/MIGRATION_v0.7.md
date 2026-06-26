@@ -5,7 +5,7 @@ layout: doc
 
 **v0.7.0 — `attested-cortex`** rolls together the v0.6.5 cortex-fluent legibility work with ROADMAP §7.3's full v0.7 trust + A2A maturity scope, **plus** (per operator directive 2026-05-09) the originally-v0.7.1 postgres+AGE first-class work, **plus** the post-grand-slam ship-readiness wave (Batman Forms 1-6 + 7th-form Option-B foundation + QW-1/2/3 + reconciliation security sweep). The substrate becomes both **more articulate** (capabilities v3, named loaders, compacted schemas, Batman `MemoryKind` vocabulary, persona/atomisation/multistep-ingest primitives) and **cryptographically trustworthy** (Ed25519 attestation, sidechain transcripts, programmable 25-event hook pipeline, enforced namespace inheritance, V-4 cross-row signed-events hash chain).
 
-> **Status:** Released 2026-05-15 at HEAD `c9472c1`. v0.7.0 closes the `attested-cortex` epic at 69/69 tasks across 11 tracks (A/B/C/D/E/F/G/H/I/J/K), plus the grand-slam recursive-learning + Agent Skills + L1-6 substrate-rules wave, plus the post-grand-slam Forms 1-6 + 7th-form + QW closeout (PRs [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-[#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766)). See [`CHANGELOG.md`](../CHANGELOG.md) for the full release entry and [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.md) for the per-area walk-through. The canonical post-grand-slam feature truth lives at [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
+> **Status:** Released 2026-05-15 at HEAD `c9472c1`. v0.7.0 closes the `attested-cortex` epic at 69/69 tasks across 11 tracks (A/B/C/D/E/F/G/H/I/J/K), plus the grand-slam recursive-learning + Agent Skills + L1-6 substrate-rules wave, plus the post-grand-slam Forms 1-6 + 7th-form + QW closeout (PRs [#761](https://github.com/alphaonedev/ai-memory-mcp/pull/761)-[#766](https://github.com/alphaonedev/ai-memory-mcp/pull/766)). See [`CHANGELOG.md`](../CHANGELOG.md) for the full release entry and [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.html) for the per-area walk-through. The canonical post-grand-slam feature truth lives at [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html).
 
 ---
 
@@ -15,27 +15,27 @@ layout: doc
 |---|---|---|---|
 | Capabilities v3 | `summary`, `to_describe_to_user`, `callable_now`, `agent_permitted_families`, `schema_version="3"` | Returned alongside v2 fields | Read v3 fields if present; v2 unchanged |
 | Loader tools | `memory_load_family`, `memory_smart_load` join `core` | **Always-on under `--profile core`** (now 7 tools, was 5) | Replace `memory_capabilities --include-schema` ergonomics |
-| Hook pipeline | **25 lifecycle events**, exec + daemon modes | **No change** — no hooks fire | `~/.config/ai-memory/hooks.toml` ([doc](hook-pipeline.md)) |
+| Hook pipeline | **25 lifecycle events**, exec + daemon modes | **No change** — no hooks fire | `~/.config/ai-memory/hooks.toml` ([doc](hook-pipeline.html)) |
 | Ed25519 attestation | Per-agent keypair, link signing, `attest_level` enum, `signed_events` audit table | `attest_level = "unsigned"` for legacy callers | `ai-memory identity generate` |
-| Signed-events V-4 chain | Cross-row `prev_hash` + `sequence` SHA-256 chain | On for new daemons (backfilled by `migrate_v34_backfill_chain`) | `ai-memory verify-signed-events-chain` ([doc](signed-events-v4.md)) |
-| Sidechain transcripts | zstd-3 BLOB store, `memory_transcript_links`, `memory_replay` | Off | `[transcripts]` config per namespace ([doc](sidechain-transcripts.md)) |
+| Signed-events V-4 chain | Cross-row `prev_hash` + `sequence` SHA-256 chain | On for new daemons (backfilled by `migrate_v34_backfill_chain`) | `ai-memory verify-signed-events-chain` ([doc](signed-events-v4.html)) |
+| Sidechain transcripts | zstd-3 BLOB store, `memory_transcript_links`, `memory_replay` | Off | `[transcripts]` config per namespace ([doc](sidechain-transcripts.html)) |
 | Apache AGE acceleration | Cypher backend for KG ops, `memory_find_paths` | SQLite/CTE path unchanged | Install AGE Postgres extension |
 | Postgres-first SAL | `ai-memory serve --store-url postgres://…`, `ai-memory schema-init` | Sqlite default unchanged | Build with `--features sal-postgres` |
 | G1 inheritance enforcement | `resolve_governance_policy` walks the namespace chain | **Behavior change** for pre-v0.6.3.1 v0.6.x users | Per-policy `inherit: bool` (default `true`) |
-| Permission system | Refactored governance with rules + modes + hooks → decision | `permissions.mode = "enforce"` (was `"advisory"` in v0.6.4) | `ai-memory governance migrate-to-permissions` ([doc](governance.md)) |
-| Federation hardening | mTLS + X-API-Key + fingerprint allowlist | Same as v0.6.4 if not configured | Three new `AI_MEMORY_FED_*` env vars ([doc](federation.md)) |
-| K8 quota tool | `memory_quota_status` + `/api/v1/quota/status` | Per-agent daily quota tracked, surfaced on demand | [doc](k8-quotas.md) |
-| K10 SSE approvals | `/api/v1/approvals/stream` with mandatory HMAC | Off when `permissions.mode = "off"` | [doc](k10-sse-approvals.md) |
+| Permission system | Refactored governance with rules + modes + hooks → decision | `permissions.mode = "enforce"` (was `"advisory"` in v0.6.4) | `ai-memory governance migrate-to-permissions` ([doc](governance.html)) |
+| Federation hardening | mTLS + X-API-Key + fingerprint allowlist | Same as v0.6.4 if not configured | Three new `AI_MEMORY_FED_*` env vars ([doc](federation.html)) |
+| K8 quota tool | `memory_quota_status` + `/api/v1/quota/status` | Per-agent daily quota tracked, surfaced on demand | [doc](k8-quotas.html) |
+| K10 SSE approvals | `/api/v1/approvals/stream` with mandatory HMAC | Off when `permissions.mode = "off"` | [doc](k10-sse-approvals.html) |
 | Batman Form 1 (online dedup-and-synthesis) | Single-batch action-emitting LLM on store | Opt-IN via existing autonomy flag | `legacy_per_pair_classifier = true` to revert |
-| Batman Form 2 (synchronous atomise) | `memory_atomise` MCP tool + pre-store hook | `auto_atomise_mode = Off` default | `Synchronous | Deferred` ([doc](atomisation.md)) |
-| Batman Form 3 (multi-step ingest) | `memory_ingest_multistep` MCP tool | Caller-driven | [doc](multistep-ingest.md) |
-| Batman Form 4 (fact provenance) | Citations + source-URI + atom-grain spans | Caller-driven via `memory_store` payload | [doc](provenance.md) |
-| Batman Form 5 (auto-confidence) | `memory_calibrate_confidence` MCP tool | Shadow mode by default | Four `AI_MEMORY_CONFIDENCE_*` env vars ([doc](confidence-calibration.md)) |
-| Batman Form 6 (MemoryKind vocab) | 10-variant enum, optional auto-classify pre-store hook | `auto_classify_kind = off` default | `regex_only \| regex_then_llm` ([doc](memory-kind-vocab.md)) |
+| Batman Form 2 (synchronous atomise) | `memory_atomise` MCP tool + pre-store hook | `auto_atomise_mode = Off` default | `Synchronous | Deferred` ([doc](atomisation.html)) |
+| Batman Form 3 (multi-step ingest) | `memory_ingest_multistep` MCP tool | Caller-driven | [doc](multistep-ingest.html) |
+| Batman Form 4 (fact provenance) | Citations + source-URI + atom-grain spans | Caller-driven via `memory_store` payload | [doc](provenance.html) |
+| Batman Form 5 (auto-confidence) | `memory_calibrate_confidence` MCP tool | Shadow mode by default | Four `AI_MEMORY_CONFIDENCE_*` env vars ([doc](confidence-calibration.html)) |
+| Batman Form 6 (MemoryKind vocab) | 10-variant enum, optional auto-classify pre-store hook | `auto_classify_kind = off` default | `regex_only \| regex_then_llm` ([doc](memory-kind-vocab.html)) |
 | Batman 7th-form (Layer-4 wiring) | Operator-signed rules `R001..R004`, `memory_check_agent_action`, `memory_rule_list` | Substrate-INTERNAL writes gated; agent-EXTERNAL `callable_now` flag | v0.8.0 full cover per [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697) |
 | QW-1 file-backed reflection export | `memory_export_reflection` MCP tool | Opt-IN per namespace | `auto_export_reflections_to_filesystem = true` |
-| QW-2 persona-as-artifact | `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` | Opt-IN per namespace | `auto_persona_trigger_every_n_memories = N` ([doc](persona.md)) |
-| QW-3 context-offload primitive | `memory_offload` + `memory_deref` tools | Caller-driven | [doc](context-offload.md) |
+| QW-2 persona-as-artifact | `memory_persona` + `memory_persona_generate` tools, `MemoryKind::Persona` | Opt-IN per namespace | `auto_persona_trigger_every_n_memories = N` ([doc](persona.html)) |
+| QW-3 context-offload primitive | `memory_offload` + `memory_deref` tools | Caller-driven | [doc](context-offload.html) |
 | Provider-agnostic LLM substrate ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) | `LlmProvider::OpenAiCompatible` wire shape, 15 vendor aliases, `OllamaClient::from_env()` | Backend defaults to `ollama` if `AI_MEMORY_LLM_BACKEND` unset — every v0.6.4 caller keeps working | Set `AI_MEMORY_LLM_BACKEND` + (alias-specific) API key env var to route the smart / autonomous tier to any of xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp |
 | Mobile target CI ([#1068](https://github.com/alphaonedev/ai-memory-mcp/issues/1068)) | `aarch64-apple-ios` + `aarch64-linux-android` cross-compile gates, iOS xcframework + Android jniLibs release artifacts, simulator/emulator runtime tests | No change for desktop deploys | Consume `ai-memory-ios.xcframework.tar.gz` + `ai-memory-android.tar.gz` release artifacts; C-ABI FFI surface itself lands v0.7.x |
 
@@ -49,7 +49,7 @@ v0.7.0 closes three long-standing gaps at once.
 
 **Trust gap (attested):** v0.6.3 left an Ed25519 `signature` column in `memory_links` that nothing populated (the v0.6.3 audit's "dead column" finding). Hook events were advertised via subscriptions but lifecycle hooks weren't programmable. Permissions were advisory, not enforced. Namespace inheritance was display-only — a parent `Approve` rule didn't actually block a child write. v0.7.0 fills the column, ships the hook pipeline, enforces inheritance, and lands an append-only `signed_events` audit chain with cross-row hash chaining (V-4 closeout #698).
 
-**Write-time-investment gap (Batman):** the v0.7.0 audit at commit `53b4d39` ([`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.md)) found 0 of Batman's 6 forms cleanly IMPLEMENTED. The post-grand-slam Forms 1-6 wave + the 7th-form Option-B foundation closed every gap; HEAD `c9472c1` ships all 7 forms IMPLEMENTED.
+**Write-time-investment gap (Batman):** the v0.7.0 audit at commit `53b4d39` ([`docs/internal/batman-framework-audit.md`](internal/batman-framework-audit.html)) found 0 of Batman's 6 forms cleanly IMPLEMENTED. The post-grand-slam Forms 1-6 wave + the 7th-form Option-B foundation closed every gap; HEAD `c9472c1` ships all 7 forms IMPLEMENTED.
 
 ---
 
@@ -76,7 +76,7 @@ Most users on v0.6.4 see **two intentional behavior changes** + a few opt-in sur
 | `to_describe_to_user` | string | Human-shaped summary the agent can paraphrase verbatim — eliminates calibration drift. |
 | `callable_now` | bool (per tool) | Whether this caller may invoke the tool right now (allowlist + profile aware). |
 | `agent_permitted_families` | array<string> | Families this caller is allowed to expand into via `memory_load_family`. |
-| `memory_kind_vocab` | object | Form-6 vocabulary + auto-classify modes (see [`docs/memory-kind-vocab.md`](memory-kind-vocab.md)). |
+| `memory_kind_vocab` | object | Form-6 vocabulary + auto-classify modes (see [`docs/memory-kind-vocab.md`](memory-kind-vocab.html)). |
 
 Clients that pin `schema_version: 2` continue to receive the v2 shape — v2 stays supported through v0.7.x.
 
@@ -101,7 +101,7 @@ curl -s http://127.0.0.1:9077/api/v1/capabilities | jq .memory_kind_vocab
 v0.7.0 adds the following tools relative to v0.6.4. Every tool ships
 in [`src/mcp/registry.rs`](../src/mcp/registry.rs) and is grouped into
 a `Family` (see [`src/profile.rs`](../src/profile.rs)). Full
-post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
+post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html).
 
 | Tool | Family | Track / form | One-line description |
 |---|---|---|---|
@@ -115,7 +115,7 @@ post-grand-slam inventory: [`docs/internal/v070-feature-inventory.md`](internal/
 | `memory_pending_reject(id, …, remember=forever?)` | Power | K10 | Rejects a pending action; `remember=forever` enables progressive trust. |
 | `memory_subscription_dlq_list` | Power | K7 | Lists dead-letter subscription deliveries. |
 | `memory_subscription_replay` | Power | K7 | Replays a DLQ entry. |
-| `memory_quota_status` | Power | K8 | Returns the caller's per-agent daily quota row. See [`docs/k8-quotas.md`](k8-quotas.md). |
+| `memory_quota_status` | Power | K8 | Returns the caller's per-agent daily quota row. See [`docs/k8-quotas.md`](k8-quotas.html). |
 | `memory_reflect` | Power | Recursive-learning Task 4/8 | Substrate primitive that synthesises a reflection over a recall set; depth-capped per namespace. |
 | `memory_reflection_origin` | Power | L2-2 / #667 | Reads `reflection_origin` metadata that federation receivers stamp on import. |
 | `memory_dependents_of_invalidated` | Power | L2-3 / #668 | Notifies dependents when a Reflection→Reflection `supersedes` edge fires. |
@@ -168,19 +168,19 @@ New `memory_atomise` MCP tool + `auto_atomise_mode` namespace-policy field with 
 
 Token budget is governed by `auto_atomise_threshold_cl100k` (default 800) and `auto_atomise_max_atom_tokens` (default 200). Each atom is a first-class memory with an `atom_of` back-pointer and a signed `derives_from` edge.
 
-Operator doc: [`docs/atomisation.md`](atomisation.md). Cookbook: [`cookbook/atomisation/01-basic-flow.sh`](../cookbook/atomisation/01-basic-flow.sh).
+Operator doc: [`docs/atomisation.md`](atomisation.html). Cookbook: [`cookbook/atomisation/01-basic-flow.sh`](../cookbook/atomisation/01-basic-flow.sh).
 
 ### Form 3 — multi-step ingest orchestrator ([#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756))
 
 `memory_ingest_multistep` threads deterministic Jaccard+FTS helpers through prompt-cache-stable LLM stages. The two reference variants (two-phase Understand-Anything exemplar; four-step OpenKB exemplar) both produce reports with a single distinct cache key per run — provable by the cookbook recipe.
 
-Operator doc: [`docs/multistep-ingest.md`](multistep-ingest.md). Cookbook: [`cookbook/multistep-ingest/01-two-phase.sh`](../cookbook/multistep-ingest/01-two-phase.sh).
+Operator doc: [`docs/multistep-ingest.md`](multistep-ingest.html). Cookbook: [`cookbook/multistep-ingest/01-two-phase.sh`](../cookbook/multistep-ingest/01-two-phase.sh).
 
 ### Form 4 — fact provenance ([#757](https://github.com/alphaonedev/ai-memory-mcp/issues/757))
 
 No new MCP tool; provenance rides on the existing `memory_store` / `memory_atomise` payloads. Schema migration `0032_v07_form4_provenance.sql` adds the columns. Federation wire shape stays backward-compatible — pre-v0.7.0 peers ignore the new fields.
 
-Operator doc: [`docs/provenance.md`](provenance.md).
+Operator doc: [`docs/provenance.md`](provenance.html).
 
 ### Form 5 — auto-confidence + shadow-mode calibration + freshness decay ([#758](https://github.com/alphaonedev/ai-memory-mcp/issues/758))
 
@@ -193,13 +193,13 @@ Operator doc: [`docs/provenance.md`](provenance.md).
 
 Schema migration `0033_v07_form5_confidence_calibration.sql`. Capability registry entry: `CapabilityConfidenceCalibration` at `src/config.rs:1331`.
 
-Operator doc: [`docs/confidence-calibration.md`](confidence-calibration.md).
+Operator doc: [`docs/confidence-calibration.md`](confidence-calibration.html).
 
 ### Form 6 — MemoryKind Batman vocabulary ([#759](https://github.com/alphaonedev/ai-memory-mcp/issues/759))
 
 10-variant `MemoryKind` enum: `Observation` (default) + `Reflection`, `Persona`, `Concept`, `Entity`, `Claim`, `Relation`, `Event`, `Conversation`, `Decision`. **No schema migration** — `memories.memory_kind TEXT NOT NULL DEFAULT 'observation'` has no CHECK constraint, so new variants land as new string values on the existing column.
 
-Optional `auto_classify_kind` pre-store hook on each namespace standard: `off | regex_only | regex_then_llm`. See [`docs/memory-kind-vocab.md`](memory-kind-vocab.md) for the per-variant matrix and recall-filter wire shapes.
+Optional `auto_classify_kind` pre-store hook on each namespace standard: `off | regex_only | regex_then_llm`. See [`docs/memory-kind-vocab.md`](memory-kind-vocab.html) for the per-variant matrix and recall-filter wire shapes.
 
 ### 7th-form — agent-EXTERNAL Layer-4 wiring ([#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760))
 
@@ -215,13 +215,13 @@ What v0.7.0 ships:
 
 What v0.7.0 ALSO ships (post-PE-1/PE-2/PE-3 fold — supersedes the earlier "v0.8.0 cover" framing):
 
-- Agent-EXTERNAL enforcement (wire kinds `bash` / `filesystem_write` / `network_request` / `process_spawn`) is live at four daemon-side `GOVERNANCE_PRE_ACTION` boundaries (skill-manifest emission, federation peer POST, hooks subprocess spawn, LLM HTTP) plus the harness PreToolUse hook (`ai-memory install claude-code --hook pretool --apply`). See [`policy-engine.md`](policy-engine.md) §2 for the merged wire-point audit.
+- Agent-EXTERNAL enforcement (wire kinds `bash` / `filesystem_write` / `network_request` / `process_spawn`) is live at four daemon-side `GOVERNANCE_PRE_ACTION` boundaries (skill-manifest emission, federation peer POST, hooks subprocess spawn, LLM HTTP) plus the harness PreToolUse hook (`ai-memory install claude-code --hook pretool --apply`). See [`policy-engine.md`](policy-engine.html) §2 for the merged wire-point audit.
 
 What v0.7.0 does NOT ship (v0.8.0 cover, [#697](https://github.com/alphaonedev/ai-memory-mcp/issues/697)):
 
 - Subprocess-chain visibility (bash spawn → fork → exec), mandatory-hook attestation, and engine-level read gating (`AgentAction::Read`).
 
-Audit-honest framing: see [`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](RECURSIVE_LEARNING.md#substrate-authority-claim--v070-option-b-foundation). Operator doc: [`docs/policy-engine.md`](policy-engine.md) + [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.md).
+Audit-honest framing: see [`docs/RECURSIVE_LEARNING.md` §Substrate authority claim](RECURSIVE_LEARNING.html#substrate-authority-claim--v070-option-b-foundation). Operator doc: [`docs/policy-engine.md`](policy-engine.html) + [`docs/governance/agent-action-rules.md`](governance/agent-action-rules.html).
 
 ---
 
@@ -251,7 +251,7 @@ namespace = "team/*"
 
 **Hot-path constraint:** `post_recall` and `post_search` default to `daemon` mode, preserving the v0.6.3 50ms recall p95 budget. `mode = "exec"` requires explicit override.
 
-Operator doc: [`docs/hook-pipeline.md`](hook-pipeline.md).
+Operator doc: [`docs/hook-pipeline.md`](hook-pipeline.html).
 
 ---
 
@@ -275,7 +275,7 @@ Keys live at `~/.config/ai-memory/keys/<agent_id>.{pub,priv}` with mode 0600 / 0
 ai-memory verify-signed-events-chain --format json
 ```
 
-Operator doc: [`docs/signed-events-v4.md`](signed-events-v4.md).
+Operator doc: [`docs/signed-events-v4.md`](signed-events-v4.html).
 
 > **Hardware-backed key storage** (TPM / HSM / Secure Enclave) is **out of OSS scope** per ROADMAP; available in the AgenticMem commercial layer.
 
@@ -302,7 +302,7 @@ archive_grace_secs = 604800    # 7d linger before prune
 
 Background sweeper archives transcripts whose memories are all expired, then prunes after a grace period. `memory_replay(memory_id, depth?)` reconstructs the transcript chain; `depth=0` reproduces the pre-L2-4 shape.
 
-Operator doc: [`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
+Operator doc: [`docs/sidechain-transcripts.md`](sidechain-transcripts.html).
 
 ---
 
@@ -374,7 +374,7 @@ Honest disclosures from v0.6.3.1 close out:
 - `approval.subscribers` events are now actually published through the subscription system (K4).
 - `rule_summary` is now populated with a real ordered list of active governance rules (K5).
 
-Operator docs: [`docs/governance.md`](governance.md), [`docs/policy-engine.md`](policy-engine.md), [`docs/k10-sse-approvals.md`](k10-sse-approvals.md).
+Operator docs: [`docs/governance.md`](governance.html), [`docs/policy-engine.md`](policy-engine.html), [`docs/k10-sse-approvals.md`](k10-sse-approvals.html).
 
 ---
 
@@ -519,9 +519,9 @@ reranker).
 
 ### Operator references
 
-- [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) — canonical schema reference (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`).
-- [`docs/ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.md#llm-backend-setup-smart--autonomous-tiers) — config-file + env-var matrix.
-- [`docs/integrations/llm-backends.md`](integrations/llm-backends.md) — per-vendor recipes.
+- [`docs/CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) — canonical schema reference (`[llm]`, `[llm.auto_tag]`, `[embeddings]`, `[reranker]`, `[storage]`).
+- [`docs/ADMIN_GUIDE.md` § "LLM Backend Setup"](ADMIN_GUIDE.html#llm-backend-setup-smart--autonomous-tiers) — config-file + env-var matrix.
+- [`docs/integrations/llm-backends.md`](integrations/llm-backends.html) — per-vendor recipes.
 - [`src/llm.rs`](../src/llm.rs) — module-level rustdoc; the LlmProvider
   table at the top of the file is the canonical
   provider × wire-shape × auth × vendor anchor.
@@ -568,7 +568,7 @@ v0.7.0 hardens the v0.6.x federation surface with mTLS + X-API-Key + SHA-256 cer
 - `AI_MEMORY_FED_SYNC_TRUST_PEER` — trust the peer's claim about origin agent on inbound sync (default deny).
 - `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` — trust the wire body's `agent_id` claim (default deny — use the authenticated peer cert).
 
-Operator doc: [`docs/federation.md`](federation.md).
+Operator doc: [`docs/federation.md`](federation.html).
 
 ---
 
@@ -636,13 +636,13 @@ ai-memory verify-signed-events-chain --format json | jq -e .chain_holds
 
 **For the comprehensive 3-tier walkthrough** (non-technical /
 SME-fleet / DevOps-idempotent recipes), see
-[`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.md). The
+[`docs/MIGRATION_QUICKSTART.md`](MIGRATION_QUICKSTART.html). The
 QUICKSTART covers the security-posture default flips (federation
 sig+nonce, permissions enforce, SSRF DNS-fail-CLOSED, governance
 fail-CLOSED, passphrase strict-perms) with their staged-rollout
 opt-out env vars.
 
-Schema migrations (sqlite v20 → v57, postgres v15 → v57 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md). Canonical anchors: `CURRENT_SCHEMA_VERSION = 57` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration file is [`migrations/sqlite/0047_v56_list_composite_indexes.sql`](../migrations/sqlite/0047_v56_list_composite_indexes.sql) (sqlite splits per-bump, file-name counter ≠ logical version; v54 is an in-code backfill arm with no new .sql file, while v55/v56 add their indexes via their own .sql files, and v57 is a sqlite no-op version stamp) and the postgres in-process `migrate_v57()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v57 deltas applied through in-process `migrate_v34()` … `migrate_v57()` async functions; `migrate_v55()` and `migrate_v56()` are version-stamp no-ops on postgres — `memories_updated_at_idx (updated_at DESC)` already serves the federation-catchup range scan, and the #1579 v56 composite list/archive indexes are sqlite-side fixes paired with the sargable `storage::list` rewrite — while `migrate_v57()` (#1579 B2) adds the stored generated `tsv` tsvector column + `memories_tsv_gin` GIN index and drops the legacy `memories_content_fts` expression index, so the search/recall shapes match AND rank on a write-time-precomputed column; the `ADD COLUMN` takes an ACCESS EXCLUSIVE table rewrite, sub-second at ~8k rows).
+Schema migrations (sqlite v20 → v57, postgres v15 → v57 logical) run automatically on first start of a sqlite-backed daemon and are idempotent. Postgres schema bootstrap is via `ai-memory schema-init` per [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html). Canonical anchors: `CURRENT_SCHEMA_VERSION = 57` in both [`src/storage/migrations.rs`](../src/storage/migrations.rs) (sqlite) and [`src/store/postgres.rs`](../src/store/postgres.rs) (postgres); the highest on-disk migration file is [`migrations/sqlite/0047_v56_list_composite_indexes.sql`](../migrations/sqlite/0047_v56_list_composite_indexes.sql) (sqlite splits per-bump, file-name counter ≠ logical version; v54 is an in-code backfill arm with no new .sql file, while v55/v56 add their indexes via their own .sql files, and v57 is a sqlite no-op version stamp) and the postgres in-process `migrate_v57()` arm (postgres runs a single greenfield+upgrade pair, with v34 → v57 deltas applied through in-process `migrate_v34()` … `migrate_v57()` async functions; `migrate_v55()` and `migrate_v56()` are version-stamp no-ops on postgres — `memories_updated_at_idx (updated_at DESC)` already serves the federation-catchup range scan, and the #1579 v56 composite list/archive indexes are sqlite-side fixes paired with the sargable `storage::list` rewrite — while `migrate_v57()` (#1579 B2) adds the stored generated `tsv` tsvector column + `memories_tsv_gin` GIN index and drops the legacy `memories_content_fts` expression index, so the search/recall shapes match AND rank on a write-time-precomputed column; the `ADD COLUMN` takes an ACCESS EXCLUSIVE table rewrite, sub-second at ~8k rows).
 
 **Per-bump narrative for the post-v34 sqlite ladder (every operator SHOULD back up to a sibling `.bak` before `ai-memory serve` first-touches the DB — the migrator also writes its own automatic `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` `VACUUM INTO` snapshot before any schema-mutating upgrade — because the daemon will traverse all 24 of these bumps on first open):**
 
@@ -688,7 +688,7 @@ The ladder is idempotent on restart but forward-only (not reversible) — once `
 - The original v0.6.4 5-tool default surface is **preserved in spirit** — the v0.7 B1/B2 loaders (`memory_load_family`, `memory_smart_load`) joined the `core` family, bringing the default count to 7. No tool was removed from `core`.
 - Existing v0.6.4 SDKs continue to work against a v0.7.0 server. Capabilities v3 fields are additive; v2 fields stay at their existing paths.
 - Memory data — no migration required for stored memories; embeddings, archives, links, governance policies all carry forward.
-- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape. v0.7.0 adds 15 net-new route registrations (73 → 88; the original "8 new HTTP routes" inventory pre-dated the #1146 config + #1416 capture_turn additions — see [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md)).
+- HTTP API endpoints — every v0.6.4 route stays at the same path with the same shape. v0.7.0 adds 15 net-new route registrations (73 → 88; the original "8 new HTTP routes" inventory pre-dated the #1146 config + #1416 capture_turn additions — see [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html)).
 - The CLI surface (`ai-memory store`, `recall`, etc.) — every v0.6.4 subcommand continues to work unchanged.
 - Boot manifest cost — `ai-memory boot` output is independent of attestation, hooks, transcripts, AGE.
 - Hook pipeline — **default off.** A v0.7.0 install with no `hooks.toml` behaves identically to v0.6.4 at the lifecycle layer.
@@ -697,11 +697,11 @@ The ladder is idempotent on restart but forward-only (not reversible) — once `
 
 ## Related
 
-- [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.md) — full release notes (incl. post-grand-slam ship-readiness wave).
-- [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md) — canonical feature truth.
-- [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.md) — single-doc framework for the v0.7.0 sprint.
-- [`docs/MIGRATION_v0.6.4.md`](MIGRATION_v0.6.4.md) — predecessor migration guide.
-- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.md) — earlier migration.
-- [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — sqlite → postgres migration runbook.
+- [`docs/v0.7.0/release-notes.md`](v0.7.0/release-notes.html) — full release notes (incl. post-grand-slam ship-readiness wave).
+- [`docs/internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html) — canonical feature truth.
+- [`docs/v0.7/V0.7-EPIC.md`](v0.7/V0.7-EPIC.html) — single-doc framework for the v0.7.0 sprint.
+- [`docs/MIGRATION_v0.6.4.md`](MIGRATION_v0.6.4.html) — predecessor migration guide.
+- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](MIGRATION-v0.6.2-to-v0.6.3.html) — earlier migration.
+- [`docs/migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) — sqlite → postgres migration runbook.
 - [`ROADMAP.md §7.3`](../ROADMAP.md) — original v0.7 spec.
 - [`CHANGELOG.md`](../CHANGELOG.md) — full v0.7.0 entry.

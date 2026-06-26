@@ -124,7 +124,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
 ai-memory recall "hello"
 ai-memory stats --json | jq .</code></pre>
 
-  <p>Full surface: <a href="../USER_GUIDE.md">USER_GUIDE.md</a> (MCP tools), <a href="../API_REFERENCE.md">API_REFERENCE.md</a> (HTTP), <a href="../CLI_REFERENCE.md">CLI_REFERENCE.md</a> (CLI). The canonical tool count is asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code>; see issue #862 for the 99+1 disambiguation.</p>
+  <p>Full surface: <a href="../USER_GUIDE.html">USER_GUIDE.md</a> (MCP tools), <a href="../API_REFERENCE.html">API_REFERENCE.md</a> (HTTP), <a href="../CLI_REFERENCE.html">CLI_REFERENCE.md</a> (CLI). The canonical tool count is asserted by <code>Profile::full().expected_tool_count()</code> in <code>src/profile.rs</code>; see issue #862 for the 99+1 disambiguation.</p>
 </section>
 
 <section class="wrap-mid">
@@ -217,7 +217,7 @@ ai-memory serve</code></pre>
   --events post_store \
   --secret "$(cat /etc/my-app/hmac.key)"</code></pre>
   <p>Events are POSTed as JSON with an <code>X-AI-Memory-Signature</code> HMAC header. Unsigned subscribers are refused at registration. SSRF gate: loopback URLs require <code>AI_MEMORY_ALLOW_LOOPBACK_WEBHOOKS=1</code>.</p>
-  <p>Full hook taxonomy + payload schemas: <a href="../hook-pipeline.md">hook-pipeline.md</a>.</p>
+  <p>Full hook taxonomy + payload schemas: <a href="../hook-pipeline.html">hook-pipeline.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -246,7 +246,7 @@ ai-memory serve</code></pre>
     <li>Implement handler in <code>src/handlers/</code> using the <code>Db</code> extractor</li>
   </ol>
 
-  <p>For deeper changes (new memory_kind, new family, new tier), the writeup is in <a href="../DEVELOPER_GUIDE.md">DEVELOPER_GUIDE.md</a> and the family/kind distinction is clarified in <a href="../agent-skills.md">agent-skills.md</a>.</p>
+  <p>For deeper changes (new memory_kind, new family, new tier), the writeup is in <a href="../DEVELOPER_GUIDE.html">DEVELOPER_GUIDE.md</a> and the family/kind distinction is clarified in <a href="../agent-skills.html">agent-skills.md</a>.</p>
 </section>
 
 <section class="wrap-mid">
@@ -255,9 +255,9 @@ ai-memory serve</code></pre>
   <p>The Track A NHI test playbook exercises the MCP tool surface, HTTP API parity, CLI dispatch, knowledge-graph traversal, capabilities v3 discovery, token budget, hooks, and chaos &mdash; the exact developer-facing surfaces you'd build against. Latest release-gate campaign (2026-05-22): <strong>7,321 PASS / 0 FAIL across 269 test binaries</strong>, 22 issues (#1120-#1141) fixed in-campaign, no deferrals to v0.8.0.</p>
   <div class="next">
     <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/"><strong>Latest campaign index</strong><span class="desc">2026-05-22 &middot; SHIP-RECOMMENDED &middot; tip <code>fd172f2cf</code></span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/track-a-build-install-results.md"><strong>Engineering writeup</strong><span class="desc">Track A build + install verification</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.md"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, schema ladder v15&rarr;v49, per-issue root cause, future-bug prevention</span></a>
-    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.md"><strong>For decision-makers</strong><span class="desc">Verdict, risk, cost, roadmap</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/track-a-build-install-results.html"><strong>Engineering writeup</strong><span class="desc">Track A build + install verification</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-sme-engineer.html"><strong>For SME engineers</strong><span class="desc">Reproducibility, methodology, schema ladder v15&rarr;v49, per-issue root cause, future-bug prevention</span></a>
+    <a href="../v0.7.0/test-campaign-2026-05-22-release-gate-final/audience-c-level.html"><strong>For decision-makers</strong><span class="desc">Verdict, risk, cost, roadmap</span></a>
   </div>
 </section>
 
@@ -265,15 +265,15 @@ ai-memory serve</code></pre>
   <div class="eyebrow-h2">Next</div>
   <h2>Where to go from here.</h2>
   <div class="next">
-    <a href="../DEVELOPER_GUIDE.md"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
-    <a href="../USER_GUIDE.md"><strong>MCP tool reference</strong><span class="desc">100 entries at --profile full (99 callable)</span></a>
-    <a href="../API_REFERENCE.md"><strong>HTTP API</strong><span class="desc">91 route registrations (77 unique paths)</span></a>
-    <a href="../CLI_REFERENCE.md"><strong>CLI reference</strong><span class="desc">83 subcommands</span></a>
+    <a href="../DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
+    <a href="../USER_GUIDE.html"><strong>MCP tool reference</strong><span class="desc">100 entries at --profile full (99 callable)</span></a>
+    <a href="../API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">91 route registrations (77 unique paths)</span></a>
+    <a href="../CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">83 subcommands</span></a>
     <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>
-    <a href="../hook-pipeline.md"><strong>Hook pipeline</strong><span class="desc">27 events</span></a>
+    <a href="../hook-pipeline.html"><strong>Hook pipeline</strong><span class="desc">27 events</span></a>
     <a href="../knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links + temporal validity</span></a>
-    <a href="../RECURSIVE_LEARNING.md"><strong>Recursive learning</strong><span class="desc">reflect / atomise / consolidate, depth-capped</span></a>
-    <a href="../integrations/README.md"><strong>Integrations</strong><span class="desc">Claude Code, Cursor, etc</span></a>
+    <a href="../RECURSIVE_LEARNING.html"><strong>Recursive learning</strong><span class="desc">reflect / atomise / consolidate, depth-capped</span></a>
+    <a href="../integrations/README.html"><strong>Integrations</strong><span class="desc">Claude Code, Cursor, etc</span></a>
     <a href="../engineering-discipline.html"><strong>Engineering discipline</strong><span class="desc">The #1558 literal burn-down: 497&rarr;28 baseline entries, CI ratchet, committed census</span></a>
   </div>
 </section>

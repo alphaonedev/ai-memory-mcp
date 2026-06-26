@@ -52,7 +52,7 @@ V0.7-EPIC.md is the **operational** doc — what's being built, by whom, in whic
 - Reviewers can challenge the design at a single document instead of chasing decisions across 11 tracks of starter prompts.
 - After v0.7.0 ships, this RFC becomes the **historical record** of why `attested-cortex` was shaped the way it was — `v1.0` security-audit reviewers in Q2 2027 should be able to read this and understand the v0.7 threat model without spelunking through a year of commits.
 
-V0.6.4 had a similar split: [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](../v0.6.4/rfc-default-tool-surface-collapse.md) recorded the **why** of collapsing the default tool surface to 5; `V0.6.4-EPIC.md` recorded the **what** and **when**. That split worked. v0.7 reuses it.
+V0.6.4 had a similar split: [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](../v0.6.4/rfc-default-tool-surface-collapse.html) recorded the **why** of collapsing the default tool surface to 5; `V0.6.4-EPIC.md` recorded the **what** and **when**. That split worked. v0.7 reuses it.
 
 ---
 
@@ -1375,25 +1375,25 @@ On sign-off, this RFC moves from `DRAFT` to `APPROVED` and becomes the historica
 
 ### Primary docs
 
-- [`docs/v0.7/V0.7-EPIC.md`](V0.7-EPIC.md) — The canonical operational epic for v0.7.0. 1237 lines. Source of truth for what's shipping, by which task ID, in which week, with which definition-of-done.
-- [`docs/v0.7/v0.7-nhi-prompts.md`](v0.7-nhi-prompts.md) — Per-task NHI starter prompts. Useful for technical detail per track.
-- [`docs/MIGRATION_v0.7.md`](../MIGRATION_v0.7.md) — Migration guide for users coming from v0.6.4. Cross-links to this RFC for design rationale.
-- [`docs/v0.7/schema-compaction-audit.md`](schema-compaction-audit.md) — Track C (schema compaction) audit data backing the ≤3500-token target.
+- [`docs/v0.7/V0.7-EPIC.md`](V0.7-EPIC.html) — The canonical operational epic for v0.7.0. 1237 lines. Source of truth for what's shipping, by which task ID, in which week, with which definition-of-done.
+- [`docs/v0.7/v0.7-nhi-prompts.md`](v0.7-nhi-prompts.html) — Per-task NHI starter prompts. Useful for technical detail per track.
+- [`docs/MIGRATION_v0.7.md`](../MIGRATION_v0.7.html) — Migration guide for users coming from v0.6.4. Cross-links to this RFC for design rationale.
+- [`docs/v0.7/schema-compaction-audit.md`](schema-compaction-audit.html) — Track C (schema compaction) audit data backing the ≤3500-token target.
 
 ### Predecessors
 
-- [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](../v0.6.4/rfc-default-tool-surface-collapse.md) — The v0.6.4 RFC; style precedent for this document.
-- [v0.6.5 epic (superseded)](../v0.6.5/V0.6.5-EPIC.md) — `cortex-fluent` epic, rolled into v0.7.0 per the V0.7-EPIC.
+- [`docs/v0.6.4/rfc-default-tool-surface-collapse.md`](../v0.6.4/rfc-default-tool-surface-collapse.html) — The v0.6.4 RFC; style precedent for this document.
+- [v0.6.5 epic (superseded)](../v0.6.5/V0.6.5-EPIC.html) — `cortex-fluent` epic, rolled into v0.7.0 per the V0.7-EPIC.
 - [`ROADMAP.md §7.3`](../../ROADMAP.md) — The original v0.7 spec (Q2 2026 target; now consolidating into `attested-cortex`).
-- [`docs/MIGRATION_v0.6.4.md`](../MIGRATION_v0.6.4.md) — The predecessor migration guide.
-- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](../MIGRATION-v0.6.2-to-v0.6.3.md) — Earlier migration.
-- [`docs/BASELINE-v0.6.3.1.md`](../BASELINE-v0.6.3.1.md) — Honest-Capabilities-v2 disclosure baseline; the document this RFC builds on.
+- [`docs/MIGRATION_v0.6.4.md`](../MIGRATION_v0.6.4.html) — The predecessor migration guide.
+- [`docs/MIGRATION-v0.6.2-to-v0.6.3.md`](../MIGRATION-v0.6.2-to-v0.6.3.html) — Earlier migration.
+- [`docs/BASELINE-v0.6.3.1.md`](../BASELINE-v0.6.3.1.html) — Honest-Capabilities-v2 disclosure baseline; the document this RFC builds on.
 
 ### ADRs (architectural decision records — historical)
 
-- [`docs/ADR-0001-quorum-replication.md`](../ADR-0001-quorum-replication.md) — Quorum replication semantics.
-- [`docs/ADR-0002-kg-schema-v15-backward-incompat.md`](../ADR-0002-kg-schema-v15-backward-incompat.md) — KG schema v15 backward-incompat decision.
-- [`docs/ADR-0003-kg-invalidation-eventual-consistency.md`](../ADR-0003-kg-invalidation-eventual-consistency.md) — KG invalidation eventual-consistency model.
+- [`docs/ADR-0001-quorum-replication.md`](../ADR-0001-quorum-replication.html) — Quorum replication semantics.
+- [`docs/ADR-0002-kg-schema-v15-backward-incompat.md`](../ADR-0002-kg-schema-v15-backward-incompat.html) — KG schema v15 backward-incompat decision.
+- [`docs/ADR-0003-kg-invalidation-eventual-consistency.md`](../ADR-0003-kg-invalidation-eventual-consistency.html) — KG invalidation eventual-consistency model.
 
 ### GitHub issues (major tracks)
 

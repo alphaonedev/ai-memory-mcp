@@ -183,7 +183,7 @@ The bundled stacked image at
 (`ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `ARG PG_MAJOR=18`)
 layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run
 operators do not build AGE from source. See
-[`postgres-age-guide.md`](postgres-age-guide.md) for the from-source
+[`postgres-age-guide.md`](postgres-age-guide.html) for the from-source
 install recipe and the Docker layering rationale (#1065).
 
 > **Alternate tested matrix.** `infra/lan-parity-test/` and the
@@ -246,7 +246,7 @@ equivalent of `AI_MEMORY_ANONYMIZE=1`).
 
 Default-OFF. When enabled, emits a hash-chained, append-only JSON audit
 log suitable for SIEM ingestion and SOC2 / HIPAA / GDPR / FedRAMP
-evidence. See [`security/audit-trail.md`](security/audit-trail.md).
+evidence. See [`security/audit-trail.md`](security/audit-trail.html).
 
 ```toml
 [audit]

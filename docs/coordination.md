@@ -192,7 +192,7 @@ daemon so Postgres-backed / MCP-over-HTTP deployments can drive them
 
 (The DATA-lane sibling for relayed memory writes is
 `AI_MEMORY_FED_REQUIRE_WRITE_SIG` (#1464), default permissive — see
-[`docs/federation.md`](federation.md).)
+[`docs/federation.md`](federation.html).)
 
 ## Pillar-2 — typed cognition
 

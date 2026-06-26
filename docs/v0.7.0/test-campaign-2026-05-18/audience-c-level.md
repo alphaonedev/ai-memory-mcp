@@ -102,7 +102,7 @@ The project deliberately produces three reading paths for every campaign, becaus
 | Developer / integrator | [`docs/audience/developer.html`](../../audience/developer.html) + `track-a-nhi-results.md` + audience-sme-engineer.md | Build with the MCP tool surface + HTTP API + CLI |
 | Decision-maker / evaluator | [`docs/audience/decision-maker.html`](../../audience/decision-maker.html) + this page + the release-notes intro | What it does, what it costs, what risk it carries, where it's going |
 
-For decision-makers specifically, the standard delivery is this page plus the [v0.7.0 release notes](../release-notes.md). The campaign README is the index.
+For decision-makers specifically, the standard delivery is this page plus the [v0.7.0 release notes](../release-notes.html). The campaign README is the index.
 
 ---
 

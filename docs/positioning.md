@@ -175,12 +175,12 @@ The Tencent v0.3.4 release surfaced three patterns worth absorbing into
 ai-memory. Each is a separate quick-win branch landing alongside this page:
 
 - **File-backed export of high-level artifacts** → QW-1
-  ([`recursive-learning.md`](./RECURSIVE_LEARNING.md)) — write-through
+  ([`recursive-learning.md`](./RECURSIVE_LEARNING.html)) — write-through
   artifacts that can be inspected without booting the substrate
 - **Persona-as-artifact** (L3 pyramid output) → QW-2
-  ([`persona.md`](./persona.md) when landed)
+  ([`persona.md`](./persona.html) when landed)
 - **Context-offload primitive** (single-key dereference for short-term
-  context) → QW-3 ([`context-offload.md`](./context-offload.md) when
+  context) → QW-3 ([`context-offload.md`](./context-offload.html) when
   landed); the full short-term compression pattern targets v0.8.0
 
 ## Patterns deliberately NOT adopted
@@ -203,14 +203,14 @@ Documented so a reader can audit our choice surface:
 
 ## Cross-links
 
-- [`RECURSIVE_LEARNING.md`](./RECURSIVE_LEARNING.md) — where QW-1
+- [`RECURSIVE_LEARNING.md`](./RECURSIVE_LEARNING.html) — where QW-1
   file-backed reflection export composes
 - `persona.md` — persona-as-artifact (QW-2, landing alongside this page)
 - `context-offload.md` — context-offload primitive (QW-3, landing
   alongside this page)
-- [`forensic-export.md`](./forensic-export.md) — forensic bundle and audit
+- [`forensic-export.md`](./forensic-export.html) — forensic bundle and audit
   trail
-- [`policy-engine.md`](./policy-engine.md) — substrate-authority
+- [`policy-engine.md`](./policy-engine.html) — substrate-authority
   enforcement
 
 ---
@@ -223,7 +223,7 @@ The Cognitive Architectures for Language Agents framework (Sumers, Yao, Narasimh
 
 **Three CoALA-named open directions ship as load-bearing substrate primitives.** CoALA §4.3 flags adaptive context-specific recall as understudied — ai-memory's 6-factor recall scoring, reflection-aware reranker boost (L2-8), and default-on cross-encoder reranker at v0.9 close this. CoALA §4.5 flags modifying/deleting memory ("unlearning") as understudied — ai-memory's `supersedes` and `contradicts` link relations, L2-3 reflection invalidation propagation, and compaction pipeline Stage-6 verify+rollback close this. CoALA §4.5 flags procedural-memory updates as alignment-risky with no current agents solving the problem — ai-memory's depth cap, hook veto, audited refusal, operator-signed governance rules, identical-digest skill promote, and compaction rollback close this structurally.
 
-**Disposition.** CoALA is corroborating prior art on cognitive architectures for language agents. The substrate's properties derive from the moonshot synthesis, not from CoALA. Where the two frame the same primitive differently, the moonshot wins. The full mapping with code anchors and ROADMAP cross-references is documented at [`docs/strategy/coala-mapping.md`](strategy/coala-mapping.md).
+**Disposition.** CoALA is corroborating prior art on cognitive architectures for language agents. The substrate's properties derive from the moonshot synthesis, not from CoALA. Where the two frame the same primitive differently, the moonshot wins. The full mapping with code anchors and ROADMAP cross-references is documented at [`docs/strategy/coala-mapping.md`](strategy/coala-mapping.html).
 
 ---
 

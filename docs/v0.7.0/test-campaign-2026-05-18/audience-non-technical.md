@@ -87,13 +87,13 @@ We're being explicit about these because the prime directive that governs this w
 
 ## For the curious
 
-The engineering writeup is at [`track-a-nhi-results.md`](track-a-nhi-results.md) — same campaign, same data, all twelve phases with the exact tests, the exact pass/fail row, and the exact evidence.
+The engineering writeup is at [`track-a-nhi-results.md`](track-a-nhi-results.html) — same campaign, same data, all twelve phases with the exact tests, the exact pass/fail row, and the exact evidence.
 
-The campaign index is at [`README.md`](README.md).
+The campaign index is at [`README.md`](README.html).
 
-The C-level / decision-maker view is at [`audience-c-level.md`](audience-c-level.md).
+The C-level / decision-maker view is at [`audience-c-level.md`](audience-c-level.html).
 
-The deep-dive engineering view is at [`audience-sme-engineer.md`](audience-sme-engineer.md).
+The deep-dive engineering view is at [`audience-sme-engineer.md`](audience-sme-engineer.html).
 
 ---
 

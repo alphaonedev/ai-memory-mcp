@@ -6,7 +6,7 @@ layout: doc
 **Audience.** Subject-matter-expert software engineers and architects
 landing `ai-memory` + agents into a production fleet. Reading-time:
 60–90 minutes; this is a planning artefact, not a quickstart. Pair
-with the existing operator guide [`production-deployment.md`](production-deployment.md)
+with the existing operator guide [`production-deployment.md`](production-deployment.html)
 (which covers single-instance defaults in ~10 minutes) — this document
 extends it to multi-server, multi-DC, multi-region, swarm, and hive
 topologies.
@@ -20,16 +20,16 @@ tier.
 
 **What this guide assumes you have already absorbed.** Federation
 auth layers (mTLS allowlist + `X-API-Key` + peer attestation) from
-[`federation.md`](federation.md). Postgres + Apache AGE + pgvector
-operator setup from [`postgres-age-guide.md`](postgres-age-guide.md).
+[`federation.md`](federation.html). Postgres + Apache AGE + pgvector
+operator setup from [`postgres-age-guide.md`](postgres-age-guide.html).
 Signed-events V-4 cross-row hash chain from
-[`signed-events-v4.md`](signed-events-v4.md). Threat model + disclosure
+[`signed-events-v4.md`](signed-events-v4.html). Threat model + disclosure
 policy from [`../SECURITY.md`](../SECURITY.md). v0.7.0 feature inventory
-from [`internal/v070-feature-inventory.md`](internal/v070-feature-inventory.md).
+from [`internal/v070-feature-inventory.md`](internal/v070-feature-inventory.html).
 **LLM backend wiring for smart / autonomous tiers — including the
 MCP env-block vs. shell-export distinction, per-vendor recipes, and
 fleet / multi-agent / multi-DC considerations** — from
-[`integrations/llm-backends.md`](integrations/llm-backends.md). The
+[`integrations/llm-backends.md`](integrations/llm-backends.html). The
 multi-agent / fleet / multi-DC section of that doc is the canonical
 cross-reference for "how do I wire the LLM at T2+ topologies."
 
@@ -39,12 +39,12 @@ cross-reference for "how do I wire the LLM at T2+ topologies."
    does not register your deployment with any central registry.**
    Identity material, mTLS allowlists, storage backend choice, topology,
    and backup cadence are operator decisions ([`production-deployment.md`
-   §1](production-deployment.md)).
+   §1](production-deployment.html)).
 2. Federation peers default-deny. The three concurrent auth layers
    (mTLS allowlist at the transport, `X-API-Key` at the application,
    per-peer attestation at identity) are enforced together — a peer
    that satisfies two but not the third **cannot push or fan-out**
-   into the local store ([`federation.md`](federation.md)).
+   into the local store ([`federation.md`](federation.html)).
 3. Per-message Ed25519 signing (`X-Memory-Sig`) + nonce freshness
    (`X-Memory-Nonce`) are the v0.7.0 defaults on `/sync/push` (env
    vars `AI_MEMORY_FED_REQUIRE_SIG=1` + `AI_MEMORY_FED_REQUIRE_NONCE=1`,
@@ -52,7 +52,7 @@ cross-reference for "how do I wire the LLM at T2+ topologies."
    pair under a stale nonce produces `401 x_memory_nonce_replay`.
 4. The signed-events V-4 chain on the `signed_events` table is
    tamper-evident across rows, not just per row
-   ([`signed-events-v4.md`](signed-events-v4.md)). Every restored
+   ([`signed-events-v4.md`](signed-events-v4.html)). Every restored
    snapshot needs a `verify-signed-events-chain` pass before traffic
    reopens.
 5. Governance is fail-CLOSED by default at v0.7.0
@@ -172,7 +172,7 @@ import the peer's public key on the destination side; graduating from
 "no keypair" to "keypair" mid-flight rewrites the audit story.
 
 Key storage defaults (mode 0600, refuses overwrite without `--force`,
-[`production-deployment.md §2`](production-deployment.md)): Linux
+[`production-deployment.md §2`](production-deployment.html)): Linux
 `~/.config/ai-memory/keys/`; macOS `~/Library/Application Support/
 ai-memory/keys/`; Windows `%APPDATA%\ai-memory\keys\`.
 
@@ -350,7 +350,7 @@ Three Postgres+AGE peers, each a full ai-memory daemon, mesh-federating
 writes. A write is canonical once `W = ceil(N/2 + 1) = 2` peers
 acknowledge it. Tolerates one-peer outage without write disruption.
 W-of-N "resolves the any-single-operator-can-rewrite-history problem"
-([`production-deployment.md §7`](production-deployment.md)); quorum
+([`production-deployment.md §7`](production-deployment.html)); quorum
 merge uses the CRDT-lite vector clock (`src/federation/vector_clock.rs`).
 
 ### 4.3 Postgres + AGE as central store
@@ -388,7 +388,7 @@ graduate to T4 for that.
 ### 4.4 mTLS allowlist between peers
 
 All federation traffic at T3+ MUST traverse mTLS. The three concurrent
-auth layers ([`federation.md`](federation.md)):
+auth layers ([`federation.md`](federation.html)):
 
 | Layer | Mechanism | Effect |
 |---|---|---|
@@ -397,8 +397,8 @@ auth layers ([`federation.md`](federation.md)):
 | 3 (identity) | Per-peer `PeerScope` JSON via `AI_MEMORY_FED_PEER_ATTESTATION` | `allowed_sender_agent_ids` on `/sync/push`; `allowed_namespaces` glob on `/sync/since`; default-deny |
 
 Cert generation, fingerprint allowlist format, and the cert-revocation
-playbook are pinned in [`federation.md §"mTLS rotation playbook"`](federation.md)
-+ [`postgres-age-guide.md §"HTTPS / mTLS configuration"`](postgres-age-guide.md).
+playbook are pinned in [`federation.md §"mTLS rotation playbook"`](federation.html)
++ [`postgres-age-guide.md §"HTTPS / mTLS configuration"`](postgres-age-guide.html).
 
 ### 4.5 Signed-events V-4 chain across peers
 
@@ -420,7 +420,7 @@ Implications:
 3. The JSONL audit log + the SQL chain + the per-link Ed25519
    signatures are three complementary surfaces; a successful attack
    must tamper with **all three** without leaving evidence
-   ([`signed-events-v4.md §"Three complementary verifiers"`](signed-events-v4.md)).
+   ([`signed-events-v4.md §"Three complementary verifiers"`](signed-events-v4.html)).
 
 ### 4.6 Latency budget (T3)
 
@@ -550,7 +550,7 @@ some queries but the production guidance at v0.7.0 is:
   read-only audit case.
 - The S76 perf gate guarantees AGE Cypher is ≥30% faster than CTE at
   depth=5 on the canonical 1k-entity / 5k-edge corpus
-  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.md)).
+  ([`postgres-age-guide.md §"AGE Cypher vs CTE fallback"`](postgres-age-guide.html)).
 
 ### 5.6 Connection pooling (PgBouncer enters at T4)
 
@@ -840,7 +840,7 @@ Federation peers exchange data via two endpoints:
   applies via `MemoryStore::apply_remote_memory` /
   `apply_remote_link` / `apply_remote_deletion`
   ([`postgres-age-guide.md §"Wave-3 Continuation 2 (Phase 8 + 9 +
-  10 + 11)"`](postgres-age-guide.md)).
+  10 + 11)"`](postgres-age-guide.html)).
 - `GET /sync/since?since=<ts>` — catchup pull. Peer B pulls memories
   it missed since the last successful sync. The per-peer
   `allowed_namespaces` glob filter (`namespace_allowed`,
@@ -967,7 +967,7 @@ ai-memory does not provide a turnkey GDPR layer; it provides the
   `allowed_namespaces`.
 - **`forget` operation** (`POST /api/v1/forget`, SAL
   `MemoryStore::forget`,
-  [`postgres-age-guide.md §"Wave-3 Continuation 3"`](postgres-age-guide.md))
+  [`postgres-age-guide.md §"Wave-3 Continuation 3"`](postgres-age-guide.html))
   — namespace + ILIKE pattern + tier filters; archive-on-forget
   moves rows to `archived_memories` with `archive_reason='forget'`
   before deletion. The operator wires this into their data-subject-request
@@ -1137,7 +1137,7 @@ ai-memory identity import --agent-id bob@host2 --pub bob.pub
 ```
 
 Verify with the federation health probe from [`federation.md §"Operator
-checklist"`](federation.md): `curl --cert peer.crt --key peer.key
+checklist"`](federation.html): `curl --cert peer.crt --key peer.key
 -H "x-peer-id: bob@host2" -H "X-API-Key: ..." https://alice.swarm.internal/api/v1/health`
 returns 200 + `{"status":"ok"}` when TLS + mTLS + attestation + API key
 all align.
@@ -1157,11 +1157,11 @@ this lowers the rewrite-defense bar.
 - **>9 peers.** The CRDT-lite merge cost is bounded by row count, not
   peer count, but the **vector-clock storage** scales linearly with
   peer count. At 10+ peers, consider sharding by namespace prefix
-  ([`federation.md §"Multi-peer scaling guidance"`](federation.md)).
+  ([`federation.md §"Multi-peer scaling guidance"`](federation.html)).
 - **>50 peers.** The peer-to-peer mesh model is the wrong shape —
   use a gossip layer or a proper consensus coordinator and treat each
   ai-memory daemon as a leaf
-  ([`federation.md §"Mesh size"`](federation.md), 50+ row).
+  ([`federation.md §"Mesh size"`](federation.html), 50+ row).
 - **Heterogeneous trust.** If subsets of peers should NOT see each
   other's data, the swarm shape is wrong — graduate to a hierarchical
   (hive-like) topology or use multiple disjoint swarms.
@@ -1242,7 +1242,7 @@ The gaps in §9.3 are honest scope for v0.8/v0.9: distributed consensus coordina
 
 Concrete operator guidance for the storage substrate from T3 upward.
 This section consolidates the v0.7.0-relevant tuning that
-[`postgres-age-guide.md`](postgres-age-guide.md) covers from the
+[`postgres-age-guide.md`](postgres-age-guide.html) covers from the
 "why postgres+AGE" angle.
 
 ### 10.1 Server sizing
@@ -1290,11 +1290,11 @@ effective_io_concurrency = 200    # NVMe
 
 For >1M-row corpora, raise pgvector `ef_construction=128` at index
 build time and `hnsw.ef_search=80` at query time
-([`postgres-age-guide.md §"pgvector HNSW"`](postgres-age-guide.md)).
+([`postgres-age-guide.md §"pgvector HNSW"`](postgres-age-guide.html)).
 
 ### 10.3 AGE extension install + permissions
 
-See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.md)
+See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.html)
 for the AGE 1.7.0-from-source recipe. The bundled
 `deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) stacks
 pgvector 0.8.2 on top of `apache/age:release_PG18_1.7.0` so K8s / ECS /
@@ -1414,7 +1414,7 @@ memories at 16 GB.
 
 ### 11.3 Signed events chain footprint
 
-From [`signed-events-v4.md`](signed-events-v4.md): each row ~200–300
+From [`signed-events-v4.md`](signed-events-v4.html): each row ~200–300
 bytes; 1 M rows ≈ 250 MB; 10 M rows ≈ 2.5 GB. Cold walk verification
 is O(rows); use `--since <last-verified>` for incremental verification.
 Operator-driven pruning is a chain break — document it in the audit log.
@@ -1512,7 +1512,7 @@ cover the substrate's standard failure modes.
 | `health` 5xx for >1 min | P1 page | `journalctl -u ai-memory --since "5 min ago"`; check disk + DB lock |
 | `federation_push_dlq_depth > 0` sustained 10 min | P2 page | Inspect DLQ rows; check peer reachability + clocks |
 | `federation_push_dlq_quarantined_total` increment | P1 page | DLQ row gave up; hand-replicate or escalate |
-| `verify-signed-events-chain` cron fail | P1 page | Suspected tamper; follow [`signed-events-v4.md §"Operator runbook (3am procedures)"`](signed-events-v4.md) |
+| `verify-signed-events-chain` cron fail | P1 page | Suspected tamper; follow [`signed-events-v4.md §"Operator runbook (3am procedures)"`](signed-events-v4.html) |
 | `recall_latency_seconds p99 > 100ms` for >5 min | P3 trend | Investigate HNSW rebuild, DB lock contention, embedder availability |
 | `memory_store_latency_seconds p95 > 100ms` | P2 trend | Likely lock contention on SQLite (T2) or pool exhaustion on Postgres (T4+); raise `AI_MEMORY_PG_POOL_MAX` or front with PgBouncer |
 | Cross-DC sync lag > 5 min | P2 trend | Check WAN; inspect `federation::sync` tracing target for retry storms |
@@ -1535,7 +1535,7 @@ cover the substrate's standard failure modes.
 ### 13.2 Restore drill — quarterly cadence
 
 The substrate's restore semantics live in
-[`MIGRATION_v0.7.md §"Restore section"`](MIGRATION_v0.7.md). The
+[`MIGRATION_v0.7.md §"Restore section"`](MIGRATION_v0.7.html). The
 quarterly restore drill is the only mechanical defense against the
 "we have backups but never tested restore" failure class.
 
@@ -1550,7 +1550,7 @@ ai-memory recall "$(date)"                              # 5. smoke-test recall
 ```
 
 For Postgres-backed deployments, use `pg_restore --clean --create`
-([`production-deployment.md §4`](production-deployment.md)) at step
+([`production-deployment.md §4`](production-deployment.html)) at step
 1, then proceed from step 2.
 
 ### 13.3 Signed-events chain re-verification after restore
@@ -1604,26 +1604,26 @@ runs the restore in 18 months will need it.
 
 A consolidated security-hardening checklist that crosses every tier.
 Refer to [`../SECURITY.md`](../SECURITY.md) for the threat model and
-disclosure policy; [`production-deployment.md`](production-deployment.md)
+disclosure policy; [`production-deployment.md`](production-deployment.html)
 for the single-instance baseline.
 
 ### 14.1 Identity + key material
 
 - [ ] Every agent has its own Ed25519 keypair (`ai-memory identity generate`); private keys mode 0600 under the canonical key directory.
 - [ ] No keypair shared across agents.
-- [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.md)).
+- [ ] Key rotation playbook documented; old keys preserved under `<id>.key.rotated-<timestamp>` for historical signature verification ([`signed-events-v4.md`](signed-events-v4.html)).
 - [ ] Daemon `agent_id` has a keypair on disk; the stderr "continuing unsigned" line at boot is a T3-graduation blocker (`load_daemon_signing_key`, `src/main.rs:116-118`).
 
 ### 14.2 Transport — mTLS + API key (T3+)
 
-- [ ] Server cert + key generated by your CA; SHA-256 fingerprint of every peer cert added to `peer-fingerprints.allow` ([`federation.md §"Operator checklist"`](federation.md)).
+- [ ] Server cert + key generated by your CA; SHA-256 fingerprint of every peer cert added to `peer-fingerprints.allow` ([`federation.md §"Operator checklist"`](federation.html)).
 - [ ] Cert rotation + revocation playbooks documented (allowlist edit + daemon restart, NOT OCSP/CRL).
 - [ ] `api_key` set in every daemon's config.toml (no `--api-key` CLI flag exists; container deploys inject via `AI_MEMORY_API_KEY` + `entrypoint.plan-c.sh`); key stored in your secret manager.
 - [ ] Every federation peer presents `X-API-Key` on every push; `/api/v1/health` is the only exempt endpoint.
 
 ### 14.3 Per-peer attestation + wire signing (T3+)
 
-- [ ] `AI_MEMORY_FED_PEER_ATTESTATION` JSON populated with explicit per-peer `PeerScope` rows ([`federation.md §"Layer 3"`](federation.md)).
+- [ ] `AI_MEMORY_FED_PEER_ATTESTATION` JSON populated with explicit per-peer `PeerScope` rows ([`federation.md §"Layer 3"`](federation.html)).
 - [ ] No `**` globs on `allowed_namespaces` for cross-trust-boundary peers.
 - [ ] `AI_MEMORY_FED_TRUST_BODY_AGENT_ID` and `AI_MEMORY_FED_SYNC_TRUST_PEER` both unset (the two bypass envs default to deny — only test harnesses set them).
 - [ ] `AI_MEMORY_FED_REQUIRE_SIG=1` and `AI_MEMORY_FED_REQUIRE_NONCE=1` (v0.7.0 secure defaults; ensures `X-Memory-Sig` + `X-Memory-Nonce` enforcement).
@@ -1632,7 +1632,7 @@ for the single-instance baseline.
 
 - [ ] `AI_MEMORY_PERMISSIONS_MODE=enforce` and `AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=0` (v0.7.0 secure defaults).
 - [ ] `verify-signed-events-chain` runs daily as a cron with paging on `chain_holds: false`.
-- [ ] Audit log routed to a separate failure domain ([`production-deployment.md §6`](production-deployment.md)).
+- [ ] Audit log routed to a separate failure domain ([`production-deployment.md §6`](production-deployment.html)).
 
 ### 14.5 SSRF + webhook hardening
 
@@ -1649,7 +1649,7 @@ for the single-instance baseline.
 ### 14.7 Admin allowlist + rate limits
 
 - [ ] `AI_MEMORY_ADMIN_AGENT_IDS` set to the explicit admin list (#1062 `for_admin_checked` typed gate); empty/unset = daemon agent_id only.
-- [ ] Edge rate-limiter (Nginx, Envoy, CloudFront) for global limits — ai-memory itself ships per-agent + per-namespace quotas via the `agent_quotas` table ([`k8-quotas.md`](k8-quotas.md), `POST /api/v1/quota/status`).
+- [ ] Edge rate-limiter (Nginx, Envoy, CloudFront) for global limits — ai-memory itself ships per-agent + per-namespace quotas via the `agent_quotas` table ([`k8-quotas.md`](k8-quotas.html), `POST /api/v1/quota/status`).
 
 ### 14.8 Backup + tooling discipline
 
@@ -1658,14 +1658,14 @@ for the single-instance baseline.
 
 ### 14.9 Cross-references
 
-- [`production-deployment.md`](production-deployment.md) — single-instance baseline.
-- [`federation.md`](federation.md) — three auth layers; mTLS rotation; revocation; 3am runbook.
-- [`postgres-age-guide.md`](postgres-age-guide.md) — Postgres + AGE + pgvector install; bundled Dockerfile.
-- [`signed-events-v4.md`](signed-events-v4.md) — V-4 chain; CLI verifier; rotation; forensic recipe.
-- [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) / [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.md) — upgrade + SQLite→Postgres migration.
+- [`production-deployment.md`](production-deployment.html) — single-instance baseline.
+- [`federation.md`](federation.html) — three auth layers; mTLS rotation; revocation; 3am runbook.
+- [`postgres-age-guide.md`](postgres-age-guide.html) — Postgres + AGE + pgvector install; bundled Dockerfile.
+- [`signed-events-v4.md`](signed-events-v4.html) — V-4 chain; CLI verifier; rotation; forensic recipe.
+- [`MIGRATION_v0.7.md`](MIGRATION_v0.7.html) / [`migration-v0.7.0-postgres.md`](migration-v0.7.0-postgres.html) — upgrade + SQLite→Postgres migration.
 - [`agent-identity.html`](agent-identity.html) / [`a2a-messaging.html`](a2a-messaging.html) — NHI identity + A2A-6 contradiction-link pattern.
-- [`k8-quotas.md`](k8-quotas.md) / [`k10-sse-approvals.md`](k10-sse-approvals.md) — per-agent quotas + SSE approval stream.
-- [`hook-pipeline.md`](hook-pipeline.md) / [`telemetry.md`](telemetry.md) / [`forensic-export.md`](forensic-export.md) — SIEM extension + observability + forensic bundle.
+- [`k8-quotas.md`](k8-quotas.html) / [`k10-sse-approvals.md`](k10-sse-approvals.html) — per-agent quotas + SSE approval stream.
+- [`hook-pipeline.md`](hook-pipeline.html) / [`telemetry.md`](telemetry.html) / [`forensic-export.md`](forensic-export.html) — SIEM extension + observability + forensic bundle.
 - [`../SECURITY.md`](../SECURITY.md) — threat model + disclosure policy.
 
 ---
@@ -1673,7 +1673,7 @@ for the single-instance baseline.
 ## 15. Closing — how to choose a tier
 
 - **Starting from scratch:** begin at T1; graduate up the continuum as constraints fire. Do not start at T7/T8 without a concrete reason — the substrate's defaults are tuned for T1–T3 and the gap between "v0.7.0 ships the primitives" and "v0.7.0 ships the full operational story" widens above T5.
-- **Existing v0.6.x deployments:** read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) first; migrations are forward-only and auto-applied on first daemon start.
+- **Existing v0.6.x deployments:** read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.html) first; migrations are forward-only and auto-applied on first daemon start.
 - **Regulated workloads** (data residency, audit retention, encryption-at-rest): treat §14 as a deployment gate, not a soft target.
 - **Piloting a hive (T8):** read §9 carefully. v0.7.0 supports a pilot with strict trust gates; the v0.8 roadmap closes consensus + cross-tier governance + edge-pull-only gaps.
 

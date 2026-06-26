@@ -3,7 +3,7 @@ layout: doc
 ---
 # Telemetry & Observability Policy
 
-**Audience:** operators evaluating what `ai-memory` emits, where it goes, and what guarantees the binary makes about your data leaving the host. **Companion guide:** [`production-deployment.md`](production-deployment.md). **Threat model:** [`SECURITY.md`](../SECURITY.md).
+**Audience:** operators evaluating what `ai-memory` emits, where it goes, and what guarantees the binary makes about your data leaving the host. **Companion guide:** [`production-deployment.md`](production-deployment.html). **Threat model:** [`SECURITY.md`](../SECURITY.md).
 
 The short version: **`ai-memory` does not phone home, does not register your deployment anywhere, and does not emit telemetry to any destination you have not explicitly configured.** Every observability surface in the binary is operator-controlled. The remaining sections enumerate exactly what is emitted and how to route it.
 
@@ -67,7 +67,7 @@ structured = true     # JSON output for SIEM ingestion
 level = "info"        # tracing::EnvFilter syntax
 ```
 
-The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.md).
+The appender writes rotated files (`ai-memory.log.YYYY-MM-DD`) under the resolved path. Path precedence: CLI flag `--log-dir` > `AI_MEMORY_LOG_DIR` env > `[logging] path` config > platform default. The substrate refuses world-writable log directories — set `chmod 750` on the parent. Shipped in v0.7.0 at 98.98% test coverage; see `src/logging.rs` and the SIEM ingestion runbook at [`security/audit-trail.md`](security/audit-trail.html).
 
 **OpenTelemetry OTLP exporter (forward-looking).** The substrate's span shape is intentionally OTel-compatible. An OTLP exporter that reads `OTEL_EXPORTER_OTLP_ENDPOINT` (and the standard `OTEL_*` companion variables) is a v1.0 commitment — see ROADMAP §7.6. Until then, the file-sink path with `structured = true` produces JSON that any OTel-aware collector can ingest as a log-receiver input.
 
@@ -81,7 +81,7 @@ Three substrate behaviors give operators a defensible privacy posture without ch
 
 **`AI_MEMORY_ANONYMIZE=1`.** When set (or `[identity] anonymize_default = true` in `config.toml`), the binary replaces the resolved `agent_id` in every emitted span with a stable anonymized hash. The original id is still recorded inside the database for the operator's own audit needs; only externally-visible spans carry the redacted form. Shipped via issue #198 closure.
 
-**Memory content is never in spans.** This is structural, not policy: the `tracing::info!` call sites never receive `content`, `title`, or `metadata` payloads. Adding a span macro that violated this would fail code review against [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.md) §Hard Prohibitions. Operators can audit this themselves: `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
+**Memory content is never in spans.** This is structural, not policy: the `tracing::info!` call sites never receive `content`, `title`, or `metadata` payloads. Adding a span macro that violated this would fail code review against [`docs/AI_DEVELOPER_GOVERNANCE.md`](AI_DEVELOPER_GOVERNANCE.html) §Hard Prohibitions. Operators can audit this themselves: `grep -rn "tracing::\(info\|warn\|error\)" src/` against the field set of `models::Memory`.
 
 **Agent-id resolution is local.** The precedence ladder (CLI flag > env > MCP `clientInfo` > `host:<hostname>`) is resolved entirely in-process. There is no central agent registry to consult. If the resolved id contains a hostname you do not want surfaced (the default fallback `host:<hostname>` is durable + pid-free since #1720, so it exposes only the hostname; only the `AI_MEMORY_ANONYMIZE=1` / hostname-unavailable `anonymous:pid-…` fallback still carries a PID), set `AI_MEMORY_AGENT_ID` to an opaque value. Tracking history: issue #198.
 
@@ -131,8 +131,8 @@ Operators who want to forward-compatibly capture spans today can run the file si
 
 ## See also
 
-- [`production-deployment.md`](production-deployment.md) — operator deployment guide (Section 6 cross-references this doc)
+- [`production-deployment.md`](production-deployment.html) — operator deployment guide (Section 6 cross-references this doc)
 - [`SECURITY.md`](../SECURITY.md) — threat model and disclosure policy
-- [`security/audit-trail.md`](security/audit-trail.md) — SIEM ingestion runbook for the file sink
+- [`security/audit-trail.md`](security/audit-trail.html) — SIEM ingestion runbook for the file sink
 - `src/logging.rs` — implementation of the rotating file appender (98.98% test coverage)
 - ROADMAP §7.6 — v1.0 OTel standardization commitment

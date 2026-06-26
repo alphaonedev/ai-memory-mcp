@@ -6,12 +6,12 @@ layout: doc
 How to wire ai-memory to **any AI** — Claude, Cursor, ChatGPT,
 Continue.dev, generic MCP clients, and even AIs that don't speak MCP
 at all. Target audience: same as
-[`docs/install-quickstart.md`](install-quickstart.md) — anyone
+[`docs/install-quickstart.md`](install-quickstart.html) — anyone
 comfortable in a terminal — plus prosumers and tinkerers who want
 multiple AIs sharing one memory.
 
 If you haven't installed yet, do that first:
-[`docs/install-quickstart.md`](install-quickstart.md).
+[`docs/install-quickstart.md`](install-quickstart.html).
 
 ## 1. The pattern, in one paragraph
 
@@ -29,7 +29,7 @@ covers everything the MCP surface does, plus a few more endpoints
 
 Every recipe below assumes the binary is on your `PATH`. If
 `ai-memory --version` doesn't print `0.8.0`, go back to
-[`docs/install-quickstart.md`](install-quickstart.md) §3.
+[`docs/install-quickstart.md`](install-quickstart.html) §3.
 
 ## 2. Claude Code (Anthropic)
 
@@ -68,15 +68,15 @@ snippet:
 
 For the full SessionStart-hook story (so Claude proactively recalls
 memory on every conversation start), see
-[`docs/integrations/claude-code.md`](integrations/claude-code.md).
+[`docs/integrations/claude-code.md`](integrations/claude-code.html).
 
 > **`--tier semantic` is the right default.** It uses local
 > sentence-transformer embeddings — no LLM provider key required.
 > The other tiers (`keyword` / `smart` / `autonomous`) are
 > documented in
-> [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md) § `mcp`.
+> [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) § `mcp`.
 
-> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> **Using `--tier smart` or `--tier autonomous` with a non-default LLM backend?** Extend the `env` block above with `AI_MEMORY_LLM_BACKEND`, `AI_MEMORY_LLM_API_KEY`, and `AI_MEMORY_LLM_MODEL`. **Do not** rely on shell exports — MCP-spawned subprocesses don't see your interactive shell's environment ([#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)). Copy-pasteable recipes for every supported provider (Ollama, LMStudio, vLLM, llama.cpp server, xAI Grok, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks): [`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 ### 2a. PreToolUse governance hook (gate every Bash / Edit / Write)
 
@@ -130,7 +130,7 @@ by design — nothing is refused until you sign and enable a rule. To
 remove the hook: `ai-memory install claude-code --hook pretool
 --uninstall --apply`. Full reference, the allow/warn/refuse decision
 table, and the operator keygen → sign → enable → smoke-test workflow:
-[`docs/integrations/claude-code.md`](integrations/claude-code.md)
+[`docs/integrations/claude-code.md`](integrations/claude-code.html)
 §"Substrate rules enforcement on every tool call".
 
 ## 3. Cursor
@@ -165,9 +165,9 @@ Restart Cursor. Verify under Settings → Tools & MCP — a green dot
 next to `ai-memory` means it's live. Full recipe (including the
 project-rules `.cursorrules` directive that nudges Cursor to recall
 on session start):
-[`docs/integrations/cursor.md`](integrations/cursor.md). LLM-backend
+[`docs/integrations/cursor.md`](integrations/cursor.html). LLM-backend
 env-block recipe for smart / autonomous tiers:
-[`integrations/llm-backends.md`](integrations/llm-backends.md).
+[`integrations/llm-backends.md`](integrations/llm-backends.html).
 
 > **Cursor has a ~40 tool cap across all MCP servers.** Stick to
 > `--profile core` (the default — 7 tools) unless you really need
@@ -189,7 +189,7 @@ ai-memory serve --host 127.0.0.1 --port 9077
 
 Then use ChatGPT's **custom GPT actions** to call ai-memory over
 HTTP. Build a custom GPT, add an Action with the OpenAPI schema
-from [`docs/API_REFERENCE.md`](API_REFERENCE.md), and point the
+from [`docs/API_REFERENCE.md`](API_REFERENCE.html), and point the
 server URL at your exposed daemon (use a tunnel like Cloudflare
 Tunnel or Tailscale Funnel if you want it reachable from
 ChatGPT's cloud).
@@ -215,7 +215,7 @@ See §7 for the full HTTP-fallback section.
 If you drive the OpenAI Apps SDK / Assistants / Responses API
 yourself, prepend `ai-memory boot` to the system message of every
 request. The SDK recipe lives in
-[`docs/integrations/openai-apps-sdk.md`](integrations/openai-apps-sdk.md).
+[`docs/integrations/openai-apps-sdk.md`](integrations/openai-apps-sdk.html).
 There's also a built-in wrapper:
 `ai-memory wrap openai-cli -- chat --model gpt-4.1` injects the
 boot context as the system prompt before launching the downstream
@@ -280,7 +280,7 @@ If you're on the older `config.json` schema:
 
 Full recipe (including the `systemMessage` that nudges Continue
 to recall on session start):
-[`docs/integrations/continue.md`](integrations/continue.md).
+[`docs/integrations/continue.md`](integrations/continue.html).
 
 > **MCP tools in Continue only work in agent mode**, not in chat
 > mode. Switch to agent mode in the Continue side panel.
@@ -305,7 +305,7 @@ copy-paste recipes live in [`docs/integrations/`](integrations/):
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,
 **windsurf**, **zed**, and **local-models** (Ollama / llama.cpp /
 LM Studio / vLLM). See
-[`integrations/README.md`](integrations/README.md) for the
+[`integrations/README.md`](integrations/README.html) for the
 Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
@@ -347,7 +347,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memory_check_agent_action \
 - Pin who can connect: `--mtls-allowlist /etc/ai-memory/peer-fingerprints.txt`.
 
 Full HTTP surface:
-[`docs/API_REFERENCE.md`](API_REFERENCE.md).
+[`docs/API_REFERENCE.md`](API_REFERENCE.html).
 
 ## 8. Multi-AI setup — one ai-memory, many clients
 
@@ -374,7 +374,7 @@ single SQLite database. The pattern:
 under sustained write load are the signal to either throttle on the
 caller or move to the **postgres+AGE** backend
 (`ai-memory serve --store-url postgres://...` — see
-[`docs/postgres-age-guide.md`](postgres-age-guide.md)). Every
+[`docs/postgres-age-guide.md`](postgres-age-guide.html)). Every
 memory carries an `agent_id` so you can always tell which AI wrote
 which memory; the MCP server auto-detects the client name via
 `initialize.clientInfo.name`.
@@ -408,7 +408,7 @@ The shorthand stack:
 That's the one-paragraph version. For the full deep dive — peer
 allowlist, quorum rules, vector-clock CRDT merge, agent-to-agent
 approval flow, and the recommended deployment topologies — see
-[`docs/enterprise-deployment.md`](enterprise-deployment.md).
+[`docs/enterprise-deployment.md`](enterprise-deployment.html).
 
 ## 10. Security defaults
 
@@ -446,22 +446,22 @@ is opinionated on purpose.
 
 ## See also
 
-- [`docs/install-quickstart.md`](install-quickstart.md) — get the
+- [`docs/install-quickstart.md`](install-quickstart.html) — get the
   binary on disk first.
-- [`docs/INSTALL.md`](INSTALL.md) — every install method, every
+- [`docs/INSTALL.md`](INSTALL.html) — every install method, every
   flag.
-- [`docs/integrations/README.md`](integrations/README.md) — the
+- [`docs/integrations/README.md`](integrations/README.html) — the
   per-harness recipe matrix (Category 1 hook-capable vs.
   Category 2 MCP-only vs. Category 3 programmatic).
-- [`docs/API_REFERENCE.md`](API_REFERENCE.md) — every HTTP
+- [`docs/API_REFERENCE.md`](API_REFERENCE.html) — every HTTP
   endpoint.
-- [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md) — every CLI
+- [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) — every CLI
   subcommand.
 - [`docs/agent-identity.html`](agent-identity.html) — what
   `agent_id` and Ed25519 attestation mean.
-- [`docs/enterprise-deployment.md`](enterprise-deployment.md) —
+- [`docs/enterprise-deployment.md`](enterprise-deployment.html) —
   multi-user, peer-federation, A2A in depth.
-- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.md) —
+- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) —
   iOS / Android / edge.
-- [`docs/postgres-age-guide.md`](postgres-age-guide.md) — switch
+- [`docs/postgres-age-guide.md`](postgres-age-guide.html) — switch
   to postgres+AGE for higher-concurrency multi-AI setups.

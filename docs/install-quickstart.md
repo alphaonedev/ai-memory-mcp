@@ -13,13 +13,13 @@ background required.
 > hive, postgres + Apache AGE storage), this is the wrong page —
 > jump to [Path B: production / fleet deployment](#path-b--need-to-go-deeper-fleet-postgres-tuning)
 > at the bottom of this file, or directly to
-> [`production-deployment.md`](production-deployment.md).
+> [`production-deployment.md`](production-deployment.html).
 
 For the wire-it-up-to-an-AI step, see
-[`docs/integration-guide.md`](integration-guide.md).
+[`docs/integration-guide.md`](integration-guide.html).
 
 For the full SME reference (every flag, every package channel, every
-production knob) see [`docs/INSTALL.md`](INSTALL.md).
+production knob) see [`docs/INSTALL.md`](INSTALL.html).
 
 ## 1. What is ai-memory, in one paragraph
 
@@ -51,7 +51,7 @@ Pick the row that matches your machine. If you're not sure, the
 | **Windows** — PowerShell (pre-built binary) | `irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 \| iex` | Drops `ai-memory.exe` into your `%USERPROFILE%\.local\bin` (or equivalent). |
 | **Windows** — cargo via WSL | Inside WSL: `cargo install ai-memory` | Treat WSL like Linux. |
 | **Windows** — cargo native | From a Developer PowerShell: `cargo install ai-memory` | Native Windows build; requires the MSVC toolchain and `rustup` installed first. |
-| **Mobile (iOS / Android) / IoT / edge** | See [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.md) | The mobile artifacts (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`) ship with every v0.7.x release and embed into your mobile app via the FFI layer. Not a stand-alone CLI install. |
+| **Mobile (iOS / Android) / IoT / edge** | See [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) | The mobile artifacts (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`) ship with every v0.7.x release and embed into your mobile app via the FFI layer. Not a stand-alone CLI install. |
 
 > **Don't have `cargo`?** Install Rust first:
 > `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
@@ -109,7 +109,7 @@ open. The MCP server launches on demand when your AI client calls
 it; the HTTP daemon only runs when you explicitly start it.
 
 > **Multi-user / multi-host?** See
-> [`docs/enterprise-deployment.md`](enterprise-deployment.md) for the
+> [`docs/enterprise-deployment.md`](enterprise-deployment.html) for the
 > shared-database, peer-federation, and agent-to-agent setup.
 
 ## 5. What's on disk
@@ -167,9 +167,9 @@ might want to set once and forget:
 |---|---|---|
 | Database path | `export AI_MEMORY_DB=/path/to/db` | Move the SQLite file anywhere on disk. |
 | Default agent ID | `export AI_MEMORY_AGENT_ID=alice` | Stamps every memory `alice` wrote with that ID (instead of the `host:<hostname>` fallback (still exposes the hostname)). Recommended on shared machines. |
-| LLM backend | **Recommended:** `[llm]` section in `~/.config/ai-memory/config.toml` (see below). **Override:** `export AI_MEMORY_LLM_BACKEND=xai` etc. | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `ollama`, `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `api_key_env = "<NAME>"` (config-file path) or `AI_MEMORY_LLM_API_KEY=…` / per-vendor env (override path) for hosted providers; `ollama` and `lmstudio` need no key. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md) for the canonical `[llm]` schema, [`integrations/llm-backends.md`](integrations/llm-backends.md) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) for the operator paper-cut history + retirement. |
+| LLM backend | **Recommended:** `[llm]` section in `~/.config/ai-memory/config.toml` (see below). **Override:** `export AI_MEMORY_LLM_BACKEND=xai` etc. | Picks which LLM the `smart` and `autonomous` tiers talk to. Aliases for `ollama`, `openai`, `xai`, `anthropic`, `gemini`, `deepseek`, `kimi`, `qwen`, `mistral`, `groq`, `together`, `cerebras`, `openrouter`, `fireworks`, `lmstudio` are recognized. Pair with `api_key_env = "<NAME>"` (config-file path) or `AI_MEMORY_LLM_API_KEY=…` / per-vendor env (override path) for hosted providers; `ollama` and `lmstudio` need no key. See [`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html) for the canonical `[llm]` schema, [`integrations/llm-backends.md`](integrations/llm-backends.html) for per-backend MCP env-block recipes, and [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146) for the operator paper-cut history + retirement. |
 | Permissions mode | `export AI_MEMORY_PERMISSIONS_MODE=advisory` | Loosens v0.7.0's enforced governance gate to the v0.6.x permissive posture. Default is `enforce` and you should leave it on unless you're debugging. |
-| Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.md) § encrypted-at-rest. |
+| Encrypted DB | `export AI_MEMORY_ENCRYPT_AT_REST=1` | Requires a sqlcipher build + `--db-passphrase-file`. See [`docs/INSTALL.md`](INSTALL.html) § encrypted-at-rest. |
 
 Put any of those in `~/.bashrc` / `~/.zshrc` (or `~/.config/fish/config.fish`,
 or Windows `setx`) and every new shell session picks them up. For
@@ -211,14 +211,14 @@ CLI flag  >  AI_MEMORY_* env  >  config.toml section  >  legacy flat fields  >  
 `config.toml` in place; `--dry-run` prints the diff;
 `--also-clean-claude-json` additionally strips redundant
 `mcpServers.<*>.env` blocks. Canonical schema reference:
-[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.md).
+[`CONFIG_SCHEMA.md`](CONFIG_SCHEMA.html).
 
 ## 8. Next: connect your AI
 
 The full integration recipes — Claude Code, Cursor, ChatGPT,
 Continue.dev, Codex CLI, Grok CLI, Gemini CLI, generic MCP clients,
 and the HTTP fallback for clients that don't speak MCP — live in
-[`docs/integration-guide.md`](integration-guide.md).
+[`docs/integration-guide.md`](integration-guide.html).
 
 The TL;DR for the most common case (Claude Code):
 
@@ -231,8 +231,8 @@ This registers a managed SessionStart hook in `~/.claude/settings.json`
 every new conversation boots memory-aware, backing up your existing
 settings to a timestamped `.bak.<ts>` file first. The MCP server entry
 itself goes in `~/.claude.json` — add the `mcpServers` block per
-[`docs/integration-guide.md`](integration-guide.md) (or
-[`INSTALL.md`](INSTALL.md) step 2). Restart Claude Code and you're done.
+[`docs/integration-guide.md`](integration-guide.html) (or
+[`INSTALL.md`](INSTALL.html) step 2). Restart Claude Code and you're done.
 
 > **Using `smart` or `autonomous` tier with a non-Ollama LLM?** The
 > installer writes a default MCP block without LLM-backend env vars
@@ -246,7 +246,7 @@ itself goes in `~/.claude.json` — add the `mcpServers` block per
 > `AI_MEMORY_LLM_MODEL` — useful for CI / per-session tweaks. Shell
 > exports work for the CLI / HTTP daemon but **not** for MCP-spawned
 > subprocesses. Copy-pasteable per-backend recipes:
-> [`integrations/llm-backends.md`](integrations/llm-backends.md).
+> [`integrations/llm-backends.md`](integrations/llm-backends.html).
 > Background: [#1144](https://github.com/alphaonedev/ai-memory-mcp/issues/1144)
 > (env-block paper-cut) → [#1146](https://github.com/alphaonedev/ai-memory-mcp/issues/1146)
 > (single source of truth, retires the env-block requirement).
@@ -310,7 +310,7 @@ the full output.
 | `Error: failed to open database` with permission denied | The DB file is owned by another user. Either `chown` it to yourself or use `--db <new-path>` to write to a path you own. |
 | First semantic recall hangs for a minute | First run downloads the `sentence-transformers/all-MiniLM-L6-v2` embedding model (~90 MB). One-time only; subsequent calls are instant. If it never completes, check your internet connection and proxy settings. |
 | `Error: governance refused` on a write | Permissions mode defaults to `enforce` at v0.7.0. Either approve the pending action (`ai-memory pending list` then `ai-memory pending approve <id>`) or temporarily set `AI_MEMORY_PERMISSIONS_MODE=advisory` while you debug. |
-| `Error: no MCP tools advertised` in the AI client | The AI client started ai-memory with the wrong `--profile` or no `--tier` flag. Confirm the args in the client's MCP config match the snippets in [`docs/integration-guide.md`](integration-guide.md). |
+| `Error: no MCP tools advertised` in the AI client | The AI client started ai-memory with the wrong `--profile` or no `--tier` flag. Confirm the args in the client's MCP config match the snippets in [`docs/integration-guide.md`](integration-guide.html). |
 | Memories from one session don't appear in another | The two clients are pointing at different DB files. Set `AI_MEMORY_DB` to the same path in every client's MCP config, or use `--db <shared-path>` consistently. |
 
 ## Path B — Need to go deeper? (fleet, postgres, tuning)
@@ -334,55 +334,55 @@ Read on **only if** any of these is true:
 
 The Path-B doc set, in reading order:
 
-1. **[`INSTALL.md`](INSTALL.md)** — full SME install reference. Every
+1. **[`INSTALL.md`](INSTALL.html)** — full SME install reference. Every
    package channel, every flag, every Windows / Docker / Kubernetes
    variant.
-2. **[`production-deployment.md`](production-deployment.md)** — 10-min
+2. **[`production-deployment.md`](production-deployment.html)** — 10-min
    hardening checklist: keypair provisioning, mTLS allowlist, backup
    discipline, schema migrations, observability, topology (single-
    instance / hub-spoke / W-of-N).
-3. **[`ADMIN_GUIDE.md`](ADMIN_GUIDE.md)** — every env var, every
+3. **[`ADMIN_GUIDE.md`](ADMIN_GUIDE.html)** — every env var, every
    `config.toml` field, the full LLM-backend matrix, the embedder /
    reranker tuning surface.
-4. **[`enterprise-deployment.md`](enterprise-deployment.md)** — 60–90
+4. **[`enterprise-deployment.md`](enterprise-deployment.html)** — 60–90
    min planning artefact. 8 deployment topologies from singleton on a
    laptop to multi-region federated fleet; capacity envelope and
    graduation triggers for each.
-5. **[`postgres-age-guide.md`](postgres-age-guide.md)** — PostgreSQL +
+5. **[`postgres-age-guide.md`](postgres-age-guide.html)** — PostgreSQL +
    Apache AGE first-class storage backend. When to switch off sqlite,
    how to provision pgvector + AGE, the `ai-memory schema-init` CLI,
    migration runbook, AGE Cypher KG.
-6. **[`federation.md`](federation.md)** — mTLS, peer attestation,
+6. **[`federation.md`](federation.html)** — mTLS, peer attestation,
    `X-API-Key`, per-message Ed25519 signing + nonce freshness, signed-
    events V-4 cross-row hash chain.
-7. **[`integrations/llm-backends.md`](integrations/llm-backends.md)** —
+7. **[`integrations/llm-backends.md`](integrations/llm-backends.html)** —
    MCP env-block recipes for every supported LLM provider (Ollama /
    LMStudio / vLLM / llama.cpp server / xAI / OpenAI / Anthropic /
    Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together /
    Cerebras / OpenRouter / Fireworks). Includes a fleet / multi-agent
    / multi-DC considerations section.
-8. **[`batman-active-mode.md`](batman-active-mode.md)** — multi-agent
+8. **[`batman-active-mode.md`](batman-active-mode.html)** — multi-agent
    coordination on one node (Batman A2A); operator how-to for turning
    Forms 1–6 + 7th from capable → active.
-9. **[`a2a-harness-integration.md`](a2a-harness-integration.md)** —
+9. **[`a2a-harness-integration.md`](a2a-harness-integration.html)** —
    agent-to-agent across nodes (full A2A wire shape).
-10. **[`mobile-iot-deployment.md`](mobile-iot-deployment.md)** — iOS,
+10. **[`mobile-iot-deployment.md`](mobile-iot-deployment.html)** — iOS,
     Android, edge / IoT, resource-constrained deployment.
 
 ## See also
 
-- [`docs/integration-guide.md`](integration-guide.md) — wire ai-memory
+- [`docs/integration-guide.md`](integration-guide.html) — wire ai-memory
   to any AI.
-- [`docs/INSTALL.md`](INSTALL.md) — full install reference (every
+- [`docs/INSTALL.md`](INSTALL.html) — full install reference (every
   package channel, every flag, every Windows variant).
-- [`docs/QUICKSTART.md`](QUICKSTART.md) — first memory in five
+- [`docs/QUICKSTART.md`](QUICKSTART.html) — first memory in five
   minutes (CLI / MCP / HTTP path comparisons).
-- [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.md) — every CLI subcommand
+- [`docs/CLI_REFERENCE.md`](CLI_REFERENCE.html) — every CLI subcommand
   and flag.
-- [`docs/API_REFERENCE.md`](API_REFERENCE.md) — every HTTP endpoint.
+- [`docs/API_REFERENCE.md`](API_REFERENCE.html) — every HTTP endpoint.
 - [`docs/agent-identity.html`](agent-identity.html) — what `agent_id`
   and the identity keypair mean.
-- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.md) — iOS,
+- [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) — iOS,
   Android, edge / IoT deployment.
-- [`docs/enterprise-deployment.md`](enterprise-deployment.md) —
+- [`docs/enterprise-deployment.md`](enterprise-deployment.html) —
   multi-user, peer-federation, agent-to-agent.

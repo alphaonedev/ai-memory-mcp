@@ -6,9 +6,9 @@ layout: doc
 > **Status: Awaiting Phase 2 orchestrator pass.**
 >
 > Phase 2 runs only after all three Phase 1 reports land:
-> - [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.md)
-> - [`report-gpt-5-5.md`](./report-gpt-5-5.md)
-> - [`report-grok-4-3.md`](./report-grok-4-3.md)
+> - [`report-claude-opus-4-7.md`](./report-claude-opus-4-7.html)
+> - [`report-gpt-5-5.md`](./report-gpt-5-5.html)
+> - [`report-grok-4-3.md`](./report-grok-4-3.html)
 >
 > The orchestrator pass (run by Claude Opus 4.7 in synthesizer-role, against all three reports as input) produces this file with:
 > - Points of agreement (high-confidence claims about v0.7.0).

@@ -82,10 +82,10 @@ These are not "out of scope" in the dismissive sense. They are work that has not
 
 ## For the curious
 
-- Engineering writeup: [`audience-engineer.md`](audience-engineer.md) — full technical detail, every commit, every reproduction step.
-- Campaign index: [`README.md`](README.md).
-- C-level / decision-maker view: [`audience-c-level.md`](audience-c-level.md).
-- Flat list of every finding: [`findings.md`](findings.md).
+- Engineering writeup: [`audience-engineer.md`](audience-engineer.html) — full technical detail, every commit, every reproduction step.
+- Campaign index: [`README.md`](README.html).
+- C-level / decision-maker view: [`audience-c-level.md`](audience-c-level.html).
+- Flat list of every finding: [`findings.md`](findings.html).
 
 ---
 

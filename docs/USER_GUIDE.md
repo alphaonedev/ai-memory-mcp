@@ -22,7 +22,7 @@ The easiest way to use ai-memory is as an **MCP tool server**. MCP (Model Contex
 
 ### Setup
 
-Each AI platform has its own MCP configuration path and format. See the [Installation Guide](INSTALL.md) for platform-specific setup instructions.
+Each AI platform has its own MCP configuration path and format. See the [Installation Guide](INSTALL.html) for platform-specific setup instructions.
 
 Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/.claude.json`; or project scope: `.mcp.json` in project root) — one of many supported platforms:
 
@@ -41,15 +41,15 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 > **Tier flag:** The `--tier` flag must be passed in the args: `keyword`, `semantic` (default), `smart`, or `autonomous`. The `config.toml` tier setting is not used when launched by an AI client. Smart/autonomous tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that is local [Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server, OR any OpenAI-compatible cloud vendor (xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks), selected via `AI_MEMORY_LLM_BACKEND`.
 
-> **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.md) for exact paths.
+> **Other platforms** (Codex, Gemini, Cursor, Windsurf, Continue.dev, etc.): config paths vary by platform. The command and args are the same -- only the config file location differs. Refer to the [Installation Guide](INSTALL.html) for exact paths.
 
-> **Grok note:** Grok connects via remote MCP over HTTPS only (no stdio). Run `ai-memory serve` and expose it behind an HTTPS reverse proxy. `server_label` is required. See the [Installation Guide](INSTALL.md) for details.
+> **Grok note:** Grok connects via remote MCP over HTTPS only (no stdio). Run `ai-memory serve` and expose it behind an HTTPS reverse proxy. `server_label` is required. See the [Installation Guide](INSTALL.html) for details.
 
-> **Llama note:** Llama Stack connects over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.md) for details.
+> **Llama note:** Llama Stack connects over HTTP rather than stdio MCP. Run `ai-memory serve` to start the HTTP daemon, then point your client at `http://localhost:9077`. See the [Installation Guide](INSTALL.html) for details.
 
 ### How It Works
 
-With MCP configured, your AI client gains 100 memory tools at `--profile full` (99 callable tools + the always-on `memory_capabilities` bootstrap) at v0.8.0 (highlights below; see [API_REFERENCE.md](API_REFERENCE.md) for the full reference):
+With MCP configured, your AI client gains 100 memory tools at `--profile full` (99 callable tools + the always-on `memory_capabilities` bootstrap) at v0.8.0 (highlights below; see [API_REFERENCE.md](API_REFERENCE.html) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -1298,7 +1298,7 @@ full`. They let multiple agents coordinate work over the shared store:
 a typed action DAG + state machine, single-holder TTL leases,
 Ed25519-signed signals, attested checkpoints, and replayable routines.
 Full parameter schemas, examples, and the federation-fanout semantics
-live in **[coordination.md](coordination.md)**; the summary below names
+live in **[coordination.md](coordination.html)**; the summary below names
 every tool so you know the surface exists.
 
 | Family | Tools | What it does |
@@ -1311,7 +1311,7 @@ every tool so you know the surface exists.
 
 Pillar-2 layers typed cognition (Goal / Plan / Step via `lifecycle_state`
 + the `decomposes_into` / `depends_on` / `advances` link relations) on top
-of this surface — see [coordination.md](coordination.md) for the worked
+of this surface — see [coordination.md](coordination.html) for the worked
 multi-agent example.
 
 ---

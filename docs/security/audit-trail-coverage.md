@@ -10,7 +10,7 @@ layout: doc
 
 This doc is the v0.7.0 honest single source of truth for the
 cryptographic forensic audit trail. It is the substrate-side companion
-to [`audit-trail.md`](./audit-trail.md) (which documents the on-disk
+to [`audit-trail.md`](./audit-trail.html) (which documents the on-disk
 JSON audit log surface — a different and complementary subsystem).
 
 Where this doc says "the chain", it means the SQLite/Postgres
@@ -27,7 +27,7 @@ Cross-references:
 - **#696** PE-3 deferred audit-log queue
 - **#697** v0.8.0 100% Cryptographic Forensic Audit Trail closeout
 
-Companion: [`docs/policy-engine.md`](../policy-engine.md).
+Companion: [`docs/policy-engine.md`](../policy-engine.html).
 
 ---
 
@@ -61,7 +61,7 @@ and read-action visibility. See §4.
 | Governance refusals on substrate-INTERNAL pre-write hook (`check_agent_action_no_audit`) | **Chain-logged today** via PE-3 deferred queue (merged commit `07b4957`) | identical shape to the audited path — same canonical bytes / payload hash; emit deferred via tokio drain task in `src/governance/deferred_audit.rs::install_deferred_audit_drainer` | hard-crash drainer loss (process-local queue); see V08-PE-4 | **#697** V08-PE-4 closes durability (V08 closeout) |
 | Approval-API decisions (L1-8) | **Chain-logged today** | `event_type = "approval.<decision>"`, binds approver identity + decision + correlation id | none | — |
 | Schema migrations | **Chain-logged today** at boot | `event_type = "schema.migration"`, binds from-version + to-version + migration filename hash | none | — |
-| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.md), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
+| Read actions (`memory_recall` / `memory_search` / `memory_list` / `memory_get` / `memory_session_boot`) | **NOT chain-logged** at engine level. Handler-layer `AuditAction::Recall` etc. row is emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html), but no `signed_events` row | n/a — v0.8.0 adds `event_type = "governance.read_check"` once V08-PE-2 lands | engine has no `AgentAction::Read` variant at HEAD | **#697** V08-PE-2 |
 | Subprocess actions from Bash spawn chain (fork→exec under a permitted shell) | **NOT visible** to the engine at HEAD | n/a — v0.8.0 adds eBPF/dtrace surface and `event_type = "process.spawn_chain"` | invisible to the substrate without a kernel-side probe | **#697** V08-PE-3 |
 | Out-of-band agent actions | **Unenforceable by definition** | n/a — substrate has no visibility | partial mitigations: V08-PE-1 mandatory-hook + V08-PE-6 TPM-bound binary integrity | **#697** V08-PE-1, V08-PE-6 |
 | Hard-crash-lost deferred events | **Gap** — process-local queue | rows drop silently on SIGKILL between verdict and drain | persistent on-disk queue closes the gap | **#697** V08-PE-4 |
@@ -222,7 +222,7 @@ Cold-honest gaps, every one tracked at **#697**:
   — the in-flight write transaction releases its lock before the
   audit row writes so deadlock is structurally impossible. The
   handler-layer `AuditAction::Store` row on the failure leg is also
-  emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.md).
+  emitted to the JSON audit log per [`audit-trail.md`](./audit-trail.html).
   Hard-crash loss is the only remaining gap (process-local queue),
   closed by V08-PE-4 in v0.8.0.
 - **Hard-crash-lost deferred events.** PE-3's queue is

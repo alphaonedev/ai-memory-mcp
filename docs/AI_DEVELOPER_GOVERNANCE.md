@@ -15,8 +15,8 @@ layout: doc
 > **Precedence (highest to lowest):**
 > 1. `LICENSE`, `CLA.md`, `NOTICE`, `CODE_OF_CONDUCT.md` (legal floor)
 > 2. This document (`AI_DEVELOPER_GOVERNANCE.md`)
-> 3. [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md)
-> 4. [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.md)
+> 3. [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html)
+> 4. [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.html)
 > 5. [`CONTRIBUTING.md`](../CONTRIBUTING.md)
 >
 > When two documents conflict, the higher-precedence document wins.
@@ -594,7 +594,7 @@ for trivial commits.
 ### 4.2 PR attribution
 
 Every PR opened by an AI agent must include the **AI involvement** section defined in
-[`AI_DEVELOPER_WORKFLOW.md` §8.2](AI_DEVELOPER_WORKFLOW.md), populated with:
+[`AI_DEVELOPER_WORKFLOW.md` §8.2](AI_DEVELOPER_WORKFLOW.html), populated with:
 
 - Agent (model id and provider)
 - Authority class (Trivial, Standard, Sensitive)
@@ -627,13 +627,13 @@ source is reserved for content the user dictated or corrected.
 
 - **All AI-authored PRs require human review before merge.** No exceptions.
 - PRs to `main` require approval from `@alphaonedev` (CODEOWNERS), per
-  [`ENGINEERING_STANDARDS.md` §1.3](ENGINEERING_STANDARDS.md).
+  [`ENGINEERING_STANDARDS.md` §1.3](ENGINEERING_STANDARDS.html).
 - PRs to `develop` require at least one human review for AI-authored changes, even
   though `develop` does not currently enforce this in branch protection.
 
 ### 5.2 Quality gates (CI + local)
 
-The four gates from [`ENGINEERING_STANDARDS.md` §1.6](ENGINEERING_STANDARDS.md) are
+The four gates from [`ENGINEERING_STANDARDS.md` §1.6](ENGINEERING_STANDARDS.html) are
 required for every AI-authored PR:
 
 ```bash
@@ -644,7 +644,7 @@ cargo audit
 ```
 
 In addition, the AI agent must walk the manual security checklist
-([`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.md)) before marking a PR
+([`ENGINEERING_STANDARDS.md` §3.2](ENGINEERING_STANDARDS.html)) before marking a PR
 ready and must record the result in the PR description.
 
 ### 5.3 AI-authored review comments
@@ -730,7 +730,7 @@ example, by adding fallback approvers or distributing approval rights — must:
 ## 6. Security Policy for AI Agents
 
 In addition to the project-wide security standards
-([`ENGINEERING_STANDARDS.md` §3](ENGINEERING_STANDARDS.md)):
+([`ENGINEERING_STANDARDS.md` §3](ENGINEERING_STANDARDS.html)):
 
 ### 6.1 No data exfiltration
 
@@ -904,14 +904,14 @@ This standard is consistent with and subordinate to:
 - [`NOTICE`](../NOTICE) — Apache 2.0 §4(d) attribution
 - [`CLA.md`](../CLA.md) — Contributor License Agreement
 - [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) — community conduct
-- [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) — code/test/release/security
+- [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) — code/test/release/security
 
 If anything in this document conflicts with the legal-floor documents above, the
 legal-floor documents win.
 
 ### 10.2 OIN, trademark, third-party licenses
 
-Per [`ENGINEERING_STANDARDS.md` §5](ENGINEERING_STANDARDS.md):
+Per [`ENGINEERING_STANDARDS.md` §5](ENGINEERING_STANDARDS.html):
 
 - AlphaOne LLC is an active OIN member (3,900+ member cross-license).
 - `ai-memory(TM)` is a pending USPTO mark (Serial No. 99761257). AI agents must not
@@ -931,8 +931,8 @@ document is itself **Sensitive** under §3.1). The PR description must include a
 
 | Topic | Document |
 |-------|----------|
-| Step-by-step workflow that operationalizes this standard | [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.md) |
-| Code, test, release, security standards | [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.md) |
+| Step-by-step workflow that operationalizes this standard | [`AI_DEVELOPER_WORKFLOW.md`](AI_DEVELOPER_WORKFLOW.html) |
+| Code, test, release, security standards | [`ENGINEERING_STANDARDS.md`](ENGINEERING_STANDARDS.html) |
 | Contributor procedures | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) |
 | Claude Code integration and MCP tool surface | [`../CLAUDE.md`](../CLAUDE.md) |
 | Conduct | [`../CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) |

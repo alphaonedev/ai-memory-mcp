@@ -362,17 +362,17 @@ high-volume tenant via the pending-actions table
 tenant to its own daemon or raise `APPROVAL_BROADCAST_CAPACITY`
 (a compiled constant — requires a rebuild) and ship.
 
-See also: [`docs/governance.md`](governance.md) for the wider
-permissions pipeline, [`docs/MIGRATION_v0.7.md` §"K10 SSE approvals"](MIGRATION_v0.7.md),
+See also: [`docs/governance.md`](governance.html) for the wider
+permissions pipeline, [`docs/MIGRATION_v0.7.md` §"K10 SSE approvals"](MIGRATION_v0.7.html),
 the canonical inventory in
-[`docs/internal/v070-feature-inventory.md` §"Feature: K1/G1 namespace-inheritance"](internal/v070-feature-inventory.md),
+[`docs/internal/v070-feature-inventory.md` §"Feature: K1/G1 namespace-inheritance"](internal/v070-feature-inventory.html),
 the hook pipeline that emits `AskUser` decisions feeding the
-approvals queue at [`docs/hook-pipeline.md`](hook-pipeline.md), the
+approvals queue at [`docs/hook-pipeline.md`](hook-pipeline.html), the
 signed-events chain that records every approval as an append-only
-audit row at [`docs/signed-events-v4.md`](signed-events-v4.md), the
+audit row at [`docs/signed-events-v4.md`](signed-events-v4.html), the
 K8 quotas substrate that paired-blocks an over-quota agent's
-pending-action queue at [`docs/k8-quotas.md`](k8-quotas.md), the
+pending-action queue at [`docs/k8-quotas.md`](k8-quotas.html), the
 federation hardening that propagates approval decisions to peers at
-[`docs/federation.md`](federation.md), and the sidechain transcripts
+[`docs/federation.md`](federation.html), and the sidechain transcripts
 that capture the context of each approved write at
-[`docs/sidechain-transcripts.md`](sidechain-transcripts.md).
+[`docs/sidechain-transcripts.md`](sidechain-transcripts.html).
