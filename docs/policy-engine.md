@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Policy Engine Architecture
 
 **Status as of branch `feat/v0.7.0-grand-slam` (HEAD `12a7f29`,

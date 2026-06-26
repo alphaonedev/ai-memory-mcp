@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 07 — Memory Cognition Lifecycle (v0.7.0)
 
 > Domain: `src/confidence/`, `src/atomisation/`, `src/synthesis/`,

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track A NHI re-run — for executives, PMs, decision-makers (2026-05-18)
 
 **Bottom line:** SHIP-RECOMMENDED for v0.7.0, gated only on the operator's tag-cut decision (the 8-tier release gate, GitHub issue [#836](https://github.com/alphaonedev/ai-memory-mcp/issues/836)).

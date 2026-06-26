@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI dogfood test — for executives, PMs, decision-makers (2026-05-18)
 
 **Bottom line:** The dogfood pass converted four invisible-but-real defects into four tracked items in a single working session. Three closed in v0.7.0 with end-to-end evidence; one is filed with a precise 600-LOC scope assigned to the next engineering dispatch. The sqlite reference implementation is ship-ready; the PostgreSQL + Apache AGE secondary backend requires the next dispatch to reach v0.7.0 provenance parity.

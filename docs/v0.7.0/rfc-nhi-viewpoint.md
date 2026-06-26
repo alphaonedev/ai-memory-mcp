@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # RFC: AI NHI viewpoint on ai-memory v0.7.0 — full-spectrum reflective assessment from inside the substrate
 
 > **Forward note (2026-05-22, DOC-F audit).** This RFC was authored at

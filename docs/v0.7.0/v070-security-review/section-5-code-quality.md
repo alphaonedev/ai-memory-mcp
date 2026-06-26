@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 5 — Code quality, async correctness, resource safety
 
 **Specialist:** S5 / 6 — code quality + async correctness + resource safety

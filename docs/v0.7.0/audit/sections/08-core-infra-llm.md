@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 08 — Core Infra / LLM / Config / Runtime (v0.7.0)
 
 Scope: `src/config.rs`, `src/llm.rs`, `src/encryption/`, `src/tls.rs`,

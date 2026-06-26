@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Initiative #9 — v0.8 Issues Pull-Forward Status
 
 **Operator directive:** memory `28860423-d12c-4959-bc8b-8fa9a94a33d9`

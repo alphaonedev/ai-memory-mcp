@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Typed-errors audit — issue #964
 
 **Wave-2 Tier-B4 — Replace remaining `anyhow::Result<T>` on substrate-public API with typed errors**

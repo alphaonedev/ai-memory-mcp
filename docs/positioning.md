@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Competitive Positioning — ai-memory
 
 > **Release tag:** v0.7.0 grand-slam (2026-05-15)

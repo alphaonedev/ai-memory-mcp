@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track B — A2A In-Host via Lan-Parity Docker Stack Results (2026-05-28)
 
 Track B re-verifies the A2A non-corpus regression against the

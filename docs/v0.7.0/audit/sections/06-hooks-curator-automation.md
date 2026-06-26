@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 06 — Hooks / Curator / Autonomy / Subscriptions / Notification (v0.7.0)
 
 Audit scope: the automation / reactive subsystem of ai-memory v0.7.0 —

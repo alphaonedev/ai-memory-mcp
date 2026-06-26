@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Developer Guide
 
 ## Architecture Overview

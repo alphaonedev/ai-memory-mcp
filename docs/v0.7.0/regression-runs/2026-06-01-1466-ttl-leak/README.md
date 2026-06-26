@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 #1466 — TTL-leak immortal-rows fix (closeout evidence, 2026-06-01)
 
 Operator directive (2026-06-01): *"#1466 TTL-leak: fix it all 100%, AI NHI

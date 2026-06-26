@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Documentation
 
 <div align="center">

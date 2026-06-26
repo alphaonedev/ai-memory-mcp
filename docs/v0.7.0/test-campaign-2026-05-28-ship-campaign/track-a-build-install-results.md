@@ -1,3 +1,7 @@
+---
+layout: doc
+---
+{% raw %}
 # Track A — Build + Install + 1hr Dogfood Loop Results (2026-05-28)
 
 Phase-1 build + install verification for the v0.7.0 ship campaign on
@@ -270,3 +274,4 @@ affected.
 - Open defect: #1378 (install codex TOML; non-blocking)
 
 Drafted by Claude (Opus 4.7, 1M context).
+{% endraw %}

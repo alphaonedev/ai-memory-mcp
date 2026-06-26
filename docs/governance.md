@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Governance + permissions (operator index)
 
 v0.7.0 refactors the v0.6.x governance subsystem into **rules + modes

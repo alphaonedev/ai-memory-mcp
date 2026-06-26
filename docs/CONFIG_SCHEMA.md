@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # `ai-memory` configuration schema reference
 
 This is the canonical reference for the v0.7.x schema-versioned

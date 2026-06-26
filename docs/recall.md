@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Recall
 
 `memory_recall` (MCP) / `POST /api/v1/recall` (HTTP) / `ai-memory recall`

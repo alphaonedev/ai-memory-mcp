@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track B — IronClaw live A2A campaign (v0.8.0), 2026-06-24
 
 Live two-daemon agent-to-agent campaign against the `release/v0.8.0` HEAD

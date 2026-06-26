@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Memory-Kind Vocabulary (Form 6, issue #759; Pillar 2, issue #1709)
 
 v0.7.x extends the substrate's `MemoryKind` enum from the original

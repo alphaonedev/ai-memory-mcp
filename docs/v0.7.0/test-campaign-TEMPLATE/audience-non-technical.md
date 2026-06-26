@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # <Campaign name> — for non-technical readers (<DATE>)
 
 **Verdict:** SHIP / NO-SHIP.

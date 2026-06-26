@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Recursive learning (v0.7.0)
 
 ## Substrate-vs-application boundary (Item B, issue #973)

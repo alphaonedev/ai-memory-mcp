@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Substrate-level agent-action rules engine
 
 **Status:** v0.7.0 7th-form closeout (issues [#691](https://github.com/alphaonedev/ai-memory-mcp/issues/691), [#760](https://github.com/alphaonedev/ai-memory-mcp/issues/760)) — **wired at the harness boundary** across four daemon-side wire-points (`skill_export`, `federation::sync`, `hooks::executor`, `llm`). Seed rules R001-R004 land at `enabled=0` per migration `0024_v07_governance_rules.sql`; the operator activates them via `ai-memory governance install-defaults` or per-rule `ai-memory rules enable <id> --sign`.

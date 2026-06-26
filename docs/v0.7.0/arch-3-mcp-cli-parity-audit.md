@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ARCH-3 — MCP/CLI parity audit (FX-12)
 
 **Base SHA:** `11b05229754d43a0c75c0f75d16eb6c676c88627`

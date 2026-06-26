@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Multi-step ingest (Form 3)
 
 *v0.7.0 — issue [#756](https://github.com/alphaonedev/ai-memory-mcp/issues/756)*

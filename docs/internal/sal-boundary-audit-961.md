@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # SAL Boundary Audit — Issue #961
 
 **Audit date:** 2026-05-21

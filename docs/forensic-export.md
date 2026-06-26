@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Forensic export (v0.7.0)
 
 > **Status (2026-05-14):** Procurement-grade forensic export ships in

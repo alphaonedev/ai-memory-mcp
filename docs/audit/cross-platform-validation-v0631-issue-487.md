@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Cross-platform validation report — v0.6.3.1 / issue #487
 
 **Author:** PR-9 Audit Agent D

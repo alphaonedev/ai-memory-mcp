@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Federation identity at scale — enterprise zero-touch trust
 
 > **Audience:** operators and platform/DevOps engineers deploying a

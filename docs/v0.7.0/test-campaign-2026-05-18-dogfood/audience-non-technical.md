@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI dogfood test — for non-technical readers (2026-05-18)
 
 **Verdict:** Safer to ship now than it was this morning. The dogfood test found 4 real defects; 3 are already fixed in the same release, and the fourth is filed with a concrete fix scoped for the next engineering session.

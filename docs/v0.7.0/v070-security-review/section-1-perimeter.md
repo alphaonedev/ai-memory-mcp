@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 1 — Security Perimeter (Specialist 1 of 6)
 
 **Base SHA:** `b4ba16c8c` (`local/install-815-816`, post-#901)

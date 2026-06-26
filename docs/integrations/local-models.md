@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Local models (Hermes, Llama, Mistral, etc.) — wrap the chat call
 
 **Category 3 (programmatic).** 100% reliable when implemented.

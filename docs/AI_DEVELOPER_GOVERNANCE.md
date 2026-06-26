@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory AI Developer Governance Standard
 
 > Authoritative policy for **AI participation** in the `alphaonedev/ai-memory-mcp`

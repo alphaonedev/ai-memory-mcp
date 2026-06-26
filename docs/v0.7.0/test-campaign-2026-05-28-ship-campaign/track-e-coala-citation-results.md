@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track E — CoALA Prior-Art Citation Results (2026-05-28)
 
 Track E is the scope-disciplined CoALA prior-art citation PR

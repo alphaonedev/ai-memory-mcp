@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # <Campaign name> — for executives, PMs, decision-makers (<DATE>)
 
 **Bottom line:** SHIP / NO-SHIP, gated on <gate>.

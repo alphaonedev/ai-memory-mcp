@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Knowledge-graph backend fallback (AGE → CTE)
 
 > v0.7.0 fold-A2A1.3 (#700). Scenarios cleared: S45, S46, S65, S82.

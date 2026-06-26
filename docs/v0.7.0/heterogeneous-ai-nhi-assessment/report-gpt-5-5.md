@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # report-gpt-5-5.md
 
 > **Status: Awaiting Phase 1 independent execution by OpenAI GPT 5.5.**

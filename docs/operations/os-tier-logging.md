@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # OS-tier logging (journald / unified log / Event Log)
 
 > **Issue #1463 — Tier 1.** ai-memory's operational logs can be emitted as

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Documentation Drift Audit (DOC-F)
 
 **Audit ID:** DOC-F (100% docs + GitHub Pages drift audit + remediation)

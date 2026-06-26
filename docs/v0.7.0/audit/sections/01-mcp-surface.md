@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 01 — MCP Tool Surface (v0.7.0)
 
 Scope: everything under `src/mcp/` (~45.8k LOC) plus `src/profile.rs` (the

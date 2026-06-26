@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Wave-C MED/LOW batch — v0.7.0 review findings remediation
 
 **Base commit:** `c27c0f2cd984e5bee5c1cacf5f6712081071c5bd`

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # DecentMem mapping (Hao et al. 2026)
 
 > **Document classification:** Public-facing strategic supplement.

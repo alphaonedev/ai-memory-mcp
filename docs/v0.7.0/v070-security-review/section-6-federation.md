@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 6 — Federation, Compliance & Cross-Node Identity
 
 **Specialist:** S6 (federation + compliance + cross-node identity)

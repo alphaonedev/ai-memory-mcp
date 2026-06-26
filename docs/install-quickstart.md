@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.8.0 — install quickstart (Path A: super simple)
 
 A friendly, no-jargon install guide. If you can use a terminal, you can

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.6.4 — `quiet-tools`
 
 **Status:** sprint authorized 2026-05-02; refactored 2026-05-04 against verified v0.6.3.1 source; dev cycle Mon 2026-05-04 → Fri 2026-05-08

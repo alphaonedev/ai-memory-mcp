@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — Full-spectrum AI NHI Test Campaign (2026-05-17)
 
 ## What this is

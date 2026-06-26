@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track C — Postgres + Apache AGE Full Regression Results (2026-05-22)
 
 > **Post-campaign update (2026-05-23):** #1156 (per-namespace K8 quota

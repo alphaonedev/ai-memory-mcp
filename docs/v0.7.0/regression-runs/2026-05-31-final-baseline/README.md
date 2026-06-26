@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 #1182 — Final Testing off Pristine Clean Baseline (2026-05-31)
 
 NO FAIL MISSION final regression run. Operator-approved AI-NHI autonomous

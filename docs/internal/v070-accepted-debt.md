@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Accepted Debt Register
 
 > Companion to [`v070-ship-readiness-adrs.md`](v070-ship-readiness-adrs.md)

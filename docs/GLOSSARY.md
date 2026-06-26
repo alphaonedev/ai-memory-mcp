@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory Glossary
 
 Every concept in the system, with a single-paragraph definition and a

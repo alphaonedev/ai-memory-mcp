@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # User Guide
 
 > **BLUF (Bottom Line Up Front):** `ai-memory` gives any AI assistant persistent memory across sessions. It works with **any MCP-compatible AI client** -- including Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others. Configure the MCP server once, and your AI automatically stores and recalls knowledge -- your project architecture, preferences, past decisions, and hard-won lessons.

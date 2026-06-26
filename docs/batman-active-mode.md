@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Activating Batman Mode — full-spectrum write-time-investment substrate
 
 > v0.7.0 ships **6 of 6 of Batman's write-time-investment forms + the 7th**

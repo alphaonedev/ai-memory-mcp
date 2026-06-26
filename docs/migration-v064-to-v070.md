@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Migrating from v0.6.4 to v0.7.0 — User-Friendly Plan
 
 > **Who this is for.** Anyone running ai-memory on v0.6.4 today who wants to move

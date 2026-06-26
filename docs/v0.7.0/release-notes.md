@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — `attested-cortex` (release notes)
 
 ## Release procedure (operator-gated, post v0.7.0)

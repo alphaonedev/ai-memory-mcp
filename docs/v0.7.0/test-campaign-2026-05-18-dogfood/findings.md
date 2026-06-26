@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Dogfood findings — flat enumeration (2026-05-18)
 
 Every anomaly the 2026-05-18 dogfood pass surfaced. One row per finding. Each row links to the GitHub issue, the closing commit (if closed), and the close-comment URL (if closed).

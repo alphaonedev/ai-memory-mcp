@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Federation hardening (mTLS + X-API-Key + peer attestation)
 
 > **Looking for zero-touch trust?** This document covers the

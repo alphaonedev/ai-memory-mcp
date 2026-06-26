@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # JSON Value Serialization Redundancy Audit — Issue #969
 
 **Status:** AUDIT + targeted refactor (v0.7.0)

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Enum proliferation audit — issue #970
 
 **Wave-2 Tier-D3 — Multi-enum proliferation cleanup**

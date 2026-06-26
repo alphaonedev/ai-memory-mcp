@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # T0 cross-LLM orchestration (v0.7.0 task E1)
 
 > **Status:** SHIPPING with v0.7.0 — E1

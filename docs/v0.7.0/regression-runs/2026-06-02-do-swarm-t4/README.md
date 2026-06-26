@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 — DigitalOcean scaled-down T4 swarm campaign (2026-06-02)
 
 Operator directive (2026-06-02): *"do something similar to the [T4]

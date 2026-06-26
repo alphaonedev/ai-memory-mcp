@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Global `~/.claude/CLAUDE.md` template
 
 **Belt-and-suspenders for category 1 (Claude Code).** The

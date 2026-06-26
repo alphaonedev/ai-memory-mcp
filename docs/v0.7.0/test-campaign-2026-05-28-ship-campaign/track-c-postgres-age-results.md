@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Track C — Postgres + Apache AGE Full Regression Results (2026-05-28)
 
 Track C is the postgres + Apache AGE backend full regression at the

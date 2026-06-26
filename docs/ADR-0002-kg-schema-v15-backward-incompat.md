@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ADR-0002 — KG schema v15 is backward-incompatible
 
 Status: **Accepted** — implemented in v0.6.3 (PRs #384, #388–#392).

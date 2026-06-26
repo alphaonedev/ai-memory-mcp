@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # synthesis.md
 
 > **Status: Awaiting Phase 2 orchestrator pass.**

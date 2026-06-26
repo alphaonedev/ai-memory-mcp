@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Runbook — Chaos campaign against a 3-node Postgres-backed deployment
 
 Status: **runbook (executable pending infrastructure)**.

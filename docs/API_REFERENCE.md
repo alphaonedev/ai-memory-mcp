@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory HTTP API Reference
 
 Complete reference for every endpoint the `ai-memory serve` daemon

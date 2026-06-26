@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Claude Code — SessionStart hook (reference recipe)
 
 **Category 1 (hook-capable). 100% reliable.** This is the load-bearing

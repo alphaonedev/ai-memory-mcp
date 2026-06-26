@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title | default: page.path | replace: ".md", "" | split: "/" | last | replace: "-", " " | replace: "_", " " }} · ai-memory docs</title>
+<meta name="description" content="ai-memory v0.8.0 documentation — {{ page.path | replace: '.md', '' | split: '/' | last | replace: '-', ' ' }}.">
+<style>
+:root{
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-code:#141414;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#e9e9e9; --text-muted:#9a9a9a; --text-dim:#666;
+  --p1:#6ee7ff; --p2:#ffb86b; --p3:#c8a2ff;
+  --good:#3fb950; --warn:#ffb86b; --bad:#f85149;
+  --accent:#c8a2ff;
+  --font-mono:"SF Mono","Cascadia Code","Fira Code",Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font-sans);font-size:16px;line-height:1.72;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.topbar{position:sticky;top:0;z-index:20;background:rgba(0,0,0,.82);backdrop-filter:saturate(180%) blur(12px);-webkit-backdrop-filter:saturate(180%) blur(12px);border-bottom:1px solid var(--border);padding:.7rem 1.4rem;display:flex;align-items:center;gap:1.4rem}
+.topbar .brand{font-weight:700;letter-spacing:-.02em;color:#fff;font-size:1.02rem}
+.topbar .brand span{color:var(--p3)}
+.topbar .ver{font-family:var(--font-mono);font-size:.7rem;color:var(--p3);border:1px solid var(--border-hl);border-radius:999px;padding:.12rem .55rem;margin-left:.1rem}
+.topbar nav{display:flex;gap:1.25rem;margin-left:auto;font-size:.9rem}
+.topbar nav a{color:var(--text-muted)}
+.topbar nav a:hover{color:#fff;text-decoration:none}
+main{max-width:850px;margin:0 auto;padding:3.2rem 1.5rem 6rem}
+main>h1:first-child{margin-top:0}
+main h1{font-size:2.15rem;line-height:1.18;letter-spacing:-.025em;margin:1.4em 0 .55em;color:#fff;font-weight:750}
+main h2{font-size:1.5rem;margin:2.3em 0 .75em;padding-bottom:.32em;border-bottom:1px solid var(--border);color:#fff;letter-spacing:-.015em;font-weight:680}
+main h3{font-size:1.22rem;margin:1.9em 0 .55em;color:#fff;font-weight:640}
+main h4{font-size:1.02rem;margin:1.6em 0 .45em;color:var(--text)}
+main h5,main h6{font-size:.92rem;margin:1.4em 0 .4em;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em}
+main p{margin:.95em 0}
+main ul,main ol{padding-left:1.45em;margin:.95em 0}
+main li{margin:.38em 0}
+main li>ul,main li>ol{margin:.38em 0}
+main strong{color:#fff;font-weight:640}
+main code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);border:1px solid var(--border);border-radius:5px;padding:.12em .42em;color:#e9e9e9}
+main pre{background:var(--bg-code);border:1px solid var(--border);border-radius:11px;padding:1.05rem 1.2rem;overflow:auto;margin:1.25em 0;line-height:1.55}
+main pre code{background:none;border:none;padding:0;font-size:.835rem;color:#e9e9e9}
+main blockquote{margin:1.3em 0;padding:.7em 1.15em;border-left:3px solid var(--p3);background:var(--bg-raised);border-radius:0 9px 9px 0;color:var(--text-muted)}
+main blockquote p{margin:.35em 0}
+main blockquote strong{color:var(--p3)}
+main table{border-collapse:collapse;width:100%;margin:1.4em 0;font-size:.91rem;display:block;overflow-x:auto}
+main th,main td{border:1px solid var(--border);padding:.56em .85em;text-align:left;vertical-align:top}
+main th{background:var(--bg-card);color:#fff;font-weight:620;white-space:nowrap}
+main tbody tr:nth-child(2n) td{background:var(--bg-raised)}
+main td code{white-space:nowrap}
+main hr{border:none;border-top:1px solid var(--border);margin:2.4em 0}
+main img{max-width:100%;border-radius:8px}
+main h1,main h2,main h3,main h4{scroll-margin-top:5rem}
+main kbd{font-family:var(--font-mono);font-size:.8em;background:var(--bg-elev,#161616);border:1px solid var(--border-hl);border-radius:5px;padding:.1em .4em;box-shadow:0 1px 0 var(--border-hl)}
+/* rouge syntax highlighting — dark */
+.highlight{background:none}
+.highlight .c,.highlight .ch,.highlight .cm,.highlight .c1,.highlight .cs,.highlight .cd{color:#6a737d;font-style:italic}
+.highlight .k,.highlight .kc,.highlight .kd,.highlight .kn,.highlight .kp,.highlight .kr,.highlight .kt{color:#c8a2ff}
+.highlight .s,.highlight .sa,.highlight .sb,.highlight .sc,.highlight .sd,.highlight .s2,.highlight .se,.highlight .sh,.highlight .si,.highlight .sx,.highlight .sr,.highlight .s1,.highlight .ss{color:#7ee787}
+.highlight .nb,.highlight .bp{color:#6ee7ff}
+.highlight .nf,.highlight .fm{color:#6ee7ff}
+.highlight .nc,.highlight .nn{color:#ffb86b}
+.highlight .nt{color:#7ee787}
+.highlight .na{color:#ffb86b}
+.highlight .nv,.highlight .vc,.highlight .vg,.highlight .vi{color:#e9e9e9}
+.highlight .mi,.highlight .mf,.highlight .mh,.highlight .mo,.highlight .il,.highlight .m{color:#ffb86b}
+.highlight .o,.highlight .ow,.highlight .p{color:#9a9a9a}
+.highlight .gd{color:#f85149}.highlight .gi{color:#3fb950}.highlight .gh{color:#6ee7ff;font-weight:600}
+.highlight .err{color:#f85149}
+footer{border-top:1px solid var(--border);padding:2.2rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;line-height:1.9}
+footer a{color:var(--text-muted)}
+@media(max-width:640px){.topbar nav a:not(:last-child){display:none}main{padding:2.2rem 1.15rem 4rem}main h1{font-size:1.72rem}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/ai-memory-mcp/">ai-<span>memory</span></a>
+  <span class="ver">v0.8.0</span>
+  <nav>
+    <a href="/ai-memory-mcp/">Home</a>
+    <a href="/ai-memory-mcp/at-a-glance.html">Atlas</a>
+    <a href="/ai-memory-mcp/feature-matrix.html">Features</a>
+    <a href="/ai-memory-mcp/coordination">Coordination</a>
+    <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+  </nav>
+</header>
+<main>
+{{ content }}
+</main>
+<footer>
+  ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a><br>
+  <a href="/ai-memory-mcp/">Documentation home</a> &middot; <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
+</footer>
+</body>
+</html>

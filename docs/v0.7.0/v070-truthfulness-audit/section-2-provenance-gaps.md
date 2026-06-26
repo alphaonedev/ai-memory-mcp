@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Truthfulness Audit — Section 2: Provenance Gaps
 
 **Auditor:** Truthfulness-Audit Specialist 2 of 6

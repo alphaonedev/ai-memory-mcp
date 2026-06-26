@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Runbook — Week-long curator soak against a production corpus
 
 Status: **runbook (executable pending wallclock)**.

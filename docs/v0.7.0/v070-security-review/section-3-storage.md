@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 3 — Storage Layer Security + SAL Parity + Migrations
 
 **Specialist:** 3 of 6

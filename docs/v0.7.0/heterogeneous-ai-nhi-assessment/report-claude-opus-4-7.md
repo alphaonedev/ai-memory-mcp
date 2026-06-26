@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # report-claude-opus-4-7.md
 
 **Evaluator:** Anthropic Claude Opus 4.7 (`claude-opus-4-7[1m]`, 1M-context variant) — FRESH Phase-1 re-run, distinct session from the 2026-05-24 report it supersedes.

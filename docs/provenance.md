@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Fact-Provenance (Form 4)
 
 ## Academic grounding (Item A, issue #973)

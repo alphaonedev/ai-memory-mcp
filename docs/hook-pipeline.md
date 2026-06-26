@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Hook pipeline (Track G — 25 lifecycle events)
 
 v0.7.0 ships a programmable extension surface that fires on every

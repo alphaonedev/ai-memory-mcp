@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Issue #487 — End-to-End Smoke Report (PR-9c, Audit Agent C)
 
 **Date:** 2026-04-30

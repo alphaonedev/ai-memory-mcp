@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Migrating from v0.6.3.x to v0.6.4
 
 **v0.6.4 — `quiet-tools`** ships with a **collapsed default tool surface**. This document is the operator's guide to the change and the opt-out path for power users.

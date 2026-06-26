@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # V-1 wire-point audit — `wire_check` (and `GOVERNANCE_PRE_WRITE`) is the ONLY path
 
 **Branch:** `validation/policy-engine-commercial-claim` @ `22101a7`

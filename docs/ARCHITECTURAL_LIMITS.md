@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Architectural Limits
 
 ai-memory is SQLite-backed by default. This is the right choice for the

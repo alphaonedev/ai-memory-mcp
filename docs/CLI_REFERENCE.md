@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory CLI Reference
 
 Complete reference for every subcommand, flag, and environment variable

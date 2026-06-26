@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Section 3 — 8-Tier Release Gate Truthfulness Audit
 
 **Auditor.** Truthfulness-Audit Specialist 3 of 6.

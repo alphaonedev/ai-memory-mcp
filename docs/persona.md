@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Persona-as-artifact (v0.7.0 QW-2)
 
 A **Persona** is a curator-generated Markdown profile of an entity,

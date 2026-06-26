@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — NSA CSI MCP Security Mapping
 
 **Document classification:** Public-facing, procurement-grade.

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Heterogeneous AI NHI Assessment of ai-memory v0.7.0 — Claude Opus 4.7 (v3 re-run)
 
 **Evaluator:** Claude Opus 4.7 (1M context), 2026-05-28 morning session.

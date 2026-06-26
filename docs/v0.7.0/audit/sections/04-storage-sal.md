@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # 04 — Storage + SAL Backend (v0.7.0)
 
 Audit of the storage substrate + Storage Abstraction Layer (SAL) of

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory and the Academic Research on AI Memory
 
 **Document classification:** Public-facing explainer.

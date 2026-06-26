@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Capabilities v3 — canonical phrasings
 
 > **Status:** SHIPPING with v0.7.0 — A1 (`summary`) + A2 (`to_describe_to_user`)

@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Admin Guide
 
 > **Upgrading to v0.7?** Read [`MIGRATION_v0.7.md`](MIGRATION_v0.7.md) **before** you upgrade. v0.7.0 (`attested-cortex`) adds Ed25519 link attestation, a 25-event hook pipeline (20 baseline lifecycle events + 5 v0.7.0 additions: PreRecallExpand, PreReflect, PostReflect, PreCompaction, OnCompactionRollback), sidechain transcripts + `memory_replay`, optional Apache AGE acceleration, capabilities v3 (with the new `memory_load_family` / `memory_smart_load` loaders), and a refactored permissions + A2A approval system. Most v0.6.4 callers see **no behavior change** — but pre-v0.6.3.1 v0.6.x users hit the G1 namespace-inheritance fix. Companion docs: [What's new in v0.7](whats-new-v07.html), [`attested-cortex` RFC](v0.7/rfc-attested-cortex.md), [v0.7 compatibility matrix](v0.7/compatibility-matrix.html), and [canonical phrasings](v0.7/canonical-phrasings.md) for the agent-facing strings.

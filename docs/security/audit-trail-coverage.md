@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Cryptographic Forensic Audit Trail — Coverage Matrix
 
 **Status as of branch `feat/v0.7.0-grand-slam` (HEAD `12a7f29`,

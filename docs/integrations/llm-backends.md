@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # LLM backends — config.toml + MCP env-block recipes for every supported provider
 
 **Audience:** operators wiring ai-memory's `smart` / `autonomous` tiers to a specific LLM provider via an MCP-capable AI client (Claude Code, Claude Desktop, Cursor, Codex CLI, Cline, Continue, Zed, Windsurf, Goose, Roo Code, Aider, Cody, Gemini CLI, OpenClaw, …).

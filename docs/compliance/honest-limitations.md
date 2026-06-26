@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — Honest Limitations
 
 **Document classification:** Public-facing, procurement-grade.

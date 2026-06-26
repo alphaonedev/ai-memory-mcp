@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Work Prompt — v0.7.0 Enhancement (a): Config-Driven Postgres Pool Sizing + Doc-Drift Fix + PgBouncer Admin-Docs
 
 > **Document type:** Operational AI-NHI work prompt. The operator feeds this

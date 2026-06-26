@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Context-offload substrate primitive
 
 v0.7.0 QW-3 ships the substrate plumbing for an offload+deref store

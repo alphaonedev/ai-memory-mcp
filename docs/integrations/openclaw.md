@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # OpenClaw — MCP server + system-message directive
 
 **Category 2 (MCP-capable, no native session-start hook).**

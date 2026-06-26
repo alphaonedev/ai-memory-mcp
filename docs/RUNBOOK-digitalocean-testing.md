@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Runbook — DigitalOcean multi-agent / multi-node ship-gate for v0.6.0.0
 
 Status: **ship-gate procedure** — v0.6.0.0 does **not** tag until

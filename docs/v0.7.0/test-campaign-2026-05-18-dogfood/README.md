@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ai-memory v0.7.0 — AI NHI Dogfood Test + In-Campaign Fix Batch (2026-05-18)
 
 ## What this is

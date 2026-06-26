@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI Build Prompt — Read-time Attested-Provenance Surfacing (§2.5)
 ### v0.8.0 EPIC #1709 fold-in · reframed from #1715 "confidence honesty"
 

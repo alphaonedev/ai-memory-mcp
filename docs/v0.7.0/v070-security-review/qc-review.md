@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Final-Review-Pass — QC Review
 
 **Working dir:** `/Users/fate/v07/v07-fixes/`

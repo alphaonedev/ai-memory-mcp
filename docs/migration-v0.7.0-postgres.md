@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Migration guide — sqlite → PostgreSQL on ai-memory v0.7.0
 
 > **Audience.** Operators currently running ai-memory on sqlite who

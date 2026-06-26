@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Runbook — v0.7.0 adapter selection (`serve --store-url postgres://…`)
 
 > **UPDATED 2026-05-09.** Per operator directive issued during the v0.7.0 A2A

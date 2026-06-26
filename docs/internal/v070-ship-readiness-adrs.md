@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # v0.7.0 Ship-Readiness — Architecture Decision Records
 
 > Companion to the [v0.7.0 review synthesis](../../docs/internal/) and the

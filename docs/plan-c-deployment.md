@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # Plan-C deployment runbook
 
 This runbook covers operator-facing concerns for the Plan-C

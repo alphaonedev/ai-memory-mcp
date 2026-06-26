@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # ADR-0001 — Quorum replication + chaos-testing methodology (v0.7 track C)
 
 Status: **Proposed** — design ratified in this PR; implementation lands in

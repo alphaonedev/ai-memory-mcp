@@ -1,3 +1,6 @@
+---
+layout: doc
+---
 # AI NHI Build Prompt — Unify the `private` Visibility Predicate + Durable Ownership + Namespace Required-Scope (§2.2)
 ### v0.8.0 EPIC #1709 fold-in · issue #1720 · `security-high` cross-tenant leak fix
 
