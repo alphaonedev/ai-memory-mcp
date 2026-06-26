@@ -48,7 +48,7 @@ Every memory row carries citation lists, source URIs, and atom-grain span coordi
 
 ### Form 6 MemoryKind vocabulary
 
-Every memory gets typed as one of ten kinds: Observation, Reflection, Persona, Skill, Concept, Entity, Claim, Relation, Event, Conversation, or Decision. Observations are the default — things the agent witnessed in the world. Reflections are explicitly marked as the agent's own synthesis on top of prior observations. Claims are unverified agent assertions. Decisions are agent actions with consequences. This is exactly the gate γ distinction from the paper, just rendered at the substrate level rather than the training level.
+Every memory gets typed as one of thirteen kinds: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision, Goal, Plan, or Step. Observations are the default — things the agent witnessed in the world. Reflections are explicitly marked as the agent's own synthesis on top of prior observations. Claims are unverified agent assertions. Decisions are agent actions with consequences. This is exactly the gate γ distinction from the paper, just rendered at the substrate level rather than the training level.
 
 ### Form 7 + L1-6 governance
 

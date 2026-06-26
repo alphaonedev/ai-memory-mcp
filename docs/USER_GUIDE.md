@@ -46,7 +46,7 @@ Below is an example for **Claude Code** (user scope: merge `mcpServers` into `~/
 
 ### How It Works
 
-With MCP configured, your AI client gains up to 74 memory tools at `--profile full` (highlights below; see [API_REFERENCE.md](API_REFERENCE.md) for the full reference):
+With MCP configured, your AI client gains 100 memory tools at `--profile full` (99 callable tools + the always-on `memory_capabilities` bootstrap) at v0.8.0 (highlights below; see [API_REFERENCE.md](API_REFERENCE.md) for the full reference):
 
 - **memory_store** -- Store new knowledge (auto-deduplicates by title+namespace, reports contradictions)
 - **memory_recall** -- Recall relevant memories for the current context (supports `until` date filter)
@@ -1283,6 +1283,33 @@ so callers can detect overwrites.
 
 Returns `{"found": false, ...}` if no link matches the
 `(source_id, target_id, relation)` triple.
+
+---
+
+## Distributed Coordination Tools (v0.8.0)
+
+v0.8.0 turns the memory substrate into a **coordination substrate**. The
+Pillar-1 surface (#1709) adds **26 coordination tools** across five
+families — all in the `power` profile, all advertised at `--profile
+full`. They let multiple agents coordinate work over the shared store:
+a typed action DAG + state machine, single-holder TTL leases,
+Ed25519-signed signals, attested checkpoints, and replayable routines.
+Full parameter schemas, examples, and the federation-fanout semantics
+live in **[coordination.md](coordination.md)**; the summary below names
+every tool so you know the surface exists.
+
+| Family | Tools | What it does |
+|---|---|---|
+| **Actions** (8) | `memory_action_create`, `memory_action_get`, `memory_action_transition`, `memory_action_list`, `memory_action_add_edge`, `memory_action_edges`, `memory_action_frontier`, `memory_action_next` | Typed action DAG + state machine. Create/get/list actions, transition state (CAS), wire typed dependency edges, then query the ready **frontier** (ranked unblocked actions) and pick the single **next** action. |
+| **Leases** (4) | `memory_lease_acquire`, `memory_lease_renew`, `memory_lease_release`, `memory_lease_get` | Single-holder TTL leases over the action substrate — acquire/renew/release a lease and read its current holder, for at-most-one-worker handoff. |
+| **Signals** (5) | `memory_signal_send`, `memory_signal_read`, `memory_signal_inbox`, `memory_signal_thread`, `memory_signal_ack` | Typed, Ed25519-signed inter-agent messages — send, read, list your inbox, walk a thread, and acknowledge. |
+| **Checkpoints** (4) | `memory_checkpoint_create`, `memory_checkpoint_resolve`, `memory_checkpoint_query`, `memory_checkpoint_verify` | Conditional coordination gates with Ed25519-attested resolution — create a gate, resolve it, query state, and verify the attestation. |
+| **Routines** (5) | `memory_routine_create`, `memory_routine_freeze`, `memory_routine_run`, `memory_routine_status`, `memory_routine_list` | Replayable scheduled-coordination routines — create, freeze (pin a version), run, check status, and list. |
+
+Pillar-2 layers typed cognition (Goal / Plan / Step via `lifecycle_state`
++ the `decomposes_into` / `depends_on` / `advances` link relations) on top
+of this surface — see [coordination.md](coordination.md) for the worked
+multi-agent example.
 
 ---
 

@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Encryption — at-rest, in-transit, integrity</title>
-<meta name="description" content="ai-memory v0.8.0 cryptographic surface. SQLCipher at-rest (PRAGMA key), mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, v0.7 Ed25519 attested identity roadmap.">
+<meta name="description" content="ai-memory v0.8.0 cryptographic surface. SQLCipher at-rest (PRAGMA key) plus opt-in #228 per-memory content envelope (ChaCha20-Poly1305 / X25519 / HKDF) on both backends, mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, Ed25519 attested identity (shipped v0.7.0) + per-write content attestation (#1464, v0.8.0).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/encryption.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -110,7 +110,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Encryption</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
+      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -191,7 +191,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v07.html">v0.7.0</a>
+        <a href="whats-new-v08.html">v0.8.0</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -254,9 +254,10 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Encryption — at rest, in transit, integrity, supply chain.</h1>
-  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 at rest. mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what v0.7.0 added (Ed25519 attested identity).</strong></p>
+  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 full-database at rest, plus opt-in ChaCha20-Poly1305 per-memory content encryption (#228). mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. Signed git tags + SBOM for supply chain. <strong>What's covered, what isn't, and what v0.8.0 added (opt-in per-memory content envelopes; Ed25519 attested identity since v0.7.0).</strong></p>
   <div class="pills">
     <span class="pill">SQLCipher at-rest</span>
+    <span class="pill">ChaCha20 content envelopes (v0.8.0)</span>
     <span class="pill">mTLS federation</span>
     <span class="pill">HMAC-SHA256 webhooks</span>
     <span class="pill">signed tags + SBOM</span>
@@ -272,8 +273,8 @@ footer a{color:var(--text-muted)}
       <div class="layer rest">
         <div class="lbl">surface 1</div>
         <h3>At rest</h3>
-        <div class="algo">SQLCipher · AES-256-CBC · PBKDF2-HMAC-SHA512</div>
-        <p>The whole SQLite database file is encrypted with the operator's passphrase. No plaintext on disk. Failed key triggers an error at <code>db::open</code>: <em>"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</em>.</p>
+        <div class="algo">SQLCipher · AES-256-CBC · PBKDF2-HMAC-SHA512<br>+ #228 ChaCha20-Poly1305 · X25519 · HKDF-SHA256</div>
+        <p>The whole SQLite database file is encrypted with the operator's passphrase (SQLCipher). No plaintext on disk. Failed key triggers an error at <code>db::open</code>: <em>"PRAGMA key failed (wrong passphrase or unencrypted DB?)"</em>. v0.8.0 adds an orthogonal, opt-in <strong>per-memory content envelope</strong> (#228) keyed to the writing agent's X25519 key — works on plain SQLite <em>and</em> Postgres.</p>
       </div>
       <div class="layer transit">
         <div class="lbl">surface 2</div>
@@ -325,6 +326,23 @@ footer a{color:var(--text-muted)}
       <div class="feature-head"><span class="feature-name">Encrypted backups</span><span class="feature-tag live">implicit</span></div>
       <div class="feature-desc">Because SQLCipher encrypts the file on disk, any standard SQLite backup mechanism (file copy, <code>VACUUM INTO</code>, sqlite3 <code>.backup</code>) produces an already-encrypted output. Backup tooling doesn't need to know about encryption — the bytes on disk are already opaque.</div>
     </div>
+
+    <div class="feature rest">
+      <div class="feature-head"><span class="feature-name">Per-memory content envelope (#228)</span><span class="feature-tag live">live since v0.8.0</span></div>
+      <div class="feature-desc">A second, orthogonal at-rest layer that does <em>not</em> require the SQLCipher build. When enabled (opt-in), each memory's <code>content</code> field is sealed into a self-describing AEAD envelope keyed to the writing agent's X25519 keypair. The plaintext never lands in the <code>content</code> column — the ciphertext envelope is persisted in <code>encrypted_envelope</code> and the column carries an empty placeholder. <strong>Content-only:</strong> title, tags, and metadata stay plaintext. Wired on <strong>both backends</strong> — embedded SQLite (<code>src/storage/mod.rs</code>) and PostgreSQL (<code>src/store/postgres.rs</code>, schema v68) — and round-trips losslessly through archive → restore.</div>
+      <div class="snip"><span class="cm">// Algorithm (src/encryption/mod.rs): ephemeral-static X25519 ECDH →
+// HKDF-SHA256 → ChaCha20-Poly1305 AEAD. The envelope binds its version
+// byte + ephemeral pubkey into the AEAD associated data; the derived key
+// is zeroized right after the cipher is built. Layout:
+//   version(1) || ephemeral_pub(32) || nonce(12) || ciphertext+tag</span>
+
+<span class="cm">// Opt-in (default OFF → byte-identical plaintext storage):</span>
+<span class="ok">$</span> AI_MEMORY_ENCRYPT_AT_REST=1 ai-memory serve   <span class="cm"># or [storage] encrypt_at_rest = true</span>
+
+<span class="cm">// Fail-closed: with encryption ON, a memory that carries no agent_id is
+// rejected ("no agent_id to key encryption to") rather than stored in clear.</span></div>
+      <div class="honest"><strong>Honest assessment</strong><p>This protects the most sensitive column (the memory body) at the application layer, independent of disk/SQLCipher encryption, and keys each row to the NHI that authored it. It does <em>not</em> encrypt title/tags/metadata, and the per-agent X25519 secret lives on disk under the key directory — pair with filesystem permissions and process hardening. SQLCipher (whole-file) and the #228 envelope (per-memory content) compose: use both for defense in depth.</p></div>
+    </div>
   </div>
 </section>
 
@@ -357,7 +375,7 @@ sha256:111222…aaa888    <span class="cm"># node-3 backup</span>
       <div class="feature-desc">Outbound webhook URLs pass through two SSRF guards before any HTTP attempt: a URL guard (rejects non-http/https schemes, file://, data:) and a DNS guard (resolves the host, rejects loopback / RFC1918 / link-local addresses). Two SSRF defects were closed in commit <code>9eeb453</code> for v0.6.3 final.</div>
     </div>
 
-    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted at the node level. v0.7.0 (#791/#922) adds envelope-level Ed25519 push signatures + nonce anti-replay (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code> / <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> secure defaults), and #626 Layer-3 verifies caller-presented per-memory signatures on the store surfaces; per-row signature verification across federation relay remains v0.8 hardening (#1464).</p></div>
+    <div class="honest"><strong>Honest assessment — what mTLS does and doesn't do</strong><p>mTLS authenticates the <em>peer node</em>, not the <em>memory author</em>. Once a peer is allowlisted, every memory it pushes is trusted at the node level. v0.7.0 (#791/#922) adds envelope-level Ed25519 push signatures + nonce anti-replay (<code>AI_MEMORY_FED_REQUIRE_SIG=1</code> / <code>AI_MEMORY_FED_REQUIRE_NONCE=1</code> secure defaults), and #626 Layer-3 verifies caller-presented per-memory signatures on the store surfaces; v0.8.0 (#1464) adds receiver-side per-write content attestation across federation relay — a relayed memory carrying a valid <code>metadata.write_signature</code> over the canonical <code>SignableWrite</code> envelope is verified against the author's enrolled key and upgraded to <code>agent_attested</code> (opt-in strict mode via <code>AI_MEMORY_FED_REQUIRE_WRITE_SIG=1</code>).</p></div>
   </div>
 </section>
 
@@ -463,7 +481,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.8.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.8.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/encryption/</code> (#228 ChaCha20-Poly1305/X25519/HKDF content envelope) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="release-pipeline.html">Release pipeline</a> · <a href="memory-rules.html">Memory rules</a></p>
 </footer>
 
