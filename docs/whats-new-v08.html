@@ -1,0 +1,564 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+
+  What's New in v0.8.0 — `distributed-coordination`. The release where a
+  memory substrate becomes a coordination substrate: a typed action DAG,
+  single-holder leases, Ed25519-signed signals, attested checkpoints, and
+  replayable routines (Pillar-1 #1709); Goal/Plan/Step typed cognition with
+  a lifecycle_state machine (Pillar-2); federation hardened secure-by-default
+  (#1789/#1718/#1464/#1805/#1678); and a governance hook that actually BLOCKS
+  a refused action (#1811). Schema v57 → v70; 100 MCP tools at --profile full.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>What's New in v0.8.0 — distributed-coordination | ai-memory</title>
+<meta name="description" content="ai-memory v0.8.0 (distributed-coordination) makes the substrate multi-agent: a typed action DAG, single-holder TTL leases, Ed25519-signed inter-agent signals, attested checkpoints, and replayable routines (Pillar-1 #1709); Goal/Plan/Step typed cognition with a lifecycle_state machine and three new link relations (Pillar-2); federation hardened secure-by-default (peer enrollment #1789, per-transition signatures #1718, per-write content attestation #1464, replay nonces #1805, peer-cert pinning #1678); a Claude Code PreToolUse governance hook that actually BLOCKS a refused action (#1811) plus mandatory-hook-presence enforcement (#1734). Schema v57 → v70, 100 MCP tools at --profile full / 7 core, 9 typed link relations, 27-field Memory. SQLite and PostgreSQL+AGE, identical API.">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/whats-new-v08.html">
+<style>
+:root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#2ea043;--warn:#ffb86b;--bad:#f85149;--prog:#c8a2ff;--accent:#6ee7ff;--green:#2ea043;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1200px}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--accent);text-decoration:none}a:hover{filter:brightness(1.2)}
+code{font-family:var(--font-mono);font-size:.85em;background:var(--bg-code);padding:.1em .35em;border-radius:4px}
+pre{font-family:var(--font-mono);font-size:.85rem;background:var(--bg-code);border:1px solid var(--border);border-radius:8px;padding:1rem;overflow-x:auto;margin:1rem 0}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1,h2,h3{font-weight:700;letter-spacing:-0.02em;color:#fff}
+h1{font-size:clamp(2.2rem,5vw,3.6rem);line-height:1.05;letter-spacing:-0.04em;margin-bottom:1rem}
+h2{font-size:1.85rem;margin-bottom:.6rem;margin-top:0}
+h3{font-size:1.15rem;margin-bottom:.5rem}
+p{color:var(--text-muted);margin-bottom:1rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text)}
+.topnav .home-link{color:var(--text);font-weight:600}
+.hero{padding:6rem 1.5rem 4rem;text-align:center;background:radial-gradient(ellipse at center,rgba(110,231,255,0.08),transparent 60%),radial-gradient(ellipse at bottom,rgba(200,162,255,0.06),transparent 70%);border-bottom:1px solid var(--border)}
+.hero .badge{display:inline-block;padding:.4rem 1rem;background:rgba(200,162,255,0.1);border:1px solid var(--p3);color:var(--p3);border-radius:999px;font-family:var(--font-mono);font-size:.85rem;margin-bottom:1.5rem}
+.hero .subtitle{font-size:1.2rem;color:var(--text-muted);max-width:760px;margin:0 auto 2rem}
+.hero .meta{display:flex;justify-content:center;gap:2rem;color:var(--text-dim);font-family:var(--font-mono);font-size:.85rem;flex-wrap:wrap}
+section{padding:5rem 0;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;font-size:.75rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:1rem;padding:.25rem .65rem;border:1px solid var(--border-hl);border-radius:999px}
+.lede{color:var(--text-muted);font-size:1.05rem;max-width:780px;margin-bottom:2rem}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:1.25rem}
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1.25rem}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;position:relative}
+.card.cyan{border-top:3px solid var(--p1)}
+.card.amber{border-top:3px solid var(--p2)}
+.card.violet{border-top:3px solid var(--p3)}
+.card.green{border-top:3px solid var(--good)}
+.card h3{margin-bottom:.65rem}
+.card p{font-size:.92rem;color:var(--text-muted);margin-bottom:.75rem}
+.card .tag{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;color:var(--text-muted);text-transform:uppercase;margin-bottom:.5rem;display:block}
+.numstat{text-align:center;padding:1rem}
+.numstat .num{font-size:2.2rem;font-weight:800;color:var(--p1);display:block;line-height:1.1}
+.numstat .label{font-size:.78rem;color:var(--text-muted);display:block;margin-top:.25rem}
+table{width:100%;border-collapse:collapse;margin:1rem 0;font-size:.92rem}
+th,td{text-align:left;padding:.65rem .85rem;border-bottom:1px solid var(--border);color:var(--text-muted)}
+th{color:#fff;font-weight:600;background:var(--bg-elev);font-size:.85rem}
+tr:hover{background:rgba(110,231,255,0.03)}
+ul.checked{list-style:none;padding-left:0}
+ul.checked li{padding-left:1.5rem;position:relative;margin:.35rem 0;color:var(--text-muted);font-size:.92rem}
+ul.checked li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:800}
+.audience-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1.25rem;margin-top:1rem}
+.audience{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.5rem;position:relative;overflow:hidden}
+.audience::before{content:"";position:absolute;top:0;left:0;right:0;height:3px}
+.audience.user::before{background:var(--p1)}
+.audience.dev::before{background:var(--p2)}
+.audience.cxo::before{background:var(--p3)}
+.audience .who{font-family:var(--font-mono);font-size:.7rem;letter-spacing:.12em;color:var(--text-muted);text-transform:uppercase;margin-bottom:.65rem}
+.audience h3{margin-bottom:1rem;font-size:1.1rem}
+.audience .pitch{color:var(--text-muted);font-size:.95rem;line-height:1.55;margin-bottom:1rem}
+.audience .pitch strong{color:#fff}
+.audience .cta{color:#fff;font-family:var(--font-mono);font-size:.8rem;border-bottom:1px dashed var(--text-muted);padding-bottom:1px}
+.cta-row{display:flex;gap:1rem;flex-wrap:wrap;justify-content:center;margin-top:2rem}
+.cta-row a{padding:.7rem 1.25rem;border-radius:10px;font-weight:600;font-size:.92rem;border:1px solid var(--p1);color:var(--p1)}
+.cta-row a.solid{background:var(--p3);color:#000;border-color:var(--p3)}
+.cta-row a.amber{border-color:var(--p2);color:var(--p2)}
+.cta-row a.green{border-color:var(--good);color:var(--good)}
+.cta-row a.violet{border-color:var(--p3);color:var(--p3)}
+.tier-ladder{display:grid;grid-template-columns:repeat(5,1fr);gap:.75rem;margin:1.5rem 0}
+.tier-ladder .tier{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center;position:relative}
+.tier-ladder .tier .t-num{font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted);letter-spacing:.12em}
+.tier-ladder .tier .t-name{font-weight:700;color:#fff;margin:.25rem 0;font-size:.95rem}
+.tier-ladder .tier .t-desc{font-size:.78rem;color:var(--text-muted);line-height:1.4}
+@media(max-width:780px){.tier-ladder{grid-template-columns:1fr 1fr}}
+@media(max-width:520px){.tier-ladder{grid-template-columns:1fr}}
+.callout{border-left:3px solid var(--p2);background:rgba(255,184,107,0.06);padding:1rem 1.25rem;border-radius:0 10px 10px 0;margin:1.25rem 0}
+.callout.breaking{border-left-color:var(--bad);background:rgba(248,81,73,0.06)}
+.callout.breaking .clabel{color:var(--bad)}
+.callout .clabel{display:block;font-family:var(--font-mono);font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--p2);margin-bottom:.4rem;font-weight:700}
+.callout p{font-size:.92rem;color:var(--text-muted);margin-bottom:.5rem}
+.callout p:last-child{margin-bottom:0}
+.status{display:inline-block;font-family:var(--font-mono);font-size:.78rem;padding:.1rem .5rem;border-radius:999px;letter-spacing:.04em}
+.status.ok{color:var(--good);border:1px solid var(--good)}
+.status.partial{color:var(--warn);border:1px solid var(--warn)}
+.status.future{color:var(--prog);border:1px solid var(--prog)}
+footer{padding:2.5rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85rem;border-top:1px solid var(--border)}
+footer .footer-links{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1rem}
+footer a{color:var(--text-dim)}
+footer a:hover{color:var(--accent)}
+</style>
+</head>
+<body>
+
+<nav class="topnav">
+  <div class="inner">
+    <a class="home-link" href="index.html">ai-memory&trade;</a>
+    <div class="right">
+      <a href="index.html">Home</a>
+      <a href="architectures.html">Tiers T1&rarr;T5</a>
+      <a href="whats-new-v08.html" class="active">v0.8.0</a>
+      <a href="whats-new-v07.html">v0.7.0 (prior release)</a>
+      <a href="coordination.md" style="color:#c8a2ff">Coordination</a>
+      <a href="https://alphaonedev.github.io/ai-memory-discovery-gate/" style="color:#2ea043">Discovery Gate</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section class="hero">
+  <div class="container">
+    <span class="badge">v0.8.0 &middot; distributed-coordination &middot; shipped</span>
+    <h1>A memory substrate becomes a<br>coordination substrate.</h1>
+    <p class="subtitle">
+      v0.6.x made ai-memory a fast, token-lean memory server. v0.7.0 made it a <strong>substrate</strong> that reflects on what it knows and proves who wrote it. <strong>v0.8.0 makes that substrate multi-agent.</strong> Agents don't just remember &mdash; they <strong>take turns</strong> (single-holder leases on a typed action DAG), <strong>hand off work</strong>, <strong>sign what they say to each other</strong> (Ed25519 signals + attested checkpoints), and operate under guardrails an operator controls and can prove. Plus typed cognition (Goal/Plan/Step + a <code>lifecycle_state</code> machine), federation hardened secure-by-default, and a governance hook that actually <strong>blocks</strong> a refused action.
+    </p>
+    <div class="meta">
+      <span>schema v57 &rarr; v70</span>
+      <span>100 MCP tools / 7 core</span>
+      <span>9 typed link relations</span>
+      <span>SQLite + Postgres/AGE</span>
+    </div>
+    <div class="cta-row">
+      <a class="solid" href="v0.8.0/release-notes.md">📓 Release notes</a>
+      <a class="violet" href="coordination.md">🧩 Coordination guide</a>
+      <a class="amber" href="federation.md">🔐 Federation hardening</a>
+      <a class="green" href="governance.html">🛡️ Governance L1&ndash;L6</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ AT A GLANCE: PILLAR TABLE ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">What's new at a glance</span>
+    <h2>v0.8.0 ships the distributed-coordination substrate</h2>
+    <p class="lede">
+      The whole release is one epic &mdash; <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1709">#1709</a> &mdash; landing the hard parts of a governed multi-agent system in the substrate, tested and portable, instead of re-invented (badly) in every app. Two pillars of new capability, hardened federation, and enforcing governance.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Area</th>
+          <th>What landed</th>
+          <th>Default posture</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Pillar-1</strong> &mdash; Coordination</td>
+          <td>Typed action DAG + state machine, single-holder TTL <strong>leases</strong> (CAS), Ed25519-<strong>signed signals</strong>, attested <strong>checkpoints</strong>, replayable <strong>routines</strong></td>
+          <td>Additive tools; drive from MCP / HTTP / CLI</td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+        <tr>
+          <td><strong>Pillar-2</strong> &mdash; Typed cognition</td>
+          <td><code>Goal</code>/<code>Plan</code>/<code>Step</code> memory kinds, a <code>lifecycle_state</code> machine, and the <code>decomposes_into</code>/<code>depends_on</code>/<code>advances</code> link relations</td>
+          <td>Additive, permissive options on <code>memory_store</code>/<code>memory_update</code> (no new tool)</td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+        <tr>
+          <td><strong>Governance that blocks</strong></td>
+          <td>Claude Code <strong>PreToolUse</strong> hook enforces — a substrate <code>Refuse</code> blocks the tool (<code>type:command</code> wrapper); plus an <code>escalate</code> verdict</td>
+          <td>Fail-closed when configured; <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1811">#1811</a> / <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1734">#1734</a></td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+        <tr>
+          <td><strong>Federation hardening</strong></td>
+          <td>Peer-enrollment required (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), per-transition signatures (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), per-write content attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>), transition-replay nonces (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1805">#1805</a>), outbound peer-cert pinning (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1678">#1678</a>)</td>
+          <td><strong>Secure by default</strong> &mdash; several paths fail closed</td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+        <tr>
+          <td><strong>Operational controls</strong></td>
+          <td>HTTP admission control (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1733">#1733</a>), deferred AGE graph projection (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1735">#1735</a>), curator compaction, mandatory-hook-presence enforcement (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1734">#1734</a>)</td>
+          <td>Opt-in knobs; default behaviour byte-unchanged</td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+        <tr>
+          <td><strong>Schema</strong></td>
+          <td>v57 &rarr; <strong>v70</strong> &mdash; additive coordination / typed-cognition / encryption-prep / archive-edge migrations (v58&ndash;v70)</td>
+          <td>Auto-migrates on first open; archive &rarr; restore lossless</td>
+          <td><span class="status ok">✅ shipped</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ THREE AUDIENCES ============ -->
+<section style="background:var(--bg-raised)">
+  <div class="container">
+    <span class="eyebrow">Three audiences, one release</span>
+    <h2>What v0.8.0 means for you</h2>
+    <p class="lede">Same release, three framings &mdash; pick yours.</p>
+
+    <div class="audience-row">
+      <div class="audience user">
+        <span class="who">👤 If you USE AI</span>
+        <h3>Your assistant stops being a goldfish &mdash; safely, alongside others.</h3>
+        <p class="pitch">
+          Nothing to relearn. Install once and your AI keeps a durable, private, <strong>self-hosted</strong> memory that survives restarts &mdash; and now it can safely work <strong>alongside other AI assistants</strong> without stepping on each other. It remembers context across sessions, can pick up where it left off after a crash, and you stay in control of what it's allowed to do. Your data stays on your machine; nothing is sent to a cloud you don't control.
+        </p>
+        <pre>brew upgrade ai-memory
+ai-memory doctor</pre>
+        <p style="font-size:.85rem">A drop-in upgrade from v0.7.x &mdash; the live DB auto-migrates on first open.</p>
+      </div>
+
+      <div class="audience dev">
+        <span class="who">🛠️ If you BUILD with AI</span>
+        <h3>Coordination, attestation, fail-closed policy, federation auth &mdash; in the substrate.</h3>
+        <ul class="checked">
+          <li><strong>Pillar-1 coordination:</strong> a typed action DAG (<code>requires</code>/<code>unlocks</code>/<code>blocks</code>/<code>gated_by</code>/<code>sibling</code>) with a real state machine, TTL-bounded single-holder <strong>leases</strong> (CAS conflict semantics), Ed25519-<strong>signed signals</strong> (typed, threaded, ack'd), Ed25519-<strong>attested checkpoints</strong> (conditional gates with signed resolution), and replayable <strong>routines</strong>. Driven from MCP, HTTP, or CLI.</li>
+          <li><strong>Pillar-2 typed cognition:</strong> <code>Goal</code>/<code>Plan</code>/<code>Step</code> memory kinds, a <code>lifecycle_state</code> machine (<code>open</code>&rarr;<code>active</code>&rarr;<code>blocked</code>/<code>done</code>/<code>abandoned</code>), and three new typed link relations (<code>decomposes_into</code>/<code>depends_on</code>/<code>advances</code>).</li>
+          <li><strong>Federation, secure by default:</strong> peer-enrollment required (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), per-transition signatures (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), per-write content attestation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>), transition-replay nonces (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1805">#1805</a>), and outbound peer-cert pinning (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1678">#1678</a>).</li>
+          <li><strong>Operational controls:</strong> HTTP admission control (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1733">#1733</a>), deferred AGE graph projection (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1735">#1735</a>), curator compaction, and mandatory-hook-presence enforcement (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1734">#1734</a>).</li>
+          <li><strong>Surface:</strong> schema <strong>v70</strong> · <strong>100</strong> MCP tools at <code>--profile full</code> (99 callable + bootstrap) / 7 core · <strong>91</strong> HTTP route registrations (77 unique paths) · <strong>83/85</strong> CLI subcommands · <strong>9</strong> typed link relations · 27-field <code>Memory</code>. SQLite <strong>and</strong> PostgreSQL+AGE, identical API.</li>
+          <li><strong>Provider-agnostic LLM and embeddings:</strong> local models or 15+ cloud vendors (xAI, OpenAI, Anthropic, Gemini, DeepSeek, Mistral, Groq, &hellip;) for chat <strong>and</strong> embeddings &mdash; swappable by config, no GPU required.</li>
+        </ul>
+      </div>
+
+      <div class="audience cxo">
+        <span class="who">🏢 If you DECIDE AI infrastructure</span>
+        <h3>Bounded agency you can audit and revoke. The gate between a pilot and production.</h3>
+        <p class="pitch">
+          v0.8.0 is the release that makes <strong>autonomous AI safe to actually run autonomously</strong> &mdash; and provable to an auditor. <strong>Governed &amp; stoppable:</strong> every agent action can be gated by operator-signed rules; refusals are enforced and fail closed &mdash; you own the kill-switch, cryptographically. <strong>Attested &amp; auditable:</strong> every write and inter-agent message can be Ed25519-signed; the audit trail is a tamper-evident hash chain &mdash; the difference between "the AI says it did X" and "here is signed, replayable proof of what happened." <strong>No lock-in:</strong> self-hosted, single binary or container, on SQLite or your existing PostgreSQL, provider-agnostic. <strong>Real, not vapor:</strong> validated by an end-to-end P0&ndash;P11 multi-agent validation, a 2-round external-model adversarial security review (every finding fixed), and a live agent-to-agent campaign across heterogeneous models &mdash; zero defects.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BREAKING CHANGES / CALLOUTS ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Read this before you upgrade</span>
+    <h2>Secure-default flips &amp; the one-command hook migration</h2>
+    <p class="lede">
+      v0.8.0 is a <strong>drop-in for v0.7.x</strong> in most surfaces. These callouts are the exceptions worth reading first.
+    </p>
+
+    <div class="callout breaking">
+      <span class="clabel">⚠ Secure-default flip &mdash; federation peer-enrollment ON by default</span>
+      <p>
+        Federation peer-enrollment is now <strong>on by default</strong> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), and several federation paths fail closed: <code>AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT</code> is now strict unless explicitly disabled, per-transition signatures are required by default (<code>AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1</code>, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), and a forged signature is rejected unconditionally regardless of any knob.
+      </p>
+      <p>
+        <strong>Mitigation:</strong> enroll every peer's Ed25519 key before upgrading a fleet, or set the documented escape-hatch flags (<code>AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS</code>, a falsy <code>AI_MEMORY_FED_REQUIRE_TRANSITION_SIG</code>) for a heterogeneous-rollout window, then flip back. See <a href="federation.md">federation.md</a> and <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/SECURITY.md">SECURITY.md &sect;v0.8.0 secure-default changes</a>.
+      </p>
+    </div>
+
+    <div class="callout breaking">
+      <span class="clabel">⚠ Action required &mdash; governance hook migration (one command)</span>
+      <p>
+        The Claude Code <strong>PreToolUse governance hook</strong> changed to the enforcing <code>type:command</code> form (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1811">#1811</a>) so a substrate <code>Refuse</code> genuinely <strong>blocks</strong> the tool dispatch &mdash; an MCP-tool hook structurally cannot block. If you installed the hook before, re-run the installer:
+      </p>
+      <pre>ai-memory install claude-code --hook pretool --apply --force</pre>
+    </div>
+
+    <div class="callout">
+      <span class="clabel">ℹ Compatibility note &mdash; drop-in upgrade, lossless migration</span>
+      <p>
+        <code>brew upgrade ai-memory</code> / <code>cargo install ai-memory --force</code>; the live DB auto-migrates <strong>v57 &rarr; v70</strong> on first open (archive &rarr; restore is lossless). The SDKs (<a href="https://www.npmjs.com/package/@alphaone/ai-memory">@alphaone/ai-memory</a> npm, <a href="https://pypi.org/project/ai-memory-mcp/">ai-memory-mcp</a> PyPI) are published at <code>0.8.0</code>. Pillar-1 / Pillar-2 surfaces are additive &mdash; no existing tool, route, or wire shape changes.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ DISTRIBUTED-COORDINATION HEADLINE FEATURES ============ -->
+<section style="background:var(--bg-raised)">
+  <div class="container">
+    <span class="eyebrow">The coordination primitives</span>
+    <h2>Headline features in v0.8.0</h2>
+    <p class="lede">
+      Every card below is anchored to the <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1709">distributed-coordination epic (#1709)</a> and a section in <a href="coordination.md">docs/coordination.md</a>. Every tool is verified against the registry (<code>src/mcp/registry.rs</code>).
+    </p>
+
+    <div class="grid-2">
+      <div class="card cyan">
+        <span class="tag">Pillar-1 &middot; Actions</span>
+        <h3>The dependency DAG</h3>
+        <p>An <strong>action</strong> is one node of work &mdash; created, claimed, worked, finished &mdash; wired into a typed directed dependency DAG via <code>requires</code>/<code>unlocks</code>/<code>blocks</code>/<code>gated_by</code>/<code>sibling</code> edges. A real state machine (<code>pending</code>&rarr;<code>claimed</code>&rarr;<code>in_progress</code>&rarr;<code>done</code>/<code>failed</code>/<code>abandoned</code>) rejects every illegal transition. The <code>frontier</code> / <code>next</code> surfaces let an agent pull the next runnable node, ranked by priority. Schema <strong>v59</strong> (<code>actions</code> + <code>action_edges</code>).</p>
+        <p><a href="coordination.md">Actions &rarr;</a></p>
+      </div>
+
+      <div class="card violet">
+        <span class="tag">Pillar-1 &middot; Leases</span>
+        <h3>Single-holder, TTL-bounded claims</h3>
+        <p>A lease is a heartbeat-renewed, expiry-swept claim on an action so two agents don't both work the same node. Acquisition is <strong>compare-and-swap</strong>: the second acquirer of a still-live lease loses. <code>PRIMARY KEY</code> on <code>action_id</code> enforces one holder at a time. Renew to heartbeat; only the recorded holder may release. Schema <strong>v59</strong> (<code>leases</code>).</p>
+        <p><a href="coordination.md">Leases &rarr;</a></p>
+      </div>
+
+      <div class="card amber">
+        <span class="tag">Pillar-1 &middot; Signals</span>
+        <h3>Typed, Ed25519-signed inter-agent messages</h3>
+        <p>The typed messaging lane between agents. Each signal carries an Ed25519 <code>signature</code> + sender <code>signer_pubkey</code> and threads via <code>correlation_id</code> + <code>in_reply_to</code>. Types: <code>authorize</code>, <code>notify</code> (default), <code>request</code>, <code>response</code>, <code>broadcast</code>; a NULL <code>to_agent</code> broadcasts. Send / read / inbox / thread-walk / ack. Schema <strong>v60</strong> (<code>signals</code>).</p>
+        <p><a href="coordination.md">Signals &rarr;</a></p>
+      </div>
+
+      <div class="card green">
+        <span class="tag">Pillar-1 &middot; Checkpoints</span>
+        <h3>Attested conditional gates</h3>
+        <p>A checkpoint blocks until a condition is resolved. Resolution is <strong>self-signed in place</strong> with the dispatch context's active Ed25519 keypair when present (landing <code>attest_level = self_signed</code>, else <code>unsigned</code>); verification re-checks that attested-resolution signature. Condition types: <code>approval</code> (default), <code>external_signal</code>, <code>condition_predicate</code>, <code>deadline</code>. Schema <strong>v61</strong> (<code>checkpoints</code>).</p>
+        <p><a href="coordination.md">Checkpoints &rarr;</a></p>
+      </div>
+
+      <div class="card cyan">
+        <span class="tag">Pillar-1 &middot; Routines</span>
+        <h3>Parameterised, frozen, replayable plans</h3>
+        <p>A reusable coordination template authored as a <code>draft</code>, then <strong>frozen</strong> (immutable, self-signed with an Ed25519 FREEZE-ATTESTATION over its immutable fields). <code>run</code> materialises a concrete set of actions + edges from the <code>{{param}}</code> template into a <code>routine_runs</code> record. Create / freeze / run / status / list. Schema <strong>v62</strong> (<code>routines</code> + <code>routine_runs</code>).</p>
+        <p><a href="coordination.md">Routines &rarr;</a></p>
+      </div>
+
+      <div class="card violet">
+        <span class="tag">Pillar-2 &middot; Typed cognition</span>
+        <h3>Goal / Plan / Step &mdash; a plan lives in the store</h3>
+        <p>Ordinary memories gain the shape of a plan so the coordination DAG has a cognitive counterpart. New <code>memory_kind</code> values <code>goal</code> / <code>plan</code> / <code>step</code>; a first-class <code>lifecycle_state</code> column (schema <strong>v64</strong>: <code>open</code>&rarr;<code>active</code>&rarr;<code>blocked</code>/<code>done</code>/<code>abandoned</code>, enforced at the <code>memory_update</code> boundary); and three new typed link relations (schema <strong>v63</strong>): <code>decomposes_into</code>, <code>depends_on</code>, <code>advances</code> &mdash; extending the closed taxonomy from 6 &rarr; 9. Additive, permissive options &mdash; no new tool.</p>
+        <p><a href="coordination.md">Typed cognition &rarr;</a></p>
+      </div>
+
+      <div class="card green">
+        <span class="tag">Governance &middot; #1811 / #1734</span>
+        <h3>Governance that actually blocks</h3>
+        <p>The Claude Code <strong>PreToolUse</strong> hook now <em>enforces</em>: a substrate <code>Refuse</code> blocks the tool (an enforcing <code>type:command</code> wrapper &mdash; an MCP-tool hook structurally cannot block). Plus mandatory <strong>hooks-presence</strong> enforcement (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1734">#1734</a>) so a missing required pre-write hook fails closed rather than silently no-op'ing, and an <code>escalate</code> verdict for human-in-the-loop. Operator-signed rules an agent cannot forge.</p>
+        <p><a href="governance.html">Governance L1&ndash;L6 &rarr;</a></p>
+      </div>
+
+      <div class="card amber">
+        <span class="tag">Federation &middot; secure by default</span>
+        <h3>Fleets that don't have to trust each other</h3>
+        <p>Peer enrollment on by default (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1789">#1789</a>), per-transition signatures on authority-granting writes (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>), per-write content attestation on relayed memories (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1464">#1464</a>), 16-byte CSPRNG transition-replay nonces (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1805">#1805</a>), and outbound peer server-cert pinning (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1678">#1678</a>). The trust is in the Ed25519 signatures, not in good behavior.</p>
+        <p><a href="federation.md">Federation &rarr;</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FIVE-TIER LADDER ============ -->
+<section style="background:linear-gradient(180deg,rgba(200,162,255,0.04) 0%,transparent 100%)">
+  <div class="container">
+    <span class="eyebrow">Same binary, five tiers</span>
+    <h2>v0.8.0 lands the substrate T4&ndash;T5 multi-agent fleets need</h2>
+    <p class="lede">
+      ai-memory's architecture scales from one developer's laptop to a multi-region hive of agents <strong>without switching products</strong>. The coordination + typed-cognition + federation-hardening work in v0.8.0 turns "several agents" into "one coordinated organism that doesn't have to trust its members." Every primitive listed below is in the v0.8.0 binary; you turn flags on as you grow.
+    </p>
+
+    <div class="tier-ladder">
+      <a href="architectures-t1.html" class="tier" style="text-decoration:none;color:inherit">
+        <div class="t-num">T1</div>
+        <div class="t-name">Single Agent</div>
+        <div class="t-desc">1 dev, 1 host. SQLite local. <code>ai-memory mcp</code></div>
+      </a>
+      <a href="architectures-t2.html" class="tier" style="text-decoration:none;color:inherit">
+        <div class="t-num">T2</div>
+        <div class="t-name">Many Agents</div>
+        <div class="t-desc">N AI clients sharing one host via HTTP+mTLS</div>
+      </a>
+      <a href="architectures-t3.html" class="tier" style="text-decoration:none;color:inherit">
+        <div class="t-num">T3</div>
+        <div class="t-name">Multi-Node Cluster</div>
+        <div class="t-desc">Quorum W-of-N writes, vector-clock CRDT-lite merge</div>
+      </a>
+      <a href="architectures-t4.html" class="tier" style="text-decoration:none;color:inherit">
+        <div class="t-num">T4</div>
+        <div class="t-name">Data-Center Swarm</div>
+        <div class="t-desc">Action DAG + leases, signed signals, attested checkpoints</div>
+      </a>
+      <a href="architectures-t5.html" class="tier" style="text-decoration:none;color:inherit">
+        <div class="t-num">T5</div>
+        <div class="t-name">Global Hive</div>
+        <div class="t-desc">Enrolled peers, per-transition signatures, peer-cert pinning</div>
+      </a>
+    </div>
+
+    <h3 style="margin-top:2rem">What v0.8.0 adds beyond v0.7.0</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Capability</th>
+          <th>v0.7.0 (attested-cortex)</th>
+          <th>v0.8.0 (distributed-coordination)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Multi-agent coordination DAG</td><td>❌</td><td>✅ typed actions + edges + state machine (<code>memory_action_*</code>)</td></tr>
+        <tr><td>Single-holder work claims</td><td>❌</td><td>✅ TTL-bounded CAS <strong>leases</strong> (<code>memory_lease_*</code>)</td></tr>
+        <tr><td>Signed inter-agent messaging</td><td>❌ (webhooks/subscriptions only)</td><td>✅ Ed25519-<strong>signals</strong>, typed + threaded + ack'd (<code>memory_signal_*</code>)</td></tr>
+        <tr><td>Attested coordination gates</td><td>❌</td><td>✅ <strong>checkpoints</strong> with self-signed resolution (<code>memory_checkpoint_*</code>)</td></tr>
+        <tr><td>Replayable plan templates</td><td>❌</td><td>✅ frozen, signed <strong>routines</strong> (<code>memory_routine_*</code>)</td></tr>
+        <tr><td>Typed cognition</td><td>Form-6 memory_kind vocabulary</td><td>✅ + <code>Goal</code>/<code>Plan</code>/<code>Step</code> + <code>lifecycle_state</code> machine</td></tr>
+        <tr><td>Typed link relations</td><td>6 relations</td><td>✅ <strong>9</strong> (adds <code>decomposes_into</code>/<code>depends_on</code>/<code>advances</code>)</td></tr>
+        <tr><td>Governance actually blocks a tool</td><td>⚠️ MCP-tool hook (cannot block)</td><td>✅ enforcing <code>type:command</code> PreToolUse hook (#1811) + presence enforcement (#1734)</td></tr>
+        <tr><td>Federation peer enrollment</td><td>⚠️ permissive default</td><td>✅ required by default (#1789)</td></tr>
+        <tr><td>Per-transition / per-write attestation</td><td>❌</td><td>✅ #1718 (transitions) + #1464 (relayed writes)</td></tr>
+        <tr><td>Outbound peer-cert pinning</td><td>❌</td><td>✅ SSH-<code>known_hosts</code>-style pin file (#1678)</td></tr>
+        <tr><td>Provider-agnostic embeddings</td><td>✅ (#1598)</td><td>✅ unchanged &mdash; 15+ vendors, no GPU required</td></tr>
+        <tr><td>Schema</td><td>v57</td><td>✅ <strong>v70</strong> (additive v58&ndash;v70)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ============ NEW MCP TOOLS ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Surface area</span>
+    <h2>New coordination tool families in v0.8.0</h2>
+    <p class="lede">
+      Pillar-1 adds <strong>26</strong> coordination tools across five families (the MCP surface grows to <strong>100</strong> advertised entries at <code>--profile full</code> &mdash; 99 callable + the always-on <code>memory_capabilities</code> bootstrap). Pillar-2 adds <strong>no</strong> new tool &mdash; its Goal/Plan/Step shape rides on additive, permissive fields of <code>memory_store</code>/<code>memory_update</code>. Each tool is verified against <code>src/mcp/registry.rs</code> and documented in <a href="coordination.md"><code>docs/coordination.md</code></a>.
+    </p>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Family</th>
+          <th>Tools</th>
+          <th>Purpose</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>memory_action_*</code></td><td><code>create</code>, <code>get</code>, <code>transition</code>, <code>list</code>, <code>add_edge</code>, <code>edges</code>, <code>frontier</code>, <code>next</code></td><td>The typed action DAG + state machine; pull the runnable frontier</td></tr>
+        <tr><td><code>memory_lease_*</code></td><td><code>acquire</code>, <code>renew</code>, <code>release</code>, <code>get</code></td><td>Single-holder TTL leases (compare-and-swap) on an action</td></tr>
+        <tr><td><code>memory_signal_*</code></td><td><code>send</code>, <code>read</code>, <code>inbox</code>, <code>thread</code>, <code>ack</code></td><td>Typed, Ed25519-signed, threaded inter-agent messages</td></tr>
+        <tr><td><code>memory_checkpoint_*</code></td><td><code>create</code>, <code>resolve</code>, <code>query</code>, <code>verify</code></td><td>Attested conditional gates with self-signed resolution</td></tr>
+        <tr><td><code>memory_routine_*</code></td><td><code>create</code>, <code>freeze</code>, <code>run</code>, <code>status</code>, <code>list</code></td><td>Parameterised, frozen, replayable coordination templates</td></tr>
+      </tbody>
+    </table>
+    <p style="font-size:.9rem">HTTP mirrors the two authority-granting coordination writes (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1718">#1718</a>): <code>POST /api/v1/actions/{id}/transition</code> (local CAS transition + W-of-N federation fan-out) and <code>POST /api/v1/signals</code> (local send + fan-out), so Postgres-backed / MCP-over-HTTP deployments can drive coordination too.</p>
+  </div>
+</section>
+
+<!-- ============ EVIDENCE / TRUST ============ -->
+<section style="background:var(--bg-raised)">
+  <div class="container">
+    <span class="eyebrow">Built with AI &middot; verified against AI</span>
+    <h2>Why every claim on this page is anchored</h2>
+    <p class="lede">
+      v0.8.0 follows the same evidence discipline established in v0.7.0 &mdash; every claim above resolves to a public, verifiable artifact:
+    </p>
+
+    <div class="grid-2">
+      <div class="card violet">
+        <span class="tag">Coordination guide</span>
+        <h3>docs/coordination.md</h3>
+        <p>The canonical write-up of Pillar-1 + Pillar-2: actions, leases, signals, checkpoints, routines, the HTTP write surfaces, and the typed-cognition kinds + <code>lifecycle_state</code> machine + new link relations. Every tool is verified against <code>src/mcp/registry.rs</code>; every schema number is cited.</p>
+        <p><a href="coordination.md" style="color:var(--p3)">Read the coordination guide &rarr;</a></p>
+      </div>
+
+      <div class="card cyan">
+        <span class="tag">Release notes</span>
+        <h3>v0.8.0 release notes</h3>
+        <p>Full track-by-track ship status, the schema v57 &rarr; v70 migration ladder (v58&ndash;v70), the secure-default flips, and the upgrade / compatibility section. The operator's source of truth for what changed since v0.7.0.</p>
+        <p><a href="v0.8.0/release-notes.md" style="color:var(--p1)">Open the release notes &rarr;</a></p>
+      </div>
+
+      <div class="card amber">
+        <span class="tag">Federation &amp; security posture</span>
+        <h3>Hardened, secure by default</h3>
+        <p>The federation hardening surface &mdash; enrollment, per-transition signatures, per-write content attestation, replay nonces, peer-cert pinning &mdash; with the exact env-var knobs, fail-closed defaults, and rollout escape-hatches. Read this before upgrading a fleet.</p>
+        <p><a href="federation.md" style="color:var(--p2)">Open federation.md &rarr;</a></p>
+      </div>
+
+      <div class="card green">
+        <span class="tag">Quality gate</span>
+        <h3>Validated end-to-end</h3>
+        <p>Full CI matrix green on the release commit &mdash; Linux/macOS/Windows, the SQLite <strong>and</strong> PostgreSQL+AGE feature gates, <code>clippy -D pedantic</code> + <code>fmt</code>, per-module coverage, iOS/Android cross-compile, MSRV (Rust 1.96), Docker build, <code>cargo audit</code> clean. Validated by a P0&ndash;P11 multi-agent validation, a 2-round external-model security review (every finding fixed), and a live agent-to-agent campaign across heterogeneous models &mdash; zero defects.</p>
+        <p><a href="https://alphaonedev.github.io/ai-memory-discovery-gate/" style="color:var(--good)">Discovery Gate &rarr;</a></p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ INSTALL SHORTCUTS ============ -->
+<section>
+  <div class="container">
+    <span class="eyebrow">Install shortcuts</span>
+    <h2>Install the current release (v0.8.0)</h2>
+    <p class="lede">v0.8.0 (<code>distributed-coordination</code>) is the current GA release. The install channels below publish v0.8.0.</p>
+
+    <div class="grid-3">
+      <div class="card">
+        <span class="tag">macOS / Linux</span>
+        <h3>Homebrew</h3>
+        <pre>brew install alphaonedev/tap/ai-memory
+ai-memory install claude-code --apply</pre>
+      </div>
+      <div class="card">
+        <span class="tag">Cargo (any host)</span>
+        <h3>From crates.io</h3>
+        <pre>cargo install ai-memory --version 0.8.0</pre>
+      </div>
+      <div class="card">
+        <span class="tag">Docker</span>
+        <h3>ghcr.io</h3>
+        <pre>docker pull ghcr.io/alphaonedev/ai-memory:0.8.0</pre>
+      </div>
+      <div class="card">
+        <span class="tag">Fedora / RHEL / Rocky</span>
+        <h3>COPR</h3>
+        <pre>sudo dnf copr enable alpha-one-ai/ai-memory
+sudo dnf install ai-memory</pre>
+      </div>
+      <div class="card">
+        <span class="tag">TypeScript SDK</span>
+        <h3>npm</h3>
+        <pre>npm install @alphaone/ai-memory</pre>
+      </div>
+      <div class="card">
+        <span class="tag">Python SDK</span>
+        <h3>PyPI</h3>
+        <pre>pip install ai-memory-mcp
+# import name remains ai_memory</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+      <a href="v0.8.0/release-notes.md">Release notes</a>
+      <a href="coordination.md">Coordination guide</a>
+      <a href="federation.md">Federation</a>
+      <a href="governance.html">Governance</a>
+      <a href="whats-new-v07.html">v0.7.0 (prior release)</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/INSTALL.md">Install Guide</a>
+    </div>
+    <p>
+      <strong>ai-memory&trade;</strong> v0.8.0 &mdash; AI-Agnostic MCP Memory &amp; Coordination Substrate &middot; codename <code>distributed-coordination</code>
+    </p>
+    <p style="margin-top:.5rem">
+      Copyright &copy; 2026 <strong>AlphaOne LLC</strong>. ai-memory is a trademark of AlphaOne LLC (USPTO Serial No.&nbsp;99761257).
+    </p>
+    <p style="margin-top:.25rem;font-size:.78rem">
+      Licensed under the <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/LICENSE">Apache License, Version 2.0</a>.
+      Built with Rust, SQLite, FTS5, Postgres (optional Apache AGE), and Axum. Works with Claude, ChatGPT, Grok, Llama, OpenClaw 🦞, and any MCP-compatible AI.
+    </p>
+    <p style="margin-top:.75rem;font-size:.72rem;color:#6e7681;max-width:700px;margin-left:auto;margin-right:auto;line-height:1.5">
+      THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+      The authors and AlphaOne LLC accept no liability for any use, misuse, or consequence arising from this software.
+      See <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/LICENSE">LICENSE</a> for full terms.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>

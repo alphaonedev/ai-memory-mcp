@@ -1,7 +1,7 @@
 <!--
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
-  Landing page redesign — DOC-A (v0.7.0 release).
+  Landing page redesign — DOC-A (v0.8.0 release).
   Streamlined navigational hub. One page, short text, strong visual hierarchy,
   clear paths into deeper docs. Mobile/IoT spotlight is a first-class section
   per operator emphasis.
@@ -292,8 +292,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
-      <a href="release-v0.7.1.html" style="color:var(--good)">v0.7.1</a>
-      <a href="whats-new-v07.html" style="color:var(--p3)">v0.7.0</a>
+      <a href="whats-new-v08.html" style="color:var(--p3)">v0.8.0</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
     <details class="mnav">
@@ -308,8 +307,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <a href="#integrate">Integrate</a>
         <a href="#audiences">Audiences</a>
         <a href="#architectures">Architectures</a>
-        <a href="release-v0.7.1.html">v0.7.1</a>
-        <a href="whats-new-v07.html">v0.7.0</a>
+        <a href="whats-new-v08.html">v0.8.0</a>
         <a href="at-a-glance.html">Atlas</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
@@ -392,7 +390,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     </div>
     <div class="cta-row">
       <a class="cta primary" href="#install">Install in 60 seconds</a>
-      <a class="cta violet" href="whats-new-v07.html">What's new in v0.7.0</a>
+      <a class="cta violet" href="whats-new-v08.html">What's new in v0.8.0</a>
       <a class="cta ghost" href="#why">Why ai-memory?</a>
     </div>
     <pre style="display:inline-block;text-align:left;margin-top:1.75rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
@@ -557,7 +555,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </div>
     </div>
 
-    <p style="margin-top:2rem"><a href="whats-new-v07.html">See what's new in v0.7.0 &rarr;</a> &middot; <a href="v070-changelog.html">CHANGELOG synthesis &rarr;</a> &middot; <a href="v070-architecture.html">v0.7.0 architecture &rarr;</a> &middot; <a href="at-a-glance.html">Atlas: everything on one page &rarr;</a> &middot; <a href="v0.7.0/heterogeneous-ai-nhi-assessment/">Heterogeneous AI NHI assessment &rarr;</a></p>
+    <p style="margin-top:2rem"><a href="whats-new-v08.html">See what's new in v0.8.0 &rarr;</a> &middot; <a href="coordination.md">Distributed coordination &rarr;</a> &middot; <a href="at-a-glance.html">Atlas: everything on one page &rarr;</a> &middot; <a href="v0.7.0/heterogeneous-ai-nhi-assessment/">Heterogeneous AI NHI assessment &rarr;</a></p>
   </div>
 </section>
 
@@ -591,7 +589,7 @@ sudo dnf install ai-memory</code></pre>
         <div class="platform">Container &middot; Plan C</div>
         <div class="name">Docker</div>
         <pre><code>docker run --rm -it \
-  ghcr.io/alphaonedev/ai-memory:0.7.0</code></pre>
+  ghcr.io/alphaonedev/ai-memory:0.8.0</code></pre>
       </div>
       <div class="install-card">
         <div class="platform">iOS &middot; Android</div>
@@ -670,15 +668,16 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
   </div>
 </section>
 
-<!-- ============ MIGRATION v0.6.4 → v0.7.0 ============ -->
+<!-- ============ MIGRATION → v0.8.0 ============ -->
 <section id="migrate">
   <div class="container-narrow">
-    <span class="eyebrow">Migrating from v0.6.4</span>
-    <h2>Already running v0.6.4? The upgrade is one boot.</h2>
+    <span class="eyebrow">Migrating to v0.8.0</span>
+    <h2>Already running v0.6.4 or v0.7.x? The upgrade is one boot.</h2>
     <p class="lede">
-      v0.7.0 migrates your existing database in place. The sqlite schema steps from
-      <strong>v15&nbsp;&rarr;&nbsp;v57</strong> on the first <code>ai-memory serve</code> after the upgrade.
-      It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged and new
+      v0.8.0 migrates your existing database in place. The sqlite schema steps up to
+      <strong>v70</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.7.x DB steps
+      <strong>v57&nbsp;&rarr;&nbsp;v70</strong>; a v0.6.4 DB walks the full ladder).
+      It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged, archive&nbsp;&rarr;&nbsp;restore is lossless, and new
       columns default to safe values for legacy rows. Typical downtime is
       <strong>30&nbsp;seconds to 2&nbsp;minutes</strong> on a laptop-sized database.
     </p>
@@ -686,17 +685,17 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       <div class="feat cyan">
         <span class="tag">Step 1 &middot; Back up</span>
         <h3>Copy the DB + sidecars</h3>
-        <p>Stop the daemon, then copy <code>ai-memory.db</code> and any <code>-wal</code>&nbsp;/&nbsp;<code>-shm</code> sidecars to a <code>.bak.pre-v07</code> file. Verify it with <code>PRAGMA&nbsp;integrity_check</code>.</p>
+        <p>Stop the daemon, then copy <code>ai-memory.db</code> and any <code>-wal</code>&nbsp;/&nbsp;<code>-shm</code> sidecars to a <code>.bak.pre-v08</code> file. Verify it with <code>PRAGMA&nbsp;integrity_check</code>.</p>
       </div>
       <div class="feat cyan">
         <span class="tag">Step 2 &middot; Upgrade</span>
-        <h3>Install v0.7.0 &amp; boot once</h3>
+        <h3>Install v0.8.0 &amp; boot once</h3>
         <p>Install the new binary, then run <code>ai-memory serve</code>. The schema ladder migrates automatically and you are back online when it finishes.</p>
       </div>
       <div class="feat cyan">
         <span class="tag">Step 3 &middot; Roll back if needed</span>
         <h3>File restore is the escape hatch</h3>
-        <p>The ladder is idempotent on replay but not reversible in place. To roll back, restore the <code>.bak.pre-v07</code> file and reinstall the v0.6.4 binary.</p>
+        <p>The ladder is idempotent on replay but not reversible in place. To roll back, restore the <code>.bak.pre-v08</code> file and reinstall the prior binary.</p>
       </div>
     </div>
     <div style="margin-top:1.5rem">
@@ -932,9 +931,9 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
         <strong>Migration v0.6.4 &rarr; v0.7.0</strong>
         <span class="desc">Step-by-step migration, schema changes, breaking-change list.</span>
       </a>
-      <a class="lk" href="v0.7.0/release-notes.md">
-        <strong>v0.7.0 release notes</strong>
-        <span class="desc">What changed since v0.6.4. Track-by-track ship status.</span>
+      <a class="lk" href="v0.8.0/release-notes.md">
+        <strong>v0.8.0 release notes</strong>
+        <span class="desc">What changed in the current release — distributed coordination, typed cognition, federation hardening. Track-by-track ship status.</span>
       </a>
     </div>
   </div>
@@ -976,8 +975,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">Changelog</a>
     <a href="SECURITY.md">Security</a>
     <a href="credits.html">Credits</a>
-    <a href="whats-new-v07.html">v0.7.0</a>
-    <a href="whats-new-v064.html">v0.6.4</a>
+    <a href="whats-new-v08.html">v0.8.0</a>
   </div>
   <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
   <div class="legal">Built for AI Non-Human Identity agents that need to remember &mdash; from a phone to a planet.</div>
