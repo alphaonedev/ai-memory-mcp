@@ -157,6 +157,29 @@ Status codes you'll commonly encounter:
 - No per-client rate limiting at the HTTP layer — all writes contend
   for a single `Mutex<Connection>`. Batch or throttle at the caller.
 
+### Admission control — overload shedding (v0.8.0, #1733 Pillar-4 4.A)
+
+A global in-flight concurrency cap is **opt-in** via
+`[limits].max_inflight_requests` / `AI_MEMORY_MAX_INFLIGHT_REQUESTS`
+(precedence: env > config > compiled default `0` = disabled). When set
+to a positive `n`, the daemon admits at most `n` concurrent in-flight
+requests and **sheds** the rest at the outermost layer (before timeout,
+body decode, or handler work) with a typed **503**:
+
+```json
+{ "error": "server_overloaded", "code": "OVERLOADED", "max_inflight": 64 }
+```
+
+The shed response carries a `Retry-After: 1` header. `GET /api/v1/health`,
+`GET /api/v1/metrics`, and the bare `GET /metrics` are **EXEMPT** from the
+cap so liveness/readiness probes and Prometheus scrapes survive an
+overload (otherwise the orchestrator's health probe would be shed, the
+node killed, and graceful shedding would become a crash-loop). Shed
+events increment the `ai_memory_admission_shed_total` Prometheus counter
+and emit a sampled WARN. When the knob is unset / `0` / non-positive, no
+admission layer is composed and behaviour is byte-identical to a build
+without admission control.
+
 ## The `Memory` object
 
 ```json
@@ -972,6 +995,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_find_paths` | `POST /api/v1/kg/find_paths` | J7. |
 | `memory_verify` | `POST /api/v1/links/verify` | H4. |
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
+| `memory_agent_register` / `memory_agent_list` | `POST /api/v1/agents`, `GET /api/v1/agents` | `meta` family. Register an NHI agent (`agent_type`, `capabilities`) in `_agents` (refreshes `last_seen_at`, preserves `registered_at`) and list every registered agent (ordered by `registered_at`). `agent_id` is CLAIMED, not attested — pair with attestation (#626 Layer-3) for a security boundary. |
 
 For the canonical full inventory (100 entries advertised at `--profile full` at v0.8.0 — 99 callable + the always-on `memory_capabilities`): `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 100 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth. The v0.8.0 net-new tools are the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
 

@@ -356,9 +356,9 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 84
+/// COMPILE under the default build. The source file declares 85
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 82.
+/// "sal")]`-gated and excluded from default builds, leaving 83.
 /// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
 /// surface, bumping 78 → 79; #1598 added `Reembed` for the
 /// `ai-memory reembed` vector-space migration, bumping 79 → 80;

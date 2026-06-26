@@ -94,7 +94,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Evidence</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
+      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -274,7 +274,7 @@ footer a{color:var(--text-muted)}
       <div class="status-card beta">
         <span class="tag">Beta (opt-in enforcement)</span>
         <h3>Cryptographic agent attestation</h3>
-        <p>v0.7.0 ships attestation in the <code>memory_links</code> table: <code>signature</code>, <code>attest_level</code> (<code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code>), and <code>signed_at</code> columns are wired through H2 (outbound self-sign), H3 (inbound verify), and H4 (<code>memory_verify</code> MCP tool); #626 Layer-3 verifies caller-presented store-surface signatures (<code>attest_level = "agent_attested"</code>). An unsigned <code>agent_id</code> remains a claim (<code>"claimed"</code>) unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code> — pair with the attestation envelope for security decisions.</p>
+        <p>ai-memory ships attestation in the <code>memory_links</code> table: <code>signature</code>, <code>attest_level</code> (<code>unsigned</code> / <code>self_signed</code> / <code>peer_attested</code>), and <code>signed_at</code> columns are wired through H2 (outbound self-sign), H3 (inbound verify), and H4 (<code>memory_verify</code> MCP tool); #626 Layer-3 verifies caller-presented store-surface signatures (<code>attest_level = "agent_attested"</code>). An unsigned <code>agent_id</code> remains a claim (<code>"claimed"</code>) unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code> — pair with the attestation envelope for security decisions.</p>
       </div>
 
       <div class="status-card unsupported">
