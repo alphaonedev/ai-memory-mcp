@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Validators — every input check</title>
-<meta name="description" content="ai-memory v0.7.0 input-validation reference. Every validator function, every limit, every accepted value, every rejection reason. Defense in depth at the API boundary.">
+<meta name="description" content="ai-memory v0.8.0 input-validation reference. Every validator function, every limit, every accepted value, every rejection reason. Defense in depth at the API boundary.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/validators.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -389,14 +389,17 @@ footer a{color:var(--text-muted)}
 
     <div class="v" id="validate_relation">
       <div class="v-head"><span class="v-name">validate_relation</span><span class="v-sig">(relation: &amp;str) → Result&lt;()&gt;</span><span class="v-when">LinkBody · sync_push links receive</span></div>
-      <div class="v-desc">Closed canonical set <strong>+ user-defined</strong> identifiers. The 6 canonical names below always pass; v0.7.0 Wave-3 Continuation 5 also accepts any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier (mirrors the AGE Cypher edge-label convention so cert harnesses can use <code>next</code> / <code>mentions</code> / <code>parent_of</code>). Whitespace / control chars / shell metacharacters are rejected. Canonical truth: <code>VALID_RELATIONS</code> in <code>src/validate.rs</code>; enum in <code>src/models/link.rs::MemoryLinkRelation</code>.</div>
-      <div class="v-rules"><div class="lbl">Canonical values (6 at v0.7.0)</div><ul>
+      <div class="v-desc"><strong>Closed canonical set — 9 relations at v0.8.0.</strong> The nine canonical names below are the only accepted values. The v0.7.0 Wave-3 affordance that additionally accepted any caller-supplied lowercase <code>[a-z0-9_]+</code> identifier was <strong>removed at v0.8.0 (#1812)</strong>: such a label never persisted on any backend — the <code>memory_links</code> <code>CHECK (relation IN (…))</code> constraint rejected it (silently under sqlite <code>INSERT OR IGNORE</code>) while the MCP tool still reported <code>linked:true</code>, a false-success + silent link-write loss. Off-taxonomy relations are now rejected LOUDLY at this earliest layer; whitespace / control chars / shell metacharacters are likewise rejected. Canonical truth: <code>VALID_RELATIONS</code> in <code>src/validate.rs</code>; enum in <code>src/models/link.rs::MemoryLinkRelation</code> (<code>COUNT = 9</code>).</div>
+      <div class="v-rules"><div class="lbl">Canonical values (9 at v0.8.0)</div><ul>
         <li><code>related_to</code> — generic association (default for <code>memory_link</code>)</li>
         <li><code>supersedes</code> — newer memory replaces older (typed cognition)</li>
         <li><code>contradicts</code> — explicit disagreement (contradiction detection)</li>
         <li><code>derived_from</code> — provenance (consolidation outputs)</li>
         <li><code>reflects_on</code> — <strong>v0.7.0 Task 1/8</strong>: recursive-learning provenance edge (reflection → reflected-upon memory)</li>
         <li><code>derives_from</code> — <strong>v0.7.0 WT-1-A</strong>: atomisation atom → parent memory; the typed, signable, federation-safe expression of the structural <code>memories.atom_of</code> FK (schema v36 sqlite / v35 postgres). Distinct from <code>derived_from</code> (consolidation provenance).</li>
+        <li><code>decomposes_into</code> — <strong>v0.8.0 Pillar-2 (#1709)</strong>: typed-cognition decomposition spine, parent → child (Goal → Plan → Step). SQL CHECK extended 6→9 at schema v63.</li>
+        <li><code>depends_on</code> — <strong>v0.8.0 Pillar-2 (#1709)</strong>: ordering / prerequisite edge between sibling Steps (dependent → prerequisite).</li>
+        <li><code>advances</code> — <strong>v0.8.0 Pillar-2 (#1709)</strong>: progress-rollup edge, child → ancestor (a Step advances its Plan / Goal).</li>
       </ul></div>
     </div>
 

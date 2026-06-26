@@ -10,7 +10,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Batman Mode — Activating full-spectrum write-time investment</title>
-<meta name="description" content="ai-memory v0.7.0 operator how-to: take a fresh install from Batman-capable to Batman-active. Operator key, signed seed rules, curator daemon, namespace policies, and per-OS persistence (launchd / systemd / Task Scheduler).">
+<meta name="description" content="ai-memory v0.8.0 operator how-to: take a fresh install from Batman-capable to Batman-active. Operator key, signed seed rules, curator daemon, namespace policies, and per-OS persistence (launchd / systemd / Task Scheduler).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/batman-active-mode.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -251,7 +251,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Going Batman-active.</h1>
-  <p class="tagline">v0.7.0 ships <strong style="color:var(--good)">6 of 6</strong> of Batman's write-time-investment forms <strong style="color:var(--good)">+ the 7th</strong> (substrate-authority at write). All <code>IMPLEMENTED</code>. None active by default. This page is the operator-facing recipe to take a fresh install from <strong style="color:var(--warn)">Batman-capable</strong> to <strong style="color:var(--good)">Batman-active</strong> — and make it survive reboot.</p>
+  <p class="tagline">v0.8.0 ships <strong style="color:var(--good)">6 of 6</strong> of Batman's write-time-investment forms <strong style="color:var(--good)">+ the 7th</strong> (substrate-authority at write). All <code>IMPLEMENTED</code>. None active by default. This page is the operator-facing recipe to take a fresh install from <strong style="color:var(--warn)">Batman-capable</strong> to <strong style="color:var(--good)">Batman-active</strong> — and make it survive reboot.</p>
   <div class="pills">
     <span class="pill">7-step recipe</span>
     <span class="pill">launchd / systemd / Task Scheduler</span>
@@ -264,7 +264,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The thesis</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Pay at write time, read for free.</h2>
-    <p class="lede"><strong>Batman</strong> is the published 6-form write-time-investment framework. Memory quality is set at WRITE time, not retrieval time. No amount of rerank fixes a substrate that ingested duplicates, un-atomized blobs, untyped facts, no provenance, no confidence, and no governance. ai-memory v0.7.0 implements all 6 + adds a 7th (substrate-authority over agent-EXTERNAL actions). On a default install the cognitive forms in the write path are on the moment you launch with <code>--tier autonomous</code>; the governance + namespace-policy forms are opt-in and need this recipe.</p>
+    <p class="lede"><strong>Batman</strong> is the published 6-form write-time-investment framework. Memory quality is set at WRITE time, not retrieval time. No amount of rerank fixes a substrate that ingested duplicates, un-atomized blobs, untyped facts, no provenance, no confidence, and no governance. ai-memory v0.8.0 implements all 6 + adds a 7th (substrate-authority over agent-EXTERNAL actions). On a default install the cognitive forms in the write path are on the moment you launch with <code>--tier autonomous</code>; the governance + namespace-policy forms are opt-in and need this recipe.</p>
 
     <table class="matrix">
       <thead>
@@ -295,7 +295,7 @@ footer a{color:var(--text-muted)}
           <td class="form-id">Form 4</td>
           <td>Fact-provenance: <code>citations</code> field + source-as-URI + atom-grain span</td>
           <td class="verdict active">ACTIVE</td>
-          <td>Schema-level; always on at v0.7.0</td>
+          <td>Schema-level; always on at v0.8.0</td>
         </tr>
         <tr>
           <td class="form-id">Form 5</td>
@@ -326,7 +326,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Default state</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Capable, not active.</h2>
-    <p class="lede">A fresh v0.7.0 install with <code>--tier autonomous --profile full</code> running gives you Forms 1–4 the moment the MCP server boots. Everything else is dormant by design. The recipe below activates Forms 5, 6, 7 and makes the activation survive reboot.</p>
+    <p class="lede">A fresh v0.8.0 install with <code>--tier autonomous --profile full</code> running gives you Forms 1–4 the moment the MCP server boots. Everything else is dormant by design. The recipe below activates Forms 5, 6, 7 and makes the activation survive reboot.</p>
     <div class="cards">
       <div class="card always">
         <div class="lbl">already on</div>

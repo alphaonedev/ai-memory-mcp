@@ -77,12 +77,12 @@ footer a{color:var(--muted)}
   <p>This essay is not anti-vector-DB. ai-memory uses one (HNSW over MiniLM embeddings, blended with FTS5 keyword score, in the recall pipeline). The argument is narrower: <strong>if all you have is similarity search, you do not have a substrate</strong>. Eight things you also need.</p>
 
   <h2><span class="num">01.</span> Typed memory_kind taxonomy</h2>
-  <p>A vector DB stores text + a vector. ai-memory stores text + a vector + a <strong>kind</strong>: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision (the Batman Form-6 vocabulary, v0.7.0). Plus free-form tags for project-specific taxonomies.</p>
+  <p>A vector DB stores text + a vector. ai-memory stores text + a vector + a <strong>kind</strong>: Observation, Reflection, Persona, Concept, Entity, Claim, Relation, Event, Conversation, Decision (the Batman Form-6 vocabulary, v0.7.0), plus Goal, Plan, Step (the v0.8.0 typed-cognition triad). Plus free-form tags for project-specific taxonomies.</p>
   <p>Why this matters: an agent recalling "what policies apply here" is a different query from "what did I observe last Tuesday." Without typed kinds, you smear them together and the LLM has to disambiguate every time. With typed kinds, you filter at SQL.</p>
   <div class="fact"><dt>Source of truth</dt><dd><code>src/models/memory.rs</code> &mdash; the 27-field Memory struct, kind is a first-class column</dd></div>
 
   <h2><span class="num">02.</span> Knowledge graph with temporal validity</h2>
-  <p>Memories link to other memories with typed directional edges: <code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code> (six variants at v0.7.0). Each edge carries optional <code>valid_from</code> / <code>valid_until</code> so the substrate can answer "what was true on date X" instead of just "what is in the DB now."</p>
+  <p>Memories link to other memories with typed directional edges: <code>related_to</code>, <code>supersedes</code>, <code>contradicts</code>, <code>derived_from</code>, <code>reflects_on</code>, <code>derives_from</code>, <code>decomposes_into</code>, <code>depends_on</code>, <code>advances</code> (nine variants at v0.8.0). Each edge carries optional <code>valid_from</code> / <code>valid_until</code> so the substrate can answer "what was true on date X" instead of just "what is in the DB now."</p>
   <p>Backends: in-process SQL for T1; Apache AGE for T3+. The same Cypher-shaped query surface in both.</p>
   <div class="fact"><dt>Source of truth</dt><dd><code>src/models/link.rs::MemoryLinkRelation</code> + <code>docs/knowledge-graph.html</code></dd></div>
 
