@@ -7,7 +7,7 @@
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0 (endpoint substrate through AGI→ASI→beyond)  
 **Prior art:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md) · [`RQGM-2606.26294-vs-v0.8.0.md`](RQGM-2606.26294-vs-v0.8.0.md) · [`docs/contracts/epoch_manifest.schema.json`](../contracts/epoch_manifest.schema.json)
 
-**Paper:** [RQGM arXiv:2606.26294](https://arxiv.org/abs/2606.26294)
+**Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 
 ---
 

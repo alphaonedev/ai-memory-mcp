@@ -6,7 +6,8 @@
 **Codebase:** `release/v0.8.0` @ workspace HEAD  
 **North Star:** [`docs/strategy/moonshot-synthesis.md`](../strategy/moonshot-synthesis.md) §0, §2.6  
 **Prior merge doc:** [`RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md`](RED-QUEEN-11-AGENT-VOTE-vs-ai-memory.md)  
-**Subagent ID:** `019f0e12-71da-71e0-8970-bae7e6d3340f` (audit trail from orchestrator)
+**Subagent ID:** `019f0e12-71da-71e0-8970-bae7e6d3340f` (audit trail from orchestrator)  
+**Paper:** [The Red Queen Gödel Machine (arXiv:2606.26294)](https://arxiv.org/abs/2606.26294) — [PDF](https://arxiv.org/pdf/2606.26294) (Iacob et al., 24 Jun 2026)
 
 ---
 
