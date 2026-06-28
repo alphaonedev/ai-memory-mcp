@@ -534,7 +534,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 70;
+const CURRENT_SCHEMA_VERSION: i32 = 71;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1387,8 +1387,11 @@ impl PostgresStore {
         if current_version < 69 {
             self.migrate_v69().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 70 {
             self.migrate_v70().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v71().await?;
         }
 
         Ok(())
@@ -3350,6 +3353,54 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v70 applied (#1771: archived_memory_links — \
              archive-link edge-preservation snapshot table)"
+        );
+        Ok(())
+    }
+
+    /// v71 (#1821 / W2.3 / gap G30, 5-agent vote 4d3ea1c5) — the signed
+    /// FORGET-tombstone table (postgres mirror of the sqlite v71 arm). The
+    /// federation receive funnel checks it before accepting an inbound write
+    /// so a forgotten row cannot be resurrected via LWW. Identity + time +
+    /// signature only — NO content fingerprint (that would re-leak the erased
+    /// row). Pure additive `CREATE TABLE IF NOT EXISTS`.
+    async fn migrate_v71(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v71 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forget_tombstones ( \
+                 memory_id    TEXT PRIMARY KEY, \
+                 namespace    TEXT NOT NULL, \
+                 forgotten_at TEXT NOT NULL, \
+                 agent_id     TEXT, \
+                 signature    BYTEA \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v71 create forget_tombstones", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS forget_tombstones_namespace_idx \
+                 ON forget_tombstones(namespace)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v71 index forget_tombstones", e))?;
+
+        record_schema_version(&mut tx, 71).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v71 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v71 applied (#1821: forget_tombstones — signed \
+             FORGET-tombstone resurrection guard)"
         );
         Ok(())
     }
