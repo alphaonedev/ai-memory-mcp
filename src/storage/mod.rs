@@ -2934,23 +2934,64 @@ fn purge_and_tombstone_forget(
         )?;
     }
 
-    // v0.8.1 W2.3 — record a FORGET tombstone per victim id (same tx, before
-    // the DELETE so `memories` still resolves). `now` binds at the next free
-    // positional index after the victim-subquery params. `INSERT OR IGNORE`
-    // keeps it idempotent under re-run.
-    let now_idx = bound.len() + 1;
-    let mut tomb_refs = refs.clone();
-    tomb_refs.push(&now);
-    conn.execute(
-        &format!(
+    // v0.8.1 W2.3 — record a SIGNED FORGET tombstone per victim (same tx,
+    // before the DELETE so `memories` still resolves). Collect the victim
+    // (id, namespace, agent_id) details, sign the canonical
+    // {memory_id, namespace, forgotten_at} bytes with the daemon audit key
+    // (unsigned when the daemon has no key — same posture as signed_events),
+    // and INSERT each. `INSERT OR IGNORE` keeps it idempotent.
+    let detail_sql = format!(
+        "SELECT id, namespace, json_extract(metadata,'$.agent_id') \
+         FROM memories WHERE id IN ({victims})"
+    );
+    let victims_detail: Vec<(String, String, Option<String>)> = {
+        let mut stmt = conn.prepare(&detail_sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, ns, agent_id) in &victims_detail {
+        let signable = forget_tombstone_signable_bytes(id, ns, now);
+        let signature: Option<Vec<u8>> =
+            crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+        conn.execute(
             "INSERT OR IGNORE INTO forget_tombstones \
-                 (memory_id, namespace, forgotten_at, agent_id) \
-             SELECT id, namespace, ?{now_idx}, json_extract(metadata,'$.agent_id') \
-             FROM memories WHERE id IN ({victims})"
-        ),
-        tomb_refs.as_slice(),
-    )?;
+                 (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, ns, now, agent_id, signature],
+        )?;
+    }
     Ok(())
+}
+
+/// v0.8.1 W2.3 (#1821 / gap G30) — the canonical signable bytes for a FORGET
+/// tombstone (the `SignableForget` shape: identity + time, NEVER content — a
+/// content fingerprint would re-leak the erased row). Deterministic
+/// delimiter-joined form so a receiver can recompute + verify the Ed25519
+/// signature against the signer's enrolled key. Versioned domain-separation
+/// prefix so a future shape change cannot collide with v1.
+#[must_use]
+pub fn forget_tombstone_signable_bytes(
+    memory_id: &str,
+    namespace: &str,
+    forgotten_at: &str,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"forget-tombstone-v1\x00";
+    let mut bytes = Vec::with_capacity(
+        DOMAIN.len() + memory_id.len() + namespace.len() + forgotten_at.len() + 2,
+    );
+    bytes.extend_from_slice(DOMAIN);
+    bytes.extend_from_slice(memory_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(namespace.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(forgotten_at.as_bytes());
+    bytes
 }
 
 /// v0.8.1 W2.3 (#1821 / gap G30) — has `memory_id` been forgotten (a

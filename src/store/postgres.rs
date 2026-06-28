@@ -13915,21 +13915,32 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget purge transcript_line_dedup", e))?;
-            // W2.3 tombstones — bulk insert via UNNEST. Identity + time +
-            // owner only (NO content). `signature` populated by the federation
-            // EMIT path; the local resurrection guard is existence-based.
+            // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
+            // + owner only (NO content). Each signs the canonical
+            // {memory_id, namespace, forgotten_at} bytes with the daemon audit
+            // key (unsigned when absent) — parity with the sqlite path.
+            let now = chrono::Utc::now().to_rfc3339();
             let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
             let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
-            let forgotten: Vec<String> = vec![chrono::Utc::now().to_rfc3339(); deleted.len()];
+            let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
+            let signatures: Vec<Option<Vec<u8>>> = deleted
+                .iter()
+                .map(|(id, ns, _)| {
+                    let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
+                    crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+                })
+                .collect();
             sqlx::query(
-                "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, agent_id) \
-                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[]) \
+                "INSERT INTO forget_tombstones \
+                     (memory_id, namespace, forgotten_at, agent_id, signature) \
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
                  ON CONFLICT (memory_id) DO NOTHING",
             )
             .bind(&ids)
             .bind(&namespaces)
             .bind(&forgotten)
             .bind(&agents)
+            .bind(&signatures)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("forget record tombstones", e))?;
