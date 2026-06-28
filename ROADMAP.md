@@ -1234,6 +1234,55 @@ CUT: full RQGM / population genetics in `src/` · governance auto-mutation witho
 
 ---
 
+## 26. TRACT vs v0.8.0 — Final Reconciled Adjudication (4 passes, 2 model families)
+
+> **The project's reconciled adjudication of the TRACT framework against the shipped v0.8.0 substrate.** Converged output of **four assessment passes** — Grok first-party + Opus first-party 21-agent councils, two reconciliations, then a final **21-agent adjudication council** — CodeGraph-anchored against `release/v0.8.0` (846 files / 27,062 nodes), distilled into **two canonical `opus` companion deliverables under `docs/design/`** (these supersede and replace all prior first-party/reconciliation drafts):
+>
+> - [`docs/design/TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md`](docs/design/TRACT-v0.8.0-CORRECT-NOW-CANONICAL-opus.md) — what the substrate demonstrably **is** today (the shipped trust spine).
+> - [`docs/design/TRACT-v0.8.0-DEVELOPMENT-GAPS-CANONICAL-opus.md`](docs/design/TRACT-v0.8.0-DEVELOPMENT-GAPS-CANONICAL-opus.md) — the **27 canonical gaps** + tracking state.
+
+### 26.0 Verdict + two-axis grade
+
+**Verdict: *substrate-ready, constitution-incomplete*.** A credible, honestly-labeled TRACT-2026 **L3-BODY Reference Profile** that ships the safety/governance/capability-cliff spine strongly and diverges, knowingly, on the data-model fundamentals. Graded on **two axes, never one composite** (averaging a strong axis with a weak one describes neither):
+
+| Axis | Grade |
+|---|---|
+| **Trust-spine / safety** (capability cliff · V-4 chain · read-only signed governance · fail-closed federation · bounded reflect) | **A− / B+** |
+| **Data-model / epistemics** (content-addressing · append-only · pure recall · causal-CRDT · three-key) | **C+** |
+
+**Coverage:** ~**75–85% of ROADMAP §2** (seven structural properties) vs ~**25–35% of TRACT L1** (frozen constitution). Pillar scorecard: **10 of 14 CORRECT, 4 partial** (Pillar 1 "One Claim" splits ✅ L3 kinds-not-classes / 🟡 L1 Claim object — UUID not BLAKE3-CID).
+
+### 26.1 The 27 canonical gaps
+
+**27 development gaps: 4 P0 epics · 9 P1 · 14 P2**; **~16 UNTRACKED**; **3 proof-impossible** (architectural limits, not backlog — chiefly vote-independence per §25.7 P2). Filing the 16 UNTRACKED gaps is itself a §24 prime-directive obligation. (An earlier "52" count was granularity inflation; deduped against code it is 27. Items Grok carried — `#1672` curator_mode, `#1674` db_schema_version, HTTP `find_paths` 501 — are already FIXED and are dropped, not listed open.)
+
+### 26.2 The reconciled P0 chain (ordered, non-negotiable)
+
+Each gate strictly precedes the next — enforcing on CLAIMED metadata is security theater (§25.3 ordering):
+
+```
+P0-1  recall purity                                   (clean the signal)
+   → P0-2  attested model_family (#1719) ▶ N≥3 decorrelation ENFORCE (#1171)
+   → P0-3  secure-default attestation FLIP             (#1464; claimed → agent_attested)
+   → P0-4  epoch-FREEZE consumer                       (RQ-10; verify-only, no optimizer)
+```
+
+**Kill-test gate (§16):** if recall still mutates and decorrelation is still claimed-only at v0.9.0, the substrate fails its own kill-test against `git+ripgrep+RAG` — P0-1+P0-2 are the minimum bar.
+
+### 26.3 Tracked fix — durability-503 API-semantics bug
+
+The council surfaced (and **tracks for fix, not defer**) the **durability-503**: on a W-of-N quorum miss the local row already persisted (ADR-0001, never rolled back, `src/handlers/create.rs:941-966`) yet the handler returns `503 quorum_not_met` — misreporting a locally-durable write as a service failure. Fix = return 201/200 (or 202) with quorum-state in the body; never 5xx. It is a bug, not honest divergence (durability is a subscription tier, never a write-time status gate).
+
+### 26.4 The convergence meta-finding
+
+Four passes across **two decorrelated model families** (Grok/xAI + Opus/Anthropic) converged on the same verdict, P0 set, and root divergences — the closest *live* instance of the N≥3 attested-distinct-producer discipline §2.6 builds and the substrate cannot yet enforce. Reported as **estimated-decorrelated / CLAIMED, not ATTESTED** (no cryptographic model-family attestation exists yet — #1719). With that caveat, decorrelated agreement is the strongest available evidence the verdict is true.
+
+### 26.5 Claims discipline (binding — mirrors §25.6)
+
+**Banned until the gate behind it ships:** "pure recall" (P0-1) · "decorrelation enforced"/"N independent producers" (P0-2) · "secure-by-default attestation" (P0-3) · "epoch closure shipped" (P0-4) · "append-only"/"no silent delete" (G6) · "content-addressed"/"BLAKE3 identity" (G8) · "TRACT-/L1-conformant" (G24 CC0 vectors). **Perma-banned:** the grandeur register (incl. ai-memory's own "eternity-grade"/"civilization-scale"/"world-class" house vocabulary) + "implements RQGM" + vote-independence. CLAIMED ≠ ATTESTED throughout.
+
+---
+
 ## Footnotes
 
 [^1]: External evidence supporting §2.5's forward-looking research direction, §5's weighting note, and §16's exclusion of cognitive-state-internals modeling as a feature category. Three publicly available sources, retrieved 2026-05-25:
