@@ -147,3 +147,54 @@ fn forget_does_not_over_purge_other_namespaces_g30() {
     );
     assert_eq!(mem_count(&conn, &keep_id), 1, "the kept memory survives");
 }
+
+fn tombstone_count(conn: &rusqlite::Connection, memory_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM forget_tombstones WHERE memory_id = ?1",
+        rusqlite::params![memory_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// W2.3 — forget records a tombstone, and a simulated peer re-push of the
+/// forgotten row via `insert_if_newer` (newer `updated_at`) is REJECTED, not
+/// resurrected (tombstone-wins).
+#[test]
+fn forget_tombstone_blocks_resurrection_g30() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+
+    let id = seed_memory(&conn, "g30-resurrect", "rnote", "original secret content");
+    db::forget(&conn, Some("g30-resurrect"), None, None, false).expect("forget");
+
+    assert_eq!(
+        tombstone_count(&conn, &id),
+        1,
+        "G30 W2.3: forget must record a FORGET tombstone for the id"
+    );
+    assert_eq!(mem_count(&conn, &id), 0, "the row is gone");
+
+    // A peer that still holds the row re-pushes it with a far-future
+    // updated_at (so LWW would normally win) via the federation receive funnel.
+    let revived = Memory {
+        id: id.clone(),
+        tier: Tier::Long,
+        namespace: "g30-resurrect".to_string(),
+        title: "rnote".to_string(),
+        content: "original secret content".to_string(),
+        updated_at: "2999-01-01T00:00:00Z".to_string(),
+        memory_kind: MemoryKind::Observation,
+        ..Memory::default()
+    };
+    let returned = db::insert_if_newer(&conn, &revived).expect("insert_if_newer");
+    assert_eq!(
+        returned, id,
+        "tombstone-wins: the id is returned without an insert"
+    );
+    assert_eq!(
+        mem_count(&conn, &id),
+        0,
+        "G30 W2.3: a forgotten row must NOT be resurrected by a peer re-push"
+    );
+}

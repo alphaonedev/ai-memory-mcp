@@ -2873,12 +2873,21 @@ pub fn forget_count(
 /// #1772 owner clause when `caller` is `Some`) so the purge scopes to the
 /// same victim set — never over-purging another caller's pending replication.
 /// (5-agent vote 4d3ea1c5 — erasure-completeness finding.)
-fn purge_forget_derived_leaks(
+///
+/// v0.8.1 W2.3 — ALSO records a FORGET tombstone (`forget_tombstones`) for
+/// every victim id in the same tx, so the federation RECEIVE funnel rejects a
+/// re-pushed forgotten row instead of resurrecting it via LWW. The tombstone
+/// carries identity + time + the owner `agent_id` ONLY — never content (a
+/// fingerprint would re-leak the erased row). The Ed25519 SIGNATURE column is
+/// populated by the federation EMIT path (slice 3c); the local resurrection
+/// guard is existence-based, so a locally-written tombstone needs no signature.
+fn purge_and_tombstone_forget(
     conn: &Connection,
     namespace: Option<&str>,
     pattern: Option<&str>,
     tier: Option<&Tier>,
     caller: Option<&str>,
+    now: &str,
 ) -> Result<()> {
     let tier_str = tier.map(|t| t.as_str().to_string());
     let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2924,7 +2933,39 @@ fn purge_forget_derived_leaks(
             refs.as_slice(),
         )?;
     }
+
+    // v0.8.1 W2.3 — record a FORGET tombstone per victim id (same tx, before
+    // the DELETE so `memories` still resolves). `now` binds at the next free
+    // positional index after the victim-subquery params. `INSERT OR IGNORE`
+    // keeps it idempotent under re-run.
+    let now_idx = bound.len() + 1;
+    let mut tomb_refs = refs.clone();
+    tomb_refs.push(&now);
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO forget_tombstones \
+                 (memory_id, namespace, forgotten_at, agent_id) \
+             SELECT id, namespace, ?{now_idx}, json_extract(metadata,'$.agent_id') \
+             FROM memories WHERE id IN ({victims})"
+        ),
+        tomb_refs.as_slice(),
+    )?;
     Ok(())
+}
+
+/// v0.8.1 W2.3 (#1821 / gap G30) — has `memory_id` been forgotten (a
+/// `forget_tombstones` row exists)? The federation RECEIVE funnel consults
+/// this BEFORE accepting an inbound write so a peer that still holds a
+/// forgotten row cannot resurrect it via LWW. Tombstone-WINS: once an id is
+/// tombstoned the inbound write is dropped unconditionally (a legitimate
+/// re-create mints a NEW uuid, unaffected).
+pub fn memory_is_tombstoned(conn: &Connection, memory_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = ?1)",
+        params![memory_id],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
 }
 
 /// Forget by pattern — delete memories matching namespace + FTS pattern + tier.
@@ -3089,8 +3130,16 @@ pub fn forget(
         //  - `transcript_line_dedup` carries a content sha256 + `memory_id`
         //    (no FK / no cascade) → a confirm-by-hash oracle for forgotten
         //    content.
-        // (5-agent vote 4d3ea1c5 — erasure-completeness finding.)
-        purge_forget_derived_leaks(conn, namespace, pattern, tier, None)?;
+        // (5-agent vote 4d3ea1c5 — erasure-completeness finding.) Also records
+        // the W2.3 FORGET tombstone for each victim id in this same tx.
+        purge_and_tombstone_forget(
+            conn,
+            namespace,
+            pattern,
+            tier,
+            None,
+            &Utc::now().to_rfc3339(),
+        )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
@@ -3497,7 +3546,14 @@ pub fn forget_for_caller(
         // leaks for the SAME owner-scoped victim set (the `caller` arg adds
         // the #1772 owner clause so this never touches another caller's DLQ /
         // dedup rows), in-tx, before the DELETE.
-        purge_forget_derived_leaks(conn, namespace, pattern, tier, Some(caller))?;
+        purge_and_tombstone_forget(
+            conn,
+            namespace,
+            pattern,
+            tier,
+            Some(caller),
+            &Utc::now().to_rfc3339(),
+        )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
@@ -8903,6 +8959,19 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // a local rule by routing through a peer would otherwise slip
     // past the gate. The hook fires on every newer-wins merge attempt.
     consult_governance_pre_write(mem)?;
+
+    // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
+    // FORGET tombstone, a peer that still holds the row is trying to revive it
+    // via LWW; DROP the inbound write (tombstone-wins) so the erasure holds.
+    // Idempotent no-op return (the row stays forgotten); logged for audit.
+    if memory_is_tombstoned(conn, &mem.id)? {
+        tracing::info!(
+            target: "forget.tombstone",
+            memory_id = %mem.id,
+            "rejected inbound federation write for a forgotten id (resurrection guard)"
+        );
+        return Ok(mem.id.clone());
+    }
 
     // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the federation
     // RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused inbound row
