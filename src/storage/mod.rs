@@ -2864,6 +2864,69 @@ pub fn forget_count(
     Ok(usize::try_from(count).unwrap_or(0))
 }
 
+/// v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
+/// leaks (`federation_push_dlq` cleartext payload, `transcript_line_dedup`
+/// content-hash oracle) for the rows a forget is about to delete. MUST run
+/// inside the forget tx BEFORE the `DELETE FROM memories` so the victim-id
+/// subquery still resolves. The subquery + bound params mirror the
+/// [`forget`] / [`forget_for_caller`] DELETE filter EXACTLY (including the
+/// #1772 owner clause when `caller` is `Some`) so the purge scopes to the
+/// same victim set — never over-purging another caller's pending replication.
+/// (5-agent vote 4d3ea1c5 — erasure-completeness finding.)
+fn purge_forget_derived_leaks(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: Option<&str>,
+) -> Result<()> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let victims = if let Some(pat) = pattern {
+        bound.push(Box::new(forget_fts_query(pat)));
+        bound.push(Box::new(namespace.map(str::to_string)));
+        bound.push(Box::new(tier_str));
+        let mut q = String::from(
+            "SELECT m.id FROM memories_fts fts JOIN memories m ON m.rowid = fts.rowid \
+             WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.namespace = ?2) \
+             AND (?3 IS NULL OR m.tier = ?3)",
+        );
+        if let Some(c) = caller {
+            bound.push(Box::new(c.to_string()));
+            q.push_str(
+                " AND (json_extract(m.metadata,'$.agent_id') = ?4 \
+                 OR json_extract(m.metadata,'$.agent_id') IS NULL \
+                 OR json_extract(m.metadata,'$.agent_id') = '')",
+            );
+        }
+        q
+    } else {
+        bound.push(Box::new(namespace.map(str::to_string)));
+        bound.push(Box::new(tier_str));
+        let mut q = String::from(
+            "SELECT id FROM memories WHERE (?1 IS NULL OR namespace = ?1) \
+             AND (?2 IS NULL OR tier = ?2)",
+        );
+        if let Some(c) = caller {
+            bound.push(Box::new(c.to_string()));
+            q.push_str(
+                " AND (json_extract(metadata,'$.agent_id') = ?3 \
+                 OR json_extract(metadata,'$.agent_id') IS NULL \
+                 OR json_extract(metadata,'$.agent_id') = '')",
+            );
+        }
+        q
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(AsRef::as_ref).collect();
+    for table in ["federation_push_dlq", "transcript_line_dedup"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE memory_id IN ({victims})"),
+            refs.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Forget by pattern — delete memories matching namespace + FTS pattern + tier.
 /// If `archive` is true, archives memories before deletion.
 pub fn forget(
@@ -3013,6 +3076,21 @@ pub fn forget(
                 )?;
             }
         }
+
+        // v0.8.1 W2.1 (#1821 / gap G30) — purge the derived-store leaks the
+        // cascade DELETE does NOT reach, in the SAME tx and BEFORE the row is
+        // deleted (so the match subquery still resolves). These survive forget
+        // regardless of `archive` because they are pure leaks, not a
+        // recoverable copy:
+        //  - `federation_push_dlq.payload_json` holds the full cleartext body
+        //    keyed by a deliberately NON-FK `memory_id`
+        //    (migrations/sqlite/0041_v07_federation_push_dlq.sql) → never
+        //    cascaded, so a forgotten secret lingers in the DLQ.
+        //  - `transcript_line_dedup` carries a content sha256 + `memory_id`
+        //    (no FK / no cascade) → a confirm-by-hash oracle for forgotten
+        //    content.
+        // (5-agent vote 4d3ea1c5 — erasure-completeness finding.)
+        purge_forget_derived_leaks(conn, namespace, pattern, tier, None)?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
@@ -3414,6 +3492,12 @@ pub fn forget_for_caller(
                 )?;
             }
         }
+
+        // v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
+        // leaks for the SAME owner-scoped victim set (the `caller` arg adds
+        // the #1772 owner clause so this never touches another caller's DLQ /
+        // dedup rows), in-tx, before the DELETE.
+        purge_forget_derived_leaks(conn, namespace, pattern, tier, Some(caller))?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
