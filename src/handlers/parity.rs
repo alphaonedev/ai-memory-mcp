@@ -3,7 +3,7 @@
 
 //! HTTP parity helpers shared across handler modules.
 //!
-//! `fanout_or_503` — fan out a locally-committed memory to peers via
+//! `fanout_or_pending` — fan out a locally-committed memory to peers via
 //! quorum store. Used by `create_memory`, `update_memory`, and the bulk
 //! endpoints in `handlers::http`.
 //!
@@ -11,18 +11,15 @@
 //! `agent_id` resolution (body → query → header → anonymous fallback).
 //! Used by every HTTP handler that needs an identified caller.
 //!
-//! `quorum_not_met_response` — issue #869: build the canonical 503 +
-//! `Retry-After: 2` response from a `QuorumNotMetPayload`. Collapses
-//! the ~30 inline `Json(serde_json::to_value(&payload).unwrap_or_default())`
-//! sites scattered across the per-domain handler modules into a single
-//! typed helper so a future encoder regression cannot silently degrade
-//! the 503 envelope to `null`. `QuorumNotMetPayload` is a flat struct
-//! with `&'static str` + `usize` + `usize` + `String` fields, so
-//! serialisation is mathematically infallible at runtime; the helper
-//! still routes through [`super::to_value_or_500`] so that if a future
-//! payload-shape change introduces a fallible serialise path the
-//! handlers fail-closed with a typed 500 instead of `null` (the prior
-//! `unwrap_or_default` would have produced `serde_json::Value::Null`).
+//! `under_replicated_response` — v0.8.1 W3 / gap G12: the durable-but-
+//! under-replicated write response. On a W-of-N quorum miss the local
+//! row is already durably committed (ADR-0001, never rolled back), so
+//! this returns **`202 Accepted`** carrying the replication state in the
+//! body (`{quorum_met:false, acks, needed, reason, durability:"local"}`)
+//! rather than the pre-v0.8.1 `503 Service Unavailable` that misreported
+//! a locally-durable write as a service failure (issue #869 introduced
+//! the shared 503 helper; W3 corrects its status semantics). Collapses
+//! the ~30 inline payload sites into one typed helper.
 //!
 //! All three helpers were extracted from `src/handlers/mod.rs` as part
 //! of the issue #650 file-architecture cleanup.
@@ -39,30 +36,56 @@ use crate::federation::QuorumNotMetPayload;
 use crate::models::Memory;
 use crate::validate;
 
-/// Build the canonical `503 Service Unavailable` + `Retry-After: 2`
-/// response from a `QuorumNotMetPayload`. Issue #869.
+/// Build the canonical under-replication response for a write whose
+/// LOCAL commit already succeeded but did not reach W-of-N quorum.
 ///
-/// Wire-compatibility: emits the same `{error, got, needed, reason}`
-/// shape that the inline call sites previously produced. The status,
-/// header, and body are unchanged from the pre-#869 inline pattern.
-pub(crate) fn quorum_not_met_response(payload: &QuorumNotMetPayload) -> axum::response::Response {
-    let body = super::to_value_or_500("quorum_not_met_response", payload);
-    match body {
-        Ok(v) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [("Retry-After", "2")],
-            Json(v),
-        )
-            .into_response(),
-        Err(resp) => resp,
-    }
+/// # v0.8.1 W3 / gap G12 — durability is NOT a 503 (5-agent vote 4d3ea1c5)
+///
+/// Pre-v0.8.1 this returned `503 Service Unavailable` + `Retry-After: 2`.
+/// That was an API-semantics bug: per ADR-0001 the local row is durably
+/// committed and never rolled back before the quorum fanout runs (every
+/// call site of this helper is post-local-commit — verified by the W3
+/// per-site audit), so a 503 misreported a **locally-durable write** as a
+/// service failure. The fix decouples the HTTP status from the
+/// replication outcome:
+///
+/// * the local write committed → **never 5xx**; this helper now returns
+///   **`202 Accepted`** carrying the replication state in the body
+///   (`quorum_met:false`, `acks`, `needed`, `reason`, `durability:"local"`).
+/// * a genuine LOCAL write failure is reported by the caller BEFORE this
+///   helper is reached (the local-commit error path), so it still surfaces
+///   as the appropriate error status — this helper is only the
+///   durable-but-under-replicated case.
+///
+/// The under-replicated write is enqueued to the federation push-DLQ and
+/// driven to convergence by the sync daemon; the named operator alarm is
+/// the `ai_memory_federation_push_dlq_depth` gauge + the #1544 edge WARN.
+/// The explicit unreached-peer identity list is a tracked follow-up (the
+/// `AckTracker` carries acks, not the full configured peer set); `acks` +
+/// `needed` convey the replication gap honestly today.
+///
+/// The `quorum_met:false` marker is REQUIRED (never a bare success body):
+/// for an authority-granting coordination write (an action claim) a caller
+/// must never infer cluster-confirmed exclusivity from a 2xx alone
+/// (split-brain guard — W3 coordination-semantics finding).
+pub(crate) fn under_replicated_response(payload: &QuorumNotMetPayload) -> axum::response::Response {
+    let body = json!({
+        "quorum_met": false,
+        "acks": payload.got,
+        "needed": payload.needed,
+        "reason": payload.reason,
+        "durability": "local",
+    });
+    (StatusCode::ACCEPTED, Json(body)).into_response()
 }
 
-/// Fan out a locally-committed memory to peers via quorum store. On success,
-/// returns `None`; on quorum miss, returns `Some(503_response)` for the
-/// caller to short-circuit with. Network errors are logged and swallowed —
+/// Fan out a locally-committed memory to peers via quorum store. On full
+/// quorum, returns `None` (caller returns its normal 2xx success). On a
+/// quorum MISS, returns `Some(202_response)` carrying the replication
+/// state — the local commit already landed (W3/G12: a durable write is
+/// never reported as a 5xx). Network errors are logged and swallowed —
 /// the local commit already landed and the sync-daemon catches stragglers.
-pub(crate) async fn fanout_or_503(
+pub(crate) async fn fanout_or_pending(
     app: &AppState,
     mem: &Memory,
 ) -> Option<axum::response::Response> {
@@ -71,11 +94,10 @@ pub(crate) async fn fanout_or_503(
         Ok(tracker) => match crate::federation::finalise_quorum(&tracker) {
             Ok(_) => None,
             Err(err) => {
-                // #869 — route through the shared helper so a future
-                // serialise regression cannot mask the quorum failure
-                // with a `Value::Null` body paired with a 503.
+                // W3/G12 — the local row is durable; surface replication
+                // state as 202 + body, never a 5xx.
                 let payload = QuorumNotMetPayload::from_err(&err);
-                Some(quorum_not_met_response(&payload))
+                Some(under_replicated_response(&payload))
             }
         },
         Err(e) => {

@@ -176,12 +176,12 @@ pub async fn transition_action(
                 }
                 Err(err) => {
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::quorum_not_met_response(&payload);
+                    return super::under_replicated_response(&payload);
                 }
             },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
         }
     }
@@ -350,12 +350,12 @@ pub async fn send_signal(
                 }
                 Err(err) => {
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::quorum_not_met_response(&payload);
+                    return super::under_replicated_response(&payload);
                 }
             },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
         }
     }

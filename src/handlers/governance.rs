@@ -25,7 +25,7 @@ use crate::validate;
 use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
-use super::fanout_or_503;
+use super::fanout_or_pending;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 
@@ -333,12 +333,12 @@ pub async fn approve_pending(
                                 // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::quorum_not_met_response(&payload);
+                                return super::under_replicated_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                     // If approval produced a brand-new memory (store
@@ -346,7 +346,7 @@ pub async fn approve_pending(
                     // delete / promote paths produce no new memory
                     // (the pending payload carries memory_id).
                     if let Some(ref mem) = produced_mem
-                        && let Some(resp) = fanout_or_503(&app, mem).await
+                        && let Some(resp) = fanout_or_pending(&app, mem).await
                     {
                         return resp;
                     }
@@ -506,12 +506,12 @@ pub async fn reject_pending(
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                             // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::quorum_not_met_response(&payload);
+                        return super::under_replicated_response(&payload);
                     }
                 }
             }

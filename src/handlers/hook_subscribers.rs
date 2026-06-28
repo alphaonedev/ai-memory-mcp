@@ -24,7 +24,7 @@ use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
 use super::{AppState, Db};
-use super::{fanout_or_503, list_namespaces, resolve_caller_agent_id};
+use super::{fanout_or_pending, list_namespaces, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
 const NAMESPACE_STANDARD_TAG: &str = "_namespace_standard";
@@ -764,7 +764,7 @@ async fn set_namespace_standard_inner(
     match result {
         Ok(v) => {
             if let Some(ref mem) = standard_mem
-                && let Some(resp) = fanout_or_503(app, mem).await
+                && let Some(resp) = fanout_or_pending(app, mem).await
             {
                 return resp;
             }
@@ -774,12 +774,12 @@ async fn set_namespace_standard_inner(
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                             // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::quorum_not_met_response(&payload);
+                        return super::under_replicated_response(&payload);
                     }
                 }
             }
@@ -1096,12 +1096,12 @@ async fn clear_namespace_standard_inner(
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                             // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::quorum_not_met_response(&payload);
+                        return super::under_replicated_response(&payload);
                     }
                 }
             }
