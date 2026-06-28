@@ -144,7 +144,7 @@ Depth cap fail-closed (`src/storage/reflect.rs:413`); `epoch_freeze`/`stopper` =
 - ❌ "end-to-end encrypted" / "client-side mandatory sealing" — G14
 - ❌ "signed lineage / succession / threshold-key recovery" — G13/G17
 - ❌ "TRACT-/L1-conformant" / "implements the Claim algebra" — G24 (keystone) + G22
-- ❌ "secrets-screened" / "no credentials in memory" / "credential-safe" — G29
+- ⚠️ G29 (v0.8.1 W1, commit `742b5f39`) — **PARTIALLY EARNED.** "best-effort credential screening on write + egress (entropy + key-pattern, default-refuse, both backends)" is now earned and may be claimed *with that qualification*. The absolute forms ❌ **"no credentials in memory" / "credential-safe"** stay BANNED regardless — a heuristic pattern/entropy screen cannot make a universally-quantified negative true (a novel vendor token, a prose passphrase, or a pre-existing row predating the screen can still pass), so unqualified credential-freedom is never earned.
 - ❌ "namespace-isolated" / "namespace is a trust boundary" / "cross-namespace isolation" — G10.4
 - ❌ "complete erasure" / "no data remanence" / "fully forgotten" / "right-to-be-forgotten compliant" — G30 *(forget deletes a row; it does not erase content)*
 - ❌ "export-screened" / "biometric-safe export" / "forbidden-class filtered export" — G28
