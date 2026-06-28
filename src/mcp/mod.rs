@@ -1677,7 +1677,7 @@ fn dispatch_memory_pending_reject(ctx: &ToolDispatchCtx<'_>) -> Result<Value, St
 }
 
 fn dispatch_memory_forget(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
-    handle_forget(ctx.conn, ctx.arguments, ctx.archive_on_gc)
+    handle_forget(ctx.conn, ctx.arguments, ctx.archive_on_gc, ctx.vector_index)
 }
 
 fn dispatch_memory_stats(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
