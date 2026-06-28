@@ -10045,15 +10045,15 @@ async fn http_capabilities_version_matches_pkg_version() {
     assert_eq!(v["tier"], "keyword");
 }
 // ====================================================================
-// W8/H8d — dual-form `*_qs` namespace handlers + `fanout_or_503` matrix
+// W8/H8d — dual-form `*_qs` namespace handlers + `fanout_or_pending` matrix
 // --------------------------------------------------------------------
 // `set/get/clear_namespace_standard_qs` are the query-string twins of
 // the path-form handlers used by S34/S35 (`/api/v1/namespaces?namespace=…`).
 // The QS-form arms were uncovered prior to this batch — both the
 // happy paths and the 400-on-missing-namespace branches needed direct
-// exercise. The `fanout_or_503` 503 paths are exercised through the
+// exercise. The `fanout_or_pending` 503 paths are exercised through the
 // QS-form `set` handler (`set_namespace_standard_inner` calls
-// `fanout_or_503` for the standard memory and then
+// `fanout_or_pending` for the standard memory and then
 // `broadcast_namespace_meta_quorum` for the meta row); the same
 // mock-peer helper used by the W3 federation tests drives both.
 // ====================================================================
@@ -10622,10 +10622,10 @@ async fn http_clear_namespace_standard_qs_missing_namespace_returns_400() {
     );
 }
 
-// --- fanout_or_503 / quorum_not_met error matrix --------------------
+// --- fanout_or_pending / quorum_not_met error matrix --------------------
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_when_all_peers_down() {
+async fn http_set_qs_fanout_202_when_all_peers_down() {
     // Single peer, W=2 (local + 1 peer required). Peer 500s on every
     // POST → cannot meet quorum → 503 `quorum_not_met` payload.
     let state = test_state();
@@ -10647,11 +10647,11 @@ async fn http_set_qs_fanout_503_when_all_peers_down() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
+async fn http_set_qs_fanout_202_payload_shape_includes_quorum_fields() {
     // The 503 body must round-trip through `QuorumNotMetPayload` and
     // surface `error="quorum_not_met"`, `got`, `needed`, `reason`.
     // Single peer down @ W=2 → got=1 (local), needed=2, reason names
@@ -10675,13 +10675,13 @@ async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"], "quorum_not_met");
-    assert!(v["got"].as_u64().is_some(), "got must be a number");
+    assert_eq!(v["quorum_met"], false);
+    assert!(v["acks"].as_u64().is_some(), "got must be a number");
     assert!(v["needed"].as_u64().is_some(), "needed must be a number");
     assert!(v["reason"].is_string(), "reason must be a string");
     // Local always commits → got >= 1; needed must equal W=2.
@@ -10689,9 +10689,11 @@ async fn http_set_qs_fanout_503_payload_shape_includes_quorum_fields() {
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_includes_retry_after_header() {
-    // The 503 path returns a `Retry-After: 2` header so clients can
-    // back off without parsing the body.
+async fn http_set_qs_fanout_202_no_retry_after_header_w3() {
+    // W3/G12: a durable-but-under-replicated write is 202 Accepted with
+    // the replication state in the BODY — NOT a 503 with a Retry-After
+    // header (the sync daemon + push-DLQ drive convergence, so the client
+    // does not retry). Pins that the legacy Retry-After: 2 header is gone.
     let state = test_state();
     let (peer_url, _count) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
     let app_state = h8d_app_state_with_fed(state, vec![peer_url], 2, 1500);
@@ -10705,26 +10707,33 @@ async fn http_set_qs_fanout_503_includes_retry_after_header() {
                 .method("POST")
                 .header(crate::HEADER_CONTENT_TYPE, crate::MIME_JSON)
                 .body(Body::from(
-                    serde_json::to_vec(&json!({"namespace": "qs-503-retry-after"})).unwrap(),
+                    serde_json::to_vec(&json!({"namespace": "qs-202-no-retry-after"})).unwrap(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let retry = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert_eq!(retry, "2", "503 must include Retry-After: 2");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(
+        resp.headers().get("retry-after").is_none(),
+        "W3: a durable 202 must NOT carry the legacy Retry-After header"
+    );
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["quorum_met"], false, "body must report replication state");
+    assert_eq!(
+        v["durability"], "local",
+        "body must affirm local durability"
+    );
 }
 
 #[tokio::test]
 async fn http_set_qs_fanout_quorum_met_with_one_peer_down() {
     // N=3, W=2 (majority). One peer 500s, one peer acks → quorum
     // met → 201 CREATED. Exercises the quorum-not-all-fail success
-    // branch of `fanout_or_503` (`Ok(_) => None`).
+    // branch of `fanout_or_pending` (`Ok(_) => None`).
     let state = test_state();
     let (peer_up, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Ack).await;
     let (peer_down, _) = h8d_spawn_mock_peer(H8dPeerBehaviour::Fail500).await;
@@ -10771,14 +10780,14 @@ async fn http_set_qs_fanout_quorum_not_met_strict_n_equals_w() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["needed"].as_u64().unwrap(), 2);
     // got must be < needed in the failure case.
-    assert!(v["got"].as_u64().unwrap() < v["needed"].as_u64().unwrap());
+    assert!(v["acks"].as_u64().unwrap() < v["needed"].as_u64().unwrap());
 }
 
 #[tokio::test]
@@ -10808,7 +10817,7 @@ async fn http_set_qs_fanout_quorum_w_equals_one_any_success_writes_succeed() {
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
+async fn http_set_qs_fanout_202_when_peer_hangs_past_deadline() {
     // Hanging peer + tight deadline → quorum_not_met with reason
     // "timeout" or "unreachable" (depending on whether the request
     // returned an error before the deadline). Either way → 503.
@@ -10831,7 +10840,7 @@ async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
@@ -10844,7 +10853,7 @@ async fn http_set_qs_fanout_503_when_peer_hangs_past_deadline() {
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_when_peer_returns_503() {
+async fn http_set_qs_fanout_202_when_peer_returns_503() {
     // A peer that itself replies 503 (overloaded) is still a
     // failed ack. The leader's 503 response carries the federation
     // payload, not the peer's. (Smoke-tests that 5xx-class peers
@@ -10868,16 +10877,16 @@ async fn http_set_qs_fanout_503_when_peer_returns_503() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"], "quorum_not_met");
+    assert_eq!(v["quorum_met"], false);
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_when_peer_returns_4xx() {
+async fn http_set_qs_fanout_202_when_peer_returns_4xx() {
     // 4xx from a peer also counts as a failed ack — the federation
     // ack tracker requires a 200 to count toward quorum. (Closes the
     // "200 + 4xx from peers" matrix row.)
@@ -10900,11 +10909,11 @@ async fn http_set_qs_fanout_503_when_peer_returns_4xx() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]
-async fn http_set_qs_fanout_503_partition_minority_fails() {
+async fn http_set_qs_fanout_202_partition_minority_fails() {
     // N=4 (local + 3 peers), W=3 (majority). Two peers down, one
     // up → can't meet quorum (got = 2, needed = 3) → 503.
     let state = test_state();
@@ -10928,13 +10937,13 @@ async fn http_set_qs_fanout_503_partition_minority_fails() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["needed"].as_u64().unwrap(), 3);
-    assert!(v["got"].as_u64().unwrap() < 3);
+    assert!(v["acks"].as_u64().unwrap() < 3);
 }
 
 #[tokio::test]
@@ -10967,9 +10976,9 @@ async fn http_set_qs_fanout_majority_tolerates_minority_partition() {
 }
 
 #[tokio::test]
-async fn http_clear_qs_fanout_503_when_peer_down() {
+async fn http_clear_qs_fanout_202_when_peer_down() {
     // The CLEAR path uses `broadcast_namespace_meta_clear_quorum`,
-    // a different fanout function from `fanout_or_503`. Both share
+    // a different fanout function from `fanout_or_pending`. Both share
     // the QuorumNotMetPayload contract and Retry-After=2 header.
     // This test exercises the clear-side 503 lane.
     let state = test_state();
@@ -11011,24 +11020,23 @@ async fn http_clear_qs_fanout_503_when_peer_down() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let retry = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert_eq!(retry, "2", "clear 503 must include Retry-After: 2");
+    // W3/G12: the local clear is durable → 202 + replication body, never 503.
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(
+        resp.headers().get("retry-after").is_none(),
+        "W3: durable 202 carries no Retry-After header"
+    );
     let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"], "quorum_not_met");
+    assert_eq!(v["quorum_met"], false);
 }
 
 #[tokio::test]
 async fn http_set_qs_fanout_no_federation_returns_201_without_peers() {
     // No `--quorum-peers` configured → `app.federation` is None →
-    // `fanout_or_503` short-circuits to None and the handler returns
+    // `fanout_or_pending` short-circuits to None and the handler returns
     // 201 without any peer involvement. Pins the no-fed branch.
     let state = test_state();
     let app = Router::new()
@@ -11076,7 +11084,7 @@ async fn http_set_qs_fanout_peer_called_at_least_once_on_quorum_failure() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     // Wait briefly for any retry to settle so the count is stable.
     for _ in 0..50 {
         if count.load(Ordering::Relaxed) >= 1 {
@@ -11118,7 +11126,7 @@ async fn http_set_qs_fanout_peer_receives_post_on_happy_path() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     // The set path triggers TWO fanout POSTs to each peer: one for
-    // the standard memory (`fanout_or_503`) and one for the
+    // the standard memory (`fanout_or_pending`) and one for the
     // namespace_meta row (`broadcast_namespace_meta_quorum`). Wait
     // for at least one to land — the second may be background-detached.
     for _ in 0..50 {
@@ -14820,17 +14828,18 @@ async fn to_value_or_500_returns_500_on_encode_failure() {
 }
 
 // ---------------------------------------------------------------------------
-// #869 (2026-05-18) — `quorum_not_met_response` regression tests. Pins
+// #869 (2026-05-18) — `under_replicated_response` regression tests. Pins
 // the helper that collapsed the ~30 inline 503 + `Retry-After: 2` +
 // `Json(serde_json::to_value(&payload).unwrap_or_default())` sites
 // across the per-domain handler modules into a single typed call.
 // ---------------------------------------------------------------------------
 
-/// Pins the wire shape: status, header, body. Wire compatibility with
-/// the pre-#869 inline pattern is the load-bearing invariant — peers
-/// that switch on `error == "quorum_not_met"` must keep working.
+/// W3/G12 — pins the under-replicated wire shape: a durable-but-under-
+/// replicated write is `202 Accepted` (NOT the pre-v0.8.1 `503` +
+/// `Retry-After: 2`) with the replication state in the body
+/// (`quorum_met:false`, `acks`, `needed`, `reason`, `durability:"local"`).
 #[tokio::test]
-async fn quorum_not_met_response_wire_compat() {
+async fn under_replicated_response_wire_compat() {
     use crate::federation::QuorumNotMetPayload;
     use crate::replication::{QuorumError, QuorumFailureReason};
 
@@ -14840,35 +14849,33 @@ async fn quorum_not_met_response_wire_compat() {
         reason: QuorumFailureReason::Unreachable,
     };
     let payload = QuorumNotMetPayload::from_err(&err);
-    let resp = super::quorum_not_met_response(&payload);
+    let resp = super::under_replicated_response(&payload);
 
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "503 status preserved"
+        StatusCode::ACCEPTED,
+        "W3: durable-but-under-replicated write is 202, never 5xx"
     );
-    assert_eq!(
-        resp.headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok()),
-        Some("2"),
-        "Retry-After header preserved"
+    assert!(
+        resp.headers().get("Retry-After").is_none(),
+        "W3: the legacy Retry-After header is removed (convergence is server-driven)"
     );
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"], "quorum_not_met");
-    assert_eq!(v["got"], 1);
+    assert_eq!(v["quorum_met"], false);
+    assert_eq!(v["acks"], 1);
     assert_eq!(v["needed"], 2);
     assert_eq!(v["reason"], "unreachable");
+    assert_eq!(v["durability"], "local");
 }
 
 /// Pins the timeout-reason branch — the `InFlight` enum variant maps
 /// to `"timeout"` per the `from_err` docstring so the wire never leaks
 /// a fourth internal state to operators.
 #[tokio::test]
-async fn quorum_not_met_response_timeout_branch() {
+async fn under_replicated_response_timeout_branch() {
     use crate::federation::QuorumNotMetPayload;
     use crate::replication::{QuorumError, QuorumFailureReason};
 
@@ -14878,19 +14885,16 @@ async fn quorum_not_met_response_timeout_branch() {
         reason: QuorumFailureReason::Timeout,
     };
     let payload = QuorumNotMetPayload::from_err(&err);
-    let resp = super::quorum_not_met_response(&payload);
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let resp = super::under_replicated_response(&payload);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let bytes = axum::body::to_bytes(resp.into_body(), crate::TEST_BODY_READ_CAP)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["reason"], "timeout");
-    assert_eq!(v["got"], 0);
+    assert_eq!(v["acks"], 0);
     assert_eq!(v["needed"], 3);
-    // Pre-#869 a silent encode failure would have surfaced
-    // `Value::Null` as the body — the 503 envelope would have looked
-    // indistinguishable from a malformed response. This assertion
-    // mechanically pins that the body is a real object.
+    // The body must be a real typed object, never `Value::Null`.
     assert!(
         v.is_object(),
         "response body must be a typed object, got {v}"

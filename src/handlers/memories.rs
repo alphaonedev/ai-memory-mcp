@@ -565,7 +565,7 @@ pub async fn update_memory(
             {
                 // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
             Json(json!(mem)).into_response()
         }
@@ -876,12 +876,12 @@ pub async fn delete_memory(
                                 // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::quorum_not_met_response(&payload);
+                                return super::under_replicated_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                 }
@@ -969,7 +969,7 @@ pub async fn delete_memory(
             {
                 // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
             Json(json!({"deleted": true})).into_response()
         }
@@ -1166,13 +1166,13 @@ pub async fn promote_memory(
                                     // #869 — typed 503 envelope via the shared helper.
                                     let payload =
                                         crate::federation::QuorumNotMetPayload::from_err(&err);
-                                    return super::quorum_not_met_response(&payload);
+                                    return super::under_replicated_response(&payload);
                                 }
                             }
                             Err(err) => {
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::quorum_not_met_response(&payload);
+                                return super::under_replicated_response(&payload);
                             }
                         }
                     }
@@ -1311,12 +1311,12 @@ pub async fn promote_memory(
                                 // #869 — typed 503 envelope via the shared helper.
                                 let payload =
                                     crate::federation::QuorumNotMetPayload::from_err(&err);
-                                return super::quorum_not_met_response(&payload);
+                                return super::under_replicated_response(&payload);
                             }
                         }
                         Err(err) => {
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                 }
@@ -1403,7 +1403,7 @@ pub async fn promote_memory(
             {
                 // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
             Json(json!({"promoted": true, "id": resolved_id, "tier": Tier::Long.as_str()}))
                 .into_response()

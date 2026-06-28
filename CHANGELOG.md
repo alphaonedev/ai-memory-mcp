@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — Patch 1 — pre-v0.9.0 defect closure ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
+
+In progress on `release/v0.8.1`. A defect-closure patch that makes shipped
+v0.8.0 correct on its own current claims before any v0.9.0 feature work. No
+new v0.9.0 capability. Work items W1–W7 per
+`docs/v0.8.1/V0.8.1-PATCH-1-WORK-PROMPT.md`.
+
+### Breaking / API-semantics changes
+
+- **W3 / gap G12 — a durable-but-under-replicated write is now `202 Accepted`,
+  not `503`.** On a W-of-N quorum miss the local row is durably committed
+  (per `ADR-0001`, never rolled back), so the prior `503 quorum_not_met` +
+  `Retry-After: 2` misreported a locally-durable write as a service failure.
+  HTTP writes now return **`202 Accepted`** with the replication state in the
+  body (`{quorum_met:false, acks, needed, reason, durability:"local"}`); a
+  genuine *local* write failure still returns an error status. The shared
+  `quorum_not_met_response`/`fanout_or_503` helpers are renamed
+  `under_replicated_response`/`fanout_or_pending`. Docs updated
+  (`API_REFERENCE.md`, `ADR-0001`). 5-agent crossroads vote (`4d3ea1c5`).
+
+### Fixed / verified
+
+- **W4 / #1685 — MCP wire-action egress governance gate pinned.**
+  `run_mcp_server` already installs `GOVERNANCE_PRE_ACTION` (closed in v0.8.0);
+  added `tests/mcp_governance_pre_action_1685.rs` (fresh-`ai-memory mcp`
+  subprocess probe) pinning that the `skill_export` egress is refused on the
+  MCP surface under a `filesystem_write` rule. #1685 closed with evidence.
+- **W5 / #1693 — postgres L2 transcript rehydration parity pinned.**
+  `PostgresStore` already overrides `recover_turn_idempotent` and the L2 CLI
+  routes `--store-url postgres://` through the SAL path (closed in v0.8.0);
+  added `tests/postgres_l2_rehydration_1693.rs` proving sqlite↔postgres
+  identical idempotent rehydration against a live instance. #1693 closed with
+  evidence.
+
+### Tracking
+
+- **W7 — the 18 UNTRACKED `§26` canonical gaps now have GitHub issues**
+  ([#1822](https://github.com/alphaonedev/ai-memory-mcp/issues/1822)–[#1839](https://github.com/alphaonedev/ai-memory-mcp/issues/1839)):
+  P1 → milestone `v0.9`, P2 → milestone `v1.0`, all labelled `tract-gap` and
+  cross-linked under #1821, so the v0.9.0 epic starts on a clean tracker.
+
+> Remaining in this patch: W1 (G29 secret write-path screen), W2 (G30 erasure
+> fanout / data remanence), W6 (subprocess-chain visibility, vote-gated).
+
 ## [0.8.0] — 2026-06-25 — `distributed-coordination` (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
 In progress on `release/v0.8.0`. Schema advances v57 → **v67** (additive: actions /
