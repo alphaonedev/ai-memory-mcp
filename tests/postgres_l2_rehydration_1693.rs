@@ -129,12 +129,16 @@ async fn l2_rehydration_identical_on_sqlite_and_postgres_1693() {
     let admin = CallerContext::for_admin("operator:test-1693");
 
     // ── First run on BOTH backends: one memory per turn ──────────────
-    let sq1 = recover_from_transcript_store(&sqlite, &opts_for(transcript.clone(), &namespace, &agent_id))
-        .await
-        .expect("sqlite recover");
-    let pg1 = recover_from_transcript_store(&pg, &opts_for(transcript.clone(), &namespace, &agent_id))
-        .await
-        .expect("postgres recover");
+    let sq1 = recover_from_transcript_store(
+        &sqlite,
+        &opts_for(transcript.clone(), &namespace, &agent_id),
+    )
+    .await
+    .expect("sqlite recover");
+    let pg1 =
+        recover_from_transcript_store(&pg, &opts_for(transcript.clone(), &namespace, &agent_id))
+            .await
+            .expect("postgres recover");
 
     assert_eq!(
         sq1.memories_created.len(),
@@ -162,9 +166,12 @@ async fn l2_rehydration_identical_on_sqlite_and_postgres_1693() {
     );
 
     // ── Idempotent re-run on BOTH: every line dedup-skipped ──────────
-    let sq2 = recover_from_transcript_store(&sqlite, &opts_for(transcript.clone(), &namespace, &agent_id))
-        .await
-        .expect("sqlite recover re-run");
+    let sq2 = recover_from_transcript_store(
+        &sqlite,
+        &opts_for(transcript.clone(), &namespace, &agent_id),
+    )
+    .await
+    .expect("sqlite recover re-run");
     let pg2 = recover_from_transcript_store(&pg, &opts_for(transcript, &namespace, &agent_id))
         .await
         .expect("postgres recover re-run");
