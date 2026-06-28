@@ -12706,6 +12706,26 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
+        // with the sqlite insert_if_newer gate). DROP an inbound write for a
+        // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
+        // row via LWW.
+        let tombstoned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(&inbound.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
+        if tombstoned {
+            tracing::info!(
+                target: "forget.tombstone",
+                memory_id = %inbound.id,
+                "rejected inbound federation write for a forgotten id (resurrection guard)"
+            );
+            return Ok(inbound.id.clone());
+        }
+
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
         // federation RECEIVE funnel (parity with sqlite insert_if_newer).
         // ALWAYS redact, NEVER refuse — a rejected inbound row would diverge
@@ -13854,14 +13874,16 @@ impl MemoryStore for PostgresStore {
         // #1783 — RETURNING id so the deleted set is known for AGE
         // unprojection in THIS tx (the projection commits atomically with
         // the cascade delete; ghost edges never appear).
-        let deleted: Vec<(String,)> = sqlx::query_as(
+        // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
+        // can be recorded in THIS tx (the rows are gone after the DELETE).
+        let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "DELETE FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
                     OR title ILIKE $3
                     OR content ILIKE $3)
-             RETURNING id",
+             RETURNING id, namespace, metadata->>'agent_id'",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
@@ -13871,19 +13893,18 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("forget delete", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            for (id,) in &deleted {
+            for (id, _, _) in &deleted {
                 unproject_memory_from_age(&mut tx, id).await?;
             }
         }
 
-        // v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
-        // leaks for the deleted ids in THIS tx (postgres parity with the
-        // sqlite `db::forget` purge): `federation_push_dlq.payload_json` holds
-        // the full cleartext body keyed by a NON-FK `memory_id`, and
-        // `transcript_line_dedup` carries a content sha256 + `memory_id` with
-        // no FK/cascade — both survive the row DELETE. 5-agent vote 4d3ea1c5.
+        // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
+        // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
+        // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
+        // hash-oracle) AND record a FORGET tombstone per deleted id, all in
+        // THIS tx. 5-agent vote 4d3ea1c5.
         if !deleted.is_empty() {
-            let ids: Vec<String> = deleted.iter().map(|(id,)| id.clone()).collect();
+            let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
             sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id = ANY($1)")
                 .bind(&ids)
                 .execute(&mut *tx)
@@ -13894,6 +13915,24 @@ impl MemoryStore for PostgresStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("forget purge transcript_line_dedup", e))?;
+            // W2.3 tombstones — bulk insert via UNNEST. Identity + time +
+            // owner only (NO content). `signature` populated by the federation
+            // EMIT path; the local resurrection guard is existence-based.
+            let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
+            let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
+            let forgotten: Vec<String> = vec![chrono::Utc::now().to_rfc3339(); deleted.len()];
+            sqlx::query(
+                "INSERT INTO forget_tombstones (memory_id, namespace, forgotten_at, agent_id) \
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[]) \
+                 ON CONFLICT (memory_id) DO NOTHING",
+            )
+            .bind(&ids)
+            .bind(&namespaces)
+            .bind(&forgotten)
+            .bind(&agents)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("forget record tombstones", e))?;
         }
 
         tx.commit()
