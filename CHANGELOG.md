@@ -25,6 +25,27 @@ new v0.9.0 capability. Work items W1–W7 per
   `under_replicated_response`/`fanout_or_pending`. Docs updated
   (`API_REFERENCE.md`, `ADR-0001`). 5-agent crossroads vote (`4d3ea1c5`).
 
+### Security / data-privacy fixes
+
+- **W1 / gap G29 — credential write-path screen (fail-closed).** Caller-origin
+  writes (MCP `memory_store`, `POST /api/v1/memories`(+`/bulk`), CLI) are now
+  screened for embedded credentials (PEM keys, AWS/GitHub/OpenAI/xAI tokens,
+  JWTs, Bearer tokens — anchored patterns with a Shannon-entropy tiebreak so
+  benign UUID/hex-SHA/base64 pass). Default `AI_MEMORY_SECRET_SCREEN_MODE=refuse`
+  rejects them; `redact` masks; `off` disables. Federation-receive / recovery /
+  internal re-store paths degrade to `redact` (a refusal there would diverge
+  replicas). Same screen at forensic-bundle egress. Both backends. 5-agent vote
+  (`4d3ea1c5`).
+- **W2 / gap G30 — erasure fanout / data-remanence on forget.** A hard forget
+  (`archive=false`) now erases the derived-store leaks a plain DELETE missed —
+  the `federation_push_dlq` cleartext payload + the `transcript_line_dedup`
+  content-hash oracle (in-tx, both backends) + the in-RAM HNSW vector (HTTP +
+  MCP) — and records a **signed FORGET tombstone** (new schema **v71**
+  `forget_tombstones`, both backends) so a peer's LWW re-push of a forgotten
+  row is rejected, not resurrected. Cross-mesh tombstone propagation + owner
+  authz is the tracked v0.9 federated-erasure layer (#1823). 5-agent vote
+  (`4d3ea1c5`).
+
 ### Fixed / verified
 
 - **W4 / #1685 — MCP wire-action egress governance gate pinned.**
@@ -46,8 +67,8 @@ new v0.9.0 capability. Work items W1–W7 per
   P1 → milestone `v0.9`, P2 → milestone `v1.0`, all labelled `tract-gap` and
   cross-linked under #1821, so the v0.9.0 epic starts on a clean tracker.
 
-> Remaining in this patch: W1 (G29 secret write-path screen), W2 (G30 erasure
-> fanout / data remanence), W6 (subprocess-chain visibility, vote-gated).
+> Remaining in this patch: W6 (subprocess-chain visibility, vote-gated) + the
+> §5 operational/dogfood test pass.
 
 ## [0.8.0] — 2026-06-25 — `distributed-coordination` (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
