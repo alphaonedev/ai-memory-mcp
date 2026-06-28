@@ -676,7 +676,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `warn_if_archive_on_gc_disabled` one-shot boot-WARN helper (emitted at
     // serve + mcp boot when [storage].archive_on_gc = false) + its two
     // gate-branch unit tests (actual 11_301).
-    ("src/config.rs", 11_350),
+    // 2026-06-28 (#1821 / W1 / gap G29) — bumped 11_350 → 11_400: the
+    // `[security]` section (`SecurityConfig.secret_screen_mode`),
+    // `ENV_SECRET_SCREEN_MODE`, and `resolve_secret_screen_mode()` for the
+    // pre-write credential screen (actual 11_353; 47 headroom).
+    ("src/config.rs", 11_400),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

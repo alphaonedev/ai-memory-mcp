@@ -172,6 +172,15 @@ pub fn validate_content(content: &str) -> Result<()> {
     if !is_clean_string(content) {
         bail!("content contains invalid characters");
     }
+    // v0.8.1 W1 (#1821 / gap G29) — caller-origin credential screen. Refuses
+    // ONLY under `AI_MEMORY_SECRET_SCREEN_MODE=refuse` (the secure default);
+    // `redact`/`off` return Ok here (a `redact` caller write is masked at the
+    // storage funnel, not refused). Internal / federation-receive / recovery
+    // writes bypass `validate_content` and are handled (redact-only) at the
+    // storage funnel, so this never breaks CRDT convergence or capture-first.
+    // The process-wide mode reads `Off` until the daemon/CLI boot seeds it, so
+    // raw-library and existing-test writes are unaffected.
+    crate::secret_screen::screen_for_caller(content).map_err(|r| anyhow::anyhow!("{r}"))?;
     Ok(())
 }
 

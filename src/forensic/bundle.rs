@@ -450,7 +450,12 @@ pub fn build_files(
                 id: mem.id.clone(),
                 namespace: mem.namespace.clone(),
                 title: mem.title.clone(),
-                content: mem.content.clone(),
+                // v0.8.1 W1.3 (#1821 / gap G29) — egress credential screen
+                // (defense-in-depth). A secret that PRE-DATES the write screen
+                // must not leak through a forensic export; mask it on the way
+                // out. No-op unless screening was seeded non-`off`.
+                content: crate::secret_screen::redact_for_storage(&mem.content)
+                    .unwrap_or_else(|| mem.content.clone()),
                 tier: mem.tier.as_str().to_string(),
                 memory_kind: format!("{:?}", mem.memory_kind).to_ascii_lowercase(),
                 reflection_depth: mem.reflection_depth,

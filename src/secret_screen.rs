@@ -36,8 +36,11 @@
 //! `ghp_`) — they are the routing key of a credential pattern, exactly the
 //! `src/mine.rs::Format::Claude` precedent.
 
+use std::sync::OnceLock;
+
 /// Per-write screening disposition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SecretScreenMode {
     /// No screening — byte-identical to the pre-W1 write path. The explicit
     /// opt-out (mirrors the secure-default convention of
@@ -348,6 +351,100 @@ fn redact_pem_blocks(content: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+// ── Process-wide resolved mode ───────────────────────────────────────────
+
+/// The process-wide resolved [`SecretScreenMode`], seeded once at boot from
+/// `AppConfig::resolve_secret_screen_mode()` (env > `[security]` > compiled
+/// `Refuse`). UNSEEDED it reads as [`SecretScreenMode::Off`] — a raw library
+/// embedder that writes via `db::insert` without booting through the config
+/// path gets NO surprise content mutation; every real daemon / CLI boots
+/// through `daemon_runtime::run`, which seeds the resolved mode (default
+/// `Refuse`). Mirrors the `set_db_mmap_size` / `set_age_projection_mode`
+/// process-wide-knob pattern.
+static SCREEN_MODE: OnceLock<SecretScreenMode> = OnceLock::new();
+
+/// Seed the process-wide screen mode (idempotent — first writer wins, like
+/// the other boot-seeded knobs).
+pub fn set_screen_mode(mode: SecretScreenMode) {
+    let _ = SCREEN_MODE.set(mode);
+}
+
+/// The resolved process-wide screen mode (`Off` until seeded).
+#[must_use]
+pub fn screen_mode() -> SecretScreenMode {
+    SCREEN_MODE.get().copied().unwrap_or(SecretScreenMode::Off)
+}
+
+/// A caller-origin write refused because it carried credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretRefusal {
+    /// The detector kinds that fired (sorted, deduped).
+    pub kinds: Vec<&'static str>,
+}
+
+impl std::fmt::Display for SecretRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "content rejected: appears to contain credential material ({}); \
+             set AI_MEMORY_SECRET_SCREEN_MODE=redact to store a masked copy, \
+             or =off to disable screening",
+            self.kinds.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for SecretRefusal {}
+
+/// CALLER-origin screen (HTTP / MCP / CLI store + update, via
+/// `validate::validate_content`). Refuses the write ONLY under
+/// [`SecretScreenMode::Refuse`]; `Redact`/`Off` return `Ok` (a `Redact`
+/// caller write is masked at the storage funnel, not refused here).
+///
+/// # Errors
+/// [`SecretRefusal`] when the mode is `Refuse` and a credential is detected.
+pub fn screen_for_caller(content: &str) -> Result<(), SecretRefusal> {
+    if screen_mode() != SecretScreenMode::Refuse {
+        return Ok(());
+    }
+    match screen(content) {
+        ScreenOutcome::Clean => Ok(()),
+        ScreenOutcome::Hit { kinds, .. } => {
+            tracing::warn!(
+                target: "secret.refused",
+                kinds = ?kinds,
+                "refused a caller write that appears to carry credential material"
+            );
+            Err(SecretRefusal { kinds })
+        }
+    }
+}
+
+/// STORAGE-funnel screen (the origin-blind backstop wired into
+/// `db::insert` / `db::insert_if_newer` and the postgres store path). When
+/// the mode is not `Off` and a credential is detected, returns the REDACTED
+/// content to persist instead — NEVER refuses, so federation-receive /
+/// recovery / internal re-store paths preserve CRDT convergence + the
+/// capture-first guarantee (the 5-agent vote's killer objection). Returns
+/// `None` when the content is clean or screening is `Off`.
+#[must_use]
+pub fn redact_for_storage(content: &str) -> Option<String> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    match screen(content) {
+        ScreenOutcome::Clean => None,
+        ScreenOutcome::Hit { kinds, redacted } => {
+            tracing::warn!(
+                target: "secret.redacted",
+                kinds = ?kinds,
+                "redacted credential material from stored content (origin-blind funnel)"
+            );
+            Some(redacted)
+        }
+    }
 }
 
 #[cfg(test)]
