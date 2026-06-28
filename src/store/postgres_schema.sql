@@ -482,6 +482,20 @@ CREATE INDEX IF NOT EXISTS archived_memory_links_source_idx ON archived_memory_l
 CREATE INDEX IF NOT EXISTS archived_memory_links_target_idx ON archived_memory_links (target_id);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- forget_tombstones — v71 (#1821 / W2.3 / gap G30) signed FORGET-tombstone
+-- resurrection guard. Identity + time + signature ONLY (no content
+-- fingerprint — that would re-leak the erased row).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS forget_tombstones (
+    memory_id    TEXT PRIMARY KEY,
+    namespace    TEXT NOT NULL,
+    forgotten_at TEXT NOT NULL,
+    agent_id     TEXT,
+    signature    BYTEA
+);
+CREATE INDEX IF NOT EXISTS forget_tombstones_namespace_idx ON forget_tombstones (namespace);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- namespace_meta — namespace standard / policy (Tasks 1.6–1.8).
 -- ─────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS namespace_meta (
