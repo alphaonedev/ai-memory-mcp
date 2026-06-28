@@ -632,6 +632,19 @@ const REASON_UNSTAMPED_TENANT_WRITE: &str =
 const REASON_UNSTAMPED_TENANT_DELETE: &str =
     "memory has no agent_id stamp; tenant deletes refused (use admin path)";
 
+/// v0.8.1 W1 (#1821 / gap G29) — postgres parity for the sqlite
+/// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
+/// redacted clone when [`crate::secret_screen::redact_for_storage`] detects
+/// credential material in the content, else `None` (caller keeps the
+/// original `&Memory`). NEVER refuses — the caller-origin REFUSE happens
+/// earlier at `validate_content`; the funnel only masks.
+fn screen_storage_memory(memory: &Memory) -> Option<Memory> {
+    crate::secret_screen::redact_for_storage(&memory.content).map(|content| Memory {
+        content,
+        ..memory.clone()
+    })
+}
+
 impl PostgresStore {
     /// Connect using a Postgres URL (e.g. `postgres://user:pass@host:5432/db`).
     /// Runs the bootstrap schema on the first connection acquired.
@@ -10173,6 +10186,11 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+        // parity with the sqlite db::insert funnel). No-op unless screening
+        // was seeded non-`off` and content carries credential material.
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
         // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
         // on EVERY substrate write path on EVERY backend; multi-tenant
@@ -10475,6 +10493,24 @@ impl MemoryStore for PostgresStore {
         if memories.is_empty() {
             return Ok(Vec::new());
         }
+
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+        // bulk parity). Mask any element carrying credential material. Stays
+        // zero-copy (keeps the original borrow) when screening is `off` or no
+        // row carries a secret; only materializes a screened copy on a hit.
+        let screened_holder;
+        let memories: &[Memory] = if memories
+            .iter()
+            .any(|m| crate::secret_screen::redact_for_storage(&m.content).is_some())
+        {
+            screened_holder = memories
+                .iter()
+                .map(|m| screen_storage_memory(m).unwrap_or_else(|| m.clone()))
+                .collect::<Vec<_>>();
+            &screened_holder
+        } else {
+            memories
+        };
 
         // Substrate governance parity: each row still passes the
         // pre-write hook (the caller's HTTP governance gate is the
@@ -11203,6 +11239,10 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
     ) -> StoreResult<String> {
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+        // parity); masks before the embedding + bind. No-op unless seeded.
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // The semantic-recall write path MUST consult the hook just
         // like the plain `store` path; otherwise an operator-signed
@@ -12615,6 +12655,12 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
+        // federation RECEIVE funnel (parity with sqlite insert_if_newer).
+        // ALWAYS redact, NEVER refuse — a rejected inbound row would diverge
+        // replicas. No-op unless screening was seeded non-`off`.
+        let screened = screen_storage_memory(inbound);
+        let inbound = screened.as_ref().unwrap_or(inbound);
         // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
         // pushed row must clear the same pre-write governance hook as a
         // locally-authored write.

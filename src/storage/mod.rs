@@ -723,6 +723,23 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // no row written. See module-level comment for layering details.
     consult_governance_pre_write(mem)?;
 
+    // v0.8.1 W1 (#1821 / gap G29) — origin-blind credential REDACT backstop
+    // on the local-authorship funnel. Caller-origin writes are REFUSED
+    // earlier (validate_content); any secret reaching here is from an
+    // internal re-store path (curator / autonomy) that bypasses validation,
+    // so it is masked, never refused (preserving the internal write). No-op
+    // unless `AI_MEMORY_SECRET_SCREEN_MODE` was seeded non-`off`.
+    let redacted_mem;
+    let mem = if let Some(redacted) = crate::secret_screen::redact_for_storage(&mem.content) {
+        redacted_mem = Memory {
+            content: redacted,
+            ..mem.clone()
+        };
+        &redacted_mem
+    } else {
+        mem
+    };
+
     let tags_json = serde_json::to_string(&mem.tags)?;
     // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
     // component of the per-memory vector clock. `db::insert` is the
@@ -8802,6 +8819,21 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // a local rule by routing through a peer would otherwise slip
     // past the gate. The hook fires on every newer-wins merge attempt.
     consult_governance_pre_write(mem)?;
+
+    // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the federation
+    // RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused inbound row
+    // would diverge replicas (the merge primitive), so a relayed secret is
+    // masked, not rejected. No-op unless screening was seeded non-`off`.
+    let redacted_mem;
+    let mem = if let Some(redacted) = crate::secret_screen::redact_for_storage(&mem.content) {
+        redacted_mem = Memory {
+            content: redacted,
+            ..mem.clone()
+        };
+        &redacted_mem
+    } else {
+        mem
+    };
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
