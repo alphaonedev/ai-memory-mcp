@@ -198,3 +198,68 @@ fn forget_tombstone_blocks_resurrection_g30() {
         "G30 W2.3: a forgotten row must NOT be resurrected by a peer re-push"
     );
 }
+
+/// W2 acceptance remanence-probe: after a hard forget (archive=false) the
+/// cleartext content appears in NO queryable store (memories, DLQ payload,
+/// archive).
+#[test]
+fn forget_leaves_no_cleartext_remanence_g30() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+    let secret = "REMANENCE-PROBE-AKIAIOSFODNN7EXAMPLE-xyz";
+
+    let id = seed_memory(&conn, "g30-remanence", "rnote", secret);
+    seed_dlq_row(&conn, &id, &format!("{{\"content\":\"{secret}\"}}"));
+
+    db::forget(&conn, Some("g30-remanence"), None, None, false).expect("forget");
+
+    let like = format!("%{secret}%");
+    let in_memories: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE content LIKE ?1",
+            rusqlite::params![like],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let in_dlq: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM federation_push_dlq WHERE payload_json LIKE ?1",
+            rusqlite::params![like],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let in_archive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE content LIKE ?1",
+            rusqlite::params![like],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(in_memories, 0, "G30: cleartext gone from memories");
+    assert_eq!(in_dlq, 0, "G30: cleartext gone from the DLQ payload");
+    assert_eq!(
+        in_archive, 0,
+        "G30: a hard forget (archive=false) must not leave the content in the archive"
+    );
+}
+
+/// The FORGET tombstone signable bytes are deterministic + domain-separated.
+#[test]
+fn forget_tombstone_signable_bytes_deterministic_g30() {
+    let first = db::forget_tombstone_signable_bytes("id-1", "ns-a", "2026-06-28T00:00:00Z");
+    let again = db::forget_tombstone_signable_bytes("id-1", "ns-a", "2026-06-28T00:00:00Z");
+    assert_eq!(first, again, "same inputs → same bytes");
+    let other_id = db::forget_tombstone_signable_bytes("id-2", "ns-a", "2026-06-28T00:00:00Z");
+    assert_ne!(first, other_id, "different memory_id → different bytes");
+    assert!(
+        first.starts_with(b"forget-tombstone-v1\x00"),
+        "domain-separation prefix present"
+    );
+    // No field-boundary ambiguity: ("ab","c") must not equal ("a","bc").
+    let split_ab_c = db::forget_tombstone_signable_bytes("ab", "c", "t");
+    let split_a_bc = db::forget_tombstone_signable_bytes("a", "bc", "t");
+    assert_ne!(
+        split_ab_c, split_a_bc,
+        "null-delimited fields are unambiguous"
+    );
+}

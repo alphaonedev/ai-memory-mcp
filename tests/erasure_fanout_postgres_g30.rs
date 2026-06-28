@@ -94,11 +94,12 @@ async fn postgres_forget_tombstone_blocks_resurrection_g30() {
         .unwrap();
     assert_eq!(mem_n, 0, "the row must be gone after forget");
 
-    let tomb_n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM forget_tombstones WHERE memory_id = $1")
-        .bind(&id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let tomb_n: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM forget_tombstones WHERE memory_id = $1")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(tomb_n, 1, "postgres forget must record a FORGET tombstone");
 
     // A peer re-pushes the forgotten row with a far-future updated_at via the
@@ -108,8 +109,14 @@ async fn postgres_forget_tombstone_blocks_resurrection_g30() {
         updated_at: "2999-01-01T00:00:00Z".to_string(),
         ..mem(&ns, "rnote", "original secret content")
     };
-    let returned = pg.merge_inbound(&admin, &revived).await.expect("merge_inbound");
-    assert_eq!(returned, id, "tombstone-wins returns the id without inserting");
+    let returned = pg
+        .merge_inbound(&admin, &revived)
+        .await
+        .expect("merge_inbound");
+    assert_eq!(
+        returned, id,
+        "tombstone-wins returns the id without inserting"
+    );
 
     let mem_n2: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
         .bind(&id)
