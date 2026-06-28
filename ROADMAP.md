@@ -32,7 +32,7 @@ We are building the **endpoint substrate that unites cloud/universe-scale AGI/AS
 
 The end state is a civilization-scale infrastructure layer that:
 
-1. Runs at every endpoint where AI/AGI/ASI touches the world — from IoT sensors with kilobytes of RAM, to mobile devices, to robotics controllers, to clinical decision systems, to autonomous vehicles, to defense systems, to the trillions of endpoints that will exist when AGI and ASI are operational.
+1. Runs at every endpoint where AI/AGI/ASI touches the world — from tens-of-MB endpoints (phones, Raspberry-Pi-class boards, robotics controllers — the substrate's real floor is a ~31 MB binary at ~18–25 MB idle RSS), up through mobile devices, clinical decision systems, autonomous vehicles, and defense systems, to the trillions of endpoints that will exist when AGI and ASI are operational. (Kilobyte-RAM MCUs — Cortex-M class, "Tier ∅" — do not host the substrate directly; their L1 memory, identity, and attestation are held on their behalf by a nearby gateway/hub. See §25.8 endpoint tiering. Corrected per D-OPUS-5, 2026-06-28.)
 2. Holds the local cognitive state — memory, identity, attestation, refusal capability, provenance — so that the strategic-layer cognition above the endpoint does not have to absorb the endpoint's state-management burden.
 3. Enforces cognitive governance at the endpoint structurally — coherent, stoppable, improvable, attested, bias-displaced — regardless of what cognition operates through the endpoint.
 4. Unites cloud/strategic AGI/ASI with endpoint AGI/ASI by being the durable persistence and governance layer at the boundary between them.
@@ -909,6 +909,7 @@ The following work is useful and should land. None of it strengthens any of the 
 | **`ai-memory-viewer`** | Real-time observability of the substrate. WebSocket stream of memory events, namespace tree, active leases/signals/checkpoints, recent `signed_events`. Consumes substrate read APIs. | Relocated from v0.8 §11.4.F |
 | **`ai-memory-schema-tools`** | Mature schema-change methodology. Single-source-of-truth manifest, codegen, adapter-parity preflight, doc-drift surfacing, codegraph integration. Consumes substrate schema definitions. | Relocated from v0.8 §11.4.G |
 | **`ai-memory-eval-panel`** (provisional) | Heterogeneous AI NHI evaluation tooling. Operationalizes [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171) methodology for arbitrary substrate-assessment questions. Consumes substrate read APIs + #1171 prompt format. | Provisional — pending operator decision |
+| **`ai-memory-rqgm`** (provisional, v0.9.1+) | **External L3 Red Queen / RQGM evolutionary search** ([arXiv:2606.26294](https://arxiv.org/abs/2606.26294)). Reads substrate exports (`recall_observations` ledger, confidence-shadow, decorrelation/dominance — read-only, aggregate), breeds the heterogeneous evaluator panel for epoch N+1, and emits **one UNSIGNED `epoch_manifest.json` draft** the operator signs out-of-band; reproduces the paper loop against a fixture corpus. **Dependency direction is grep-provable one-way** (`rg -i 'rqgm\|epoch_manifest\|red.?queen' src/` = 0) — sibling → substrate only, never the reverse; the substrate has zero compile dependency on it. **CUT from `src/` for eternity** (category error per the 21/21 Red Queen vote). | New sibling, per §25 Red Queen final decision (2026-06-28) |
 
 **Sibling-repo discipline:**
 - Each sibling has its own ROADMAP.md, license, governance.
@@ -1169,13 +1170,67 @@ Quantization backends (RaBitQ-IVF, TurboQuant, residual VQ) — pluggable via tr
 
 **Audit reconciliation.** v0.6.3 audit found 22 distinct gaps. None blocked the published v0.6.3 claims. Status at v0.7.0: 19 SHIPPED across v0.6.3.1 / v0.7.0; 2 scheduled at v0.9 (G3 cold-start, G7-step2 reranker pool — addressed by §23 vector index substrate); 1 watch-only (G15 stats live-counted). All recovered commitments from prior phased roadmap either shipped, scheduled, cut explicitly, or tracked as research direction.
 
-**Open structural gap (§5).** Cryptographic verification that producer and reflector are from decorrelated cognitive families is currently policy, not architecture. Four candidate mechanisms named; selection deferred to heterogeneous AI NHI panel adjudication per [#1171](https://github.com/alphaonedev/ai-memory-mcp/issues/1171). Roadmap home provisional: v1.x or v2.0+. The §2.6 property is held by operator discipline until then; the substrate is honest about the gap.
+**Open structural gap (§5) — SELECTION MADE (2026-06-28, supersedes the prior "deferred to v1.x/v2.0+" framing).** Cryptographic verification that producer and reflector are from decorrelated cognitive families is currently policy, not architecture. The mechanism is now **selected** per the 21-lens Red Queen / RQGM final decision (§25): candidate (4) **N≥3 attested-family quorum is PRIMARY**, candidate (2) empirical decorrelation probe is the **advisory shipped floor** (`enforce` correctly INERT until attestation lands). Roadmap home is now **v0.9.0** (attested `model_family` D3-012 + advisory decorrelation every curator cycle RQ-11) → **v1.0.0** (live enforce D3-021, gated on D3-012; enforcing on CLAIMED metadata is security theater). The §2.6 property remains held by operator discipline until D3-012 lands, and the substrate is honest that bias-displacement durability is **conditional on two unbuilt predicates** — attested family-distinctness (~5% today, buildable) and vote-independence (0% today, likely permanently only *estimable*, not *attestable*). See §25 for the full development pathway.
 
 **Cuts surfaced by §3 scope test.** WebSocket viewer (was §11.4.F) and schema-change methodology (was §11.4.G) relocate to sibling repositories (`ai-memory-viewer`, `ai-memory-schema-tools`). Both are useful work; neither belongs in this substrate by the seven-property test. The work is preserved; the substrate's center of gravity is preserved.
 
 **Release cadence.** v0.6.3.1 (Q2 2026, shipped). v0.7.0 (Q2 2026, shipped). v0.8.0 (Q4 2026). v0.9 (Q1 2027). v1.0 (Q2 2027). v1.x and beyond: AGI/ASI evolution per §11.7.
 
 Apache 2.0. Forever. Endpoint-resident. Cognitively governed. Bias-displaced by architecture. **From AI through AGI through ASI through whatever follows.**
+
+---
+
+## 25. Red Queen / RQGM — Final Locked Decision + Development Pathway
+
+> **This section is the project's final, eternity-grade decision point on Red Queen / RQGM.** Full analysis + master deliverable table: [`docs/reviews/RED-QUEEN-FINAL-DECISION-AND-ROADMAP-OPUS.md`](docs/reviews/RED-QUEEN-FINAL-DECISION-AND-ROADMAP-OPUS.md). Placement authority: [`docs/reviews/RED-QUEEN-21-AGENT-VOTE-OPUS.md`](docs/reviews/RED-QUEEN-21-AGENT-VOTE-OPUS.md); mechanism map: [`RQGM-2606.26294-vs-v0.8.0-OPUS.md`](docs/reviews/RQGM-2606.26294-vs-v0.8.0-OPUS.md). **Paper:** [The Red Queen Gödel Machine, arXiv:2606.26294](https://arxiv.org/abs/2606.26294) (Iacob et al.) — surfaced by **Nick Jensen**. **Method:** three adversarial rounds (21-lens assessment → 7-agent self-red-team → 21-lens final convergence), CodeGraph-anchored, against `release/v0.8.0`. Tracking: [#1820](https://github.com/alphaonedev/ai-memory-mcp/issues/1820). Crossroads cite: `5-agent vote (4d3ea1c5)`.
+
+### 25.0 The final decision (21/21 unanimous + red-teamed)
+
+Adopt the Red Queen **principles** — frozen-within-epoch evaluation, decorrelated **N≥3 *attested*-family quorum**, adversarial bias-checking — while keeping the evolutionary **search engine permanently external** in a dependency-clean `ai-memory-rqgm` sibling (§13) that reads substrate telemetry and writes **exactly one operator-signed epoch artifact** the in-repo **L2 curator** verifies and anchors to the **V-4 chain**. Welding the optimizer into `src/` is a **category error** (the verifier becomes a player) that would falsify the §0 anchor — **CUT 21/21, for eternity**. RQGM optimizes **agents**; ai-memory governs **persistence**. **Grade:** moonshot-§0 substrate-fitness **B+ today → A− after the full v0.9.0 P0 spine**; **C−/D+ if internal RQGM ever ships** (distinct from the **~15% RQGM-optimization-readiness** / **~5% family-verify** metrics — never conflate the axes).
+
+### 25.1 L1/L2/L3 placement (the contract)
+
+```
+L3  ai-memory-rqgm (EXTERNAL, sibling, v0.9.1+)  — search · panel breeding · adversarial objectives
+        READS exports (read-only, aggregate)  ·  WRITES one UNSIGNED manifest draft
+            │ operator Ed25519 signature
+L2  ai-memory curator (IN REPO, v0.9.0)  — verify manifest → bind to EpochAdvance Checkpoint → V-4 epoch.manifest_applied → decorrelation every cycle
+            │ SAL / hooks
+L1  ai-memory substrate (v0.9.0 spine)  — persist · bounded reflect · N≥3 ATTESTED quorum · static signed RuleEngine · V-4 chain · federation checkpoints
+```
+Dependency direction is **grep-provable** (`rg -i 'rqgm|epoch_manifest|red.?queen' src/` = 0): sibling → substrate only.
+
+### 25.2 Epoch contract — RESOLVED design (one open T1+T4 vote)
+
+An epoch is **three complementary artifacts bound by one SHA-256** (a Checkpoint resolution signature *excludes* `condition`/`metadata`, `src/identity/sign.rs:650-678`, so it cannot carry the payload — the manifest is complementary, not redundant): a **content-signed `epoch_manifest.json`** (signs the WHAT — panel slots, utility weights `frozen_within_epoch=true`, `policy_version`, `prior_epoch_id`, `content_hash`) **bound to an `EpochAdvance` Checkpoint** (attests WHEN+WHO; `resolution = content_hash`, a signed field; reuses FED-RQ-01 transport) **anchored by a V-4 `epoch.manifest_applied` row** (`payload_hash == content_hash`). `ConditionType::EpochAdvance` is **migration-free** (SAL-enforced, `src/models/checkpoint.rs:13-32`). **The schema (`docs/contracts/epoch_manifest.schema.json`) stays git-UNTRACKED with zero `src/` consumer until this fork is resolved by a 5-agent vote** — claiming "RQ-01 shipped" is BANNED (D-OPUS-4).
+
+### 25.3 Development pathway — epic alignment
+
+The full master deliverable table (ID · layer · epic · depends · effort · acceptance · file:line · issue) lives in the companion doc §4. Epic summary:
+
+- **Sprint 0 (v0.8.0 hotfix):** D-OPUS-2 (PreReflect docstring), D-OPUS-5 (§2.1 RAM, done above), `honest-limitations.md` addendum, `RECURSIVE_LEARNING.md` L1/L2/L3 boundary.
+- **v0.9.0 P0 spine (blocking tag):** **D3-012** ⭐ attested `model_family` ([#1719](https://github.com/alphaonedev/ai-memory-mcp/issues/1719), the keystone — needs the §11.4.D `model_attestations` table) · **D1-001** ⭐ MCP PreReflect veto ([#655](https://github.com/alphaonedev/ai-memory-mcp/issues/655)) · **RQ-10** ⭐ `SignableEpochManifest` + V-4 `epoch.manifest_applied` (mirror `rules_store::remove_signed`) + EpochAdvance-bind · **RQ-PARITY-01** ⭐ curator unification (postgres L2 epoch parity) · **F-40** governance silent-disable + **F-41** `policy_version` (one coupled fix, D-OPUS-1) · **RQ-11** decorrelation every curator cycle ([#1764](https://github.com/alphaonedev/ai-memory-mcp/issues/1764)) · **#1705** consume-flip wiring + LIST SAL-routing (D-OPUS-6/7) · **#1706** shadow recall-utility sweep · **D3-002** #1171 panel · **FED-RQ-01** commit checkpoint federation (in-flight, +~282 LOC, with crossroads cite).
+- **v0.9.0 P1/P2 (gated within-epic):** D3-021 enforce non-inert (gated on D3-012) · D3-031 consolidation gate · D3-060 enforcement-invariants ship-gate.
+- **v1.0.0 (§11.6 federation maturity):** FED-RQ-02/03 federated epoch manifest + cross-node `policy_version` gate · FED-RQ-AGG privacy-preserving aggregate utility (**never raw rates**) · #1707 live recall wire (only after #1706 proves signal) · F-53/#1809 federation E2E · vote-independence empirical estimator.
+- **Sibling v0.9.1+ (§13):** `ai-memory-rqgm` RQ-20..23 + RQ-20.1 decorrelation export — **never blocks the v0.9.0 tag**.
+
+**Non-negotiable ordering gates:** D3-012 → D3-021 (no enforce on CLAIMED = no security theater) · #1706 → #1707 (shadow before live) · RQ-PARITY-01 → RQ-11 (else sqlite-only blinds postgres fleets) · F-41 + D3-012 → RQ-10 (else a signed manifest launders unattested diversity).
+
+### 25.4 T4 / hard-to-reverse — 5-agent vote BEFORE commit
+
+The `epoch_manifest` schema + `SignableEpochManifest` byte layout, the `epoch.manifest_applied` event type, the `EpochAdvance` Checkpoint binding, and every FED-RQ authority-write are **T1+T4 crossroads**. Each requires a cited `5-agent vote (4d3ea1c5)` before `git add`/commit. FED-RQ-01 (in-flight working tree) must carry the cite at commit.
+
+### 25.5 CUT (for eternity) + ship-gate invariants
+
+CUT: full RQGM / population genetics in `src/` · governance auto-mutation without operator-signed packs · epoch panel as MCP tools · `--rqgm` flag merging L2+L3 · `enforce` on CLAIMED metadata · cross-node raw utility leaderboards · webhook/`hooks.toml`-as-epoch-manifest. Each becomes a CI gate (modeled on `scripts/check-vendor-literals.sh` self-test); six are at a 0-hit baseline today and land as v0.8.0 ratchets. **Separation-of-powers invariant:** the L1 law (operator-signed `RuleEngine`) is read-only and never programmatically mutated (`src/governance/agent_action.rs:782`; `enforced_rule_passes` requires operator Ed25519, `rules_store.rs:205`). Add to §16 (cuts) + §17 (quality gates).
+
+### 25.6 Claims discipline (binding)
+
+**Allowed (v0.8.0, caveated):** "Red-Queen-*principles*-aligned (~15% optimization-readiness)" · "advisory visibility-only decorrelation probe (CLAIMED; enforce INERT)" · "signed epoch contract *spec* (untracked, no consumer)" · "FED-RQ-01 (in-flight)". **Banned → unlock:** "decorrelation enforced" (D3-012+D3-021+D3-060) · "attests model family" (D3-012, and only "loader-attested") · "epoch closure shipped"/"RQ-01 shipped" (RQ-10 + wired consumer + git-track) · **"implements RQGM"/"co-evolving evaluators shipped" = perma-ban** (category error). **Readiness:** optimization 15%→~50-60% (v0.9)→~70-80% (v1.0); family-verify 5%→~40% loader-attested (hard cap); vote-independence 0% throughout (architectural limit).
+
+### 25.7 ASI durability — conditional, honest
+
+§2.6 quorum+epoch is more ASI-durable than internal RQGM because its *mechanism* is capability-orthogonal (counts signatures, freezes windows), **conditional on two predicates:** **P1 family-distinctness** (~5%, buildable v0.9) and **P2 vote-independence** (0%, likely permanently only *estimable* — the substrate sees signed bytes, never the generating process, so it cannot distinguish genuine agreement from N rubber-stamp votes by one model in N hats). The measurability cliff is a **split**: structural-invariant counts survive ASI; semantic (contradiction-density LLM verdict) does not. `honest-limitations.md` carries this verbatim (no AGI-safety claim; CLAIMED≠ATTESTED).
 
 ---
 
