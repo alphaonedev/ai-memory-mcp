@@ -480,14 +480,46 @@ pub async fn forget_memories(
     }
 
     let lock = app.db.lock().await;
-    match db::forget(
+    // v0.8.1 W2.2 (#1821 / gap G30) — collect the victim ids BEFORE the
+    // forget so the in-memory HNSW vector can be evicted afterwards. The
+    // bulk `db::forget` purges the embedding COLUMN, but the HNSW graph keeps
+    // a copy of the vector in RAM and keeps answering nearest-neighbour recall
+    // for the forgotten id until the next rebuild (gap G30 channel c). The
+    // match set is stable: the same `app.db` mutex is held across the collect
+    // and the forget, so no concurrent writer can diverge it. (postgres uses
+    // pgvector / DB-side ANN, so its recall drops the row on DELETE — no
+    // in-memory eviction needed there.)
+    let victim_ids: Vec<String> = db::forget_matches(
+        &lock.0,
+        body.namespace.as_deref(),
+        body.pattern.as_deref(),
+        body.tier.as_ref(),
+        usize::MAX,
+    )
+    .map(|rows| rows.into_iter().map(|m| m.id).collect())
+    .unwrap_or_default();
+    let forget_result = db::forget(
         &lock.0,
         body.namespace.as_deref(),
         body.pattern.as_deref(),
         body.tier.as_ref(),
         lock.3, // archive_on_gc
-    ) {
-        Ok(n) => Json(json!({"deleted": n})).into_response(),
+    );
+    // Drop the DB lock BEFORE taking the vector-index lock (the locking
+    // discipline pinned at handlers/memories.rs — never hold both).
+    drop(lock);
+    match forget_result {
+        Ok(n) => {
+            if !victim_ids.is_empty() {
+                let mut idx_lock = app.vector_index.lock().await;
+                if let Some(idx) = idx_lock.as_mut() {
+                    for id in &victim_ids {
+                        idx.remove(id);
+                    }
+                }
+            }
+            Json(json!({"deleted": n})).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),

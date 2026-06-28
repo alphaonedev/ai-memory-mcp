@@ -13825,6 +13825,26 @@ impl MemoryStore for PostgresStore {
             }
         }
 
+        // v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
+        // leaks for the deleted ids in THIS tx (postgres parity with the
+        // sqlite `db::forget` purge): `federation_push_dlq.payload_json` holds
+        // the full cleartext body keyed by a NON-FK `memory_id`, and
+        // `transcript_line_dedup` carries a content sha256 + `memory_id` with
+        // no FK/cascade — both survive the row DELETE. 5-agent vote 4d3ea1c5.
+        if !deleted.is_empty() {
+            let ids: Vec<String> = deleted.iter().map(|(id,)| id.clone()).collect();
+            sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget purge federation_push_dlq", e))?;
+            sqlx::query("DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget purge transcript_line_dedup", e))?;
+        }
+
         tx.commit()
             .await
             .map_err(|e| to_store_err("forget commit tx", e))?;

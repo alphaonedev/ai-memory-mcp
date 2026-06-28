@@ -48,6 +48,11 @@ pub(super) fn handle_forget(
     conn: &rusqlite::Connection,
     params: &Value,
     archive: bool,
+    // v0.8.1 W2.2 (#1821 / gap G30) — the live HNSW index so the forgotten
+    // vectors can be evicted from RAM (the embedding survives the row DELETE
+    // in the in-memory graph and keeps answering recall until the next
+    // rebuild). `None` on paths with no index (CLI, tests).
+    vector_index: Option<&crate::hnsw::VectorIndex>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let pattern = params["pattern"].as_str();
@@ -176,6 +181,15 @@ pub(super) fn handle_forget(
         None => db::forget(conn, namespace, pattern, tier.as_ref(), archive),
     }
     .map_err(|e| e.to_string())?;
+    // v0.8.1 W2.2 (#1821 / gap G30) — evict the forgotten vectors from the
+    // in-memory HNSW graph so semantic recall returns zero hits immediately
+    // (not only after the next rebuild). `VectorIndex::remove` is `&self`
+    // (interior `Mutex`), so a shared `Arc<VectorIndex>` ref suffices.
+    if let Some(idx) = vector_index {
+        for id in &deleted_ids {
+            idx.remove(id);
+        }
+    }
     Ok(json!({
         "deleted": deleted,
         "archived": archive,
@@ -383,6 +397,7 @@ mod tests {
             &conn,
             &json!({"namespace": "forget-ns", "dry_run": true}),
             false,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["dry_run"], true);
@@ -409,6 +424,7 @@ mod tests {
             &conn,
             &json!({"namespace": "del-ns", "dry_run": false}),
             false,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["deleted"].as_u64(), Some(2));
@@ -421,7 +437,7 @@ mod tests {
         let _envg = crate::identity::agent_id_env_test_lock();
         let conn = fresh_conn();
         let _ = insert_one(&conn, "arc-ns", "a", Tier::Mid);
-        let resp = handle_forget(&conn, &json!({"namespace": "arc-ns"}), true).expect("ok");
+        let resp = handle_forget(&conn, &json!({"namespace": "arc-ns"}), true, None).expect("ok");
         assert_eq!(resp["archived"], true);
         assert_eq!(resp["deleted"].as_u64(), Some(1));
     }
@@ -437,6 +453,7 @@ mod tests {
             &conn,
             &json!({"namespace": "tier-ns", "tier": Tier::Short.as_str()}),
             false,
+            None,
         )
         .expect("ok");
         // Only the short-tier row should be deleted.
@@ -453,6 +470,7 @@ mod tests {
             &conn,
             &json!({"namespace": "bad-tier-ns", "tier": "not-a-tier", "dry_run": true}),
             false,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["would_delete"].as_u64(), Some(1));
@@ -462,7 +480,7 @@ mod tests {
     #[test]
     fn forget_no_filter_returns_error() {
         let conn = fresh_conn();
-        let err = handle_forget(&conn, &json!({"dry_run": true}), false).unwrap_err();
+        let err = handle_forget(&conn, &json!({"dry_run": true}), false, None).unwrap_err();
         assert!(!err.is_empty());
     }
 
@@ -487,6 +505,7 @@ mod tests {
             &conn,
             &json!({"namespace": "preview-ns", "dry_run": true}),
             false,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["would_delete"].as_u64(), Some(2));
@@ -515,6 +534,7 @@ mod tests {
             &conn,
             &json!({"namespace": "cap-ns", "dry_run": true}),
             false,
+            None,
         )
         .expect("ok");
         assert_eq!(resp["would_delete"].as_u64(), Some(total as u64));
@@ -533,7 +553,7 @@ mod tests {
         let conn = fresh_conn();
         let id_a = insert_one(&conn, "live-ns", "a", Tier::Mid);
         let id_b = insert_one(&conn, "live-ns", "b", Tier::Mid);
-        let resp = handle_forget(&conn, &json!({"namespace": "live-ns"}), true).expect("ok");
+        let resp = handle_forget(&conn, &json!({"namespace": "live-ns"}), true, None).expect("ok");
         assert_eq!(resp["deleted"].as_u64(), Some(2));
         assert_eq!(resp["truncated"], false);
         let ids: Vec<&str> = resp["deleted_ids"]
@@ -596,8 +616,13 @@ mod tests {
         unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
 
         // Dry-run parity: must report exactly alice's + the unstamped row.
-        let preview = handle_forget(&conn, &json!({"namespace": ns, "dry_run": true}), true)
-            .expect("dry-run ok");
+        let preview = handle_forget(
+            &conn,
+            &json!({"namespace": ns, "dry_run": true}),
+            true,
+            None,
+        )
+        .expect("dry-run ok");
         assert_eq!(preview["would_delete"].as_u64(), Some(2), "dry-run count");
         let preview_ids: Vec<&str> = preview["rows"]
             .as_array()
@@ -613,7 +638,7 @@ mod tests {
         );
 
         // Live run (archive=true): deletes alice's + unstamped; bob survives.
-        let resp = handle_forget(&conn, &json!({"namespace": ns}), true).expect("live ok");
+        let resp = handle_forget(&conn, &json!({"namespace": ns}), true, None).expect("live ok");
         assert_eq!(resp["deleted"].as_u64(), Some(2), "live deleted count");
 
         assert!(
@@ -718,7 +743,7 @@ mod tests {
         );
         let id_appr = insert_meta(&conn, ns_appr, "appr row", json!({"agent_id": "ai:alice"}));
         unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:alice") };
-        let err = handle_forget(&conn, &json!({"namespace": ns_appr}), true).unwrap_err();
+        let err = handle_forget(&conn, &json!({"namespace": ns_appr}), true, None).unwrap_err();
         assert!(
             err.contains("approval") || err.contains("governance"),
             "approve-policy bulk forget must be refused; got: {err}"
@@ -728,7 +753,13 @@ mod tests {
             "row must survive a refused forget"
         );
         assert!(
-            handle_forget(&conn, &json!({"namespace": ns_appr, "dry_run": true}), true).is_err(),
+            handle_forget(
+                &conn,
+                &json!({"namespace": ns_appr, "dry_run": true}),
+                true,
+                None
+            )
+            .is_err(),
             "dry-run must surface the same governance refusal"
         );
 
@@ -742,8 +773,8 @@ mod tests {
             "ai:alice",
         );
         let id_own = insert_meta(&conn, ns_own, "own row", json!({"agent_id": "ai:alice"}));
-        let ok =
-            handle_forget(&conn, &json!({"namespace": ns_own}), true).expect("owner forget ok");
+        let ok = handle_forget(&conn, &json!({"namespace": ns_own}), true, None)
+            .expect("owner forget ok");
         assert_eq!(ok["deleted"].as_u64(), Some(1), "owner may forget own rows");
         assert!(
             db::get(&conn, &id_own).expect("get own").is_none(),
@@ -755,7 +786,7 @@ mod tests {
         // (3) NO REGRESSION: same Approve namespace, single-operator default
         //     (env unset → owner None) → gate SKIPPED, forget proceeds.
         let id_appr2 = insert_meta(&conn, ns_appr, "appr row2", json!({"agent_id": "ai:alice"}));
-        let ok2 = handle_forget(&conn, &json!({"namespace": ns_appr}), true)
+        let ok2 = handle_forget(&conn, &json!({"namespace": ns_appr}), true, None)
             .expect("single-operator forget must not be governance-gated");
         assert!(
             ok2["deleted"].as_u64().unwrap_or(0) >= 1,
