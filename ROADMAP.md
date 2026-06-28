@@ -1252,9 +1252,9 @@ CUT: full RQGM / population genetics in `src/` · governance auto-mutation witho
 
 **Coverage:** ~**75–85% of ROADMAP §2** (seven structural properties) vs ~**25–35% of TRACT L1** (frozen constitution). Pillar scorecard: **10 of 14 CORRECT, 4 partial** (Pillar 1 "One Claim" splits ✅ L3 kinds-not-classes / 🟡 L1 Claim object — UUID not BLAKE3-CID).
 
-### 26.1 The 27 canonical gaps
+### 26.1 The 32 canonical gaps
 
-**27 development gaps: 4 P0 epics · 9 P1 · 14 P2**; **~16 UNTRACKED**; **3 proof-impossible** (architectural limits, not backlog — chiefly vote-independence per §25.7 P2). Filing the 16 UNTRACKED gaps is itself a §24 prime-directive obligation. (An earlier "52" count was granularity inflation; deduped against code it is 27. Items Grok carried — `#1672` curator_mode, `#1674` db_schema_version, HTTP `find_paths` 501 — are already FIXED and are dropped, not listed open.)
+**32 development gaps: 4 P0 epics · 11 P1 · 17 P2**; **~20 UNTRACKED**; **3 proof-impossible** (architectural limits, not backlog — chiefly vote-independence per §25.7 P2). Filing the UNTRACKED gaps is itself a §24 prime-directive obligation. (An earlier "52" count was granularity inflation; deduped against code it was 27, then raised to **32** by the §26.6 corpus-completeness pass — see §26.6 for the +5 recovery. Items Grok carried — `#1672` curator_mode, `#1674` db_schema_version, HTTP `find_paths` 501 — are already FIXED and are dropped, not listed open.)
 
 ### 26.2 The reconciled P0 chain (ordered, non-negotiable)
 
@@ -1280,6 +1280,21 @@ Four passes across **two decorrelated model families** (Grok/xAI + Opus/Anthropi
 ### 26.5 Claims discipline (binding — mirrors §25.6)
 
 **Banned until the gate behind it ships:** "pure recall" (P0-1) · "decorrelation enforced"/"N independent producers" (P0-2) · "secure-by-default attestation" (P0-3) · "epoch closure shipped" (P0-4) · "append-only"/"no silent delete" (G6) · "content-addressed"/"BLAKE3 identity" (G8) · "TRACT-/L1-conformant" (G24 CC0 vectors). **Perma-banned:** the grandeur register (incl. ai-memory's own "eternity-grade"/"civilization-scale"/"world-class" house vocabulary) + "implements RQGM" + vote-independence. CLAIMED ≠ ATTESTED throughout.
+
+### 26.6 Corpus-completeness pass (gap count 27→32)
+
+**Method.** A **21-agent corpus-completeness council** (3 waves × 7) diffed the full pre-TRACT design corpus (the four superseded clean-slate design drafts) against the TRACT framework that distilled it, CodeGraph-anchored against `release/v0.8.0`. The question was narrow and adversarial: *did the distillation into TRACT lose anything load-bearing the corpus had carried, before TRACT became the sole measuring stick of this assessment?* Full report: [`docs/reviews/corpus-completeness-21-agent-OPUS.md`](docs/reviews/corpus-completeness-21-agent-OPUS.md).
+
+**Finding — faithful ~97% superset, no constitutional loss.** TRACT is a faithful **~97% superset** of the corpus: every constitutional property survives the distillation intact, and 8 of 15 themes were *extended* with net-new resolutions. The "for infinity / OSS" longevity clause is substantively honored — only the grandeur *words* were cut; the mechanisms were kept and several sharpened. The §26.0 verdict and scorecard are **unchanged** (10 of 14 CORRECT, two-axis A− / C+). No re-grade.
+
+**Recovery — 5 operational/security gaps TRACT had folded into prose** (lifting the count **27 → 32: 4 P0 · 11 P1 · 17 P2**). The two highest-value are CodeGraph-verified v0.8.0 **defects** — present-tense data-privacy holes in the shipped substrate, not horizon divergences — and are therefore **§24 prime-directive defects to file + fix, not divergences to label**:
+
+- **G29 — secrets-in-memory have no write-path screening.** No store surface screens caller content for credential-shaped material (API keys, bearer tokens, PEM private keys, passphrases); `validate.rs` checks shape/length only (`src/validate.rs:917`). A pasted secret is persisted, FTS-indexed, embedded, federated, and surfaced verbatim on recall + forensic export. **Fix:** a fail-closed pre-write screen on the SAL write path (SQLite + Postgres parity).
+- **G30 — erasure is incomplete (forget is not erasure).** Bulk `forget` (`src/storage/mod.rs:2852`) deletes the relational row but leaves the content **(a)** in the **federation push-DLQ** (`payload_json`, non-FK `memory_id` — re-syncs the "forgotten" content to peers), **(b)** as a **live HNSW vector in RAM** (never calls `idx.remove` — semantic recall still surfaces it until rebuild), and **(c)** with **no persisted tombstone** (`federation_receive.rs:446-450` "no tombstone row" → a peer re-pushes the row on the next catch-up sync → resurrection). **Fix:** make `forget` a true erasure — purge matching DLQ payloads in-tx, invalidate the HNSW vector synchronously, persist a signed tombstone the receive path checks before accepting an inbound write.
+
+The remaining 3 recovered gaps are operational hardening (G28 forbidden-export-class · G31 latency-SLO degrade actuator · G32 cross-mind MPC/FHE/DP — G32 already TRACKED @ §11.7 / FED-RQ-AGG #1707, horizon, advertise-banned); none touches the constitution. Plus enrichments to G1/G5/G6/G10 in the canonical gaps deliverable.
+
+**Claims discipline (extends §26.5).** Until G29 + G30 ship, **banned:** "secrets are screened" / "credential-safe storage" (G29) · "forget erases" / "right-to-erasure" / "complete erasure" / "tombstoned delete" (G30). The substrate **deletes a row** today; it does not **erase content**. CLAIMED ≠ ATTESTED throughout.
 
 ---
 

@@ -292,6 +292,41 @@ This design advances *what can be guaranteed about records*. It does not pretend
 - **The dissent stays LIVE.** The "DO NOT BUILD" argument remains on its own page, steelmanned and **un-defanged** — a 17/21 vote *overrules* it, it does not *resolve* it. The benchmark is the resolution; until it runs, the dissent is the operative position, and the gate must be able to fail the whole project, not just the A→B step.
 - **Banned claims (incl. this project's own grandeur):** "perfect memory," "ASI-ready," "hive mind," "implements Red Queen," "ZK-synced semantic search," "decorrelation enforce shipped," "runs on kilobyte RAM," **and "eternal," "∞," "world-class to infinity," "writing for AI civilization," "the value rises with the intelligence using it."** **Allowed:** "open protocol + reference implementation," "constitutional / consent-bound / attested endpoint persistence," "bias-displacement *trajectory* (advisory until attestation)," "encrypted local substrate with optional consent-gated replication," "free forever under an open license."
 
+### 16.A — Falsifiable self-grade (discharges commandment 13)
+
+This grades **the design in this document**, not any implementation (a codebase's realization of TRACT is graded separately). Per the honesty discipline it is **two-axis and banded** — a falsifiable column on every guarantee, a permanent-0% column on every proof-impossible, and a per-domain completeness *estimate* — never a single composite, because averaging a provable guarantee against a proof-that-cannot-be-written would itself be the grandeur §16 bans. **A grade is "falsifiable" iff it names the observation that would disprove it**; a hostile reviewer is invited to produce any falsifier below.
+
+**Axis 1 — what TRACT provably guarantees *about the records* (high confidence; falsifiable now).**
+
+| Guarantee (about records, never minds) | Band | Falsifier — disprove by exhibiting… |
+|---|---|---|
+| Tamper-evidence over what was committed (§5) | HIGH | a byte-altered committed Claim whose `id` + batch-Merkle chain still verify |
+| Append-only; FORGET leaves a signed tombstone (§5, cmd 3) | HIGH | a FORGET that removes a leaf without a signed tombstone leaf |
+| Provenance binding; *claimed→attested* never silent (§2, cmd 2) | HIGH | an `attest_level` that rises without a different-key/-domain countersignature |
+| Recall purity — reads never write (§3, cmd 5) | HIGH | two identical log replays that diverge in state or `S(t)` |
+| Owner-blind host — custody confers zero read advantage (§9) | HIGH | an operator deriving plaintext or a utility-signal from custody alone |
+| Identity = signed lineage-DAG; ancestry unforgeable (§4) | HIGH | an heir speaking *as* a dead lineage without ante-mortem consent |
+| Durability is a tier, not a gate (§8) | HIGH | a partitioned node that deadlocks on an unmet durability target |
+
+**Axis 2 — what TRACT provably *cannot* solve (0% forever; not backlog, not estimate).** The §15 "hardest three" — proofs that cannot be written. Exact, not banded: (1) **singleton with no counterparty** — a true singleton collapses attestation to self-attestation; (2) **cryptography-proves-mechanism-never-mind** (vote-independence + signer≠thinker) — makeable *loud*, never *closed*; (3) **legibility / anti-ritual** — the only "fix" is judging rationale quality, which the capability cliff forbids.
+
+**Banded completeness vs. a *perfect* endpoint memory (an estimate, held-to-able — no composite).** Record-integrity core (faithfulness + accountability): **HIGH band** (residual is engineering, not proof). Survivability-across-time: **PARTIAL band** (migration-proof re-encode, unbounded-append economics, deep-archive funding named-and-open, §15). "Perfect endpoint memory" as a totality: **STRUCTURALLY-CAPPED — cannot reach complete by construction**, because the Axis-2 trio sits inside the totality and is 0% forever; any document claiming this band approaches 100% is making the banned claim. **The caveat, plainly:** the bands are an *estimate* a hostile reviewer may legitimately argue a tier lower — that contest is the falsifiability the grade exists to invite. The self-grade is *disproved* if any Axis-1 falsifier is exhibited, or any Axis-2 "0% forever" problem is genuinely solved by a primitive.
+
+### 16.B — Ranked killer-risk → mitigation deployment register
+
+**Distinct from §15** (which tables *proof-impossible / open-research* frontiers — things that can only be *labeled*). This register tables **deployment/adoption/governance risks TRACT already mitigates** — each row carries the brake that is *in the design now*. Rank = soonest-and-hardest kill first; residual falls as rank rises.
+
+| Rank | Killer-risk | How it kills | Mitigation already in TRACT |
+|---|---|---|---|
+| **1** | **Complexity-tax → SoR creep** | becomes system-of-record for the median 5–10-fact session and loses to `git + ripgrep + RAG` on the complexity tax | §16 narrow-gate: **Tier-A only** until a **pre-registered, kill-capable eval** beats the git+rg+RAG baseline on the irreducible 20%; **L3-SIDE cites hashes, never absorbs**; the **DO-NOT-BUILD dissent stays LIVE** and the gate can fail the whole project |
+| **2** | **Category-error** | a confidently-wrong durable memory ships as truth (worse than a cache miss); or it claims to *judge* a mind it is built only to witness ("implements RQGM") | §0 cliff + cmd 6 **"attest, count, freeze — never judge"**; banned-claims list; **"staleness beats amnesia; confidently-wrong durable memory is worse than a cache miss"**; the RAG-wins carve-out is refused on purpose |
+| **3** | **Capability-consolidation** | one daemon holds record + judge + stop → a single compromise captures all three | **Recorder ≠ Judge ≠ Stopper** in distinct trust domains (§6); rule-root key **outside the cognition's address space**; governance-disable-without-audit = **fail-closed boot refusal** |
+| **4** | **Monoculture-laundering** | *claimed* decorrelation sold as *attested* — a forgeable green checkmark over a shared-pretraining family | **two-axis `min(structural, behavioral)`** (§7); the behavioral rung is **mandatory + continuous**; `enforce` **INERT on claimed metadata**; reports "estimated-decorrelated at confidence X," never "decorrelated" |
+| **5** | **Audit-theater** | a present hash-chain read as a *coverage* proof; integrity ≠ completeness | named coverage-gap honesty (§5); **batch-Merkle fail-closed on append-completeness**; `witness_level` tiers so the reader sees what the audit proves *right now* |
+| **6** | **Durability-gate-deadlock** | a durability target treated as a write-gate deadlocks a partitioned node | **W-of-N is a caller-selected subscription, never a write-gate** (§8); local-first commit is the only write path; the formal tier-not-gate proof |
+
+Rank 1–2 carry the highest residual (the mitigation is a *gate that must actually be run*, not a property already proven); rank 6 the lowest (a closed formal proof). Promoting **complexity-tax** and **category-error** to rows 1–2 makes the two existential risks first-class and ranked, not buried in prose.
+
 ---
 
 ## 17. The commandments
