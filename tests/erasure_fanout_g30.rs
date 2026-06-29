@@ -243,6 +243,51 @@ fn forget_leaves_no_cleartext_remanence_g30() {
     );
 }
 
+/// #1848 (security review S5) — archive-restore must NOT resurrect a
+/// forgotten (tombstoned) memory. `forget` with archive=true leaves the row
+/// in `archived_memories` AND records a tombstone; `restore_archived` must
+/// treat the tombstoned id as not-found (Ok(false)) and leave it dead.
+#[test]
+fn restore_archived_blocked_by_forget_tombstone_1848() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+
+    let id = seed_memory(&conn, "g30-restore", "rnote", "original secret content");
+    // archive=true: the archived copy survives the forget (this is the
+    // resurrection vector the guard must close).
+    db::forget(&conn, Some("g30-restore"), None, None, true).expect("forget");
+    assert_eq!(
+        tombstone_count(&conn, &id),
+        1,
+        "#1848: forget must record a tombstone"
+    );
+    assert_eq!(mem_count(&conn, &id), 0, "the live row is gone");
+
+    let restored = db::restore_archived(&conn, &id).expect("restore_archived");
+    assert!(
+        !restored,
+        "#1848: restoring a tombstoned (forgotten) memory must be a no-op"
+    );
+    assert_eq!(
+        mem_count(&conn, &id),
+        0,
+        "#1848: a forgotten memory must NOT be resurrected via archive-restore"
+    );
+
+    // Owner-scoped restore path must enforce the same guard.
+    let restored_caller =
+        db::restore_archived_for_caller(&conn, &id, "ai:tester@host").expect("restore_for_caller");
+    assert!(
+        !restored_caller,
+        "#1848: owner-scoped restore of a tombstoned memory must also be a no-op"
+    );
+    assert_eq!(
+        mem_count(&conn, &id),
+        0,
+        "still dead after owner-scoped restore"
+    );
+}
+
 /// The FORGET tombstone signable bytes are deterministic + domain-separated.
 #[test]
 fn forget_tombstone_signable_bytes_deterministic_g30() {

@@ -8564,6 +8564,14 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         if !exists {
             return Ok(false);
         }
+        // #1848 (security review S5, gap G30) — a forgotten memory carries a
+        // signed forget-tombstone; restoring its archived copy would resurrect
+        // the erased content and undo the durable erasure. Treat a tombstoned id
+        // as not-found (no-op restore), mirroring the G30 gate on
+        // `insert_if_newer` / `merge_inbound`.
+        if memory_is_tombstoned(conn, id)? {
+            return Ok(false);
+        }
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -8702,6 +8710,12 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             )
             .unwrap_or(false);
         if !owned {
+            return Ok(false);
+        }
+        // #1848 (security review S5, gap G30) — never resurrect a tombstoned
+        // (forgotten) memory via restore; treat as not-found. Mirrors the G30
+        // gate on the restore + insert chokepoints.
+        if memory_is_tombstoned(conn, id)? {
             return Ok(false);
         }
         // Check if ID already exists in active memories to prevent silent overwrite.

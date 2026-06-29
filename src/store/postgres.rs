@@ -15635,6 +15635,20 @@ impl MemoryStore for PostgresStore {
             return Ok(false);
         }
 
+        // #1848 (security review S5, gap G30) — never resurrect a tombstoned
+        // (forgotten) memory via restore; treat as not-found. Mirrors the G30
+        // tombstone-wins gate on `merge_inbound` (forget_tombstones EXISTS).
+        let tombstoned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("archive_restore tombstone check", e))?;
+        if tombstoned {
+            return Ok(false);
+        }
+
         // Reject if the id is already in active memories.
         let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)
             .bind(id)
