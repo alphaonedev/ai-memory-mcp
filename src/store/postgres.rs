@@ -632,17 +632,16 @@ const REASON_UNSTAMPED_TENANT_WRITE: &str =
 const REASON_UNSTAMPED_TENANT_DELETE: &str =
     "memory has no agent_id stamp; tenant deletes refused (use admin path)";
 
-/// v0.8.1 W1 (#1821 / gap G29) — postgres parity for the sqlite
+/// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
-/// redacted clone when [`crate::secret_screen::redact_for_storage`] detects
-/// credential material in the content, else `None` (caller keeps the
-/// original `&Memory`). NEVER refuses — the caller-origin REFUSE happens
-/// earlier at `validate_content`; the funnel only masks.
+/// redacted clone when [`crate::secret_screen::redact_memory_for_storage`]
+/// detects credential material in `content`, `title`, any `tag`, or a
+/// metadata string-leaf value (minus the crypto/system carve-out), else
+/// `None` (caller keeps the original `&Memory`). NEVER refuses — the
+/// caller-origin REFUSE happens earlier in `validate::*`; the funnel only
+/// masks (federation / recovery / internal paths must converge).
 fn screen_storage_memory(memory: &Memory) -> Option<Memory> {
-    crate::secret_screen::redact_for_storage(&memory.content).map(|content| Memory {
-        content,
-        ..memory.clone()
-    })
+    crate::secret_screen::redact_memory_for_storage(memory)
 }
 
 impl PostgresStore {
@@ -10545,15 +10544,14 @@ impl MemoryStore for PostgresStore {
             return Ok(Vec::new());
         }
 
-        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
-        // bulk parity). Mask any element carrying credential material. Stays
-        // zero-copy (keeps the original borrow) when screening is `off` or no
-        // row carries a secret; only materializes a screened copy on a hit.
+        // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT backstop
+        // (postgres bulk parity). Mask any element carrying credential
+        // material in content / title / tags / metadata (minus the carve-out).
+        // Stays zero-copy (keeps the original borrow) when screening is `off`
+        // or no row carries a secret; only materializes a screened copy on a
+        // hit.
         let screened_holder;
-        let memories: &[Memory] = if memories
-            .iter()
-            .any(|m| crate::secret_screen::redact_for_storage(&m.content).is_some())
-        {
+        let memories: &[Memory] = if memories.iter().any(|m| screen_storage_memory(m).is_some()) {
             screened_holder = memories
                 .iter()
                 .map(|m| screen_storage_memory(m).unwrap_or_else(|| m.clone()))
