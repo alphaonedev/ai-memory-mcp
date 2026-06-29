@@ -139,9 +139,12 @@ fn transcript_credential_is_redacted_in_forensic_bundle_1845() {
     let bytes = std::fs::read(&bundle_path).expect("read bundle");
     let files = read_ustar(&bytes).expect("parse bundle tar");
     let content_key = format!("transcripts/{}.content", t.id);
-    let egressed = files
-        .get(&content_key)
-        .unwrap_or_else(|| panic!("bundle must contain {content_key}; keys: {:?}", files.keys()));
+    let egressed = files.get(&content_key).unwrap_or_else(|| {
+        panic!(
+            "bundle must contain {content_key}; keys: {:?}",
+            files.keys()
+        )
+    });
     let egressed = String::from_utf8(egressed.clone()).expect("content is utf-8");
 
     // (e) the verbatim credential is ABSENT and the mask token PRESENT.
