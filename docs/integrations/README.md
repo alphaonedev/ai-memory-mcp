@@ -165,6 +165,7 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 | [`claude-agent-sdk.md`](claude-agent-sdk.md) | Claude Agent SDK | 3 (programmatic) | n/a (programmatic) | recipe (TS + Python) |
 | [`openai-apps-sdk.md`](openai-apps-sdk.md) | OpenAI Apps SDK / Assistants / Responses | 3 (programmatic) | n/a (programmatic) | recipe |
 | [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`grok-build.md`](grok-build.md) | xAI Grok Build / Grok Shell (`grok` CLI) | 1+2 hybrid (MCP stdio + session-boot hooks + permission gates) | yes (--config) | reference recipe |
 | [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
 | [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
 | [`networking.md`](networking.md) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
