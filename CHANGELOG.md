@@ -18,8 +18,11 @@ No new v0.9.0 capability. Three streams:
    postgres L2 rehydration parity ([#1693](https://github.com/alphaonedev/ai-memory-mcp/issues/1693)),
    and documentation/GitHub-Pages drift remediation.
 2. **Security review — 9 findings, all fixed.** A 7-lane adversarial review
-   (find → verify → triage) surfaced 9 confirmed issues — all fixed, tested,
-   and closed, each contested call decided by a 5-agent vote (`4d3ea1c5`):
+   (find → verify → triage) surfaced 9 confirmed issues — all fixed and closed,
+   7 of the 9 also covered by a dedicated regression test (#1845 forensic-
+   transcript redaction and #1851 CI `workflow_dispatch` injection ship verified
+   code fixes that are not separately regression-tested), each contested call
+   decided by a 5-agent vote (`4d3ea1c5`):
    federated-signal authorship ([#1843](https://github.com/alphaonedev/ai-memory-mcp/issues/1843)),
    field-complete secret screen ([#1844](https://github.com/alphaonedev/ai-memory-mcp/issues/1844)),
    forensic-transcript redaction ([#1845](https://github.com/alphaonedev/ai-memory-mcp/issues/1845)),
