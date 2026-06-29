@@ -35,6 +35,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -798,6 +799,183 @@ pub fn load_daemon_verifying_key(agent_id: &str) -> Result<Option<VerifyingKey>>
 #[must_use]
 pub fn resolve_daemon_verifying_key() -> Option<VerifyingKey> {
     DAEMON_AUDIT_KEY.get().map(SigningKey::verifying_key)
+}
+
+// ---------------------------------------------------------------------------
+// v0.8.1 #1850 (CWE-354) — off-table audit-trail truncation anchor
+// ---------------------------------------------------------------------------
+//
+// `signed_events::verify_audit_trail` recomputes the chain head from the
+// surviving `MAX(sequence)` with NO external high-water mark, so deleting
+// the trailing N rows of the `signed_events` table leaves a contiguous
+// `1..=(head-N)` chain and the verifier reports `chain_intact = true` — a
+// false all-clear (CWE-354 Improper Validation of Integrity Check Value).
+//
+// The bar-raise (5-agent vote `4d3ea1c5`, T4): periodically stamp the
+// in-DB chain head into the #697 append-only forensic JSONL chain — an
+// ON-HOST sibling file that a naive `DELETE FROM signed_events` does not
+// touch. `verify_audit_trail` then reads the last anchored head back and
+// flags `db_head < anchored_head` as truncation.
+//
+// T4 TRAP — the watermark is carried INSIDE the existing free-form
+// `payload` Value of [`ForensicDecision`]. It MUST NOT become a new struct
+// field: [`ForensicDecision::canonical_bytes`] is a field-ordered
+// `serde_json::to_vec` with `sig` cleared, so a new field would perturb the
+// signed-bytes layout and break cross-version signature verification of the
+// WHOLE forensic chain. The payload is VERSIONED (`"v": 1`) from day one.
+
+/// `ForensicDecision.kind` for the #1850 audit-trail truncation anchor.
+/// Read back by [`last_audit_watermark`] and matched verbatim.
+pub const AUDIT_WATERMARK_KIND: &str = "audit_watermark";
+
+/// `ForensicDecision.actor` stamped on watermark rows. Distinct, reserved
+/// pseudo-actor so an auditor can grep the anchors apart from governance
+/// decisions.
+const AUDIT_WATERMARK_ACTOR: &str = "audit:watermark";
+
+/// `ForensicDecision.decision` stamped on watermark rows. The watermark is
+/// informational (not an allow/refuse/warn governance verdict); the verify
+/// path never interprets this slot, but the chain still signs over it.
+const AUDIT_WATERMARK_DECISION: &str = "watermark";
+
+/// Schema version embedded in the watermark `payload` (`"v": N`). Bump
+/// only with a forward-compatible reader change in [`last_audit_watermark`].
+const AUDIT_WATERMARK_PAYLOAD_VERSION: i64 = 1;
+
+/// Emit a watermark only once the `signed_events` chain head has advanced
+/// by at least this many sequences since the last emission. Amortizes the
+/// forensic file write off the per-append hot path (the throttle in
+/// [`maybe_record_audit_watermark`]).
+pub const WATERMARK_INTERVAL: i64 = 64;
+
+/// Process-static "last anchored sequence". `0` = none emitted yet this
+/// process. Drives the [`WATERMARK_INTERVAL`] throttle.
+static LAST_WATERMARKED_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// #1850 — record an audit-trail truncation anchor into the #697
+/// append-only forensic JSONL chain.
+///
+/// `head_sequence` is the in-DB `signed_events` chain head at emission
+/// time; `head_canonical_hash` is the hex SHA-256 of the head row's
+/// `canonical_chain_bytes` (what the NEXT row's `prev_hash` would be) so an
+/// auditor can also confirm the anchored head row's content, not just its
+/// ordinal. The pair is carried in the forensic `payload` Value — NEVER a
+/// new [`ForensicDecision`] field (see the module-level T4 note).
+///
+/// Fire-and-forget through [`record_decision`]: a no-op when the forensic
+/// sink is not initialised, errors logged + swallowed otherwise.
+pub fn record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
+    let payload = serde_json::json!({
+        "v": AUDIT_WATERMARK_PAYLOAD_VERSION,
+        "head_sequence": head_sequence,
+        "head_canonical_hash": head_canonical_hash,
+    });
+    record_decision(
+        AUDIT_WATERMARK_ACTOR,
+        AUDIT_WATERMARK_DECISION,
+        AUDIT_WATERMARK_KIND,
+        "",
+        payload,
+    );
+}
+
+/// #1850 — throttled emitter for the signed-events append hot path.
+///
+/// Writes a watermark only when `head_sequence` has advanced at least
+/// [`WATERMARK_INTERVAL`] beyond the last anchored sequence (process-wide),
+/// so the forensic file write is amortized across many appends. The first
+/// emission of a process happens once the head reaches `WATERMARK_INTERVAL`.
+///
+/// Lock-free throttle via a compare-and-swap on [`LAST_WATERMARKED_SEQ`];
+/// concurrent callers crossing the same interval boundary collapse to a
+/// single emission.
+pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &str) {
+    if head_sequence <= 0 {
+        return;
+    }
+    let last = LAST_WATERMARKED_SEQ.load(Ordering::Relaxed);
+    if head_sequence.saturating_sub(last) < WATERMARK_INTERVAL {
+        return;
+    }
+    // Claim the slot: only the CAS winner emits; a concurrent advance
+    // (Err) means a sibling already anchored a head >= ours.
+    if LAST_WATERMARKED_SEQ
+        .compare_exchange(last, head_sequence, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    record_audit_watermark(head_sequence, head_canonical_hash);
+}
+
+/// Forensic directory of the live sink, if [`init`] has run.
+fn live_sink_dir() -> Option<PathBuf> {
+    let guard = sink().lock().ok()?;
+    guard.as_ref().map(|s| s.dir.clone())
+}
+
+/// #1850 — read back the most-recent audit-trail truncation anchor from the
+/// #697 forensic JSONL chain: `(anchored_head_sequence, head_canonical_hash)`.
+///
+/// Scans the current + previous daily forensic file (newest first) for the
+/// last `kind == "audit_watermark"` row and parses its versioned `payload`.
+/// Returns `None` — anchor ABSENT (no live forensic sink / no watermark yet
+/// / legacy DB / fresh deployment / rotated away) — in which case
+/// `verify_audit_trail` reports truncation as `Unknown` rather than ever
+/// raising a false alarm or claiming intact-because-of-anchor.
+///
+/// The forensic directory is resolved from the live sink only. In the
+/// daemon and in the `ai-memory` CLI the sink is brought up at process
+/// start (`init_forensic_audit`), so this is populated for the operator
+/// `verify-audit-trail` surface; a raw-library caller that never called
+/// [`init`] sees `None` (Unknown), which is the safe default.
+#[must_use]
+pub fn last_audit_watermark() -> Option<(i64, String)> {
+    let dir = live_sink_dir()?;
+    let files = list_forensic_files(&dir).ok()?;
+    // Newest first; "current + previous daily file" per the daily rotation.
+    for file in files.iter().rev().take(2) {
+        if let Some(found) = scan_file_last_watermark(file) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Return the LAST (most-recent) watermark row in a single forensic file,
+/// or `None` if it carries none. Malformed / wrong-version rows are skipped.
+fn scan_file_last_watermark(path: &Path) -> Option<(i64, String)> {
+    let f = File::open(path).ok()?;
+    let mut found: Option<(i64, String)> = None;
+    for line in BufReader::new(f).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(row) = serde_json::from_str::<ForensicDecision>(&line) else {
+            continue;
+        };
+        if row.kind != AUDIT_WATERMARK_KIND {
+            continue;
+        }
+        if row.payload.get("v").and_then(serde_json::Value::as_i64)
+            != Some(AUDIT_WATERMARK_PAYLOAD_VERSION)
+        {
+            continue;
+        }
+        let seq = row
+            .payload
+            .get("head_sequence")
+            .and_then(serde_json::Value::as_i64);
+        let hash = row
+            .payload
+            .get("head_canonical_hash")
+            .and_then(serde_json::Value::as_str);
+        if let (Some(seq), Some(hash)) = (seq, hash) {
+            found = Some((seq, hash.to_string()));
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
