@@ -1297,6 +1297,24 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #1848 (security review S5, gap G30; 5-agent vote 4d3ea1c5 option B):
+        // this federation /sync/push restores[] path is the AUTOMATIC,
+        // peer-triggered resurrection vector. A peer must NOT undo a local
+        // forget by pushing a restore of a tombstoned id — so the G30 tombstone
+        // gate lives HERE, not on the operator restore_archived (an authorized
+        // un-forget per #1771). Tombstoned → no-op (matches the loop's posture).
+        match db::memory_is_tombstoned(&lock.0, res_id) {
+            Ok(true) => {
+                noop += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!("sync_push: tombstone check failed for {res_id}: {e}");
+                skipped += 1;
+                continue;
+            }
+        }
         match db::restore_archived(&lock.0, res_id) {
             Ok(true) => restored += 1,
             Ok(false) => noop += 1,
