@@ -481,7 +481,9 @@ pub const METADATA_SCREEN_CARVE_OUT_KEYS: &[&str] = &[
     "agent_id",
     "signature",
     "citations",
-    "consolidated_from_agents",
+    // Reference the canonical metadata-key const (SSOT) rather than re-scatter
+    // the literal — keeps the no-hardcoded-literals gate green (pm-v3.1).
+    crate::META_KEY_CONSOLIDATED_FROM_AGENTS,
     "imported_from_agent_id",
     "model_family",
 ];

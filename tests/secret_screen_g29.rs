@@ -160,6 +160,9 @@ fn store(
 
 /// #1844 — store with explicit tags + metadata so the title / tags /
 /// metadata screen surfaces can be exercised over the real MCP write path.
+// Test helper: `metadata` is an owned JSON Value passed straight into a
+// `json!` payload; taking it by value keeps the call sites readable.
+#[allow(clippy::needless_pass_by_value)]
 fn store_full(
     stdin: &mut ChildStdin,
     rx: &mpsc::Receiver<String>,
@@ -181,7 +184,7 @@ fn store_full(
     )
 }
 
-/// #1844 — read back (title, tags_json, metadata_json) for the single row in
+/// #1844 — read back (title, `tags_json`, `metadata_json`) for the single row in
 /// `namespace` so the funnel-redaction of every field can be asserted.
 fn stored_row_by_ns(
     db_path: &std::path::Path,

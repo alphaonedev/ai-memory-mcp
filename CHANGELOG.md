@@ -5,12 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.1] — Patch 1 — pre-v0.9.0 defect closure ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
+## [0.8.1] — 2026-06-29 — `hardened-patch` — defect closure + security review ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
 
-In progress on `release/v0.8.1`. A defect-closure patch that makes shipped
-v0.8.0 correct on its own current claims before any v0.9.0 feature work. No
-new v0.9.0 capability. Work items W1–W7 per
-`docs/v0.8.1/V0.8.1-PATCH-1-WORK-PROMPT.md`.
+A defect-closure + security-hardening patch that makes shipped v0.8.0 correct
+on its own current claims, then puts the result through an adversarial review.
+No new v0.9.0 capability. Three streams:
+
+1. **Work items W1–W7** (per `docs/v0.8.1/V0.8.1-PATCH-1-WORK-PROMPT.md`):
+   G29 write-path secret screen, G30 erasure fan-out + signed tombstones
+   (schema **v71**), G12 honest durability (`202` not `503`), MCP governance
+   fail-closed ([#1685](https://github.com/alphaonedev/ai-memory-mcp/issues/1685)),
+   postgres L2 rehydration parity ([#1693](https://github.com/alphaonedev/ai-memory-mcp/issues/1693)),
+   and documentation/GitHub-Pages drift remediation.
+2. **Security review — 9 findings, all fixed.** A 7-lane adversarial review
+   (find → verify → triage) surfaced 9 confirmed issues — all fixed, tested,
+   and closed, each contested call decided by a 5-agent vote (`4d3ea1c5`):
+   federated-signal authorship ([#1843](https://github.com/alphaonedev/ai-memory-mcp/issues/1843)),
+   field-complete secret screen ([#1844](https://github.com/alphaonedev/ai-memory-mcp/issues/1844)),
+   forensic-transcript redaction ([#1845](https://github.com/alphaonedev/ai-memory-mcp/issues/1845)),
+   FTS OR-tree DoS cap ([#1846](https://github.com/alphaonedev/ai-memory-mcp/issues/1846)),
+   CGNAT SSRF ([#1847](https://github.com/alphaonedev/ai-memory-mcp/issues/1847)),
+   archive-restore tombstone gate ([#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848)),
+   namespace-less forget governance ([#1849](https://github.com/alphaonedev/ai-memory-mcp/issues/1849)),
+   audit tail-truncation anchor ([#1850](https://github.com/alphaonedev/ai-memory-mcp/issues/1850)),
+   CI workflow_dispatch injection ([#1851](https://github.com/alphaonedev/ai-memory-mcp/issues/1851)).
+3. **PostgreSQL + Apache AGE + pgvector verified live.** The postgres+AGE
+   backend was deployed on real infra and passed 3 green rounds + an AI-NHI
+   dogfood (store / pgvector semantic recall / AGE graph projection / forget /
+   secret-screen); the do-hive provisioning was fixed to install pgvector +
+   build AGE ([#1842](https://github.com/alphaonedev/ai-memory-mcp/issues/1842)).
 
 ### Breaking / API-semantics changes
 
