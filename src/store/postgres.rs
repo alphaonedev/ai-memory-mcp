@@ -13951,6 +13951,36 @@ impl MemoryStore for PostgresStore {
         Ok(deleted.len())
     }
 
+    async fn forget_distinct_namespaces(
+        &self,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+    ) -> StoreResult<Vec<String>> {
+        // #1849 (CWE-862) — DISTINCT namespaces of the forget match set,
+        // NON-owner-scoped (admin path). Mirrors the [`forget`] DELETE
+        // predicate EXACTLY (the same ILIKE-over-title/content substring
+        // match + tier filter) but omits the namespace predicate (this is
+        // only consulted on a `namespace = None` cross-namespace forget) and
+        // SELECTs DISTINCT namespace with NO LIMIT — so the HTTP gate sees
+        // every governed namespace, including any whose rows would sort past
+        // the #1602 preview cap. 5-agent vote 4d3ea1c5.
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let pattern_like = pattern.map(|p| format!("%{p}%"));
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT namespace FROM memories
+             WHERE ($1::text IS NULL OR tier = $1)
+               AND ($2::text IS NULL
+                    OR title ILIKE $2
+                    OR content ILIKE $2)",
+        )
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("forget_distinct_namespaces", e))?;
+        Ok(rows.into_iter().map(|(ns,)| ns).collect())
+    }
+
     async fn consolidate(
         &self,
         _ctx: &CallerContext,
