@@ -256,7 +256,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `purge_and_tombstone_forget` erasure-fanout helper + `memory_is_tombstoned`
     // tombstone gate + the W1/G29 redact-at-storage funnel wiring in `db::insert`
     // / `insert_if_newer`.
-    ("src/storage/mod.rs", 21_250),
+    // 2026-06-29 (#1849/#1844 security review) — bumped 21_250 → 21_350 for the
+    // UNCAPPED `forget_distinct_namespaces` / `forget_distinct_namespaces_for_caller`
+    // governance-gate query helpers (#1849) + the title/tags/metadata redact funnel.
+    ("src/storage/mod.rs", 21_350),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

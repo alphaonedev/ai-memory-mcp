@@ -149,7 +149,14 @@ const QUAL_6_CEILING: usize = 114;
 /// test-mock impls add 4 sites. No new error contract; the legacy String
 /// shape is required for signature parity with the pre-existing trait.
 /// Net acknowledged addition: +4.
-const QUAL_7_CEILING: usize = 33;
+///
+/// 2026-06-29 (#1849 security review) — raised 33 → 34 for the factored
+/// `forget_governance_gate_one_ns` helper in `src/mcp/tools/forget.rs`, which
+/// returns `Result<(), String>` to match the existing forget-gate
+/// `deny_message` convention it was extracted from (the per-namespace gate the
+/// namespace-less bulk-forget branch now reuses). Signature parity with the
+/// pre-existing single-namespace gate; no new error contract. Net: +1.
+const QUAL_7_CEILING: usize = 34;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
