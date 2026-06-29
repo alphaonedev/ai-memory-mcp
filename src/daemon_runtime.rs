@@ -763,11 +763,13 @@ pub struct ServeArgs {
     /// sync-daemon already uses.
     #[arg(long, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
-    /// Deadline for quorum-ack collection. After this many ms the
-    /// write returns 503 `quorum_not_met`. Default 2000 assumes
-    /// same-DC peers; cross-region (WAN) meshes need 5000-10000 —
-    /// the do-1461 reference deployment uses 8000. See
-    /// docs/federation.md for sizing guidance. (#1565)
+    /// Deadline for quorum-ack collection. After this many ms a
+    /// locally-durable write returns **202 Accepted** with the
+    /// replication state in the body (`quorum_met:false`) — NOT a 503
+    /// (v0.8.1 W3 / gap G12; the local row committed, so it is never a
+    /// 5xx). Default 2000 assumes same-DC peers; cross-region (WAN)
+    /// meshes need 5000-10000 — the do-1461 reference deployment uses
+    /// 8000. See docs/federation.md for sizing guidance. (#1565)
     #[arg(long, default_value_t = 2000)]
     pub quorum_timeout_ms: u64,
     /// Optional mTLS client cert for outbound federation POSTs. Same
