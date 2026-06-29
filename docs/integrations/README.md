@@ -1,6 +1,3 @@
----
-layout: doc
----
 # Session-boot integrations — agent matrix
 
 This directory documents how to wire `ai-memory` into every AI agent so the
@@ -37,15 +34,15 @@ agents and humans always know exactly what's loaded and what's configured.
 
 ```text
 # ai-memory boot: ok
-#   version:    0.7.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v57, 161 memories)
+#   version:    0.8.0
+#   db:         /home/u/.claude/ai-memory.db (schema=v71, 161 memories)
 #   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma3:4b)
 #   latency:    12ms
-#   namespace:  ai-memory-mcp/v0.7.0-release (loaded 3 memories)
+#   namespace:  ai-memory-mcp/v0.8.0-release (loaded 3 memories)
 ```
 
 > DOC-4 (med/low review batch) — example version + schema bumped to
-> match the current v0.8.0-dev substrate (`CURRENT_SCHEMA_VERSION = 70`).
+> match the current v0.8.1 substrate (`CURRENT_SCHEMA_VERSION = 71`).
 > The pre-v0.7.0 example showed v0.6.3 / schema v19, which was many
 > migrations behind the substrate and major releases behind the
 > daemon binary integrators land on today.
@@ -130,11 +127,11 @@ Override the strategy with `--system-flag <flag>`, `--system-env <name>`,
 or `--message-file-flag <flag>` if your agent uses a different
 contract. See `ai-memory wrap --help` for the full surface.
 
-The category-3 recipes ([`codex-cli.md`](codex-cli.html),
-[`claude-agent-sdk.md`](claude-agent-sdk.html),
-[`openai-apps-sdk.md`](openai-apps-sdk.html),
-[`grok-and-xai.md`](grok-and-xai.html),
-[`local-models.md`](local-models.html)) all link to `ai-memory wrap` for
+The category-3 recipes ([`codex-cli.md`](codex-cli.md),
+[`claude-agent-sdk.md`](claude-agent-sdk.md),
+[`openai-apps-sdk.md`](openai-apps-sdk.md),
+[`grok-and-xai.md`](grok-and-xai.md),
+[`local-models.md`](local-models.md)) all link to `ai-memory wrap` for
 the launcher case and keep the SDK code patterns for in-process
 integrations.
 
@@ -152,29 +149,30 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 
 | File | Agent | Category | Installer | Status |
 |---|---|---|---|---|
-| [`claude-code.md`](claude-code.html) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (2 hooks: SessionStart boot + PreToolUse governance) | yes | reference recipe |
-| [`cursor.md`](cursor.html) | Cursor | 2 (MCP + rules) | yes | recipe |
-| [`cline.md`](cline.html) | Cline (VS Code extension) | 2 (MCP + custom instructions) | yes (--config) | recipe |
-| [`roo-code.md`](roo-code.html) | Roo Code (Cline fork) | 2 (MCP + custom instructions) | no (PR-2 follow-up) | recipe |
-| [`continue.md`](continue.html) | Continue (VS Code / JetBrains) | 2 (MCP + systemMessage) | yes | recipe |
-| [`windsurf.md`](windsurf.html) | Windsurf (Codeium) | 2 (MCP + rules) | yes | recipe |
-| [`zed.md`](zed.html) | Zed assistant | 2 (MCP + assistant directive) | no (PR-2 follow-up) | recipe |
-| [`goose.md`](goose.html) | Block Goose | 2 (MCP + system instructions) | no (PR-2 follow-up) | recipe |
-| [`openclaw.md`](openclaw.html) | OpenClaw CLI | 2 (MCP + system message) | yes (--config) | recipe |
-| [`codex-cli.md`](codex-cli.html) | OpenAI Codex CLI | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`gemini.md`](gemini.html) | Google Gemini CLI / Gemini Code Assist | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`aider.md`](aider.html) | Aider | 3 (programmatic via `--message-file`) | n/a (programmatic) | recipe |
-| [`cody.md`](cody.html) | Sourcegraph Cody | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`claude-agent-sdk.md`](claude-agent-sdk.html) | Claude Agent SDK | 3 (programmatic) | n/a (programmatic) | recipe (TS + Python) |
-| [`openai-apps-sdk.md`](openai-apps-sdk.html) | OpenAI Apps SDK / Assistants / Responses | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`grok-and-xai.md`](grok-and-xai.html) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`local-models.md`](local-models.html) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
-| [`platforms.md`](platforms.html) | macOS / Linux / Windows / WSL / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
-| [`networking.md`](networking.html) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
-| [`global-claude-md-template.md`](global-claude-md-template.html) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
-| [`v0.6.4-system-prompt-snippet.md`](v0.6.4-system-prompt-snippet.html) | v0.6.4 discovery-aware NHI bootstrap (drop-in for any harness) | n/a | n/a | reference |
-| [`llm-backends.md`](llm-backends.html) | Per-backend MCP `env:` block recipes (Ollama, LMStudio, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, vLLM, llama.cpp). Closes #1144 (operator paper-cut: shell env doesn't reach MCP subprocesses). | n/a | n/a | reference |
-| [`mobile.md`](mobile.html) | Consumer-signs-at-integration discipline for iOS + Android release artifacts (#1247 / PR #1283); xcframework + jniLibs layout, code-signing handoff to the consuming app, mobile-runtime CI subset. | n/a | n/a | reference |
+| [`claude-code.md`](claude-code.md) | Claude Code (CLI, Mac/Win desktop, IDE) | 1 (2 hooks: SessionStart boot + PreToolUse governance) | yes | reference recipe |
+| [`cursor.md`](cursor.md) | Cursor | 2 (MCP + rules) | yes | recipe |
+| [`cline.md`](cline.md) | Cline (VS Code extension) | 2 (MCP + custom instructions) | yes (--config) | recipe |
+| [`roo-code.md`](roo-code.md) | Roo Code (Cline fork) | 2 (MCP + custom instructions) | no (PR-2 follow-up) | recipe |
+| [`continue.md`](continue.md) | Continue (VS Code / JetBrains) | 2 (MCP + systemMessage) | yes | recipe |
+| [`windsurf.md`](windsurf.md) | Windsurf (Codeium) | 2 (MCP + rules) | yes | recipe |
+| [`zed.md`](zed.md) | Zed assistant | 2 (MCP + assistant directive) | no (PR-2 follow-up) | recipe |
+| [`goose.md`](goose.md) | Block Goose | 2 (MCP + system instructions) | no (PR-2 follow-up) | recipe |
+| [`openclaw.md`](openclaw.md) | OpenClaw CLI | 2 (MCP + system message) | yes (--config) | recipe |
+| [`codex-cli.md`](codex-cli.md) | OpenAI Codex CLI | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`gemini.md`](gemini.md) | Google Gemini CLI / Gemini Code Assist | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`aider.md`](aider.md) | Aider | 3 (programmatic via `--message-file`) | n/a (programmatic) | recipe |
+| [`cody.md`](cody.md) | Sourcegraph Cody | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`claude-agent-sdk.md`](claude-agent-sdk.md) | Claude Agent SDK | 3 (programmatic) | n/a (programmatic) | recipe (TS + Python) |
+| [`openai-apps-sdk.md`](openai-apps-sdk.md) | OpenAI Apps SDK / Assistants / Responses | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`grok-and-xai.md`](grok-and-xai.md) | xAI Grok | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`grok-build.md`](grok-build.md) | xAI Grok Build / Grok Shell (`grok` CLI) | 1+2 hybrid (MCP stdio + session-boot hooks + permission gates) | yes (--config) | reference recipe |
+| [`local-models.md`](local-models.md) | Hermes, Llama, Mistral, etc. via LM Studio / Ollama / vLLM | 3 (programmatic) | n/a (programmatic) | recipe |
+| [`platforms.md`](platforms.md) | macOS / Linux / Windows / WSL / Docker / Kubernetes / ARM Linux / commercial Unix / embedded Linux / BSD platform notes | n/a | n/a | reference |
+| [`networking.md`](networking.md) | macOS + Tailscale / VPN per-app intercept gotchas (#704) and tailnet-IP workarounds | n/a | n/a | reference |
+| [`global-claude-md-template.md`](global-claude-md-template.md) | `~/.claude/CLAUDE.md` belt-and-suspenders snippet | 1 fallback | n/a | reference |
+| [`v0.6.4-system-prompt-snippet.md`](v0.6.4-system-prompt-snippet.md) | v0.6.4 discovery-aware NHI bootstrap (drop-in for any harness) | n/a | n/a | reference |
+| [`llm-backends.md`](llm-backends.md) | Per-backend MCP `env:` block recipes (Ollama, LMStudio, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, vLLM, llama.cpp). Closes #1144 (operator paper-cut: shell env doesn't reach MCP subprocesses). | n/a | n/a | reference |
+| [`mobile.md`](mobile.md) | Consumer-signs-at-integration discipline for iOS + Android release artifacts (#1247 / PR #1283); xcframework + jniLibs layout, code-signing handoff to the consuming app, mobile-runtime CI subset. | n/a | n/a | reference |
 
 ## Failure modes (any recipe)
 
@@ -192,7 +190,7 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
   hide memory subjects (`title` → `<redacted>`, every other field —
   namespace, tier, id_short, priority, age — still surfaces). The env
   var `AI_MEMORY_BOOT_ENABLED=0` overrides the config-file value. See
-  [`claude-code.md` §Privacy / disable](claude-code.html#privacy--disable-v0631-pr-9h)
+  [`claude-code.md` §Privacy / disable](claude-code.md#privacy--disable-v0631-pr-9h)
   for the full table.
 - Schema drift across a fleet: from v0.6.3.1 the JSON manifest exposes
   `schema_supported: bool` as a top-level key so SIEMs can alert when a
@@ -202,13 +200,13 @@ recipe's snippets and `ai-memory wrap <agent>` (PR-6).
 - Platform mismatch: a recipe written for `bash` doesn't run on native
   Windows, embedded BusyBox `ash`, or inside a Kubernetes sidecar with
   no shell. See
-  [`platforms.md`](platforms.html) for per-platform notes —
-  including the [Kubernetes HTTP boot equivalent](platforms.html#boot-hook-in-kubernetes)
+  [`platforms.md`](platforms.md) for per-platform notes —
+  including the [Kubernetes HTTP boot equivalent](platforms.md#boot-hook-in-kubernetes)
   for clusters where stdio recipes don't apply, and
-  [ARM Linux / embedded](platforms.html#arm-linux-raspberry-pi-aws-graviton-others)
+  [ARM Linux / embedded](platforms.md#arm-linux-raspberry-pi-aws-graviton-others)
   resource budgets for low-memory devices.
 - CI gap: not every supported platform is in the GitHub Actions matrix.
-  See the [Lifetime test matrix](platforms.html#lifetime-test-matrix-pr-3)
+  See the [Lifetime test matrix](platforms.md#lifetime-test-matrix-pr-3)
   in `platforms.md` for what CI actually exercises vs. what's
   documented best-effort.
 

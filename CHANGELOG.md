@@ -5,24 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] — 2026-06-29 — `hardened-patch` — defect closure + security review ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
 
-_Next development cycle. Nothing yet._
+A defect-closure + security-hardening patch that makes shipped v0.8.0 correct
+on its own current claims, then puts the result through an adversarial review.
+No new v0.9.0 capability. Three streams:
+
+1. **Work items W1–W7** (per `docs/v0.8.1/V0.8.1-PATCH-1-WORK-PROMPT.md`):
+   G29 write-path secret screen, G30 erasure fan-out + signed tombstones
+   (schema **v71**), G12 honest durability (`202` not `503`), MCP governance
+   fail-closed ([#1685](https://github.com/alphaonedev/ai-memory-mcp/issues/1685)),
+   postgres L2 rehydration parity ([#1693](https://github.com/alphaonedev/ai-memory-mcp/issues/1693)),
+   and documentation/GitHub-Pages drift remediation.
+2. **Security review — 9 findings, all fixed.** A 7-lane adversarial review
+   (find → verify → triage) surfaced 9 confirmed issues — all fixed, tested,
+   and closed, each contested call decided by a 5-agent vote (`4d3ea1c5`):
+   federated-signal authorship ([#1843](https://github.com/alphaonedev/ai-memory-mcp/issues/1843)),
+   field-complete secret screen ([#1844](https://github.com/alphaonedev/ai-memory-mcp/issues/1844)),
+   forensic-transcript redaction ([#1845](https://github.com/alphaonedev/ai-memory-mcp/issues/1845)),
+   FTS OR-tree DoS cap ([#1846](https://github.com/alphaonedev/ai-memory-mcp/issues/1846)),
+   CGNAT SSRF ([#1847](https://github.com/alphaonedev/ai-memory-mcp/issues/1847)),
+   archive-restore tombstone gate ([#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848)),
+   namespace-less forget governance ([#1849](https://github.com/alphaonedev/ai-memory-mcp/issues/1849)),
+   audit tail-truncation anchor ([#1850](https://github.com/alphaonedev/ai-memory-mcp/issues/1850)),
+   CI workflow_dispatch injection ([#1851](https://github.com/alphaonedev/ai-memory-mcp/issues/1851)).
+3. **PostgreSQL + Apache AGE + pgvector verified live.** The postgres+AGE
+   backend was deployed on real infra and passed 3 green rounds + an AI-NHI
+   dogfood (store / pgvector semantic recall / AGE graph projection / forget /
+   secret-screen); the do-hive provisioning was fixed to install pgvector +
+   build AGE ([#1842](https://github.com/alphaonedev/ai-memory-mcp/issues/1842)).
+
+### Breaking / API-semantics changes
+
+- **W3 / gap G12 — a durable-but-under-replicated write is now `202 Accepted`,
+  not `503`.** On a W-of-N quorum miss the local row is durably committed
+  (per `ADR-0001`, never rolled back), so the prior `503 quorum_not_met` +
+  `Retry-After: 2` misreported a locally-durable write as a service failure.
+  HTTP writes now return **`202 Accepted`** with the replication state in the
+  body (`{quorum_met:false, acks, needed, reason, durability:"local"}`); a
+  genuine *local* write failure still returns an error status. The shared
+  `quorum_not_met_response`/`fanout_or_503` helpers are renamed
+  `under_replicated_response`/`fanout_or_pending`. Docs updated
+  (`API_REFERENCE.md`, `ADR-0001`). 5-agent crossroads vote (`4d3ea1c5`).
+
+### Security / data-privacy fixes
+
+- **W1 / gap G29 — credential write-path screen (fail-closed).** Caller-origin
+  writes (MCP `memory_store`, `POST /api/v1/memories`(+`/bulk`), CLI) are now
+  screened for embedded credentials (PEM keys, AWS/GitHub/OpenAI/xAI tokens,
+  JWTs, Bearer tokens — anchored patterns with a Shannon-entropy tiebreak so
+  benign UUID/hex-SHA/base64 pass). Default `AI_MEMORY_SECRET_SCREEN_MODE=refuse`
+  rejects them; `redact` masks; `off` disables. Federation-receive / recovery /
+  internal re-store paths degrade to `redact` (a refusal there would diverge
+  replicas). Same screen at forensic-bundle egress. Both backends. 5-agent vote
+  (`4d3ea1c5`).
+- **W2 / gap G30 — erasure fanout / data-remanence on forget.** A hard forget
+  (`archive=false`) now erases the derived-store leaks a plain DELETE missed —
+  the `federation_push_dlq` cleartext payload + the `transcript_line_dedup`
+  content-hash oracle (in-tx, both backends) + the in-RAM HNSW vector (HTTP +
+  MCP) — and records a **signed FORGET tombstone** (new schema **v71**
+  `forget_tombstones`, both backends) so a peer's LWW re-push of a forgotten
+  row is rejected, not resurrected. Cross-mesh tombstone propagation + owner
+  authz is the tracked v0.9 federated-erasure layer (#1823). 5-agent vote
+  (`4d3ea1c5`).
+
+### Fixed / verified
+
+- **W4 / #1685 — MCP wire-action egress governance gate pinned.**
+  `run_mcp_server` already installs `GOVERNANCE_PRE_ACTION` (closed in v0.8.0);
+  added `tests/mcp_governance_pre_action_1685.rs` (fresh-`ai-memory mcp`
+  subprocess probe) pinning that the `skill_export` egress is refused on the
+  MCP surface under a `filesystem_write` rule. #1685 closed with evidence.
+- **W5 / #1693 — postgres L2 transcript rehydration parity pinned.**
+  `PostgresStore` already overrides `recover_turn_idempotent` and the L2 CLI
+  routes `--store-url postgres://` through the SAL path (closed in v0.8.0);
+  added `tests/postgres_l2_rehydration_1693.rs` proving sqlite↔postgres
+  identical idempotent rehydration against a live instance. #1693 closed with
+  evidence.
+
+### Tracking
+
+- **W7 — the 18 UNTRACKED `§26` canonical gaps now have GitHub issues**
+  ([#1822](https://github.com/alphaonedev/ai-memory-mcp/issues/1822)–[#1839](https://github.com/alphaonedev/ai-memory-mcp/issues/1839)):
+  P1 → milestone `v0.9`, P2 → milestone `v1.0`, all labelled `tract-gap` and
+  cross-linked under #1821, so the v0.9.0 epic starts on a clean tracker.
+
+> Remaining in this patch: W6 (subprocess-chain visibility, vote-gated) + the
+> §5 operational/dogfood test pass.
 
 ## [0.8.0] — 2026-06-25 — `distributed-coordination` (Distributed Coordination Substrate, [#1709](https://github.com/alphaonedev/ai-memory-mcp/issues/1709))
 
-Released 2026-06-25 from `release/v0.8.0`. Schema advances v57 → **v70** (additive: actions /
+In progress on `release/v0.8.0`. Schema advances v57 → **v67** (additive: actions /
 action_edges / leases at v59, signals at v60, checkpoints at v61, routines /
 routine_runs at v62; the `memory_links.relation` closed-taxonomy CHECK extends
 6 → 9 relations at v63; the typed-cognition `memories.lifecycle_state` column at
 v64; the `memory_links` signature-trigger restore at v65; the
 `governance_rules.severity` CHECK extends `refuse`/`warn`/`log` → `+escalate`
 for the §22 PE-5 `Decision::Escalate` verdict at v66; the
-`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A); the
-`encrypted_envelope` column on `memories` (postgres parity) + `archived_memories`
-(both backends) at v68 (#228/#1728); the `kg_projection_outbox` deferred-AGE-projection
-queue at v69 (#1735); and the `archived_memory_links` archive-edge snapshot table at
-v70 (#1771)). Surface grows to **100 MCP tools** at `--profile full` and
+`memories.target_agent_id_idx` visibility generated column at v67 (#1720 A)). Surface grows to **100 MCP tools** at `--profile full` and
 **27 hook lifecycle events** (the tool count is unchanged by the v64 work — the
 lifecycle surface adds only permissive optional fields to the existing
 `memory_store` / `memory_update` request structs).

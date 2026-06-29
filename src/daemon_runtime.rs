@@ -763,11 +763,13 @@ pub struct ServeArgs {
     /// sync-daemon already uses.
     #[arg(long, value_delimiter = ',')]
     pub quorum_peers: Vec<String>,
-    /// Deadline for quorum-ack collection. After this many ms the
-    /// write returns 503 `quorum_not_met`. Default 2000 assumes
-    /// same-DC peers; cross-region (WAN) meshes need 5000-10000 —
-    /// the do-1461 reference deployment uses 8000. See
-    /// docs/federation.md for sizing guidance. (#1565)
+    /// Deadline for quorum-ack collection. After this many ms a
+    /// locally-durable write returns **202 Accepted** with the
+    /// replication state in the body (`quorum_met:false`) — NOT a 503
+    /// (v0.8.1 W3 / gap G12; the local row committed, so it is never a
+    /// 5xx). Default 2000 assumes same-DC peers; cross-region (WAN)
+    /// meshes need 5000-10000 — the do-1461 reference deployment uses
+    /// 8000. See docs/federation.md for sizing guidance. (#1565)
     #[arg(long, default_value_t = 2000)]
     pub quorum_timeout_ms: u64,
     /// Optional mTLS client cert for outbound federation POSTs. Same
@@ -953,6 +955,15 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // `PostgresStore::link_internal` reads it at write time. Default sync =
     // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
     crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
+    // v0.8.1 W1 (#1821 / gap G29) — seed the process-wide credential-screen
+    // mode from the resolved `[security]` config (env
+    // `AI_MEMORY_SECRET_SCREEN_MODE` > `[security].secret_screen_mode` >
+    // compiled default `refuse`). Every subsequent caller-origin write
+    // (validate_content) + the storage funnel (db::insert / insert_if_newer /
+    // postgres store) read it. Default `refuse` screens caller writes;
+    // receive/internal paths degrade to redact. Seeded on every subcommand
+    // path (serve / mcp / CLI) before any write.
+    crate::secret_screen::set_screen_mode(app_config.resolve_secret_screen_mode());
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent

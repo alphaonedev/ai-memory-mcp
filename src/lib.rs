@@ -669,6 +669,7 @@ pub mod quotas;
 pub mod recover;
 pub mod replication;
 pub mod reranker;
+pub mod secret_screen;
 pub mod sequencer;
 // v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
 // substrate state (HMAC override, decompression cap, audit chain,

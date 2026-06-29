@@ -24,7 +24,7 @@ Open a feature request at [GitHub Issues](https://github.com/alphaonedev/ai-memo
 
 ### Prerequisites
 
-- **Rust 1.87+** (install via [rustup](https://rustup.rs/))
+- **Rust 1.96+** (install via [rustup](https://rustup.rs/))
 - **C compiler** (gcc, clang, or MSVC)
 - Git
 

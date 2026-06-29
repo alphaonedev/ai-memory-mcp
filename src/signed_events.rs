@@ -702,6 +702,40 @@ pub fn verify_chain(
 /// `chain_intact` mirrors [`ChainVerificationReport::chain_holds`]
 /// (no `prev_hash`/sequence break inside the window). An empty chain
 /// (`total_events == 0`) is trivially intact with no gaps.
+/// v0.8.1 #1850 (CWE-354) — verdict of the off-table tail-truncation
+/// check that [`verify_audit_trail`] runs against the #697 append-only
+/// forensic JSONL watermark.
+///
+/// The in-table cross-row hash chain is tamper-EVIDENT against in-place
+/// edits and middle-of-chain deletion, but tail truncation leaves a
+/// contiguous surviving chain with no gap, so `chain_intact` alone reads
+/// `true`. This enum carries the independent anchor verdict:
+///
+/// - [`Unknown`](TruncationCheck::Unknown) — no off-table anchor was
+///   available (no live forensic sink, no watermark yet, legacy / fresh
+///   DB, or the anchoring file rotated away). The check makes NO claim —
+///   it never reports intact-because-of-anchor and never raises a false
+///   alarm.
+/// - [`NotDetected`](TruncationCheck::NotDetected) — an anchor was read
+///   and the in-DB head is `>=` the anchored head: no truncation evidence.
+/// - [`Detected`](TruncationCheck::Detected) — the in-DB head is strictly
+///   BELOW the anchored head: trailing signed-events rows were removed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum TruncationCheck {
+    /// No off-table anchor available — verdict withheld (see enum docs).
+    Unknown,
+    /// Anchor read; in-DB head `>=` anchored head — no truncation evidence.
+    NotDetected,
+    /// Anchor read; in-DB head `<` anchored head — tail truncation.
+    Detected {
+        /// Highest head recorded in the off-table forensic watermark.
+        anchored_head: i64,
+        /// Highest `sequence` surviving in the `signed_events` table.
+        db_head: i64,
+    },
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditTrailReport {
     /// Rows walked inside the `since` window (the whole table when
@@ -725,15 +759,30 @@ pub struct AuditTrailReport {
     /// Echoes the caller's RFC3339 `since` filter (or `None` for a
     /// full-table verification).
     pub since: Option<String>,
+    /// v0.8.1 #1850 (CWE-354) — off-table tail-truncation verdict from the
+    /// #697 forensic JSONL watermark. `Unknown` when no anchor is available
+    /// (the safe default — never a false alarm, never intact-by-anchor);
+    /// `Detected { anchored_head, db_head }` when the in-DB head dropped
+    /// below the anchored head. Independent of `chain_intact`, which a tail
+    /// truncation does not disturb. See [`TruncationCheck`].
+    pub truncation: TruncationCheck,
 }
 
 impl AuditTrailReport {
-    /// `true` when the chain held AND no sequence gaps were found —
-    /// the all-clear an operator (or CI exit-code 0) wants. A chain
-    /// break OR a gap makes this `false`.
+    /// `true` when the chain held, no sequence gaps were found, AND the
+    /// off-table anchor did not detect a tail truncation — the all-clear an
+    /// operator (or CI exit-code 0) wants. A chain break, a gap, OR a
+    /// [`TruncationCheck::Detected`] verdict makes this `false`.
+    ///
+    /// A [`TruncationCheck::Unknown`] verdict (no anchor available) does
+    /// NOT make the report dirty — the off-table check withholds judgement
+    /// rather than raising a false alarm (#1850, CWE-354), so a deployment
+    /// without a forensic watermark keeps the pre-#1850 clean semantics.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.chain_intact && self.sequence_gaps.is_empty()
+        self.chain_intact
+            && self.sequence_gaps.is_empty()
+            && !matches!(self.truncation, TruncationCheck::Detected { .. })
     }
 }
 
@@ -764,6 +813,54 @@ impl AuditTrailReport {
 /// An empty chain (or an empty window) is trivially intact with a
 /// `total_events` of 0 and no gaps.
 ///
+/// # Limitations (security review #1850, CWE-354)
+///
+/// The hash chain is tamper-EVIDENT against in-place edits and
+/// middle-of-chain row deletion (which leave a hash break or a
+/// `sequence_gap`), but it is NOT a complete integrity oracle:
+///
+/// - **Tail truncation — now DETECTION-flagged, not silently clean.**
+///   `head_sequence` is recomputed from the surviving `MAX(sequence)`
+///   with no in-table high-water mark, so deleting the trailing N rows
+///   leaves a contiguous `1..=(head-N)` chain with no gap — `chain_intact`
+///   alone reports `true`. The [`AuditTrailReport::truncation`] field
+///   closes this by comparing the in-DB head against the most-recent head
+///   anchored into the OFF-TABLE #697 append-only forensic JSONL chain
+///   (the on-host watermark stamped by every signed-events append, see
+///   [`crate::governance::audit::maybe_record_audit_watermark`]):
+///   `db_head < anchored_head` → [`TruncationCheck::Detected`].
+///
+///   **What the on-host anchor IS — a detection bar-raise.** It reliably
+///   catches naive / accidental / crash-induced truncation and disk
+///   corruption of the table suffix, and it forces any deliberate tamper
+///   to be DUAL-atomic: an attacker must now rewrite BOTH the
+///   `signed_events` suffix AND the append-only forensic JSONL sibling in
+///   lockstep, not just the one writable table.
+///
+///   **What it is NOT — unconditional cryptographic proof.** Its strength
+///   is CONDITIONAL on an enrolled signing key. On a SIGNED daemon the
+///   forensic rows (watermark included) carry an Ed25519 `sig`, so a
+///   forged watermark is detectable. On an UNSIGNED daemon
+///   (`load_daemon_signing_key` → `None`, verifier `None`) the JSONL
+///   watermark is unsigned too, so a DB-file-write attacker can rewrite
+///   BOTH the `signed_events` suffix AND the unsigned JSONL watermark and
+///   evade detection. The residual-closing control for that hostile-host /
+///   unsigned posture is shipping the forensic log OFF-HOST via the
+///   `AI_MEMORY_LOG_SINK=syslog` tier (RFC 5424 over TLS, RFC 5425;
+///   CLAUDE.md env rows #86 / #88-90) so the anchor lands on a collector
+///   the host attacker cannot reach. A [`TruncationCheck::Unknown`]
+///   verdict (no anchor available) withholds judgement — it never raises a
+///   false alarm and never reports intact-because-of-anchor.
+/// - **Unsigned-daemon whole-suffix rewrite is undetectable.** When the
+///   daemon boots without an enrolled signing key (`load_daemon_signing_key`
+///   → `None`, "continuing unsigned"), [`verify_chain`]'s signature
+///   verifier is `None`, so an attacker with DB-file write access can
+///   rewrite a suffix with recomputed `prev_hash` values and zero
+///   `signature_failures` (and, per the tail-truncation note above, the
+///   unsigned JSONL watermark alongside it). Run with an enrolled audit
+///   key — and ship the forensic log off-host — for cryptographic (not
+///   merely hash-chain) tamper evidence.
+///
 /// # Errors
 ///
 /// Returns the underlying `rusqlite` error if any of the head /
@@ -778,6 +875,32 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
             |row| row.get(0),
         )
         .context("verify_audit_trail: read chain head sequence")?;
+
+    // v0.8.1 #1850 (CWE-354) — off-table tail-truncation check. The in-DB
+    // head above is recomputed from the surviving `MAX(sequence)`, so a
+    // trailing-row DELETE leaves a contiguous chain and `chain_intact`
+    // alone cannot see it. Read the last head anchored into the #697
+    // append-only forensic JSONL chain and compare:
+    //   - in-DB head  <  anchored head  → tail TRUNCATION detected.
+    //   - no anchor available            → UNKNOWN (withhold judgement —
+    //     never a false alarm, never intact-because-of-anchor).
+    //   - in-DB head  >= anchored head   → no truncation evidence.
+    // No SIEM/syslog call here (the report is the surface); the off-host
+    // `AI_MEMORY_LOG_SINK=syslog` tier is the residual-closing control for
+    // the hostile-host / unsigned-daemon posture (see fn-level docs).
+    let truncation = match crate::governance::audit::last_audit_watermark() {
+        Some((anchored_head, _head_canonical_hash)) => {
+            if head_sequence < anchored_head {
+                TruncationCheck::Detected {
+                    anchored_head,
+                    db_head: head_sequence,
+                }
+            } else {
+                TruncationCheck::NotDetected
+            }
+        }
+        None => TruncationCheck::Unknown,
+    };
 
     // Resolve the RFC3339 `since` timestamp to a sequence FLOOR: the
     // max sequence of any row strictly BEFORE the window. `verify_chain`
@@ -838,6 +961,7 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         sequence_gaps,
         head_sequence,
         since: since.map(ToString::to_string),
+        truncation,
     })
 }
 
@@ -935,7 +1059,47 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
         ],
     )
     .context("append signed_event")?;
+
+    // v0.8.1 #1850 (CWE-354) — stamp the just-written chain head into the
+    // #697 append-only forensic JSONL chain as an OFF-TABLE truncation
+    // anchor (throttled to one write per `WATERMARK_INTERVAL` appends).
+    // `verify_audit_trail` reads the last anchor back and flags
+    // `db_head < anchored_head` — a tail truncation that a contiguous
+    // surviving `1..=(head-N)` chain would otherwise hide as `chain_intact`.
+    // The hash binds the anchor to the head row's content (it is exactly
+    // what the NEXT row's `prev_hash` would be). Sink-gated + fire-and-
+    // forget — never fails the append.
+    //
+    // NB: emitted pre-commit on the caller's transaction. A rollback after
+    // an anchor landed could — only at an exact interval boundary, and only
+    // if no later append re-reaches the sequence — leave the anchor one
+    // ahead of the committed head. The interval makes that vanishingly
+    // rare; the residual is a single-row false "Detected", never a MISSED
+    // truncation. This is the single append chokepoint (both the public
+    // `append_signed_event` tx wrapper and every direct `_no_tx` caller
+    // route through here), so one wiring point anchors every write path.
+    let head_view = SignedEvent {
+        sequence: next_seq,
+        ..event.clone()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_chain_bytes(&head_view));
+    let head_hash_hex = hex_lower(hasher.finalize().as_slice());
+    crate::governance::audit::maybe_record_audit_watermark(next_seq, &head_hash_hex);
+
     Ok(())
+}
+
+/// Lowercase-hex encode a byte slice. Centralised so the #1850 watermark
+/// hash and any future hex producer share one stable rendering.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // `write!` to a String is infallible.
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Read-only listing.

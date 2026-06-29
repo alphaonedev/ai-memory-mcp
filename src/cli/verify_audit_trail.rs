@@ -94,6 +94,20 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             writeln!(out.stdout, "  chain break first detected at sequence={seq}")
                 .context(CTX_WRITE_AUDIT_REPORT)?;
         }
+        // #1850 (CWE-354) — surface an off-table tail-truncation verdict.
+        if let crate::signed_events::TruncationCheck::Detected {
+            anchored_head,
+            db_head,
+        } = report.truncation
+        {
+            writeln!(
+                out.stdout,
+                "  tail truncation detected: off-table anchor head={anchored_head} \
+                 but in-DB head={db_head} ({} trailing row(s) removed)",
+                anchored_head - db_head,
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
         for (from, to) in &report.sequence_gaps {
             if from == to {
                 writeln!(out.stdout, "  sequence gap: {from} missing")

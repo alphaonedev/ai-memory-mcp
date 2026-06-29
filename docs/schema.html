@@ -31,17 +31,6 @@ p{color:var(--text-muted)}
 .hero .tagline{color:var(--text-muted);font-size:1.05rem;max-width:760px;margin:0 auto 1rem}
 .hero .pills{display:flex;justify-content:center;gap:.5rem;flex-wrap:wrap;margin-top:1.25rem}
 .hero .pill{padding:.4rem 1rem;border:1px solid var(--border-hl);border-radius:999px;font-family:var(--font-mono);font-size:.78rem;color:var(--text-muted)}
-.hero .stats{display:flex;justify-content:center;gap:.75rem;flex-wrap:wrap;margin-top:1.75rem}
-.hero .stat{display:flex;flex-direction:column;align-items:center;min-width:132px;padding:.9rem 1.15rem;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;position:relative;overflow:hidden}
-.hero .stat::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--p1)}
-.hero .stat:nth-child(2)::before{background:var(--p2)}
-.hero .stat:nth-child(3)::before{background:var(--p3)}
-.hero .stat:nth-child(4)::before{background:var(--gold)}
-.hero .stat:nth-child(5)::before{background:var(--p2)}
-.hero .stat-num{font-family:var(--font-mono);font-size:1.5rem;font-weight:700;color:var(--text);line-height:1.05}
-.hero .stat-label{font-family:var(--font-mono);font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--text-muted);margin-top:.4rem;text-align:center}
-.hero .hero-note{font-size:.9rem;color:var(--text-dim);max-width:660px;margin:1.6rem auto 0}
-.hero .hero-note a{color:var(--p1)}
 
 section{padding:3.5rem 0;border-bottom:1px solid var(--border)}
 .eyebrow{display:inline-block;font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--text-muted);margin-bottom:.5rem;padding:.2rem .6rem;border:1px solid var(--border-hl);border-radius:999px}
@@ -115,7 +104,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Schema</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
+      <a href="whats-new-v07.html" style="color:#ffb86b">v0.7.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -196,7 +185,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v08.html">v0.8.0</a>
+        <a href="whats-new-v07.html">v0.7.0</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -259,22 +248,20 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>The schema, table by table.</h1>
-  <p class="tagline">Every table, every column, every index, every foreign key that ai-memory creates &mdash; SQLite by default, with a Postgres mirror through the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). This atlas tracks the live schema at <strong>v70</strong>, shipped in <strong>v0.8.0</strong>.</p>
-  <div class="stats">
-    <div class="stat"><span class="stat-num">v70</span><span class="stat-label">schema version</span></div>
-    <div class="stat"><span class="stat-num">34</span><span class="stat-label">first-class tables</span></div>
-    <div class="stat"><span class="stat-num">27</span><span class="stat-label">Memory fields</span></div>
-    <div class="stat"><span class="stat-num">9</span><span class="stat-label">link relations</span></div>
-    <div class="stat"><span class="stat-num">13</span><span class="stat-label">MemoryKind variants</span></div>
+  <p class="tagline">Every SQLite table ai-memory creates, every column, every index, every foreign key. Postgres mirror via the SAL adapter (<code>--features sal,sal-postgres</code>; Apache AGE Cypher graph backend). <strong>Schema version: v71 at v0.8.1</strong> (was v57 at v0.7.0, v33 at v0.6.4). The v34 → v57 ladder shipped V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> table at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension extension at v50 #1156, <code>federation_nonce_cache</code> at v51 #1255, <code>transcript_line_dedup</code> at v52 #1389, <code>memories_au</code> FTS5 trigger scoping at v53 #1418, tier-default expiry backfill at v54 #1466, the sargable <code>list_memories_updated_since</code> rewrite + <code>idx_memories_updated_at</code> at v55 #1476, composite list-ordering indexes at v56 + the postgres stored tsvector at v57 (both #1579). The <strong>v58 → v71 ladder is the v0.8.0/v0.8.1 coordination + typed-cognition + encryption-prep work</strong>: recall-observations identity binding at v58 #1705, the <code>actions</code> / <code>action_edges</code> / <code>leases</code> coordination substrate at v59, signed <code>signals</code> at v60, attested <code>checkpoints</code> at v61 (all #1709), <code>routines</code> / <code>routine_runs</code> at v62, the <code>memory_links</code> relation CHECK 6→9 at v63, the <code>memories.lifecycle_state</code> column at v64, signature-trigger restore at v65, governance-rule <code>+escalate</code> severity at v66, owner-visibility index at v67 #1720, postgres/archive <code>encrypted_envelope</code> parity at v68 #228/#1728, the <code>kg_projection_outbox</code> cold-path queue at v69 #1735, the <code>archived_memory_links</code> edge-preservation snapshot at v70 #1771, and the signed <code>forget_tombstones</code> table at v71 #1821 (W2/G30). Migration is automatic on first daemon start.</p>
+  <div class="pills">
+    <span class="pill">34 tables</span>
+    <span class="pill">65+ indexes</span>
+    <span class="pill">v71 schema</span>
+    <span class="pill">SQLite + Postgres mirror</span>
   </div>
-  <p class="hero-note">The full v34&nbsp;&rarr;&nbsp;v70 migration history is laid out in the <a href="#migration-ladder">version timeline table</a> below. Migration is automatic on first daemon start.</p>
 </section>
 
 <section>
   <div class="container">
     <span class="eyebrow">Table-relationship map</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">34 first-class tables at v0.8.0.</h2>
-    <p class="lede">Every relation flows from the central <code>memories</code> table. Foreign-key cascade-on-delete protects against orphan rows. <code>memory_links</code> is the KG primitive; <code>pending_actions</code> is the governance queue; <code>sync_state</code> is the federation cursor table; <code>audit_log</code> + <code>signed_events</code> are the V-4 tamper-evident chain; <code>signed_events_dlq</code> + <code>federation_push_dlq</code> are the reliability DLQs (Track D #933). The v0.8.0 Pillar-1 distributed-coordination substrate adds <code>actions</code> / <code>action_edges</code> / <code>leases</code> (state machine + typed DAG + lease/heartbeat), <code>signals</code> (Ed25519-signed inter-agent messages), <code>checkpoints</code> (attested coordination gates), and <code>routines</code> / <code>routine_runs</code> (scheduled coordination); <code>archived_memory_links</code> snapshots KG edges for lossless archive→restore (#1771). Table list authoritative against <code>src/storage/migrations.rs</code> CREATE TABLE statements at <code>CURRENT_SCHEMA_VERSION = 70</code>.</p>
+    <p class="lede">Every relation flows from the central <code>memories</code> table. Foreign-key cascade-on-delete protects against orphan rows. <code>memory_links</code> is the KG primitive; <code>pending_actions</code> is the governance queue; <code>sync_state</code> is the federation cursor table; <code>audit_log</code> + <code>signed_events</code> are the V-4 tamper-evident chain; <code>signed_events_dlq</code> + <code>federation_push_dlq</code> are the reliability DLQs (Track D #933). The v0.8.0 Pillar-1 distributed-coordination substrate adds <code>actions</code> / <code>action_edges</code> / <code>leases</code> (state machine + typed DAG + lease/heartbeat), <code>signals</code> (Ed25519-signed inter-agent messages), <code>checkpoints</code> (attested coordination gates), and <code>routines</code> / <code>routine_runs</code> (scheduled coordination); <code>archived_memory_links</code> snapshots KG edges for lossless archive→restore (#1771). Table list authoritative against <code>src/storage/migrations.rs</code> CREATE TABLE statements at <code>CURRENT_SCHEMA_VERSION = 71</code>.</p>
 
     <svg class="relations-svg" viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg">
       <!-- Central: memories -->
@@ -411,7 +398,7 @@ footer a{color:var(--text-muted)}
       <g>
         <rect class="table-box" x="780" y="280" width="160" height="50" rx="8"/>
         <text class="table-name" x="860" y="305" text-anchor="middle">schema_version</text>
-        <text class="table-cols" x="860" y="320" text-anchor="middle">version = 70 (v0.8.0)</text>
+        <text class="table-cols" x="860" y="320" text-anchor="middle">version = 71 (v0.8.1)</text>
       </g>
 
       <!-- FK lines -->
@@ -440,7 +427,7 @@ footer a{color:var(--text-muted)}
       </defs>
     </svg>
 
-    <p class="lede" style="margin-top:1rem">Plus governance + identity + lifecycle + coordination tables introduced across the v34–v70 ladder (and visible via <code>SELECT name FROM sqlite_master WHERE type='table'</code> on a fresh DB): <code>agent_quotas</code> (K8 per-agent quotas; per-namespace PK dimension at v50 #1156), <code>governance_rules</code> (K11 substrate rules engine; <code>+escalate</code> severity at v66), <code>skills</code> + <code>skill_resources</code> (Agent Skills, L1-5), <code>recall_observations</code> (Form-5 recall ledger; identity binding at v58 #1705), <code>offloaded_blobs</code> (QW-3 context-offload), <code>memory_transcripts</code> + <code>memory_transcript_links</code> (sidechain transcripts, I2), <code>subscription_dlq</code> (K7 webhook DLQ), <code>federation_nonce_cache</code> (v51 #1255 replay-prevention persistence), <code>transcript_line_dedup</code> (v52 #1389 L4 idempotency), and the v0.8.0 Pillar-1 coordination set <code>actions</code> / <code>action_edges</code> / <code>leases</code> (v59), <code>signals</code> (v60), <code>checkpoints</code> (v61), <code>routines</code> / <code>routine_runs</code> (v62) — all #1709 — plus <code>kg_projection_outbox</code> (v69 #1735, postgres-only AGE cold-path queue) and <code>archived_memory_links</code> (v70 #1771), plus migration tracking (<code>schema_version</code> shown above). Agents, entities, personas, and namespace standards are NOT side tables — they are memories (reserved namespaces / standard memories) resolved via <code>namespace_meta</code> + <code>entity_aliases</code>. Verified against <code>src/storage/migrations.rs</code> CREATE TABLE census at v0.8.0 release HEAD.</p>
+    <p class="lede" style="margin-top:1rem">Plus governance + identity + lifecycle + coordination tables introduced across the v34–v71 ladder (and visible via <code>SELECT name FROM sqlite_master WHERE type='table'</code> on a fresh DB): <code>agent_quotas</code> (K8 per-agent quotas; per-namespace PK dimension at v50 #1156), <code>governance_rules</code> (K11 substrate rules engine; <code>+escalate</code> severity at v66), <code>skills</code> + <code>skill_resources</code> (Agent Skills, L1-5), <code>recall_observations</code> (Form-5 recall ledger; identity binding at v58 #1705), <code>offloaded_blobs</code> (QW-3 context-offload), <code>memory_transcripts</code> + <code>memory_transcript_links</code> (sidechain transcripts, I2), <code>subscription_dlq</code> (K7 webhook DLQ), <code>federation_nonce_cache</code> (v51 #1255 replay-prevention persistence), <code>transcript_line_dedup</code> (v52 #1389 L4 idempotency), and the v0.8.0 Pillar-1 coordination set <code>actions</code> / <code>action_edges</code> / <code>leases</code> (v59), <code>signals</code> (v60), <code>checkpoints</code> (v61), <code>routines</code> / <code>routine_runs</code> (v62) — all #1709 — plus <code>kg_projection_outbox</code> (v69 #1735, postgres-only AGE cold-path queue), <code>archived_memory_links</code> (v70 #1771), and the signed <code>forget_tombstones</code> table (v71 #1821), plus migration tracking (<code>schema_version</code> shown above). Agents, entities, personas, and namespace standards are NOT side tables — they are memories (reserved namespaces / standard memories) resolved via <code>namespace_meta</code> + <code>entity_aliases</code>. Verified against <code>src/storage/migrations.rs</code> CREATE TABLE census at v0.8.0 release HEAD.</p>
   </div>
 </section>
 
@@ -521,10 +508,10 @@ footer a{color:var(--text-muted)}
         <span class="tbl-name">schema_version</span>
         <span class="tbl-tag">▸ MIGRATION</span>
       </div>
-      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 70 at v0.8.0</strong> (was 57 at v0.7.0, 33 at v0.6.4 — the v58 → v70 ladder is the v0.8.0 coordination + typed-cognition + encryption-prep work).</div>
+      <div class="tbl-desc">Single-row table. Tracks current schema version. Daemon checks at startup; runs forward migrations idempotently. <strong>Current version: 71 at v0.8.1</strong> (was 57 at v0.7.0, 33 at v0.6.4 — the v58 → v71 ladder is the v0.8.0/v0.8.1 coordination + typed-cognition + encryption-prep work).</div>
       <table class="cols">
         <tbody>
-          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 70 (v0.8.0)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 70</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. The v34 → v57 ladder covered V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, the optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension at v50 (#1156), <code>federation_nonce_cache</code> at v51 (#1255), <code>transcript_line_dedup</code> at v52 (#1389), <code>memories_au</code> FTS5 trigger scoping at v53 (#1418), tier-default expiry backfill at v54 (#1466), the sargable <code>list_memories_updated_since</code> rewrite + <code>idx_memories_updated_at</code> at v55 (#1476), composite ordering indexes at v56 (#1579), and the postgres stored tsvector at v57 (#1579). The <strong>v0.8.0 v58 → v70 ladder</strong>: recall-observations identity binding at v58 (#1705); the <code>actions</code> / <code>action_edges</code> / <code>leases</code> coordination substrate at v59, signed <code>signals</code> at v60, attested <code>checkpoints</code> at v61 (all #1709); <code>routines</code> / <code>routine_runs</code> at v62; the <code>memory_links.relation</code> CHECK extended 6→9 at v63; the <code>memories.lifecycle_state</code> column at v64; <code>memory_links</code> signature-trigger restore at v65; <code>governance_rules.severity</code> <code>+escalate</code> at v66 (§22 PE-5); the <code>target_agent_id_idx</code> owner-visibility generated column at v67 (#1720); <code>encrypted_envelope</code> postgres + archive parity at v68 (#228/#1728); the <code>kg_projection_outbox</code> AGE cold-path queue at v69 (#1735, postgres-only); and the <code>archived_memory_links</code> edge-preservation snapshot at v70 (#1771).</td></tr>
+          <tr><td class="col">version</td><td class="type">INTEGER NOT NULL</td><td class="note"><strong>Currently 71 (v0.8.1)</strong>. Canonical: <code>CURRENT_SCHEMA_VERSION = 71</code> in <code>src/storage/migrations.rs</code>. Bumped only on additive migrations. The v34 → v57 ladder covered V-4 cross-row hash chain, recursive-learning depth columns, Batman Form-4/5 provenance + confidence, the optimistic-concurrency <code>version</code> column at v45, <code>federation_push_dlq</code> at v48, archive_memories +14 columns at v49, per-namespace K8 quota dimension at v50 (#1156), <code>federation_nonce_cache</code> at v51 (#1255), <code>transcript_line_dedup</code> at v52 (#1389), <code>memories_au</code> FTS5 trigger scoping at v53 (#1418), tier-default expiry backfill at v54 (#1466), the sargable <code>list_memories_updated_since</code> rewrite + <code>idx_memories_updated_at</code> at v55 (#1476), composite ordering indexes at v56 (#1579), and the postgres stored tsvector at v57 (#1579). The <strong>v0.8.0/v0.8.1 v58 → v71 ladder</strong>: recall-observations identity binding at v58 (#1705); the <code>actions</code> / <code>action_edges</code> / <code>leases</code> coordination substrate at v59, signed <code>signals</code> at v60, attested <code>checkpoints</code> at v61 (all #1709); <code>routines</code> / <code>routine_runs</code> at v62; the <code>memory_links.relation</code> CHECK extended 6→9 at v63; the <code>memories.lifecycle_state</code> column at v64; <code>memory_links</code> signature-trigger restore at v65; <code>governance_rules.severity</code> <code>+escalate</code> at v66 (§22 PE-5); the <code>target_agent_id_idx</code> owner-visibility generated column at v67 (#1720); <code>encrypted_envelope</code> postgres + archive parity at v68 (#228/#1728); the <code>kg_projection_outbox</code> AGE cold-path queue at v69 (#1735, postgres-only); the <code>archived_memory_links</code> edge-preservation snapshot at v70 (#1771); and the signed <code>forget_tombstones</code> table at v71 (#1821 / W2 / G30, v0.8.1).</td></tr>
         </tbody>
       </table>
     </div>
@@ -660,7 +647,7 @@ footer a{color:var(--text-muted)}
 </section>
 
 <!-- ============== MIGRATION / VERSIONING ============== -->
-<section id="migration-ladder">
+<section>
   <div class="container">
     <span class="eyebrow">Migrations</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Schema is versioned. Migrations are idempotent.</h2>
@@ -708,7 +695,8 @@ footer a{color:var(--text-muted)}
           <tr><td class="col">67</td><td class="type">v0.8.0</td><td class="note"><strong>target_agent_id_idx visibility column</strong> (#1720 A): owner-keyed <code>scope=private</code> visibility generated column.</td></tr>
           <tr><td class="col">68</td><td class="type">v0.8.0</td><td class="note"><strong>encrypted_envelope parity</strong> (#228/#1728): adds the at-rest-encryption ciphertext column to <code>memories</code> on postgres (sqlite had it at v44) AND to <code>archived_memories</code> on both backends, so archive → restore round-trips an encrypted memory losslessly.</td></tr>
           <tr><td class="col">69</td><td class="type">v0.8.0</td><td class="note"><strong>kg_projection_outbox table</strong> (#1735 Pillar-4): the staggered AGE cold-path projection queue for <code>AI_MEMORY_AGE_PROJECTION_MODE=deferred</code>. Postgres-only (AGE is postgres-only); the SQLite ladder stamps v69 as a no-op.</td></tr>
-          <tr><td class="col">70</td><td class="type">v0.8.0</td><td class="note"><strong>archived_memory_links table</strong> (#1771): the archive-link edge-preservation snapshot — mirrors <code>memory_links</code> sans the FK plus an <code>archived_at</code> stamp; explicit delete paths snapshot edges before the cascade reaps them, restore re-inserts edges whose both endpoints survive. <strong>Current = CURRENT_SCHEMA_VERSION = 70.</strong></td></tr>
+          <tr><td class="col">70</td><td class="type">v0.8.0</td><td class="note"><strong>archived_memory_links table</strong> (#1771): the archive-link edge-preservation snapshot — mirrors <code>memory_links</code> sans the FK plus an <code>archived_at</code> stamp; explicit delete paths snapshot edges before the cascade reaps them, restore re-inserts edges whose both endpoints survive.</td></tr>
+          <tr><td class="col">71</td><td class="type">v0.8.1</td><td class="note"><strong>forget_tombstones table</strong> (#1821 / W2.3 / gap G30): signed FORGET-tombstone table — a forget emits an owner-signed tombstone (identity + time + signature ONLY, no content fingerprint) that the federation receive funnel checks before accepting an inbound write, so a forgotten row cannot be resurrected via LWW. <strong>Current = CURRENT_SCHEMA_VERSION = 71.</strong></td></tr>
         </tbody>
       </table>
     </div>

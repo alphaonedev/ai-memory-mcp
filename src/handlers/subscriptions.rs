@@ -31,7 +31,7 @@ use super::AppState;
 use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{fanout_or_503, resolve_caller_agent_id};
+use super::{fanout_or_pending, resolve_caller_agent_id};
 
 /// Namespace prefix under which subscriptions are mirrored as memories
 /// (`_subscriptions/<agent_id>`). Used by the postgres dispatch path to
@@ -163,7 +163,7 @@ pub async fn notify(
             }
         };
         if let Some(mem) = fanout_mem.as_ref()
-            && let Some(resp) = fanout_or_503(&app, mem).await
+            && let Some(resp) = fanout_or_pending(&app, mem).await
         {
             return resp;
         }
@@ -204,7 +204,7 @@ pub async fn notify(
     // node-1 only — when bob polls `/api/v1/inbox` against node-2 he sees
     // nothing. The HTTP wrapper bypassed the `create_memory` fanout path
     // that every other `db::insert` write uses, so we wire it here with the
-    // same posture as `fanout_or_503`: on quorum miss return 503; on a
+    // same posture as `fanout_or_pending`: on quorum miss return 503; on a
     // network error, swallow (local commit landed, sync-daemon catches up).
     let fanout_mem = match &result {
         Ok(v) => v
@@ -218,7 +218,7 @@ pub async fn notify(
     match result {
         Ok(v) => {
             if let Some(mem) = fanout_mem
-                && let Some(resp) = fanout_or_503(&app, &mem).await
+                && let Some(resp) = fanout_or_pending(&app, &mem).await
             {
                 return resp;
             }
@@ -446,8 +446,8 @@ pub async fn subscribe(
         // using the same quorum-write contract as `_agents` /
         // `_inbox` rows. On quorum miss return 503; on a network
         // error, swallow (local commit landed). Mirrors the sqlite
-        // branch's `fanout_or_503` call below.
-        if let Some(resp) = fanout_or_503(&app, &mem).await {
+        // branch's `fanout_or_pending` call below.
+        if let Some(resp) = fanout_or_pending(&app, &mem).await {
             return resp;
         }
         return (
@@ -535,7 +535,7 @@ pub async fn subscribe(
     drop(lock);
 
     if let Some(ref mem) = registered_mem
-        && let Some(resp) = fanout_or_503(&app, mem).await
+        && let Some(resp) = fanout_or_pending(&app, mem).await
     {
         return resp;
     }

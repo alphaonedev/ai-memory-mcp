@@ -309,7 +309,7 @@ flowchart TB
 | `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` | Blocks unsigned writes | After `ai-memory identity generate` + agent registration |
 | `AI_MEMORY_REQUIRE_OWNED_ROWS=1` | MCP boot refusal on owner lockout | Strict multi-agent hosts with `AI_MEMORY_AGENT_ID` set |
 | `[memory] enabled = true` in Grok | Second memory system | Only if you want Grok native memory **in addition** to ai-memory |
-| `--profile core` | Drops 93 power/graph tools | Low-token or read-mostly workflows |
+| `--profile core` | Drops 92 power/graph tools | Low-token or read-mostly workflows |
 
 ---
 

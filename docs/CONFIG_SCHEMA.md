@@ -1,6 +1,3 @@
----
-layout: doc
----
 # `ai-memory` configuration schema reference
 
 This is the canonical reference for the v0.7.x schema-versioned
@@ -124,16 +121,6 @@ db_mmap_size_bytes = 268435456  # sqlite PRAGMA mmap_size (#1579 B7).
                                 # memory-mapped I/O. Env override:
                                 # AI_MEMORY_DB_MMAP_SIZE (env > this
                                 # field > compiled default).
-age_projection_mode = "sync"    # #1735 Pillar-4 4.C, v0.8.0 — postgres+AGE
-                                # graph-projection posture. "sync" (default)
-                                # runs the inline Cypher MERGE inside the
-                                # link-write tx; "deferred" enqueues a
-                                # kg_projection_outbox row (schema v69) and a
-                                # cold drainer projects out-of-band, taking the
-                                # ~6 AGE round-trips off the write hot path.
-                                # Postgres-only (SQLite ignores it). Env
-                                # override: AI_MEMORY_AGE_PROJECTION_MODE
-                                # (env > this field > compiled "sync").
 
 # ---------------------------------------------------------------------
 # [limits] — operator-tunable resource caps (#1156 follow-up; #1733
@@ -176,14 +163,14 @@ to certify a stack whose probed versions drift from the pins below).
 | Apache AGE | **1.7.0** | `AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `EXPECTED_AGE_VERSION=1.7.0` |
 | pgvector (server extension) | **0.8.2** | `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1` |
 | pgvector (Rust binding crate) | **0.4** | `Cargo.toml` → `pgvector = "0.4"` |
-| ai-memory postgres schema | **v70** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 70` (`src/storage/migrations.rs`); the `deploy/docker-1461/provision/lib.sh` validate-harness pins are aligned (`EXPECTED_SCHEMA=70`, `EXPECTED_VERSION=0.8.0`). |
+| ai-memory postgres schema | **v71** | postgres ladder pinned in lockstep with SQLite `CURRENT_SCHEMA_VERSION = 71` (`src/storage/migrations.rs`). NOTE: the `deploy/docker-1461/provision/lib.sh` `EXPECTED_SCHEMA` default still reads `57` and is stale relative to the v0.8.0 code tip (deploy-side bump tracked separately). |
 
 The bundled stacked image at
 [`deploy/docker-1461/Dockerfile.pg-age-vector`](../deploy/docker-1461/Dockerfile.pg-age-vector)
 (`ARG AGE_BASE_IMAGE=apache/age:release_PG18_1.7.0`, `ARG PG_MAJOR=18`)
 layers pgvector 0.8.2 onto the AGE base so K8s / ECS / Cloud Run
 operators do not build AGE from source. See
-[`postgres-age-guide.md`](postgres-age-guide.html) for the from-source
+[`postgres-age-guide.md`](postgres-age-guide.md) for the from-source
 install recipe and the Docker layering rationale (#1065).
 
 > **Alternate tested matrix.** `infra/lan-parity-test/` and the
@@ -246,7 +233,7 @@ equivalent of `AI_MEMORY_ANONYMIZE=1`).
 
 Default-OFF. When enabled, emits a hash-chained, append-only JSON audit
 log suitable for SIEM ingestion and SOC2 / HIPAA / GDPR / FedRAMP
-evidence. See [`security/audit-trail.md`](security/audit-trail.html).
+evidence. See [`security/audit-trail.md`](security/audit-trail.md).
 
 ```toml
 [audit]
@@ -299,22 +286,10 @@ max_decompressed_bytes = 16777216    # 16 MiB decompression-bomb cap (per fetch 
   auto_extract       = true          # opt into the R5 pre_store transcript-extractor hook
 ```
 
-### `[hooks]` — outgoing-webhook signing (K7) + mandatory-hook presence (PE-1, #1734)
+### `[hooks]` — outgoing-webhook signing (K7)
 
 ```toml
 [hooks]
-enforce_mode = "off"   # #1734 PE-1, v0.8.0 — mandatory-hook PRESENCE
-                       # enforcement: off (default; byte-identical to
-                       # pre-#1734) / advisory (WARN on a required event with
-                       # no enabled hook) / enforce (Deny{503}). Env override:
-                       # AI_MEMORY_HOOKS_ENFORCE_MODE (env > this field > off).
-required_events = []   # pre-* mutation/governance events that MUST have an
-                       # enabled hook. Default EMPTY = hard no-op even under
-                       # `enforce` (self-DOS guard). Eligible: PreStore /
-                       # PreDelete / PrePromote / PreLink / PreConsolidate /
-                       # PreGovernanceDecision / PreReflect (ineligible
-                       # entries are dropped with a WARN).
-
   [hooks.subscription]
   hmac_secret = "..."   # server-wide HMAC override; signs every webhook payload
 ```
@@ -322,12 +297,6 @@ required_events = []   # pre-* mutation/governance events that MUST have an
 `hmac_secret` is a secret: it is `skip_serializing`, redacted to
 `<redacted>` in `Debug`, and zeroized on drop. Keep the config file
 `chmod 600`. When unset, only per-subscription secrets apply.
-
-`enforce_mode` + `required_events` (PE-1, #1734) close the hook-PRESENCE
-gap: per-hook `FailMode` only fails closed when a *configured* hook errors,
-so an ABSENT pre-write governance hook otherwise gives silent
-no-enforcement. Surfaced at boot (serve banner, silent when `off`) and by
-`ai-memory doctor --hooks`.
 
 ### `[subscriptions]` — webhook SSRF guard (H11, #628)
 
@@ -403,40 +372,6 @@ must match a caller's resolved `agent_id` verbatim (no glob); entries
 failing `validate_agent_id` are logged at `warn` and dropped so a typo
 cannot lock the operator out. The role gate runs **after**
 `api_key_auth` — set `api_key` too for sensitive corpora.
-
-### `[logging]` — operational-log sink + remote syslog (#1463 Tier 1, #1765 Tier 2)
-
-```toml
-[logging]
-enabled            = true       # master switch (default false → no sink at all)
-structured         = false      # JSON lines instead of human-readable fmt
-level              = "info"     # tracing EnvFilter directive
-path               = "~/.local/state/ai-memory/logs/"  # file-sink dir
-rotation           = "daily"    # minutely | hourly | daily | never
-max_files          = 30         # rotated files retained
-retention_days     = 90         # history before `ai-memory logs archive`
-filename_prefix    = "ai-memory.log"
-sink               = "file"     # #1463 Tier 1, v0.8.0 — file (default) |
-                                # stdout (init-system capture) | syslog
-                                # (#1765 Tier 2, --features syslog). Env:
-                                # AI_MEMORY_LOG_SINK (env > this > "file").
-syslog_address     = "logs.example.com:6514"  # REQUIRED when sink=syslog.
-                                # Env: AI_MEMORY_LOG_SYSLOG_ADDRESS.
-syslog_transport   = "tls"      # tls (RFC 5425, default) | tcp (loopback only).
-                                # Env: AI_MEMORY_LOG_SYSLOG_TRANSPORT.
-syslog_tls_ca_file = "/etc/ai-memory/collector-ca.pem"  # REQUIRED when
-                                # transport=tls. Env: AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE.
-```
-
-`sink = "file"` is byte-identical to pre-#1463. `stdout` reuses the same
-non-blocking background worker so systemd-journald / macOS unified logging /
-Windows Event Log capture the stream natively (zero new deps, zero hot-path
-cost). The remote `syslog` sink (RFC 5424 over TCP, optional RFC 5425 TLS) is
-feature-gated `--features syslog`; selecting it without the feature compiled
-fails CLOSED at boot, as does `sink=syslog` with no `syslog_address` or a
-`tls` transport with no `syslog_tls_ca_file`. The `enabled=false` master
-switch wins over every sink. Resolved once at boot; never read on the
-store/recall hot path.
 
 ## Canonical resolver
 
@@ -645,17 +580,3 @@ verify the chosen model exists on their account before relying on it.
 - CLAUDE.md `### Environment Variables` — full env-var table with
   precedence ladder and classification (`secret` / `config` /
   `test-only`).
-
-## v0.8.0 curator-pass knobs (opt-in)
-
-Three v0.8.0 curator passes are gated behind opt-in env vars (all read by
-`ai-memory curator --reflect`; require `--features sal`). All default to the
-no-op posture so production behaviour is byte-unchanged until enabled.
-
-| Env var | Type | Default | Purpose |
-|---|---|---|---|
-| `AI_MEMORY_TRANSCRIPT_CLASSIFY_ENABLED` | bool | `false` | [#1393](https://github.com/alphaonedev/ai-memory-mcp/issues/1393) — activates the transcript-classify pass: the curator re-classifies still-`Observation` memories recovered from host transcripts via the autonomy LLM and re-tags refined kinds through the audited `reclassify_memory_kind` path (`memory.reclassified` signed-events row). Config: `[curator].transcript_classify_enabled`. |
-| `AI_MEMORY_REFLECT_DECORRELATION_MODE` | enum `off`/`advisory`/`enforce` | `off` | [#1764](https://github.com/alphaonedev/ai-memory-mcp/issues/1764) — reflection-corpus decorrelation **visibility** probe (DeepMind AGI-audit rec #1). `advisory` emits a structured WARN + per-namespace advisory when a single CLAIMED producer dominates the Reflection corpus (distinctness is CLAIMED, not ATTESTED); `enforce` is reserved for the v0.9 write-time N≥3 attested-model-family refusal and degrades to `advisory` at v0.8.0. |
-| `AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD` | float `(0.0, 1.0]` | `0.8` | [#1764](https://github.com/alphaonedev/ai-memory-mcp/issues/1764) — producer-dominance threshold for the decorrelation advisory (over ≥3 reflections). Only consulted when the mode above is `advisory`/`enforce`. |
-
-(Companion v0.8.0 curator knobs already covered above: `AI_MEMORY_COMPACTION_ENABLED` + `AI_MEMORY_COMPACTION_COSINE_THRESHOLD` for Pillar-2.5 consolidation.)

@@ -147,6 +147,39 @@ pub fn require_write_sig_enabled() -> bool {
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
+/// Env knob gating the inbound per-signal AUTHOR-signature requirement on
+/// relayed signals (#1843) — the DATA-lane sibling of [`REQUIRE_WRITE_SIG_ENV`]
+/// (#1464) for the signal subcollection.
+pub const REQUIRE_SIGNAL_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG";
+
+/// Whether an inbound relayed signal must be cryptographically signed by its
+/// `from_agent`'s locally-**enrolled** key.
+///
+/// **Default permissive (`false`)** per the #1843 5-agent vote (`4d3ea1c5`):
+/// a relayed signal is *data* (a message), not an authority-granting write, so
+/// it keeps the documented accept-and-flag posture (contrast the authority lane
+/// [`require_transition_sig_enabled`], default fail-closed). The always-on base
+/// gate (Layer 1, in the `/sync/push` signal loop) already binds `from_agent`
+/// to the enrolled peer's authorship allowlist under an enrolled posture;
+/// defaulting this ON would self-DOS a heterogeneous mesh whose signal authors
+/// are not yet key-enrolled locally.
+///
+/// When the operator opts in (`1`/`true`/`yes`/`on`), an inbound signal is
+/// applied only when `signal.signature` verifies against `from_agent`'s
+/// locally-enrolled Ed25519 key (binds `from_agent → enrolled key`; the wire
+/// `sender_pubkey` is NOT trusted for this check — verifying against it would
+/// let a relayer forge identity). An unenrolled / unverified `from_agent` is
+/// skipped per-signal (the batch survives). A *forged* signature (present but
+/// invalid against its own wire key) is rejected unconditionally by the
+/// existing `crate::signals::verify` check regardless of this knob. Mirrors the
+/// secure-opt-in shape of [`require_write_sig_enabled`] (#1464).
+#[must_use]
+pub fn require_signal_sig_enabled() -> bool {
+    std::env::var(REQUIRE_SIGNAL_SIG_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +270,25 @@ mod tests {
             authorize_remote_transition(&tampered, &sig, Some(&kp.public), None, true),
             TransitionAuthz::RejectForged
         );
+    }
+
+    #[test]
+    fn require_signal_sig_default_permissive_and_truthy_opts_in() {
+        // #1843 — mirrors the #1464 write-sig knob: default OFF (permissive),
+        // truthy (`1`/`true`/`yes`/`on`) opts in. The var is unique to this
+        // test so the process-global env mutation cannot race another test.
+        // SAFETY: single-threaded mutation of a var no other test reads.
+        unsafe { std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV) };
+        assert!(!require_signal_sig_enabled(), "unset → permissive default");
+        for truthy in ["1", "true", "yes", "on", "  on  "] {
+            unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, truthy) };
+            assert!(require_signal_sig_enabled(), "{truthy:?} → strict");
+        }
+        for falsy in ["0", "false", "no", "off", ""] {
+            unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, falsy) };
+            assert!(!require_signal_sig_enabled(), "{falsy:?} → permissive");
+        }
+        unsafe { std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV) };
     }
 
     #[test]

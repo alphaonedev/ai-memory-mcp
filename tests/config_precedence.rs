@@ -1162,3 +1162,93 @@ fn test_embed_secret_not_in_capabilities_1598() {
          either; got: {response_v3_str}",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// v0.8.1 W1 (#1821 / gap G29) — AI_MEMORY_SECRET_SCREEN_MODE precedence.
+// Ladder: env > [security].secret_screen_mode > compiled default `refuse`.
+// Mirrors the resolve_* precedence tests; uses the non-reentrant env guard.
+// ─────────────────────────────────────────────────────────────────────────
+#[test]
+fn test_secret_screen_mode_precedence() {
+    use ai_memory::config::{AppConfig, SecurityConfig};
+    use ai_memory::secret_screen::SecretScreenMode;
+
+    // ---- Default (no env, no config) → compiled `refuse` (secure default).
+    {
+        let _g = EnvVarGuard::remove("AI_MEMORY_SECRET_SCREEN_MODE");
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cfg.resolve_secret_screen_mode(),
+            SecretScreenMode::Refuse,
+            "unset env + no [security] MUST resolve the secure default `refuse`"
+        );
+    }
+
+    // ---- [security].secret_screen_mode config field (no env) wins over default.
+    {
+        let _g = EnvVarGuard::remove("AI_MEMORY_SECRET_SCREEN_MODE");
+        let cfg = AppConfig {
+            security: Some(SecurityConfig {
+                secret_screen_mode: Some(SecretScreenMode::Redact),
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_secret_screen_mode(),
+            SecretScreenMode::Redact,
+            "[security].secret_screen_mode MUST win over the compiled default"
+        );
+    }
+
+    // ---- env wins over the config field.
+    {
+        let _g = EnvVarGuard::set("AI_MEMORY_SECRET_SCREEN_MODE", "off".to_string());
+        let cfg = AppConfig {
+            security: Some(SecurityConfig {
+                secret_screen_mode: Some(SecretScreenMode::Redact),
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_secret_screen_mode(),
+            SecretScreenMode::Off,
+            "AI_MEMORY_SECRET_SCREEN_MODE env MUST override the [security] config field"
+        );
+    }
+
+    // ---- each valid token parses (case-insensitive).
+    for (tok, want) in [
+        ("redact", SecretScreenMode::Redact),
+        ("REFUSE", SecretScreenMode::Refuse),
+        ("Off", SecretScreenMode::Off),
+    ] {
+        let _g = EnvVarGuard::set("AI_MEMORY_SECRET_SCREEN_MODE", tok.to_string());
+        assert_eq!(
+            AppConfig::default().resolve_secret_screen_mode(),
+            want,
+            "token {tok:?} must resolve to {want:?}"
+        );
+    }
+
+    // ---- unparseable env falls through to the config field, then default.
+    {
+        let _g = EnvVarGuard::set("AI_MEMORY_SECRET_SCREEN_MODE", "garbage".to_string());
+        let cfg = AppConfig {
+            security: Some(SecurityConfig {
+                secret_screen_mode: Some(SecretScreenMode::Redact),
+            }),
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_secret_screen_mode(),
+            SecretScreenMode::Redact,
+            "unparseable env MUST fall through to the [security] config field"
+        );
+        let bare = AppConfig::default();
+        assert_eq!(
+            bare.resolve_secret_screen_mode(),
+            SecretScreenMode::Refuse,
+            "unparseable env + no config MUST fall through to the compiled default"
+        );
+    }
+}

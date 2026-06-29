@@ -876,12 +876,17 @@ When `ai-memory serve --quorum-writes N --quorum-peers URL,URL,…` is
 set, every write fans out to peers and returns **only** once W-1 peer
 acks land within `--quorum-timeout-ms`.
 
-- **201** + `{"quorum_acks": W}` on success.
-- **503** + `{"error":"quorum_not_met","got":X,"needed":Y,"reason":"unreachable|timeout|id_drift"}` + `Retry-After: 2` on failure.
+- **201** + `{"quorum_acks": W}` when quorum is met.
+- **202 Accepted** + `{"quorum_met":false,"acks":X,"needed":Y,"reason":"unreachable|timeout|id_drift","durability":"local"}` when the local write committed but quorum was not met (v0.8.1 W3 / gap G12).
 
-Local write is **not** rolled back on quorum failure — per
-`ADR-0001`, the sync-daemon's eventual-consistency loop converges
-peers afterwards.
+The local write is durably committed and **never** rolled back, so an
+under-replicated write is reported as a **`202 Accepted`**, not a `5xx`
+(the pre-v0.8.1 `503` + `Retry-After: 2` misreported a locally-durable
+write as a service failure). The replication state is carried in the
+body; the sync-daemon's eventual-consistency loop + the federation
+push-DLQ converge peers afterwards (per `ADR-0001`), so there is no
+client retry to perform. A genuine **local** write failure still
+returns the appropriate error status.
 
 ## Curl recipes
 

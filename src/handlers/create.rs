@@ -328,12 +328,12 @@ async fn enforce_create_governance<'a>(
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                             // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return Err(super::quorum_not_met_response(&payload));
+                            return Err(super::under_replicated_response(&payload));
                         }
                     }
                     Err(err) => {
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return Err(super::quorum_not_met_response(&payload));
+                        return Err(super::under_replicated_response(&payload));
                     }
                 }
             }
@@ -664,12 +664,12 @@ async fn fanout_and_assemble_create_response(
                 Err(err) => {
                     // #869 — typed 503 envelope via the shared helper.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::quorum_not_met_response(&payload);
+                    return super::under_replicated_response(&payload);
                 }
             },
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
         }
     }
@@ -1017,12 +1017,12 @@ async fn create_memory_postgres(
                 if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                     // #869 — typed 503 envelope via the shared helper.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::quorum_not_met_response(&payload);
+                    return super::under_replicated_response(&payload);
                 }
             }
             Err(err) => {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return super::quorum_not_met_response(&payload);
+                return super::under_replicated_response(&payload);
             }
         }
     }

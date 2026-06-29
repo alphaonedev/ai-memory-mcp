@@ -450,7 +450,12 @@ pub fn build_files(
                 id: mem.id.clone(),
                 namespace: mem.namespace.clone(),
                 title: mem.title.clone(),
-                content: mem.content.clone(),
+                // v0.8.1 W1.3 (#1821 / gap G29) — egress credential screen
+                // (defense-in-depth). A secret that PRE-DATES the write screen
+                // must not leak through a forensic export; mask it on the way
+                // out. No-op unless screening was seeded non-`off`.
+                content: crate::secret_screen::redact_for_storage(&mem.content)
+                    .unwrap_or_else(|| mem.content.clone()),
                 tier: mem.tier.as_str().to_string(),
                 memory_kind: format!("{:?}", mem.memory_kind).to_ascii_lowercase(),
                 reflection_depth: mem.reflection_depth,
@@ -586,9 +591,15 @@ pub fn build_files(
             if let Some(content) = crate::transcripts::storage::fetch(conn, &entry.meta.id)
                 .context("fetch transcript content for bundle")?
             {
+                // #1845 (security review S3, CWE-312) — mask any credential in
+                // the raw transcript body on egress, identical to the memory
+                // content mask above; a secret pasted into a captured turn must
+                // not leak verbatim into the signed bundle handed to an auditor.
+                let screened =
+                    crate::secret_screen::redact_for_storage(&content).unwrap_or(content);
                 files.insert(
                     format!("transcripts/{}.content", entry.meta.id),
-                    content.into_bytes(),
+                    screened.into_bytes(),
                 );
             }
         }

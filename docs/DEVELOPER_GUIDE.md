@@ -1,6 +1,3 @@
----
-layout: doc
----
 # Developer Guide
 
 ## Architecture Overview
@@ -20,7 +17,7 @@ main.rs            -- Thin CLI shim (W6 refactor); top-level Command enum now li
 daemon_runtime.rs  -- HTTP daemon `serve` bootstrap, MCP `mcp` dispatch, top-level clap Command enum
 models/            -- Data structures: Memory (27 fields at v0.8.0), MemoryLink (9 relations at v0.8.0), MemoryKind (Batman Form-6 + Goal/Plan/Step), LifecycleState (v0.8.0 Pillar-2 state machine), Citation/SourceSpan (Form-4), query types, constants
 handlers/          -- HTTP request handlers split per domain (http.rs, federation_receive.rs, hook_subscribers.rs, transport.rs, plus per-surface modules: recall.rs, memories.rs, admin.rs, kg.rs, …); Axum extractors + JSON responses; error sanitization. Route-path SSOT in handlers/routes.rs (#1558 batch 4 — one const per production route path; lib.rs registers them, the postgres gate / federation receiver / doctor match on them)
-storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 70)
+storage/           -- sqlite SQL primitives; CRUD, FTS5, recall scoring, GC, migration (CURRENT_SCHEMA_VERSION = 71)
 store/             -- SAL `MemoryStore` trait + adapter implementations (sqlite + postgres + AGE feature gates); new DB operations land here FIRST (post-#961)
 mcp/               -- MCP server over stdio JSON-RPC; tool registry (registry.rs incl. the tool_names const module), per-tool handlers under tools/, JSON-RPC wire-constant SSOT (mcp/jsonrpc.rs, #1558 batch 3 — version tag, reserved error codes, method names), tool-call param-name SSOT (mcp/param_names.rs), notification handling
 identity/          -- NHI identity: keypair storage (keypair.rs — DAEMON_KEYPAIR_LABEL), reserved-principal sentinel SSOT (sentinels.rs, #1558 batch 2 — DAEMON_PRINCIPAL, ANONYMOUS_INVALID, …; validate::RESERVED_AGENT_IDS is built from these), attestation (attest.rs), signing/verification (sign.rs/verify.rs), replay protection (replay.rs)
@@ -66,7 +63,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 ### `src/main.rs`
 
 - `Cli` struct with `clap` derive -- defines all CLI commands and global flags (`--db`, `--json`). Lives in `src/daemon_runtime.rs` (W6 refactor moved it off `src/main.rs`).
-- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.8.0-dev the enum carries **85 unique variants** under `--features sal` (83 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `EXPECTED_CLI_SUBCOMMANDS_SAL=85` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), the #1389 L2 `RecoverPreviousSession`, the v0.8.0 #1720 B2 `Reown` + PE-8 `VerifyAuditTrail`, and the v0.8.0 #1727 `UndoEdit` (non-destructive in-place-edit undo). Run `ai-memory --help` for the live list.
+- `Command` enum (in `src/daemon_runtime.rs`) -- at v0.8.0 the enum carries **85 unique variants** under `--features sal` (83 in the default build — the gap is the two sal-gated variants `Migrate` + `SchemaInit`; SSOT: `EXPECTED_CLI_SUBCOMMANDS_DEFAULT=83` / `EXPECTED_CLI_SUBCOMMANDS_SAL=85` in `src/lib.rs`, pinned by `tests/cli_subcommand_count_invariant.rs`): the v0.6.x core (`Serve`, `Mcp`, `Store`, `Update`, `Recall`, `Search`, `Get`, `List`, `Delete`, `Promote`, `Forget`, `Link`, `Consolidate`, `Resolve`, `Shell`, `Sync`, `SyncDaemon`, `AutoConsolidate`, `Gc`, `Stats`, `Namespaces`, `Namespace`, `Config`, `Export`, `Import`, `Completions`, `Man`, `Mine`, `Archive`, `Agents`, `Pending`, `Backup`, `Restore`, `Curator`, `Bench`, `Migrate` (gated `--features sal`), `SchemaInit` (gated `--features sal`), `Doctor`, `Boot`, `Install`, `Wrap`, `Logs`, `Audit`), the v0.7 additions (`Identity`, `Offload`, `Deref`, `Rules`, `Governance`, `VerifyReflectionChain`, `VerifySignedEventsChain`, `ExportForensicBundle`, `VerifyForensicBundle`, `ExportReflections`, `Atomise`, `Persona`, `Calibrate`, `Skill`, `Share`, `Expand`, `Reembed` (#1598)), the FX-12/FX-C3 MCP↔CLI parity batch (`KgQuery`, `FindPaths`, `RecallObservations`, `CheckDuplicate`, `Replay`, `Reflect`, `Subscribe`, `Unsubscribe`, `ListSubscriptions`, `SubscriptionReplay`, `SubscriptionDlqList`, `Notify`, `Inbox`, `IngestMultistep`, `KgInvalidate`, `KgTimeline`, `EntityRegister`, `EntityGetByAlias`, `DependentsOfInvalidated`, `ReflectionOrigin`, `QuotaStatus`), the #1389 L2 `RecoverPreviousSession`, the v0.8.0 #1720 B2 `Reown` + PE-8 `VerifyAuditTrail`, and the v0.8.0 #1727 `UndoEdit` (non-destructive in-place-edit undo). Run `ai-memory --help` for the live list.
 - `StoreArgs` includes `--expires-at` and `--ttl-secs` flags for custom expiration
 - `UpdateArgs` includes `--expires-at` flag for setting expiration on existing memories
 - `ListArgs` includes `--offset` flag for pagination
@@ -268,7 +265,7 @@ Defines the `AutonomyLlm` trait so the curator can be unit-tested without a live
 
 ### `src/replication.rs`
 
-W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the contract described in [`ADR-0001-quorum-replication.md`](ADR-0001-quorum-replication.html). The `QuorumWriter` sits ABOVE the existing sync-daemon — deployments without `--quorum-writes` keep the v0.6.0 one-way push behaviour byte-for-byte. Public API: `QuorumPolicy`, `QuorumWriter::commit`, `AckTracker`. Emits metrics: `replication_quorum_ack_total{result}`, `replication_quorum_failures_total{reason}`, `replication_clock_skew_seconds`.
+W-of-N quorum-write layer for the peer-mesh sync (v0.7 track C). Scaffolds the contract described in [`ADR-0001-quorum-replication.md`](ADR-0001-quorum-replication.md). The `QuorumWriter` sits ABOVE the existing sync-daemon — deployments without `--quorum-writes` keep the v0.6.0 one-way push behaviour byte-for-byte. Public API: `QuorumPolicy`, `QuorumWriter::commit`, `AckTracker`. Emits metrics: `replication_quorum_ack_total{result}`, `replication_quorum_failures_total{reason}`, `replication_clock_skew_seconds`.
 
 ### `src/federation/`
 
@@ -386,7 +383,7 @@ Added in schema migration v3 -> v4 (shown in its original 16-column shape). Stor
 
 ### `schema_version` table
 
-Tracks migration state. Current version: **70** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
+Tracks migration state. Current version: **71** (`CURRENT_SCHEMA_VERSION` in `src/storage/migrations.rs`).
 
 ## Recall Scoring Formula
 
@@ -739,7 +736,7 @@ Content-Type: application/json
 {"source_id": "id1", "target_id": "id2", "relation": "related_to"}
 ```
 
-Relations (nine at v0.8.0): `related_to`, `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Self-links rejected. Response (201): `{"linked": true}`
+Relations: `related_to`, `supersedes`, `contradicts`, `derived_from`. Self-links rejected. Response (201): `{"linked": true}`
 
 ### Get Links
 
@@ -937,7 +934,7 @@ At least one filter is required.
 ai-memory link <source-id> <target-id> --relation supersedes
 ```
 
-Relation types (nine at v0.8.0): `related_to` (default), `supersedes`, `contradicts`, `derived_from`, `reflects_on`, `derives_from`, `decomposes_into`, `depends_on`, `advances`. Self-links rejected.
+Relation types: `related_to` (default), `supersedes`, `contradicts`, `derived_from`. Self-links rejected.
 
 ### `consolidate`
 
@@ -1196,7 +1193,7 @@ When this repository is being driven by the `campaign` Python harness
 (at `alphaonedev/agentic-mem-labs/tools/campaign/`, Apache 2.0 ©
 AlphaOne LLC), the development workflow is the same workflow described
 above plus the constraints in
-[`ENGINEERING_STANDARDS.md` §7](ENGINEERING_STANDARDS.html#7-autonomous-campaign-workflow).
+[`ENGINEERING_STANDARDS.md` §7](ENGINEERING_STANDARDS.md#7-autonomous-campaign-workflow).
 
 ### Concurrent operation
 

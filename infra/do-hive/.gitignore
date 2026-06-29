@@ -1,0 +1,9 @@
+# Terraform working state — environment-specific, may contain resource
+# metadata / secrets. Never committed. (v0.8.1 §5.2)
+.terraform/
+.terraform.lock.hcl
+terraform.tfstate
+terraform.tfstate.backup
+*.tfstate
+*.tfstate.*
+terraform.tfvars

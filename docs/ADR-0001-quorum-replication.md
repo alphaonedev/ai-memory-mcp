@@ -181,9 +181,15 @@ both of those qualifications — a campaign report with only
 - Write latency rises by one RTT to the slowest peer in the W quorum.
   Operators who don't want that cost keep `--quorum-writes 1` (current
   behaviour).
-- Adds a new failure mode (`BackendUnavailable{quorum}`) that callers
-  need to handle. MCP and HTTP endpoints map this to 503 with
-  `Retry-After`.
+- Adds a replication-state signal that callers may handle. Because the
+  local write is durably committed and never rolled back, an
+  under-replicated write is **not** a failure: as of v0.8.1 (W3 / gap
+  G12) HTTP endpoints return **`202 Accepted`** carrying the
+  replication state in the body
+  (`{quorum_met:false, acks, needed, reason, durability:"local"}`),
+  not the earlier `503` + `Retry-After` (which misreported a durable
+  write as a service failure). A genuine **local** write failure still
+  surfaces as an error status.
 - Does not improve read consistency; reads stay eventual. Operators
   who need read-your-writes must hit the originating node.
 

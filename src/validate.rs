@@ -159,6 +159,15 @@ pub fn validate_title(title: &str) -> Result<()> {
     if !is_clean_string(trimmed) {
         bail!("title contains invalid characters");
     }
+    // v0.8.1 #1844 (CWE-312 / gap G29 OPTION C) — caller-origin credential
+    // screen on the title, exactly mirroring `validate_content`. Title is
+    // stored cleartext + FTS-indexed + federated + forensic-exported, so a
+    // credential pasted here leaks the same way a content credential did
+    // pre-W1. Refuses ONLY under `AI_MEMORY_SECRET_SCREEN_MODE=refuse`;
+    // `redact`/`off` return Ok (a `redact` caller write is masked at the
+    // storage funnel). Internal / federation-receive / recovery writes are
+    // handled (redact-only) at the funnel, so this never breaks convergence.
+    crate::secret_screen::screen_for_caller(trimmed).map_err(|r| anyhow::anyhow!("{r}"))?;
     Ok(())
 }
 
@@ -172,6 +181,15 @@ pub fn validate_content(content: &str) -> Result<()> {
     if !is_clean_string(content) {
         bail!("content contains invalid characters");
     }
+    // v0.8.1 W1 (#1821 / gap G29) — caller-origin credential screen. Refuses
+    // ONLY under `AI_MEMORY_SECRET_SCREEN_MODE=refuse` (the secure default);
+    // `redact`/`off` return Ok here (a `redact` caller write is masked at the
+    // storage funnel, not refused). Internal / federation-receive / recovery
+    // writes bypass `validate_content` and are handled (redact-only) at the
+    // storage funnel, so this never breaks CRDT convergence or capture-first.
+    // The process-wide mode reads `Off` until the daemon/CLI boot seeds it, so
+    // raw-library and existing-test writes are unaffected.
+    crate::secret_screen::screen_for_caller(content).map_err(|r| anyhow::anyhow!("{r}"))?;
     Ok(())
 }
 
@@ -584,6 +602,12 @@ pub fn validate_tags(tags: &[String]) -> Result<()> {
         if !is_clean_string(trimmed) {
             bail!("tag contains invalid characters");
         }
+        // v0.8.1 #1844 (CWE-312 / gap G29 OPTION C) — per-tag caller-origin
+        // credential screen, exactly mirroring `validate_content`. Tags are
+        // stored cleartext + FTS-indexed + federated + forensic-exported.
+        // Refuses ONLY under refuse mode; redact/off return Ok (masked at the
+        // storage funnel). Free text — same disposition as title/content.
+        crate::secret_screen::screen_for_caller(trimmed).map_err(|r| anyhow::anyhow!("{r}"))?;
     }
     Ok(())
 }
@@ -669,6 +693,17 @@ pub fn validate_metadata(metadata: &serde_json::Value) -> Result<()> {
     if depth > MAX_METADATA_DEPTH {
         bail!("metadata nesting depth exceeds limit of {MAX_METADATA_DEPTH} (got {depth})");
     }
+    // v0.8.1 #1844 (CWE-312 / gap G29 OPTION C) — caller-origin credential
+    // screen on metadata STRING LEAF VALUES (recursive), NOT the serialized
+    // blob: screening the whole blob would false-refuse the legitimate base64
+    // Ed25519 signatures + attestation JWTs the #626 / #1464 machinery writes
+    // into metadata. Values under the crypto/system carve-out keys
+    // (`crate::secret_screen::METADATA_SCREEN_CARVE_OUT_KEYS` + the `_b64`
+    // suffix) are exempt; every other string leaf is screened with the same
+    // refuse-only disposition as `validate_content`. Internal / federation /
+    // recovery writes are masked (not refused) at the storage funnel.
+    crate::secret_screen::screen_metadata_values_for_caller(metadata)
+        .map_err(|r| anyhow::anyhow!("{r}"))?;
     Ok(())
 }
 

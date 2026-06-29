@@ -140,6 +140,12 @@ pub mod msg {
     // ---- validation -------------------------------------------------------------
     pub const FORGET_FILTER_REQUIRED: &str =
         "at least one of namespace, pattern, or tier is required";
+    /// #1849 (CWE-862) — an admin bulk `memory_forget` with the namespace
+    /// OMITTED would span a namespace carrying a non-`Any` `delete` governance
+    /// level, bypassing the per-namespace / per-memory delete gate. Refuse the
+    /// cross-namespace forget and direct the operator at the gated path.
+    pub const FORGET_GOVERNED_NAMESPACE_REQUIRES_SCOPED_DELETE: &str = "bulk forget without a namespace would touch a delete-governed namespace; \
+         scope the forget to that namespace or use per-memory delete so governance applies";
     pub const MAX_DEPTH_MIN: &str = "max_depth must be >= 1";
     pub const VERIFY_LINK_ARGS_REQUIRED: &str = "verify_link requires either source_id or link_id";
     pub const ENTITY_ID_EMPTY: &str = "entity_id cannot be empty";
