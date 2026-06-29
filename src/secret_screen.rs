@@ -447,6 +447,195 @@ pub fn redact_for_storage(content: &str) -> Option<String> {
     }
 }
 
+// ── #1844 (CWE-312) — title / tags / metadata screening ──────────────────
+//
+// G29 (above) closed the leak on memory `content` only. Finding #1844 is
+// that `title`, `tags`, and `metadata` are equally stored cleartext, FTS-
+// indexed, federated, and forensic-exported — so a credential pasted into
+// any of them leaks exactly the way a content-credential did pre-G29. The
+// 5-agent vote (`4d3ea1c5`) chose OPTION C: extend the SAME screen to those
+// fields, with ONE structural carve-out so the legitimate base64 Ed25519
+// signatures / attestation JWTs / pubkeys that the #626 / #1464 attestation
+// machinery writes into `metadata` are NOT false-refused or mangled (which
+// would break federation convergence + the signed-write contract).
+
+/// Metadata keys whose VALUES are EXEMPT from the #1844 string-leaf
+/// credential screen — the canonical crypto/system field set. These keys
+/// legitimately carry high-entropy base64 / JWT material (detached Ed25519
+/// signatures, attestation tokens, public keys, agent identifiers) that the
+/// anchored detectors would otherwise flag; screening them would refuse or
+/// mangle the #626 Layer-3 + #1464 per-write attestation envelope and the
+/// federation provenance fields, diverging replicas.
+///
+/// A key is carved out when it matches one of these EXACTLY **or** ends in
+/// the [`CARVE_OUT_B64_SUFFIX`] (`_b64`) suffix — exact-key / suffix match
+/// only, never substring or wildcard, so a free-text key like
+/// `aws_secret_note` is still screened. This const is the single SSOT shared
+/// by the caller-refuse path ([`screen_metadata_values_for_caller`]) and the
+/// storage-funnel redact path ([`redact_metadata_values`]).
+pub const METADATA_SCREEN_CARVE_OUT_KEYS: &[&str] = &[
+    "write_signature",
+    "host_signature_b64",
+    "host_pubkey_b64",
+    "agent_pubkey",
+    "agent_id",
+    "signature",
+    "citations",
+    "consolidated_from_agents",
+    "imported_from_agent_id",
+    "model_family",
+];
+
+/// Suffix marking a metadata key as carrying base64 crypto material
+/// (e.g. `host_signature_b64`, `host_pubkey_b64`); ANY key ending in it is
+/// carve-out-exempt in addition to the exact-name set above.
+const CARVE_OUT_B64_SUFFIX: &str = "_b64";
+
+/// True when a metadata key's value is exempt from the #1844 string-leaf
+/// screen — exact-name match against [`METADATA_SCREEN_CARVE_OUT_KEYS`] OR
+/// the `_b64` suffix. Used by BOTH the refuse and redact recursions so the
+/// carve-out is defined exactly once.
+#[must_use]
+fn metadata_key_is_carved_out(key: &str) -> bool {
+    key.ends_with(CARVE_OUT_B64_SUFFIX) || METADATA_SCREEN_CARVE_OUT_KEYS.contains(&key)
+}
+
+/// CALLER-origin metadata screen (#1844): recurses the structured value and
+/// runs [`screen_for_caller`] on every STRING LEAF whose JSON key is not in
+/// the crypto/system carve-out. Refuses ONLY under [`SecretScreenMode::Refuse`]
+/// (each `screen_for_caller` no-ops otherwise), exactly mirroring
+/// `validate::validate_content`. NEVER screens the serialized blob as a whole
+/// (that would false-refuse a legitimate base64 signature / attestation JWT).
+///
+/// # Errors
+/// [`SecretRefusal`] for the first carve-out-eligible string leaf that the
+/// mode is `Refuse` and a credential is detected in.
+pub fn screen_metadata_values_for_caller(meta: &serde_json::Value) -> Result<(), SecretRefusal> {
+    screen_value_leaves(meta)
+}
+
+/// Recursive worker for [`screen_metadata_values_for_caller`]. Object values
+/// under a carved-out key are skipped wholesale (string, array, or object);
+/// every other string leaf is screened.
+fn screen_value_leaves(val: &serde_json::Value) -> Result<(), SecretRefusal> {
+    match val {
+        serde_json::Value::String(s) => screen_for_caller(s),
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if metadata_key_is_carved_out(k) {
+                    continue;
+                }
+                screen_value_leaves(v)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                screen_value_leaves(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// STORAGE-funnel metadata redact (#1844): the redact-only sibling of
+/// [`screen_metadata_values_for_caller`], sharing the SAME carve-out. Returns
+/// a rebuilt value with every non-carve-out string leaf masked when at least
+/// one leaf changed, else `None` (clean / `Off`). NEVER refuses — federation-
+/// receive / recovery / internal paths must converge.
+#[must_use]
+pub fn redact_metadata_values(meta: &serde_json::Value) -> Option<serde_json::Value> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    redact_value_leaves(meta)
+}
+
+/// Recursive worker for [`redact_metadata_values`]. Returns `Some(rebuilt)`
+/// only when a descendant string leaf was actually redacted, so the clean
+/// path keeps the caller's original value (zero rebuild).
+fn redact_value_leaves(val: &serde_json::Value) -> Option<serde_json::Value> {
+    match val {
+        serde_json::Value::String(s) => redact_for_storage(s).map(serde_json::Value::String),
+        serde_json::Value::Object(map) => {
+            let mut changed = false;
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if metadata_key_is_carved_out(k) {
+                    out.insert(k.clone(), v.clone());
+                } else if let Some(red) = redact_value_leaves(v) {
+                    changed = true;
+                    out.insert(k.clone(), red);
+                } else {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            changed.then(|| serde_json::Value::Object(out))
+        }
+        serde_json::Value::Array(arr) => {
+            let mut changed = false;
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                if let Some(red) = redact_value_leaves(v) {
+                    changed = true;
+                    out.push(red);
+                } else {
+                    out.push(v.clone());
+                }
+            }
+            changed.then(|| serde_json::Value::Array(out))
+        }
+        _ => None,
+    }
+}
+
+/// STORAGE-funnel WHOLE-ROW redact (#1844): masks credential material in
+/// EVERY cleartext-indexed field the screen historically missed — `content`,
+/// `title`, each `tag`, and `metadata` string-leaf values (minus the
+/// [`METADATA_SCREEN_CARVE_OUT_KEYS`] carve-out) — rebuilding the row only
+/// when something changed. NEVER refuses, so the federation-receive /
+/// L2-recovery / internal re-store funnels preserve CRDT convergence + the
+/// capture-first guarantee. Returns `None` (zero-copy) when the row is clean
+/// or screening is `Off`. The single helper both storage backends share.
+#[must_use]
+pub fn redact_memory_for_storage(mem: &crate::models::Memory) -> Option<crate::models::Memory> {
+    if screen_mode() == SecretScreenMode::Off {
+        return None;
+    }
+    let content = redact_for_storage(&mem.content);
+    let title = redact_for_storage(&mem.title);
+    let tags: Option<Vec<String>> = {
+        let mut changed = false;
+        let rebuilt: Vec<String> = mem
+            .tags
+            .iter()
+            .map(|t| {
+                redact_for_storage(t).map_or_else(
+                    || t.clone(),
+                    |red| {
+                        changed = true;
+                        red
+                    },
+                )
+            })
+            .collect();
+        changed.then_some(rebuilt)
+    };
+    let metadata = redact_metadata_values(&mem.metadata);
+
+    if content.is_none() && title.is_none() && tags.is_none() && metadata.is_none() {
+        return None;
+    }
+    Some(crate::models::Memory {
+        content: content.unwrap_or_else(|| mem.content.clone()),
+        title: title.unwrap_or_else(|| mem.title.clone()),
+        tags: tags.unwrap_or_else(|| mem.tags.clone()),
+        metadata: metadata.unwrap_or_else(|| mem.metadata.clone()),
+        ..mem.clone()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -723,18 +723,17 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // no row written. See module-level comment for layering details.
     consult_governance_pre_write(mem)?;
 
-    // v0.8.1 W1 (#1821 / gap G29) — origin-blind credential REDACT backstop
-    // on the local-authorship funnel. Caller-origin writes are REFUSED
-    // earlier (validate_content); any secret reaching here is from an
+    // v0.8.1 W1 (#1821 / gap G29) + #1844 — origin-blind credential REDACT
+    // backstop on the local-authorship funnel. Caller-origin writes are
+    // REFUSED earlier (validate_*); any secret reaching here is from an
     // internal re-store path (curator / autonomy) that bypasses validation,
-    // so it is masked, never refused (preserving the internal write). No-op
-    // unless `AI_MEMORY_SECRET_SCREEN_MODE` was seeded non-`off`.
+    // so it is masked, never refused (preserving the internal write). #1844
+    // extends the mask from `content` to title / tags / metadata string-leaf
+    // values (minus the crypto/system carve-out). No-op unless
+    // `AI_MEMORY_SECRET_SCREEN_MODE` was seeded non-`off`.
     let redacted_mem;
-    let mem = if let Some(redacted) = crate::secret_screen::redact_for_storage(&mem.content) {
-        redacted_mem = Memory {
-            content: redacted,
-            ..mem.clone()
-        };
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+        redacted_mem = redacted;
         &redacted_mem
     } else {
         mem
@@ -9039,16 +9038,16 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         return Ok(mem.id.clone());
     }
 
-    // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the federation
-    // RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused inbound row
-    // would diverge replicas (the merge primitive), so a relayed secret is
-    // masked, not rejected. No-op unless screening was seeded non-`off`.
+    // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
+    // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused
+    // inbound row would diverge replicas (the merge primitive), so a relayed
+    // secret is masked, not rejected. #1844 extends the mask from `content`
+    // to title / tags / metadata string-leaf values (minus the crypto/system
+    // carve-out, so the inbound attestation envelope is preserved intact).
+    // No-op unless screening was seeded non-`off`.
     let redacted_mem;
-    let mem = if let Some(redacted) = crate::secret_screen::redact_for_storage(&mem.content) {
-        redacted_mem = Memory {
-            content: redacted,
-            ..mem.clone()
-        };
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+        redacted_mem = redacted;
         &redacted_mem
     } else {
         mem
