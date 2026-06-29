@@ -102,6 +102,12 @@ variable "ssh_pubkey_fingerprint" {
   type        = string
 }
 
+variable "firewall_ssh_sources" {
+  description = "CIDR list allowed to SSH (port 22) to the hive droplets. Set TF_VAR_firewall_ssh_sources to the operator CIDR(s). Defaults open (key-only auth on short-lived smoke-test droplets) — restrict for any non-ephemeral hive."
+  type        = list(string)
+  default     = ["0.0.0.0/0"]
+}
+
 variable "ai_memory_image_url" {
   description = "URL to the pre-built ai-memory release tarball (operator-published)."
   type        = string
@@ -181,11 +187,13 @@ resource "digitalocean_firewall" "hive" {
     digitalocean_droplet.agent[*].id,
   )
 
-  // SSH from operator only (operator sets DO_FIREWALL_SSH_SOURCES via env)
+  // SSH from operator only — set TF_VAR_firewall_ssh_sources to the operator
+  // CIDR(s). (Terraform has no `getenv`; the prior `getenv(...)` call made the
+  // whole config fail to plan — fixed to a typed variable, v0.8.1 §5.2.)
   inbound_rule {
     protocol         = "tcp"
     port_range       = "22"
-    source_addresses = [getenv("DO_FIREWALL_SSH_SOURCES")]
+    source_addresses = var.firewall_ssh_sources
   }
 
   // East-west on :9077 (ai-memory HTTP daemon)
