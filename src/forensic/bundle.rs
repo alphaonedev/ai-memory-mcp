@@ -591,9 +591,15 @@ pub fn build_files(
             if let Some(content) = crate::transcripts::storage::fetch(conn, &entry.meta.id)
                 .context("fetch transcript content for bundle")?
             {
+                // #1845 (security review S3, CWE-312) — mask any credential in
+                // the raw transcript body on egress, identical to the memory
+                // content mask above; a secret pasted into a captured turn must
+                // not leak verbatim into the signed bundle handed to an auditor.
+                let screened =
+                    crate::secret_screen::redact_for_storage(&content).unwrap_or(content);
                 files.insert(
                     format!("transcripts/{}.content", entry.meta.id),
-                    content.into_bytes(),
+                    screened.into_bytes(),
                 );
             }
         }
