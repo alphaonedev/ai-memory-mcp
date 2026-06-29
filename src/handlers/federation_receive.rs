@@ -242,6 +242,94 @@ pub(super) fn resolve_inbound_attribution(
     sender_agent_id.to_string()
 }
 
+/// #1843 (v0.8.1, security-high) — author-binding authorization for an inbound
+/// relayed signal, shared verbatim by the sqlite (`sync_push`) and postgres
+/// (`sync_push_via_store`) receive loops so both backends behave identically.
+///
+/// ## The hole this closes (CWE-346)
+///
+/// A federated signal's `from_agent` is set by the wire. The receive loop's
+/// forged-signature check ([`crate::signals::verify`]) validates the signature
+/// against the signal's OWN wire-supplied `sender_pubkey` — it never binds
+/// `from_agent` to the enrolled peer's authorship allowlist nor to
+/// `from_agent`'s locally-enrolled key. So an enrolled peer could relay a signal
+/// forged as ANY agent. The memory lane ([`resolve_inbound_attribution`]) and
+/// the transition lane
+/// ([`crate::federation::receive_auth::authorize_remote_transition`]) already
+/// close this for their subcollections. A signal cannot be cleanly
+/// re-attributed (`from_agent` is inside the signed canonical bytes), so the
+/// disposition here is a PER-SIGNAL skip — never re-attribution, never a drop of
+/// the rest of the batch.
+///
+/// Returns `true` when the signal may be stored, `false` (with an author-naming
+/// WARN already emitted) when the caller must `skipped += 1; continue`.
+///
+/// Two composed layers (5-agent vote `4d3ea1c5`):
+///
+/// - **Layer 1 (always-on base).** Gated on the SAME primitive
+///   [`resolve_inbound_attribution`] uses — [`PeerAttestationConfig::has_allowlist`].
+///   Under an enrolled posture, a relayed signal is trusted only when it
+///   self-relays (`from_agent == sender_agent_id`) OR `from_agent` is in the
+///   peer's [`peer_attestation::PeerScope::allowed_sender_agent_ids`].
+///   Zero-config (no allowlist) does NOTHING new — byte-identical faith-based
+///   behavior.
+/// - **Layer 2 (opt-in `require_signal_sig`).** When the operator sets
+///   `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`
+///   ([`crate::federation::receive_auth::require_signal_sig_enabled`]),
+///   additionally require `signal.signature` to verify against `from_agent`'s
+///   locally-ENROLLED key ([`crate::identity::verify::lookup_peer_public_key`])
+///   — NOT the wire `sender_pubkey`. An unenrolled / unverified author is
+///   skipped. A *forged* signature is already skipped by [`crate::signals::verify`]
+///   regardless of this knob.
+#[must_use]
+pub(super) fn signal_author_authorized(
+    sig: &crate::models::Signal,
+    sender_agent_id: &str,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+    require_signal_sig: bool,
+) -> bool {
+    // Layer 1 — enrolled-posture authorship allowlist (mirrors the memory lane).
+    if attest_cfg.has_allowlist() && sig.from_agent != sender_agent_id {
+        let authorized = peer_id
+            .and_then(|p| attest_cfg.scope_for(p))
+            .is_some_and(|scope| {
+                scope
+                    .allowed_sender_agent_ids
+                    .iter()
+                    .any(|a| a == &sig.from_agent)
+            });
+        if !authorized {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                signal_id = %sig.id,
+                from_agent = %sig.from_agent,
+                sender = %sender_agent_id,
+                peer_id = %peer_id.unwrap_or(""),
+                "sync_push: peer not authorized to relay a signal authored as from_agent \
+                 — skipping (#1843); batch survives"
+            );
+            return false;
+        }
+    }
+    // Layer 2 — opt-in strict author-signature against the enrolled key.
+    if require_signal_sig {
+        let verified = crate::identity::verify::lookup_peer_public_key(&sig.from_agent)
+            .is_some_and(|key| crate::signals::verify_with_key(sig, key.as_bytes()));
+        if !verified {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                signal_id = %sig.id,
+                from_agent = %sig.from_agent,
+                "sync_push: AI_MEMORY_FED_REQUIRE_SIGNAL_SIG set but signal is not validly \
+                 signed by from_agent's enrolled key — skipping (#1843)"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 /// #1464 (v0.8.0) — per-write CONTENT attestation on the federation receive
 /// path. The ATTRIBUTION lane ([`resolve_inbound_attribution`]) resolves
 /// WHO a relayed memory is attributed to; this resolves WHETHER the relayed
@@ -1400,6 +1488,7 @@ pub async fn sync_push(
     // authorship) — a refusal skips the offending signal without 429-ing the
     // whole push (signals are not the primary write surface).
     let mut signals_applied = 0usize;
+    let require_signal_sig = crate::federation::receive_auth::require_signal_sig_enabled();
     for sig in &body.signals {
         if validate::validate_id(&sig.id).is_err() {
             skipped += 1;
@@ -1410,6 +1499,26 @@ pub async fn sync_push(
                 "sync_push: signal {} has an invalid signature — skipping (forged)",
                 sig.id
             );
+            skipped += 1;
+            continue;
+        }
+        // #1843 (v0.8.1) — bind `from_agent` to the enrolled peer's authorship
+        // before storing. The forged-signature check above only proves the
+        // signal verifies against its OWN wire `sender_pubkey`; it never binds
+        // `from_agent` to anything, so an enrolled peer could relay a signal
+        // authored as ANY agent (CWE-346 — the memory + transition lanes already
+        // close this). Signals carry `from_agent` inside the signed canonical
+        // bytes, so a forged author cannot be cleanly re-attributed: the
+        // disposition is a PER-SIGNAL skip — never a re-attribution and never a
+        // drop of the rest of the batch (co-resident memories/links/transitions
+        // in the same push still apply). 5-agent vote `4d3ea1c5`.
+        if !signal_author_authorized(
+            sig,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_signal_sig,
+        ) {
             skipped += 1;
             continue;
         }

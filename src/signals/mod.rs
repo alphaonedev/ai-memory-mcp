@@ -95,6 +95,27 @@ pub fn verify(signal: &Signal) -> bool {
     )
 }
 
+/// Verify a signal's Ed25519 signature against an EXPLICITLY supplied public
+/// key — the locally-**enrolled** key of `signal.from_agent` — rather than the
+/// wire-embedded `sender_pubkey`.
+///
+/// #1843 (v0.8.1) — the federation receive path's strict-mode author binding.
+/// [`verify`] proves the holder of the wire `sender_pubkey` signed the signal,
+/// but a relaying peer controls that field, so it does not bind `from_agent` to
+/// an attested identity. This re-derives the exact canonical bytes [`sign_into`]
+/// signed and checks the signature against the caller-supplied enrolled key
+/// (binds `from_agent → enrolled key`, the same gate the transition lane applies
+/// to `claimed_by`). Returns `false` — never panics — for an unsigned signal
+/// (empty `signature`) and for any key/signature that does not validate.
+#[must_use]
+pub fn verify_with_key(signal: &Signal, pubkey: &[u8]) -> bool {
+    if signal.signature.is_empty() {
+        return false;
+    }
+    let body_hash = body_sha256(signal);
+    verify_signal(&signable(signal, &body_hash), &signal.signature, pubkey)
+}
+
 /// SELECT column list for the `signals` table, in the canonical order
 /// [`row_to_signal`] expects. One definition shared by every signal read.
 pub const SIGNAL_SELECT_SQL: &str = "SELECT id, namespace, from_agent, to_agent, subject, body, \
