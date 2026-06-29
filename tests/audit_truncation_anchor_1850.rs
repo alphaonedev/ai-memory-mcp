@@ -16,12 +16,12 @@
 //! Pins:
 //! - (a) trailing-rows DELETE after a watermark → truncation `Detected`.
 //! - (b) no forensic anchor present → `Unknown` (NOT a false positive,
-//!       NOT intact-because-of-anchor — `is_clean()` stays true).
+//!   NOT intact-because-of-anchor — `is_clean()` stays true).
 //! - (c) intact chain with a current watermark → `NotDetected`.
 //! - (d) the watermark is carried INSIDE the forensic `payload` and does
-//!       NOT add a `ForensicDecision` struct field — a canonical-bytes /
-//!       signature round-trip of a pre-existing non-watermark row still
-//!       verifies (the T4 signed-bytes invariant).
+//!   NOT add a `ForensicDecision` struct field — a canonical-bytes /
+//!   signature round-trip of a pre-existing non-watermark row still
+//!   verifies (the T4 signed-bytes invariant).
 //!
 //! The forensic sink is process-global, so these tests serialise via a
 //! module-local lock (the same discipline as
@@ -88,7 +88,9 @@ fn append_row(conn: &Connection, payload: &[u8]) {
 
 #[test]
 fn trailing_delete_after_watermark_is_detected() {
-    let _g = forensic_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fdir = fresh_dir("a-forensic");
     let ddir = fresh_dir("a-db");
     forensic::init(fdir.path(), None).expect("forensic init");
@@ -141,7 +143,9 @@ fn trailing_delete_after_watermark_is_detected() {
 
 #[test]
 fn no_anchor_present_is_unknown_not_false_positive() {
-    let _g = forensic_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fdir = fresh_dir("b-forensic");
     let ddir = fresh_dir("b-db");
     // Sink is live but NO watermark is ever written → anchor ABSENT.
@@ -173,7 +177,9 @@ fn no_anchor_present_is_unknown_not_false_positive() {
 
 #[test]
 fn intact_chain_with_current_watermark_is_not_detected() {
-    let _g = forensic_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fdir = fresh_dir("c-forensic");
     let ddir = fresh_dir("c-db");
     forensic::init(fdir.path(), None).expect("forensic init");
@@ -278,7 +284,7 @@ fn watermark_is_payload_only_and_canonical_bytes_unchanged() {
         watermark
             .payload
             .get("head_sequence")
-            .and_then(|v| v.as_i64()),
+            .and_then(serde_json::Value::as_i64),
         Some(42)
     );
 }

@@ -263,7 +263,11 @@ fn operator_restore_unblocked_after_forget_tombstone_1848() {
         1,
         "#1848: forget still records a tombstone (gates the federation path)"
     );
-    assert_eq!(mem_count(&conn, &id), 0, "the live row is gone after forget");
+    assert_eq!(
+        mem_count(&conn, &id),
+        0,
+        "the live row is gone after forget"
+    );
 
     // Operator un-forget via the unscoped restore path SUCCEEDS.
     let restored = db::restore_archived(&conn, &id).expect("restore_archived");
@@ -281,17 +285,21 @@ fn operator_restore_unblocked_after_forget_tombstone_1848() {
     // exercise it on a fresh tombstoned id).
     db::forget(&conn, Some("g30-restore"), None, None, true).expect("re-forget");
     assert_eq!(mem_count(&conn, &id), 0, "gone again after re-forget");
-    let restored_caller = db::restore_archived_for_caller(&conn, &id, "ai:test:g30")
-        .expect("restore_for_caller");
+    let restored_caller =
+        db::restore_archived_for_caller(&conn, &id, "ai:test:g30").expect("restore_for_caller");
     assert!(
         restored_caller,
         "#1848/#1771: owner-scoped operator restore must also succeed"
     );
-    assert_eq!(mem_count(&conn, &id), 1, "live again after owner-scoped restore");
+    assert_eq!(
+        mem_count(&conn, &id),
+        1,
+        "live again after owner-scoped restore"
+    );
 }
 
 /// #1848 (option B) — the federation `/sync/push` restores[] chokepoint
-/// (src/handlers/federation_receive.rs) consults `db::memory_is_tombstoned`
+/// (`src/handlers/federation_receive.rs`) consults `db::memory_is_tombstoned`
 /// BEFORE `db::restore_archived` and skips (noop) when true, so a PEER cannot
 /// undo a local forget by pushing a restore. This pins the gate primitive: a
 /// forgotten id reports tombstoned (→ the federation loop no-ops) EVEN THOUGH
@@ -313,7 +321,10 @@ fn federation_restore_gate_primitive_blocks_tombstoned_1848() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(archived, 1, "the archived copy exists after forget(archive=true)");
+    assert_eq!(
+        archived, 1,
+        "the archived copy exists after forget(archive=true)"
+    );
 
     // ...yet the federation guard primitive reports it tombstoned, so the
     // restores[] loop takes its `noop += 1; continue;` branch and never reaches
