@@ -114,6 +114,13 @@ variable "vpc_ip_range" {
   default     = "10.20.0.0/16"
 }
 
+variable "db_password" {
+  description = "PostgreSQL password for the ai-memory role (substrate-local; the daemon connects over localhost only — postgres is not exposed to the network). Pass via TF_VAR_db_password."
+  type        = string
+  default     = "aimem-do-substrate"
+  sensitive   = true
+}
+
 variable "ai_memory_image_url" {
   description = "URL to the pre-built ai-memory release tarball (operator-published)."
   type        = string
@@ -157,6 +164,7 @@ resource "digitalocean_droplet" "memory" {
 
   user_data = templatefile("${path.module}/cloud-init-memory.yaml.tpl", {
     ai_memory_image_url = var.ai_memory_image_url
+    db_password         = var.db_password
   })
 
   tags = ["ai-memory-hive", "ai-memory-substrate"]
