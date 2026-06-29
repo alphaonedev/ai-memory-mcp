@@ -2863,6 +2863,44 @@ pub fn forget_count(
     Ok(usize::try_from(count).unwrap_or(0))
 }
 
+/// #1849 (CWE-862) — DISTINCT namespaces of the FULL forget match set,
+/// NON-owner-scoped (the admin / HTTP `forget_memories` path). Mirrors
+/// [`forget_count`]'s WHERE (the FTS branch + the no-pattern branch) but
+/// SELECTs DISTINCT namespace with **NO LIMIT**, so the HTTP admin
+/// bulk-forget governance gate sees EVERY touched namespace — including a
+/// governed namespace whose rows would sort PAST the #1602 preview cap (the
+/// load-bearing 5-agent-vote objection, 4d3ea1c5: the capped preview would
+/// silently miss it and the gate would leak). `namespace` is intentionally
+/// omitted from the predicate — this is only consulted on a
+/// `namespace = None` cross-namespace forget.
+pub fn forget_distinct_namespaces(
+    conn: &Connection,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+) -> Result<Vec<String>> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.namespace
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.tier = ?2)",
+        )?;
+        let rows = stmt
+            .query_map(params![fts_query, tier_str], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT namespace FROM memories WHERE (?1 IS NULL OR tier = ?1)")?;
+    let rows = stmt
+        .query_map(params![tier_str], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
 /// leaks (`federation_push_dlq` cleartext payload, `transcript_line_dedup`
 /// content-hash oracle) for the rows a forget is about to delete. MUST run
@@ -3345,6 +3383,58 @@ pub fn forget_count_for_caller(
         |r| r.get(0),
     )?;
     Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// #1849 (CWE-862) — DISTINCT namespaces of the FULL owner-scoped forget
+/// match set, with **NO LIMIT**. The MCP bulk `memory_forget` governance gate
+/// consults this on a `namespace = None` cross-namespace forget so it can run
+/// the per-namespace delete-governance check against EVERY namespace the
+/// forget would actually touch. Mirrors [`forget_count_for_caller`]'s WHERE
+/// EXACTLY (the FTS branch + the no-pattern branch, both with the
+/// unstamped-inclusive owner clause) but SELECTs DISTINCT namespace UNCAPPED:
+/// the #1602 preview ([`forget_matches_for_caller`]) caps at
+/// `DRY_RUN_PREVIEW_CAP + 1`, truncates to the cap, and `ORDER BY rowid`, so a
+/// governed namespace whose rows sort past the cap would be INVISIBLE and the
+/// gate would silently leak (the load-bearing 5-agent-vote objection,
+/// 4d3ea1c5). `namespace` is omitted from the predicate — this is only
+/// consulted when namespace is `None`. `caller` is always `Some(...)`.
+pub fn forget_distinct_namespaces_for_caller(
+    conn: &Connection,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: &str,
+) -> Result<Vec<String>> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.namespace
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.tier = ?2)
+               AND (json_extract(m.metadata,'$.agent_id') = ?3
+                    OR json_extract(m.metadata,'$.agent_id') IS NULL
+                    OR json_extract(m.metadata,'$.agent_id') = '')",
+        )?;
+        let rows = stmt
+            .query_map(params![fts_query, tier_str, caller], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT namespace FROM memories
+         WHERE (?1 IS NULL OR tier = ?1)
+           AND (json_extract(metadata,'$.agent_id') = ?2
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')",
+    )?;
+    let rows = stmt
+        .query_map(params![tier_str, caller], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// #1772 — owner-scoped twin of [`forget_matches`] for the multi-tenant
