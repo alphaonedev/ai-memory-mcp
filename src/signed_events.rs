@@ -764,6 +764,29 @@ impl AuditTrailReport {
 /// An empty chain (or an empty window) is trivially intact with a
 /// `total_events` of 0 and no gaps.
 ///
+/// # Limitations (security review #1850, CWE-354)
+///
+/// The hash chain is tamper-EVIDENT against in-place edits and
+/// middle-of-chain row deletion (which leave a hash break or a
+/// `sequence_gap`), but it is NOT a complete integrity oracle:
+///
+/// - **Tail truncation is undetectable here.** `head_sequence` is
+///   recomputed from the surviving `MAX(sequence)` with no external
+///   high-water mark, so deleting the trailing N rows leaves a
+///   contiguous `1..=(head-N)` chain with no gap — `chain_intact`
+///   reports `true`. Detecting this requires comparing the in-DB head
+///   against an append-only watermark persisted OUTSIDE this writable
+///   table (e.g. the #697 daily-rotated forensic JSONL chain, or an
+///   off-host `AI_MEMORY_LOG_SINK=syslog` shipment). That external
+///   anchor is tracked separately.
+/// - **Unsigned-daemon whole-suffix rewrite is undetectable.** When the
+///   daemon boots without an enrolled signing key (`load_daemon_signing_key`
+///   → `None`, "continuing unsigned"), [`verify_chain`]'s signature
+///   verifier is `None`, so an attacker with DB-file write access can
+///   rewrite a suffix with recomputed `prev_hash` values and zero
+///   `signature_failures`. Run with an enrolled audit key for
+///   cryptographic (not merely hash-chain) tamper evidence.
+///
 /// # Errors
 ///
 /// Returns the underlying `rusqlite` error if any of the head /
