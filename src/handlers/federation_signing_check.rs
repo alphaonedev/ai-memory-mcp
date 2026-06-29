@@ -34,6 +34,7 @@ use super::AppState;
 use super::federation_receive::{
     ATTESTATION_TRACE_TARGET, SyncPushBody, apply_inbound_write_attestation,
     check_sender_clock_skew, extract_peer_id, next_utc_midnight, resolve_inbound_attribution,
+    signal_author_authorized,
 };
 #[cfg(feature = "sal")]
 use crate::validate;
@@ -518,8 +519,24 @@ pub(super) async fn sync_push_via_store(
     // metadata DB even on postgres-backed daemons (same as the memories loop
     // above), so it is charged via `app.db` before the trait write.
     let mut signals_applied = 0usize;
+    let require_signal_sig = crate::federation::receive_auth::require_signal_sig_enabled();
     for sig in &body.signals {
         if validate::validate_id(&sig.id).is_err() {
+            skipped += 1;
+            continue;
+        }
+        // #1843 (v0.8.1) — bind `from_agent` to the enrolled peer's authorship
+        // (sqlite-twin parity; see `federation_receive::signal_author_authorized`).
+        // The forged-signature check lives inside `apply_remote_signal` below; the
+        // author binding is checked here, before the quota charge + trait write,
+        // and is a PER-SIGNAL skip — the rest of the push still applies.
+        if !signal_author_authorized(
+            sig,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+            require_signal_sig,
+        ) {
             skipped += 1;
             continue;
         }
