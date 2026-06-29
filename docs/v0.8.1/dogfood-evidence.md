@@ -38,7 +38,36 @@ acks, needed, durability:"local"}`, never a 5xx; the row is locally durable.
 the egress gate refuses a policy-denied skill export on the MCP surface);
 `tests/postgres_l2_rehydration_1693.rs` (live PG — backend-blind L2 rehydration).
 
-> A manual interactive MCP dogfood transcript (driving the live binary by hand)
-> is appended below once the release binary is rebuilt on this branch HEAD.
+## Live interactive MCP dogfood transcript (release/v0.8.1 binary, by hand)
+
+Driving the rebuilt `target/release/ai-memory` binary directly over MCP stdio
+JSON-RPC as an AI-NHI agent (`clientInfo.name = dogfood-nhi`), default
+`AI_MEMORY_SECRET_SCREEN_MODE=refuse`. Raw transcript:
+`.local-runs/v081-2026-06-28/dogfood-transcript.txt`.
+
+```
+init: ok
+# W1 — paste a credential into memory_store
+store credential  -> isError=True: "content rejected: appears to contain
+                     credential material (openai_style_key); set
+                     AI_MEMORY_SECRET_SCREEN_MODE=redact ... or =off ..."
+store benign      -> ok  (id 764b16ed…, namespace df)
+
+# W2 — store, recall (found), forget, recall (gone)
+store forgetme        -> ok  (id d8e5e5e1…, namespace df-forget)
+recall BEFORE forget  -> count:1   (df-forgetme surfaced)
+forget ns             -> {"deleted":1,"deleted_ids":["d8e5e5e1…"]}
+recall AFTER forget   -> count:0   (content erased — no remanence)
+```
+
+- **W1 (G29)** live PASS — a pasted OpenAI-style key is refused on the real MCP
+  write surface; benign content stores.
+- **W2 (G30)** live PASS — store → recall:1 → forget:1 → recall:0 end-to-end in
+  one interactive MCP session; the forgotten content is gone.
+
+This is the by-hand counterpart to the automated fresh-subprocess tests above
+and the DO HTTP smoke (`operational-evidence-do.md`) — three independent
+surfaces (automated MCP tests, live HTTP on DO, by-hand MCP stdio) all confirm
+W1 + W2.
 
 🤖 Claude Code (Opus 4.8, 1M context).
