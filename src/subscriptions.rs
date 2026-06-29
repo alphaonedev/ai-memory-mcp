@@ -1878,11 +1878,18 @@ fn is_private(ip: IpAddr) -> bool {
             // OSes the kernel routes 0.0.0.0 to a local listener, so an
             // attacker-controlled hostname resolving to 0.0.0.0 hits the
             // local box.
+            // #1847 (security review S4, CWE-918) — RFC 6598 CGNAT
+            // (100.64.0.0/10) is not covered by `is_private()` but is a
+            // routable-to-internal range on AWS EKS secondary-CIDR / GKE /
+            // carrier-grade-NAT topologies, so SSRF-reject it too.
+            let o = v4.octets();
+            let is_cgnat = o[0] == 100 && (o[1] & 0xc0) == 0x40;
             v4.is_private()
                 || v4.is_link_local()
                 || v4.is_multicast()
                 || v4.is_broadcast()
                 || v4.is_unspecified()
+                || is_cgnat
         }
         IpAddr::V6(v6) => {
             // Conservative: reject unique-local (fc00::/7), link-local
@@ -2304,6 +2311,28 @@ mod tests {
         assert!(validate_url("https://169.254.1.1/hook").is_err());
         assert!(validate_url("https://[fc00::1]/hook").is_err());
         assert!(validate_url("https://[fe80::1]/hook").is_err());
+    }
+
+    #[test]
+    fn cgnat_range_blocked_1847() {
+        // #1847 (security review S4, CWE-918) — RFC 6598 CGNAT 100.64.0.0/10.
+        assert!(
+            validate_url("https://100.64.0.1/hook").is_err(),
+            "100.64.0.1 (CGNAT) must be SSRF-rejected"
+        );
+        assert!(
+            validate_url("https://100.127.255.254/hook").is_err(),
+            "100.127.255.254 (top of CGNAT /10) must be rejected"
+        );
+        // Boundaries just outside 100.64.0.0/10 are public → allowed.
+        assert!(
+            validate_url("https://100.63.0.1/hook").is_ok(),
+            "100.63.0.1 is below the CGNAT range and must be allowed"
+        );
+        assert!(
+            validate_url("https://100.128.0.1/hook").is_ok(),
+            "100.128.0.1 is above the CGNAT range and must be allowed"
+        );
     }
 
     #[test]
