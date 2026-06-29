@@ -24,14 +24,23 @@ jobs:
         run: cargo install cargo-fuzz --locked
 
       - name: Fuzz validate
+        # #1851 (security review S7, CWE-94) — route the untrusted
+        # workflow_dispatch input through an intermediate env var instead of
+        # inlining `${{ inputs.duration }}` in `run:` (template interpolation
+        # expands before the shell parses the line, so a crafted input could
+        # inject shell). Mirrors the env-indirection pattern in yank.yml.
+        env:
+          DURATION: ${{ github.event.inputs.duration }}
         run: |
           cd fuzz
-          cargo fuzz run fuzz_validate -- -max_len=512 -max_total_time=${{ github.event.inputs.duration }}
+          cargo fuzz run fuzz_validate -- -max_len=512 -max_total_time="$DURATION"
 
       - name: Fuzz namespace
+        env:
+          DURATION: ${{ github.event.inputs.duration }}
         run: |
           cd fuzz
-          cargo fuzz run fuzz_namespace -- -max_len=512 -max_total_time=${{ github.event.inputs.duration }}
+          cargo fuzz run fuzz_namespace -- -max_len=512 -max_total_time="$DURATION"
 
       - name: Upload fuzz artifacts
         if: failure()

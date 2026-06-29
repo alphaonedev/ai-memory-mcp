@@ -52,9 +52,16 @@ jobs:
       - name: Resolve tag + sha + prerelease flag
         id: check
         shell: bash
+        # #1851 (security review S7, CWE-94) — read the untrusted
+        # workflow_dispatch tag from an intermediate env var, NOT an inline
+        # `${{ inputs.tag }}` in `run:`. Inline template interpolation expands
+        # before the SemVer regex below runs and before the shell parses the
+        # line, so a crafted tag could inject shell ahead of validation.
+        # Mirrors the env-indirection pattern in yank.yml.
+        env:
+          TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag }}"
           # Sanity check — refuse anything that doesn't start with `v`
           # so a workflow_dispatch typo can't accidentally tag a branch.
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.\-]+)?$ ]]; then
