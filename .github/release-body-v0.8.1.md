@@ -12,7 +12,7 @@ This patch is the result of pointing the substrate's own adversarial-review disc
 
 1. **Secrets don't leak in, forgotten data doesn't leak out.** A credential pasted into a memory is screened on the write path (refuse/redact, configurable); a `forget` now performs a real erasure fan-out — DLQ cleartext, the transcript-dedup oracle, the vector index, and a **signed tombstone** so a federation peer can't resurrect it — while an *operator's* authorized un-forget still round-trips.
 2. **The substrate tells the truth about durability.** A durable-but-under-replicated write returns `202 Accepted` + the replication state, not a misleading `503`.
-3. **A real security review, all findings fixed.** A 7-lane × find→adversarial-verify→triage review surfaced **9** confirmed issues across federation auth, secret-handling, injection/DoS, governance/erasure, and CI supply-chain — **all 9 fixed, tested, and closed**, each contested call decided by a deterministic 5-agent vote.
+3. **A real security review, all findings fixed.** A 7-lane × find→adversarial-verify→triage review surfaced **9** confirmed issues across federation auth, secret-handling, injection/DoS, governance/erasure, and CI supply-chain — **all 9 fixed and closed** (7 of the 9 also regression-tested; #1845 and #1851 ship verified code fixes without a dedicated regression test), each contested call decided by a deterministic 5-agent vote.
 4. **Proven on PostgreSQL + Apache AGE + pgvector.** The postgres+AGE backend was stood up live and put through 3 green rounds + an AI-NHI dogfood — store, pgvector semantic recall, AGE graph projection, forget/erasure, and the secret-screen, all on real infra.
 
 Same identical API across embedded SQLite and PostgreSQL + Apache AGE, across desktop, server, and on-device.
@@ -44,7 +44,7 @@ v0.8.1 is a **defect-closure + security-hardening patch** ([#1821](https://githu
 - **Security review — 9 fixed:** federated-signal authorship binding ([#1843](https://github.com/alphaonedev/ai-memory-mcp/issues/1843)), field-complete secret screen ([#1844](https://github.com/alphaonedev/ai-memory-mcp/issues/1844)), forensic-transcript redaction ([#1845](https://github.com/alphaonedev/ai-memory-mcp/issues/1845)), FTS OR-tree DoS cap ([#1846](https://github.com/alphaonedev/ai-memory-mcp/issues/1846)), CGNAT SSRF ([#1847](https://github.com/alphaonedev/ai-memory-mcp/issues/1847)), archive-restore tombstone gate ([#1848](https://github.com/alphaonedev/ai-memory-mcp/issues/1848)), namespace-less forget governance ([#1849](https://github.com/alphaonedev/ai-memory-mcp/issues/1849)), audit tail-truncation anchor ([#1850](https://github.com/alphaonedev/ai-memory-mcp/issues/1850)), CI workflow_dispatch injection ([#1851](https://github.com/alphaonedev/ai-memory-mcp/issues/1851)).
 - **Surface (unchanged from v0.8.0 except schema):** schema **v71** · **100** MCP tools at `--profile full` / 7 core · **91** HTTP routes (77 unique paths) · **83/85** CLI subcommands · **9** typed link relations · 27-field `Memory`. SQLite **and** PostgreSQL+AGE, identical API.
 
-**Why care:** the gaps you'd file on day one of an audit are already filed, fixed, tested, and closed.
+**Why care:** the gaps you'd file on day one of an audit are already filed, fixed, and closed (7 of the 9 also carry a dedicated regression test).
 
 ---
 
@@ -60,7 +60,7 @@ v0.8.1 is a **defect-closure + security-hardening patch** ([#1821](https://githu
 A locally-durable write that misses quorum returns `202 Accepted` with `{quorum_met, acks, needed, durability}` — the replication state, not a misleading `503`.
 
 ### 🛡️ Security review — 9 findings, all fixed
-A 7-lane adversarial review (authn/identity, federation, secrets, injection/DoS, governance/erasure, memory-safety, supply-chain) → 9 confirmed → all fixed, tested, closed (#1843–#1851). Contested calls (signal-auth shape, metadata-screen scope, forget governance, truncation anchor, restore/erasure reconciliation) each resolved by a deterministic 5-agent vote.
+A 7-lane adversarial review (authn/identity, federation, secrets, injection/DoS, governance/erasure, memory-safety, supply-chain) → 9 confirmed → all fixed and closed (#1843–#1851; 7 of the 9 also carry a dedicated regression test — #1845 forensic-transcript redaction and #1851 CI `workflow_dispatch` injection are fixed but not separately regression-tested). Contested calls (signal-auth shape, metadata-screen scope, forget governance, truncation anchor, restore/erasure reconciliation) each resolved by a deterministic 5-agent vote.
 
 ### 🐘 PostgreSQL + Apache AGE + pgvector — verified live
 Stood up on real infra and run through **3 green rounds + an AI-NHI dogfood**: store, pgvector semantic recall, AGE graph projection (`memory_graph`), tsvector search, forget/erasure, and the secret-screen — all on PostgreSQL 16 + Apache AGE 1.6 + pgvector 0.6. The do-hive provisioning was fixed to install pgvector + build AGE ([#1842](https://github.com/alphaonedev/ai-memory-mcp/issues/1842)).
