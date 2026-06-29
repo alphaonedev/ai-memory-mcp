@@ -108,6 +108,12 @@ variable "firewall_ssh_sources" {
   default     = ["0.0.0.0/0"]
 }
 
+variable "vpc_ip_range" {
+  description = "Private CIDR for the hive VPC. Must not overlap an existing account VPC. Override via TF_VAR_vpc_ip_range if 10.20.0.0/16 is taken."
+  type        = string
+  default     = "10.20.0.0/16"
+}
+
 variable "ai_memory_image_url" {
   description = "URL to the pre-built ai-memory release tarball (operator-published)."
   type        = string
@@ -125,9 +131,12 @@ variable "ironclaw_image_url" {
 // ---------------------------------------------------------------------------
 
 resource "digitalocean_vpc" "hive" {
-  name     = "ai-memory-hive-${var.region}"
-  region   = var.region
-  ip_range = "10.10.0.0/16"
+  name = "ai-memory-hive-${var.region}"
+  region = var.region
+  // v0.8.1 §5.2 — was hardcoded 10.10.0.0/16, which collides with any
+  // pre-existing account VPC on that range (it did: do-1461-vpc-fra1) and
+  // aborts the whole apply. Now a variable so each hive picks a free range.
+  ip_range = var.vpc_ip_range
 }
 
 // ---------------------------------------------------------------------------
