@@ -210,7 +210,7 @@ spec:
         - name: AI_MEMORY_HTTP
           value: "http://127.0.0.1:9077"
     - name: ai-memory
-      image: ghcr.io/alphaonedev/ai-memory:0.7.0
+      image: ghcr.io/alphaonedev/ai-memory:0.8.0
       args: ["serve", "--host", "0.0.0.0", "--port", "9077"]
       env:
         - name: AI_MEMORY_DB
@@ -273,7 +273,7 @@ spec:
       hostNetwork: false
       containers:
         - name: ai-memory
-          image: ghcr.io/alphaonedev/ai-memory:0.7.0
+          image: ghcr.io/alphaonedev/ai-memory:0.8.0
           args: ["serve", "--host", "0.0.0.0", "--port", "9077"]
           ports:
             - containerPort: 9077
@@ -312,7 +312,7 @@ name: ai-memory
 description: Persistent memory sidecar/daemon for AI agents
 type: application
 version: 0.1.0
-appVersion: "0.7.0"
+appVersion: "0.8.0"
 ```
 
 ```yaml

@@ -68,7 +68,7 @@ wire boundary honors each as follows:
 | **Allow**   | `wire_check::check` returns `Ok(())`; the action proceeds.                                              |
 | **Refuse**  | Returns `Err(GovernanceRefusal { reason })`; caller short-circuits with HTTP `403 / GOVERNANCE_REFUSED`. |
 | **Warn**    | Logged via the audit chain; returns `Ok(())`. The action proceeds; the warning is operator-observable.  |
-| **Escalate** | v0.8.0 (#1727 / §22 PE-5, schema v66). **Fails closed:** an unresolved `Decision::Escalate` blocks exactly like `Refuse` (`Decision::is_block`) pending human review — the wire boundary returns `Err(GovernanceRefusal { reason })`. |
+| **Escalate** | v0.8.0 (#697 / §22 PE-5, schema v66). **Fails closed:** an unresolved `Decision::Escalate` blocks exactly like `Refuse` (`Decision::is_block`) pending human review — the wire boundary returns `Err(GovernanceRefusal { reason })`. |
 | **Modify**  | Rules engine pre-rewrites the action's args; the wire boundary sees the modified payload and Allows it. |
 | **Ask**     | Future K10 surface — operator-approval queueing. Today reduces to Refuse (action does not proceed).      |
 
@@ -93,7 +93,7 @@ CREATE TABLE governance_rules (
 ```
 
 > **Schema update (v0.8.0).** The `severity` CHECK above is the original
-> migration 0024 (v0.7.0) form. **Schema v66 (#1727 / §22 PE-5,
+> migration 0024 (v0.7.0) form. **Schema v66 (#697 / §22 PE-5,
 > `migrations/sqlite/0055_v66_governance_rules_escalate_severity.sql`)
 > extended it to `CHECK (severity IN ('refuse','warn','log','escalate'))`**
 > — the `escalate` severity produces the fail-closed `Decision::Escalate`
