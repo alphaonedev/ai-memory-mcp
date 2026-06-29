@@ -252,7 +252,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // NON-DESTRUCTIVE `undo_in_place_edit` free fn + `read_owner_agent_id` /
     // `UndoSnapshot` helpers (the sqlite reference behind the CLI-only
     // `ai-memory undo-edit` operator tool).
-    ("src/storage/mod.rs", 21_000),
+    // 2026-06-28 (#1821, v0.8.1 W2/G30) — bumped 21_000 → 21_250 for the
+    // `purge_and_tombstone_forget` erasure-fanout helper + `memory_is_tombstoned`
+    // tombstone gate + the W1/G29 redact-at-storage funnel wiring in `db::insert`
+    // / `insert_if_newer`.
+    ("src/storage/mod.rs", 21_250),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -580,7 +584,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // NON-DESTRUCTIVE `undo_in_place_edit` PostgresStore trait method (the
     // postgres twin behind the CLI-only `ai-memory undo-edit` operator tool).
     // Per-domain split tracked #650.
-    ("src/store/postgres.rs", 22_300),
+    // 2026-06-28 (#1821, v0.8.1 W1+W2) — bumped 22_300 → 22_450 for the G29
+    // redact-at-storage wiring (store/store_with_embedding/store_batch/
+    // merge_inbound) + the G30 forget erasure-fanout (DLQ/transcript purge +
+    // UNNEST signed-tombstone insert) + the `migrate_v71` forget_tombstones arm.
+    ("src/store/postgres.rs", 22_450),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
