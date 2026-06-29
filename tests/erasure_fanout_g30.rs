@@ -243,49 +243,86 @@ fn forget_leaves_no_cleartext_remanence_g30() {
     );
 }
 
-/// #1848 (security review S5) — archive-restore must NOT resurrect a
-/// forgotten (tombstoned) memory. `forget` with archive=true leaves the row
-/// in `archived_memories` AND records a tombstone; `restore_archived` must
-/// treat the tombstoned id as not-found (Ok(false)) and leave it dead.
+/// #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B) — an
+/// OPERATOR-initiated restore of a forgotten (tombstoned) memory is an
+/// AUTHORIZED un-forget and MUST round-trip (the #1771 recoverable-delete
+/// contract). The G30 tombstone gates only AUTOMATIC peer-triggered
+/// resurrection (the federation `/sync/push` restores[] chokepoint + the LWW
+/// re-push gate), NOT the operator's own restore. This pins the revert of the
+/// over-broad original #1848 storage-layer guard against silent reintroduction.
 #[test]
-fn restore_archived_blocked_by_forget_tombstone_1848() {
+fn operator_restore_unblocked_after_forget_tombstone_1848() {
     let (_dir, path) = fresh_db();
     let conn = db::open(&path).expect("open");
 
     let id = seed_memory(&conn, "g30-restore", "rnote", "original secret content");
-    // archive=true: the archived copy survives the forget (this is the
-    // resurrection vector the guard must close).
+    // archive=true: the archived copy survives the forget (+ a tombstone).
     db::forget(&conn, Some("g30-restore"), None, None, true).expect("forget");
     assert_eq!(
         tombstone_count(&conn, &id),
         1,
-        "#1848: forget must record a tombstone"
+        "#1848: forget still records a tombstone (gates the federation path)"
     );
-    assert_eq!(mem_count(&conn, &id), 0, "the live row is gone");
+    assert_eq!(mem_count(&conn, &id), 0, "the live row is gone after forget");
 
+    // Operator un-forget via the unscoped restore path SUCCEEDS.
     let restored = db::restore_archived(&conn, &id).expect("restore_archived");
     assert!(
-        !restored,
-        "#1848: restoring a tombstoned (forgotten) memory must be a no-op"
+        restored,
+        "#1848/#1771: operator restore of a forgotten memory must SUCCEED (authorized un-forget)"
     );
     assert_eq!(
         mem_count(&conn, &id),
-        0,
-        "#1848: a forgotten memory must NOT be resurrected via archive-restore"
+        1,
+        "#1771: the memory is live again after the operator restore"
     );
 
-    // Owner-scoped restore path must enforce the same guard.
-    let restored_caller =
-        db::restore_archived_for_caller(&conn, &id, "ai:tester@host").expect("restore_for_caller");
+    // Owner-scoped operator restore path likewise succeeds (re-forget first to
+    // exercise it on a fresh tombstoned id).
+    db::forget(&conn, Some("g30-restore"), None, None, true).expect("re-forget");
+    assert_eq!(mem_count(&conn, &id), 0, "gone again after re-forget");
+    let restored_caller = db::restore_archived_for_caller(&conn, &id, "ai:test:g30")
+        .expect("restore_for_caller");
     assert!(
-        !restored_caller,
-        "#1848: owner-scoped restore of a tombstoned memory must also be a no-op"
+        restored_caller,
+        "#1848/#1771: owner-scoped operator restore must also succeed"
     );
-    assert_eq!(
-        mem_count(&conn, &id),
-        0,
-        "still dead after owner-scoped restore"
+    assert_eq!(mem_count(&conn, &id), 1, "live again after owner-scoped restore");
+}
+
+/// #1848 (option B) — the federation `/sync/push` restores[] chokepoint
+/// (src/handlers/federation_receive.rs) consults `db::memory_is_tombstoned`
+/// BEFORE `db::restore_archived` and skips (noop) when true, so a PEER cannot
+/// undo a local forget by pushing a restore. This pins the gate primitive: a
+/// forgotten id reports tombstoned (→ the federation loop no-ops) EVEN THOUGH
+/// its archived copy exists (so it is the tombstone, not a missing archive,
+/// that gates the peer path) — while the operator path stays open (above).
+#[test]
+fn federation_restore_gate_primitive_blocks_tombstoned_1848() {
+    let (_dir, path) = fresh_db();
+    let conn = db::open(&path).expect("open");
+
+    let id = seed_memory(&conn, "g30-fedrestore", "rnote", "peer-resurrect attempt");
+    db::forget(&conn, Some("g30-fedrestore"), None, None, true).expect("forget");
+
+    // The archived copy is present (forget archived it)...
+    let archived: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM archived_memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(archived, 1, "the archived copy exists after forget(archive=true)");
+
+    // ...yet the federation guard primitive reports it tombstoned, so the
+    // restores[] loop takes its `noop += 1; continue;` branch and never reaches
+    // restore_archived — a peer-pushed restore cannot resurrect it.
+    assert!(
+        db::memory_is_tombstoned(&conn, &id).expect("tombstone check"),
+        "#1848: the federation restore gate must see the forgotten id as tombstoned"
     );
+    assert_eq!(mem_count(&conn, &id), 0, "the row stays forgotten");
 }
 
 /// The FORGET tombstone signable bytes are deterministic + domain-separated.

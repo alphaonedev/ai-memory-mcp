@@ -8664,14 +8664,13 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         if !exists {
             return Ok(false);
         }
-        // #1848 (security review S5, gap G30) — a forgotten memory carries a
-        // signed forget-tombstone; restoring its archived copy would resurrect
-        // the erased content and undo the durable erasure. Treat a tombstoned id
-        // as not-found (no-op restore), mirroring the G30 gate on
+        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
+        // OPERATOR-initiated restore is an AUTHORIZED un-forget and must
+        // round-trip per the #1771 recoverable-delete contract — so NO
+        // tombstone gate here. The G30 forget-tombstone gates only AUTOMATIC
+        // resurrection: the federation /sync/push `restores[]` chokepoint
+        // (src/handlers/federation_receive.rs) and the LWW re-push gate on
         // `insert_if_newer` / `merge_inbound`.
-        if memory_is_tombstoned(conn, id)? {
-            return Ok(false);
-        }
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -8812,12 +8811,10 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         if !owned {
             return Ok(false);
         }
-        // #1848 (security review S5, gap G30) — never resurrect a tombstoned
-        // (forgotten) memory via restore; treat as not-found. Mirrors the G30
-        // gate on the restore + insert chokepoints.
-        if memory_is_tombstoned(conn, id)? {
-            return Ok(false);
-        }
+        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
+        // owner-initiated restore is an AUTHORIZED un-forget — no tombstone gate
+        // here (the G30 tombstone gates only automatic resurrection: the
+        // federation restores[] chokepoint + the LWW re-push gate).
         // Check if ID already exists in active memories to prevent silent overwrite.
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
