@@ -462,6 +462,12 @@ pub async fn forget_memories(
     // namespace through the normal delete path). Skipped when neither pattern
     // nor tier is set (no forget scope — the FORGET_FILTER_REQUIRED error must
     // surface). 5-agent vote 4d3ea1c5.
+    //
+    // Gated on `sal`: the resolution + policy lookup go through the `app.store`
+    // SAL trait (present for every production HTTP daemon — sqlite-SAL and
+    // postgres). The non-`sal` build has no `app.store` (mobile/minimal lib
+    // target), mirroring the `#[cfg(feature = "sal")]` SAL forget path below.
+    #[cfg(feature = "sal")]
     if body.namespace.is_none() && (body.pattern.is_some() || body.tier.is_some()) {
         let matched = match app
             .store

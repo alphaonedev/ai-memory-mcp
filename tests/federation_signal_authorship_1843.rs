@@ -24,7 +24,7 @@
 //! - **Layer 2 (opt-in `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG`)** — additionally
 //!   require the signature to verify against `from_agent`'s locally-enrolled key.
 //!
-//! These tests exercise the SQLite `/sync/push` receive handler end-to-end:
+//! These tests exercise the `SQLite` `/sync/push` receive handler end-to-end:
 //! (a) forged signature → skipped; (b) enrolled peer + allowlist, `from_agent`
 //! OUTSIDE the allowlist → skipped while a co-resident memory in the SAME push
 //! still applies (batch survival); (c) self-relay + allowlisted third-party →
