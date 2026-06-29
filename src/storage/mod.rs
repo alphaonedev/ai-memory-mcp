@@ -5819,6 +5819,14 @@ fn strip_invisible(s: &str) -> String {
         .collect()
 }
 
+/// #1846 (security review S4, CWE-400) — hard cap on the number of terms
+/// any caller query expands into. Without it, a ~2 MiB whitespace-token
+/// `context` builds a ~1M-phrase FTS5 MATCH OR-tree per request, and a
+/// handful of concurrent such requests exhaust the fixed read pool. Every
+/// recall/search path (HTTP / MCP / CLI / postgres) funnels through here, so
+/// clamping at this chokepoint bounds the OR-tree for all of them.
+pub const MAX_FTS_OR_TERMS: usize = 128;
+
 fn sanitize_fts_query(input: &str, use_or: bool) -> String {
     let joiner = if use_or { " OR " } else { " " };
     let cleaned = strip_invisible(input);
@@ -5864,6 +5872,9 @@ fn sanitize_fts_query(input: &str, use_or: bool) -> String {
             format!("\"{clean}\"")
         })
         .filter(|t| !t.is_empty())
+        // #1846 — clamp the OR-tree size so no caller can build an unbounded
+        // FTS5 MATCH expression (read-pool exhaustion DoS).
+        .take(MAX_FTS_OR_TERMS)
         .collect();
     if tokens.is_empty() {
         return "\"_empty_\"".to_string();
@@ -16312,6 +16323,22 @@ mod tests {
         // Hyphenated tokens pass through as phrase searches.
         let sanitized5 = sanitize_fts_query("well-known", true);
         assert!(sanitized5.contains("well-known"));
+    }
+
+    #[test]
+    fn sanitize_fts_query_clamps_or_terms_1846() {
+        // #1846 (security review S4, CWE-400) — a huge query must not expand
+        // into an unbounded FTS5 MATCH OR-tree (read-pool exhaustion DoS).
+        let huge = (0..5000)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sanitized = sanitize_fts_query(&huge, true);
+        let term_count = sanitized.matches(" OR ").count() + 1;
+        assert!(
+            term_count <= MAX_FTS_OR_TERMS,
+            "OR-tree must be clamped to MAX_FTS_OR_TERMS ({MAX_FTS_OR_TERMS}), got {term_count}"
+        );
     }
 
     #[test]
