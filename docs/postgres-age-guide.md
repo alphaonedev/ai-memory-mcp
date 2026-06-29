@@ -193,7 +193,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v70 (ending at `migrate_v70()`) as a side effect. The
+   schema v71 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -629,7 +629,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v70 means `ai-memory migrate` sqlite → postgres
+Schema parity at v71 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both
@@ -743,8 +743,8 @@ bootstrap.
 ### Old postgres schema version detected
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
-run `ai-memory schema-init --store-url postgres://…` with the v0.8.0
-binary — opening the store applies the upgrade ladder to v70
+run `ai-memory schema-init --store-url postgres://…` with a current
+(v0.8.1) binary — opening the store applies the upgrade ladder to v71
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 
@@ -783,7 +783,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v70 | v70 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v71 | v71 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
