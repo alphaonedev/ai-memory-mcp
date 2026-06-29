@@ -252,7 +252,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // NON-DESTRUCTIVE `undo_in_place_edit` free fn + `read_owner_agent_id` /
     // `UndoSnapshot` helpers (the sqlite reference behind the CLI-only
     // `ai-memory undo-edit` operator tool).
-    ("src/storage/mod.rs", 21_000),
+    // 2026-06-28 (#1821, v0.8.1 W2/G30) — bumped 21_000 → 21_250 for the
+    // `purge_and_tombstone_forget` erasure-fanout helper + `memory_is_tombstoned`
+    // tombstone gate + the W1/G29 redact-at-storage funnel wiring in `db::insert`
+    // / `insert_if_newer`.
+    // 2026-06-29 (#1849/#1844 security review) — bumped 21_250 → 21_350 for the
+    // UNCAPPED `forget_distinct_namespaces` / `forget_distinct_namespaces_for_caller`
+    // governance-gate query helpers (#1849) + the title/tags/metadata redact funnel.
+    ("src/storage/mod.rs", 21_350),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -580,7 +587,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // NON-DESTRUCTIVE `undo_in_place_edit` PostgresStore trait method (the
     // postgres twin behind the CLI-only `ai-memory undo-edit` operator tool).
     // Per-domain split tracked #650.
-    ("src/store/postgres.rs", 22_300),
+    // 2026-06-28 (#1821, v0.8.1 W1+W2) — bumped 22_300 → 22_450 for the G29
+    // redact-at-storage wiring (store/store_with_embedding/store_batch/
+    // merge_inbound) + the G30 forget erasure-fanout (DLQ/transcript purge +
+    // UNNEST signed-tombstone insert) + the `migrate_v71` forget_tombstones arm.
+    ("src/store/postgres.rs", 22_450),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -676,7 +687,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `warn_if_archive_on_gc_disabled` one-shot boot-WARN helper (emitted at
     // serve + mcp boot when [storage].archive_on_gc = false) + its two
     // gate-branch unit tests (actual 11_301).
-    ("src/config.rs", 11_350),
+    // 2026-06-28 (#1821 / W1 / gap G29) — bumped 11_350 → 11_400: the
+    // `[security]` section (`SecurityConfig.secret_screen_mode`),
+    // `ENV_SECRET_SCREEN_MODE`, and `resolve_secret_screen_mode()` for the
+    // pre-write credential screen (actual 11_353; 47 headroom).
+    ("src/config.rs", 11_400),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

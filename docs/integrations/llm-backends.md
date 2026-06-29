@@ -540,7 +540,7 @@ Expected output:
 
 ```text
 ai-memory: requested tier = autonomous
-ai-memory: profile = 8 families (...); expected tool count = 73
+ai-memory: profile = 8 families (...); expected tool count = 100
 ai-memory: LLM ready (backend=<your-backend>, model=<your-model>)
 ai-memory: LLM client is OpenAI-compatible (non-Ollama wire shape);
            building dedicated Ollama embed client at http://localhost:11434 (#1143)

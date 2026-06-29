@@ -246,12 +246,12 @@ pub async fn restore_archive(
                 if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                     // #869 — typed 503 envelope via the shared helper.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                    return super::quorum_not_met_response(&payload);
+                    return super::under_replicated_response(&payload);
                 }
             }
             Err(e) => {
                 // Local commit already landed — sync-daemon catches
-                // stragglers. Same posture as `fanout_or_503`.
+                // stragglers. Same posture as `fanout_or_pending`.
                 tracing::warn!("restore fanout error (local committed): {e:?}");
             }
         }
@@ -405,7 +405,7 @@ pub struct ArchiveByIdsBody {
 ///      state (row out of `memories`, row into `archived_memories`).
 ///
 /// On a quorum miss for ANY id, short-circuit with 503 via the shared
-/// `fanout_or_503`-style payload. This matches the posture of the
+/// `fanout_or_pending`-style payload. This matches the posture of the
 /// delete + consolidate fanout endpoints.
 ///
 /// Response body:
@@ -572,12 +572,12 @@ pub async fn archive_by_ids(
                     if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                         // #869 — typed 503 envelope via the shared helper.
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                        return super::quorum_not_met_response(&payload);
+                        return super::under_replicated_response(&payload);
                     }
                 }
                 Err(e) => {
                     // Local commit already landed — sync-daemon catches
-                    // stragglers. Same posture as `fanout_or_503`.
+                    // stragglers. Same posture as `fanout_or_pending`.
                     tracing::warn!("archive fanout error (local committed): {e:?}");
                 }
             }

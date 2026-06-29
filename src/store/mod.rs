@@ -1576,6 +1576,26 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// #1849 (CWE-862) — DISTINCT namespaces of the FULL forget match set
+    /// for `pattern`/`tier`, with NO LIMIT (the `namespace = None` admin path
+    /// omits the namespace predicate). Backend-blind feed for the HTTP
+    /// `forget_memories` cross-namespace governance gate: it must see EVERY
+    /// touched namespace — including a governed one whose rows sort past the
+    /// #1602 preview cap (the load-bearing 5-agent-vote objection, 4d3ea1c5),
+    /// so the gate can never silently leak a delete-governed namespace.
+    ///
+    /// Default returns `UnsupportedCapability` so a stub adapter fails loudly
+    /// rather than returning an empty set that would silently disable the gate.
+    async fn forget_distinct_namespaces(
+        &self,
+        _pattern: Option<&str>,
+        _tier: Option<&Tier>,
+    ) -> StoreResult<Vec<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "FORGET_DISTINCT_NAMESPACES".to_string(),
+        })
+    }
+
     /// Consolidate a set of memory ids into a single new memory. Returns
     /// the new memory's id. Adapters MUST:
     /// 1. Verify all source ids exist (else `NotFound`).

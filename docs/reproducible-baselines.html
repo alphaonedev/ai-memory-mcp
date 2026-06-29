@@ -260,7 +260,7 @@ ai-memory bench --baseline baseline-&lt;sha&gt;.json --regression-threshold 10</
         <tr><td class="col-name">2 · Binary</td><td>Single release binary, sha256 <code>d4b60aa5b8f97470d95007f30bddb15e7e35c3855f0085c6b4f43d57f6b4ef3e</code></td></tr>
         <tr><td class="col-name">3 · Exact invocation</td><td><code>cargo test --release --no-default-features --features sal,sal-postgres,sqlite-bundled -- --include-ignored --test-threads=1</code></td></tr>
         <tr><td class="col-name">4 · Environment</td><td>macOS Sequoia / Darwin 25.4.0; lan-parity PG + AGE container (<code>PG16 + AGE 1.6.0 + pgvector 0.8.2</code> on <code>127.0.0.1:15432</code>); <code>AI_MEMORY_TEST_POSTGRES_URL</code> + <code>AI_MEMORY_TEST_AGE_URL</code> bound to it</td></tr>
-        <tr><td class="col-name">5 · Schema version</td><td>v49 (current at that campaign's HEAD; the ladder has since advanced to v55 — re-running at today's HEAD reproduces against the current schema constant, which is the point of pinning the tip SHA)</td></tr>
+        <tr><td class="col-name">5 · Schema version</td><td>v49 (current at that campaign's HEAD; the ladder has since advanced to v71 — re-running at today's HEAD reproduces against the current schema constant, which is the point of pinning the tip SHA)</td></tr>
         <tr><td class="col-name">6 · Authoring + QC agents</td><td>Named in the dossier, with two independent QC passes</td></tr>
       </tbody>
     </table>

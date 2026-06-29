@@ -448,6 +448,62 @@ pub async fn forget_memories(
     {
         return resp;
     }
+    // #1849 (CWE-862) — admin bulk forget with the namespace OMITTED spans
+    // EVERY namespace, so the per-namespace delete-governance gate (the
+    // per-memory `DELETE` gate + the #1772 MCP forget gate) would be silently
+    // bypassed: a `delete:Approve` legal-hold on `compliance/*` is no defence
+    // if the operator can erase the gated rows with a single namespace-less
+    // forget. Resolve the matched namespaces UNCAPPED (backend-blind via the
+    // SAL trait — never the #1602 preview, which would miss a governed
+    // namespace whose rows sort past the cap) and REFUSE the whole forget if
+    // ANY of them carries a non-`Any` `delete` level, directing the operator to
+    // a per-namespace / per-memory delete that the governance pipeline gates.
+    // `namespace = Some` is unchanged (the policy applies to that one named
+    // namespace through the normal delete path). Skipped when neither pattern
+    // nor tier is set (no forget scope — the FORGET_FILTER_REQUIRED error must
+    // surface). 5-agent vote 4d3ea1c5.
+    //
+    // Gated on `sal`: the resolution + policy lookup go through the `app.store`
+    // SAL trait (present for every production HTTP daemon — sqlite-SAL and
+    // postgres). The non-`sal` build has no `app.store` (mobile/minimal lib
+    // target), mirroring the `#[cfg(feature = "sal")]` SAL forget path below.
+    #[cfg(feature = "sal")]
+    if body.namespace.is_none() && (body.pattern.is_some() || body.tier.is_some()) {
+        let matched = match app
+            .store
+            .forget_distinct_namespaces(body.pattern.as_deref(), body.tier.as_ref())
+            .await
+        {
+            Ok(ns) => ns,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        for ns in &matched {
+            let governed = app
+                .store
+                .resolve_governance_policy(ns)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|p| !matches!(p.core.delete, crate::models::GovernanceLevel::Any));
+            if governed {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": crate::errors::msg::FORGET_GOVERNED_NAMESPACE_REQUIRES_SCOPED_DELETE,
+                        "code": crate::errors::error_codes::GOVERNANCE_REFUSED,
+                        "namespace": ns,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     // v0.7.0 Wave-3 Continuation 3 (Phase 13) — route through SAL trait
     // on postgres-backed daemons. Sqlite-backed daemons keep the legacy
     // `db::forget` free-function path verbatim.
@@ -480,14 +536,46 @@ pub async fn forget_memories(
     }
 
     let lock = app.db.lock().await;
-    match db::forget(
+    // v0.8.1 W2.2 (#1821 / gap G30) — collect the victim ids BEFORE the
+    // forget so the in-memory HNSW vector can be evicted afterwards. The
+    // bulk `db::forget` purges the embedding COLUMN, but the HNSW graph keeps
+    // a copy of the vector in RAM and keeps answering nearest-neighbour recall
+    // for the forgotten id until the next rebuild (gap G30 channel c). The
+    // match set is stable: the same `app.db` mutex is held across the collect
+    // and the forget, so no concurrent writer can diverge it. (postgres uses
+    // pgvector / DB-side ANN, so its recall drops the row on DELETE — no
+    // in-memory eviction needed there.)
+    let victim_ids: Vec<String> = db::forget_matches(
+        &lock.0,
+        body.namespace.as_deref(),
+        body.pattern.as_deref(),
+        body.tier.as_ref(),
+        usize::MAX,
+    )
+    .map(|rows| rows.into_iter().map(|m| m.id).collect())
+    .unwrap_or_default();
+    let forget_result = db::forget(
         &lock.0,
         body.namespace.as_deref(),
         body.pattern.as_deref(),
         body.tier.as_ref(),
         lock.3, // archive_on_gc
-    ) {
-        Ok(n) => Json(json!({"deleted": n})).into_response(),
+    );
+    // Drop the DB lock BEFORE taking the vector-index lock (the locking
+    // discipline pinned at handlers/memories.rs — never hold both).
+    drop(lock);
+    match forget_result {
+        Ok(n) => {
+            if !victim_ids.is_empty() {
+                let mut idx_lock = app.vector_index.lock().await;
+                if let Some(idx) = idx_lock.as_mut() {
+                    for id in &victim_ids {
+                        idx.remove(id);
+                    }
+                }
+            }
+            Json(json!({"deleted": n})).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": e.to_string()})),

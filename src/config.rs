@@ -2825,6 +2825,12 @@ pub struct AppConfig {
     /// When unset, only per-subscription secrets are used (legacy
     /// pre-K7 behaviour).
     pub hooks: Option<HooksConfig>,
+    /// v0.8.1 W1 (#1821 / gap G29) — `[security]` block. Carries the
+    /// `secret_screen_mode` knob (`off` / `redact` / `refuse`) gating the
+    /// pre-write credential screen. Env override: `AI_MEMORY_SECRET_SCREEN_MODE`
+    /// (see [`ENV_SECRET_SCREEN_MODE`]). `None` / omitted → compiled default
+    /// `refuse` (the secure default for caller-origin writes).
+    pub security: Option<SecurityConfig>,
     /// v0.7.0 H11 (#628 blocker) — `[subscriptions]` block. Carries
     /// the `allow_loopback_webhooks` opt-in that re-enables loopback
     /// webhook URLs (`127.0.0.1`, `localhost`, `[::1]`). Default-OFF
@@ -4203,6 +4209,24 @@ pub const ENV_TRANSCRIPT_CLASSIFY_ENABLED: &str = "AI_MEMORY_TRANSCRIPT_CLASSIFY
 /// out-of-range value falls through to the config field then the compiled
 /// default (`0.75`, [`crate::curator::cluster::DEFAULT_COSINE_THRESHOLD`]).
 pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_THRESHOLD";
+
+/// v0.8.1 W1 (#1821 / gap G29) — env override for
+/// `[security].secret_screen_mode`. A valid `off` / `redact` / `refuse`
+/// token wins; an unparseable value falls through to the config field then
+/// the compiled default [`crate::secret_screen::SecretScreenMode::Refuse`].
+pub const ENV_SECRET_SCREEN_MODE: &str = "AI_MEMORY_SECRET_SCREEN_MODE";
+
+/// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Pre-write credential-screen disposition for caller-origin writes
+    /// (`off` / `redact` / `refuse`). `None` / omitted → compiled default
+    /// `refuse`. Federation-receive / recovery / internal re-store paths
+    /// always degrade `refuse` → `redact` to preserve convergence; `off`
+    /// disables screening everywhere. Env override: `AI_MEMORY_SECRET_SCREEN_MODE`.
+    #[serde(default)]
+    pub secret_screen_mode: Option<crate::secret_screen::SecretScreenMode>,
+}
 
 /// v0.8.0 #1734 (PE-1) — env override for `[hooks].enforce_mode`. A valid
 /// `off` / `advisory` / `enforce` token (case-insensitive) wins over config;
@@ -6514,6 +6538,7 @@ impl AppConfig {
             "permissions",
             "transcripts",
             "hooks",
+            "security",
             "subscriptions",
             "postgres_statement_timeout_secs",
             "postgres_pool_max_connections",
@@ -6632,6 +6657,31 @@ impl AppConfig {
             .as_ref()
             .and_then(|h| h.enforce_mode)
             .unwrap_or(HookEnforceMode::Off)
+    }
+
+    /// v0.8.1 W1 (#1821 / gap G29) — resolve the pre-write credential-screen
+    /// mode. Ladder: `AI_MEMORY_SECRET_SCREEN_MODE` env >
+    /// `[security].secret_screen_mode` config > compiled default
+    /// [`crate::secret_screen::SecretScreenMode::Refuse`]. A valid
+    /// `off`/`redact`/`refuse` env token wins; an unparseable env value falls
+    /// through to the config field then the default. Mirrors
+    /// [`Self::resolve_hooks_enforce_mode`].
+    #[must_use]
+    pub fn resolve_secret_screen_mode(&self) -> crate::secret_screen::SecretScreenMode {
+        use crate::secret_screen::SecretScreenMode;
+        if let Ok(raw) = std::env::var(ENV_SECRET_SCREEN_MODE) {
+            if let Some(m) = SecretScreenMode::parse(&raw) {
+                return m;
+            }
+            eprintln!(
+                "ai-memory: {ENV_SECRET_SCREEN_MODE}={raw:?} is not a valid mode \
+                 (expected off / redact / refuse); falling back to config.toml"
+            );
+        }
+        self.security
+            .as_ref()
+            .and_then(|s| s.secret_screen_mode)
+            .unwrap_or(SecretScreenMode::Refuse)
     }
 
     /// v0.8.0 #1734 (PE-1) — resolve the declared `[hooks].required_events`
@@ -9042,6 +9092,7 @@ legacy_scoring = false
             permissions: Some(PermissionsConfig::default()),
             transcripts: Some(TranscriptsConfig::default()),
             hooks: Some(HooksConfig::default()),
+            security: Some(SecurityConfig::default()),
             subscriptions: Some(SubscriptionsConfig::default()),
             postgres_statement_timeout_secs: Some(30),
             postgres_pool_max_connections: Some(16),
@@ -9098,6 +9149,7 @@ legacy_scoring = false
             "permissions",
             "transcripts",
             "hooks",
+            "security",
             "subscriptions",
             "postgres_statement_timeout_secs",
             "postgres_pool_max_connections",

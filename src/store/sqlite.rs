@@ -807,6 +807,15 @@ impl MemoryStore for SqliteStore {
         db::forget(&conn, namespace, pattern, tier, archive).map_err(box_err)
     }
 
+    async fn forget_distinct_namespaces(
+        &self,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+    ) -> StoreResult<Vec<String>> {
+        let conn = self.state.lock().await;
+        db::forget_distinct_namespaces(&conn, pattern, tier).map_err(box_err)
+    }
+
     async fn consolidate(
         &self,
         _ctx: &CallerContext,

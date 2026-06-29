@@ -534,7 +534,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 70;
+const CURRENT_SCHEMA_VERSION: i32 = 71;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -631,6 +631,18 @@ const REASON_UNSTAMPED_TENANT_WRITE: &str =
 /// #1628 — delete-verb sibling of [`REASON_UNSTAMPED_TENANT_WRITE`].
 const REASON_UNSTAMPED_TENANT_DELETE: &str =
     "memory has no agent_id stamp; tenant deletes refused (use admin path)";
+
+/// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
+/// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
+/// redacted clone when [`crate::secret_screen::redact_memory_for_storage`]
+/// detects credential material in `content`, `title`, any `tag`, or a
+/// metadata string-leaf value (minus the crypto/system carve-out), else
+/// `None` (caller keeps the original `&Memory`). NEVER refuses — the
+/// caller-origin REFUSE happens earlier in `validate::*`; the funnel only
+/// masks (federation / recovery / internal paths must converge).
+fn screen_storage_memory(memory: &Memory) -> Option<Memory> {
+    crate::secret_screen::redact_memory_for_storage(memory)
+}
 
 impl PostgresStore {
     /// Connect using a Postgres URL (e.g. `postgres://user:pass@host:5432/db`).
@@ -1374,8 +1386,11 @@ impl PostgresStore {
         if current_version < 69 {
             self.migrate_v69().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 70 {
             self.migrate_v70().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v71().await?;
         }
 
         Ok(())
@@ -3337,6 +3352,54 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v70 applied (#1771: archived_memory_links — \
              archive-link edge-preservation snapshot table)"
+        );
+        Ok(())
+    }
+
+    /// v71 (#1821 / W2.3 / gap G30, 5-agent vote 4d3ea1c5) — the signed
+    /// FORGET-tombstone table (postgres mirror of the sqlite v71 arm). The
+    /// federation receive funnel checks it before accepting an inbound write
+    /// so a forgotten row cannot be resurrected via LWW. Identity + time +
+    /// signature only — NO content fingerprint (that would re-leak the erased
+    /// row). Pure additive `CREATE TABLE IF NOT EXISTS`.
+    async fn migrate_v71(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v71 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS forget_tombstones ( \
+                 memory_id    TEXT PRIMARY KEY, \
+                 namespace    TEXT NOT NULL, \
+                 forgotten_at TEXT NOT NULL, \
+                 agent_id     TEXT, \
+                 signature    BYTEA \
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v71 create forget_tombstones", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS forget_tombstones_namespace_idx \
+                 ON forget_tombstones(namespace)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v71 index forget_tombstones", e))?;
+
+        record_schema_version(&mut tx, 71).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v71 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v71 applied (#1821: forget_tombstones — signed \
+             FORGET-tombstone resurrection guard)"
         );
         Ok(())
     }
@@ -10173,6 +10236,11 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+        // parity with the sqlite db::insert funnel). No-op unless screening
+        // was seeded non-`off` and content carries credential material.
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity with
         // the SQLite path. The `GOVERNANCE_PRE_WRITE` hook is consulted
         // on EVERY substrate write path on EVERY backend; multi-tenant
@@ -10475,6 +10543,23 @@ impl MemoryStore for PostgresStore {
         if memories.is_empty() {
             return Ok(Vec::new());
         }
+
+        // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT backstop
+        // (postgres bulk parity). Mask any element carrying credential
+        // material in content / title / tags / metadata (minus the carve-out).
+        // Stays zero-copy (keeps the original borrow) when screening is `off`
+        // or no row carries a secret; only materializes a screened copy on a
+        // hit.
+        let screened_holder;
+        let memories: &[Memory] = if memories.iter().any(|m| screen_storage_memory(m).is_some()) {
+            screened_holder = memories
+                .iter()
+                .map(|m| screen_storage_memory(m).unwrap_or_else(|| m.clone()))
+                .collect::<Vec<_>>();
+            &screened_holder
+        } else {
+            memories
+        };
 
         // Substrate governance parity: each row still passes the
         // pre-write hook (the caller's HTTP governance gate is the
@@ -11203,6 +11288,10 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
     ) -> StoreResult<String> {
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
+        // parity); masks before the embedding + bind. No-op unless seeded.
+        let screened = screen_storage_memory(memory);
+        let memory = screened.as_ref().unwrap_or(memory);
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // The semantic-recall write path MUST consult the hook just
         // like the plain `store` path; otherwise an operator-signed
@@ -12615,6 +12704,32 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
+        // with the sqlite insert_if_newer gate). DROP an inbound write for a
+        // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
+        // row via LWW.
+        let tombstoned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = $1)",
+        )
+        .bind(&inbound.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("merge_inbound tombstone check", e))?;
+        if tombstoned {
+            tracing::info!(
+                target: "forget.tombstone",
+                memory_id = %inbound.id,
+                "rejected inbound federation write for a forgotten id (resurrection guard)"
+            );
+            return Ok(inbound.id.clone());
+        }
+
+        // v0.8.1 W1 (#1821 / gap G29) — credential REDACT on the postgres
+        // federation RECEIVE funnel (parity with sqlite insert_if_newer).
+        // ALWAYS redact, NEVER refuse — a rejected inbound row would diverge
+        // replicas. No-op unless screening was seeded non-`off`.
+        let screened = screen_storage_memory(inbound);
+        let inbound = screened.as_ref().unwrap_or(inbound);
         // ARCH-1 parity (mirrors apply_remote_memory) — a federation-
         // pushed row must clear the same pre-write governance hook as a
         // locally-authored write.
@@ -13757,14 +13872,16 @@ impl MemoryStore for PostgresStore {
         // #1783 — RETURNING id so the deleted set is known for AGE
         // unprojection in THIS tx (the projection commits atomically with
         // the cascade delete; ghost edges never appear).
-        let deleted: Vec<(String,)> = sqlx::query_as(
+        // W2.3 — RETURNING namespace + agent_id too so the FORGET tombstones
+        // can be recorded in THIS tx (the rows are gone after the DELETE).
+        let deleted: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "DELETE FROM memories
              WHERE ($1::text IS NULL OR namespace = $1)
                AND ($2::text IS NULL OR tier = $2)
                AND ($3::text IS NULL
                     OR title ILIKE $3
                     OR content ILIKE $3)
-             RETURNING id",
+             RETURNING id, namespace, metadata->>'agent_id'",
         )
         .bind(namespace)
         .bind(tier_str.as_deref())
@@ -13774,9 +13891,57 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("forget delete", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            for (id,) in &deleted {
+            for (id, _, _) in &deleted {
                 unproject_memory_from_age(&mut tx, id).await?;
             }
+        }
+
+        // v0.8.1 W2 (#1821 / gap G30) — postgres parity for the sqlite
+        // `purge_and_tombstone_forget`: purge the non-cascaded derived-store
+        // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
+        // hash-oracle) AND record a FORGET tombstone per deleted id, all in
+        // THIS tx. 5-agent vote 4d3ea1c5.
+        if !deleted.is_empty() {
+            let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
+            sqlx::query("DELETE FROM federation_push_dlq WHERE memory_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget purge federation_push_dlq", e))?;
+            sqlx::query("DELETE FROM transcript_line_dedup WHERE memory_id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("forget purge transcript_line_dedup", e))?;
+            // W2.3 SIGNED tombstones — bulk insert via UNNEST. Identity + time
+            // + owner only (NO content). Each signs the canonical
+            // {memory_id, namespace, forgotten_at} bytes with the daemon audit
+            // key (unsigned when absent) — parity with the sqlite path.
+            let now = chrono::Utc::now().to_rfc3339();
+            let namespaces: Vec<String> = deleted.iter().map(|(_, ns, _)| ns.clone()).collect();
+            let agents: Vec<Option<String>> = deleted.iter().map(|(_, _, a)| a.clone()).collect();
+            let forgotten: Vec<String> = vec![now.clone(); deleted.len()];
+            let signatures: Vec<Option<Vec<u8>>> = deleted
+                .iter()
+                .map(|(id, ns, _)| {
+                    let signable = crate::storage::forget_tombstone_signable_bytes(id, ns, &now);
+                    crate::governance::audit::try_sign_audit_payload(&signable).map(|(s, _)| s)
+                })
+                .collect();
+            sqlx::query(
+                "INSERT INTO forget_tombstones \
+                     (memory_id, namespace, forgotten_at, agent_id, signature) \
+                 SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::bytea[]) \
+                 ON CONFLICT (memory_id) DO NOTHING",
+            )
+            .bind(&ids)
+            .bind(&namespaces)
+            .bind(&forgotten)
+            .bind(&agents)
+            .bind(&signatures)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("forget record tombstones", e))?;
         }
 
         tx.commit()
@@ -13784,6 +13949,36 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("forget commit tx", e))?;
 
         Ok(deleted.len())
+    }
+
+    async fn forget_distinct_namespaces(
+        &self,
+        pattern: Option<&str>,
+        tier: Option<&Tier>,
+    ) -> StoreResult<Vec<String>> {
+        // #1849 (CWE-862) — DISTINCT namespaces of the forget match set,
+        // NON-owner-scoped (admin path). Mirrors the [`forget`] DELETE
+        // predicate EXACTLY (the same ILIKE-over-title/content substring
+        // match + tier filter) but omits the namespace predicate (this is
+        // only consulted on a `namespace = None` cross-namespace forget) and
+        // SELECTs DISTINCT namespace with NO LIMIT — so the HTTP gate sees
+        // every governed namespace, including any whose rows would sort past
+        // the #1602 preview cap. 5-agent vote 4d3ea1c5.
+        let tier_str = tier.map(|t| t.as_str().to_string());
+        let pattern_like = pattern.map(|p| format!("%{p}%"));
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT namespace FROM memories
+             WHERE ($1::text IS NULL OR tier = $1)
+               AND ($2::text IS NULL
+                    OR title ILIKE $2
+                    OR content ILIKE $2)",
+        )
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("forget_distinct_namespaces", e))?;
+        Ok(rows.into_iter().map(|(ns,)| ns).collect())
     }
 
     async fn consolidate(
@@ -15467,6 +15662,11 @@ impl MemoryStore for PostgresStore {
         if exists.is_none() {
             return Ok(false);
         }
+
+        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): this is
+        // the OPERATOR un-forget path (federation /sync/push restores[] are
+        // sqlite-only per federation_signing_check.rs, never PostgresStore), so
+        // NO tombstone gate here — an authorized restore round-trips per #1771.
 
         // Reject if the id is already in active memories.
         let active: Option<(String,)> = sqlx::query_as(SQL_SELECT_MEMORY_ID_BY_ID)

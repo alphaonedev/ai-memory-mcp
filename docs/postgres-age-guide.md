@@ -39,9 +39,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v70** as of v0.8.0
-(`CURRENT_SCHEMA_VERSION = 70` on both ladders — the postgres upgrade
-ladder ends at `migrate_v70()`) — every feature that works on sqlite
+The two backends have **schema parity at v71** as of v0.8.1
+(`CURRENT_SCHEMA_VERSION = 71` on both ladders — the postgres upgrade
+ladder ends at `migrate_v71()`) — every feature that works on sqlite
 works on postgres.
 
 ## Prerequisites
@@ -211,7 +211,7 @@ What it does (see `src/cli/schema_init.rs`):
    afterwards; `embedding_dim_migrated: true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 70`) or the `--json` report.
+   `schema_version: 71`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.

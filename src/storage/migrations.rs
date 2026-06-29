@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 70).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 71).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -281,6 +281,22 @@ CREATE INDEX IF NOT EXISTS idx_archived_memory_links_source
     ON archived_memory_links(source_id);
 CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
     ON archived_memory_links(target_id);
+
+-- v71 (#1821 / W2.3 / gap G30) — signed FORGET-tombstone table. A forget
+-- emits an owner-signed tombstone; the federation receive funnel checks it
+-- before accepting an inbound write so a forgotten row cannot be resurrected
+-- via LWW. Identity + time + signature ONLY (no content fingerprint — that
+-- would re-leak the erased row). Created by migration v71 for upgrading DBs;
+-- inline here so a fresh bootstrap has it.
+CREATE TABLE IF NOT EXISTS forget_tombstones (
+    memory_id    TEXT PRIMARY KEY,
+    namespace    TEXT NOT NULL,
+    forgotten_at TEXT NOT NULL,
+    agent_id     TEXT,
+    signature    BLOB
+);
+CREATE INDEX IF NOT EXISTS idx_forget_tombstones_namespace
+    ON forget_tombstones(namespace);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -675,7 +691,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 70;
+const CURRENT_SCHEMA_VERSION: i64 = 71;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -2947,6 +2963,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     ON archived_memory_links(source_id);
                 CREATE INDEX IF NOT EXISTS idx_archived_memory_links_target
                     ON archived_memory_links(target_id);",
+            )?;
+        }
+
+        if version < 71 {
+            // v71 = #1821 / W2.3 / gap G30 (5-agent vote 4d3ea1c5) — the signed
+            // FORGET-tombstone table. A `forget` emits an owner-signed tombstone
+            // here; the federation RECEIVE funnel checks it BEFORE accepting an
+            // inbound write so a peer that still holds a forgotten row cannot
+            // resurrect it via LWW `insert_if_newer`. PURE ADDITIVE
+            // `CREATE TABLE IF NOT EXISTS` — NO full-table rebuild (no
+            // trigger-drop, the v63→v65 lesson). Carries NO content/payload — a
+            // content fingerprint would itself re-leak the erased row, so the
+            // signed surface is strictly identity + time. Also inline in the
+            // bootstrap `SCHEMA` const so fresh DBs have it.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS forget_tombstones (
+                    memory_id    TEXT PRIMARY KEY,
+                    namespace    TEXT NOT NULL,
+                    forgotten_at TEXT NOT NULL,
+                    agent_id     TEXT,
+                    signature    BLOB
+                );
+                CREATE INDEX IF NOT EXISTS idx_forget_tombstones_namespace
+                    ON forget_tombstones(namespace);",
             )?;
         }
 

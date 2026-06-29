@@ -1,6 +1,3 @@
----
-layout: doc
----
 # A2A Campaign Harness Integration Contract — v0.7.0
 
 **GH issue:** #718 (cross-repo).
@@ -28,8 +25,8 @@ exercising this repo's binary.
 - 100 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
 - 91 production HTTP routes (77 unique URL paths) registered.
-- Schema v68 (single logical version across sqlite + postgres at
-  v0.8.0-dev HEAD; see `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
+- Schema v71 (single logical version across sqlite + postgres; see
+  `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).
 - Per-peer attestation via `x-peer-id` header on every push.

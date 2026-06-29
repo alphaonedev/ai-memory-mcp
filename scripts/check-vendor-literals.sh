@@ -26,6 +26,7 @@
 #         - `src/harness.rs`       (harness vendor-variant enum)
 #         - `src/recover/transcript_paths.rs`              (per-AI-host transcript dir router; #1389 L2)
 #         - `src/cli/commands/recover_previous_session.rs` (per-AI-host CLI dispatcher; #1389 L2)
+#         - `src/secret_screen.rs` (W1/G29 credential-detector table; vendor token PREFIXES `xai-`/`sk-`/`ghp_` ARE the routing key of a credential pattern — same precedent as `src/mine.rs::Format::Claude`)
 #
 #   (B) SECS_PER_* regression gate. PR3 (#1188 lineage) extracted
 #       named constants `SECS_PER_HOUR` / `SECS_PER_DAY` / `SECS_PER_WEEK`
@@ -82,6 +83,7 @@ ALLOWED_FILES=(
     "src/harness.rs"
     "src/recover/transcript_paths.rs"
     "src/cli/commands/recover_previous_session.rs"
+    "src/secret_screen.rs"
     "tools/t0-orchestrate/src/main.rs"
 )
 

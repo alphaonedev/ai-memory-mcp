@@ -723,6 +723,22 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // no row written. See module-level comment for layering details.
     consult_governance_pre_write(mem)?;
 
+    // v0.8.1 W1 (#1821 / gap G29) + #1844 — origin-blind credential REDACT
+    // backstop on the local-authorship funnel. Caller-origin writes are
+    // REFUSED earlier (validate_*); any secret reaching here is from an
+    // internal re-store path (curator / autonomy) that bypasses validation,
+    // so it is masked, never refused (preserving the internal write). #1844
+    // extends the mask from `content` to title / tags / metadata string-leaf
+    // values (minus the crypto/system carve-out). No-op unless
+    // `AI_MEMORY_SECRET_SCREEN_MODE` was seeded non-`off`.
+    let redacted_mem;
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+        redacted_mem = redacted;
+        &redacted_mem
+    } else {
+        mem
+    };
+
     let tags_json = serde_json::to_string(&mem.tags)?;
     // #1757 / #1719 item 2b — populate-on-write: advance THIS node's own
     // component of the per-memory vector clock. `db::insert` is the
@@ -2847,6 +2863,189 @@ pub fn forget_count(
     Ok(usize::try_from(count).unwrap_or(0))
 }
 
+/// #1849 (CWE-862) — DISTINCT namespaces of the FULL forget match set,
+/// NON-owner-scoped (the admin / HTTP `forget_memories` path). Mirrors
+/// [`forget_count`]'s WHERE (the FTS branch + the no-pattern branch) but
+/// SELECTs DISTINCT namespace with **NO LIMIT**, so the HTTP admin
+/// bulk-forget governance gate sees EVERY touched namespace — including a
+/// governed namespace whose rows would sort PAST the #1602 preview cap (the
+/// load-bearing 5-agent-vote objection, 4d3ea1c5: the capped preview would
+/// silently miss it and the gate would leak). `namespace` is intentionally
+/// omitted from the predicate — this is only consulted on a
+/// `namespace = None` cross-namespace forget.
+pub fn forget_distinct_namespaces(
+    conn: &Connection,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+) -> Result<Vec<String>> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.namespace
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.tier = ?2)",
+        )?;
+        let rows = stmt
+            .query_map(params![fts_query, tier_str], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT namespace FROM memories WHERE (?1 IS NULL OR tier = ?1)")?;
+    let rows = stmt
+        .query_map(params![tier_str], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
+/// leaks (`federation_push_dlq` cleartext payload, `transcript_line_dedup`
+/// content-hash oracle) for the rows a forget is about to delete. MUST run
+/// inside the forget tx BEFORE the `DELETE FROM memories` so the victim-id
+/// subquery still resolves. The subquery + bound params mirror the
+/// [`forget`] / [`forget_for_caller`] DELETE filter EXACTLY (including the
+/// #1772 owner clause when `caller` is `Some`) so the purge scopes to the
+/// same victim set — never over-purging another caller's pending replication.
+/// (5-agent vote 4d3ea1c5 — erasure-completeness finding.)
+///
+/// v0.8.1 W2.3 — ALSO records a FORGET tombstone (`forget_tombstones`) for
+/// every victim id in the same tx, so the federation RECEIVE funnel rejects a
+/// re-pushed forgotten row instead of resurrecting it via LWW. The tombstone
+/// carries identity + time + the owner `agent_id` ONLY — never content (a
+/// fingerprint would re-leak the erased row). The Ed25519 SIGNATURE column is
+/// populated by the federation EMIT path (slice 3c); the local resurrection
+/// guard is existence-based, so a locally-written tombstone needs no signature.
+fn purge_and_tombstone_forget(
+    conn: &Connection,
+    namespace: Option<&str>,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let victims = if let Some(pat) = pattern {
+        bound.push(Box::new(forget_fts_query(pat)));
+        bound.push(Box::new(namespace.map(str::to_string)));
+        bound.push(Box::new(tier_str));
+        let mut q = String::from(
+            "SELECT m.id FROM memories_fts fts JOIN memories m ON m.rowid = fts.rowid \
+             WHERE memories_fts MATCH ?1 AND (?2 IS NULL OR m.namespace = ?2) \
+             AND (?3 IS NULL OR m.tier = ?3)",
+        );
+        if let Some(c) = caller {
+            bound.push(Box::new(c.to_string()));
+            q.push_str(
+                " AND (json_extract(m.metadata,'$.agent_id') = ?4 \
+                 OR json_extract(m.metadata,'$.agent_id') IS NULL \
+                 OR json_extract(m.metadata,'$.agent_id') = '')",
+            );
+        }
+        q
+    } else {
+        bound.push(Box::new(namespace.map(str::to_string)));
+        bound.push(Box::new(tier_str));
+        let mut q = String::from(
+            "SELECT id FROM memories WHERE (?1 IS NULL OR namespace = ?1) \
+             AND (?2 IS NULL OR tier = ?2)",
+        );
+        if let Some(c) = caller {
+            bound.push(Box::new(c.to_string()));
+            q.push_str(
+                " AND (json_extract(metadata,'$.agent_id') = ?3 \
+                 OR json_extract(metadata,'$.agent_id') IS NULL \
+                 OR json_extract(metadata,'$.agent_id') = '')",
+            );
+        }
+        q
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(AsRef::as_ref).collect();
+    for table in ["federation_push_dlq", "transcript_line_dedup"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE memory_id IN ({victims})"),
+            refs.as_slice(),
+        )?;
+    }
+
+    // v0.8.1 W2.3 — record a SIGNED FORGET tombstone per victim (same tx,
+    // before the DELETE so `memories` still resolves). Collect the victim
+    // (id, namespace, agent_id) details, sign the canonical
+    // {memory_id, namespace, forgotten_at} bytes with the daemon audit key
+    // (unsigned when the daemon has no key — same posture as signed_events),
+    // and INSERT each. `INSERT OR IGNORE` keeps it idempotent.
+    let detail_sql = format!(
+        "SELECT id, namespace, json_extract(metadata,'$.agent_id') \
+         FROM memories WHERE id IN ({victims})"
+    );
+    let victims_detail: Vec<(String, String, Option<String>)> = {
+        let mut stmt = conn.prepare(&detail_sql)?;
+        let rows = stmt.query_map(refs.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, ns, agent_id) in &victims_detail {
+        let signable = forget_tombstone_signable_bytes(id, ns, now);
+        let signature: Option<Vec<u8>> =
+            crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+        conn.execute(
+            "INSERT OR IGNORE INTO forget_tombstones \
+                 (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, ns, now, agent_id, signature],
+        )?;
+    }
+    Ok(())
+}
+
+/// v0.8.1 W2.3 (#1821 / gap G30) — the canonical signable bytes for a FORGET
+/// tombstone (the `SignableForget` shape: identity + time, NEVER content — a
+/// content fingerprint would re-leak the erased row). Deterministic
+/// delimiter-joined form so a receiver can recompute + verify the Ed25519
+/// signature against the signer's enrolled key. Versioned domain-separation
+/// prefix so a future shape change cannot collide with v1.
+#[must_use]
+pub fn forget_tombstone_signable_bytes(
+    memory_id: &str,
+    namespace: &str,
+    forgotten_at: &str,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"forget-tombstone-v1\x00";
+    let mut bytes = Vec::with_capacity(
+        DOMAIN.len() + memory_id.len() + namespace.len() + forgotten_at.len() + 2,
+    );
+    bytes.extend_from_slice(DOMAIN);
+    bytes.extend_from_slice(memory_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(namespace.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(forgotten_at.as_bytes());
+    bytes
+}
+
+/// v0.8.1 W2.3 (#1821 / gap G30) — has `memory_id` been forgotten (a
+/// `forget_tombstones` row exists)? The federation RECEIVE funnel consults
+/// this BEFORE accepting an inbound write so a peer that still holds a
+/// forgotten row cannot resurrect it via LWW. Tombstone-WINS: once an id is
+/// tombstoned the inbound write is dropped unconditionally (a legitimate
+/// re-create mints a NEW uuid, unaffected).
+pub fn memory_is_tombstoned(conn: &Connection, memory_id: &str) -> Result<bool> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forget_tombstones WHERE memory_id = ?1)",
+        params![memory_id],
+        |r| r.get(0),
+    )?;
+    Ok(exists)
+}
+
 /// Forget by pattern — delete memories matching namespace + FTS pattern + tier.
 /// If `archive` is true, archives memories before deletion.
 pub fn forget(
@@ -2996,6 +3195,29 @@ pub fn forget(
                 )?;
             }
         }
+
+        // v0.8.1 W2.1 (#1821 / gap G30) — purge the derived-store leaks the
+        // cascade DELETE does NOT reach, in the SAME tx and BEFORE the row is
+        // deleted (so the match subquery still resolves). These survive forget
+        // regardless of `archive` because they are pure leaks, not a
+        // recoverable copy:
+        //  - `federation_push_dlq.payload_json` holds the full cleartext body
+        //    keyed by a deliberately NON-FK `memory_id`
+        //    (migrations/sqlite/0041_v07_federation_push_dlq.sql) → never
+        //    cascaded, so a forgotten secret lingers in the DLQ.
+        //  - `transcript_line_dedup` carries a content sha256 + `memory_id`
+        //    (no FK / no cascade) → a confirm-by-hash oracle for forgotten
+        //    content.
+        // (5-agent vote 4d3ea1c5 — erasure-completeness finding.) Also records
+        // the W2.3 FORGET tombstone for each victim id in this same tx.
+        purge_and_tombstone_forget(
+            conn,
+            namespace,
+            pattern,
+            tier,
+            None,
+            &Utc::now().to_rfc3339(),
+        )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
@@ -3161,6 +3383,58 @@ pub fn forget_count_for_caller(
         |r| r.get(0),
     )?;
     Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// #1849 (CWE-862) — DISTINCT namespaces of the FULL owner-scoped forget
+/// match set, with **NO LIMIT**. The MCP bulk `memory_forget` governance gate
+/// consults this on a `namespace = None` cross-namespace forget so it can run
+/// the per-namespace delete-governance check against EVERY namespace the
+/// forget would actually touch. Mirrors [`forget_count_for_caller`]'s WHERE
+/// EXACTLY (the FTS branch + the no-pattern branch, both with the
+/// unstamped-inclusive owner clause) but SELECTs DISTINCT namespace UNCAPPED:
+/// the #1602 preview ([`forget_matches_for_caller`]) caps at
+/// `DRY_RUN_PREVIEW_CAP + 1`, truncates to the cap, and `ORDER BY rowid`, so a
+/// governed namespace whose rows sort past the cap would be INVISIBLE and the
+/// gate would silently leak (the load-bearing 5-agent-vote objection,
+/// 4d3ea1c5). `namespace` is omitted from the predicate — this is only
+/// consulted when namespace is `None`. `caller` is always `Some(...)`.
+pub fn forget_distinct_namespaces_for_caller(
+    conn: &Connection,
+    pattern: Option<&str>,
+    tier: Option<&Tier>,
+    caller: &str,
+) -> Result<Vec<String>> {
+    let tier_str = tier.map(|t| t.as_str().to_string());
+    if let Some(pat) = pattern {
+        let fts_query = forget_fts_query(pat);
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT m.namespace
+             FROM memories_fts fts
+             JOIN memories m ON m.rowid = fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND (?2 IS NULL OR m.tier = ?2)
+               AND (json_extract(m.metadata,'$.agent_id') = ?3
+                    OR json_extract(m.metadata,'$.agent_id') IS NULL
+                    OR json_extract(m.metadata,'$.agent_id') = '')",
+        )?;
+        let rows = stmt
+            .query_map(params![fts_query, tier_str, caller], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT namespace FROM memories
+         WHERE (?1 IS NULL OR tier = ?1)
+           AND (json_extract(metadata,'$.agent_id') = ?2
+                OR json_extract(metadata,'$.agent_id') IS NULL
+                OR json_extract(metadata,'$.agent_id') = '')",
+    )?;
+    let rows = stmt
+        .query_map(params![tier_str, caller], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// #1772 — owner-scoped twin of [`forget_matches`] for the multi-tenant
@@ -3397,6 +3671,19 @@ pub fn forget_for_caller(
                 )?;
             }
         }
+
+        // v0.8.1 W2.1 (#1821 / gap G30) — purge the non-cascaded derived-store
+        // leaks for the SAME owner-scoped victim set (the `caller` arg adds
+        // the #1772 owner clause so this never touches another caller's DLQ /
+        // dedup rows), in-tx, before the DELETE.
+        purge_and_tombstone_forget(
+            conn,
+            namespace,
+            pattern,
+            tier,
+            Some(caller),
+            &Utc::now().to_rfc3339(),
+        )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
         if let Some(pat) = pattern {
@@ -5621,6 +5908,14 @@ fn strip_invisible(s: &str) -> String {
         .collect()
 }
 
+/// #1846 (security review S4, CWE-400) — hard cap on the number of terms
+/// any caller query expands into. Without it, a ~2 MiB whitespace-token
+/// `context` builds a ~1M-phrase FTS5 MATCH OR-tree per request, and a
+/// handful of concurrent such requests exhaust the fixed read pool. Every
+/// recall/search path (HTTP / MCP / CLI / postgres) funnels through here, so
+/// clamping at this chokepoint bounds the OR-tree for all of them.
+pub const MAX_FTS_OR_TERMS: usize = 128;
+
 fn sanitize_fts_query(input: &str, use_or: bool) -> String {
     let joiner = if use_or { " OR " } else { " " };
     let cleaned = strip_invisible(input);
@@ -5666,6 +5961,9 @@ fn sanitize_fts_query(input: &str, use_or: bool) -> String {
             format!("\"{clean}\"")
         })
         .filter(|t| !t.is_empty())
+        // #1846 — clamp the OR-tree size so no caller can build an unbounded
+        // FTS5 MATCH expression (read-pool exhaustion DoS).
+        .take(MAX_FTS_OR_TERMS)
         .collect();
     if tokens.is_empty() {
         return "\"_empty_\"".to_string();
@@ -8366,6 +8664,13 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         if !exists {
             return Ok(false);
         }
+        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
+        // OPERATOR-initiated restore is an AUTHORIZED un-forget and must
+        // round-trip per the #1771 recoverable-delete contract — so NO
+        // tombstone gate here. The G30 forget-tombstone gates only AUTOMATIC
+        // resurrection: the federation /sync/push `restores[]` chokepoint
+        // (src/handlers/federation_receive.rs) and the LWW re-push gate on
+        // `insert_if_newer` / `merge_inbound`.
         // Check if ID already exists in active memories to prevent silent overwrite
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -8506,6 +8811,10 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         if !owned {
             return Ok(false);
         }
+        // #1848 reconciled to #1771 (5-agent vote 4d3ea1c5, option B): an
+        // owner-initiated restore is an AUTHORIZED un-forget — no tombstone gate
+        // here (the G30 tombstone gates only automatic resurrection: the
+        // federation restores[] chokepoint + the LWW re-push gate).
         // Check if ID already exists in active memories to prevent silent overwrite.
         let active_exists: bool = conn
             .query_row(SQL_MEMORY_EXISTS_COUNT, params![id], |r| r.get(0))
@@ -8802,6 +9111,34 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // a local rule by routing through a peer would otherwise slip
     // past the gate. The hook fires on every newer-wins merge attempt.
     consult_governance_pre_write(mem)?;
+
+    // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
+    // FORGET tombstone, a peer that still holds the row is trying to revive it
+    // via LWW; DROP the inbound write (tombstone-wins) so the erasure holds.
+    // Idempotent no-op return (the row stays forgotten); logged for audit.
+    if memory_is_tombstoned(conn, &mem.id)? {
+        tracing::info!(
+            target: "forget.tombstone",
+            memory_id = %mem.id,
+            "rejected inbound federation write for a forgotten id (resurrection guard)"
+        );
+        return Ok(mem.id.clone());
+    }
+
+    // v0.8.1 W1 (#1821 / gap G29) + #1844 — credential REDACT on the
+    // federation RECEIVE funnel. ALWAYS redact, NEVER refuse: a refused
+    // inbound row would diverge replicas (the merge primitive), so a relayed
+    // secret is masked, not rejected. #1844 extends the mask from `content`
+    // to title / tags / metadata string-leaf values (minus the crypto/system
+    // carve-out, so the inbound attestation envelope is preserved intact).
+    // No-op unless screening was seeded non-`off`.
+    let redacted_mem;
+    let mem = if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+        redacted_mem = redacted;
+        &redacted_mem
+    } else {
+        mem
+    };
 
     let tags_json = serde_json::to_string(&mem.tags)?;
     let metadata_json = serde_json::to_string(&mem.metadata)?;
@@ -16072,6 +16409,22 @@ mod tests {
         // Hyphenated tokens pass through as phrase searches.
         let sanitized5 = sanitize_fts_query("well-known", true);
         assert!(sanitized5.contains("well-known"));
+    }
+
+    #[test]
+    fn sanitize_fts_query_clamps_or_terms_1846() {
+        // #1846 (security review S4, CWE-400) — a huge query must not expand
+        // into an unbounded FTS5 MATCH OR-tree (read-pool exhaustion DoS).
+        let huge = (0..5000)
+            .map(|i| format!("t{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sanitized = sanitize_fts_query(&huge, true);
+        let term_count = sanitized.matches(" OR ").count() + 1;
+        assert!(
+            term_count <= MAX_FTS_OR_TERMS,
+            "OR-tree must be clamped to MAX_FTS_OR_TERMS ({MAX_FTS_OR_TERMS}), got {term_count}"
+        );
     }
 
     #[test]

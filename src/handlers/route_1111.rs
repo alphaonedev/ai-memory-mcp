@@ -91,7 +91,7 @@ async fn reflect_fanout(
         Ok(tracker) => {
             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return Some(super::quorum_not_met_response(&payload));
+                return Some(super::under_replicated_response(&payload));
             }
         }
         Err(e) => {

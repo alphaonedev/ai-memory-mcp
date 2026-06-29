@@ -245,7 +245,7 @@ async fn consolidate_fanout(
             if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                 // #869 — typed 503 envelope via the shared helper.
                 let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                return Some(super::quorum_not_met_response(&payload));
+                return Some(super::under_replicated_response(&payload));
             }
         }
         Err(e) => {

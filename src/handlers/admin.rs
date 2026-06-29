@@ -190,7 +190,7 @@ pub async fn register_agent(
                         if let Err(err) = crate::federation::finalise_quorum(&tracker) {
                             // #869 — typed 503 envelope via the shared helper.
                             let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
-                            return super::quorum_not_met_response(&payload);
+                            return super::under_replicated_response(&payload);
                         }
                     }
                     Err(e) => {
