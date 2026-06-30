@@ -3735,6 +3735,13 @@ impl PostgresStore {
         else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
+        // #1823 G6 — capture the COW SUPERSEDE leaf's identity fields now,
+        // before the governance builder below consumes `cur_meta` / `cur_ns`.
+        let leaf_agent_id = cur_meta
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let leaf_ns = cur_ns.clone();
 
         // Pre-check (cheap fast-path); the atomic re-check below is
         // the load-bearing guard.
@@ -3960,6 +3967,21 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("rollback update tx", e))?;
             return Ok(None);
         }
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the in-place
+        // content UPDATE (same id) is the path-a supersede; prior content
+        // lives in the in_place_edit archive snapshot above, never in the
+        // leaf. Append ONE identity-only SUPERSEDE leaf in this tx.
+        pg_emit_revision_leaf_if_enabled(
+            &mut tx,
+            id,
+            crate::revisions::RecordKind::Supersede,
+            Some(current),
+            &leaf_ns,
+            leaf_agent_id.as_deref(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .map_err(|e| to_store_err("append supersede revision leaf", e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit update tx", e))?;
@@ -8718,6 +8740,56 @@ async fn pg_append_revision_leaf_in_tx(
     Ok(())
 }
 
+/// v0.9.0 G6 (#1823) STEP 2 — the gated postgres convenience used by every
+/// sanctioned mutation primitive (the async twin of
+/// [`crate::revisions::emit_revision_leaf_if_enabled`]). When the
+/// append-only spine is OFF (the default) this is a NO-OP, so the legacy
+/// mutation path stays BYTE-IDENTICAL. When ON it signs the identity-only
+/// bytes with the daemon audit key and appends ONE leaf in the caller's
+/// transaction via [`pg_append_revision_leaf_in_tx`].
+///
+/// The caller owns BEGIN/COMMIT and MUST emit the leaf in the SAME tx as
+/// the mutation it records (capture-then-compact for a delete; alongside
+/// the in-place UPDATE for a COW supersede). Content is NEVER carried.
+async fn pg_emit_revision_leaf_if_enabled(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    memory_id: &str,
+    kind: crate::revisions::RecordKind,
+    prior_version: Option<i64>,
+    namespace: &str,
+    agent_id: Option<&str>,
+    created_at: &str,
+) -> Result<(), sqlx::Error> {
+    if !crate::config::append_only_enabled() {
+        return Ok(());
+    }
+    let signable = crate::revisions::revision_leaf_signable_bytes(
+        memory_id,
+        kind,
+        prior_version,
+        namespace,
+        agent_id,
+        created_at,
+    );
+    let signature =
+        crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let id = uuid::Uuid::new_v4().to_string();
+    pg_append_revision_leaf_in_tx(
+        tx,
+        PgRevisionLeafInsert {
+            id: &id,
+            memory_id,
+            kind,
+            prior_version,
+            namespace,
+            agent_id,
+            created_at,
+            signature: signature.as_deref(),
+        },
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // #1558 batch 5 wave 2 — shared sqlx `row.try_get` context labels.
 //
@@ -12009,6 +12081,32 @@ impl MemoryStore for PostgresStore {
             return Err(StoreError::NotFound { id: id.to_string() });
         }
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the one-shot
+        // COALESCE content UPDATE (same id) is the path-a supersede; prior
+        // content lives in the in_place_edit snapshot above, never in the
+        // leaf. Append ONE identity-only SUPERSEDE leaf in this tx. The
+        // namespace/version lookup runs ONLY under the flag (flag-OFF stays
+        // byte-identical).
+        if crate::config::append_only_enabled() {
+            let (leaf_ns, leaf_ver): (String, i64) =
+                sqlx::query_as("SELECT namespace, version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("read row for supersede leaf", e))?;
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                id,
+                crate::revisions::RecordKind::Supersede,
+                Some(leaf_ver - 1),
+                &leaf_ns,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .await
+            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
+
         // #1799 — commit the atomic snapshot + UPDATE before any
         // pool-direct follow-up. `apply_lifecycle_patch` below uses
         // `self.pool` separately (its own statement), so it MUST run after
@@ -12047,6 +12145,51 @@ impl MemoryStore for PostgresStore {
             .execute(&self.pool)
             .await
             .map_err(|e| to_store_err("delete: namespace_meta cleanup", e))?;
+
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE:
+        // under the flag, run the leaf + the memory delete in ONE tx so they
+        // commit atomically. Flag-OFF falls through to the byte-identical
+        // pool-direct delete below.
+        if crate::config::append_only_enabled() {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("delete begin tx", e))?;
+            if let Some((ns, ver)) =
+                sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
+            {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Tombstone,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err("append tombstone revision leaf", e))?;
+            }
+            let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("delete", e))?
+                .rows_affected();
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("delete commit tx", e))?;
+            if rows == 0 {
+                return Err(StoreError::NotFound { id: id.to_string() });
+            }
+            self.unproject_memory_ids_best_effort(&[id]).await;
+            return Ok(());
+        }
 
         let rows_affected = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
             .bind(id)
@@ -13035,6 +13178,24 @@ impl MemoryStore for PostgresStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("merge_inbound full-row update", e))?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the federation
+        // LWW full-row overwrite rewrites content in place (same id); the
+        // pre-merge content lives in the merge snapshot, never in the leaf.
+        // Append ONE identity-only SUPERSEDE leaf in this tx.
+        pg_emit_revision_leaf_if_enabled(
+            &mut tx,
+            &merged.id,
+            crate::revisions::RecordKind::Supersede,
+            None,
+            &merged.namespace,
+            merged
+                .metadata
+                .get("agent_id")
+                .and_then(|v| v.as_str()),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        .map_err(|e| to_store_err("append supersede revision leaf", e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
@@ -13132,6 +13293,52 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
+        // (origin=remote). This is the headline data-loss fix: the legacy
+        // path hard-deletes the row pool-direct (no tx, no audit trail).
+        // Under the flag we append the identity-only TOMBSTONE leaf and run
+        // the delete in ONE tx so the remote erasure is atomic + auditable.
+        // Flag-OFF falls through to the byte-identical pool-direct delete.
+        if crate::config::append_only_enabled() {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
+            if let Some((ns, ver)) =
+                sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
+            {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Tombstone,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err("append remote tombstone revision leaf", e))?;
+            }
+            let rows = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion", e))?
+                .rows_affected();
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
+            if rows > 0 {
+                self.unproject_memory_ids_best_effort(&[id]).await;
+            }
+            return Ok(rows > 0);
+        }
+
         let rows_affected = sqlx::query(SQL_DELETE_MEMORY_BY_ID)
             .bind(id)
             .execute(&self.pool)
@@ -13837,6 +14044,16 @@ impl MemoryStore for PostgresStore {
             detail: format!("serialize agent metadata for pubkey bind: {e}"),
         })?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the pubkey-bind
+        // UPDATE rewrites the registration row's content; wrap it in a tx so
+        // the identity-only SUPERSEDE leaf lands atomically with the write
+        // (the id lookup + leaf run only under the flag, so flag-OFF is the
+        // same single UPDATE committed immediately).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("bind_agent_pubkey begin tx", e))?;
         sqlx::query(
             "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
@@ -13846,9 +14063,32 @@ impl MemoryStore for PostgresStore {
         .bind(&meta)
         .bind(&content)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
+        if crate::config::append_only_enabled() {
+            let (mid,): (String,) =
+                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
+                    .bind(AGENTS_NAMESPACE)
+                    .bind(&title)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &mid,
+                crate::revisions::RecordKind::Supersede,
+                None,
+                AGENTS_NAMESPACE,
+                None,
+                &now,
+            )
+            .await
+            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("bind_agent_pubkey commit tx", e))?;
 
         Ok(())
     }
@@ -13909,6 +14149,16 @@ impl MemoryStore for PostgresStore {
             detail: format!("serialize agent metadata for pubkey revoke: {e}"),
         })?;
 
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the pubkey-
+        // revoke UPDATE rewrites the registration row's content; wrap it in
+        // a tx so the identity-only SUPERSEDE leaf lands atomically with the
+        // write (id lookup + leaf run only under the flag, so flag-OFF is
+        // the same single UPDATE committed immediately).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("revoke_agent_pubkey begin tx", e))?;
         sqlx::query(
             "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
              WHERE namespace = $1 AND title = $2",
@@ -13918,9 +14168,32 @@ impl MemoryStore for PostgresStore {
         .bind(&meta)
         .bind(&content)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("revoke_agent_pubkey", e))?;
+        if crate::config::append_only_enabled() {
+            let (mid,): (String,) =
+                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
+                    .bind(AGENTS_NAMESPACE)
+                    .bind(&title)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &mid,
+                crate::revisions::RecordKind::Supersede,
+                None,
+                AGENTS_NAMESPACE,
+                None,
+                &now,
+            )
+            .await
+            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("revoke_agent_pubkey commit tx", e))?;
 
         Ok(())
     }
@@ -14115,6 +14388,29 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("forget record tombstones", e))?;
+
+            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+            // append ONE identity-only FORGET leaf per deleted id IN THIS
+            // tx (the cascade DELETE already ran with RETURNING, so a
+            // rollback discards leaf + delete together). Reuses the same
+            // victim set as the W2.3 tombstones above; the leaf NEVER
+            // carries content — destruction stays the right-to-be-forgotten
+            // path.
+            if crate::config::append_only_enabled() {
+                for ((id, ns), agent) in ids.iter().zip(&namespaces).zip(&agents) {
+                    pg_emit_revision_leaf_if_enabled(
+                        &mut tx,
+                        id,
+                        crate::revisions::RecordKind::Forget,
+                        None,
+                        ns,
+                        agent.as_deref(),
+                        &now,
+                    )
+                    .await
+                    .map_err(|e| to_store_err("append forget revision leaf", e))?;
+                }
+            }
         }
 
         tx.commit()
@@ -14398,6 +14694,30 @@ impl MemoryStore for PostgresStore {
         for id in ids {
             if id == &new_id {
                 continue;
+            }
+            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: the
+            // merged-away source is consolidated INTO new_id; append ONE
+            // identity-only CONSOLIDATE leaf for the source IN THIS tx BEFORE
+            // its delete. Gated → flag-OFF unchanged.
+            if crate::config::append_only_enabled()
+                && let Some((ns, ver)) =
+                    sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("consolidate read source for leaf", e))?
+            {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Consolidate,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err("append consolidate revision leaf", e))?;
             }
             sqlx::query(SQL_DELETE_MEMORY_BY_ID)
                 .bind(id)
@@ -15664,9 +15984,9 @@ impl MemoryStore for PostgresStore {
         // v70 "don't snapshot auto-eviction" restore-rationale does NOT
         // transfer to a SECONDARY query index — a gc-evicted memory still
         // leaves a ghost :Memory node/edges that kg_query would return.
-        let evicted: Vec<(String,)> = sqlx::query_as(
+        let evicted: Vec<(String, String)> = sqlx::query_as(
             "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < $1 \
-             RETURNING id",
+             RETURNING id, namespace",
         )
         .bind(now)
         .fetch_all(&mut *tx)
@@ -15674,8 +15994,29 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("gc delete", e))?;
 
         if matches!(self.kg_backend, KgBackend::Age) {
-            for (id,) in &evicted {
+            for (id, _) in &evicted {
                 unproject_memory_from_age(&mut tx, id).await?;
+            }
+        }
+
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+        // ONE identity-only EXPIRE leaf per TTL-evicted id IN THIS tx (the
+        // DELETE ran with RETURNING, so a rollback discards leaf + delete
+        // together). Gated so flag-OFF appends nothing.
+        if crate::config::append_only_enabled() {
+            let now_str = now.to_rfc3339();
+            for (id, ns) in &evicted {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Expire,
+                    None,
+                    ns,
+                    None,
+                    &now_str,
+                )
+                .await
+                .map_err(|e| to_store_err("append expire revision leaf", e))?;
             }
         }
 
@@ -15788,7 +16129,25 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("size_gc archive copy", e))?;
             }
 
-            sqlx::query("DELETE FROM memories WHERE id = $1")
+            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+            // append ONE identity-only EVICT leaf for this victim IN THIS
+            // tx BEFORE the delete. The inline literal is routed through the
+            // SQL_DELETE_MEMORY_BY_ID SSOT (#1823 worklist). Gated so
+            // flag-OFF appends nothing.
+            if crate::config::append_only_enabled() {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    &id,
+                    crate::revisions::RecordKind::Evict,
+                    None,
+                    namespace,
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err("append evict revision leaf", e))?;
+            }
+            sqlx::query(SQL_DELETE_MEMORY_BY_ID)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await
@@ -16105,6 +16464,30 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_by_ids snapshot links", e))?;
+            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+            // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
+            // delete (the cold-storage copy already landed above). Gated →
+            // flag-OFF unchanged.
+            if crate::config::append_only_enabled()
+                && let Some((ns, ver)) =
+                    sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
+            {
+                pg_emit_revision_leaf_if_enabled(
+                    &mut tx,
+                    id,
+                    crate::revisions::RecordKind::Archive,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &now.to_rfc3339(),
+                )
+                .await
+                .map_err(|e| to_store_err("append archive revision leaf", e))?;
+            }
             sqlx::query(SQL_DELETE_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)

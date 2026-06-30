@@ -212,6 +212,69 @@ fn stmt_has_content_assignment(stmt: &str) -> bool {
     false
 }
 
+/// Brace-counted line spans (`[start, end]`, 0-based, inclusive) of every
+/// `#[cfg(test)]`-annotated braced item (`mod`, `fn`, `impl`, …) in a file.
+/// The append-only invariant governs the PRODUCTION mutation surface only —
+/// `#[cfg(test)]` code is never compiled into the daemon, so a delete/update
+/// inside a test module or test helper is out of scope and MUST NOT appear in
+/// the worklist. A `#[cfg(test)] use/const/static/type …;` statement carries
+/// no body, so it bounds no scope and is skipped (it would otherwise capture
+/// the next real item's braces and over-exclude).
+fn cfg_test_spans(raw_lines: &[&str]) -> Vec<(usize, usize)> {
+    let n = raw_lines.len();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if raw_lines[i].contains("#[cfg(test)]") {
+            // The annotated item: skip blank / further-attribute / comment
+            // lines to reach the item declaration itself.
+            let mut j = i + 1;
+            while j < n {
+                let t = raw_lines[j].trim_start();
+                if t.is_empty() || t.starts_with("#[") || t.starts_with("//") {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j < n {
+                let item = raw_lines[j].trim_start();
+                let stmt_only = item.starts_with("use ")
+                    || item.starts_with("const ")
+                    || item.starts_with("static ")
+                    || item.starts_with("type ");
+                let braced = ["mod ", "fn ", "impl", "struct ", "enum ", "trait "]
+                    .iter()
+                    .any(|kw| item.contains(kw));
+                if braced && !stmt_only {
+                    // Brace COUNTING is unreliable here: a `#[cfg(test)] mod
+                    // tests` body holds thousands of `{`/`}` inside JSON
+                    // string literals (`json!({...})`) and comments that a
+                    // raw char scan miscounts. Instead, rustfmt emits the
+                    // item's CLOSING brace alone on a line at the SAME
+                    // indentation as the item declaration — match that. This
+                    // is literal/comment-brace-proof.
+                    let indent = raw_lines[j].len() - raw_lines[j].trim_start().len();
+                    let mut end = j;
+                    for (k, line) in raw_lines.iter().enumerate().skip(j + 1) {
+                        let this_indent = line.len() - line.trim_start().len();
+                        let t = line.trim_start();
+                        if this_indent == indent && (t == "}" || t.starts_with("} ")) {
+                            end = k;
+                            break;
+                        }
+                    }
+                    spans.push((i, end));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    spans
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct UnroutedSite {
     file_line: String,
@@ -234,10 +297,21 @@ fn collect_unrouted_sites() -> Vec<UnroutedSite> {
         let stripped = strip_rust_comments(raw);
         let raw_lines: Vec<&str> = raw.lines().collect();
         let path_str = path.to_string_lossy().replace('\\', "/");
+        // Test-scope spans are out of the append-only invariant's reach.
+        let test_spans = cfg_test_spans(&raw_lines);
 
         let mut record = |offset: usize, pattern: &str| {
             let line_no = line_of_offset(&stripped, offset);
             let line_idx = line_no.saturating_sub(1);
+            // EXCLUDE: hits inside any `#[cfg(test)]` item — test code is
+            // never compiled into the daemon, so it is not a production
+            // mutation site.
+            if test_spans
+                .iter()
+                .any(|&(s, e)| line_idx >= s && line_idx <= e)
+            {
+                return;
+            }
             // ALLOWLIST: the two SQL_DELETE_MEMORY_BY_ID const SSOTs.
             if raw_lines
                 .get(line_idx)
@@ -281,11 +355,12 @@ fn collect_unrouted_sites() -> Vec<UnroutedSite> {
     sites
 }
 
-/// STEP 1: MUST FAIL today — prints the authoritative un-routed worklist.
-/// `#[ignore]`d so it does not break CI during step 1. UN-IGNORE when site
-/// conversion (step 2+) is complete and the worklist has drained to empty.
+/// STEP 2 (#1823): every production memory-mutation site now routes through
+/// the signed `memory_revisions` ledger (each enclosing fn carries the
+/// `APPEND-ONLY-SANCTIONED` marker), `#[cfg(test)]` scope is excluded, and
+/// the worklist has drained to empty — so this guard is now ENFORCED in CI.
+/// A new un-routed delete / in-place content rewrite re-fails it.
 #[test]
-#[ignore = "un-ignore when site conversion (step 2+) is complete"]
 fn append_only_spine_all_memory_mutations_routed() {
     let sites = collect_unrouted_sites();
 

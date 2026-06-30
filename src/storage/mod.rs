@@ -1958,7 +1958,23 @@ pub fn update_with_expected_version(
                 }
                 Ok((false, false))
             }
-            Ok(_) => Ok((true, content_changed)),
+            Ok(_) => {
+                // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the
+                // in-place UPDATE (same id) is the convergence-proven
+                // path-a supersede. Append ONE identity-only SUPERSEDE leaf
+                // in THIS tx; prior content lives only in the in_place_edit
+                // archive snapshot above, never in the leaf.
+                crate::revisions::emit_revision_leaf_if_enabled(
+                    conn,
+                    id,
+                    crate::revisions::RecordKind::Supersede,
+                    expected_version,
+                    namespace,
+                    Some(update_agent_id).filter(|s| !s.is_empty()),
+                    &now,
+                )?;
+                Ok((true, content_changed))
+            }
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
@@ -2229,6 +2245,30 @@ pub fn update_with_archive_on_supersede(
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     // Clean up namespace_meta if this memory was a namespace standard
     conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append ONE
+    // identity-only TOMBSTONE leaf BEFORE the delete. The ns/version lookup
+    // runs only under the flag, so flag-OFF is byte-identical.
+    if crate::config::append_only_enabled() {
+        use rusqlite::OptionalExtension;
+        if let Some((ns, ver)) = conn
+            .query_row(
+                "SELECT namespace, version FROM memories WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+        {
+            crate::revisions::emit_revision_leaf_if_enabled(
+                conn,
+                id,
+                crate::revisions::RecordKind::Tombstone,
+                Some(ver),
+                &ns,
+                None,
+                &Utc::now().to_rfc3339(),
+            )?;
+        }
+    }
     let changed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
     Ok(changed > 0)
 }
@@ -2378,6 +2418,30 @@ pub(crate) fn archive_memory_no_tx(
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
         conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+        // ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the delete (the
+        // cold-storage copy already landed above). Gated → flag-OFF unchanged.
+        if crate::config::append_only_enabled() {
+            use rusqlite::OptionalExtension;
+            if let Some((ns, ver)) = conn
+                .query_row(
+                    "SELECT namespace, version FROM memories WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                crate::revisions::emit_revision_leaf_if_enabled(
+                    conn,
+                    id,
+                    crate::revisions::RecordKind::Archive,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &now,
+                )?;
+            }
+        }
         let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
@@ -2792,6 +2856,30 @@ pub fn archive_memory_for_caller(
         // Clean up namespace_meta — mirrors `delete`'s cleanup so an archived
         // row is not still referenced as the namespace standard.
         conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+        // ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the delete (the
+        // cold-storage copy already landed above). Gated → flag-OFF unchanged.
+        if crate::config::append_only_enabled() {
+            use rusqlite::OptionalExtension;
+            if let Some((ns, ver)) = conn
+                .query_row(
+                    "SELECT namespace, version FROM memories WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+                )
+                .optional()?
+            {
+                crate::revisions::emit_revision_leaf_if_enabled(
+                    conn,
+                    id,
+                    crate::revisions::RecordKind::Archive,
+                    Some(ver),
+                    &ns,
+                    None,
+                    &now,
+                )?;
+            }
+        }
         let removed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
         Ok(removed > 0)
     })();
@@ -3001,6 +3089,19 @@ fn purge_and_tombstone_forget(
                  (memory_id, namespace, forgotten_at, agent_id, signature) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, ns, now, agent_id, signature],
+        )?;
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
+        // ONE identity-only FORGET leaf per victim IN THIS tx, BEFORE the
+        // forget DELETE. Reuses the same victim set as the W2.3 tombstone
+        // above; content destruction stays the right-to-be-forgotten path.
+        crate::revisions::emit_revision_leaf_if_enabled(
+            conn,
+            id,
+            crate::revisions::RecordKind::Forget,
+            None,
+            ns,
+            agent_id.as_deref(),
+            now,
         )?;
     }
     Ok(())
@@ -3220,6 +3321,9 @@ pub fn forget(
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — the capture-then-compact
+        // FORGET leaf for every victim id was appended IN THIS tx by the
+        // purge_and_tombstone_forget call above (before this DELETE).
         if let Some(pat) = pattern {
             let fts_query = forget_fts_query(pat);
             let tier_str = tier.map(|t| t.as_str().to_string());
@@ -3686,6 +3790,9 @@ pub fn forget_for_caller(
         )?;
 
         // Delete the same matched set (same tx, same write lock → same rows).
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — the capture-then-compact
+        // FORGET leaf for every owner-scoped victim id was appended IN THIS
+        // tx by the purge_and_tombstone_forget call above (before DELETE).
         if let Some(pat) = pattern {
             let fts_query = forget_fts_query(pat);
             let tier_str = tier.map(|t| t.as_str().to_string());
@@ -8120,6 +8227,26 @@ pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) ->
             "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
         );
     }
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the in-place
+    // pubkey-bind UPDATE rewrites the registration row's content; append
+    // ONE identity-only SUPERSEDE leaf in the same connection. Gated so
+    // flag-OFF skips even the id lookup (byte-identical legacy path).
+    if crate::config::append_only_enabled() {
+        let mid: String = conn.query_row(
+            "SELECT id FROM memories WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, &title],
+            |r| r.get(0),
+        )?;
+        crate::revisions::emit_revision_leaf_if_enabled(
+            conn,
+            &mid,
+            crate::revisions::RecordKind::Supersede,
+            None,
+            AGENTS_NAMESPACE,
+            None,
+            &now,
+        )?;
+    }
     Ok(())
 }
 
@@ -8185,6 +8312,26 @@ pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
         anyhow::bail!(
             "cannot revoke pubkey: agent '{agent_id}' is not registered (register it first)"
         );
+    }
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the in-place
+    // pubkey-revoke UPDATE rewrites the registration row's content; append
+    // ONE identity-only SUPERSEDE leaf in the same connection. Gated so
+    // flag-OFF skips even the id lookup (byte-identical legacy path).
+    if crate::config::append_only_enabled() {
+        let mid: String = conn.query_row(
+            "SELECT id FROM memories WHERE namespace = ?1 AND title = ?2",
+            params![AGENTS_NAMESPACE, &title],
+            |r| r.get(0),
+        )?;
+        crate::revisions::emit_revision_leaf_if_enabled(
+            conn,
+            &mid,
+            crate::revisions::RecordKind::Supersede,
+            None,
+            AGENTS_NAMESPACE,
+            None,
+            &now,
+        )?;
     }
     Ok(())
 }
@@ -8338,6 +8485,33 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                 ))?;
                 archive_stmt.execute(params![now, GC_CHUNK_ROWS])?;
             }
+            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+            // append ONE identity-only EXPIRE leaf per doomed row IN THIS
+            // tx BEFORE the delete. The id set is the SAME deterministic
+            // chunk (SQL_GC_EXPIRED_CHUNK_IDS) the DELETE targets. Gated so
+            // flag-OFF runs neither the select nor the append (byte-identical).
+            if crate::config::append_only_enabled() {
+                let mut leaf_stmt = conn.prepare_cached(&format!(
+                    "SELECT id, namespace, version FROM memories \
+                     WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                ))?;
+                let doomed: Vec<(String, String, i64)> = leaf_stmt
+                    .query_map(params![now, GC_CHUNK_ROWS], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (mid, ns, ver) in &doomed {
+                    crate::revisions::emit_revision_leaf_if_enabled(
+                        conn,
+                        mid,
+                        crate::revisions::RecordKind::Expire,
+                        Some(*ver),
+                        ns,
+                        None,
+                        &now,
+                    )?;
+                }
+            }
             let mut delete_stmt = conn.prepare_cached(&format!(
                 "DELETE FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
             ))?;
@@ -8456,6 +8630,30 @@ pub fn size_gc(
                 archive_memory_no_tx(conn, &id, Some(SIZE_GC_ARCHIVE_REASON))?;
             } else {
                 conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
+                // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
+                // append ONE identity-only EVICT leaf IN THIS tx BEFORE the
+                // non-archiving delete (the archive branch above routes
+                // through archive_memory_no_tx, which leaves its own leaf).
+                // Gated → flag-OFF unchanged.
+                if crate::config::append_only_enabled()
+                    && let Some(ver) = conn
+                        .query_row(
+                            "SELECT version FROM memories WHERE id = ?1",
+                            params![id],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                {
+                    crate::revisions::emit_revision_leaf_if_enabled(
+                        conn,
+                        &id,
+                        crate::revisions::RecordKind::Evict,
+                        Some(ver),
+                        namespace,
+                        None,
+                        &Utc::now().to_rfc3339(),
+                    )?;
+                }
                 conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
             }
             Ok(())
@@ -9562,6 +9760,20 @@ fn overwrite_full_row_by_id(conn: &Connection, mem: &Memory) -> Result<()> {
             merge_encrypted_envelope,
             mem.id,
         ],
+    )?;
+    // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: this peer-driven
+    // LWW full-row overwrite rewrites content in place (same id); the
+    // pre-merge content is preserved in the `federation_merge` archive
+    // snapshot above, never in the leaf. Append ONE identity-only
+    // SUPERSEDE leaf in the caller's tx.
+    crate::revisions::emit_revision_leaf_if_enabled(
+        conn,
+        &mem.id,
+        crate::revisions::RecordKind::Supersede,
+        None,
+        &mem.namespace,
+        Some(merge_agent_id).filter(|s| !s.is_empty()),
+        &mem.updated_at,
     )?;
     Ok(())
 }
