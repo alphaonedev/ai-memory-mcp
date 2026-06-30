@@ -1,0 +1,92 @@
+# Nightly cross-backend (sqlite <-> postgres) parity tests.
+#
+# v0.8.1 audit follow-up (#1855, epic #1853). The parity binaries
+# `secret_screen_postgres_parity_g29`, `postgres_l2_rehydration_1693`, and
+# `erasure_fanout_postgres_g30` are `#![cfg(feature = "sal-postgres")]` AND
+# `#[ignore]`-gated, so the PR-time `postgres-feature` job in `ci.yml` — which
+# runs `cargo test --features sal-postgres` WITHOUT `--ignored` — never actually
+# executes them. The CHANGELOG implied these parity assertions were exercised in
+# CI; this job exercises them for real against a live PostgreSQL + pgvector
+# instance, on a nightly schedule (kept off the PR critical path) plus on-demand.
+#
+# Service image mirrors `ci.yml`'s `postgres-feature` job exactly
+# (`pgvector/pgvector:pg16`, same creds/port); the three binaries here do not
+# depend on the AGE extension, so no AGE build is required.
+name: Postgres parity (nightly)
+
+on:
+  schedule:
+    - cron: '27 4 * * *'   # 04:27 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: postgres-parity-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  postgres-parity:
+    name: Postgres parity (#[ignore]-gated, live PG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Match `postgres-feature`: mold linker + no dev debug info to keep the
+      # heavy sal-postgres build under the runner's RSS/disk ceilings (#1148/#1744).
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      AI_MEMORY_TEST_POSTGRES_URL: postgres://ai_memory:ai_memory_ci@localhost:5432/ai_memory_ci
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: ai_memory
+          POSTGRES_PASSWORD: ai_memory_ci
+          POSTGRES_DB: ai_memory_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_memory -d ai_memory_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Wait for postgres readiness
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U ai_memory -d ai_memory_ci >/dev/null 2>&1; then
+              echo "::notice::postgres is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::postgres did not become ready within 60s"
+          exit 1
+
+      - name: Run #[ignore]-gated cross-backend parity tests (live PG)
+        run: |
+          cargo test --features sal-postgres \
+            --test secret_screen_postgres_parity_g29 \
+            --test postgres_l2_rehydration_1693 \
+            --test erasure_fanout_postgres_g30 \
+            -- --include-ignored --test-threads=1
