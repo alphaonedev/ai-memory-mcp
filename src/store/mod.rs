@@ -1620,7 +1620,9 @@ pub trait MemoryStore: Send + Sync {
         _consolidator_agent_id: &str,
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
-            capability: "CONSOLIDATE".to_string(),
+            capability: crate::revisions::RecordKind::Consolidate
+                .as_str()
+                .to_string(),
         })
     }
 

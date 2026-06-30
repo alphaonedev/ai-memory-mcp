@@ -93,6 +93,13 @@ const SQL_SELECT_MEMORY_ID_BY_ID: &str = "SELECT id FROM memories WHERE id = $1"
 const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = $1";
 const SQL_SELECT_METADATA_BY_NS_TITLE: &str =
     "SELECT metadata FROM memories WHERE namespace = $1 AND title = $2";
+/// #1823 G6 — title-keyed id lookup, shared by the append-only spine's
+/// COW / consolidate leaf paths (single SQL SSOT per pm-v3.1).
+const SQL_SELECT_ID_BY_NS_TITLE: &str =
+    "SELECT id FROM memories WHERE namespace = $1 AND title = $2";
+/// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
+/// shared across every append-only revision site (single SQL SSOT).
+const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = $1";
 const SQL_LOAD_AGE: &str = "LOAD 'age'";
 const SQL_SET_AGE_SEARCH_PATH: &str = "SET LOCAL search_path = ag_catalog, \"$user\", public";
 /// AGE graph bootstrap — shared with `ai-memory schema-init`
@@ -105,6 +112,9 @@ const CTX_BEGIN_AGE_TX: &str = "begin AGE tx";
 const CTX_COMMIT_AGE_TX: &str = "commit AGE tx";
 const CTX_SET_SEARCH_PATH: &str = "set search_path";
 const CTX_VERIFY_LINK_SELECT: &str = "verify_link select";
+/// #1823 G6 — `to_store_err` context for the supersede revision-leaf
+/// append, referenced by every append-only spine site (single SSOT).
+const CTX_APPEND_SUPERSEDE_LEAF: &str = "append supersede revision leaf";
 const COL_CONTENT_LEN: &str = "content_len";
 const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
 
@@ -3981,7 +3991,7 @@ impl PostgresStore {
             &chrono::Utc::now().to_rfc3339(),
         )
         .await
-        .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit update tx", e))?;
@@ -12104,12 +12114,11 @@ impl MemoryStore for PostgresStore {
         // namespace/version lookup runs ONLY under the flag (flag-OFF stays
         // byte-identical).
         if crate::config::append_only_enabled() {
-            let (leaf_ns, leaf_ver): (String, i64) =
-                sqlx::query_as("SELECT namespace, version FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("read row for supersede leaf", e))?;
+            let (leaf_ns, leaf_ver): (String, i64) = sqlx::query_as(SQL_SELECT_NS_VERSION_BY_ID)
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("read row for supersede leaf", e))?;
             pg_emit_revision_leaf_if_enabled(
                 &mut tx,
                 id,
@@ -12120,7 +12129,7 @@ impl MemoryStore for PostgresStore {
                 &chrono::Utc::now().to_rfc3339(),
             )
             .await
-            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+            .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         }
 
         // #1799 — commit the atomic snapshot + UPDATE before any
@@ -12172,13 +12181,11 @@ impl MemoryStore for PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("delete begin tx", e))?;
-            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
-                "SELECT namespace, version FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
+            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -13209,7 +13216,7 @@ impl MemoryStore for PostgresStore {
             &chrono::Utc::now().to_rfc3339(),
         )
         .await
-        .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+        .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("merge_inbound commit tx", e))?;
@@ -13319,13 +13326,11 @@ impl MemoryStore for PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
-            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
-                "SELECT namespace, version FROM memories WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
+            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -14082,13 +14087,12 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
         if crate::config::append_only_enabled() {
-            let (mid,): (String,) =
-                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
-                    .bind(AGENTS_NAMESPACE)
-                    .bind(&title)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+            let (mid,): (String,) = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
             pg_emit_revision_leaf_if_enabled(
                 &mut tx,
                 &mid,
@@ -14099,7 +14103,7 @@ impl MemoryStore for PostgresStore {
                 &now,
             )
             .await
-            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+            .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         }
         tx.commit()
             .await
@@ -14187,13 +14191,12 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("revoke_agent_pubkey", e))?;
         if crate::config::append_only_enabled() {
-            let (mid,): (String,) =
-                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
-                    .bind(AGENTS_NAMESPACE)
-                    .bind(&title)
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+            let (mid,): (String,) = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
             pg_emit_revision_leaf_if_enabled(
                 &mut tx,
                 &mid,
@@ -14204,7 +14207,7 @@ impl MemoryStore for PostgresStore {
                 &now,
             )
             .await
-            .map_err(|e| to_store_err("append supersede revision leaf", e))?;
+            .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
         }
         tx.commit()
             .await
@@ -14715,13 +14718,12 @@ impl MemoryStore for PostgresStore {
             // identity-only CONSOLIDATE leaf for the source IN THIS tx BEFORE
             // its delete. Gated → flag-OFF unchanged.
             if crate::config::append_only_enabled()
-                && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
-                    "SELECT namespace, version FROM memories WHERE id = $1",
-                )
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("consolidate read source for leaf", e))?
+                && let Some((ns, ver)) =
+                    sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("consolidate read source for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -16485,13 +16487,12 @@ impl MemoryStore for PostgresStore {
             // delete (the cold-storage copy already landed above). Gated →
             // flag-OFF unchanged.
             if crate::config::append_only_enabled()
-                && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
-                    "SELECT namespace, version FROM memories WHERE id = $1",
-                )
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
+                && let Some((ns, ver)) =
+                    sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
+                        .bind(id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -16922,13 +16923,12 @@ impl MemoryStore for PostgresStore {
     async fn is_registered_agent(&self, agent_id: &str) -> StoreResult<bool> {
         use crate::models::AGENTS_NAMESPACE;
         let title = crate::models::agent_registration_title(agent_id);
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
-                .bind(AGENTS_NAMESPACE)
-                .bind(&title)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| to_store_err("is_registered_agent", e))?;
+        let row: Option<(String,)> = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+            .bind(AGENTS_NAMESPACE)
+            .bind(&title)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("is_registered_agent", e))?;
         Ok(row.is_some())
     }
 
@@ -17043,13 +17043,12 @@ impl MemoryStore for PostgresStore {
         let registered_agent_check = if matches!(level, GovernanceLevel::Registered) {
             use crate::models::AGENTS_NAMESPACE;
             let title = crate::models::agent_registration_title(agent_id);
-            let row: Option<(String,)> =
-                sqlx::query_as("SELECT id FROM memories WHERE namespace = $1 AND title = $2")
-                    .bind(AGENTS_NAMESPACE)
-                    .bind(&title)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("is_registered_agent (tx)", e))?;
+            let row: Option<(String,)> = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("is_registered_agent (tx)", e))?;
             row.is_some()
         } else {
             false

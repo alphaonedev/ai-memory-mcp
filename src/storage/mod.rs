@@ -22,6 +22,9 @@ const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
 const SQL_MEMORY_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)";
 const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1";
+/// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
+/// shared across the append-only revision sites (single SQL SSOT).
+const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
 // ── #1579 A2 — sargable `list` SQL fragments ──────────────────────────────
 // The always-present expiry guard opens the WHERE clause; every other
 // filter is appended by `build_list_query` ONLY when the caller supplied
@@ -2251,11 +2254,9 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     if crate::config::append_only_enabled() {
         use rusqlite::OptionalExtension;
         if let Some((ns, ver)) = conn
-            .query_row(
-                "SELECT namespace, version FROM memories WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-            )
+            .query_row(SQL_SELECT_NS_VERSION_BY_ID, params![id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .optional()?
         {
             crate::revisions::emit_revision_leaf_if_enabled(
@@ -2424,11 +2425,9 @@ pub(crate) fn archive_memory_no_tx(
         if crate::config::append_only_enabled() {
             use rusqlite::OptionalExtension;
             if let Some((ns, ver)) = conn
-                .query_row(
-                    "SELECT namespace, version FROM memories WHERE id = ?1",
-                    params![id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )
+                .query_row(SQL_SELECT_NS_VERSION_BY_ID, params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .optional()?
             {
                 crate::revisions::emit_revision_leaf_if_enabled(
@@ -2862,11 +2861,9 @@ pub fn archive_memory_for_caller(
         if crate::config::append_only_enabled() {
             use rusqlite::OptionalExtension;
             if let Some((ns, ver)) = conn
-                .query_row(
-                    "SELECT namespace, version FROM memories WHERE id = ?1",
-                    params![id],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                )
+                .query_row(SQL_SELECT_NS_VERSION_BY_ID, params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })
                 .optional()?
             {
                 crate::revisions::emit_revision_leaf_if_enabled(
