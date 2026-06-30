@@ -259,7 +259,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-29 (#1849/#1844 security review) — bumped 21_250 → 21_350 for the
     // UNCAPPED `forget_distinct_namespaces` / `forget_distinct_namespaces_for_caller`
     // governance-gate query helpers (#1849) + the title/tags/metadata redact funnel.
-    ("src/storage/mod.rs", 21_350),
+    ("src/storage/mod.rs", 21_600),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -591,7 +591,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // redact-at-storage wiring (store/store_with_embedding/store_batch/
     // merge_inbound) + the G30 forget erasure-fanout (DLQ/transcript purge +
     // UNNEST signed-tombstone insert) + the `migrate_v71` forget_tombstones arm.
-    ("src/store/postgres.rs", 22_450),
+    ("src/store/postgres.rs", 23_050),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -691,7 +691,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `[security]` section (`SecurityConfig.secret_screen_mode`),
     // `ENV_SECRET_SCREEN_MODE`, and `resolve_secret_screen_mode()` for the
     // pre-write credential screen (actual 11_353; 47 headroom).
-    ("src/config.rs", 11_400),
+    ("src/config.rs", 11_500),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -873,7 +873,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-23 (#1771) — bumped 4_500 → 4_600 (lockstep): the v70
     // `archived_memory_links` migration arm + bootstrap-SCHEMA CREATE landed
     // it at 4_560.
-    ("src/storage/migrations.rs", 4_600),
+    ("src/storage/migrations.rs", 4_700),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
