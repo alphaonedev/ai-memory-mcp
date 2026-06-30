@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 71).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 72).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -297,6 +297,33 @@ CREATE TABLE IF NOT EXISTS forget_tombstones (
 );
 CREATE INDEX IF NOT EXISTS idx_forget_tombstones_namespace
     ON forget_tombstones(namespace);
+
+-- v72 (#1823, v0.9.0 G6) — append-only spine: the signed identity-only
+-- `memory_revisions` revision ledger. One signed leaf per supersede /
+-- tombstone / forget / archive / expire / evict / consolidate
+-- transition. IDENTITY-ONLY, NEVER content (a content fingerprint would
+-- re-leak an erased row). `prev_hash` + `sequence` mirror `signed_events`
+-- so the ledger is a verifiable hash chain. Created by migration v72 for
+-- upgrading DBs; inline here so a fresh bootstrap has it.
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id            TEXT PRIMARY KEY,
+    memory_id     TEXT NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN (
+                      'SUPERSEDE', 'TOMBSTONE', 'FORGET', 'ARCHIVE',
+                      'EXPIRE', 'EVICT', 'CONSOLIDATE'
+                  )),
+    prior_version INTEGER,
+    namespace     TEXT NOT NULL,
+    agent_id      TEXT,
+    created_at    TEXT NOT NULL,
+    signature     BLOB,
+    prev_hash     BLOB NOT NULL,
+    sequence      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
+    ON memory_revisions(memory_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_revisions_sequence
+    ON memory_revisions(sequence);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -691,7 +718,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 71;
+const CURRENT_SCHEMA_VERSION: i64 = 72;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1211,6 +1238,10 @@ const MIGRATION_V65_SQLITE: &str =
 // a version-stamp no-op.
 const MIGRATION_V66_SQLITE: &str =
     include_str!("../../migrations/sqlite/0055_v66_governance_rules_escalate_severity.sql");
+
+/// v72 (#1823, v0.9.0 G6) — append-only spine `memory_revisions` ledger.
+const MIGRATION_V72_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0056_v72_memory_revisions.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -2988,6 +3019,22 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 CREATE INDEX IF NOT EXISTS idx_forget_tombstones_namespace
                     ON forget_tombstones(namespace);",
             )?;
+        }
+
+        if version < 72 {
+            // v72 = #1823 / v0.9.0 G6 (append-only spine, step 1) — the
+            // signed identity-only `memory_revisions` revision ledger. The
+            // (step 2+) append-only write paths route one signed leaf here
+            // per supersede / tombstone / forget / archive / expire / evict
+            // / consolidate transition via `append_revision_leaf`. PURE
+            // ADDITIVE `CREATE TABLE IF NOT EXISTS` — NO full-table rebuild
+            // (no trigger-drop, the v63 -> v65 lesson). Carries NO content
+            // (a content fingerprint would re-leak an erased row), so the
+            // signed surface is strictly identity + time. `prev_hash` +
+            // `sequence` mirror `signed_events` for a verifiable hash chain.
+            // Also inline in the bootstrap `SCHEMA` const so fresh DBs have
+            // it. Postgres mirrors via `migrate_v72`.
+            conn.execute_batch(MIGRATION_V72_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;
