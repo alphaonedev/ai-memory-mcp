@@ -364,6 +364,49 @@ pub fn append_revision_leaf(conn: &Connection, leaf: &RevisionLeaf) -> Result<()
     Ok(())
 }
 
+/// v0.9.0 G6 (#1823) STEP 2 — the gated sqlite convenience used by every
+/// sanctioned mutation primitive. When the append-only spine is OFF (the
+/// default) this is a NO-OP, so the legacy mutation path stays
+/// BYTE-IDENTICAL. When ON it mints a fresh leaf id, signs the
+/// identity-only bytes with the daemon audit key (unsigned when no key is
+/// installed, same posture as `signed_events`), and appends ONE leaf in
+/// the caller's transaction via [`append_revision_leaf`].
+///
+/// Callers hold the surrounding transaction and MUST emit the leaf in the
+/// SAME tx as the mutation it records — BEFORE a destructive delete
+/// (capture-then-compact) or alongside an in-place content UPDATE (COW
+/// supersede) — so the chain never lags the data and a rollback discards
+/// both. Content is NEVER carried (an erased row must not be re-leaked).
+///
+/// # Errors
+///
+/// Propagates the chain-head read / INSERT error from
+/// [`append_revision_leaf`]. The caller MUST roll back its own transaction.
+pub fn emit_revision_leaf_if_enabled(
+    conn: &Connection,
+    memory_id: &str,
+    kind: RecordKind,
+    prior_version: Option<i64>,
+    namespace: &str,
+    agent_id: Option<&str>,
+    created_at: &str,
+) -> Result<()> {
+    if !crate::config::append_only_enabled() {
+        return Ok(());
+    }
+    let leaf = RevisionLeaf::new(
+        uuid::Uuid::new_v4().to_string(),
+        memory_id,
+        kind,
+        prior_version,
+        namespace,
+        agent_id.map(str::to_string),
+        created_at,
+    )
+    .signed();
+    append_revision_leaf(conn, &leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
