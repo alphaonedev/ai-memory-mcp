@@ -191,6 +191,12 @@ const MIGRATION_V38_FORM5_CONFIDENCE: &str =
 const MIGRATION_V39_SIGNED_EVENTS_DLQ: &str =
     include_str!("../../migrations/postgres/0021_v07_signed_events_dlq.sql");
 
+/// v72 (#1823, v0.9.0 G6) — append-only spine `memory_revisions` ledger
+/// (postgres mirror of the sqlite v72 arm). Pure additive
+/// `CREATE TABLE IF NOT EXISTS` + indexes — fully idempotent.
+const MIGRATION_V72_MEMORY_REVISIONS: &str =
+    include_str!("../../migrations/postgres/0031_v07_memory_revisions.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -534,7 +540,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 71;
+const CURRENT_SCHEMA_VERSION: i32 = 72;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1389,8 +1395,11 @@ impl PostgresStore {
         if current_version < 70 {
             self.migrate_v70().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 71 {
             self.migrate_v71().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v72().await?;
         }
 
         Ok(())
@@ -3400,6 +3409,41 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v71 applied (#1821: forget_tombstones — signed \
              FORGET-tombstone resurrection guard)"
+        );
+        Ok(())
+    }
+
+    /// v72 (#1823 / v0.9.0 G6, append-only spine step 1) — the signed
+    /// identity-only `memory_revisions` revision ledger (postgres mirror of
+    /// the sqlite v72 arm). The (step 2+) append-only write paths route one
+    /// signed leaf here per supersede / tombstone / forget / archive /
+    /// expire / evict / consolidate transition via
+    /// [`pg_append_revision_leaf_in_tx`]. Identity + time + signature only —
+    /// NO content fingerprint (that would re-leak an erased row). `prev_hash`
+    /// + `sequence` mirror `signed_events` for a verifiable hash chain. Pure
+    /// additive `CREATE TABLE IF NOT EXISTS`.
+    async fn migrate_v72(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v72 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V72_MEMORY_REVISIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("v72 create memory_revisions", e))?;
+
+        record_schema_version(&mut tx, 72).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v72 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v72 applied (#1823: memory_revisions — signed \
+             identity-only append-only revision ledger)"
         );
         Ok(())
     }
@@ -8537,6 +8581,135 @@ async fn pg_append_signed_event_with_chain_in_tx(
     .bind(signature.map(<[u8]>::to_vec))
     .bind(attest_level)
     .bind(timestamp)
+    .bind(&prev_hash)
+    .bind(next_seq)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Caller-supplied IDENTITY-ONLY fields for
+/// [`pg_append_revision_leaf_in_tx`]. Bundled in a struct (like
+/// [`PgSignedEventInsert`]) so the helper stays under the
+/// `clippy::too_many_arguments` ceiling. NEVER carries content.
+///
+/// v0.9.0 G6 step 1 (#1823): defined + wired to the table but NOT yet
+/// called from a mutation path — that is step 2+.
+#[allow(dead_code)]
+struct PgRevisionLeafInsert<'a> {
+    id: &'a str,
+    memory_id: &'a str,
+    kind: crate::revisions::RecordKind,
+    prior_version: Option<i64>,
+    namespace: &'a str,
+    agent_id: Option<&'a str>,
+    created_at: &'a str,
+    signature: Option<&'a [u8]>,
+}
+
+/// v0.9.0 G6 (#1823) — postgres twin of
+/// [`crate::revisions::append_revision_leaf`]. Computes the
+/// `memory_revisions` chain head and INSERTs ONE signed identity-only leaf
+/// against a caller-owned transaction, so the leaf lands in the SAME
+/// transaction as the data mutation it records (the chain never lags the
+/// data; a rollback discards both). Mirrors
+/// [`pg_append_signed_event_with_chain_in_tx`]. The caller owns
+/// BEGIN/COMMIT.
+///
+/// STEP 1 (foundation): defined but NOT yet called from a mutation path —
+/// site conversion is step 2+.
+#[allow(dead_code)]
+async fn pg_append_revision_leaf_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: PgRevisionLeafInsert<'_>,
+) -> Result<(), sqlx::Error> {
+    use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
+    use crate::signed_events::ZERO_HASH;
+    use sha2::{Digest, Sha256};
+
+    let PgRevisionLeafInsert {
+        id,
+        memory_id,
+        kind,
+        prior_version,
+        namespace,
+        agent_id,
+        created_at,
+        signature,
+    } = row;
+
+    // Read the chain head.
+    let head: Option<(
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                signature, sequence \
+         FROM memory_revisions \
+         ORDER BY sequence DESC \
+         LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    let (next_seq, prev_hash) = match head {
+        None => (1_i64, ZERO_HASH.to_vec()),
+        Some((
+            h_id,
+            h_memory_id,
+            h_kind,
+            h_prior,
+            h_namespace,
+            h_agent,
+            h_created_at,
+            h_sig,
+            h_seq,
+        )) => {
+            // An unknown kind in the head row is a corrupted ledger; map it
+            // to a decode error rather than silently rehashing a bad row.
+            let h_kind = crate::revisions::RecordKind::from_str_opt(&h_kind)
+                .ok_or(sqlx::Error::Decode("memory_revisions: unknown kind".into()))?;
+            let leaf = RevisionLeaf {
+                id: h_id,
+                memory_id: h_memory_id,
+                kind: h_kind,
+                prior_version: h_prior,
+                namespace: h_namespace,
+                agent_id: h_agent,
+                created_at: h_created_at,
+                signature: h_sig,
+            };
+            let canon = canonical_revision_chain_bytes(&leaf, h_seq);
+            let mut hasher = Sha256::new();
+            hasher.update(&canon);
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&hasher.finalize());
+            (h_seq + 1, digest.to_vec())
+        }
+    };
+
+    sqlx::query(
+        "INSERT INTO memory_revisions \
+            (id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+             signature, prev_hash, sequence) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+    )
+    .bind(id)
+    .bind(memory_id)
+    .bind(kind.as_str())
+    .bind(prior_version)
+    .bind(namespace)
+    .bind(agent_id)
+    .bind(created_at)
+    .bind(signature.map(<[u8]>::to_vec))
     .bind(&prev_hash)
     .bind(next_seq)
     .execute(&mut **tx)

@@ -3635,6 +3635,13 @@ pub struct StorageSection {
     /// Postgres-only; SQLite has no graph backend and ignores it.
     /// Unparseable / unset falls through to the compiled default `sync`.
     pub age_projection_mode: Option<String>,
+
+    /// v0.9.0 G6 (#1823) — append-only spine master switch. When `true`,
+    /// the (step 2+) write paths route memory mutations through the signed
+    /// `memory_revisions` ledger rather than mutating rows in place.
+    /// Default `false` (OFF). Env override: `AI_MEMORY_APPEND_ONLY`
+    /// ([`ENV_APPEND_ONLY`]).
+    pub append_only: Option<bool>,
 }
 
 /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
@@ -4019,6 +4026,12 @@ pub struct ResolvedStorage {
     /// `crate::config::set_age_projection_mode` at boot; read by
     /// `PostgresStore::link_internal`.
     pub age_projection_mode: AgeProjectionMode,
+    /// v0.9.0 G6 (#1823) — resolved append-only spine flag
+    /// (`AI_MEMORY_APPEND_ONLY` env > `[storage].append_only` > compiled
+    /// default `false`). Exposed process-wide via
+    /// [`crate::config::append_only_enabled`]. STEP 1: resolved + exposed
+    /// but NOT yet wired into any mutation path (that is step 2+).
+    pub append_only: bool,
     /// #1590 — per-field provenance of `default_namespace`:
     /// [`ConfigSource::Config`] when `[storage].default_namespace` is
     /// explicitly set, [`ConfigSource::Legacy`] when only the
@@ -4152,6 +4165,14 @@ pub const ENV_DB_MMAP_SIZE: &str = "AI_MEMORY_DB_MMAP_SIZE";
 /// inline AGE MERGE synchronously (default) or defer it to the cold-path
 /// projection drainer via `kg_projection_outbox`.
 pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
+
+/// v0.9.0 G6 (#1823) — env override for the append-only spine flag
+/// (`[storage].append_only`). Truthy (`1`/`true`) or falsy (`0`/`false`)
+/// wins over config; anything else falls through to the config field then
+/// the compiled default `false` (OFF). When ON, the (step 2+) write paths
+/// route memory mutations through the signed `memory_revisions` ledger
+/// instead of mutating rows in place. Default-OFF is the opt-in posture.
+pub const ENV_APPEND_ONLY: &str = "AI_MEMORY_APPEND_ONLY";
 
 /// #1463 Tier 1 — env override for the operational-log sink destination
 /// (`[logging].sink`). Highest layer of the `env > [logging].sink > file`
@@ -5164,6 +5185,29 @@ pub fn age_projection_mode() -> AgeProjectionMode {
         1 => AgeProjectionMode::Deferred,
         _ => AgeProjectionMode::Sync,
     }
+}
+
+/// v0.9.0 G6 (#1823) — process-wide append-only spine flag, seeded once at
+/// daemon boot from the resolved `[storage]` config
+/// ([`ResolvedStorage::append_only`]: `AI_MEMORY_APPEND_ONLY` env >
+/// `[storage].append_only` > compiled default `false`). Read at write time
+/// by the (step 2+) mutation paths, which have no `AppConfig` handle —
+/// mirrors the [`set_age_projection_mode`] boot-seeded global precedent.
+/// Defaults to `false` (OFF) when unseeded. STEP 1: exposed but not yet
+/// consulted by any mutation path.
+static APPEND_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Seed the process-wide append-only spine flag (#1823). Called once at
+/// boot from [`ResolvedStorage::append_only`].
+pub fn set_append_only(enabled: bool) {
+    APPEND_ONLY.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the append-only spine is enabled process-wide (#1823).
+/// Defaults to `false` (OFF) until seeded by [`set_append_only`].
+#[must_use]
+pub fn append_only_enabled() -> bool {
+    APPEND_ONLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `[permissions]` block in `config.toml`. Carries the gate's
@@ -7553,6 +7597,26 @@ impl AppConfig {
             })
             .unwrap_or_default();
 
+        // v0.9.0 G6 (#1823) — append-only spine flag, uniform ladder:
+        // env (truthy/falsy wins) > `[storage].append_only` > compiled
+        // default `false` (OFF). Any non-boolean env string falls through
+        // to the config field then the default. Mirrors
+        // `resolve_compaction_enabled`.
+        let append_only = {
+            let env = std::env::var(ENV_APPEND_ONLY).ok().and_then(|v| {
+                let t = v.trim();
+                if t == "1" || t.eq_ignore_ascii_case("true") {
+                    Some(true)
+                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+            env.or_else(|| cfg.and_then(|s| s.append_only))
+                .unwrap_or(false)
+        };
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.default_namespace.is_some()
@@ -7572,6 +7636,7 @@ impl AppConfig {
             max_memory_mb,
             db_mmap_size_bytes,
             age_projection_mode,
+            append_only,
             default_namespace_source,
             source,
         }
