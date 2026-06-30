@@ -45,10 +45,10 @@ fn walk_rs_files(dir: &Path, visit: &mut dyn FnMut(&Path, &str)) {
         let path = entry.path();
         if path.is_dir() {
             walk_rs_files(&path, visit);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                visit(&path, &contents);
-            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs")
+            && let Ok(contents) = std::fs::read_to_string(&path)
+        {
+            visit(&path, &contents);
         }
     }
 }
