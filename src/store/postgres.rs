@@ -4023,6 +4023,23 @@ impl PostgresStore {
     ///   `expected_version` is `Some` and the stored version drifted.
     /// * `NotFound` — when no live memory matches `id`.
     /// * `BackendUnavailable` — on SQL failure.
+    ///
+    /// ## Append-only spine (#1823 G6) — DEFERRED, not reachable
+    ///
+    /// This `mint-new-id` + `DELETE`-old supersede is a parity-API
+    /// surface with NO production caller — `grep '.update_with_archive_on_supersede'`
+    /// over `src/` is empty; only `tests/` exercise it. The reachable
+    /// production postgres supersede is [`MemoryStore::update`] →
+    /// `update_with_expected_version_once`, the convergence-proven path-a
+    /// SAME-id in-place `UPDATE` that already appends a sanctioned
+    /// `SUPERSEDE` leaf. The MCP append-and-archive branch
+    /// (`mcp::tools::update`) routes through the SQLite twin
+    /// ([`crate::storage::update_with_archive_on_supersede`]), never this
+    /// adapter method. This legacy body is therefore retained
+    /// byte-identical under BOTH `append_only` flag states; were it ever
+    /// wired into a production supersede it MUST first be converted to
+    /// path-a per the locked G6 design so the federation tiebreak
+    /// (`EXCLUDED.id > memories.id`) stays unperturbed.
     pub async fn update_with_archive_on_supersede(
         &self,
         id: &str,
