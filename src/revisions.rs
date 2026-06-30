@@ -304,9 +304,20 @@ fn read_revision_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
 
     match head {
         None => Ok((0, ZERO_HASH)),
-        Some((id, memory_id, kind_s, prior_version, namespace, agent_id, created_at, signature, sequence)) => {
-            let kind = RecordKind::from_str_opt(&kind_s)
-                .ok_or_else(|| anyhow!("memory_revisions chain head has unknown kind {kind_s:?}"))?;
+        Some((
+            id,
+            memory_id,
+            kind_s,
+            prior_version,
+            namespace,
+            agent_id,
+            created_at,
+            signature,
+            sequence,
+        )) => {
+            let kind = RecordKind::from_str_opt(&kind_s).ok_or_else(|| {
+                anyhow!("memory_revisions chain head has unknown kind {kind_s:?}")
+            })?;
             let leaf = RevisionLeaf {
                 id,
                 memory_id,

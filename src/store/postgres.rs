@@ -8788,8 +8788,7 @@ async fn pg_emit_revision_leaf_if_enabled(
         agent_id,
         created_at,
     );
-    let signature =
-        crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let signature = crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
     let id = uuid::Uuid::new_v4().to_string();
     pg_append_revision_leaf_in_tx(
         tx,
@@ -12173,12 +12172,13 @@ impl MemoryStore for PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("delete begin tx", e))?;
-            if let Some((ns, ver)) =
-                sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
+            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
+                "SELECT namespace, version FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("delete read row for tombstone leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -13205,10 +13205,7 @@ impl MemoryStore for PostgresStore {
             crate::revisions::RecordKind::Supersede,
             None,
             &merged.namespace,
-            merged
-                .metadata
-                .get("agent_id")
-                .and_then(|v| v.as_str()),
+            merged.metadata.get("agent_id").and_then(|v| v.as_str()),
             &chrono::Utc::now().to_rfc3339(),
         )
         .await
@@ -13322,12 +13319,13 @@ impl MemoryStore for PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("apply_remote_deletion begin tx", e))?;
-            if let Some((ns, ver)) =
-                sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
+            if let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
+                "SELECT namespace, version FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply_remote_deletion read row for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -14717,12 +14715,13 @@ impl MemoryStore for PostgresStore {
             // identity-only CONSOLIDATE leaf for the source IN THIS tx BEFORE
             // its delete. Gated → flag-OFF unchanged.
             if crate::config::append_only_enabled()
-                && let Some((ns, ver)) =
-                    sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("consolidate read source for leaf", e))?
+                && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
+                    "SELECT namespace, version FROM memories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("consolidate read source for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,
@@ -16486,12 +16485,13 @@ impl MemoryStore for PostgresStore {
             // delete (the cold-storage copy already landed above). Gated →
             // flag-OFF unchanged.
             if crate::config::append_only_enabled()
-                && let Some((ns, ver)) =
-                    sqlx::query_as::<_, (String, i64)>("SELECT namespace, version FROM memories WHERE id = $1")
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
-                        .await
-                        .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
+                && let Some((ns, ver)) = sqlx::query_as::<_, (String, i64)>(
+                    "SELECT namespace, version FROM memories WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("archive_by_ids read row for leaf", e))?
             {
                 pg_emit_revision_leaf_if_enabled(
                     &mut tx,

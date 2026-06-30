@@ -79,7 +79,11 @@ fn strip_rust_comments(src: &str) -> String {
 
 /// 1-based line number of a byte offset within `s`.
 fn line_of_offset(s: &str, offset: usize) -> usize {
-    s[..offset.min(s.len())].bytes().filter(|&b| b == b'\n').count() + 1
+    s[..offset.min(s.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// Does the line look like a Rust `fn` declaration? (`fn NAME(` after
