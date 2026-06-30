@@ -200,6 +200,27 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 
+  # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
+  # actionlint's NATIVE expression-injection check flags the #1851 class: an
+  # untrusted `${{ github.event.* }}` expression interpolated directly into a
+  # `run:` shell block (the fix env-indirects those inputs). shellcheck is
+  # disabled (`-shellcheck=`) so the bundled bash-style SC* warnings across the
+  # ~15 legacy workflows don't drown out that guard — the injection check is
+  # built into actionlint and does not depend on shellcheck. `ubuntu-24.04-arm`
+  # is whitelisted via `.github/actionlint.yaml`. Advisory until added to branch
+  # protection, mirroring the `msrv` job.
+  actionlint:
+    name: actionlint (workflow-injection guard)
+    needs: classify
+    if: needs.classify.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.1
+        with:
+          args: -shellcheck= -color
+
   # MSRV gate — ai-memory standardizes on Rust 1.96, declared in
   # Cargo.toml `rust-version`. CI's other jobs build on `@stable` (which
   # floats forward), so without this pin the declared floor is never

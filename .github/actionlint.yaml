@@ -1,0 +1,10 @@
+# actionlint configuration (#1855, epic #1853).
+#
+# `ubuntu-24.04-arm` is a real GitHub-hosted ARM64 runner label, but
+# actionlint 1.7.1's built-in label table predates it, so it is reported as
+# an unknown `runner-label`. Registering it here treats it as known (it is
+# not actually a self-hosted runner; this is the documented mechanism for
+# teaching actionlint about newer/extra labels).
+self-hosted-runner:
+  labels:
+    - ubuntu-24.04-arm
