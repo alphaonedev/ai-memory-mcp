@@ -884,6 +884,162 @@ pub enum TruncationCheck {
     },
 }
 
+/// v0.9.0 G5b (#1822) — verdict of the INDEPENDENT dual-chain audit-head
+/// WITNESS check (K1 pin + tail-truncation of EITHER chain), computed by
+/// [`compute_witness_verdict`] from the latest
+/// [`crate::models::ConditionType::AuditHeadWitness`] checkpoint.
+///
+/// - [`Unknown`](WitnessCheck::Unknown) — no witness anchor available (or one
+///   present but unpinnable/unverifiable) in the DEFAULT withhold posture:
+///   never a false alarm, never clean-because-of-anchor.
+/// - [`NotDetected`](WitnessCheck::NotDetected) — a pinned, signature-valid
+///   witness anchors heads `>=` the surviving heads on BOTH chains.
+/// - [`Detected`](WitnessCheck::Detected) — a pinned witness head is strictly
+///   ABOVE the surviving head of `chain` (`signed_events` or
+///   `memory_revisions`): tail truncation of that chain.
+/// - [`Forged`](WitnessCheck::Forged) — K1 pin FAILED: the witness
+///   `resolver_pubkey` does not match the out-of-band enrolled witness pubkey
+///   (e.g. a head re-signed under the daemon key). A hard-dirty verdict.
+/// - [`Missing`](WitnessCheck::Missing) — require-mode
+///   (`AI_MEMORY_REQUIRE_WITNESS`) is on but no pinnable/verifiable witness is
+///   available: fail-closed (dirty).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WitnessCheck {
+    /// No usable witness anchor — verdict withheld (default posture).
+    Unknown,
+    /// Pinned + valid witness; surviving heads `>=` witnessed heads.
+    NotDetected,
+    /// Pinned witness head above the surviving head of `chain`.
+    Detected {
+        /// Which chain truncated: `"signed_events"` or `"memory_revisions"`.
+        chain: String,
+        /// Head anchored by the witness checkpoint.
+        witness_head: i64,
+        /// Surviving in-DB head of that chain.
+        db_head: i64,
+    },
+    /// K1 pin failed — witness `resolver_pubkey` != enrolled witness pubkey.
+    Forged {
+        /// Human-readable reason (for the CLI/JSON surface).
+        detail: String,
+    },
+    /// Require-mode is on but no pinnable/verifiable witness is available.
+    Missing,
+}
+
+/// v0.9.0 G5b (#1822) — verdict of the cause-binding coverage scan
+/// (`signed_events.cause_hash IS NULL`), computed by
+/// [`compute_cause_binding_verdict`].
+///
+/// - [`NotDetected`](CauseBinding::NotDetected) — every walked row binds a
+///   `cause_hash`.
+/// - [`Unknown`](CauseBinding::Unknown) — some rows are unbound but
+///   cause-binding is NOT required: withhold (default). Legacy/mixed chains
+///   legitimately carry unbound rows, so this never dirties by default.
+/// - [`Detected`](CauseBinding::Detected) — require-mode
+///   (`AI_MEMORY_REQUIRE_CAUSE_BINDING`) is on and `rows_without_cause` rows
+///   are unbound: fail-closed (dirty).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CauseBinding {
+    /// Some rows unbound but not required — verdict withheld (default).
+    Unknown,
+    /// Every walked row binds a cause.
+    NotDetected,
+    /// Require-mode on + unbound rows present (fail-closed).
+    Detected {
+        /// Count of `signed_events` rows with `cause_hash IS NULL`.
+        rows_without_cause: i64,
+    },
+}
+
+/// Chain-name tag for a `signed_events` witness [`WitnessCheck::Detected`].
+pub const WITNESS_CHAIN_SIGNED_EVENTS: &str = "signed_events";
+/// Chain-name tag for a `memory_revisions` witness [`WitnessCheck::Detected`].
+pub const WITNESS_CHAIN_MEMORY_REVISIONS: &str = "memory_revisions";
+
+/// K1 (#1822) — witness-pinned tail-truncation verdict over BOTH chains.
+///
+/// The out-of-band enrolled witness pubkey is asserted against the latest
+/// witness checkpoint's `resolver_pubkey` BEFORE trusting its signature — a
+/// sig-valid-but-wrong-key anchor (e.g. a head re-signed under the daemon
+/// key) is [`WitnessCheck::Forged`], NOT a verbatim-reused pass. Only once
+/// pinned + signature-valid are the anchored heads compared against the
+/// surviving heads.
+#[must_use]
+pub fn compute_witness_verdict(
+    latest_witness: Option<&crate::models::Checkpoint>,
+    enrolled_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+    db_signed_head: i64,
+    db_revisions_head: i64,
+    require_witness: bool,
+) -> WitnessCheck {
+    let withhold = || {
+        if require_witness {
+            WitnessCheck::Missing
+        } else {
+            WitnessCheck::Unknown
+        }
+    };
+    let Some(cp) = latest_witness else {
+        return withhold();
+    };
+    // K1 pin FIRST — assert the resolver pubkey equals the out-of-band
+    // enrolled witness pubkey BEFORE trusting the checkpoint signature.
+    if let Some(expected) = enrolled_pubkey {
+        if cp.resolver_pubkey.as_slice() != expected.to_bytes().as_slice() {
+            return WitnessCheck::Forged {
+                detail: "witness resolver_pubkey does not match the enrolled out-of-band \
+                         witness pubkey (K1 pin) — anchor rejected"
+                    .to_string(),
+            };
+        }
+    }
+    // Signature self-consistency over the canonical resolution.
+    if !crate::checkpoints::verify(cp) {
+        return withhold();
+    }
+    // No out-of-band pin available → cannot cryptographically anchor the
+    // pubkey; require-mode fails closed, default withholds.
+    if enrolled_pubkey.is_none() {
+        return withhold();
+    }
+    let Some(dual) = crate::governance::audit::parse_witness_dual_head(cp) else {
+        return withhold();
+    };
+    if dual.signed_head_sequence > db_signed_head {
+        return WitnessCheck::Detected {
+            chain: WITNESS_CHAIN_SIGNED_EVENTS.to_string(),
+            witness_head: dual.signed_head_sequence,
+            db_head: db_signed_head,
+        };
+    }
+    if dual.revisions_head_sequence > db_revisions_head {
+        return WitnessCheck::Detected {
+            chain: WITNESS_CHAIN_MEMORY_REVISIONS.to_string(),
+            witness_head: dual.revisions_head_sequence,
+            db_head: db_revisions_head,
+        };
+    }
+    WitnessCheck::NotDetected
+}
+
+/// Cause-binding verdict (#1822 K2). `rows_without_cause == 0` →
+/// [`CauseBinding::NotDetected`]; otherwise [`CauseBinding::Detected`] under
+/// require-mode (fail-closed) or [`CauseBinding::Unknown`] (withhold) by
+/// default. Shared by both backends so the verdict is IDENTICAL (K3).
+#[must_use]
+pub fn compute_cause_binding_verdict(rows_without_cause: i64, require: bool) -> CauseBinding {
+    if rows_without_cause <= 0 {
+        CauseBinding::NotDetected
+    } else if require {
+        CauseBinding::Detected { rows_without_cause }
+    } else {
+        CauseBinding::Unknown
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditTrailReport {
     /// Rows walked inside the `since` window (the whole table when
@@ -914,6 +1070,15 @@ pub struct AuditTrailReport {
     /// below the anchored head. Independent of `chain_intact`, which a tail
     /// truncation does not disturb. See [`TruncationCheck`].
     pub truncation: TruncationCheck,
+    /// v0.9.0 G5b (#1822) — INDEPENDENT dual-chain audit-head WITNESS verdict
+    /// (K1 pin + tail-truncation of `signed_events` OR `memory_revisions`
+    /// against the out-of-band-enrolled witness anchor). `Unknown` withholds
+    /// (default); `Detected`/`Forged`/`Missing` are dirty. See [`WitnessCheck`].
+    pub witness: WitnessCheck,
+    /// v0.9.0 G5b (#1822) — cause-binding coverage verdict
+    /// (`cause_hash IS NULL` scan). `Unknown` withholds by default;
+    /// `Detected` (require-mode) is dirty. See [`CauseBinding`].
+    pub cause_binding: CauseBinding,
 }
 
 impl AuditTrailReport {
@@ -931,6 +1096,14 @@ impl AuditTrailReport {
         self.chain_intact
             && self.sequence_gaps.is_empty()
             && !matches!(self.truncation, TruncationCheck::Detected { .. })
+            // v0.9.0 G5b (#1822) — witness Detected/Forged/Missing are dirty;
+            // Unknown withholds (never dirties an otherwise-clean report).
+            && !matches!(
+                self.witness,
+                WitnessCheck::Detected { .. } | WitnessCheck::Forged { .. } | WitnessCheck::Missing
+            )
+            // Cause-binding Detected (require-mode) is dirty; Unknown withholds.
+            && !matches!(self.cause_binding, CauseBinding::Detected { .. })
     }
 }
 
@@ -1013,6 +1186,7 @@ impl AuditTrailReport {
 ///
 /// Returns the underlying `rusqlite` error if any of the head /
 /// floor / gap-scan queries fail, or the `verify_chain` error.
+#[allow(clippy::too_many_lines)]
 pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<AuditTrailReport> {
     // Chain head — highest sequence in the WHOLE table (independent of
     // the window). `MAX(sequence)` is NULL on an empty table → 0.
@@ -1102,6 +1276,44 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         expected = seq + 1;
     }
 
+    // v0.9.0 G5b (#1822) — INDEPENDENT dual-chain witness verdict (K1 pin) +
+    // cause-binding coverage. Both use the SHARED verdict fns so the postgres
+    // twin ([`crate::store::postgres::PostgresStore::verify_audit_trail`])
+    // surfaces IDENTICAL verdicts (K3).
+    let require_witness = crate::governance::audit::require_witness_enabled();
+    let require_cause = crate::governance::audit::require_cause_binding_enabled();
+    let enrolled_pubkey = crate::governance::audit::load_enrolled_witness_pubkey()
+        .ok()
+        .flatten();
+    // The witness tier is ADDITIVE + optional: a legacy / minimal schema with
+    // no `checkpoints` (or `memory_revisions`) table has definitionally no
+    // witness, so any read failure degrades to "no anchor" → the safe withhold
+    // (Unknown) posture — never aborts the whole verify. Require-mode
+    // (`AI_MEMORY_REQUIRE_WITNESS`) still fail-closes on the resulting None.
+    let latest_witness = read_latest_witness_checkpoint(conn).ok().flatten();
+    let revisions_head = crate::revisions::read_revision_chain_head(conn)
+        .map(|(seq, _)| seq)
+        .unwrap_or(0);
+    let witness = compute_witness_verdict(
+        latest_witness.as_ref(),
+        enrolled_pubkey.as_ref(),
+        head_sequence,
+        revisions_head,
+        require_witness,
+    );
+    // Cause-binding coverage scan. A missing `cause_hash` column (pre-v73
+    // hand-rolled schema) degrades to 0 unbound rows → NotDetected rather than
+    // aborting the verify.
+    let rows_without_cause: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events \
+             WHERE cause_hash IS NULL AND sequence IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let cause_binding = compute_cause_binding_verdict(rows_without_cause, require_cause);
+
     Ok(AuditTrailReport {
         total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
         chain_intact: report.chain_holds(),
@@ -1110,7 +1322,35 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         head_sequence,
         since: since.map(ToString::to_string),
         truncation,
+        witness,
+        cause_binding,
     })
+}
+
+/// v0.9.0 G5b (#1822) — read the NEWEST
+/// [`crate::models::ConditionType::AuditHeadWitness`] checkpoint (the current
+/// dual-chain head anchor), or `None` when none has been emitted. Scoped to
+/// the reserved witness namespace, newest by `resolved_at` then `created_at`.
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+fn read_latest_witness_checkpoint(conn: &Connection) -> Result<Option<crate::models::Checkpoint>> {
+    use rusqlite::OptionalExtension;
+    let sql = format!(
+        "{} WHERE namespace = ?1 AND condition_type = ?2 \
+         ORDER BY resolved_at DESC, created_at DESC LIMIT 1",
+        crate::checkpoints::CHECKPOINT_SELECT_SQL
+    );
+    conn.query_row(
+        &sql,
+        params![
+            crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE,
+            crate::models::ConditionType::AuditHeadWitness.as_str(),
+        ],
+        crate::checkpoints::row_to_checkpoint,
+    )
+    .optional()
+    .context("read latest audit-head witness checkpoint")
 }
 
 /// SHA-256 helper. Centralised so every audit-row producer commits
@@ -1236,12 +1476,97 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     let head_hash_hex = hex_lower(hasher.finalize().as_slice());
     crate::governance::audit::maybe_record_audit_watermark(next_seq, &head_hash_hex);
 
+    // v0.9.0 G5b (#1822) — INDEPENDENT dual-chain audit-head witness anchor.
+    // Emitted on the SAME `WATERMARK_INTERVAL` cadence (throttled), in the
+    // caller's transaction so the witness lands atomically with the head it
+    // binds. Opt-in (no-op unless a witness key is enrolled) + fire-and-
+    // forget (a witness failure NEVER fails the append). This is the single
+    // sqlite append chokepoint, so one wiring point witnesses every path.
+    maybe_emit_audit_head_witness(conn, next_seq, &head_hash_hex, false);
+
     Ok(())
+}
+
+/// v0.9.0 G5b (#1822) — emit the dual-chain audit-head witness anchor if a
+/// witness key is enrolled AND the throttle boundary is reached (or `force`
+/// on graceful shutdown). Fire-and-forget: a witness failure is logged and
+/// swallowed — it NEVER fails the signed-events append (mirrors the #1850
+/// watermark). Opt-in: a deployment with no enrolled witness key emits
+/// nothing (byte-identical legacy behaviour).
+fn maybe_emit_audit_head_witness(
+    conn: &Connection,
+    signed_head_seq: i64,
+    signed_head_hash: &str,
+    force: bool,
+) {
+    if let Err(e) = try_emit_audit_head_witness(conn, signed_head_seq, signed_head_hash, force) {
+        tracing::warn!(
+            target: SIGNED_EVENTS_TRACE_TARGET,
+            "audit-head witness emission failed (swallowed): {e:#}"
+        );
+    }
+}
+
+/// Fallible core of [`maybe_emit_audit_head_witness`]. Cheap boundary
+/// pre-check FIRST (no key I/O off the hot path), then load the witness key,
+/// then claim the emission slot (CAS) and write the signed dual-head anchor.
+fn try_emit_audit_head_witness(
+    conn: &Connection,
+    signed_head_seq: i64,
+    signed_head_hash: &str,
+    force: bool,
+) -> Result<()> {
+    use crate::governance::audit as witness;
+    // Cheap pre-check — keeps witness-key file I/O off every append.
+    if !force && !witness::witness_interval_reached(signed_head_seq) {
+        return Ok(());
+    }
+    let Some(keypair) = witness::load_witness_signing_key()? else {
+        return Ok(()); // opt-in: no witness key enrolled → no-op.
+    };
+    // Claim the slot only once we know we can actually sign.
+    if !witness::witness_claim_slot(signed_head_seq, force) {
+        return Ok(());
+    }
+    let (mem_seq, mem_hash) = crate::revisions::read_revision_chain_head(conn)
+        .context("witness: read memory_revisions head")?;
+    let dual = witness::WitnessDualHead {
+        signed_head_sequence: signed_head_seq,
+        signed_head_hash: signed_head_hash.to_string(),
+        revisions_head_sequence: mem_seq,
+        revisions_head_hash: hex_lower(&mem_hash),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let cp = witness::build_signed_witness_checkpoint(&dual, now, &keypair)?;
+    crate::checkpoints::insert(conn, &cp).context("witness: insert checkpoint")?;
+    Ok(())
+}
+
+/// v0.9.0 G5b (#1822) — force-emit a dual-chain audit-head witness anchor for
+/// the CURRENT chain head, bypassing the interval throttle. The graceful-
+/// shutdown entry point: call before a clean daemon exit so the final head is
+/// witnessed even if it did not reach a `WATERMARK_INTERVAL` boundary. No-op
+/// (Ok) when no witness key is enrolled. Fire-and-forget — errors logged.
+pub fn force_emit_audit_head_witness(conn: &Connection) {
+    let (head_seq, head_hash) = match read_chain_head(conn) {
+        Ok((seq, hash)) => (seq, hex_lower(&hash)),
+        Err(e) => {
+            tracing::warn!(
+                target: SIGNED_EVENTS_TRACE_TARGET,
+                "audit-head witness shutdown flush: read head failed (swallowed): {e:#}"
+            );
+            return;
+        }
+    };
+    if head_seq <= 0 {
+        return;
+    }
+    maybe_emit_audit_head_witness(conn, head_seq, &head_hash, true);
 }
 
 /// Lowercase-hex encode a byte slice. Centralised so the #1850 watermark
 /// hash and any future hex producer share one stable rendering.
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

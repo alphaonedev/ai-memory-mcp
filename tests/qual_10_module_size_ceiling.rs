@@ -595,7 +595,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // redact-at-storage wiring (store/store_with_embedding/store_batch/
     // merge_inbound) + the G30 forget erasure-fanout (DLQ/transcript purge +
     // UNNEST signed-tombstone insert) + the `migrate_v71` forget_tombstones arm.
-    ("src/store/postgres.rs", 23_050),
+    // 2026-07-01 (#1822, v0.9.0 G5b) — bumped 23_050 → 23_450 for the postgres
+    // audit-witness tier: the pg watermark-parity wiring (item 7), the
+    // `pg_emit_audit_head_witness_in_tx` + `pg_read_revision_head_in_tx`
+    // dual-chain emitter (item 6), and the `verify_audit_trail` twin (item 10 /
+    // K3) that surfaces identical WitnessCheck/CauseBinding verdicts.
+    ("src/store/postgres.rs", 23_450),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

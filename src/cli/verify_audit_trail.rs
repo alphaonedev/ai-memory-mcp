@@ -108,6 +108,45 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             )
             .context(CTX_WRITE_AUDIT_REPORT)?;
         }
+        // #1822 G5b — surface the INDEPENDENT dual-chain witness verdict (K1).
+        match &report.witness {
+            crate::signed_events::WitnessCheck::Detected {
+                chain,
+                witness_head,
+                db_head,
+            } => writeln!(
+                out.stdout,
+                "  witness truncation detected on {chain}: witness head={witness_head} \
+                 but in-DB head={db_head} ({} row(s) removed)",
+                witness_head - db_head,
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::WitnessCheck::Forged { detail } => {
+                writeln!(
+                    out.stdout,
+                    "  witness anchor FORGED (K1 pin failed): {detail}"
+                )
+                .context(CTX_WRITE_AUDIT_REPORT)?;
+            }
+            crate::signed_events::WitnessCheck::Missing => writeln!(
+                out.stdout,
+                "  witness anchor MISSING but AI_MEMORY_REQUIRE_WITNESS is set (fail-closed)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::WitnessCheck::Unknown
+            | crate::signed_events::WitnessCheck::NotDetected => {}
+        }
+        // #1822 G5b — surface a require-mode cause-binding coverage failure.
+        if let crate::signed_events::CauseBinding::Detected { rows_without_cause } =
+            report.cause_binding
+        {
+            writeln!(
+                out.stdout,
+                "  cause-binding required but {rows_without_cause} row(s) have no bound cause \
+                 (AI_MEMORY_REQUIRE_CAUSE_BINDING is set; fail-closed)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?;
+        }
         for (from, to) in &report.sequence_gaps {
             if from == to {
                 writeln!(out.stdout, "  sequence gap: {from} missing")

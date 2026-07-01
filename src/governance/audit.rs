@@ -979,6 +979,353 @@ fn scan_file_last_watermark(path: &Path) -> Option<(i64, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.0 G5b (#1822) — INDEPENDENT audit-head WITNESS anchor (dual-chain)
+// ---------------------------------------------------------------------------
+//
+// The #1850 forensic watermark above raises the truncation-detection bar but
+// is signed by the DAEMON key (or nothing). The accepted 2×5-vote design adds
+// a SECOND, independent anchor whose custody is DELIBERATELY separate from the
+// daemon signer: an [`crate::models::ConditionType::AuditHeadWitness`]
+// checkpoint, signed by the audit-WITNESS key, that binds BOTH chain heads
+// (the `signed_events` head AND the `memory_revisions` head) into one
+// resolution. `verify_audit_trail` pins the witness pubkey out-of-band (K1)
+// before trusting the checkpoint signature, so a host attacker who can
+// `DELETE FROM signed_events` (and even re-sign a lowered head with the DAEMON
+// key) cannot forge a matching witness — the pin surfaces it as `Forged`.
+//
+// # Key custody + rotation (SEPARATE from the daemon signer)
+//
+// - PRIVATE signing key: loaded from a custody directory DISTINCT from the
+//   daemon key dir — [`WITNESS_KEY_DIR_ENV`] (`AI_MEMORY_WITNESS_KEY_DIR`),
+//   defaulting to `<config>/ai-memory/witness-keys/` (NOT the daemon
+//   `<config>/ai-memory/keys/`). Filed under the reserved label
+//   [`WITNESS_KEY_LABEL`] as `<label>.priv` (0o600, enforced by
+//   [`crate::identity::keypair::load`]). The operational intent is that this
+//   directory lives on a mount the daemon can READ but a compromised daemon
+//   process should not be able to overwrite (e.g. a read-only secret mount),
+//   so witness emission is a WRITE the attacker cannot forge after the fact.
+// - PUBLIC verify (K1) anchor: resolved OUT-OF-BAND via
+//   [`WITNESS_PUBKEY_ENV`] (`AI_MEMORY_WITNESS_PUBKEY`, URL-safe-no-pad
+//   base64 of the 32 raw bytes) with highest precedence — an operator/
+//   orchestrator injects it from a secret store, so it never lives on the
+//   DB-writable disk. When unset it falls back to the `<label>.pub` file in
+//   the custody dir. K1 is only cryptographically load-bearing when the
+//   out-of-band pubkey is enrolled; a require-mode deployment
+//   (`AI_MEMORY_REQUIRE_WITNESS`) that cannot pin fails CLOSED.
+// - ROTATION: rotate the witness keypair with the same
+//   [`crate::identity::keypair::rotate`] archival semantics as any agent key,
+//   then re-enroll the new public key into `AI_MEMORY_WITNESS_PUBKEY`.
+//   Checkpoints signed by the prior witness key remain verifiable against the
+//   archived `<label>.pub.<unix_secs>` anchor out-of-band; the pin only
+//   trusts the currently-enrolled pubkey (same posture as the daemon-key
+//   rotation note in `keypair.rs`).
+
+/// Env override for the audit-witness PRIVATE-key custody directory.
+/// Distinct from [`crate::identity::keypair::KEY_DIR_ENV`] so the witness
+/// signer's custody is physically separable from the daemon signer's.
+pub const WITNESS_KEY_DIR_ENV: &str = "AI_MEMORY_WITNESS_KEY_DIR";
+
+/// Env carrying the OUT-OF-BAND enrolled audit-witness PUBLIC key
+/// (URL-safe-no-pad base64 of the 32 raw verifying-key bytes). The K1 pin
+/// authority — highest precedence over the custody-dir `.pub` file.
+pub const WITNESS_PUBKEY_ENV: &str = "AI_MEMORY_WITNESS_PUBKEY";
+
+/// Reserved keypair label the witness key files are stored under
+/// (`<label>.pub` / `<label>.priv`) inside the witness custody dir.
+pub const WITNESS_KEY_LABEL: &str = "audit-witness";
+
+/// Reserved `checkpoints.namespace` the audit-head witness anchors live in.
+/// Distinct so an operator can grep the anchors apart from coordination
+/// checkpoints and `verify_audit_trail` can scope its "latest witness" read.
+pub const WITNESS_CHECKPOINT_NAMESPACE: &str = "_audit_witness";
+
+/// `checkpoints.title` stamped on every audit-head witness anchor.
+const WITNESS_CHECKPOINT_TITLE: &str = "audit head witness";
+
+/// `checkpoints.created_by` / `resolved_by` pseudo-actor for witness anchors.
+pub const WITNESS_RESOLVED_BY: &str = "audit:witness";
+
+/// Schema version embedded in the witness `resolution` JSON (`"v": N`).
+const WITNESS_RESOLUTION_VERSION: i64 = 1;
+
+/// Env that flips the witness verdict to FAIL-CLOSED (require-mode, K2):
+/// when set truthy, a missing / unpinnable witness anchor makes
+/// `verify_audit_trail` dirty instead of withholding judgement (`Unknown`).
+pub const REQUIRE_WITNESS_ENV: &str = "AI_MEMORY_REQUIRE_WITNESS";
+
+/// Env that flips the cause-binding verdict to FAIL-CLOSED (require-mode,
+/// K2): when set truthy, any `signed_events` row with `cause_hash IS NULL`
+/// makes `verify_audit_trail` dirty instead of withholding (`Unknown`).
+pub const REQUIRE_CAUSE_BINDING_ENV: &str = "AI_MEMORY_REQUIRE_CAUSE_BINDING";
+
+/// Process-static "last witnessed `signed_events` head". `0` = none emitted
+/// yet this process. Drives the [`WATERMARK_INTERVAL`] emission throttle,
+/// independent of [`LAST_WATERMARKED_SEQ`].
+static LAST_WITNESSED_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// Truthy-env helper mirroring [`crate::identity::attest::require_agent_attestation_enabled`].
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// K2 — `true` when `AI_MEMORY_REQUIRE_WITNESS` is set truthy (fail-closed on
+/// a missing / unpinnable witness anchor). Default `false` (withhold posture).
+#[must_use]
+pub fn require_witness_enabled() -> bool {
+    env_flag_enabled(REQUIRE_WITNESS_ENV)
+}
+
+/// K2 — `true` when `AI_MEMORY_REQUIRE_CAUSE_BINDING` is set truthy
+/// (fail-closed on any unbound-cause row). Default `false` (withhold posture).
+#[must_use]
+pub fn require_cause_binding_enabled() -> bool {
+    env_flag_enabled(REQUIRE_CAUSE_BINDING_ENV)
+}
+
+/// Resolve the audit-witness PRIVATE-key custody directory: the
+/// [`WITNESS_KEY_DIR_ENV`] override when set + non-empty, else
+/// `<config>/ai-memory/witness-keys/` (DISTINCT from the daemon key dir).
+///
+/// # Errors
+/// The OS did not advertise a config directory (exotic platforms with no
+/// HOME) and no override was set.
+pub fn witness_key_dir() -> Result<PathBuf> {
+    if let Ok(v) = std::env::var(WITNESS_KEY_DIR_ENV) {
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    let base = dirs::config_dir().ok_or_else(|| {
+        anyhow!("OS did not advertise a config directory for witness-key storage")
+    })?;
+    Ok(base.join("ai-memory").join("witness-keys"))
+}
+
+/// Load the audit-witness SIGNING keypair from the custody dir. Returns
+/// `Ok(None)` when no witness key is enrolled (the default, opt-in posture —
+/// witness emission is a no-op) or when only a public-only key is present
+/// (cannot sign). Mirrors [`load_daemon_signing_key`]'s absent-vs-corrupt
+/// disposition.
+///
+/// # Errors
+/// The witness key dir cannot be resolved.
+pub fn load_witness_signing_key() -> Result<Option<crate::identity::keypair::AgentKeypair>> {
+    let dir = witness_key_dir()?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    match crate::identity::keypair::load(WITNESS_KEY_LABEL, &dir) {
+        Ok(kp) if kp.can_sign() => Ok(Some(kp)),
+        Ok(_) => {
+            tracing::debug!("audit-witness key present but public-only; witness emission disabled");
+            Ok(None)
+        }
+        Err(e) => {
+            if signing_key_load_is_absent(&e) {
+                tracing::debug!("no audit-witness key enrolled; witness emission disabled");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "audit-witness key present but could not be loaded; witness emission disabled"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Load the OUT-OF-BAND enrolled audit-witness VERIFYING key (the K1 pin
+/// authority). Precedence: [`WITNESS_PUBKEY_ENV`] URL-safe-no-pad base64
+/// (highest — injected from a secret store, never on the DB-writable disk),
+/// then the `<label>.pub` file in the custody dir. Returns `Ok(None)` when
+/// neither is available.
+///
+/// # Errors
+/// The witness key dir cannot be resolved, or `AI_MEMORY_WITNESS_PUBKEY` is
+/// set but does not decode to a valid 32-byte Ed25519 verifying key.
+pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if let Ok(v) = std::env::var(WITNESS_PUBKEY_ENV) {
+        let v = v.trim();
+        if !v.is_empty() {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(v.as_bytes())
+                .context("decode AI_MEMORY_WITNESS_PUBKEY (expect url-safe-no-pad base64)")?;
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow!(
+                    "AI_MEMORY_WITNESS_PUBKEY decoded to {} bytes, expected 32",
+                    bytes.len()
+                )
+            })?;
+            let vk = VerifyingKey::from_bytes(&arr)
+                .context("AI_MEMORY_WITNESS_PUBKEY is not a valid Ed25519 verifying key")?;
+            return Ok(Some(vk));
+        }
+    }
+    let dir = witness_key_dir()?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    match crate::identity::keypair::load(WITNESS_KEY_LABEL, &dir) {
+        Ok(kp) => Ok(Some(kp.public)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `true` when the `signed_events` head has advanced at least
+/// [`WATERMARK_INTERVAL`] beyond the last witnessed head — the CHEAP,
+/// no-side-effect pre-check the append chokepoints run BEFORE loading the
+/// witness key (keeps key I/O off the per-append hot path).
+#[must_use]
+pub fn witness_interval_reached(head_sequence: i64) -> bool {
+    head_sequence > 0
+        && head_sequence.saturating_sub(LAST_WITNESSED_SEQ.load(Ordering::Relaxed))
+            >= WATERMARK_INTERVAL
+}
+
+/// Claim the witness-emission slot for `head_sequence`. Returns `true` for the
+/// single caller that should emit. `force` (graceful shutdown) bypasses the
+/// interval and always claims the current head. Lock-free CAS on
+/// [`LAST_WITNESSED_SEQ`]; concurrent callers crossing the same boundary
+/// collapse to one emission.
+#[must_use]
+pub fn witness_claim_slot(head_sequence: i64, force: bool) -> bool {
+    if head_sequence <= 0 {
+        return false;
+    }
+    if force {
+        LAST_WITNESSED_SEQ.store(head_sequence, Ordering::Relaxed);
+        return true;
+    }
+    let last = LAST_WITNESSED_SEQ.load(Ordering::Relaxed);
+    if head_sequence.saturating_sub(last) < WATERMARK_INTERVAL {
+        return false;
+    }
+    LAST_WITNESSED_SEQ
+        .compare_exchange(last, head_sequence, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// The dual-chain head bound into an [`crate::models::ConditionType::AuditHeadWitness`]
+/// checkpoint's `resolution`. Both the `signed_events` and `memory_revisions`
+/// heads are anchored so a truncation of EITHER chain is detectable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessDualHead {
+    /// `MAX(sequence)` of `signed_events` at emission.
+    pub signed_head_sequence: i64,
+    /// Lowercase-hex head hash of the `signed_events` head row.
+    pub signed_head_hash: String,
+    /// `MAX(sequence)` of `memory_revisions` at emission.
+    pub revisions_head_sequence: i64,
+    /// Lowercase-hex head hash of the `memory_revisions` head row.
+    pub revisions_head_hash: String,
+}
+
+/// One chain's head in the witness `resolution` wire shape. The field
+/// identifiers ARE the JSON keys (no scattered string literals — a serde
+/// struct is the pm-v3.1-clean way to name a fixed wire shape once).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WitnessHeadWire {
+    head_sequence: i64,
+    head_hash: String,
+}
+
+/// The versioned witness `resolution` wire shape (both chain heads). Field
+/// order = declaration order → deterministic serialisation, so the signature
+/// commits to a stable byte layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WitnessResolutionWire {
+    v: i64,
+    signed_events: WitnessHeadWire,
+    memory_revisions: WitnessHeadWire,
+}
+
+/// Serialise a [`WitnessDualHead`] into the versioned `resolution` JSON the
+/// witness signature commits to (via `SignableCheckpointResolution`).
+fn witness_resolution_json(dual: &WitnessDualHead) -> String {
+    let wire = WitnessResolutionWire {
+        v: WITNESS_RESOLUTION_VERSION,
+        signed_events: WitnessHeadWire {
+            head_sequence: dual.signed_head_sequence,
+            head_hash: dual.signed_head_hash.clone(),
+        },
+        memory_revisions: WitnessHeadWire {
+            head_sequence: dual.revisions_head_sequence,
+            head_hash: dual.revisions_head_hash.clone(),
+        },
+    };
+    // to_string on a fixed-shape struct is infallible in practice.
+    serde_json::to_string(&wire).unwrap_or_default()
+}
+
+/// Parse the dual-chain head back out of a witness checkpoint's `resolution`.
+/// `None` when `cp` is not an audit-head witness or its resolution is absent /
+/// malformed / a version this reader does not understand.
+#[must_use]
+pub fn parse_witness_dual_head(cp: &crate::models::Checkpoint) -> Option<WitnessDualHead> {
+    use crate::models::ConditionType;
+    if cp.condition_type != ConditionType::AuditHeadWitness {
+        return None;
+    }
+    let res = cp.resolution.as_deref()?;
+    let wire: WitnessResolutionWire = serde_json::from_str(res).ok()?;
+    if wire.v != WITNESS_RESOLUTION_VERSION {
+        return None;
+    }
+    Some(WitnessDualHead {
+        signed_head_sequence: wire.signed_events.head_sequence,
+        signed_head_hash: wire.signed_events.head_hash,
+        revisions_head_sequence: wire.memory_revisions.head_sequence,
+        revisions_head_hash: wire.memory_revisions.head_hash,
+    })
+}
+
+/// Build + SIGN a resolved [`crate::models::ConditionType::AuditHeadWitness`]
+/// checkpoint binding `dual` at wall-clock `now` (epoch seconds), signed by
+/// `keypair` (the witness signer). The returned checkpoint is ready to
+/// `checkpoints::insert` into either backend.
+///
+/// # Errors
+/// Propagates the [`crate::checkpoints::sign_resolution_into`] error (a
+/// public-only keypair or a CBOR-encode fault).
+pub fn build_signed_witness_checkpoint(
+    dual: &WitnessDualHead,
+    now: i64,
+    keypair: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::models::Checkpoint> {
+    use crate::models::{CheckpointState, ConditionType};
+    let mut cp = crate::models::Checkpoint {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: WITNESS_CHECKPOINT_NAMESPACE.to_string(),
+        title: WITNESS_CHECKPOINT_TITLE.to_string(),
+        condition_type: ConditionType::AuditHeadWitness,
+        condition: serde_json::Value::Null,
+        state: CheckpointState::Resolved,
+        created_by: WITNESS_RESOLVED_BY.to_string(),
+        resolved_by: Some(WITNESS_RESOLVED_BY.to_string()),
+        resolution: Some(witness_resolution_json(dual)),
+        resolution_note: None,
+        signature: Vec::new(),
+        resolver_pubkey: Vec::new(),
+        created_at: now,
+        deadline_at: None,
+        resolved_at: Some(now),
+        metadata: serde_json::Value::Null,
+    };
+    crate::checkpoints::sign_resolution_into(&mut cp, keypair)
+        .context("sign audit-head witness resolution")?;
+    Ok(cp)
+}
+
+// ---------------------------------------------------------------------------
 // Cross-module test-isolation lock (#899 root-cause fix)
 // ---------------------------------------------------------------------------
 //
