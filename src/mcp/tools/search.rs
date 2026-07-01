@@ -207,6 +207,7 @@ mod visibility_1468_tests {
             None => json!({crate::META_KEY_AGENT_ID: agent}),
         };
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: MTier::Mid,
             namespace: "ns".to_string(),

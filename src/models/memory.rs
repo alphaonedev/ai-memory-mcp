@@ -737,6 +737,21 @@ pub struct Memory {
     /// matching the SQL `DEFAULT 'open'`.
     #[serde(default)]
     pub lifecycle_state: LifecycleState,
+    /// v0.9.0 G8 (#1825) — the additive, content-addressed BLAKE3
+    /// content-id (`b3:<hex>`) minted from this memory's GENESIS identity
+    /// (`agent_id + namespace + screen(title) + memory_kind + created_at +
+    /// SHA256(screen(content))`). Sits ALONGSIDE `id` (the UUID stays the
+    /// PK / every FK / the federation LWW tiebreak); the cid is a second,
+    /// content-derived name. Stored in `memories.cid TEXT` (schema v74),
+    /// `NULL` on legacy rows the v74 backfill couldn't stamp (undecryptable
+    /// or `version >= 2` re-stored rows). The storage-internal `cid_genesis`
+    /// pre-image BLOB is NOT a `Memory` field — it is read on demand only by
+    /// the verify path ([`crate::identity::cid::verify_cid`]).
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` keeps
+    /// the absent shape off the wire for pre-v74 federation peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
 }
 
 impl Memory {
@@ -744,7 +759,8 @@ impl Memory {
     /// `Memory` struct. SSOT for the "27-field struct at v0.8.0
     /// (26 at v0.7.0, was 15 at v0.6.x)" narrative in CLAUDE.md /
     /// README.md / ROADMAP.md / release-notes — the 27th field is the
-    /// v0.8.0 Pillar-2 (#1709) `lifecycle_state` column.
+    /// v0.8.0 Pillar-2 (#1709) `lifecycle_state` column; the 28th field is
+    /// the v0.9.0 G8 (#1825) additive `cid` content-id column.
     /// Adding or removing a field requires
     /// bumping this const in the same commit, OR the parity test pin
     /// at `tests/memory_field_count_invariant.rs` fails the build.
@@ -753,7 +769,7 @@ impl Memory {
     /// (Memory shape drift), mirrors the
     /// `MemoryLinkRelation::COUNT` + `EXPECTED_CLI_SUBCOMMANDS_*`
     /// drift-blocker pattern landed in commits 960578cfd + 233e8a247.
-    pub const FIELD_COUNT: usize = 27;
+    pub const FIELD_COUNT: usize = 28;
 
     /// v0.7.0 #1466 — the `expires_at` value a fresh store must persist.
     /// An explicit value the caller supplied wins; otherwise a non-`Long`
@@ -1042,6 +1058,7 @@ impl Default for Memory {
     /// `Mid` to match the API-layer default in [`CreateMemory`].
     fn default() -> Self {
         Self {
+            cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             id: String::new(),
             tier: Tier::Mid,
             namespace: crate::DEFAULT_NAMESPACE.to_string(),

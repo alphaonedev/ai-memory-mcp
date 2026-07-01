@@ -1054,6 +1054,7 @@ async fn sync_since_enrolled_key_valid_sig_passes() {
 fn ga2_memory(id: &str) -> ai_memory::models::Memory {
     let now = chrono::Utc::now().to_rfc3339();
     ai_memory::models::Memory {
+        cid: None,
         id: id.to_string(),
         tier: ai_memory::models::Tier::Mid,
         namespace: "covga2".to_string(),

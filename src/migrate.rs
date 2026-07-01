@@ -338,6 +338,7 @@ mod tests {
     ) -> Memory {
         let ts = created_at.to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),

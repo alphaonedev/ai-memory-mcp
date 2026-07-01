@@ -346,6 +346,7 @@ mod tests {
     fn seed_observation(conn: &rusqlite::Connection, ns: &str, title: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),
@@ -471,6 +472,7 @@ mod tests {
         // Insert a private memory owned by alice.
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "alice-ns".to_string(),
@@ -541,6 +543,7 @@ mod tests {
         let conn = fresh_conn();
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "alice-ns-1571".to_string(),

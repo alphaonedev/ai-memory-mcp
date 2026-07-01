@@ -38,6 +38,7 @@ fn insert_standard(conn: &Connection, namespace: &str) -> String {
     let now = Utc::now().to_rfc3339();
     let id = uuid::Uuid::new_v4().to_string();
     let mem = Memory {
+        cid: None,
         id: id.clone(),
         tier: Tier::Long,
         namespace: namespace.to_string(),

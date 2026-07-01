@@ -119,6 +119,7 @@ fn seed_parent(conn: &rusqlite::Connection, namespace: &str) -> Result<(String, 
     let body = synth_long_body();
     let body_len = body.len();
     let parent = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: namespace.to_string(),

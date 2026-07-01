@@ -203,6 +203,7 @@ fn seed_observation(db_path: &std::path::Path, namespace: &str, title: &str) -> 
     let conn = db::open(db_path).expect("db::open for seed");
     let now = Utc::now().to_rfc3339();
     let mem = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),

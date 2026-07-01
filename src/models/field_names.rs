@@ -203,6 +203,17 @@ pub const LIFECYCLE_STATE: &str = "lifecycle_state";
 /// carrying the sealed [`crate::encryption::Envelope`] ciphertext when at-rest
 /// encryption is enabled; NULL on every legacy + encryption-off row.
 pub const ENCRYPTED_ENVELOPE: &str = "encrypted_envelope";
+/// `cid` — wire/row field name (v0.9.0 G8 #1825, schema v74). The
+/// additive `b3:<hex>` content-address minted from a memory's genesis
+/// identity; NULL on legacy rows the v74 backfill couldn't stamp.
+pub const CID: &str = "cid";
+/// `cid_genesis` — row field name (v0.9.0 G8 #1825, schema v74). The
+/// storage-internal BLOB carrying the canonical cid pre-image
+/// ([`crate::identity::cid::canonical_cid_preimage`]); read on demand by
+/// the verify path only, NEVER a `Memory` field. NULLed on erasure
+/// (RecordKind::Forget) so the stored content digest cannot become a
+/// confirmation-oracle for erased content, while `cid` is retained.
+pub const CID_GENESIS: &str = "cid_genesis";
 /// `last_seen_at` — wire/row field name.
 pub const LAST_SEEN_AT: &str = "last_seen_at";
 /// `latency_ms` — wire/row field name.

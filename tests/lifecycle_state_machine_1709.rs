@@ -21,6 +21,7 @@ fn fresh_conn() -> rusqlite::Connection {
 fn make_mem(title: &str, state: LifecycleState) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "lc-test".to_string(),

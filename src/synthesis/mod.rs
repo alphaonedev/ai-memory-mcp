@@ -622,6 +622,7 @@ mod tests {
     fn cand(id: &str, title: &str, content: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "ns".to_string(),

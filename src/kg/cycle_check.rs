@@ -274,6 +274,7 @@ mod tests {
         use chrono::Utc;
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),

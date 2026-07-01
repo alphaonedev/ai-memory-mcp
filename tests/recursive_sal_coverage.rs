@@ -27,6 +27,7 @@ const TEST_AGENT: &str = "test-agent-sal-cov";
 fn base_memory(id: &str, namespace: &str, title: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
+        cid: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),

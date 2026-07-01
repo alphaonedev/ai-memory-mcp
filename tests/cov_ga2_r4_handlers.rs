@@ -436,6 +436,7 @@ fn signed_approval_request(pending_id: &str, body: &Value) -> Request<Body> {
 fn mem(id: &str, ns: &str, title: &str, owner: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
+        cid: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: ns.to_string(),

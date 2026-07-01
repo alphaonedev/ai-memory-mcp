@@ -152,6 +152,7 @@ pub async fn register_agent(
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         return match app.store.store(&ctx, &agent_mem).await {
             Ok(id) => (

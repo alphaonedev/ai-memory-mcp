@@ -50,6 +50,83 @@ pub struct VerifyChainArgs {
     /// Include `signed_events` creation entries in the report.
     #[arg(long)]
     pub include_signed_events: bool,
+
+    /// v0.9.0 G8 (#1825) — opt-in fleet-wide content-id (cid) sweep:
+    /// recompute every stamped memory's BLAKE3 address from its stored
+    /// `cid_genesis` pre-image and report matches / mismatches. Detects
+    /// partial corruption of `cid` / `cid_genesis`. Detect-and-log only —
+    /// never mutates or refuses; `AI_MEMORY_CID_ENFORCE=1` raises the log
+    /// level of a mismatch to `WARN`.
+    #[arg(long)]
+    pub cid: bool,
+}
+
+/// v0.9.0 G8 (#1825) — outcome of a fleet-wide cid sweep.
+#[derive(Debug, Serialize)]
+pub struct CidSweepReport {
+    /// Rows carrying a non-NULL `cid` AND `cid_genesis` (i.e. checkable).
+    pub checked: usize,
+    /// Rows whose recomputed BLAKE3 address matched the stored `cid`.
+    pub cid_verified: usize,
+    /// Rows whose recomputed address did NOT match (partial corruption).
+    pub cid_mismatched: usize,
+    /// Rows with a `cid` but a NULL `cid_genesis` (e.g. forgotten rows,
+    /// T7) — unverifiable, reported but not a failure.
+    pub cid_unverifiable: usize,
+    /// Per-mismatch `id: description` detail (capped for output sanity).
+    pub mismatches: Vec<String>,
+}
+
+/// v0.9.0 G8 (#1825) — run the fleet-wide cid sweep. Reads `(id, cid,
+/// cid_genesis)` for every row and verifies each stamped pair. Pure read;
+/// never mutates. A mismatch is logged at `WARN` when
+/// `AI_MEMORY_CID_ENFORCE` is truthy, else at `INFO` — NEVER refused.
+///
+/// # Errors
+///
+/// Propagates the database read error.
+pub fn run_cid_sweep(conn: &Connection) -> Result<CidSweepReport> {
+    let enforce = crate::config::cid_enforce_enabled();
+    let mut stmt =
+        conn.prepare("SELECT id, cid, cid_genesis FROM memories WHERE cid IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<Vec<u8>>>(2)?,
+        ))
+    })?;
+
+    let mut report = CidSweepReport {
+        checked: 0,
+        cid_verified: 0,
+        cid_mismatched: 0,
+        cid_unverifiable: 0,
+        mismatches: Vec::new(),
+    };
+    for row in rows {
+        let (id, cid, genesis) = row?;
+        let (Some(cid), Some(genesis)) = (cid, genesis) else {
+            report.cid_unverifiable += 1;
+            continue;
+        };
+        report.checked += 1;
+        match crate::identity::cid::verify_cid(&cid, &genesis) {
+            Ok(()) => report.cid_verified += 1,
+            Err(mismatch) => {
+                report.cid_mismatched += 1;
+                if report.mismatches.len() < 100 {
+                    report.mismatches.push(format!("{id}: {mismatch}"));
+                }
+                if enforce {
+                    tracing::warn!(target: "cid.enforce", memory_id = %id, "cid mismatch: {mismatch}");
+                } else {
+                    tracing::info!(target: "cid.enforce", memory_id = %id, "cid mismatch (detect-only): {mismatch}");
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -559,6 +636,37 @@ pub fn run(db_path: &Path, args: &VerifyChainArgs, out: &mut CliOutput<'_>) -> R
         writeln!(out.stdout, "{payload}")?;
     } else {
         render_text(&report, out)?;
+        // v0.9.0 G8 (#1825) — per-memory cid_verified line for the root.
+        if let Some(genesis) = crate::db::read_cid_genesis(&conn, &args.memory_id)
+            .ok()
+            .flatten()
+        {
+            if let Some(mem) = crate::db::get(&conn, &args.memory_id).ok().flatten() {
+                if let Some(cid) = mem.cid.as_deref() {
+                    let ok = crate::identity::cid::verify_cid(cid, &genesis).is_ok();
+                    writeln!(out.stdout, "cid_verified:   {ok} ({cid})")?;
+                }
+            }
+        }
+    }
+
+    // v0.9.0 G8 (#1825) — opt-in fleet-wide cid sweep.
+    if args.cid {
+        let sweep = run_cid_sweep(&conn)?;
+        if json {
+            let payload =
+                serde_json::to_string_pretty(&sweep).context("serialise cid sweep report")?;
+            writeln!(out.stdout, "{payload}")?;
+        } else {
+            writeln!(
+                out.stdout,
+                "cid sweep: checked={} verified={} mismatched={} unverifiable={}",
+                sweep.checked, sweep.cid_verified, sweep.cid_mismatched, sweep.cid_unverifiable
+            )?;
+            for m in &sweep.mismatches {
+                writeln!(out.stdout, "  MISMATCH {m}")?;
+            }
+        }
     }
 
     // Exit code mirrors `report.ok`. The predicate is
@@ -1005,6 +1113,7 @@ mod tests {
             memory_id: id,
             format: "json".to_string(),
             include_signed_events: false,
+            cid: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1035,6 +1144,7 @@ mod tests {
             memory_id: d1,
             format: "text".to_string(),
             include_signed_events: false,
+            cid: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1061,6 +1171,7 @@ mod tests {
             memory_id: d1,
             format: "json".to_string(),
             include_signed_events: false,
+            cid: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();
@@ -1083,6 +1194,7 @@ mod tests {
             memory_id: id,
             format: "json".to_string(),
             include_signed_events: true,
+            cid: false,
         };
         let mut stdout = Vec::<u8>::new();
         let mut stderr = Vec::<u8>::new();

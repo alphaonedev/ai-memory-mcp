@@ -285,6 +285,7 @@ mod tests {
 
     fn make_memory(content: &str) -> Memory {
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "team/alpha".to_string(),

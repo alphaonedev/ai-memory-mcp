@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 73).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 74).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -162,10 +162,25 @@ CREATE TABLE IF NOT EXISTS memories (
     -- write boundary by `models::LifecycleState::can_transition_to`,
     -- not a SQL CHECK, so a future state needs no migration. Mirrors
     -- `models::Memory::lifecycle_state`.
-    lifecycle_state       TEXT NOT NULL DEFAULT 'open'
+    lifecycle_state       TEXT NOT NULL DEFAULT 'open',
+    -- v0.9.0 G8 (#1825, schema v74) — additive content-addressed BLAKE3
+    -- content-id for a memory's GENESIS identity. `cid` is the
+    -- `b3:<hex>` address minted from `agent_id + namespace +
+    -- screen(title) + memory_kind + created_at + SHA256(screen(content))`
+    -- and sits ALONGSIDE the UUID `id` (which stays the PK / every FK /
+    -- the federation LWW tiebreak). `cid_genesis` carries the canonical
+    -- pre-image bytes so the verify path recomputes the address without
+    -- re-reading plaintext; it is NULLed on erasure (RecordKind::Forget)
+    -- while `cid` is retained. NULL on legacy rows the v74 backfill
+    -- couldn't stamp. Mirrors `models::Memory::cid`.
+    cid                   TEXT,
+    cid_genesis           BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
+-- #1825 (v74) — content-id lookup index. Also added by migration v74
+-- (file 0058) for upgrading DBs; inline here so a fresh bootstrap has it.
+CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories(cid);
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(priority DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
@@ -718,7 +733,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 73;
+const CURRENT_SCHEMA_VERSION: i64 = 74;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1251,6 +1266,15 @@ const MIGRATION_V72_SQLITE: &str =
 // bytes so their chain links verify unchanged.
 const MIGRATION_V73_SQLITE: &str =
     include_str!("../../migrations/sqlite/0057_v73_signed_events_cause.sql");
+// v74 (#1825, v0.9.0 G8) — additive content-addressed BLAKE3 content-id:
+// the `memories.cid` (TEXT) + `memories.cid_genesis` (BLOB) columns +
+// the `idx_memories_cid` index. SQLite has no `ADD COLUMN IF NOT EXISTS`
+// and adds one column per ALTER, so the v74 ladder arm runs this only
+// behind a column-existence probe (fresh installs inherit the columns
+// inline from the CREATE TABLE in `SCHEMA`). The `cid` backfill for
+// legacy rows runs after the ALTER in the same arm.
+const MIGRATION_V74_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0058_v74_memories_cid.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3046,7 +3070,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V72_SQLITE)?;
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 73 {
             // v73 = #1822 / v0.9.0 G5a (audit cause-binding) — add the
             // additive nullable `signed_events.cause_hash` column. The
             // ALTER lives in the SQL file (Rust-guarded because SQLite
@@ -3077,6 +3101,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v74 = #1825 / v0.9.0 G8 (additive BLAKE3 content-id) — add
+            // the `memories.cid` (TEXT) + `memories.cid_genesis` (BLOB)
+            // columns + `idx_memories_cid`. SQLite lacks `ADD COLUMN IF
+            // NOT EXISTS` and adds one column per ALTER, so the DDL lives
+            // in the SQL file behind a column-existence probe (the v73
+            // pattern) — fresh installs already carry the columns from
+            // the CREATE TABLE, so the probe skips the ALTER. Then
+            // backfill `cid` for legacy genesis rows in the SAME
+            // transaction (the v54 in-code-backfill precedent): the
+            // unconditional version stamp below runs only AFTER the sweep,
+            // so a crash mid-backfill rolls the whole step back and re-runs
+            // cleanly.
+            let has_cid = conn.prepare("SELECT cid FROM memories LIMIT 0").is_ok();
+            if !has_cid {
+                conn.execute_batch(MIGRATION_V74_SQLITE)?;
+            }
+            backfill_memory_cids(conn)?;
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -3095,6 +3139,86 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             Err(e)
         }
     }
+}
+
+/// v0.9.0 G8 (#1825) — backfill the additive `cid` / `cid_genesis`
+/// columns for legacy GENESIS rows during the v74 migration. Runs INSIDE
+/// the migrate transaction (the v54 in-code-backfill precedent), so the
+/// unconditional `schema_version` stamp at the tail of [`migrate`] runs
+/// only AFTER the sweep and a crash mid-backfill rolls the whole v74 step
+/// back and re-runs cleanly.
+///
+/// Scope is DELIBERATELY narrow (do not overclaim breadth):
+///   * `cid IS NULL` — never re-stamp an already-addressed row.
+///   * `version <= 1` — a row re-stored / edited to `version >= 2` no
+///     longer holds its genesis content, so its live plaintext cannot
+///     recover the genesis cid; those stay NULL intentionally.
+///   * no `in_place_edit` archive snapshot — same reason (the live
+///     content diverged from genesis).
+///
+/// Each candidate is re-read through [`super::row_to_memory`] for the
+/// PLAINTEXT content (decrypting a sealed row); a row that fails to
+/// decrypt is SKIPPED (left NULL), never aborting the sweep. Returns the
+/// number of rows stamped.
+///
+/// # Errors
+///
+/// Propagates a SELECT / UPDATE error (a genuine SQL failure — NOT a
+/// per-row decrypt failure, which is swallowed as a skip).
+///
+/// `pub` so the v74 migration test can drive the sweep on a DB whose
+/// legacy rows were NULLed after the ladder already ran. Safe to call
+/// outside a transaction (each per-row UPDATE autocommits); inside the
+/// migrate tx it participates in that tx.
+pub fn backfill_memory_cids(conn: &Connection) -> Result<usize> {
+    // The `in_place_edit` snapshot exclusion needs `archived_memories`; some
+    // fixture DBs (partial-schema migration-ladder tests) don't create it, so
+    // probe first and drop the sub-query when it's absent — a bare
+    // `version <= 1` scan is a strict SUPERSET-safe scope there.
+    let has_archive: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'archived_memories')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    let select_sql = if has_archive {
+        "SELECT m.id FROM memories m \
+         WHERE m.cid IS NULL AND m.version <= 1 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM archived_memories a \
+               WHERE a.id = m.id AND a.archive_reason = 'in_place_edit')"
+    } else {
+        "SELECT m.id FROM memories m WHERE m.cid IS NULL AND m.version <= 1"
+    };
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(select_sql)?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut stamped = 0usize;
+    for id in ids {
+        // Re-read the full row and decrypt via `row_to_memory`; SKIP
+        // (leave NULL) on ANY decrypt failure — a lost/rotated key must
+        // never abort the migration (T5).
+        let mem = {
+            let mut stmt = conn.prepare_cached(super::SQL_SELECT_MEMORY_ROW_BY_ID)?;
+            match stmt.query_row(params![id], super::row_to_memory) {
+                Ok(m) => m,
+                Err(_) => continue,
+            }
+        };
+        let stamp = crate::identity::cid::stamp_memory_cid(&mem);
+        conn.execute(
+            "UPDATE memories SET cid = ?1, cid_genesis = ?2 \
+             WHERE id = ?3 AND cid IS NULL",
+            params![stamp.cid, stamp.genesis, id],
+        )?;
+        stamped += 1;
+    }
+    Ok(stamped)
 }
 
 /// v34 (V-4 closeout, #698) — backfill `prev_hash` + `sequence` on

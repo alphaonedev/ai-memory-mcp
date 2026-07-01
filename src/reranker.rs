@@ -1862,6 +1862,7 @@ mod tests {
 
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
+            cid: None,
             id: "test-id".to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),
@@ -2546,6 +2547,7 @@ mod tests {
         let cands = vec![
             (
                 Memory {
+                    cid: None,
                     id: "a".to_string(),
                     tier: Tier::Mid,
                     namespace: "ns".to_string(),
@@ -2578,6 +2580,7 @@ mod tests {
             ),
             (
                 Memory {
+                    cid: None,
                     id: "b".to_string(),
                     tier: Tier::Mid,
                     namespace: "ns".to_string(),
@@ -2934,6 +2937,7 @@ mod mock_tests {
 
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
+            cid: None,
             id: "test-id".to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),

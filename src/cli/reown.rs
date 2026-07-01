@@ -135,6 +135,7 @@ mod tests {
         let conn = crate::db::open(path).expect("open");
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Long,
             namespace: ns.to_string(),

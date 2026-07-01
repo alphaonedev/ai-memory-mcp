@@ -519,6 +519,7 @@ async fn insert_fixture(
     let now = chrono::Utc::now().to_rfc3339();
     for (i, id) in ids.iter().enumerate() {
         let mem = Memory {
+            cid: None,
             id: id.clone(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),

@@ -194,6 +194,7 @@ pub fn generate_scenarios() -> Vec<Scenario> {
             let j_i64 = i64::try_from(j).expect("OBSERVATIONS_PER_SCENARIO fits in i64");
             let ts = (base - Duration::minutes(j_i64)).to_rfc3339();
             observations.push(Memory {
+                cid: None,
                 // Deterministic id derived from scenario + j so a
                 // re-materialised snapshot is byte-identical.
                 id: format!("{scenario_id}-obs-{j:02}"),

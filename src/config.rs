@@ -4237,6 +4237,31 @@ pub const ENV_COMPACTION_COSINE_THRESHOLD: &str = "AI_MEMORY_COMPACTION_COSINE_T
 /// the compiled default [`crate::secret_screen::SecretScreenMode::Refuse`].
 pub const ENV_SECRET_SCREEN_MODE: &str = "AI_MEMORY_SECRET_SCREEN_MODE";
 
+/// v0.9.0 G8 (#1825) — content-id (cid) enforcement posture. When set to
+/// a truthy token (`1` / `true` / `yes` / `on`, case-insensitive) the
+/// verify + federation-receive paths LOG a `WARN` on a cid mismatch under
+/// the `cid.enforce` target instead of the default `INFO`/detect-only
+/// posture. Enforcement is DETECT-AND-LOG only — it NEVER refuses a
+/// federated write (a receive-time refusal would break CRDT convergence /
+/// capture-first, the same posture as secret-screen REDACT). Unset /
+/// unparseable → detect-and-log default.
+pub const ENV_CID_ENFORCE: &str = "AI_MEMORY_CID_ENFORCE";
+
+/// v0.9.0 G8 (#1825) — whether cid-mismatch ENFORCE logging is enabled
+/// (see [`ENV_CID_ENFORCE`]). Reads the env var directly (no boot-seeded
+/// global — the verify/federation paths are already env-aware). DETECT-
+/// AND-LOG only; NEVER refuses a write regardless of this flag.
+#[must_use]
+pub fn cid_enforce_enabled() -> bool {
+    std::env::var(ENV_CID_ENFORCE)
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 /// v0.8.1 W1 (#1821 / gap G29) — the `[security]` config block.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {

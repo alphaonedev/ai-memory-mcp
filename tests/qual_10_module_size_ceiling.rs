@@ -263,7 +263,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `conserve_contradiction` + `reverse_conserve_contradiction` non-destructive
     // contradiction-conserve primitives (transaction-wrapped, doc-heavy) and the
     // shared `SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID` SSOT const.
-    ("src/storage/mod.rs", 21_800),
+    // 2026-07-01 (#1825 G8) — bumped 21_800 → 21_900: the additive
+    // BLAKE3 content-id genesis stamping (insert/insert_if_newer/
+    // consolidate/restore) + verify + T7 scrub pushed the file to 21_880.
+    ("src/storage/mod.rs", 21_900),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -600,7 +603,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `pg_emit_audit_head_witness_in_tx` + `pg_read_revision_head_in_tx`
     // dual-chain emitter (item 6), and the `verify_audit_trail` twin (item 10 /
     // K3) that surfaces identical WitnessCheck/CauseBinding verdicts.
-    ("src/store/postgres.rs", 23_450),
+    // 2026-07-01 (#1825 G8) — bumped 23_450 → 23_800: cid stamping across
+    // ~10 postgres genesis INSERTs + migrate_v74 + backfill + verify +
+    // T7 scrub pushed the file to 23_748.
+    ("src/store/postgres.rs", 23_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -882,7 +888,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-23 (#1771) — bumped 4_500 → 4_600 (lockstep): the v70
     // `archived_memory_links` migration arm + bootstrap-SCHEMA CREATE landed
     // it at 4_560.
-    ("src/storage/migrations.rs", 4_700),
+    // 2026-07-01 (#1825 G8) — bumped 4_700 → 4_850: the v74 ladder arm +
+    // MIGRATION_V74_SQLITE + backfill_memory_cids pushed the file to 4_816.
+    ("src/storage/migrations.rs", 4_850),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

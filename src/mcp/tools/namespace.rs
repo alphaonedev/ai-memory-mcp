@@ -639,6 +639,7 @@ mod tests {
     fn insert_one(conn: &rusqlite::Connection, ns: &str, title: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -673,6 +674,7 @@ mod tests {
     fn insert_owned(conn: &rusqlite::Connection, ns: &str, title: &str, owner: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),

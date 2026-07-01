@@ -215,6 +215,14 @@ const MIGRATION_V72_MEMORY_REVISIONS: &str =
 const MIGRATION_V73_SIGNED_EVENTS_CAUSE: &str =
     include_str!("../../migrations/postgres/0032_v07_signed_events_cause.sql");
 
+/// v74 (#1825, v0.9.0 G8) — additive content-addressed BLAKE3 content-id:
+/// the `memories.cid` (TEXT) + `memories.cid_genesis` (BYTEA) columns +
+/// `idx_memories_cid` (postgres mirror of the sqlite v74 arm). Postgres
+/// supports `ADD COLUMN IF NOT EXISTS`, so the DDL is a single idempotent
+/// batch; the `cid` backfill for legacy rows runs in `migrate_v74`.
+const MIGRATION_V74_MEMORIES_CID: &str =
+    include_str!("../../migrations/postgres/0033_v74_memories_cid.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -558,7 +566,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 73;
+const CURRENT_SCHEMA_VERSION: i32 = 74;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1419,8 +1427,11 @@ impl PostgresStore {
         if current_version < 72 {
             self.migrate_v72().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 73 {
             self.migrate_v73().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v74().await?;
         }
 
         Ok(())
@@ -3489,7 +3500,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("apply v73 signed_events cause", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 73).await?;
 
         tx.commit()
             .await
@@ -3501,6 +3512,138 @@ impl PostgresStore {
              audit cause-binding)"
         );
         Ok(())
+    }
+
+    /// v74 (#1825, v0.9.0 G8) — additive content-addressed BLAKE3
+    /// content-id: add the `memories.cid` (TEXT) + `memories.cid_genesis`
+    /// (BYTEA) columns + `idx_memories_cid`, then backfill `cid` for legacy
+    /// genesis rows. Idempotent `ADD COLUMN IF NOT EXISTS` DDL; fresh
+    /// installs already carry the columns from `postgres_schema.sql`.
+    ///
+    /// The backfill is chunked and runs in `version <= 1` genesis rows with
+    /// no `in_place_edit` archive snapshot (mirrors the sqlite v74
+    /// backfill); a row whose sealed content cannot be decrypted is SKIPPED
+    /// (left NULL), never aborting the migration. `record_schema_version`
+    /// runs ONLY after the sweep completes.
+    async fn migrate_v74(&self) -> StoreResult<()> {
+        // 1. Additive DDL in its own tx.
+        {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("begin v74 ddl tx", e))?;
+            sqlx::raw_sql(MIGRATION_V74_MEMORIES_CID)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply v74 memories cid", e))?;
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("commit v74 ddl", e))?;
+        }
+
+        // 2. Chunked backfill (tx-per-chunk). `set_embeddings_batch` shape.
+        let stamped = self.backfill_memory_cids().await?;
+
+        // 3. Stamp the schema version ONLY after the sweep.
+        {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("begin v74 stamp tx", e))?;
+            record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("commit v74 stamp", e))?;
+        }
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            stamped,
+            "schema migration v74 applied (#1825: memories.cid / cid_genesis — \
+             additive BLAKE3 content-id; backfilled {stamped} legacy genesis rows)"
+        );
+        Ok(())
+    }
+
+    /// v0.9.0 G8 (#1825) T5 — backfill the additive `cid` / `cid_genesis`
+    /// columns for legacy GENESIS rows during the v74 migration (postgres
+    /// twin of `crate::storage::migrations::backfill_memory_cids`). Chunked
+    /// with a transaction per chunk (the `set_embeddings_batch` shape).
+    ///
+    /// Scope mirrors the sqlite sweep EXACTLY:
+    ///   * `cid IS NULL` — never re-stamp an already-addressed row.
+    ///   * `version <= 1` — a row re-stored / edited to `version >= 2` no
+    ///     longer holds its genesis content, so its live plaintext cannot
+    ///     recover the genesis cid; those stay NULL intentionally.
+    ///   * no `in_place_edit` archive snapshot — same reason.
+    ///
+    /// Each candidate is re-read through [`Self::row_to_memory`] for the
+    /// PLAINTEXT content (decrypting a sealed row); a row that fails to load
+    /// or decrypt is SKIPPED (left NULL), never aborting the sweep.
+    /// `record_schema_version` is the CALLER's job (`migrate_v74`), NOT this
+    /// method's. Returns the number of rows stamped.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a genuine SQL failure (SELECT / UPDATE / tx) — NOT a
+    /// per-row decrypt failure, which is swallowed as a skip.
+    async fn backfill_memory_cids(&self) -> StoreResult<usize> {
+        // Rows stamped per transaction (chunked, tx-per-chunk).
+        const CHUNK: usize = 500;
+
+        // Snapshot the candidate id set up-front; the per-row UPDATE below
+        // re-checks `cid IS NULL` so a concurrent stamp can't double-write.
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT m.id FROM memories m \
+             WHERE m.cid IS NULL AND m.version <= 1 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM archived_memories a \
+                   WHERE a.id = m.id AND a.archive_reason = 'in_place_edit')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("backfill_memory_cids select", e))?;
+
+        let mut stamped = 0usize;
+        for chunk in ids.chunks(CHUNK) {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| to_store_err("begin backfill_memory_cids tx", e))?;
+            for id in chunk {
+                // Re-read + decrypt via `row_to_memory` on the SAME tx
+                // connection; SKIP (leave NULL) on ANY load/decrypt failure —
+                // a lost/rotated key must never abort the migration (T5).
+                let row = sqlx::query(SQL_SELECT_MEMORY_ROW_BY_ID)
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("backfill_memory_cids read row", e))?;
+                let Some(row) = row else { continue };
+                let Ok(mem) = Self::row_to_memory(&row) else {
+                    continue;
+                };
+                let stamp = crate::identity::cid::stamp_memory_cid(&mem);
+                sqlx::query(
+                    "UPDATE memories SET cid = $1, cid_genesis = $2 \
+                     WHERE id = $3 AND cid IS NULL",
+                )
+                .bind(&stamp.cid)
+                .bind(&stamp.genesis)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("backfill_memory_cids update", e))?;
+                stamped += 1;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| to_store_err("commit backfill_memory_cids tx", e))?;
+        }
+        Ok(stamped)
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -4240,6 +4383,7 @@ impl PostgresStore {
             confidence_decayed_at: existing.confidence_decayed_at.clone(),
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -4327,6 +4471,9 @@ impl PostgresStore {
         // Tier-default expiry backfill (#1466 parity with the sqlite
         // `storage::insert` chokepoint the twin routes through).
         let new_expires_dt = parse_rfc3339_opt(candidate.effective_expires_at().as_deref());
+        // v0.9.0 G8 (#1825) — the supersede mints a NEW genesis row, so it
+        // stamps its own content-id from the (plaintext) candidate identity.
+        let supersede_cid = crate::identity::cid::stamp_memory_cid(&candidate);
         sqlx::query(
             "INSERT INTO memories
                 (id, tier, namespace, title, content, tags, priority, confidence,
@@ -4334,12 +4481,12 @@ impl PostgresStore {
                  expires_at, metadata, reflection_depth, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version)
+                 mentioned_entity_id, version, cid, cid_genesis)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, NOW(), NOW(), NULL,
                      $10, $11, $12, $13,
                      $14, $15, $16, $17, $18,
                      $19, $20, $21,
-                     $22, 1)",
+                     $22, 1, $23, $24)",
         )
         .bind(&new_id)
         .bind(new_tier.as_str())
@@ -4367,6 +4514,8 @@ impl PostgresStore {
         .bind(confidence_signals_json.as_deref())
         .bind(candidate.confidence_decayed_at.as_deref())
         .bind(mentioned_entity_id.as_deref())
+        .bind(&supersede_cid.cid)
+        .bind(&supersede_cid.genesis)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert new on supersede", e))?;
@@ -8033,6 +8182,10 @@ impl PostgresStore {
                 .ok()
                 .and_then(|s| crate::models::LifecycleState::from_str(&s))
                 .unwrap_or_default(),
+            // v0.9.0 G8 (#1825) — read the v74 additive content-id. `None`
+            // on pre-v74 rows (column absent) and rows the backfill left
+            // NULL. `cid_genesis` is read on demand by the verify path only.
+            cid: row.try_get::<Option<String>, _>(field_names::CID).unwrap_or(None),
         };
 
         // #228 Commit B — at-rest content decryption (postgres parity).
@@ -8340,6 +8493,7 @@ impl PostgresStore {
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         if let Err(e) = consult_governance_pre_write_pg(&candidate) {
             // Map `StoreError::PermissionDenied` (the canonical refusal
@@ -8374,13 +8528,21 @@ impl PostgresStore {
         // postgres adapter to parity.
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(&candidate);
 
+        // v0.9.0 G8 (#1825) — a reflection is a fresh genesis, so it stamps
+        // its own content-id from the (plaintext) candidate identity. OMITTED
+        // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
+        // own genesis cid.
+        let reflect_cid = crate::identity::cid::stamp_memory_cid(&candidate);
+
         // Insert the reflection memory inside the tx.
         let actual_id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
-                expires_at, metadata, reflection_depth, memory_kind, mentioned_entity_id
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16)
+                expires_at, metadata, reflection_depth, memory_kind, mentioned_entity_id,
+                cid, cid_genesis
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL, NULL, $13, $14, $15, $16,
+                      $17, $18)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -8427,6 +8589,8 @@ impl PostgresStore {
         .bind(new_depth_i32)
         .bind(crate::models::MemoryKind::Reflection.as_str())
         .bind(mentioned_entity_id.as_deref())
+        .bind(&reflect_cid.cid)
+        .bind(&reflect_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ReflectError::Database(format!("insert reflection memory: {e}")))?
@@ -11096,6 +11260,11 @@ impl MemoryStore for PostgresStore {
             .map_or(memory.content.as_str(), |(_, ph)| ph.as_str());
         let store_encrypted_envelope: Option<&[u8]> =
             store_sealed.as_ref().map(|(env, _)| env.as_slice());
+        // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
+        // genesis identity (never the ciphertext placeholder). OMITTED from
+        // the DO UPDATE SET below so a surviving upsert-merge row keeps its
+        // own genesis cid.
+        let store_cid = crate::identity::cid::stamp_memory_cid(memory);
 
         let id: String = sqlx::query(
             "INSERT INTO memories (
@@ -11105,12 +11274,13 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state, encrypted_envelope
+                mentioned_entity_id, lifecycle_state, encrypted_envelope,
+                cid, cid_genesis
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26, $27, $28)
+                      $26, $27, $28, $29, $30)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #228 Commit B — content + envelope move together on upsert
@@ -11224,6 +11394,8 @@ impl MemoryStore for PostgresStore {
         .bind(mentioned_entity_id.as_deref())
         .bind(memory.lifecycle_state.as_str())
         .bind(store_encrypted_envelope)
+        .bind(&store_cid.cid)
+        .bind(&store_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -11333,7 +11505,8 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
-                mentioned_entity_id, lifecycle_state
+                mentioned_entity_id, lifecycle_state,
+                cid, cid_genesis
             ) ",
         );
 
@@ -11404,6 +11577,10 @@ impl MemoryStore for PostgresStore {
                 None => None,
             };
             let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+            // v0.9.0 G8 (#1825) — per-row genesis content-id from the
+            // (plaintext) memory identity. OMITTED from the DO UPDATE SET
+            // below so a surviving upsert-merge row keeps its own genesis cid.
+            let batch_cid = crate::identity::cid::stamp_memory_cid(memory);
 
             row.push_bind(memory.id.clone())
                 .push_bind(memory.tier.as_str().to_string())
@@ -11433,7 +11610,11 @@ impl MemoryStore for PostgresStore {
                 .push_bind(memory.persona_version)
                 .push_bind(mentioned_entity_id)
                 // v0.8.0 Pillar 2 (#1709) — lifecycle_state parity with `store()`.
-                .push_bind(memory.lifecycle_state.as_str().to_string());
+                .push_bind(memory.lifecycle_state.as_str().to_string())
+                // v0.9.0 G8 (#1825) — genesis content-id pair (positional
+                // order matches the `cid, cid_genesis` column tail above).
+                .push_bind(batch_cid.cid)
+                .push_bind(batch_cid.genesis);
         });
         if let Some(e) = push_err {
             return Err(e);
@@ -11488,6 +11669,8 @@ impl MemoryStore for PostgresStore {
                 -- v0.8.0 Pillar 2 (#1709) — lifecycle_state preserved on
                 -- re-store (sqlite parity).
                 lifecycle_state = memories.lifecycle_state,
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
+                -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id, title, namespace",
@@ -11651,6 +11834,12 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin capture_turn tx", e))?;
 
+        // v0.9.0 G8 (#1825) — the L4 capture mints a genesis row, so it stamps
+        // its own content-id from the (plaintext) memory identity. OMITTED
+        // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
+        // own genesis cid.
+        let capture_cid = crate::identity::cid::stamp_memory_cid(memory);
+
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -11658,11 +11847,11 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id
+                mentioned_entity_id, cid, cid_genesis
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24)
+                      $24, $25, $26)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -11706,6 +11895,8 @@ impl MemoryStore for PostgresStore {
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
+                -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id",
@@ -11734,6 +11925,8 @@ impl MemoryStore for PostgresStore {
         .bind(confidence_signals_json.as_deref())
         .bind(memory.confidence_decayed_at.as_deref())
         .bind(mentioned_entity_id.as_deref())
+        .bind(&capture_cid.cid)
+        .bind(&capture_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("capture_turn insert memory", e))?
@@ -11883,6 +12076,12 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("begin recover_turn tx", e))?;
 
+        // v0.9.0 G8 (#1825) — the L2 recovery mints a genesis row, so it
+        // stamps its own content-id from the (plaintext) memory identity.
+        // OMITTED from the DO UPDATE SET below: a surviving upsert-merge row
+        // keeps its own genesis cid.
+        let recover_cid = crate::identity::cid::stamp_memory_cid(memory);
+
         let inserted_id: String = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -11890,11 +12089,11 @@ impl MemoryStore for PostgresStore {
                 expires_at, metadata, reflection_depth, memory_kind,
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id
+                mentioned_entity_id, cid, cid_genesis
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
-                      $24)
+                      $24, $25, $26)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -11936,6 +12135,8 @@ impl MemoryStore for PostgresStore {
                 confidence_signals = COALESCE(EXCLUDED.confidence_signals, memories.confidence_signals),
                 confidence_decayed_at = COALESCE(EXCLUDED.confidence_decayed_at, memories.confidence_decayed_at),
                 mentioned_entity_id = COALESCE(EXCLUDED.mentioned_entity_id, memories.mentioned_entity_id),
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
+                -- SET: surviving row keeps its genesis.
                 version = memories.version + 1
             RETURNING id",
         )
@@ -11963,6 +12164,8 @@ impl MemoryStore for PostgresStore {
         .bind(confidence_signals_json.as_deref())
         .bind(memory.confidence_decayed_at.as_deref())
         .bind(mentioned_entity_id.as_deref())
+        .bind(&recover_cid.cid)
+        .bind(&recover_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("recover_turn insert memory", e))?
@@ -12097,6 +12300,11 @@ impl MemoryStore for PostgresStore {
         // `store_with_embedding` (the recall-hybrid hot path) must
         // still light up the `mentioned_entity_id` partial index.
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+        // v0.9.0 G8 (#1825) — the embed-before-store hot path mints a genesis
+        // row, so it stamps its own content-id from the (plaintext) memory
+        // identity. OMITTED from the DO UPDATE SET below: a surviving
+        // upsert-merge row keeps its own genesis cid.
+        let embed_cid = crate::identity::cid::stamp_memory_cid(memory);
 
         let id: String = sqlx::query(
             "INSERT INTO memories (
@@ -12106,12 +12314,13 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, embedding,
-                mentioned_entity_id, lifecycle_state
+                mentioned_entity_id, lifecycle_state,
+                cid, cid_genesis
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25, $26,
-                      $27, $28)
+                      $27, $28, $29, $30)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 tier = CASE
@@ -12168,6 +12377,8 @@ impl MemoryStore for PostgresStore {
                 -- re-store (sqlite parity); advances go through the typed
                 -- update gate.
                 lifecycle_state = memories.lifecycle_state,
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
+                -- SET: surviving row keeps its genesis.
                 -- #1632 (pg twin) — upsert-merge bumps the Gap-1 counter.
                 version = memories.version + 1
             RETURNING id",
@@ -12200,6 +12411,8 @@ impl MemoryStore for PostgresStore {
         .bind(emb_pgvec)
         .bind(mentioned_entity_id.as_deref())
         .bind(memory.lifecycle_state.as_str())
+        .bind(&embed_cid.cid)
+        .bind(&embed_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_with_embedding", e))?
@@ -12988,6 +13201,19 @@ impl MemoryStore for PostgresStore {
         // a malformed created_at is now a FINDING (parity with sqlite)
         // instead of a postgres-only IntegrityFailed hard error.
         let findings = super::integrity_findings(&mem);
+        // v0.9.0 G8 (#1825) — when the row carries a `cid`, load its
+        // storage-internal `cid_genesis` pre-image and verify the BLAKE3
+        // address (partial-corruption detection). `None` when unstamped or
+        // when the pre-image was erased on forget (T7).
+        let genesis: Option<Vec<u8>> = sqlx::query_scalar::<_, Option<Vec<u8>>>(
+            "SELECT cid_genesis FROM memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("verify read cid_genesis", e))?;
+        let (cid_ok, cid_mismatch) =
+            crate::store::cid_verify_fields(mem.cid.as_deref(), genesis.as_deref());
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),
@@ -12995,6 +13221,8 @@ impl MemoryStore for PostgresStore {
             // v0.6.0 does NOT perform signature verification; real
             // cryptographic verify lands with Task 1.4. See #302.
             signature_verified: false,
+            cid_ok,
+            cid_mismatch,
         })
     }
 
@@ -13312,6 +13540,13 @@ impl MemoryStore for PostgresStore {
         // receiver — a silent loss of persona-generation coverage on
         // multi-peer deployments.
         let mentioned_entity_id = crate::storage::extract_mentioned_entity_id(memory);
+        // v0.9.0 G8 (#1825) — federation RECEIVE genesis. The cid is a
+        // deterministic mode-independent function of the genesis fields, so
+        // recomputing locally from the inbound PLAINTEXT yields the SAME cid
+        // the origin minted (receive-time equivalence). OMITTED from the DO
+        // UPDATE SET below so an existing local row keeps its own genesis cid
+        // on a federation-merge.
+        let remote_cid = crate::identity::cid::stamp_memory_cid(memory);
         let row = sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
@@ -13320,11 +13555,12 @@ impl MemoryStore for PostgresStore {
                 citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
-                mentioned_entity_id, lifecycle_state
+                mentioned_entity_id, lifecycle_state,
+                cid, cid_genesis
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28
+                $27, $28, $29, $30
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -13467,6 +13703,9 @@ impl MemoryStore for PostgresStore {
                         THEN EXCLUDED.lifecycle_state
                     ELSE memories.lifecycle_state
                 END
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
+                -- SET: the surviving local row keeps its genesis cid on a
+                -- federation-merge (preserves the local genesis pre-image).
             RETURNING id",
         )
         .bind(&memory.id)
@@ -13497,6 +13736,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.version)
         .bind(mentioned_entity_id.as_deref())
         .bind(memory.lifecycle_state.as_str())
+        .bind(&remote_cid.cid)
+        .bind(&remote_cid.genesis)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -14472,6 +14713,7 @@ impl MemoryStore for PostgresStore {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -14795,6 +15037,29 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("forget snapshot links", e))?;
 
+        // v0.9.0 G8 (#1825) T7 — erasure invariant (postgres parity/defence):
+        // NULL the `cid_genesis` pre-image for every row this forget will
+        // reap, BEFORE the delete, mirroring the sqlite `forget_scrub_cid_genesis`.
+        // The DELETE below hard-deletes the row so this scrub is belt-and-braces
+        // (a rollback discards both); it keeps the erase-the-pre-image contract
+        // explicit and correct should this path ever become a soft-delete. The
+        // predicate matches the DELETE's victim set EXACTLY.
+        sqlx::query(
+            "UPDATE memories SET cid_genesis = NULL
+             WHERE cid_genesis IS NOT NULL
+               AND ($1::text IS NULL OR namespace = $1)
+               AND ($2::text IS NULL OR tier = $2)
+               AND ($3::text IS NULL
+                    OR title ILIKE $3
+                    OR content ILIKE $3)",
+        )
+        .bind(namespace)
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
+
         // #1783 — RETURNING id so the deleted set is known for AGE
         // unprojection in THIS tx (the projection commits atomically with
         // the cascade delete; ghost edges never appear).
@@ -15078,6 +15343,7 @@ impl MemoryStore for PostgresStore {
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -15102,12 +15368,18 @@ impl MemoryStore for PostgresStore {
         // consolidations keep NULL (long has no TTL). The UPSERT branch
         // intentionally has no `expires_at` SET clause (keep the existing
         // row's expiry — same convention as `reflection_depth` below).
+        // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so it
+        // mints its own content-id from the (plaintext) summary + candidate
+        // identity (mirrors the sqlite `storage::consolidate` stamp). OMITTED
+        // from the DO UPDATE SET below: a surviving upsert-merge row keeps its
+        // own genesis cid.
+        let consolidate_cid = crate::identity::cid::stamp_memory_cid(&candidate);
         let inserted_id: String = sqlx::query_scalar(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, expires_at, metadata,
-                confidence_source
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13)
+                confidence_source, cid, cid_genesis
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, 1.0, $8, $9, $10, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 tier = CASE
                     WHEN tier_rank(EXCLUDED.tier) >= tier_rank(memories.tier)
@@ -15134,6 +15406,8 @@ impl MemoryStore for PostgresStore {
                 -- consolidate path mints a fresh memory and the DB column
                 -- DEFAULT 0 applies. The UPSERT branch preserves the
                 -- existing row's reflection_depth (no SET clause = keep).
+                -- v0.9.0 G8 (#1825) — cid/cid_genesis likewise OMITTED from
+                -- DO UPDATE SET: surviving row keeps its genesis.
             RETURNING id",
         )
         .bind(&new_id)
@@ -15155,6 +15429,8 @@ impl MemoryStore for PostgresStore {
         .bind(&merged_metadata_value)
         // #1633 — $13: honest engine provenance for the pinned 1.0.
         .bind(candidate.confidence_source.as_str())
+        .bind(&consolidate_cid.cid)
+        .bind(&consolidate_cid.genesis)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("consolidate upsert", e))?;
@@ -16702,6 +16978,43 @@ impl MemoryStore for PostgresStore {
         let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
         consult_governance_pre_write_pg(&candidate)?;
 
+        // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
+        // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
+        // archived envelope when present, falling back to the stored content
+        // on any decrypt error) so the restored live row carries the same
+        // `b3:` address it held before archival. created_at / title /
+        // namespace / kind are the ORIGINAL archived values (via `candidate`),
+        // NOT NOW(). Mirrors the sqlite `restored_cid_stamp` path.
+        let restored_cid = {
+            let agent_id = candidate
+                .metadata
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (raw_content, envelope): (String, Option<Vec<u8>>) = sqlx::query_as(
+                "SELECT content, encrypted_envelope FROM archived_memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("archive_restore load plaintext for cid", e))?;
+            let plaintext = match envelope {
+                Some(env) => {
+                    crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content)
+                }
+                None => raw_content,
+            };
+            crate::identity::cid::stamp_cid(
+                &agent_id,
+                &candidate.namespace,
+                &candidate.title,
+                candidate.memory_kind.as_str(),
+                &candidate.created_at,
+                &plaintext,
+            )
+        };
+
         let now = chrono::Utc::now();
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
         // archive→restore. Pre-#1025 the SELECT pulled only 17 columns
@@ -16719,7 +17032,8 @@ impl MemoryStore for PostgresStore {
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
-                mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
+                cid, cid_genesis
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -16737,11 +17051,14 @@ impl MemoryStore for PostgresStore {
                    mentioned_entity_id,
                    COALESCE(version, 1),
                    COALESCE(lifecycle_state, 'open'),
-                   encrypted_envelope
+                   encrypted_envelope,
+                   $3::text, $4::bytea
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
         .bind(id)
+        .bind(&restored_cid.cid)
+        .bind(&restored_cid.genesis)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("archive_restore insert", e))?;
@@ -17055,6 +17372,7 @@ impl MemoryStore for PostgresStore {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         self.store(ctx, &mem).await
     }
@@ -19327,6 +19645,7 @@ impl MemoryStore for PostgresStore {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         let written_id = self.store(ctx, &mem).await?;
         let created = prior.is_none();
@@ -21061,6 +21380,7 @@ mod tests {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         }
     }
 
@@ -21788,18 +22108,32 @@ mod tests {
             "agent_id": owner,
             "governance": policy_json,
         });
+        // v0.9.0 G8 (#1825) — the seeded standard is a genesis row, so it
+        // stamps its own content-id from the seeded identity fields (kind is
+        // the DB DEFAULT 'observation'; content is the literal 'standard').
+        let standard_cid = crate::identity::cid::stamp_cid(
+            owner,
+            namespace,
+            &format!("standard:{namespace}"),
+            crate::models::MemoryKind::Observation.as_str(),
+            &now.to_rfc3339(),
+            "standard",
+        );
         sqlx::query(
             "INSERT INTO memories (
                 id, tier, namespace, title, content, tags, priority, confidence,
-                source, access_count, created_at, updated_at, metadata
+                source, access_count, created_at, updated_at, metadata,
+                cid, cid_genesis
             ) VALUES ($1, 'long', $2, $3, 'standard', '[]'::jsonb, 5, 1.0,
-                      'test', 0, $4, $4, $5)",
+                      'test', 0, $4, $4, $5, $6, $7)",
         )
         .bind(&standard_id)
         .bind(namespace)
         .bind(format!("standard:{namespace}"))
         .bind(now)
         .bind(&metadata)
+        .bind(&standard_cid.cid)
+        .bind(&standard_cid.genesis)
         .execute(pool)
         .await
         .expect("seed standard memory");

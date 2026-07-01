@@ -200,6 +200,14 @@ CREATE TABLE IF NOT EXISTS memories (
     -- column lands at v68 — fresh schemas carry it inline here, existing
     -- schemas pick it up via migrate_v68().
     encrypted_envelope    BYTEA,
+    -- v0.9.0 G8 (schema v74, #1825) — additive, content-addressed BLAKE3
+    -- content-id for the GENESIS identity. `cid` is the `b3:<hex>` address
+    -- (a second name ALONGSIDE the UUID `id`); `cid_genesis` is the canonical
+    -- pre-image, read on demand by verify and NULLed on erasure (Forget)
+    -- while `cid` is retained. Fresh schemas carry them inline here; existing
+    -- schemas pick them up via migrate_v74().
+    cid                   TEXT,
+    cid_genesis           BYTEA,
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -245,6 +253,9 @@ CREATE INDEX IF NOT EXISTS idx_memories_embedding_dim
 CREATE INDEX IF NOT EXISTS idx_memories_ns_dim
     ON memories (namespace, embedding_dim)
     WHERE embedding_dim IS NOT NULL;
+-- v0.9.0 G8 (schema v74, #1825) — content-address lookup on the additive
+-- `cid` column (postgres mirror of the sqlite idx_memories_cid arm).
+CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories (cid);
 -- Partial indexes that reference columns ALTER-added by the migrate
 -- ladder (`atom_of` / `atomised_into` v35 postgres ↔ v36 sqlite;
 -- `entity_id` v36 ↔ v37; `source_uri` v37 ↔ v38; `confidence_source`

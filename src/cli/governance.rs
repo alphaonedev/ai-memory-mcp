@@ -201,6 +201,7 @@ mod tests {
             );
         }
         let standard = models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: models::Tier::Long,
             namespace: format!("_standards-{namespace}"),

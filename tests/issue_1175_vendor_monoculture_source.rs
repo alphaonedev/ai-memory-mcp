@@ -115,6 +115,7 @@ const FORBIDDEN_VENDOR_DEFAULTS: &[&str] = &[
 fn seed_observation(conn: &Connection, namespace: &str, title: &str) -> String {
     let now = Utc::now().to_rfc3339();
     let mem = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),
@@ -374,6 +375,7 @@ fn caller_can_still_pass_legacy_claude_source_for_back_compat() {
     // to confirm the storage layer doesn't reject it.
     let now = Utc::now().to_rfc3339();
     let mem = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: NS_STORE.to_string(),

@@ -98,6 +98,7 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
 
     let shared_id = uuid::Uuid::new_v4().to_string();
     let shared = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: shared_id.clone(),
         tier: source.tier,
         namespace: target_namespace.clone(),
@@ -214,6 +215,7 @@ mod tests {
     fn make_mem(title: &str, namespace: &str, agent_id: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),

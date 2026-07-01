@@ -409,6 +409,30 @@ pub fn integrity_findings(mem: &Memory) -> Vec<String> {
     findings
 }
 
+/// v0.9.0 G8 (#1825) — resolve the `(cid_ok, cid_mismatch)` pair for a
+/// [`VerifyReport`] from a row's stored `cid` + its on-demand `cid_genesis`
+/// pre-image. Shared by BOTH adapters so the report is identical for
+/// identical rows.
+///
+/// * `cid IS NULL` OR `cid_genesis IS NULL` → `(None, None)` — no check
+///   ran (a legacy/unstamped row, or a forgotten row whose pre-image was
+///   erased while the `cid` was retained, T7).
+/// * present pair → `verify_cid`: `(Some(true), None)` on match,
+///   `(Some(false), Some(description))` on a partial-corruption mismatch.
+#[must_use]
+pub fn cid_verify_fields(
+    cid: Option<&str>,
+    genesis: Option<&[u8]>,
+) -> (Option<bool>, Option<String>) {
+    match (cid, genesis) {
+        (Some(cid), Some(genesis)) => match crate::identity::cid::verify_cid(cid, genesis) {
+            Ok(()) => (Some(true), None),
+            Err(mismatch) => (Some(false), Some(mismatch.to_string())),
+        },
+        _ => (None, None),
+    }
+}
+
 /// Identity + visibility + governance context threaded through every
 /// mutating operation. Reuses the NHI-hardened `agent_id` from the
 /// existing `crate::identity` resolution chain.
@@ -3229,6 +3253,18 @@ pub struct VerifyReport {
     /// True iff the adapter performed a real cryptographic signature
     /// verification. Always false pre-Task-1.4.
     pub signature_verified: bool,
+    /// v0.9.0 G8 (#1825) — `Some(true)` when the row's `cid` was verified
+    /// against its stored `cid_genesis` pre-image and matched; `Some(false)`
+    /// when the recomputed BLAKE3 address did NOT match (partial corruption
+    /// of `cid` or `cid_genesis`); `None` when no cid check ran (`cid IS
+    /// NULL`, or `cid_genesis IS NULL` — e.g. a forgotten row's erased
+    /// pre-image). This is PARTIAL-corruption detection only, NOT
+    /// at-rest forgery-evidence (a consistent re-forge of both columns
+    /// passes — see [`crate::identity::cid`]).
+    pub cid_ok: Option<bool>,
+    /// v0.9.0 G8 (#1825) — a human-readable `stored … recomputed …`
+    /// description when `cid_ok == Some(false)`, else `None`.
+    pub cid_mismatch: Option<String>,
 }
 
 /// v0.7.0 Continuation 6 — filter shape for [`MemoryStore::verify_link`].
@@ -3518,6 +3554,7 @@ mod tests {
 
     fn dummy_memory(id: &str) -> Memory {
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "mock".to_string(),
@@ -3591,6 +3628,8 @@ mod tests {
                 integrity_ok: true,
                 findings: vec![],
                 signature_verified: false,
+                cid_ok: None,
+                cid_mismatch: None,
             })
         }
         async fn link(&self, _ctx: &CallerContext, _link: &MemoryLink) -> StoreResult<()> {
@@ -3832,6 +3871,8 @@ mod tests {
                     integrity_ok: true,
                     findings: vec![],
                     signature_verified: false,
+                    cid_ok: None,
+                    cid_mismatch: None,
                 })
             }
             async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
@@ -4135,6 +4176,8 @@ mod tests {
             integrity_ok: true,
             findings: vec!["finding".to_string()],
             signature_verified: false,
+            cid_ok: None,
+            cid_mismatch: None,
         };
         assert_eq!(r.memory_id, "id");
         assert!(r.integrity_ok);
@@ -4430,6 +4473,8 @@ mod tests {
                 integrity_ok: true,
                 findings: vec![],
                 signature_verified: false,
+                cid_ok: None,
+                cid_mismatch: None,
             })
         }
         async fn link(&self, _: &CallerContext, _: &MemoryLink) -> StoreResult<()> {
@@ -4626,6 +4671,8 @@ mod tests {
                 integrity_ok: true,
                 findings: Vec::new(),
                 signature_verified: false,
+                cid_ok: None,
+                cid_mismatch: None,
             })
         }
 
@@ -4785,6 +4832,8 @@ mod tests {
             integrity_ok: true,
             findings: vec!["structural check only".to_string()],
             signature_verified: false,
+            cid_ok: None,
+            cid_mismatch: None,
         };
         let cloned = report.clone();
         assert!(cloned.integrity_ok);

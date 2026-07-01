@@ -223,6 +223,7 @@ pub fn run(
     };
 
     let mut mem = models::Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace,
