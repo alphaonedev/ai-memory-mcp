@@ -141,6 +141,7 @@ mod tests {
     fn make_mem(title: &str, namespace: &str, kind: MemoryKind) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),

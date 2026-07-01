@@ -352,6 +352,7 @@ mod tests {
             metadata["entity_id"] = serde_json::Value::String(eid.to_string());
         }
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),

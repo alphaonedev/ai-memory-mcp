@@ -775,6 +775,7 @@ mod tests {
             obj.insert("governance".to_string(), policy);
         }
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Long,
             namespace: namespace.to_string(),

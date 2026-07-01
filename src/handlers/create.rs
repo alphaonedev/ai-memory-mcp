@@ -752,6 +752,7 @@ async fn create_memory_postgres(
         confidence_decayed_at: None,
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
+        cid: None,
     };
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
@@ -1158,6 +1159,7 @@ pub async fn create_memory(
     }
 
     let mut mem = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: Uuid::new_v4().to_string(),
         tier: body.tier.clone(),
         namespace: body.namespace.clone(),

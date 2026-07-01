@@ -622,6 +622,7 @@ fn seed_corpus(conn: &Connection, namespace: &str, prefix: &str, count: usize) -
 fn synth_memory(namespace: &str, i: usize, prefix: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: namespace.to_string(),

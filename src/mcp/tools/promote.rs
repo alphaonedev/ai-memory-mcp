@@ -346,6 +346,7 @@ mod tests {
     fn insert_owned(conn: &rusqlite::Connection, title: &str, ns: &str, owner: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),

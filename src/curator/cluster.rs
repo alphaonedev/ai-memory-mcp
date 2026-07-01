@@ -248,6 +248,7 @@ mod tests {
     fn make_memory(id: &str, ns: &str, content: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),

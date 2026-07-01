@@ -1335,6 +1335,7 @@ mod tests {
             );
         }
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "_curator/rollback".to_string(),
@@ -1385,6 +1386,7 @@ mod tests {
                 );
             }
             let mem = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1462,6 +1464,7 @@ mod tests {
                 );
             }
             let m1 = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1491,6 +1494,7 @@ mod tests {
                 lifecycle_state: crate::models::LifecycleState::Open,
             };
             let m2 = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1566,6 +1570,7 @@ mod tests {
                 );
             }
             let mem = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1611,6 +1616,7 @@ mod tests {
                 );
             }
             let mem = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "_curator/rollback".to_string(),

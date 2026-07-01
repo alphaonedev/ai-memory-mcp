@@ -437,6 +437,7 @@ mod tests {
     fn insert_observation(conn: &rusqlite::Connection, title: &str, ns: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let m = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),

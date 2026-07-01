@@ -622,6 +622,14 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             .ok()
             .and_then(|s| crate::models::LifecycleState::from_str(&s))
             .unwrap_or_default(),
+        // v0.9.0 G8 (#1825) — schema v74 additive content-id. `None` on
+        // pre-v74 rows (column absent) and on rows the backfill left NULL
+        // (undecryptable / `version >= 2` re-stored). `cid_genesis` is
+        // read on demand by the verify path only — never mapped here.
+        cid: row
+            .get::<_, Option<String>>(field_names::CID)
+            .ok()
+            .flatten(),
     };
 
     // #228 Commit B — at-rest content decryption. The decrypt branch is
@@ -809,14 +817,27 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
         .as_ref()
         .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
     let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+    // v0.9.0 G8 (#1825) — stamp the additive content-id from the
+    // PLAINTEXT genesis identity, BEFORE the seal/placeholder swap above
+    // ever touched `content_to_store` (we hash `mem.content`, never the
+    // ciphertext placeholder). On an upsert conflict the surviving row
+    // keeps its own genesis (DO UPDATE SET cid = memories.cid), so this
+    // pair only lands on a fresh genesis INSERT.
+    let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
     // #1579 B6 — `insert` is the hottest write statement in the
     // substrate (every store / upsert / capture-turn / federation push
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
          ON CONFLICT(title, namespace) DO UPDATE SET
+            -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
+            -- content-id + pre-image (self-assign, never the excluded
+            -- value): an upsert-merge mutates content but the memory's
+            -- GENESIS identity is fixed at creation.
+            cid = memories.cid,
+            cid_genesis = memories.cid_genesis,
             content = excluded.content,
             -- #228 Commit B — content + envelope move together on upsert so
             -- a re-store under encryption replaces both the placeholder and
@@ -943,6 +964,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             mentioned_entity_id,
             mem.lifecycle_state.as_str(),
             encrypted_envelope,
+            cid_stamp.cid,
+            cid_stamp.genesis,
         ],
         |r| r.get(0),
     )?;
@@ -1314,6 +1337,11 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                 .as_ref()
                 .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
             let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+            // v0.9.0 G8 (#1825) — stamp the content-id from the PLAINTEXT
+            // genesis identity (never the ciphertext placeholder). This is
+            // a genesis INSERT (refuses duplicates), so the pair always
+            // lands.
+            let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
             // v0.7.0 L1-1 wave merge — include the `memory_kind` column.
             // This INSERT path was added by the fix-campaign R1-M3
             // (ConflictMode::Error refuses duplicates) and originally
@@ -1324,8 +1352,8 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
                  RETURNING id",
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
@@ -1336,6 +1364,7 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                     citations_json, mem.source_uri, source_span_json,
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
                     mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
+                    cid_stamp.cid, cid_stamp.genesis,
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -3291,6 +3320,16 @@ fn purge_and_tombstone_forget(
             agent_id.as_deref(),
             now,
         )?;
+        // v0.9.0 G8 (#1825) T7 — erasure invariant: NULL `cid_genesis`
+        // (the stored SHA256(screen(content)) pre-image) while RETAINING
+        // `cid`, so the pre-image can never become a confirmation-oracle
+        // for the erased content. Runs on the live row BEFORE the forget
+        // DELETE; if a future soft-forget keeps the row, the invariant
+        // still holds on the surviving row. The production forget then
+        // hard-deletes the whole row (`memories` cascade), and the archive
+        // copy carries no cid columns — so no genesis pre-image survives a
+        // forget by ANY path.
+        forget_scrub_cid_genesis(conn, id)?;
     }
     Ok(())
 }
@@ -3333,6 +3372,48 @@ pub fn memory_is_tombstoned(conn: &Connection, memory_id: &str) -> Result<bool> 
         |r| r.get(0),
     )?;
     Ok(exists)
+}
+
+/// v0.9.0 G8 (#1825) — read a row's storage-internal `cid_genesis`
+/// pre-image on demand (it is deliberately NOT a [`Memory`] field). The
+/// verify path uses it to recompute + check the BLAKE3 address. Returns
+/// `Ok(None)` when the row is missing, the column is absent (pre-v74), or
+/// `cid_genesis IS NULL` (a forgotten row's erased pre-image).
+///
+/// # Errors
+///
+/// Never errors on a missing row / NULL (those map to `Ok(None)`);
+/// reserved `Result` for a future hard-SQL surface.
+pub fn read_cid_genesis(conn: &Connection, id: &str) -> Result<Option<Vec<u8>>> {
+    use rusqlite::OptionalExtension;
+    let genesis = conn
+        .query_row(
+            "SELECT cid_genesis FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten();
+    Ok(genesis)
+}
+
+/// v0.9.0 G8 (#1825) T7 — the erasure invariant primitive: NULL a live
+/// row's `cid_genesis` pre-image while RETAINING its `cid` address. The
+/// stored genesis pre-image ends in `SHA256(screen(content))`; dropping it
+/// on erasure removes any confirmation-oracle for the erased content, but
+/// the `cid` string (a public-ish content-address / G13 lineage node id)
+/// is kept. `WHERE cid_genesis IS NOT NULL` keeps it idempotent.
+///
+/// # Errors
+///
+/// Propagates the UPDATE error.
+pub fn forget_scrub_cid_genesis(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE memories SET cid_genesis = NULL WHERE id = ?1 AND cid_genesis IS NOT NULL",
+        params![id],
+    )?;
+    Ok(())
 }
 
 /// Forget by pattern — delete memories matching namespace + FTS pattern + tier.
@@ -4977,6 +5058,7 @@ pub fn promote_to_namespace(
 
     let now = Utc::now().to_rfc3339();
     let clone = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier: source.tier.clone(),
         namespace: to_namespace.to_string(),
@@ -6145,8 +6227,15 @@ pub fn consolidate(
             confidence_decayed_at: None,
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
+            // v0.9.0 G8 (#1825) — stamped below from this candidate's
+            // genesis identity; the raw INSERT binds the pair.
+            cid: None,
         };
         consult_governance_pre_write(&candidate)?;
+        // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
+        // it mints its own content-id from the (plaintext) summary + the
+        // candidate's genesis identity.
+        let cid_stamp = crate::identity::cid::stamp_memory_cid(&candidate);
 
         // v0.7.0 #1466 — consolidate mints a fresh memory via this raw
         // INSERT, so it must carry the tier-default expiry too; otherwise a
@@ -6154,9 +6243,9 @@ pub fn consolidate(
         // never reaped by GC. `candidate.created_at == now` so the backfill
         // here matches the `?10` bound below.
         conn.execute(
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13)",
-            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str()],
+            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1.0, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis],
         )?;
 
         // Delete source memories first. Note: we intentionally do NOT create
@@ -7396,6 +7485,7 @@ pub fn entity_register(
 
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: namespace.to_string(),
@@ -8284,6 +8374,7 @@ pub fn register_agent(
         .context("failed to serialize agent registration content")?;
 
     let mem = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: AGENTS_NAMESPACE.to_string(),
@@ -9095,6 +9186,10 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // a refusal short-circuits the transaction (outer ROLLBACK).
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id (from
+        // the decrypted plaintext) so the restored live row carries the
+        // same `b3:` address it had before archival.
+        let cid_stamp = restored_cid_stamp(conn, id, &candidate)?;
 
         // v0.6.3.1 P2 (G5) — preserve original tier + expires_at + embedding
         // on restore. Pre-v17 rows lost this metadata permanently; the
@@ -9116,7 +9211,8 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
+              cid, cid_genesis)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -9133,9 +9229,10 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     mentioned_entity_id,
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
-                    encrypted_envelope
+                    encrypted_envelope,
+                    ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id],
+            params![now, id, cid_stamp.cid, cid_stamp.genesis],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). Edges whose other endpoint is permanently gone are
@@ -9236,6 +9333,9 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // v0.9.0 G8 (#1825) — re-mint the genesis content-id (from the
+        // decrypted plaintext) so the restored row keeps its `b3:` address.
+        let cid_stamp = restored_cid_stamp(conn, id, &candidate)?;
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry on
         // archive→restore. Pre-#1025 the SELECT pulled only 17 columns;
         // restored row landed with reflection_depth=0 (DEFAULT),
@@ -9251,7 +9351,8 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
-              mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+              mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
+              cid, cid_genesis)
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
@@ -9268,9 +9369,10 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     mentioned_entity_id,
                     COALESCE(version, 1),
                     COALESCE(lifecycle_state, 'open'),
-                    encrypted_envelope
+                    encrypted_envelope,
+                    ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id],
+            params![now, id, cid_stamp.cid, cid_stamp.genesis],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). See [`restore_archived`] for the contract.
@@ -9300,6 +9402,49 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
 /// over the archive-time `tier` so the candidate hook sees the row
 /// at the tier it will land at post-restore (matches the SQL the
 /// caller is about to execute).
+/// v0.9.0 G8 (#1825) — re-mint the genesis content-id for an archived
+/// row about to be restored. The `candidate` (loaded via
+/// [`load_archived_as_memory`]) carries the ORIGINAL genesis identity
+/// (namespace / title / created_at / memory_kind / agent_id); the
+/// archived `content` may be an encryption placeholder, so the PLAINTEXT
+/// is resolved here (decrypting a sealed archive row) before hashing so
+/// the re-minted cid matches the row's original genesis. A decrypt
+/// failure falls back to the stored content — a lost key must never abort
+/// a restore.
+///
+/// # Errors
+///
+/// Propagates the `archived_memories` read error.
+fn restored_cid_stamp(
+    conn: &Connection,
+    id: &str,
+    candidate: &Memory,
+) -> Result<crate::identity::cid::CidStamp> {
+    let agent_id = candidate
+        .metadata
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (raw_content, envelope): (String, Option<Vec<u8>>) = conn.query_row(
+        "SELECT content, encrypted_envelope FROM archived_memories WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
+    )?;
+    let plaintext = match envelope {
+        Some(env) => crate::encryption::open_content(&env, &agent_id).unwrap_or(raw_content),
+        None => raw_content,
+    };
+    Ok(crate::identity::cid::stamp_cid(
+        &agent_id,
+        &candidate.namespace,
+        &candidate.title,
+        candidate.memory_kind.as_str(),
+        &candidate.created_at,
+        &plaintext,
+    ))
+}
+
 fn load_archived_as_memory(conn: &Connection, id: &str) -> Result<Memory> {
     let mut stmt = conn.prepare(
         "SELECT id, COALESCE(original_tier, tier) AS tier, namespace, title, content,
@@ -9573,13 +9718,27 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
         .as_ref()
         .map_or(mem.content.as_str(), |(_, ph)| ph.as_str());
     let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+    // v0.9.0 G8 (#1825) — stamp the content-id from the inbound PLAINTEXT
+    // genesis identity. Because the cid is a deterministic,
+    // MODE-INDEPENDENT function of the genesis fields, recomputing it
+    // locally on a fresh federation insert yields the SAME `b3:` address
+    // the origin node minted (receive-time equivalence,
+    // `cross_node_same_genesis_same_cid`). On a `(title, namespace)`
+    // conflict the local row KEEPS its own genesis (DO UPDATE SET below).
+    let cid_stamp = crate::identity::cid::stamp_memory_cid(mem);
     // #1579 B6 — federation catch-up replays this newer-wins upsert
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
          ON CONFLICT(title, namespace) DO UPDATE SET
+            -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
+            -- surviving local row's genesis content-id: keep the local
+            -- `cid` / `cid_genesis` (self-assign, not excluded) so
+            -- `federation_merge_preserves_local_cid` holds.
+            cid = memories.cid,
+            cid_genesis = memories.cid_genesis,
             content = CASE WHEN excluded.updated_at > memories.updated_at
                              OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
                            THEN excluded.content ELSE memories.content END,
@@ -9722,6 +9881,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             mem.version,
             mem.lifecycle_state.as_str(),
             encrypted_envelope,
+            cid_stamp.cid,
+            cid_stamp.genesis,
         ],
         |r| r.get(0),
     )?;
@@ -14352,6 +14513,7 @@ mod tests {
     fn make_memory(title: &str, ns: &str, tier: Tier, priority: i32) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: tier.clone(),
             namespace: ns.to_string(),
@@ -19120,6 +19282,7 @@ mod tests {
             );
         }
         let standard = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -19264,6 +19427,7 @@ mod tests {
             );
         }
         let standard = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -21139,6 +21303,7 @@ mod tests {
 
         // Insert one observation and one reflection memory.
         let obs = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -21168,6 +21333,7 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         let ref_mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -21238,6 +21404,7 @@ mod tests {
     fn l1_1_memory_kind_roundtrips_through_insert_get() {
         let conn = test_db();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "roundtrip-ns".to_string(),
@@ -21288,6 +21455,7 @@ mod tests {
 
         // First insert: Reflection.
         let mem_reflection = Memory {
+            cid: None,
             id: id.clone(),
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),
@@ -21320,6 +21488,7 @@ mod tests {
 
         // Second upsert: Observation (same title+namespace → triggers ON CONFLICT).
         let mem_obs = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(), // different id, same title+ns
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),

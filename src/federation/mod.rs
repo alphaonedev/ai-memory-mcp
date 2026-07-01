@@ -336,6 +336,7 @@ mod tests {
     fn sample_memory() -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: "fed-test".to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "app".to_string(),
@@ -1832,6 +1833,7 @@ mod tests {
     /// progression so the test asserts deterministic ordering.
     fn catchup_memory(title: &str, updated_at: &str) -> Memory {
         Memory {
+            cid: None,
             id: format!("cat-{title}"),
             tier: crate::models::Tier::Mid,
             namespace: "catchup".to_string(),

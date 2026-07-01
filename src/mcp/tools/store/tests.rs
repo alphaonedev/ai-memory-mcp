@@ -1054,6 +1054,7 @@ fn install_store_policy(
         );
     }
     let standard = crate::models::Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: crate::models::Tier::Long,
         namespace: format!("_standards-{ns}"),
@@ -1126,6 +1127,7 @@ fn install_legacy_classifier_policy(conn: &rusqlite::Connection, ns: &str) {
         );
     }
     let standard = crate::models::Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: crate::models::Tier::Long,
         namespace: format!("_standards-{ns}"),
@@ -1261,6 +1263,7 @@ fn install_required_scope_policy(
         );
     }
     let standard = crate::models::Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: format!("_standards-{ns}"),

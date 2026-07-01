@@ -97,6 +97,13 @@ pub mod attest;
 // sentinels, daemon agent ids) lives here as one named const;
 // `crate::validate::RESERVED_AGENT_IDS` is built from these.
 pub mod sentinels;
+// v0.9.0 G8 (#1825) — additive, content-addressed BLAKE3 content-id (CID)
+// for a memory's GENESIS identity. Sits ALONGSIDE the UUID PK (which stays
+// the PK / every FK / the federation LWW tiebreak); the cid is a second,
+// content-derived name minted once at the genesis INSERT. BLAKE3 is the
+// OUTER address hash only — the inner content digest + the audit spine stay
+// on SHA-256.
+pub mod cid;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).

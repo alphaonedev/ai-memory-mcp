@@ -36,6 +36,7 @@ use common::fresh_conn;
 fn insert_depth0_observation(conn: &Connection, namespace: &str, title: &str) -> String {
     let now = Utc::now().to_rfc3339();
     let mem = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),

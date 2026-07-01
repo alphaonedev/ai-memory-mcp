@@ -148,6 +148,7 @@ mod tests {
         // Insert a plain memory (depth = 0).
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),

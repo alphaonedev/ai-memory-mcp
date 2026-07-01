@@ -43,6 +43,7 @@ async fn inspection_pool(url: &str) -> sqlx::PgPool {
 fn reflection(namespace: &str, title: &str, content: &str, metadata: serde_json::Value) -> Memory {
     let now = Utc::now().to_rfc3339();
     Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: namespace.to_string(),

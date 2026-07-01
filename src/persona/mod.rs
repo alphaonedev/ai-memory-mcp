@@ -373,6 +373,7 @@ impl<'a> PersonaGenerator<'a> {
         });
 
         let persona_mem = Memory {
+            cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             id: persona_id_local.clone(),
             tier: self.config.tier.clone(),
             namespace: namespace.to_string(),
@@ -943,6 +944,7 @@ mod tests {
     fn seed_reflection(conn: &Connection, namespace: &str, title: &str, body: &str) -> String {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),
@@ -1034,6 +1036,7 @@ mod tests {
         // Seed a persona row directly to bump version state.
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "team/alpha".into(),
@@ -1174,6 +1177,7 @@ mod tests {
         for i in 0..2 {
             let now = Utc::now().to_rfc3339();
             let mem = Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: namespace.to_string(),

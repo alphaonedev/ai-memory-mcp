@@ -493,6 +493,7 @@ impl<'a> ReflectionPass<'a> {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         })
     }
 
@@ -1025,6 +1026,7 @@ mod tests {
     fn make_obs(id: &str, ns: &str, title: &str, content: &str, access: i64) -> Memory {
         let now = Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -1296,6 +1298,7 @@ mod tests {
                 );
             }
             let mem = Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.to_string(),
@@ -1622,6 +1625,7 @@ mod tests {
                 );
             }
             let m = Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1761,6 +1765,7 @@ mod tests {
                     );
                 }
                 let m = Memory {
+                    cid: None,
                     id: uuid::Uuid::new_v4().to_string(),
                     tier: Tier::Long,
                     namespace: "deep".to_string(),

@@ -138,6 +138,7 @@ mod tests {
     fn seed(conn: &rusqlite::Connection, title: &str, content: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "tier-d".to_string(),

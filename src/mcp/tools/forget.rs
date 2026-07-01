@@ -393,6 +393,7 @@ mod tests {
     fn insert_one(conn: &rusqlite::Connection, ns: &str, title: &str, tier: Tier) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier,
             namespace: ns.to_string(),
@@ -608,6 +609,7 @@ mod tests {
     fn insert_meta(conn: &rusqlite::Connection, ns: &str, title: &str, metadata: Value) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),
@@ -723,6 +725,7 @@ mod tests {
             );
         }
         let standard = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{ns}"),

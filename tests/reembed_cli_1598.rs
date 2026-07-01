@@ -60,6 +60,7 @@ fn scratch_db(tag: &str) -> (tempfile::TempDir, PathBuf) {
 fn seed_embedded(conn: &rusqlite::Connection, title: &str, content: &str) -> String {
     let now = chrono::Utc::now().to_rfc3339();
     let mem = Memory {
+        cid: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: NAMESPACE.to_string(),

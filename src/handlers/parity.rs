@@ -216,6 +216,7 @@ mod require_caller_owns_memory_tests {
 
     fn mem_with(metadata: serde_json::Value) -> Memory {
         Memory {
+            cid: None,
             id: "test-id".to_string(),
             tier: Tier::Long,
             namespace: "test-ns".to_string(),

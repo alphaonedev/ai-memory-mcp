@@ -178,6 +178,7 @@ fn set_cap(conn: &rusqlite::Connection, ns: &str, cap: u32) {
 /// return `(exit_code, stdout_string)`.
 fn run_verify_reflection(db_path: &Path, mem_id: &str, format: &str) -> (i32, String) {
     let args = cli_verify::VerifyChainArgs {
+        cid: false,
         memory_id: mem_id.to_string(),
         format: format.to_string(),
         include_signed_events: false,

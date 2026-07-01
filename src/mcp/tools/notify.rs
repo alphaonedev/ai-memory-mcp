@@ -52,6 +52,7 @@ pub fn handle_notify(
     });
 
     let mem = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier,
         namespace: namespace.clone(),
@@ -312,6 +313,7 @@ mod d1_5_986_tests {
     fn seed_inbox_message(conn: &rusqlite::Connection, owner: &str, sender: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: super::super::agent::messages_namespace_for(owner),

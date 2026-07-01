@@ -390,6 +390,13 @@ impl MemoryStore for SqliteStore {
         // so sqlite and postgres report identical findings for
         // identical rows. Real signature verification lands with #302.
         let findings = super::integrity_findings(&mem);
+        // v0.9.0 G8 (#1825) — when the row carries a `cid`, load its
+        // storage-internal `cid_genesis` pre-image and verify the BLAKE3
+        // address (partial-corruption detection). `None` when unstamped or
+        // when the pre-image was erased on forget (T7).
+        let genesis = db::read_cid_genesis(&conn, id).map_err(box_err)?;
+        let (cid_ok, cid_mismatch) =
+            super::cid_verify_fields(mem.cid.as_deref(), genesis.as_deref());
         Ok(VerifyReport {
             memory_id: id.to_string(),
             integrity_ok: findings.is_empty(),
@@ -397,6 +404,8 @@ impl MemoryStore for SqliteStore {
             // v0.6.0 does NOT perform signature verification; real
             // cryptographic verify lands with Task 1.4. See #302.
             signature_verified: false,
+            cid_ok,
+            cid_mismatch,
         })
     }
 
@@ -2027,6 +2036,7 @@ impl MemoryStore for SqliteStore {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)
@@ -2214,6 +2224,7 @@ mod tests {
     fn test_memory(title: &str, content: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "sal-test".to_string(),

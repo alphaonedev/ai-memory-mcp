@@ -298,6 +298,7 @@ impl<'a> ConsolidationPass<'a> {
             confidence_decayed_at: None,
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
+            cid: None,
         })
     }
 
@@ -586,6 +587,7 @@ mod tests {
     fn make_memory(id: &str, ns: &str, content: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -768,6 +770,7 @@ mod tests {
         ) -> Memory {
             let now = chrono::Utc::now().to_rfc3339();
             Memory {
+                cid: None,
                 id: id.to_string(),
                 tier,
                 namespace: ns.to_string(),

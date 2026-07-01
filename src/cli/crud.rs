@@ -569,6 +569,7 @@ mod tests {
             );
         }
         let standard = models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "_standards-gov-ns".to_string(),

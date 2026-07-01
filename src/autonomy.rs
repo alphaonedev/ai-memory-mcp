@@ -682,6 +682,7 @@ pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
     Ok(Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: format!("{CURATOR_NAMESPACE}/rollback"),
@@ -752,6 +753,7 @@ pub fn persist_self_report(
         "errors_total": errors_total,
     });
     let mem = Memory {
+        cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: format!("{CURATOR_NAMESPACE}/reports"),
@@ -1098,6 +1100,7 @@ mod tests {
     fn sample_mem(id: &str, ns: &str, title: &str, content: &str, tier: Tier) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: id.to_string(),
             tier,
             namespace: ns.to_string(),

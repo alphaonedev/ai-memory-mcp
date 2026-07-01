@@ -850,6 +850,7 @@ mod tests {
             let conn = crate::db::open(&db).unwrap();
             let now = chrono::Utc::now().to_rfc3339();
             let mem = crate::models::Memory {
+                cid: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "test".to_string(),
@@ -1289,6 +1290,7 @@ limit = 25
         // Insert a low-confidence memory directly.
         let mut conn = db::open(&db).unwrap();
         let mut mem = crate::models::Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),

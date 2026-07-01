@@ -283,6 +283,7 @@ mod tests {
     fn make_mem(title: &str, ns: &str) -> Memory {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),
@@ -557,6 +558,7 @@ mod tests {
             );
         }
         let standard = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{ns}"),

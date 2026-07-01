@@ -492,6 +492,12 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `id` — equality (precondition above). Both args share it; take
         // local's deterministically.
         id: local.id.clone(),
+        // v0.9.0 G8 (#1825) — `cid` is genesis identity, immutable and
+        // never LWW'd: a federation merge PRESERVES the LOCAL row's
+        // content-id (the persist path `overwrite_full_row_by_id` leaves
+        // `cid`/`cid_genesis` untouched, so this carried value is
+        // informational). `federation_merge_preserves_local_cid`.
+        cid: local.cid.clone(),
         // `tier` — max durability (short < mid < long); never downgrade.
         tier: merge_tier(&local.tier, &remote.tier),
         // `namespace` — LWW by updated_at (tiebreak id).
@@ -638,6 +644,7 @@ mod tests {
     /// the LWW order deterministically.
     fn base(id: &str, updated_at: &str) -> Memory {
         Memory {
+            cid: None,
             id: id.to_string(),
             tier: Tier::Short,
             namespace: "ns".to_string(),

@@ -222,6 +222,7 @@ mod tests {
     fn seed_memory(conn: &rusqlite::Connection, ns: &str, title: &str) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
+            cid: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: ns.to_string(),
