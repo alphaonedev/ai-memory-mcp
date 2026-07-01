@@ -551,7 +551,8 @@ fn a2a_4_governance_rule_refuses_cross_agent() {
              attest_level TEXT NOT NULL DEFAULT 'unsigned',
              timestamp TEXT NOT NULL,
              prev_hash BLOB,
-             sequence INTEGER
+             sequence INTEGER,
+             cause_hash BLOB
          );",
     )
     .unwrap();
@@ -859,6 +860,7 @@ fn a2a_8_signature_chain_triangle_integrity() {
             timestamp: chrono::Utc::now().to_rfc3339(),
             prev_hash: Vec::new(),
             sequence: 0,
+            cause_hash: None,
         };
         append_signed_event(conn, &event).expect("append");
     }

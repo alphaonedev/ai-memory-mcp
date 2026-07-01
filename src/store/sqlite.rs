@@ -1825,14 +1825,30 @@ impl MemoryStore for SqliteStore {
         if changed == 0 {
             return Ok(false);
         }
+        let action_kind = "memory.reclassified";
         let ph = crate::signed_events::payload_hash(
-            format!("memory.reclassified|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+            format!("{action_kind}|{id}|{old_kind}|{new_kind_str}").as_bytes(),
+        );
+        // v73 (#1822, G5a) — bind the TRIGGERING CAUSE of this write into
+        // the signed chain: caller identity + the reclassify action + its
+        // identity-only inputs (memory id + old/new kind). The inputs are
+        // secret-screened inside `compute_cause_hash`, so a credential
+        // that ever appeared in an id/kind can never be recovered from the
+        // stored `cause_hash` (K4). `with_daemon_signature` folds the
+        // cause into the Ed25519 signing input, and the cause is carried
+        // into the row's `cause_hash` column (present-only chain fold).
+        let cause = crate::signed_events::compute_cause_hash(
+            &ctx.agent_id,
+            action_kind,
+            id,
+            &format!("{id}|{old_kind}|{new_kind_str}"),
         );
         let event = crate::signed_events::SignedEvent::with_daemon_signature(
             ph,
             ctx.agent_id.clone(),
-            "memory.reclassified".to_string(),
+            action_kind.to_string(),
             chrono::Utc::now().to_rfc3339(),
+            Some(&cause),
         );
         crate::signed_events::append_signed_event_no_tx(&tx, &event).map_err(box_err)?;
         tx.commit().map_err(box_err)?;

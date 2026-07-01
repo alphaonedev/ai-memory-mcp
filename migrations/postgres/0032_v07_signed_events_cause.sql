@@ -1,0 +1,21 @@
+-- v73 (#1822, v0.9.0 G5a) — audit cause-binding on the Postgres
+-- backend: add the additive, nullable `signed_events.cause_hash`
+-- column. Mirrors SQLite schema v73
+-- (`migrations/sqlite/0057_v73_signed_events_cause.sql`).
+--
+-- Binds the TRIGGERING CAUSE of an audit-bearing write into the
+-- tamper-evident cross-row hash chain. `cause_hash` is a 32-byte
+-- SHA-256 over a screened, identity-only pre-image computed by
+-- `signed_events::compute_cause_hash`; it NEVER carries raw content
+-- (the input is secret-screened and only the redacted, one-way-hashed
+-- `input_digest` reaches the pre-image — K4).
+--
+-- Present-only fold: a NULL `cause_hash` contributes zero bytes to
+-- `canonical_chain_bytes`, so legacy rows hash byte-identically to
+-- before this migration. Postgres-native `BYTEA` mirrors SQLite's
+-- `BLOB`. Postgres supports `ADD COLUMN IF NOT EXISTS`, so this is a
+-- single idempotent DDL batch — fresh installs inherit the column
+-- inline from `postgres_schema.sql`; pre-v73 deployments pick it up
+-- here via `PostgresStore::migrate_v73`.
+
+ALTER TABLE signed_events ADD COLUMN IF NOT EXISTS cause_hash BYTEA;

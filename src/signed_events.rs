@@ -261,6 +261,19 @@ pub struct SignedEvent {
     /// ignored. Use `..SignedEvent::default()` at the struct-literal
     /// tail to leave this zero.
     pub sequence: i64,
+    /// v73 (#1822, v0.9.0 G5a) — audit cause-binding. When `Some`, a
+    /// 32-byte SHA-256 over the screened, identity-only pre-image of
+    /// the TRIGGERING CAUSE of this write (see [`compute_cause_hash`]).
+    /// `None` when no cause is bound (additive — not every event needs
+    /// one yet). Present-only in the chain: a `None` cause contributes
+    /// ZERO bytes and ZERO separators to [`canonical_chain_bytes`], so
+    /// legacy rows hash byte-identically to pre-v73. When present it is
+    /// ALSO folded into the per-row Ed25519 signing input, so tampering
+    /// the cause is caught by BOTH the next row's `prev_hash` link and
+    /// this row's own signature. Set explicitly (or left `None` via
+    /// `..SignedEvent::default()`); unlike `prev_hash`/`sequence` this
+    /// IS a caller-supplied field carried verbatim into the row.
+    pub cause_hash: Option<Vec<u8>>,
 }
 
 impl SignedEvent {
@@ -281,15 +294,29 @@ impl SignedEvent {
     /// The other chain columns (`prev_hash`, `sequence`) are left at
     /// their defaults — [`append_signed_event`] fills them at INSERT
     /// time. Callers MUST NOT pre-populate them.
+    ///
+    /// # v73 (#1822, G5a) — cause-binding
+    ///
+    /// `cause_hash` binds the TRIGGERING CAUSE of the write (see
+    /// [`compute_cause_hash`]). When `Some`, the daemon signs the
+    /// cause-folded digest `SHA-256(payload_hash || 0x1F || cause)`
+    /// (via [`signing_input_bytes`]) so the signature commits to the
+    /// cause as well as the payload; the value is also carried into the
+    /// row's `cause_hash` column (and thus [`canonical_chain_bytes`]).
+    /// When `None`, the daemon signs `payload_hash` verbatim exactly as
+    /// before — every legacy caller passing `None` produces a
+    /// byte-identical signing input and row.
     #[must_use]
     pub fn with_daemon_signature(
         payload_hash: Vec<u8>,
         agent_id: String,
         event_type: String,
         timestamp: String,
+        cause_hash: Option<&[u8]>,
     ) -> Self {
+        let signing_input = signing_input_bytes(&payload_hash, cause_hash);
         let (signature, attest_level) =
-            match crate::governance::audit::try_sign_audit_payload(&payload_hash) {
+            match crate::governance::audit::try_sign_audit_payload(&signing_input) {
                 Some((sig_bytes, tag)) => (Some(sig_bytes), tag.to_string()),
                 None => (
                     None,
@@ -304,6 +331,7 @@ impl SignedEvent {
             signature,
             attest_level,
             timestamp,
+            cause_hash: cause_hash.map(<[u8]>::to_vec),
             ..SignedEvent::default()
         }
     }
@@ -341,7 +369,9 @@ pub fn canonical_chain_bytes(event: &SignedEvent) -> Vec<u8> {
             + event.attest_level.len()
             + event.timestamp.len()
             + 8
-            + 7, // seven separators
+            + 7 // seven separators
+            // v73 present-only cause: separator + digest, or nothing.
+            + event.cause_hash.as_ref().map_or(0, |c| 1 + c.len()),
     );
     out.extend_from_slice(event.id.as_bytes());
     out.push(FIELD_SEP);
@@ -362,7 +392,104 @@ pub fn canonical_chain_bytes(event: &SignedEvent) -> Vec<u8> {
     out.extend_from_slice(event.timestamp.as_bytes());
     out.push(FIELD_SEP);
     out.extend_from_slice(&event.sequence.to_be_bytes());
+    // v73 (#1822, G5a) — PRESENT-ONLY cause fold. A `None` cause writes
+    // nothing (no separator, no bytes), so every legacy row's canonical
+    // bytes are byte-identical to pre-v73 and their predecessors verify
+    // unchanged. When present, one FIELD_SEP then the 32-byte cause
+    // digest are appended so the triggering cause is committed into the
+    // cross-row hash chain.
+    if let Some(cause) = event.cause_hash.as_ref() {
+        out.push(FIELD_SEP);
+        out.extend_from_slice(cause);
+    }
     out
+}
+
+/// Domain-separation prefix for the audit cause-binding pre-image
+/// ([`compute_cause_hash`]). The trailing NUL byte keeps the prefix
+/// unambiguous against any `caller_agent_id` that begins with the same
+/// ASCII bytes. Versioned (`-v1`) so a future pre-image change is a
+/// distinct domain rather than a silent collision.
+const CAUSE_PREIMAGE_DOMAIN: &[u8] = b"audit-cause-v1\0";
+
+/// v73 (#1822, v0.9.0 G5a) — compute the `cause_hash` binding the
+/// TRIGGERING CAUSE of an audit-bearing write.
+///
+/// Returns the 32-byte SHA-256 over
+/// `CAUSE_PREIMAGE_DOMAIN || caller_agent_id || 0x1F || action_kind ||
+///  0x1F || action_id || 0x1F || input_digest`, where `input_digest`
+/// is itself SHA-256 over the SECRET-SCREENED `input_args`.
+///
+/// # K4 — credential-leak guard (load-bearing)
+///
+/// `input_args` is run through [`crate::secret_screen::screen`] BEFORE
+/// it enters the pre-image. On a [`Hit`](crate::secret_screen::ScreenOutcome::Hit)
+/// only the REDACTED form is folded — the raw credential bytes never
+/// reach the hash input — so a screened AWS key / PEM block / JWT is
+/// unrecoverable from the stored `cause_hash`. A
+/// [`Clean`](crate::secret_screen::ScreenOutcome::Clean) input passes
+/// through verbatim. The digest is one-way regardless, so the stored
+/// column reveals nothing about the args even on a Clean input.
+///
+/// # K5 — low-entropy pre-image residual (decision)
+///
+/// We KEEP `input_digest` rather than dropping the cause to
+/// identity-only (`agent || kind || id`). The cause-binding's security
+/// goal is tamper-EVIDENCE — committing the cause into the append-only
+/// chain — not confidentiality of the (already non-secret, post-screen)
+/// args. The accepted residual: an offline dictionary attack could
+/// recover a LOW-entropy screened-args pre-image from `input_digest`.
+/// That is tolerated because (a) the args are identity-derived and
+/// carry no secret after screening, and (b) recovering them yields
+/// nothing an auditor holding table-read access cannot already read
+/// from the row's other identity columns. A future callsite feeding
+/// genuinely sensitive inputs should pass identity-only args (empty
+/// `input_args`) so no residual exists.
+#[must_use]
+pub fn compute_cause_hash(
+    caller_agent_id: &str,
+    action_kind: &str,
+    action_id: &str,
+    input_args: &str,
+) -> Vec<u8> {
+    // K4: screen first; fold only the redacted form on a Hit.
+    let screened = match crate::secret_screen::screen(input_args) {
+        crate::secret_screen::ScreenOutcome::Clean => input_args.to_string(),
+        crate::secret_screen::ScreenOutcome::Hit { redacted, .. } => redacted,
+    };
+    let input_digest = payload_hash(screened.as_bytes());
+
+    let mut hasher = Sha256::new();
+    hasher.update(CAUSE_PREIMAGE_DOMAIN);
+    hasher.update(caller_agent_id.as_bytes());
+    hasher.update([FIELD_SEP]);
+    hasher.update(action_kind.as_bytes());
+    hasher.update([FIELD_SEP]);
+    hasher.update(action_id.as_bytes());
+    hasher.update([FIELD_SEP]);
+    hasher.update(&input_digest);
+    hasher.finalize().to_vec()
+}
+
+/// v73 (#1822, G5a) — the exact bytes the daemon Ed25519 key signs for
+/// a `signed_events` row. When a cause is bound the signature commits
+/// to BOTH the payload and the triggering cause via
+/// `SHA-256(payload_hash || 0x1F || cause_hash)`; otherwise it is the
+/// `payload_hash` verbatim (legacy rows sign byte-identically to
+/// pre-v73). Shared by [`SignedEvent::with_daemon_signature`] (signing)
+/// and [`verify_chain`] (verification) so the two never drift.
+#[must_use]
+fn signing_input_bytes(payload_hash: &[u8], cause_hash: Option<&[u8]>) -> Vec<u8> {
+    match cause_hash {
+        Some(cause) => {
+            let mut hasher = Sha256::new();
+            hasher.update(payload_hash);
+            hasher.update([FIELD_SEP]);
+            hasher.update(cause);
+            hasher.finalize().to_vec()
+        }
+        None => payload_hash.to_vec(),
+    }
 }
 
 /// Read the chain head — `(max_sequence, prev_canonical_hash)`.
@@ -424,7 +551,7 @@ fn read_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
     let mut stmt = conn
         .prepare(
             "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
-                    timestamp, sequence \
+                    timestamp, sequence, cause_hash \
              FROM signed_events \
              WHERE sequence IS NOT NULL \
              ORDER BY sequence DESC, rowid DESC \
@@ -442,6 +569,9 @@ fn read_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
                 attest_level: row.get(5)?,
                 timestamp: row.get(6)?,
                 sequence: row.get(7)?,
+                // v73: read the head's cause so the next row's prev_hash
+                // commits to it (present-only in the canonical bytes).
+                cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
                 prev_hash: Vec::new(), // not part of the canonical bytes
             })
         })
@@ -523,7 +653,7 @@ pub fn verify_chain(
     let mut stmt = conn
         .prepare(
             "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
-                    timestamp, prev_hash, COALESCE(sequence, 0) \
+                    timestamp, prev_hash, COALESCE(sequence, 0), cause_hash \
              FROM signed_events \
              WHERE COALESCE(sequence, 0) > ?1 \
              ORDER BY COALESCE(sequence, 0) ASC",
@@ -553,7 +683,7 @@ pub fn verify_chain(
         let mut head_stmt = conn
             .prepare(
                 "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
-                        timestamp, COALESCE(sequence, 0) \
+                        timestamp, COALESCE(sequence, 0), cause_hash \
                  FROM signed_events \
                  WHERE COALESCE(sequence, 0) = ?1",
             )
@@ -569,6 +699,9 @@ pub fn verify_chain(
                     attest_level: row.get(5)?,
                     timestamp: row.get(6)?,
                     sequence: row.get(7)?,
+                    // v73: include the resume-boundary row's cause so the
+                    // first in-window row's prev_hash lines up.
+                    cause_hash: row.get::<_, Option<Vec<u8>>>(8)?,
                     prev_hash: Vec::new(),
                 })
             })
@@ -599,6 +732,9 @@ pub fn verify_chain(
                 .context("verify_chain: prev_hash")?
                 .unwrap_or_default(),
             sequence: row.get(8).context("verify_chain: sequence")?,
+            cause_hash: row
+                .get::<_, Option<Vec<u8>>>(9)
+                .context("verify_chain: cause_hash")?,
         };
 
         // (1) Sequence contiguity.
@@ -636,7 +772,19 @@ pub fn verify_chain(
                     match sig_array {
                         Some(arr) => {
                             let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                            if vk.verify_strict(&event.payload_hash, &sig).is_err() {
+                            // v73 (#1822, G5a) — branch identically to
+                            // signing: when the row carries a cause the
+                            // signature is over the cause-folded digest,
+                            // else over payload_hash verbatim (legacy
+                            // rows verify byte-identically). Tampering
+                            // OR stripping the cause after signing flips
+                            // this input and surfaces as a
+                            // signature_failure.
+                            let signing_input = signing_input_bytes(
+                                &event.payload_hash,
+                                event.cause_hash.as_deref(),
+                            );
+                            if vk.verify_strict(&signing_input, &sig).is_err() {
                                 signature_failures.push(event.sequence);
                             }
                         }
@@ -1044,8 +1192,8 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     conn.execute(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-             prev_hash, sequence) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             prev_hash, sequence, cause_hash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             event.id,
             event.agent_id,
@@ -1056,6 +1204,7 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
             event.timestamp,
             prev_hash.to_vec(),
             next_seq,
+            event.cause_hash,
         ],
     )
     .context("append signed_event")?;
@@ -1126,7 +1275,7 @@ pub fn list_signed_events(
     if let Some(agent) = agent_id {
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-                    prev_hash, COALESCE(sequence, 0) \
+                    prev_hash, COALESCE(sequence, 0), cause_hash \
              FROM signed_events \
              WHERE agent_id = ?1 \
              ORDER BY timestamp ASC, id ASC \
@@ -1138,7 +1287,7 @@ pub fn list_signed_events(
     } else {
         let mut stmt = conn.prepare(
             "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-                    prev_hash, COALESCE(sequence, 0) \
+                    prev_hash, COALESCE(sequence, 0), cause_hash \
              FROM signed_events \
              ORDER BY timestamp ASC, id ASC \
              LIMIT ?1 OFFSET ?2",
@@ -1160,6 +1309,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedEvent> {
         timestamp: row.get(6)?,
         prev_hash: row.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
         sequence: row.get(8)?,
+        cause_hash: row.get::<_, Option<Vec<u8>>>(9)?,
     })
 }
 
@@ -1197,6 +1347,7 @@ mod tests {
             // placeholders so the struct constructs.
             prev_hash: Vec::new(),
             sequence: 0,
+            cause_hash: None,
         }
     }
 

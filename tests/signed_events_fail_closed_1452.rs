@@ -77,6 +77,7 @@ fn missing_signature_fails_closed_unless_attest_level_unsigned() {
         "alice".to_string(),
         "memory_link.created".to_string(),
         now,
+        None,
     );
     assert!(
         row3.signature.is_some(),

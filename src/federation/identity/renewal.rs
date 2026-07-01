@@ -195,6 +195,8 @@ fn emit_renewal_audit(conn: &rusqlite::Connection, claims: &FederationCredential
         claims.subject_agent_id.clone(),
         crate::signed_events::event_types::FED_CREDENTIAL_RENEWED.to_string(),
         timestamp,
+        // v73 (#1822, G5a): no triggering cause bound on this path yet.
+        None,
     );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(target: crate::federation::SIGNING_TRACE_TARGET, error = %e,

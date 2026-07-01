@@ -2955,6 +2955,8 @@ pub fn undo_in_place_edit(
             .to_string(),
         crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
         Utc::now().to_rfc3339(),
+        // v73 (#1822, G5a): no triggering cause bound on this path yet.
+        None,
     );
     crate::signed_events::append_signed_event(conn, &event)?;
 
@@ -12944,6 +12946,8 @@ fn emit_pending_action_event(
         agent_id,
         event_type.to_string(),
         timestamp,
+        // v73 (#1822, G5a): no triggering cause bound on this path yet.
+        None,
     );
     if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
         tracing::warn!(

@@ -514,7 +514,7 @@ mod tests {
                  attest_level TEXT NOT NULL DEFAULT 'unsigned',
                  timestamp TEXT NOT NULL,
                  prev_hash BLOB,
-                 sequence INTEGER
+                 sequence INTEGER, cause_hash BLOB
              );",
         )
         .unwrap();
