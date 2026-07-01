@@ -8696,7 +8696,406 @@ async fn pg_append_signed_event_with_chain_in_tx(
     .execute(&mut **tx)
     .await?;
 
+    // Compute the just-written head row's canonical hash (exactly what the
+    // NEXT row's prev_hash would be) — shared by the #1850 watermark (item 7)
+    // and the #1822 dual-chain witness (item 6) below.
+    let head_view = crate::signed_events::SignedEvent {
+        id: id.to_string(),
+        agent_id: agent_id.to_string(),
+        event_type: event_type.to_string(),
+        payload_hash: payload_hash.to_vec(),
+        signature: signature.map(<[u8]>::to_vec),
+        attest_level: attest_level.to_string(),
+        timestamp: timestamp.to_rfc3339(),
+        prev_hash: Vec::new(),
+        sequence: next_seq,
+        cause_hash: cause_hash.map(<[u8]>::to_vec),
+    };
+    let mut head_hasher = Sha256::new();
+    head_hasher.update(canonical_chain_bytes(&head_view));
+    let head_hash_hex = crate::signed_events::hex_lower(head_hasher.finalize().as_slice());
+
+    // v0.8.1 #1850 (item 7, G5b) — POSTGRES WATERMARK PARITY. Stamp the head
+    // into the OFF-TABLE #697 forensic JSONL chain (throttled). Pre-G5b this
+    // was sqlite-only, so a postgres deployment's `TruncationCheck` was
+    // permanently `Unknown`; wiring it here closes that gap. The forensic
+    // write is a FILE write (never touches this pg tx), so it is safe
+    // fire-and-forget.
+    crate::governance::audit::maybe_record_audit_watermark(next_seq, &head_hash_hex);
+
+    // v0.9.0 G5b (#1822, item 6) — INDEPENDENT dual-chain audit-head witness
+    // anchor at the postgres chokepoint (parity with sqlite). Emitted in THIS
+    // tx so the witness lands atomically with the head it binds. Opt-in
+    // (no-op unless a witness key is enrolled). Unlike sqlite's swallow, a
+    // genuine DB error propagates: postgres aborts the tx on any statement
+    // error, so the atomic append fails rather than committing a half-written
+    // pair — the correct fail-closed posture.
+    pg_emit_audit_head_witness_in_tx(tx, next_seq, &head_hash_hex).await?;
+
     Ok(())
+}
+
+/// v0.9.0 G5b (#1822) — postgres twin of `signed_events`'
+/// `maybe_emit_audit_head_witness`. Throttled, opt-in emission of a signed
+/// dual-chain [`crate::models::ConditionType::AuditHeadWitness`] checkpoint in
+/// the caller's transaction. Cheap boundary pre-check FIRST (no key I/O off
+/// the hot path), then load the witness key, claim the slot (CAS), and INSERT
+/// the signed anchor.
+async fn pg_emit_audit_head_witness_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    signed_head_seq: i64,
+    signed_head_hash: &str,
+) -> Result<(), sqlx::Error> {
+    use crate::governance::audit as witness;
+    if !witness::witness_interval_reached(signed_head_seq) {
+        return Ok(());
+    }
+    let keypair = match witness::load_witness_signing_key() {
+        Ok(Some(kp)) => kp,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                "audit-witness key load failed (pg, swallowed): {e:#}"
+            );
+            return Ok(());
+        }
+    };
+    if !witness::witness_claim_slot(signed_head_seq, false) {
+        return Ok(());
+    }
+    let (mem_seq, mem_hash_hex) = pg_read_revision_head_in_tx(tx).await?;
+    let dual = witness::WitnessDualHead {
+        signed_head_sequence: signed_head_seq,
+        signed_head_hash: signed_head_hash.to_string(),
+        revisions_head_sequence: mem_seq,
+        revisions_head_hash: mem_hash_hex,
+    };
+    let now = chrono::Utc::now().timestamp();
+    let cp = witness::build_signed_witness_checkpoint(&dual, now, &keypair)
+        .map_err(|e| sqlx::Error::Encode(format!("audit-witness sign: {e:#}").into()))?;
+    sqlx::query(
+        "INSERT INTO checkpoints \
+            (id, namespace, title, condition_type, condition, state, created_by, \
+             resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+             created_at, deadline_at, resolved_at, metadata) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+    )
+    .bind(&cp.id)
+    .bind(&cp.namespace)
+    .bind(&cp.title)
+    .bind(cp.condition_type.as_str())
+    .bind(cp.condition.to_string())
+    .bind(cp.state.as_str())
+    .bind(&cp.created_by)
+    .bind(&cp.resolved_by)
+    .bind(&cp.resolution)
+    .bind(&cp.resolution_note)
+    .bind(&cp.signature)
+    .bind(&cp.resolver_pubkey)
+    .bind(cp.created_at)
+    .bind(cp.deadline_at)
+    .bind(cp.resolved_at)
+    .bind(cp.metadata.to_string())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// v0.9.0 G5b (#1822) — read the pg `memory_revisions` chain head as
+/// `(max_sequence, head_hash_hex)` for the dual-chain witness. `(0, hex(ZERO))`
+/// on an empty table. Mirrors [`pg_append_revision_leaf_in_tx`]'s head read.
+async fn pg_read_revision_head_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(i64, String), sqlx::Error> {
+    use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
+    use crate::signed_events::ZERO_HASH;
+    use sha2::{Digest, Sha256};
+    let head: Option<(
+        String,
+        String,
+        String,
+        Option<i64>,
+        String,
+        Option<String>,
+        String,
+        Option<Vec<u8>>,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                signature, sequence \
+         FROM memory_revisions \
+         ORDER BY sequence DESC \
+         LIMIT 1",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    match head {
+        None => Ok((0, crate::signed_events::hex_lower(&ZERO_HASH))),
+        Some((
+            h_id,
+            h_memory_id,
+            h_kind,
+            h_prior,
+            h_namespace,
+            h_agent,
+            h_created_at,
+            h_sig,
+            h_seq,
+        )) => {
+            let h_kind = crate::revisions::RecordKind::from_str_opt(&h_kind)
+                .ok_or(sqlx::Error::Decode("memory_revisions: unknown kind".into()))?;
+            let leaf = RevisionLeaf {
+                id: h_id,
+                memory_id: h_memory_id,
+                kind: h_kind,
+                prior_version: h_prior,
+                namespace: h_namespace,
+                agent_id: h_agent,
+                created_at: h_created_at,
+                signature: h_sig,
+            };
+            let canon = canonical_revision_chain_bytes(&leaf, h_seq);
+            let mut hasher = Sha256::new();
+            hasher.update(&canon);
+            Ok((
+                h_seq,
+                crate::signed_events::hex_lower(hasher.finalize().as_slice()),
+            ))
+        }
+    }
+}
+
+/// Row tuple for the postgres `verify_audit_trail` chain walk.
+type PgSignedEventWalkRow = (
+    String,
+    String,
+    String,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    String,
+    chrono::DateTime<chrono::Utc>,
+    Vec<u8>,
+    i64,
+    Option<Vec<u8>>,
+);
+
+impl PostgresStore {
+    /// v0.9.0 G5b (#1822, item 10 / GATE K3) — POSTGRES `verify_audit_trail`
+    /// TWIN. Surfaces IDENTICAL [`crate::signed_events::WitnessCheck`],
+    /// [`crate::signed_events::CauseBinding`], and
+    /// [`crate::signed_events::TruncationCheck`] verdicts to the sqlite
+    /// [`crate::signed_events::verify_audit_trail`] by reusing the SAME shared
+    /// verdict fns ([`crate::signed_events::compute_witness_verdict`] /
+    /// [`crate::signed_events::compute_cause_binding_verdict`]) and the SAME
+    /// off-table forensic watermark reader
+    /// ([`crate::governance::audit::last_audit_watermark`]) — only the DB
+    /// reads differ per backend, so BOTH backends surface identical audit
+    /// verdicts.
+    ///
+    /// # Errors
+    /// Propagates any pg query error (wrapped in [`StoreError`]) or a
+    /// malformed `since` timestamp.
+    #[allow(clippy::too_many_lines)]
+    pub async fn verify_audit_trail(
+        &self,
+        since: Option<&str>,
+    ) -> StoreResult<crate::signed_events::AuditTrailReport> {
+        use crate::signed_events::{
+            SignedEvent, TruncationCheck, ZERO_HASH, canonical_chain_bytes,
+        };
+        use sha2::{Digest, Sha256};
+
+        // Chain head (whole table, independent of the window).
+        let head_sequence: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) FROM signed_events WHERE sequence IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("verify_audit_trail.head", e))?;
+
+        // Off-table tail-truncation verdict — the SAME shared forensic reader
+        // the sqlite path uses (item 7 wired the pg chokepoint to stamp it).
+        let truncation = match crate::governance::audit::last_audit_watermark() {
+            Some((anchored_head, _)) => {
+                if head_sequence < anchored_head {
+                    TruncationCheck::Detected {
+                        anchored_head,
+                        db_head: head_sequence,
+                    }
+                } else {
+                    TruncationCheck::NotDetected
+                }
+            }
+            None => TruncationCheck::Unknown,
+        };
+
+        // Resolve the RFC3339 `since` to a sequence FLOOR (mirrors sqlite).
+        let floor: i64 = match since {
+            Some(ts) => {
+                let dt = chrono::DateTime::parse_from_rfc3339(ts)
+                    .map_err(|e| {
+                        to_store_err(
+                            "verify_audit_trail.since",
+                            sqlx::Error::Decode(format!("bad --since {ts}: {e}").into()),
+                        )
+                    })?
+                    .with_timezone(&chrono::Utc);
+                sqlx::query_scalar(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM signed_events \
+                     WHERE sequence IS NOT NULL AND timestamp < $1",
+                )
+                .bind(dt)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| to_store_err("verify_audit_trail.floor", e))?
+            }
+            None => 0,
+        };
+
+        // Expected prev_hash for the first in-window row: ZERO_HASH at floor 0,
+        // else the canonical hash of the row AT the floor (so the boundary link
+        // is CHECKED, not assumed — parity with sqlite verify_chain).
+        let mut expected_prev: Vec<u8> = if floor == 0 {
+            ZERO_HASH.to_vec()
+        } else {
+            let floor_row: Option<PgSignedEventWalkRow> = sqlx::query_as(
+                "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                        timestamp, prev_hash, sequence, cause_hash \
+                 FROM signed_events WHERE sequence = $1",
+            )
+            .bind(floor)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_audit_trail.floor_row", e))?;
+            match floor_row {
+                Some((id, agent, etype, ph, sig, attest, ts, _prev, seq, cause)) => {
+                    let ev = SignedEvent {
+                        id,
+                        agent_id: agent,
+                        event_type: etype,
+                        payload_hash: ph,
+                        signature: sig,
+                        attest_level: attest,
+                        timestamp: ts.to_rfc3339(),
+                        prev_hash: Vec::new(),
+                        sequence: seq,
+                        cause_hash: cause,
+                    };
+                    let mut h = Sha256::new();
+                    h.update(canonical_chain_bytes(&ev));
+                    h.finalize().to_vec()
+                }
+                None => ZERO_HASH.to_vec(),
+            }
+        };
+
+        // Walk `sequence > floor` for the chain link + contiguity + gaps.
+        let rows: Vec<PgSignedEventWalkRow> = sqlx::query_as(
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, prev_hash, sequence, cause_hash \
+             FROM signed_events WHERE sequence IS NOT NULL AND sequence > $1 \
+             ORDER BY sequence ASC",
+        )
+        .bind(floor)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("verify_audit_trail.walk", e))?;
+
+        let total_events = rows.len();
+        let mut chain_intact = true;
+        let mut first_break_sequence: Option<i64> = None;
+        let mut sequence_gaps: Vec<(i64, i64)> = Vec::new();
+        let mut expected_seq = floor + 1;
+        for (id, agent, etype, ph, sig, attest, ts, prev_hash, seq, cause) in rows {
+            if seq > expected_seq {
+                sequence_gaps.push((expected_seq, seq - 1));
+            }
+            if prev_hash != expected_prev && first_break_sequence.is_none() {
+                chain_intact = false;
+                first_break_sequence = Some(seq);
+            }
+            let ev = SignedEvent {
+                id,
+                agent_id: agent,
+                event_type: etype,
+                payload_hash: ph,
+                signature: sig,
+                attest_level: attest,
+                timestamp: ts.to_rfc3339(),
+                prev_hash: Vec::new(),
+                sequence: seq,
+                cause_hash: cause,
+            };
+            let mut h = Sha256::new();
+            h.update(canonical_chain_bytes(&ev));
+            expected_prev = h.finalize().to_vec();
+            expected_seq = seq + 1;
+        }
+
+        // Surviving memory_revisions head (the second witnessed chain).
+        let revisions_head: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM memory_revisions")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| to_store_err("verify_audit_trail.rev_head", e))?;
+
+        // Cause-binding coverage scan.
+        let rows_without_cause: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signed_events WHERE cause_hash IS NULL AND sequence IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| to_store_err("verify_audit_trail.cause_scan", e))?;
+
+        // Latest audit-head witness checkpoint (newest by resolved_at).
+        let witness_cp: Option<crate::models::Checkpoint> = {
+            let row_opt = sqlx::query(
+                "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                        resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                        created_at, deadline_at, resolved_at, metadata \
+                 FROM checkpoints WHERE namespace = $1 AND condition_type = $2 \
+                 ORDER BY resolved_at DESC NULLS LAST, created_at DESC LIMIT 1",
+            )
+            .bind(crate::governance::audit::WITNESS_CHECKPOINT_NAMESPACE)
+            .bind(crate::models::ConditionType::AuditHeadWitness.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_audit_trail.witness", e))?;
+            match row_opt {
+                Some(r) => Some(pg_row_to_checkpoint(&r)?),
+                None => None,
+            }
+        };
+
+        // SHARED verdict fns → IDENTICAL verdicts to sqlite (K3).
+        let require_witness = crate::governance::audit::require_witness_enabled();
+        let require_cause = crate::governance::audit::require_cause_binding_enabled();
+        let enrolled = crate::governance::audit::load_enrolled_witness_pubkey()
+            .ok()
+            .flatten();
+        let witness = crate::signed_events::compute_witness_verdict(
+            witness_cp.as_ref(),
+            enrolled.as_ref(),
+            head_sequence,
+            revisions_head,
+            require_witness,
+        );
+        let cause_binding =
+            crate::signed_events::compute_cause_binding_verdict(rows_without_cause, require_cause);
+
+        Ok(crate::signed_events::AuditTrailReport {
+            total_events,
+            chain_intact,
+            first_break_sequence,
+            sequence_gaps,
+            head_sequence,
+            since: since.map(ToString::to_string),
+            truncation,
+            witness,
+            cause_binding,
+        })
+    }
 }
 
 /// Caller-supplied IDENTITY-ONLY fields for

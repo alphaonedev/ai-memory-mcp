@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 /// column).
 ///
 /// The canonical wire/DB spellings are
-/// `approval | external_signal | condition_predicate | deadline`. The set
-/// is enforced by the SAL layer (not a SQL CHECK, so a future type needs no
-/// migration). Defaults to [`ConditionType::Approval`].
+/// `approval | external_signal | condition_predicate | deadline |
+/// audit_head_witness`. The set is enforced by the SAL layer (not a SQL
+/// CHECK, so a future type needs no migration). Defaults to
+/// [`ConditionType::Approval`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConditionType {
@@ -29,6 +30,16 @@ pub enum ConditionType {
     ConditionPredicate,
     /// Resolved (as expired) when a deadline passes.
     Deadline,
+    /// v0.9.0 G5b (#1822) — an INDEPENDENT audit-head witness anchor.
+    /// Not a coordination gate: the substrate itself emits (and
+    /// immediately resolves) one of these, signed by the DISTINCT
+    /// audit-witness key, on every `WATERMARK_INTERVAL` boundary of the
+    /// `signed_events` append chokepoint. Its `resolution` carries the
+    /// dual-chain head (both `signed_events` and `memory_revisions`
+    /// `MAX(sequence)` + head hash) so `verify_audit_trail` can pin the
+    /// witness pubkey (K1) and detect tail-truncation of EITHER chain
+    /// against an anchor a `DELETE FROM signed_events` does not touch.
+    AuditHeadWitness,
 }
 
 impl ConditionType {
@@ -40,6 +51,7 @@ impl ConditionType {
             Self::ExternalSignal => "external_signal",
             Self::ConditionPredicate => "condition_predicate",
             Self::Deadline => "deadline",
+            Self::AuditHeadWitness => "audit_head_witness",
         }
     }
 
@@ -51,6 +63,7 @@ impl ConditionType {
             "external_signal" => Some(Self::ExternalSignal),
             "condition_predicate" => Some(Self::ConditionPredicate),
             "deadline" => Some(Self::Deadline),
+            "audit_head_witness" => Some(Self::AuditHeadWitness),
             _ => None,
         }
     }
@@ -140,6 +153,7 @@ mod tests {
             ConditionType::ExternalSignal,
             ConditionType::ConditionPredicate,
             ConditionType::Deadline,
+            ConditionType::AuditHeadWitness,
         ] {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }

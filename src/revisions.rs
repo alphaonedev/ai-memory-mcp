@@ -266,7 +266,12 @@ pub fn canonical_revision_chain_bytes(leaf: &RevisionLeaf, sequence: i64) -> Vec
 /// Read the `memory_revisions` chain head — `(max_sequence,
 /// prev_canonical_hash)`. Returns `(0, ZERO_HASH)` on an empty table.
 /// Mirrors [`crate::signed_events`]' `read_chain_head`.
-fn read_revision_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
+///
+/// v0.9.0 G5b (#1822) — `pub` so the audit-head witness emitter
+/// ([`crate::governance::audit`]) can bind the `memory_revisions` head into
+/// the dual-chain [`crate::models::ConditionType::AuditHeadWitness`] anchor
+/// alongside the `signed_events` head.
+pub fn read_revision_chain_head(conn: &Connection) -> Result<(i64, [u8; 32])> {
     let head: Option<(
         String,
         String,
