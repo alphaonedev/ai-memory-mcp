@@ -306,19 +306,31 @@ pub(crate) struct PretoolDecision {
     permission: &'static str,
     /// Human-facing `permissionDecisionReason` (`<rule_id> — <reason>`).
     reason: String,
+    /// v0.9.0 G9 (#1826) — ADVISORY / FORENSIC stopper signature (url-safe-
+    /// no-pad base64 of the stopper-signed `GovernanceEnforcement` resolution),
+    /// present ONLY on a `deny` when a stopper key is enrolled. This is NOT the
+    /// enforcement: the `deny` above is produced BEFORE and INDEPENDENT of any
+    /// stopper signing (C5), so an unsigned `deny` still blocks. `None` →
+    /// `to_cc_json` is byte-identical to the legacy output (opt-in).
+    stopper_sig: Option<String>,
 }
 
 impl PretoolDecision {
     /// Render the Claude Code PreToolUse `hookSpecificOutput` JSON that, on
     /// stdout with exit 0, drives the harness decision.
     fn to_cc_json(&self) -> Value {
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": self.permission,
-                "permissionDecisionReason": self.reason,
-            }
-        })
+        let mut hook = serde_json::json!({
+            "hookEventName": "PreToolUse",
+            "permissionDecision": self.permission,
+            "permissionDecisionReason": self.reason,
+        });
+        // Additive: the advisory stopper signature is attached only when a
+        // stopper key is enrolled; when absent the object is byte-identical to
+        // the legacy three-key shape (#1826 opt-in).
+        if let Some(sig) = &self.stopper_sig {
+            hook["stopperSig"] = Value::String(sig.clone());
+        }
+        serde_json::json!({ "hookSpecificOutput": hook })
     }
 }
 
@@ -400,22 +412,75 @@ pub(crate) fn decide_pretool_event(
         .and_then(Value::as_str)
         .unwrap_or("?");
 
-    let mapped = match verdict {
+    let mut mapped = match verdict {
         // Refuse + Escalate both block the action (Escalate fails closed
         // pending human review; the harness "deny" is the closest contract).
         "refuse" | "escalate" => Some(PretoolDecision {
             permission: "deny",
             reason: format!("{rule_id} — {reason}"),
+            stopper_sig: None,
         }),
         // Warn surfaces to the human via the harness "ask" decision.
         "warn" => Some(PretoolDecision {
             permission: "ask",
             reason: format!("{rule_id} — {reason}"),
+            stopper_sig: None,
         }),
         // Allow (and any unknown verdict) → pass through.
         _ => None,
     };
+    // v0.9.0 G9 (#1826), C5 — the `deny` above is FULLY FORMED and returned
+    // regardless of what follows: the stopper enforcement anchor + advisory
+    // signature are a strictly-additive, best-effort side effect that NEVER
+    // suppresses the deny. Both are gated on stopper enrollment, so the wire
+    // JSON is byte-identical to legacy when no stopper key is enrolled.
+    if let Some(d) = mapped.as_mut() {
+        if d.permission == "deny" {
+            d.stopper_sig =
+                emit_stopper_enforcement(conn, agent_id, kind, &action, rule_id, reason);
+        }
+    }
     Ok(mapped)
+}
+
+/// v0.9.0 G9 (#1826) — emit a stopper-signed `GovernanceEnforcement`
+/// checkpoint for a dispatched `deny` and return the advisory/forensic
+/// signature (url-safe-no-pad base64) to embed as `stopperSig`. Returns `None`
+/// when no stopper key is enrolled OR on any failure — the caller's `deny` is
+/// already fully formed and is NEVER suppressed by this (C5). Best-effort: a
+/// checkpoint-insert failure is logged and swallowed.
+fn emit_stopper_enforcement(
+    conn: &rusqlite::Connection,
+    agent_id: &str,
+    kind: &str,
+    action: &crate::governance::agent_action::AgentAction,
+    rule_id: &str,
+    reason: &str,
+) -> Option<String> {
+    use base64::Engine as _;
+    let keypair = crate::governance::audit::load_stopper_signing_key()
+        .ok()
+        .flatten()?;
+    let action_bytes = action.canonical_bytes().ok()?;
+    let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
+    let now = chrono::Utc::now().timestamp();
+    let cp = crate::governance::audit::build_signed_enforcement_checkpoint(
+        agent_id,
+        kind,
+        &action_hash,
+        "deny",
+        rule_id,
+        reason,
+        now,
+        &keypair,
+    )
+    .ok()?;
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&cp.signature);
+    if let Err(e) = crate::checkpoints::insert(conn, &cp) {
+        // Advisory anchor only — the deny already stands (C5).
+        tracing::warn!("stopper enforcement checkpoint insert failed (swallowed): {e:#}");
+    }
+    Some(sig_b64)
 }
 
 /// `--from-pretool-stdin` entry: read the PreToolUse event off stdin, decide,
@@ -474,6 +539,9 @@ fn run_from_pretool_stdin(
                         "governance subsystem error (fail-closed); set \
                          AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR=1 to allow on error: {e}"
                     ),
+                    // Infra-error fail-closed deny — no DB/conn to sign an
+                    // enforcement anchor against; the deny stands unsigned (C5).
+                    stopper_sig: None,
                 };
                 writeln!(out.stdout, "{}", serde_json::to_string(&deny.to_cc_json())?)?;
             }

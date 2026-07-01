@@ -340,6 +340,16 @@ pub fn init(dir: &Path, signing_key: Option<SigningKey>) -> Result<()> {
     if let Some(key) = signing_key.as_ref() {
         let _ = DAEMON_AUDIT_KEY.set(key.clone());
     }
+    // v0.9.0 G9 (#1826) — co-install the process-static RECORDER signer
+    // alongside the daemon key so the per-row recorder signature stays off the
+    // key-file I/O path (mirrors DAEMON_AUDIT_KEY). Opt-in: absent recorder key
+    // → RECORDER_KEY stays empty → try_sign_recorder_payload returns None →
+    // emit falls back to the daemon signer (byte-identical legacy).
+    if let Ok(Some(kp)) = load_recorder_signing_key() {
+        if let Some(sk) = kp.private {
+            let _ = RECORDER_KEY.set(sk);
+        }
+    }
     let new_sink = ForensicSink {
         dir: dir.to_path_buf(),
         last_hash,
@@ -1178,6 +1188,452 @@ pub fn load_enrolled_witness_pubkey() -> Result<Option<VerifyingKey>> {
         Ok(kp) => Ok(Some(kp.public)),
         Err(_) => Ok(None),
     }
+}
+
+// ===========================================================================
+// v0.9.0 G9 (#1826) — three-key Recorder / Judge / Stopper signing-layer
+// separation of the three governance roles.
+// ===========================================================================
+//
+// # Capability manifest — what this signing-layer separation IS and IS NOT
+//
+// Before G9 a SINGLE process-wide daemon key was the entire governance TCB:
+// the same key RECORDED the audit row, signed the JUDGE verdict, and
+// authorised the STOPPER enforcement. G9 splits those three duties across
+// three DISTINCT, separately-enrolled Ed25519 keys so no single key file can
+// forge all three roles:
+//
+// - RECORDER — signs each `signed_events` governance row over the
+//   domain-separated preimage `DOMAIN_RECORDER || signing_input_bytes(
+//   payload_hash, cause_hash)` ([`try_sign_recorder_payload`]); verified
+//   per-row against the enrolled [`RECORDER_PUBKEY_ENV`] pubkey.
+// - JUDGE — signs a [`crate::models::ConditionType::GovernanceVerdict`]
+//   checkpoint on EVERY governed verdict (allow AND block); K1-pinned to
+//   [`JUDGE_PUBKEY_ENV`].
+// - STOPPER — signs a [`crate::models::ConditionType::GovernanceEnforcement`]
+//   checkpoint on a PreToolUse deny; K1-pinned to [`STOPPER_PUBKEY_ENV`].
+//
+// WHAT THIS IS: signing-layer separation-of-duties (SoD). It defends against
+// theft of a SINGLE role's key FILE — a stolen recorder key cannot forge a
+// judge verdict (wrong pin) and a stolen judge key cannot forge a recorder
+// row (wrong domain + pin). Additive + opt-in: with NO role keys enrolled the
+// substrate is byte-identical to the legacy single-key posture.
+//
+// WHAT THIS IS NOT (explicit scope disclaimers):
+// - NOT a BFT / consensus protocol — there is no quorum, no view-change, no
+//   tolerance of a malicious majority.
+// - NOT an HSM / secure-enclave integration — keys are Ed25519 files on disk
+//   under separate custody dirs, not hardware-sealed.
+// - NOT M-of-N threshold signing — each role is a single key, not a
+//   k-of-n share set.
+// - NOT a `governance.halt` / kill-switch — G9 attests duties, it does not
+//   stop the process.
+// - INTRA-PROCESS KEY CO-LOCATION: the recorder key is loaded into a
+//   process-static [`RECORDER_KEY`] at [`init`], so all three roles' key
+//   MATERIAL may be readable by the SAME compromised process. The SoD defends
+//   single-key-FILE theft (distinct custody mounts), NOT full process
+//   compromise (an attacker who owns the process address space can read every
+//   loaded key). Physical custody separation (a read-only witness/role mount)
+//   is the operational control for the file-theft threat.
+// - The STOPPER signature (`stopperSig`) embedded in the PreToolUse output is
+//   ADVISORY / FORENSIC ONLY. The runtime `deny` is produced BEFORE and
+//   INDEPENDENT of any stopper signing (a signing failure never suppresses a
+//   deny); an UNSIGNED deny is the actual runtime enforcement.
+
+/// Env override for the RECORDER PRIVATE-key custody directory.
+pub const RECORDER_KEY_DIR_ENV: &str = "AI_MEMORY_RECORDER_KEY_DIR";
+/// Env carrying the OUT-OF-BAND enrolled RECORDER PUBLIC key (K1 pin
+/// authority; URL-safe-no-pad base64 of the 32 raw verifying-key bytes).
+pub const RECORDER_PUBKEY_ENV: &str = "AI_MEMORY_RECORDER_PUBKEY";
+/// Reserved keypair label the recorder key files are stored under.
+pub const RECORDER_KEY_LABEL: &str = "governance-recorder";
+/// Default custody sub-directory (under `<config>/ai-memory/`) for the
+/// recorder key when [`RECORDER_KEY_DIR_ENV`] is unset.
+const RECORDER_KEY_SUBDIR: &str = "recorder-keys";
+
+/// Env override for the JUDGE PRIVATE-key custody directory.
+pub const JUDGE_KEY_DIR_ENV: &str = "AI_MEMORY_JUDGE_KEY_DIR";
+/// Env carrying the OUT-OF-BAND enrolled JUDGE PUBLIC key (K1 pin authority).
+pub const JUDGE_PUBKEY_ENV: &str = "AI_MEMORY_JUDGE_PUBKEY";
+/// Reserved keypair label the judge key files are stored under.
+pub const JUDGE_KEY_LABEL: &str = "governance-judge";
+/// Default custody sub-directory for the judge key.
+const JUDGE_KEY_SUBDIR: &str = "judge-keys";
+
+/// Env override for the STOPPER PRIVATE-key custody directory.
+pub const STOPPER_KEY_DIR_ENV: &str = "AI_MEMORY_STOPPER_KEY_DIR";
+/// Env carrying the OUT-OF-BAND enrolled STOPPER PUBLIC key (K1 pin authority).
+pub const STOPPER_PUBKEY_ENV: &str = "AI_MEMORY_STOPPER_PUBKEY";
+/// Reserved keypair label the stopper key files are stored under.
+pub const STOPPER_KEY_LABEL: &str = "governance-stopper";
+/// Default custody sub-directory for the stopper key.
+const STOPPER_KEY_SUBDIR: &str = "stopper-keys";
+
+/// Env that flips role-separation verification to FAIL-CLOSED: when set
+/// truthy, `verify_audit_trail` treats a MISSING / unpinnable role-separation
+/// posture as DIRTY ([`crate::signed_events::RoleSeparationCheck::Missing`])
+/// instead of withholding judgement (`Unknown`). Default `false`.
+pub const REQUIRE_ROLE_SEPARATION_ENV: &str = "AI_MEMORY_REQUIRE_ROLE_SEPARATION";
+
+/// Domain-separation tag folded into the RECORDER row signing preimage so a
+/// recorder signature can never be replayed as (or forged from) a daemon /
+/// judge / stopper signature over the same `payload_hash`. Trailing 0x1F unit
+/// separator keeps the concatenation unambiguous.
+pub const DOMAIN_RECORDER: &[u8] = b"ai-memory:gov-recorder:v1\x1f";
+
+/// Process-static RECORDER signing key, installed once by [`init`] (co-located
+/// with [`DAEMON_AUDIT_KEY`]) so the per-row recorder signature stays off the
+/// key-file I/O path. Empty until a recorder key is enrolled (opt-in).
+static RECORDER_KEY: OnceLock<SigningKey> = OnceLock::new();
+
+/// K2 — `true` when `AI_MEMORY_REQUIRE_ROLE_SEPARATION` is set truthy.
+#[must_use]
+pub fn require_role_separation_enabled() -> bool {
+    env_flag_enabled(REQUIRE_ROLE_SEPARATION_ENV)
+}
+
+/// Resolve a role custody directory: the `dir_env` override when set +
+/// non-empty, else `<config>/ai-memory/<subdir>/`. Shared by the three role
+/// triplets (mirrors [`witness_key_dir`]).
+fn role_key_dir(dir_env: &str, subdir: &str) -> Result<PathBuf> {
+    if let Ok(v) = std::env::var(dir_env) {
+        if !v.is_empty() {
+            return Ok(PathBuf::from(v));
+        }
+    }
+    let base = dirs::config_dir()
+        .ok_or_else(|| anyhow!("OS did not advertise a config directory for role-key storage"))?;
+    Ok(base.join("ai-memory").join(subdir))
+}
+
+/// Load a role SIGNING keypair from its custody dir. `Ok(None)` when no key is
+/// enrolled or only a public-only key is present. Mirrors
+/// [`load_witness_signing_key`].
+fn load_role_signing_key(
+    dir_env: &str,
+    subdir: &str,
+    label: &str,
+) -> Result<Option<crate::identity::keypair::AgentKeypair>> {
+    let dir = role_key_dir(dir_env, subdir)?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    match crate::identity::keypair::load(label, &dir) {
+        Ok(kp) if kp.can_sign() => Ok(Some(kp)),
+        Ok(_) => Ok(None),
+        Err(e) => {
+            if !signing_key_load_is_absent(&e) {
+                tracing::warn!(label, error = %e, "role signing key present but unloadable");
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// Load the OUT-OF-BAND enrolled role VERIFYING key (K1 pin). Precedence:
+/// `pubkey_env` URL-safe-no-pad base64 (highest), then the `<label>.pub` file
+/// in the custody dir. Mirrors [`load_enrolled_witness_pubkey`].
+fn load_enrolled_role_pubkey(
+    pubkey_env: &str,
+    dir_env: &str,
+    subdir: &str,
+    label: &str,
+) -> Result<Option<VerifyingKey>> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    if let Ok(v) = std::env::var(pubkey_env) {
+        let v = v.trim();
+        if !v.is_empty() {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(v.as_bytes())
+                .with_context(|| format!("decode {pubkey_env} (expect url-safe-no-pad base64)"))?;
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow!("{pubkey_env} decoded to {} bytes, expected 32", bytes.len())
+            })?;
+            let vk = VerifyingKey::from_bytes(&arr)
+                .with_context(|| format!("{pubkey_env} is not a valid Ed25519 verifying key"))?;
+            return Ok(Some(vk));
+        }
+    }
+    let dir = role_key_dir(dir_env, subdir)?;
+    if !dir.exists() {
+        return Ok(None);
+    }
+    match crate::identity::keypair::load(label, &dir) {
+        Ok(kp) => Ok(Some(kp.public)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Load the RECORDER signing keypair. `Ok(None)` when unenrolled (opt-in).
+///
+/// # Errors
+/// The recorder key dir cannot be resolved.
+pub fn load_recorder_signing_key() -> Result<Option<crate::identity::keypair::AgentKeypair>> {
+    load_role_signing_key(
+        RECORDER_KEY_DIR_ENV,
+        RECORDER_KEY_SUBDIR,
+        RECORDER_KEY_LABEL,
+    )
+}
+
+/// Load the OUT-OF-BAND enrolled RECORDER verifying key (K1 pin authority).
+///
+/// # Errors
+/// Dir cannot be resolved, or [`RECORDER_PUBKEY_ENV`] is set but not valid.
+pub fn load_enrolled_recorder_pubkey() -> Result<Option<VerifyingKey>> {
+    load_enrolled_role_pubkey(
+        RECORDER_PUBKEY_ENV,
+        RECORDER_KEY_DIR_ENV,
+        RECORDER_KEY_SUBDIR,
+        RECORDER_KEY_LABEL,
+    )
+}
+
+/// Load the JUDGE signing keypair. `Ok(None)` when unenrolled (opt-in).
+///
+/// # Errors
+/// The judge key dir cannot be resolved.
+pub fn load_judge_signing_key() -> Result<Option<crate::identity::keypair::AgentKeypair>> {
+    load_role_signing_key(JUDGE_KEY_DIR_ENV, JUDGE_KEY_SUBDIR, JUDGE_KEY_LABEL)
+}
+
+/// Load the OUT-OF-BAND enrolled JUDGE verifying key (K1 pin authority).
+///
+/// # Errors
+/// Dir cannot be resolved, or [`JUDGE_PUBKEY_ENV`] is set but not valid.
+pub fn load_enrolled_judge_pubkey() -> Result<Option<VerifyingKey>> {
+    load_enrolled_role_pubkey(
+        JUDGE_PUBKEY_ENV,
+        JUDGE_KEY_DIR_ENV,
+        JUDGE_KEY_SUBDIR,
+        JUDGE_KEY_LABEL,
+    )
+}
+
+/// Load the STOPPER signing keypair. `Ok(None)` when unenrolled (opt-in).
+///
+/// # Errors
+/// The stopper key dir cannot be resolved.
+pub fn load_stopper_signing_key() -> Result<Option<crate::identity::keypair::AgentKeypair>> {
+    load_role_signing_key(STOPPER_KEY_DIR_ENV, STOPPER_KEY_SUBDIR, STOPPER_KEY_LABEL)
+}
+
+/// Load the OUT-OF-BAND enrolled STOPPER verifying key (K1 pin authority).
+///
+/// # Errors
+/// Dir cannot be resolved, or [`STOPPER_PUBKEY_ENV`] is set but not valid.
+pub fn load_enrolled_stopper_pubkey() -> Result<Option<VerifyingKey>> {
+    load_enrolled_role_pubkey(
+        STOPPER_PUBKEY_ENV,
+        STOPPER_KEY_DIR_ENV,
+        STOPPER_KEY_SUBDIR,
+        STOPPER_KEY_LABEL,
+    )
+}
+
+/// The domain-separated RECORDER row signing preimage:
+/// `DOMAIN_RECORDER || signing_input_bytes(payload_hash, cause_hash)`.
+/// C1 — the cause-fold is PRESERVED (a cause-bound row commits to both the
+/// payload and the triggering cause). Shared by [`try_sign_recorder_payload`]
+/// (signing) and `verify_chain` (verification) so the two never drift.
+#[must_use]
+pub(crate) fn recorder_signing_preimage(payload_hash: &[u8], cause_hash: Option<&[u8]>) -> Vec<u8> {
+    let inner = crate::signed_events::signing_input_bytes(payload_hash, cause_hash);
+    let mut out = Vec::with_capacity(DOMAIN_RECORDER.len() + inner.len());
+    out.extend_from_slice(DOMAIN_RECORDER);
+    out.extend_from_slice(&inner);
+    out
+}
+
+/// Sign a governance row's `(payload_hash, cause_hash)` with the process-static
+/// RECORDER key when one is enrolled. Returns `None` when no recorder key is
+/// installed — the caller then falls back to the daemon signer (byte-identical
+/// legacy). Mirrors [`try_sign_audit_payload`] but over the domain-separated
+/// recorder preimage.
+#[must_use]
+pub fn try_sign_recorder_payload(
+    payload_hash: &[u8],
+    cause_hash: Option<&[u8]>,
+) -> Option<(Vec<u8>, &'static str)> {
+    let key = RECORDER_KEY.get()?;
+    let preimage = recorder_signing_preimage(payload_hash, cause_hash);
+    let sig: Signature = key.sign(&preimage);
+    Some((
+        sig.to_bytes().to_vec(),
+        crate::models::AttestLevel::RecorderSigned.as_str(),
+    ))
+}
+
+/// `true` when a process-wide RECORDER signing key is installed (tests +
+/// diagnostics).
+#[must_use]
+pub fn recorder_key_installed() -> bool {
+    RECORDER_KEY.get().is_some()
+}
+
+// --- PASS 2: judge-verdict + stopper-enforcement checkpoint builders --------
+
+/// `checkpoints.namespace` for JUDGE governance-verdict anchors.
+pub const GOVERNANCE_VERDICT_NAMESPACE: &str = "_governance_verdict";
+/// `checkpoints.namespace` for STOPPER governance-enforcement anchors.
+pub const GOVERNANCE_ENFORCEMENT_NAMESPACE: &str = "_governance_enforcement";
+/// `checkpoints.title` stamped on a judge governance-verdict anchor.
+const GOVERNANCE_VERDICT_TITLE: &str = "governance verdict";
+/// `checkpoints.title` stamped on a stopper governance-enforcement anchor.
+const GOVERNANCE_ENFORCEMENT_TITLE: &str = "governance enforcement";
+/// `created_by` / `resolved_by` pseudo-actor for judge anchors.
+pub const JUDGE_RESOLVED_BY: &str = "governance:judge";
+/// `created_by` / `resolved_by` pseudo-actor for stopper anchors.
+pub const STOPPER_RESOLVED_BY: &str = "governance:stopper";
+/// Schema version embedded in the verdict / enforcement `resolution` JSON.
+const ROLE_RESOLUTION_VERSION: i64 = 1;
+
+/// Lowercase-hex SHA-256 of the canonical action bytes — the JOIN key that
+/// binds a judge verdict / stopper enforcement anchor to the action it judged
+/// (C4). One definition so both builders + both verify backends agree.
+#[must_use]
+pub fn action_hash_hex(canonical_action: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(canonical_action);
+    crate::signed_events::hex_lower(&h.finalize())
+}
+
+/// Versioned JUDGE verdict `resolution` wire shape. Field order = declaration
+/// order → deterministic serialisation, so the judge signature commits to a
+/// stable byte layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VerdictResolutionWire {
+    v: i64,
+    agent_id: String,
+    action_kind: String,
+    action_hash: String,
+    verdict: String,
+    rule_id: String,
+    reason: String,
+}
+
+/// Versioned STOPPER enforcement `resolution` wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnforcementResolutionWire {
+    v: i64,
+    agent_id: String,
+    action_kind: String,
+    action_hash: String,
+    permission: String,
+    rule_id: String,
+    reason: String,
+}
+
+/// Build + SIGN a resolved [`crate::models::ConditionType::GovernanceVerdict`]
+/// checkpoint binding the judged verdict tuple, signed by the judge `keypair`.
+/// Clone of [`build_signed_witness_checkpoint`].
+///
+/// # Errors
+/// Propagates the [`crate::checkpoints::sign_resolution_into`] error.
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_verdict_checkpoint(
+    agent_id: &str,
+    action_kind: &str,
+    action_hash: &str,
+    verdict: &str,
+    rule_id: &str,
+    reason: &str,
+    now: i64,
+    keypair: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::models::Checkpoint> {
+    let wire = VerdictResolutionWire {
+        v: ROLE_RESOLUTION_VERSION,
+        agent_id: agent_id.to_string(),
+        action_kind: action_kind.to_string(),
+        action_hash: action_hash.to_string(),
+        verdict: verdict.to_string(),
+        rule_id: rule_id.to_string(),
+        reason: reason.to_string(),
+    };
+    build_signed_role_checkpoint(
+        crate::models::ConditionType::GovernanceVerdict,
+        GOVERNANCE_VERDICT_NAMESPACE,
+        GOVERNANCE_VERDICT_TITLE,
+        JUDGE_RESOLVED_BY,
+        &serde_json::to_string(&wire).unwrap_or_default(),
+        now,
+        keypair,
+    )
+}
+
+/// Build + SIGN a resolved
+/// [`crate::models::ConditionType::GovernanceEnforcement`] checkpoint binding
+/// the enforcement tuple, signed by the stopper `keypair`. Clone of
+/// [`build_signed_witness_checkpoint`].
+///
+/// # Errors
+/// Propagates the [`crate::checkpoints::sign_resolution_into`] error.
+#[allow(clippy::too_many_arguments)]
+pub fn build_signed_enforcement_checkpoint(
+    agent_id: &str,
+    action_kind: &str,
+    action_hash: &str,
+    permission: &str,
+    rule_id: &str,
+    reason: &str,
+    now: i64,
+    keypair: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::models::Checkpoint> {
+    let wire = EnforcementResolutionWire {
+        v: ROLE_RESOLUTION_VERSION,
+        agent_id: agent_id.to_string(),
+        action_kind: action_kind.to_string(),
+        action_hash: action_hash.to_string(),
+        permission: permission.to_string(),
+        rule_id: rule_id.to_string(),
+        reason: reason.to_string(),
+    };
+    build_signed_role_checkpoint(
+        crate::models::ConditionType::GovernanceEnforcement,
+        GOVERNANCE_ENFORCEMENT_NAMESPACE,
+        GOVERNANCE_ENFORCEMENT_TITLE,
+        STOPPER_RESOLVED_BY,
+        &serde_json::to_string(&wire).unwrap_or_default(),
+        now,
+        keypair,
+    )
+}
+
+/// Shared builder for a resolved role-separation checkpoint (verdict or
+/// enforcement) — mirrors [`build_signed_witness_checkpoint`]'s body once so
+/// the two role builders never drift.
+fn build_signed_role_checkpoint(
+    condition_type: crate::models::ConditionType,
+    namespace: &str,
+    title: &str,
+    resolved_by: &str,
+    resolution_json: &str,
+    now: i64,
+    keypair: &crate::identity::keypair::AgentKeypair,
+) -> Result<crate::models::Checkpoint> {
+    use crate::models::CheckpointState;
+    let mut cp = crate::models::Checkpoint {
+        id: uuid::Uuid::new_v4().to_string(),
+        namespace: namespace.to_string(),
+        title: title.to_string(),
+        condition_type,
+        condition: serde_json::Value::Null,
+        state: CheckpointState::Resolved,
+        created_by: resolved_by.to_string(),
+        resolved_by: Some(resolved_by.to_string()),
+        resolution: Some(resolution_json.to_string()),
+        resolution_note: None,
+        signature: Vec::new(),
+        resolver_pubkey: Vec::new(),
+        created_at: now,
+        deadline_at: None,
+        resolved_at: Some(now),
+        metadata: serde_json::Value::Null,
+    };
+    crate::checkpoints::sign_resolution_into(&mut cp, keypair)
+        .context("sign role-separation checkpoint resolution")?;
+    Ok(cp)
 }
 
 /// `true` when the `signed_events` head has advanced at least

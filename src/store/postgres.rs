@@ -9166,6 +9166,18 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("verify_audit_trail.walk", e))?;
 
+        // v0.9.0 G9 (#1826), C7 — per-row Ed25519 verification, which the pg
+        // twin did ZERO of before. Resolve the daemon + recorder verifiers once
+        // and classify each row with the SHARED
+        // [`crate::signed_events::classify_row_signature`] so BOTH backends
+        // surface IDENTICAL signature_failures + role_separation_failures (K3).
+        let daemon_verifier = crate::governance::audit::resolve_daemon_verifying_key();
+        let recorder_verifier = crate::governance::audit::load_enrolled_recorder_pubkey()
+            .ok()
+            .flatten();
+        let mut signature_failures: Vec<i64> = Vec::new();
+        let mut role_separation_failures: Vec<i64> = Vec::new();
+
         let total_events = rows.len();
         let mut chain_intact = true;
         let mut first_break_sequence: Option<i64> = None;
@@ -9191,6 +9203,17 @@ impl PostgresStore {
                 sequence: seq,
                 cause_hash: cause,
             };
+            let rv = crate::signed_events::classify_row_signature(
+                &ev,
+                daemon_verifier.as_ref(),
+                recorder_verifier.as_ref(),
+            );
+            if rv.signature_failure {
+                signature_failures.push(seq);
+            }
+            if rv.role_separation_failure {
+                role_separation_failures.push(seq);
+            }
             let mut h = Sha256::new();
             h.update(canonical_chain_bytes(&ev));
             expected_prev = h.finalize().to_vec();
@@ -9248,6 +9271,45 @@ impl PostgresStore {
         let cause_binding =
             crate::signed_events::compute_cause_binding_verdict(rows_without_cause, require_cause);
 
+        // v0.9.0 G9 (#1826), C7 — role-separation verdict. Fetch the newest
+        // judge verdict + stopper enforcement anchors (clones of the witness
+        // fetch above) and feed the SHARED
+        // [`crate::signed_events::compute_role_separation_verdict`] so the pg
+        // twin surfaces IDENTICAL verdicts to sqlite (K3). The two new free-TEXT
+        // condition types need NO migration (`checkpoint_create` stores them
+        // unchanged).
+        let verdict_cp = self
+            .pg_read_latest_role_checkpoint(
+                crate::governance::audit::GOVERNANCE_VERDICT_NAMESPACE,
+                crate::models::ConditionType::GovernanceVerdict.as_str(),
+            )
+            .await?;
+        let enforcement_cp = self
+            .pg_read_latest_role_checkpoint(
+                crate::governance::audit::GOVERNANCE_ENFORCEMENT_NAMESPACE,
+                crate::models::ConditionType::GovernanceEnforcement.as_str(),
+            )
+            .await?;
+        let require_role = crate::governance::audit::require_role_separation_enabled();
+        let enrolled_recorder = crate::governance::audit::load_enrolled_recorder_pubkey()
+            .ok()
+            .flatten();
+        let enrolled_judge = crate::governance::audit::load_enrolled_judge_pubkey()
+            .ok()
+            .flatten();
+        let enrolled_stopper = crate::governance::audit::load_enrolled_stopper_pubkey()
+            .ok()
+            .flatten();
+        let role_separation = crate::signed_events::compute_role_separation_verdict(
+            verdict_cp.as_ref(),
+            enforcement_cp.as_ref(),
+            enrolled_recorder.as_ref(),
+            enrolled_judge.as_ref(),
+            enrolled_stopper.as_ref(),
+            role_separation_failures.len(),
+            require_role,
+        );
+
         Ok(crate::signed_events::AuditTrailReport {
             total_events,
             chain_intact,
@@ -9258,7 +9320,34 @@ impl PostgresStore {
             truncation,
             witness,
             cause_binding,
+            signature_failures,
+            role_separation,
         })
+    }
+
+    /// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint in
+    /// `namespace` (a clone of the pg witness fetch). `None` when none exists.
+    async fn pg_read_latest_role_checkpoint(
+        &self,
+        namespace: &str,
+        condition_type: &str,
+    ) -> StoreResult<Option<crate::models::Checkpoint>> {
+        let row_opt = sqlx::query(
+            "SELECT id, namespace, title, condition_type, condition, state, created_by, \
+                    resolved_by, resolution, resolution_note, signature, resolver_pubkey, \
+                    created_at, deadline_at, resolved_at, metadata \
+             FROM checkpoints WHERE namespace = $1 AND condition_type = $2 \
+             ORDER BY resolved_at DESC NULLS LAST, created_at DESC LIMIT 1",
+        )
+        .bind(namespace)
+        .bind(condition_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| to_store_err("verify_audit_trail.role_checkpoint", e))?;
+        match row_opt {
+            Some(r) => Ok(Some(pg_row_to_checkpoint(&r)?)),
+            None => Ok(None),
+        }
     }
 }
 

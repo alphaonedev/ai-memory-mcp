@@ -62,6 +62,17 @@ pub enum AttestLevel {
     /// content the substrate received from a caller. Closes F-C9
     /// spec-drift (#1430).
     DaemonSigned,
+    /// v0.9.0 G9 (#1826) — governance-audit row signed by the DISTINCT
+    /// RECORDER key (three-key Recorder/Judge/Stopper signing-layer
+    /// separation). Distinct from `DaemonSigned`: the recorder key has
+    /// SEPARATE custody (`AI_MEMORY_RECORDER_KEY_DIR`) and its signature
+    /// commits to the domain-separated preimage
+    /// `DOMAIN_RECORDER || signing_input_bytes(payload_hash, cause_hash)`
+    /// (so a judge/stopper key cannot forge a recorder row and vice-versa).
+    /// Verified per-row against the out-of-band-enrolled
+    /// `AI_MEMORY_RECORDER_PUBKEY` in `verify_chain`. Additive/opt-in:
+    /// unset recorder key → rows stay `DaemonSigned` (byte-identical legacy).
+    RecorderSigned,
 }
 
 impl AttestLevel {
@@ -82,6 +93,7 @@ impl AttestLevel {
             "peer_attested" => Some(Self::PeerAttested),
             "signed_by_peer" => Some(Self::SignedByPeer),
             "daemon_signed" => Some(Self::DaemonSigned),
+            "recorder_signed" => Some(Self::RecorderSigned),
             _ => None,
         }
     }
@@ -97,6 +109,7 @@ impl AttestLevel {
             Self::PeerAttested => "peer_attested",
             Self::SignedByPeer => "signed_by_peer",
             Self::DaemonSigned => "daemon_signed",
+            Self::RecorderSigned => "recorder_signed",
         }
     }
 }
