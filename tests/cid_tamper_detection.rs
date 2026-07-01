@@ -85,7 +85,7 @@ async fn verify_report_cid_ok_flips_on_tamper() {
     use ai_memory::store::{CallerContext, MemoryStore};
 
     let tmp = TempDir::new().unwrap();
-    let store = SqliteStore::open(tmp.path()).expect("open store");
+    let store = SqliteStore::open(tmp.path().join("ai-memory.db")).expect("open store");
     let ctx = CallerContext::for_agent("ai:tamper@host");
     let id = Uuid::new_v4().to_string();
     store
