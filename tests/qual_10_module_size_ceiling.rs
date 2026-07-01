@@ -610,7 +610,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // twin gained C7 per-row Ed25519 recorder verification in its row walk +
     // the two role-checkpoint fetches (`pg_read_latest_role_checkpoint`) + the
     // shared `compute_role_separation_verdict` wiring (file grew to 23_837).
-    ("src/store/postgres.rs", 23_920),
+    // 2026-07-01 (v0.9.0 coverage-gate uplift) — bumped 23_920 → 24_400 for the
+    // eleven live-PG `live_cov1859_*` tests that lift store/postgres.rs
+    // comfortably over its per-module coverage floor with margin (store_batch +
+    // recall_hybrid, consolidate, forget guard+archive, link/list_links/
+    // verify_link, verify_audit_trail, find_paths + drain_kg_projection_outbox,
+    // update_with_expected_version CAS, update_with_archive_on_supersede,
+    // apply_remote_memory idempotency, merge_inbound + apply_remote_link,
+    // reclassify_memory_kind). Pure `#[cfg(test)]` coverage additions, ZERO new
+    // production surface; file grew to 24_342. 24_400 = 24_342 + 58 headroom,
+    // far under the 1.5x aspirational cap.
+    ("src/store/postgres.rs", 24_400),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

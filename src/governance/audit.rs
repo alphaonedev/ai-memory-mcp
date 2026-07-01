@@ -2650,4 +2650,189 @@ mod tests {
         assert!(body.contains("ai:epoch-2") && !body.contains("ai:epoch-1"));
         shutdown();
     }
+
+    // ===================================================================
+    // v0.9.0 coverage uplift (#1826 G9 / #1822 witness / #1827 role keys)
+    // — the three-key Recorder/Judge/Stopper + audit-head-witness
+    // checkpoint BUILDERS and their hash/preimage helpers had no direct
+    // unit coverage: the integration suites exercised the persisted wire
+    // but never the pure builder bodies. These are deterministic,
+    // env-free, global-state-free functions, so they unit-test cleanly.
+    //
+    // Rust rules applied: `test-cfg-test-module` + `test-use-super`
+    // (co-located `#[cfg(test)]` over `use super::*`), `test-descriptive-
+    // names`, `test-arrange-act-assert`, and M-TAUTOLOGICAL-TESTS
+    // (assertions pin real round-trip behaviour — signature presence,
+    // domain separation, resolution decode — not restated ground truth).
+    // ===================================================================
+
+    fn cov_role_keypair() -> crate::identity::keypair::AgentKeypair {
+        crate::identity::keypair::generate("ai:cov-role-signer").expect("generate role keypair")
+    }
+
+    #[test]
+    fn action_hash_hex_is_deterministic_lowercase_sha256() {
+        let a = action_hash_hex(b"canonical-action-bytes");
+        assert_eq!(
+            a,
+            action_hash_hex(b"canonical-action-bytes"),
+            "stable per input"
+        );
+        assert_eq!(a.len(), 64, "sha-256 renders as 64 hex chars");
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "hex is lowercase with no uppercase: {a}"
+        );
+        assert_ne!(
+            a,
+            action_hash_hex(b"different"),
+            "distinct inputs hash apart"
+        );
+    }
+
+    #[test]
+    fn recorder_signing_preimage_domain_separates_and_folds_cause() {
+        let payload = [3u8; 32];
+        let no_cause = recorder_signing_preimage(&payload, None);
+        assert!(
+            no_cause.starts_with(DOMAIN_RECORDER),
+            "preimage carries the recorder domain-separation tag"
+        );
+        let with_cause = recorder_signing_preimage(&payload, Some(&[9u8; 32]));
+        assert_ne!(
+            no_cause, with_cause,
+            "the cause fold changes the signed bytes (C1 cause-binding)"
+        );
+        assert!(
+            with_cause.starts_with(DOMAIN_RECORDER),
+            "the cause-bound preimage still carries the recorder domain tag"
+        );
+    }
+
+    #[test]
+    fn witness_claim_slot_rejects_nonpositive_and_honours_force() {
+        assert!(
+            !witness_claim_slot(0, false),
+            "a zero head never claims a slot"
+        );
+        assert!(
+            !witness_claim_slot(-9, true),
+            "a negative head never claims even when forced"
+        );
+        assert!(
+            !witness_interval_reached(0),
+            "a zero head is below any interval"
+        );
+        // `force` (graceful-shutdown path) always claims the current head,
+        // bypassing the WATERMARK_INTERVAL throttle.
+        let far = LAST_WITNESSED_SEQ.load(Ordering::Relaxed) + WATERMARK_INTERVAL + 4096;
+        assert!(
+            witness_claim_slot(far, true),
+            "force claims the head regardless of interval"
+        );
+    }
+
+    #[test]
+    fn build_signed_verdict_checkpoint_binds_and_signs_the_tuple() {
+        let kp = cov_role_keypair();
+        let cp = build_signed_verdict_checkpoint(
+            "ai:agent-x",
+            "PreToolUse",
+            &action_hash_hex(b"act-verdict"),
+            "allow",
+            "rule-7",
+            "policy permits",
+            1_700_000_000,
+            &kp,
+        )
+        .expect("build judge verdict checkpoint");
+        assert_eq!(
+            cp.condition_type,
+            crate::models::ConditionType::GovernanceVerdict
+        );
+        assert_eq!(cp.namespace, GOVERNANCE_VERDICT_NAMESPACE);
+        assert_eq!(cp.resolved_by.as_deref(), Some(JUDGE_RESOLVED_BY));
+        assert!(matches!(cp.state, crate::models::CheckpointState::Resolved));
+        assert!(!cp.signature.is_empty(), "verdict checkpoint is signed");
+        assert!(
+            !cp.resolver_pubkey.is_empty(),
+            "resolver pubkey is embedded"
+        );
+        let res = cp.resolution.expect("resolution json present");
+        assert!(
+            res.contains("rule-7") && res.contains("allow"),
+            "resolution binds the tuple"
+        );
+    }
+
+    #[test]
+    fn build_signed_enforcement_checkpoint_binds_and_signs_the_tuple() {
+        let kp = cov_role_keypair();
+        let cp = build_signed_enforcement_checkpoint(
+            "ai:agent-y",
+            "PreToolUse",
+            &action_hash_hex(b"act-enforce"),
+            "deny",
+            "rule-9",
+            "blocked by policy",
+            1_700_000_100,
+            &kp,
+        )
+        .expect("build stopper enforcement checkpoint");
+        assert_eq!(
+            cp.condition_type,
+            crate::models::ConditionType::GovernanceEnforcement
+        );
+        assert_eq!(cp.namespace, GOVERNANCE_ENFORCEMENT_NAMESPACE);
+        assert_eq!(cp.resolved_by.as_deref(), Some(STOPPER_RESOLVED_BY));
+        assert!(!cp.signature.is_empty(), "enforcement checkpoint is signed");
+        let res = cp.resolution.expect("resolution json present");
+        assert!(res.contains("deny") && res.contains("rule-9"));
+    }
+
+    #[test]
+    fn witness_checkpoint_round_trips_through_parse_dual_head() {
+        let kp = cov_role_keypair();
+        let dual = WitnessDualHead {
+            signed_head_sequence: 128,
+            signed_head_hash: "aa".repeat(32),
+            revisions_head_sequence: 64,
+            revisions_head_hash: "bb".repeat(32),
+        };
+        let cp = build_signed_witness_checkpoint(&dual, 1_700_000_200, &kp)
+            .expect("build audit-head witness checkpoint");
+        assert_eq!(
+            cp.condition_type,
+            crate::models::ConditionType::AuditHeadWitness
+        );
+        assert!(!cp.signature.is_empty(), "witness checkpoint is signed");
+        let parsed = parse_witness_dual_head(&cp).expect("parse the dual head back out");
+        assert_eq!(
+            parsed, dual,
+            "both chain heads survive the resolution round-trip"
+        );
+    }
+
+    #[test]
+    fn parse_witness_dual_head_declines_a_non_witness_checkpoint() {
+        // A verdict checkpoint is a valid, signed checkpoint but the WRONG
+        // condition_type — the parser must decline rather than misread it.
+        let kp = cov_role_keypair();
+        let verdict = build_signed_verdict_checkpoint(
+            "ai:agent-z",
+            "PreToolUse",
+            &action_hash_hex(b"act-wrongtype"),
+            "allow",
+            "rule-1",
+            "",
+            1_700_000_300,
+            &kp,
+        )
+        .expect("build verdict checkpoint");
+        assert!(
+            parse_witness_dual_head(&verdict).is_none(),
+            "parse declines a non-AuditHeadWitness checkpoint"
+        );
+    }
 }
