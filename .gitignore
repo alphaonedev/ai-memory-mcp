@@ -75,3 +75,6 @@ coverage/*.profdata
 # Stray per-issue cargo target dirs left by prior session work (#899,
 # #922, etc.). Each is a separate compile cache, never committed.
 .cargo-*-target/
+
+# local gate/run logs (never commit)
+.local-runs*
