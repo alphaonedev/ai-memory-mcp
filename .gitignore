@@ -77,4 +77,4 @@ coverage/*.profdata
 .cargo-*-target/
 
 # local gate/run logs (never commit)
-.local-runs*
+/.local-runs-*
