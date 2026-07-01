@@ -92,6 +92,11 @@ rustls = { version = "0.23", features = ["ring"] }
 # client cert DER. RustCrypto sha2 — same family as the HKDF we'll use
 # for Layer 3 E2E encryption (#228).
 sha2 = "0.10"
+# v0.9.0 G10.1 (#1827) — HMAC-SHA256 is the macaroon capability-token caveat
+# chain (`governance::capability`): the `root_secret`-keyed initial tag plus
+# the keyless per-caveat attenuation fold. RustCrypto hmac, same family as
+# `sha2` above.
+hmac = "0.12"
 # v0.9.0 G8 (#1825) — BLAKE3 is the OUTER content-address hash for the
 # additive memory-genesis content-id (`identity::cid`, the `b3:<hex>`
 # form). Introduced ONLY as the cid address function; the inner content

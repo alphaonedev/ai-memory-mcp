@@ -1,0 +1,1196 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! G10.1 (#1827) — stateless macaroon-style capability tokens.
+//!
+//! This module is the security-critical *primitive* behind the accepted
+//! v0.9.0 G10.1 design (2×5 vote): an opt-in, stateless capability token
+//! that acts as a pure `Deny`/`Pending`→`Allow` grant *wrapper* around the
+//! untouched coarse ACL gate. It is deliberately additive — nothing here
+//! changes when capabilities are disabled (the GA default).
+//!
+//! # Trust model (read this before touching [`verify`])
+//!
+//! A token is a **macaroon**: a first-party-caveat chain authenticated by an
+//! HMAC-SHA256 tag. The daemon (issuer == verifier in the single-process
+//! v0.9 deployment) holds, per issuer, a secret **`root_secret`**. That
+//! secret is the **SOLE mint gate** — only a holder of `root_secret` can
+//! produce a token whose tag chain verifies.
+//!
+//! The issuer's **Ed25519 signature** over the root block ([`RootBlock`]) is
+//! **ATTRIBUTION ONLY**: it names *who* minted the root grant so audits can
+//! attribute it, but it confers **no authority** and is NOT what gates the
+//! mint. This split is why [`resolve_capability_issuer_pubkey`] is allowed to
+//! be a closed allowlist and MUST NEVER consult the broad
+//! `db::agent_pubkey` registry — an attacker who registers an agent key
+//! learns nothing that lets them mint, because they still lack `root_secret`.
+//!
+//! # Attenuation-only
+//!
+//! [`attenuate`] appends a [`Caveat`] to the token's `ext_caveats` and folds
+//! it into the HMAC chain **keyless** (it only needs the current tag, not
+//! `root_secret`). Because the chain is append-only and each caveat is an
+//! *additional* predicate that must independently hold at [`verify`] time, a
+//! token can only ever **narrow**. Removing or reordering a caveat breaks the
+//! recomputed tag ([`CapReject::BadChain`]). This is the load-bearing
+//! non-escalation property: `verify` accepting a request implies that request
+//! tuple is ⊆ every ancestor grant, clamped to the issuer ceiling.
+//!
+//! # Revocation
+//!
+//! Stateless — there is no online revocation store in G10.1. A token is
+//! bounded by its mandatory [`Caveat::ExpiresAt`]; emergency revocation is
+//! `root_secret` rotation (which invalidates every outstanding token minted
+//! under the rotated secret). Co-signer, server-side persistence, and online
+//! revocation are DEFERRED (EPIC §9, override 2026-07-01).
+
+use std::collections::BTreeMap;
+
+use anyhow::{Context, Result};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+
+use base64::Engine;
+
+use super::Decision;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Wire/version of the token envelope. `verify` fails closed on anything else.
+pub const CAPABILITY_VERSION: u16 = 1;
+
+/// Base64url-no-pad envelope prefix (`cap1:<b64url>`).
+pub const TOKEN_PREFIX: &str = "cap1:";
+
+/// Conservative cap on the encoded token length accepted at the edge, so an
+/// anonymous caller cannot hand us an unbounded CBOR blob to decode.
+pub const MAX_TOKEN_B64_LEN: usize = 8 * 1024;
+
+/// Environment-variable knob mirroring `AI_MEMORY_SECRET_SCREEN_MODE`: an
+/// operator override for `[capabilities].enabled`. `on`/`off` (case
+/// insensitive); anything else is ignored (config value stands).
+pub const ENV_CAPABILITIES: &str = "AI_MEMORY_CAPABILITIES";
+
+// Domain-separation discriminator baked into the RootBlock CBOR. The key set
+// below ({dom, v, issuer, root_id, caveats}) is DISTINCT from SignableLink
+// ({src_id,dst_id,relation,observed_by,valid_from,valid_until}), the Write
+// payload, and the Signal payload — so an Ed25519 signature over a RootBlock
+// can never be replayed as a signature over one of those protocols (or vice
+// versa). The explicit domain string is belt-and-suspenders on top of the
+// distinct key set.
+const KEY_DOMAIN: &str = "cap_dom";
+const KEY_V: &str = "cap_v";
+const KEY_ISSUER: &str = "cap_issuer";
+const KEY_ROOT_ID: &str = "cap_root_id";
+const KEY_ROOT_CAVEATS: &str = "cap_root_caveats";
+const DOMAIN_ROOT: &str = "ai-memory/capability-root/v1";
+
+/// Shared label for the namespace-prefix concept: both the [`IssuerConfig`]
+/// Debug field and the [`CapReject::Caveat`] reason for a namespace-prefix
+/// miss (hoisted to one named const per the pm-v3.1 no-hardcoded-literal
+/// discipline).
+const NAMESPACE_PREFIX_LABEL: &str = "namespace_prefix";
+
+// ---------------------------------------------------------------------------
+// OpLevel — the total-ordered coarse operation ceiling
+// ---------------------------------------------------------------------------
+
+/// Coarse operation level with the total order `None < Read < Write < Admin`.
+///
+/// The derived `Ord` follows declaration order, which is the intended total
+/// order — do not reorder these variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OpLevel {
+    /// No authority.
+    None,
+    /// Read-only authority (recall/reflect).
+    Read,
+    /// Mutating authority (store/promote/delete).
+    Write,
+    /// Namespace-administrative authority.
+    Admin,
+}
+
+impl OpLevel {
+    /// Stable integer tag used inside canonical CBOR (independent of the
+    /// derived `Ord` discriminant so the wire form is explicit and frozen).
+    #[must_use]
+    fn wire_ord(self) -> i64 {
+        match self {
+            OpLevel::None => 0,
+            OpLevel::Read => 1,
+            OpLevel::Write => 2,
+            OpLevel::Admin => 3,
+        }
+    }
+}
+
+/// Map a coarse governance action name to its [`OpLevel`], **fail-closed
+/// high**: any action this function does not explicitly recognise as
+/// lower-privilege is treated as [`OpLevel::Admin`], so an unknown/new action
+/// can never be satisfied by a lesser token.
+///
+/// The explicit lower-privilege arms are the only escape from `Admin`:
+/// `Store`/`Promote`/`Delete` → `Write`, `Reflect` → `Read`. Everything else
+/// — including namespace-admin actions and anything unrecognised — is `Admin`.
+#[must_use]
+pub fn op_level_of(action: &str) -> OpLevel {
+    match action {
+        "Store" | "Promote" | "Delete" => OpLevel::Write,
+        "Reflect" => OpLevel::Read,
+        // ns-admin actions and every unknown action fail closed HIGH.
+        _ => OpLevel::Admin,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caveat — a first-party restriction predicate
+// ---------------------------------------------------------------------------
+
+/// A first-party caveat: a predicate that must independently hold at
+/// [`verify`] time. Caveats only ever *restrict* — see the module docs on
+/// attenuation-only.
+///
+/// `#[non_exhaustive]`: new caveat kinds may be added; an *older* verifier
+/// that cannot parse a newer caveat fails closed at [`CapabilityToken::from_wire`]
+/// (the CBOR decode rejects the unknown variant), never silently ignoring it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Caveat {
+    /// The request namespace must equal `p` or be a `/`-delimited descendant.
+    NamespacePrefix(String),
+    /// The request operation level must be `<=` this ceiling.
+    OpCeiling(OpLevel),
+    /// The request action name must equal this string.
+    Action(String),
+    /// The request agent id must equal this string.
+    Agent(String),
+    /// `now` must be `<=` this unix-seconds bound (mandatory in practice).
+    ExpiresAt(i64),
+    /// `now` must be `>=` this unix-seconds bound.
+    NotBefore(i64),
+}
+
+impl Caveat {
+    /// Deterministic CBOR value for this caveat: a fixed `[tag, payload]`
+    /// array. Used both inside the root block and as the fold input for the
+    /// HMAC chain, so the byte layout is frozen.
+    fn to_value(&self) -> ciborium::Value {
+        let (tag, payload): (i64, ciborium::Value) = match self {
+            Caveat::NamespacePrefix(s) => (0, ciborium::Value::Text(s.clone())),
+            Caveat::OpCeiling(l) => (1, ciborium::Value::Integer(l.wire_ord().into())),
+            Caveat::Action(s) => (2, ciborium::Value::Text(s.clone())),
+            Caveat::Agent(s) => (3, ciborium::Value::Text(s.clone())),
+            Caveat::ExpiresAt(t) => (4, ciborium::Value::Integer((*t).into())),
+            Caveat::NotBefore(t) => (5, ciborium::Value::Integer((*t).into())),
+        };
+        ciborium::Value::Array(vec![ciborium::Value::Integer(tag.into()), payload])
+    }
+
+    /// Canonical CBOR bytes for the HMAC chain fold.
+    ///
+    /// # Errors
+    /// Propagates a CBOR encoding error (unreachable for the fixed shapes
+    /// above; surfaced rather than panicked).
+    fn canonical_cbor(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(32);
+        ciborium::ser::into_writer(&self.to_value(), &mut out)
+            .context("capability: encode caveat")?;
+        Ok(out)
+    }
+}
+
+/// Whether a caveat slice carries at least one [`Caveat::ExpiresAt`]. The CLI
+/// `mint` path uses this for its mandatory-expiry lint (reject unbounded
+/// tokens).
+#[must_use]
+pub fn caveats_have_expiry(caveats: &[Caveat]) -> bool {
+    caveats.iter().any(|c| matches!(c, Caveat::ExpiresAt(_)))
+}
+
+// ---------------------------------------------------------------------------
+// RootBlock — the domain-separated, signed + HMAC-anchored root grant
+// ---------------------------------------------------------------------------
+
+/// The root grant of a token: version + issuer + a unique `root_id` + the
+/// caveats bound at mint. Its canonical CBOR is the message for BOTH the
+/// issuer Ed25519 signature (attribution) AND the initial HMAC tag (authority).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootBlock {
+    /// Envelope version.
+    pub v: u16,
+    /// Issuer id (attribution; resolved against the closed allowlist).
+    pub issuer: String,
+    /// Unique id for this root grant (for audit/attribution).
+    pub root_id: String,
+    /// Caveats bound at mint time under `root_secret`.
+    pub root_caveats: Vec<Caveat>,
+}
+
+impl RootBlock {
+    /// Canonical, domain-separated CBOR bytes for signing + HMAC anchoring.
+    ///
+    /// # Errors
+    /// Propagates a CBOR encoding error (unreachable for the fixed shape).
+    fn canonical_cbor(&self) -> Result<Vec<u8>> {
+        let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+        map.insert(KEY_DOMAIN, ciborium::Value::Text(DOMAIN_ROOT.to_string()));
+        map.insert(KEY_V, ciborium::Value::Integer(i64::from(self.v).into()));
+        map.insert(KEY_ISSUER, ciborium::Value::Text(self.issuer.clone()));
+        map.insert(KEY_ROOT_ID, ciborium::Value::Text(self.root_id.clone()));
+        map.insert(
+            KEY_ROOT_CAVEATS,
+            ciborium::Value::Array(self.root_caveats.iter().map(Caveat::to_value).collect()),
+        );
+        // BTreeMap iteration is lexicographic key order — canonical.
+        let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+            .into_iter()
+            .map(|(k, val)| (ciborium::Value::Text(k.to_string()), val))
+            .collect();
+        let mut out = Vec::with_capacity(128);
+        ciborium::ser::into_writer(&ciborium::Value::Map(entries), &mut out)
+            .context("capability: encode root block")?;
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapabilityToken — the wire object
+// ---------------------------------------------------------------------------
+
+/// A stateless macaroon capability token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityToken {
+    /// Envelope version (== [`CAPABILITY_VERSION`]).
+    pub v: u16,
+    /// Issuer id (attribution).
+    pub issuer: String,
+    /// Unique root grant id.
+    pub root_id: String,
+    /// Caveats bound at mint under `root_secret`.
+    pub root_caveats: Vec<Caveat>,
+    /// Ed25519 signature over the [`RootBlock`] canonical CBOR — ATTRIBUTION
+    /// ONLY (confers no authority; `root_secret` is the mint gate).
+    pub root_sig: Vec<u8>,
+    /// Attenuation caveats appended keyless via [`attenuate`].
+    pub ext_caveats: Vec<Caveat>,
+    /// The HMAC-SHA256 chain tag authenticating the whole token.
+    pub tag: Vec<u8>,
+}
+
+impl CapabilityToken {
+    /// The root block view of this token.
+    #[must_use]
+    fn root_block(&self) -> RootBlock {
+        RootBlock {
+            v: self.v,
+            issuer: self.issuer.clone(),
+            root_id: self.root_id.clone(),
+            root_caveats: self.root_caveats.clone(),
+        }
+    }
+
+    /// Encode to the `cap1:<base64url-no-pad>` wire form.
+    ///
+    /// # Errors
+    /// Propagates a CBOR encoding error.
+    pub fn to_wire(&self) -> Result<String> {
+        let mut buf = Vec::with_capacity(256);
+        ciborium::ser::into_writer(self, &mut buf).context("capability: encode token")?;
+        Ok(format!(
+            "{TOKEN_PREFIX}{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+        ))
+    }
+
+    /// Parse from the `cap1:<base64url-no-pad>` wire form. Fails closed
+    /// ([`CapReject::Malformed`]) on a missing prefix, oversize payload, bad
+    /// base64, bad CBOR, or an unknown caveat variant (fail-closed on
+    /// forward-incompatible tokens).
+    ///
+    /// # Errors
+    /// [`CapReject::Malformed`] on any structural problem.
+    pub fn from_wire(s: &str) -> std::result::Result<Self, CapReject> {
+        let b64 = s.strip_prefix(TOKEN_PREFIX).ok_or(CapReject::Malformed)?;
+        if b64.len() > MAX_TOKEN_B64_LEN {
+            return Err(CapReject::Malformed);
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(b64)
+            .map_err(|_| CapReject::Malformed)?;
+        ciborium::de::from_reader(&bytes[..]).map_err(|_| CapReject::Malformed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapReject — the fail-closed verify verdict
+// ---------------------------------------------------------------------------
+
+/// Why a token was rejected. Every non-`Ok` outcome leaves the base gate
+/// decision UNCHANGED (fail-closed) and is auditable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapReject {
+    /// Envelope version is not [`CAPABILITY_VERSION`].
+    UnsupportedVersion,
+    /// Issuer is not in the closed allowlist.
+    UnknownIssuer,
+    /// The issuer Ed25519 attribution signature did not verify.
+    BadRootSig,
+    /// The recomputed HMAC chain tag did not match (tamper / reorder /
+    /// forge-by-removal / wrong `root_secret`).
+    BadChain,
+    /// A time caveat rejected the request: token expired.
+    Expired,
+    /// A time caveat rejected the request: not yet valid.
+    NotYetValid,
+    /// A first-party caveat (or the issuer ceiling) rejected the request. The
+    /// static reason names which predicate failed.
+    Caveat(&'static str),
+    /// The token could not be parsed / re-encoded.
+    Malformed,
+}
+
+impl std::fmt::Display for CapReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapReject::UnsupportedVersion => write!(f, "unsupported capability version"),
+            CapReject::UnknownIssuer => write!(f, "unknown capability issuer"),
+            CapReject::BadRootSig => write!(f, "bad capability root signature"),
+            CapReject::BadChain => write!(f, "bad capability caveat chain"),
+            CapReject::Expired => write!(f, "capability expired"),
+            CapReject::NotYetValid => write!(f, "capability not yet valid"),
+            CapReject::Caveat(reason) => write!(f, "capability caveat unmet: {reason}"),
+            CapReject::Malformed => write!(f, "malformed capability token"),
+        }
+    }
+}
+
+impl std::error::Error for CapReject {}
+
+/// Machine label for a reject, for audit rows (single site each — no literal
+/// duplication across production paths).
+impl CapReject {
+    /// A stable snake_case code for audit rows.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            CapReject::UnsupportedVersion => "unsupported_version",
+            CapReject::UnknownIssuer => "unknown_issuer",
+            CapReject::BadRootSig => "bad_root_sig",
+            CapReject::BadChain => "bad_chain",
+            CapReject::Expired => "expired",
+            CapReject::NotYetValid => "not_yet_valid",
+            CapReject::Caveat(_) => "caveat",
+            CapReject::Malformed => "malformed",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CapabilityConfig — the closed issuer allowlist
+// ---------------------------------------------------------------------------
+
+/// Per-issuer configuration: the attribution pubkey, the `root_secret` mint
+/// gate, and the issuer's authority ceiling.
+#[derive(Clone)]
+pub struct IssuerConfig {
+    /// Ed25519 attribution pubkey (NOT the authority gate).
+    pub pubkey: VerifyingKey,
+    /// HMAC-SHA256 mint secret. THE SOLE MINT GATE. Never logged.
+    pub root_secret: Vec<u8>,
+    /// The maximum op level this issuer may ever grant (clamp).
+    pub max_op: OpLevel,
+    /// Optional namespace-prefix ceiling for this issuer.
+    pub namespace_prefix: Option<String>,
+}
+
+impl std::fmt::Debug for IssuerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render `root_secret`.
+        f.debug_struct("IssuerConfig")
+            .field("pubkey", &self.pubkey)
+            .field("root_secret", &"<redacted>")
+            .field("max_op", &self.max_op)
+            .field(NAMESPACE_PREFIX_LABEL, &self.namespace_prefix)
+            .finish()
+    }
+}
+
+/// The loaded capability configuration: the on/off switch plus the closed
+/// issuer allowlist. Built from `[capabilities]` + the operator key; NEVER
+/// from the broad agent registry.
+#[derive(Clone, Default)]
+pub struct CapabilityConfig {
+    /// Master enable (default false — the GA posture is inert).
+    pub enabled: bool,
+    /// The closed allowlist keyed by issuer id.
+    pub issuers: BTreeMap<String, IssuerConfig>,
+}
+
+impl std::fmt::Debug for CapabilityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityConfig")
+            .field("enabled", &self.enabled)
+            .field("issuer_count", &self.issuers.len())
+            .finish()
+    }
+}
+
+impl CapabilityConfig {
+    /// Number of configured issuers (surfaced by doctor / `/capabilities`).
+    #[must_use]
+    pub fn issuer_count(&self) -> usize {
+        self.issuers.len()
+    }
+}
+
+/// Parse the `AI_MEMORY_CAPABILITIES` toggle value (`on`/`off`,
+/// case-insensitive). Returns `None` for an unrecognised value so the config
+/// value stands.
+#[must_use]
+pub fn parse_capabilities_toggle(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Some(true),
+        "off" | "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// The `AI_MEMORY_CAPABILITIES` env override for `[capabilities].enabled`,
+/// mirroring `AI_MEMORY_SECRET_SCREEN_MODE`. `None` when unset/unrecognised.
+#[must_use]
+pub fn capabilities_env_override() -> Option<bool> {
+    std::env::var(ENV_CAPABILITIES)
+        .ok()
+        .and_then(|v| parse_capabilities_toggle(&v))
+}
+
+// ---------------------------------------------------------------------------
+// CapRequest / VerifiedGrant — verify input & output
+// ---------------------------------------------------------------------------
+
+/// The in-flight operation a token is asked to authorise.
+#[derive(Debug, Clone)]
+pub struct CapRequest {
+    /// Coarse governance action name (mapped via [`op_level_of`]).
+    pub action: String,
+    /// Target namespace.
+    pub namespace: String,
+    /// The effective principal the request runs as (bound by
+    /// [`Caveat::Agent`] — see the impersonation-seam note on [`verify`]).
+    pub agent_id: String,
+    /// Current unix-seconds time (for the time caveats).
+    pub now: i64,
+}
+
+/// A successfully verified grant. `op_level` is the effective granted level
+/// after clamping to the issuer ceiling; `namespace_prefix` is the most
+/// specific namespace constraint that held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGrant {
+    /// The authorising token's root id (for the audit row).
+    pub root_id: String,
+    /// The issuer id (for the audit row).
+    pub issuer: String,
+    /// Effective granted op level (clamped to the issuer ceiling).
+    pub op_level: OpLevel,
+    /// Effective namespace prefix that authorised the request.
+    pub namespace_prefix: String,
+}
+
+// ---------------------------------------------------------------------------
+// Issuer resolver — SECURITY CRITICAL closed allowlist
+// ---------------------------------------------------------------------------
+
+/// Resolve the Ed25519 attribution pubkey for `issuer`.
+///
+/// **SECURITY-CRITICAL.** This is a CLOSED allowlist sourced ONLY from
+/// [`CapabilityConfig::issuers`] (which the loader builds from
+/// `[capabilities.issuers]` + the narrow operator key). It MUST NEVER fall
+/// through to the broad `db::agent_pubkey` registry — an unlisted issuer
+/// resolves to `None` (⇒ [`CapReject::UnknownIssuer`]). Recall that the key
+/// is attribution only; `root_secret` is the real mint gate.
+#[must_use]
+pub fn resolve_capability_issuer_pubkey(
+    cfg: &CapabilityConfig,
+    issuer: &str,
+) -> Option<VerifyingKey> {
+    cfg.issuers.get(issuer).map(|ic| ic.pubkey)
+}
+
+// ---------------------------------------------------------------------------
+// mint / attenuate — construction
+// ---------------------------------------------------------------------------
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // HMAC accepts a key of any length, so `new_from_slice` cannot fail here.
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// Mint a fresh root capability token given the issuer's mint `root_secret`.
+///
+/// `root_sig` is the issuer's Ed25519 signature over the root block
+/// (attribution); the returned `tag` is `HMAC(root_secret, root_block)` — the
+/// authority anchor. Callers that require a mandatory expiry (the CLI) should
+/// check [`caveats_have_expiry`] on `root_caveats` first.
+///
+/// # Errors
+/// Propagates a CBOR encoding error while building the root block.
+pub fn mint_with_secret(
+    issuer_key: &SigningKey,
+    root_secret: &[u8],
+    issuer: &str,
+    root_id: &str,
+    root_caveats: Vec<Caveat>,
+) -> Result<CapabilityToken> {
+    let root = RootBlock {
+        v: CAPABILITY_VERSION,
+        issuer: issuer.to_string(),
+        root_id: root_id.to_string(),
+        root_caveats: root_caveats.clone(),
+    };
+    let root_bytes = root.canonical_cbor()?;
+    let root_sig = issuer_key.sign(&root_bytes).to_bytes().to_vec();
+    let tag = hmac_sha256(root_secret, &root_bytes);
+    Ok(CapabilityToken {
+        v: CAPABILITY_VERSION,
+        issuer: issuer.to_string(),
+        root_id: root_id.to_string(),
+        root_caveats,
+        root_sig,
+        ext_caveats: Vec::new(),
+        tag,
+    })
+}
+
+/// Attenuate a token by appending `caveat`. **Keyless** (needs only the
+/// current tag, not `root_secret`) and **append-only** — the returned token
+/// is strictly narrower than `token`.
+///
+/// # Errors
+/// Propagates a CBOR encoding error while folding the caveat.
+pub fn attenuate(token: &CapabilityToken, caveat: Caveat) -> Result<CapabilityToken> {
+    let cav_bytes = caveat.canonical_cbor()?;
+    let new_tag = hmac_sha256(&token.tag, &cav_bytes);
+    let mut out = token.clone();
+    out.ext_caveats.push(caveat);
+    out.tag = new_tag;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// verify — the fail-closed authority check (steps 1–7)
+// ---------------------------------------------------------------------------
+
+/// Verify a token against `cfg` and the in-flight `req`, returning the
+/// effective [`VerifiedGrant`] on success or a fail-closed [`CapReject`].
+///
+/// Steps: (1) version; (2) known variants (guaranteed by
+/// [`CapabilityToken::from_wire`]); (3) resolve issuer pubkey via the closed
+/// allowlist; (4) `verify_strict` the root signature (attribution); (5)
+/// recompute the HMAC-SHA256 caveat chain from `root_secret` and
+/// constant-time compare against `token.tag`; (6) enforce every caveat
+/// (`root_caveats` then `ext_caveats`) against `req`; (7) clamp to the issuer
+/// ceiling and assert the request op ⊆ the granted op.
+///
+/// **Impersonation seam.** A [`Caveat::Agent`] binds against `req.agent_id`,
+/// which callers MUST set to the *effective principal* the request runs as
+/// (the same identity the coarse gate authorises), NOT a caller-supplied
+/// label — otherwise a token scoped to agent A could be presented on a
+/// request effectively running as B. The wiring layer is responsible for
+/// passing the effective principal here.
+///
+/// # Errors
+/// Returns the specific [`CapReject`] for the first failing step.
+pub fn verify(
+    token: &CapabilityToken,
+    cfg: &CapabilityConfig,
+    req: &CapRequest,
+) -> std::result::Result<VerifiedGrant, CapReject> {
+    // 1. version — fail closed on v=2/unknown.
+    if token.v != CAPABILITY_VERSION {
+        return Err(CapReject::UnsupportedVersion);
+    }
+
+    // 3. issuer pubkey via the CLOSED allowlist (never the agent registry).
+    let issuer_cfg = cfg
+        .issuers
+        .get(&token.issuer)
+        .ok_or(CapReject::UnknownIssuer)?;
+    let pubkey =
+        resolve_capability_issuer_pubkey(cfg, &token.issuer).ok_or(CapReject::UnknownIssuer)?;
+
+    // 4. verify_strict the root signature (attribution).
+    let root_bytes = token
+        .root_block()
+        .canonical_cbor()
+        .map_err(|_| CapReject::Malformed)?;
+    let sig_arr: [u8; 64] = token
+        .root_sig
+        .as_slice()
+        .try_into()
+        .map_err(|_| CapReject::BadRootSig)?;
+    pubkey
+        .verify_strict(&root_bytes, &Signature::from_bytes(&sig_arr))
+        .map_err(|_| CapReject::BadRootSig)?;
+
+    // 5. recompute the HMAC chain from root_secret + fold ext_caveats.
+    let mut tag = hmac_sha256(&issuer_cfg.root_secret, &root_bytes);
+    for c in &token.ext_caveats {
+        let cav = c.canonical_cbor().map_err(|_| CapReject::Malformed)?;
+        tag = hmac_sha256(&tag, &cav);
+    }
+    if tag.ct_eq(&token.tag).unwrap_u8() != 1 {
+        return Err(CapReject::BadChain);
+    }
+
+    // 6. per-caveat enforcement (AND semantics) over root ++ ext caveats.
+    let req_op = op_level_of(&req.action);
+    // Start permissive; each OpCeiling / NamespacePrefix narrows.
+    let mut op_ceiling = OpLevel::Admin;
+    let mut ns_prefix: Option<String> = None;
+
+    for c in token.root_caveats.iter().chain(token.ext_caveats.iter()) {
+        match c {
+            Caveat::NamespacePrefix(p) => {
+                if !namespace_under(&req.namespace, p) {
+                    return Err(CapReject::Caveat(NAMESPACE_PREFIX_LABEL));
+                }
+                // Track the most specific (longest) prefix that held.
+                if ns_prefix.as_ref().is_none_or(|cur| p.len() > cur.len()) {
+                    ns_prefix = Some(p.clone());
+                }
+            }
+            Caveat::OpCeiling(l) => {
+                if req_op > *l {
+                    return Err(CapReject::Caveat("op_ceiling"));
+                }
+                op_ceiling = op_ceiling.min(*l);
+            }
+            Caveat::Action(a) => {
+                if req.action != *a {
+                    return Err(CapReject::Caveat("action"));
+                }
+            }
+            Caveat::Agent(a) => {
+                if req.agent_id != *a {
+                    return Err(CapReject::Caveat("agent"));
+                }
+            }
+            Caveat::ExpiresAt(t) => {
+                if req.now > *t {
+                    return Err(CapReject::Expired);
+                }
+            }
+            Caveat::NotBefore(t) => {
+                if req.now < *t {
+                    return Err(CapReject::NotYetValid);
+                }
+            }
+        }
+    }
+
+    // 7. issuer ceiling ∩ clamp. The request op must fit under BOTH the
+    // caveat-accumulated ceiling AND the issuer's configured max — a bare
+    // Write token can never satisfy an Admin (e.g. ns-admin / future
+    // approve-gated) op, so it cannot skip a human court.
+    if req_op > issuer_cfg.max_op {
+        return Err(CapReject::Caveat("issuer_ceiling"));
+    }
+    if let Some(issuer_ns) = issuer_cfg.namespace_prefix.as_ref() {
+        if !namespace_under(&req.namespace, issuer_ns) {
+            return Err(CapReject::Caveat("issuer_namespace"));
+        }
+        if ns_prefix
+            .as_ref()
+            .is_none_or(|cur| issuer_ns.len() > cur.len())
+        {
+            ns_prefix = Some(issuer_ns.clone());
+        }
+    }
+
+    let effective_op = op_ceiling.min(issuer_cfg.max_op);
+    // Defensive: never report a grant that does not cover the request.
+    if req_op > effective_op {
+        return Err(CapReject::Caveat("op_ceiling"));
+    }
+
+    Ok(VerifiedGrant {
+        root_id: token.root_id.clone(),
+        issuer: token.issuer.clone(),
+        op_level: effective_op,
+        namespace_prefix: ns_prefix.unwrap_or_default(),
+    })
+}
+
+/// Whether `namespace` is `prefix` itself or a `/`-delimited descendant.
+#[must_use]
+fn namespace_under(namespace: &str, prefix: &str) -> bool {
+    namespace == prefix || namespace.starts_with(&format!("{prefix}/"))
+}
+
+// ---------------------------------------------------------------------------
+// apply_capability_grant — the Deny/Pending→Allow joiner (T4)
+// ---------------------------------------------------------------------------
+
+/// The audit-relevant outcome of [`apply_capability_grant`]. The joiner is
+/// pure — it returns the decision plus what the caller should audit, and does
+/// NOT itself perform any I/O, so the hot governance path decides how/where
+/// to emit via the existing `append_signed_event`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantOutcome {
+    /// No capability logic ran (base was Allow, feature off/not-enforce, or no
+    /// token / non-flippable base). Emit ZERO new audit bytes.
+    NoOp,
+    /// A verified grant flipped a `Deny`/`Ask` base to `Allow`. Audit a
+    /// capability-grant event naming the token.
+    Granted {
+        /// The authorising root id.
+        root_id: String,
+        /// The issuer id.
+        issuer: String,
+        /// The effective granted op level.
+        op_level: OpLevel,
+    },
+    /// A presented token failed to verify; the base decision is UNCHANGED.
+    /// Audit a capability-reject event.
+    Rejected(CapReject),
+}
+
+/// Join a verified capability grant onto a base gate [`Decision`].
+///
+/// Pure identity when: `base == Allow`, capabilities disabled, `mode` is not
+/// Enforce, or no token is presented. Otherwise a token that [`verify`]s and
+/// covers the request flips a `Deny`/`Ask` (pending/approve) base to `Allow`
+/// (audited grant); a token that fails to verify leaves the base UNCHANGED
+/// (audited reject). `Modify`/`Allow` bases are never touched.
+///
+/// The `Ask`→`Allow` flip is only reachable when [`verify`] succeeds, which
+/// already requires the request op to fit under the issuer ceiling — so a
+/// bare `Write` token cannot flip an `Admin`/approve-gated `Ask` and skip a
+/// (future G10.3) human court.
+#[must_use]
+pub fn apply_capability_grant(
+    base: Decision,
+    cfg: &CapabilityConfig,
+    mode_is_enforce: bool,
+    token: Option<&CapabilityToken>,
+    req: &CapRequest,
+) -> (Decision, GrantOutcome) {
+    // Identity fast paths — emit no audit.
+    if matches!(base, Decision::Allow) || !cfg.enabled || !mode_is_enforce {
+        return (base, GrantOutcome::NoOp);
+    }
+    let Some(tok) = token else {
+        return (base, GrantOutcome::NoOp);
+    };
+    // Only Deny / Ask(pending) are flippable.
+    if !matches!(base, Decision::Deny(_) | Decision::Ask(_)) {
+        return (base, GrantOutcome::NoOp);
+    }
+    match verify(tok, cfg, req) {
+        Ok(grant) => (
+            Decision::Allow,
+            GrantOutcome::Granted {
+                root_id: grant.root_id,
+                issuer: grant.issuer,
+                op_level: grant.op_level,
+            },
+        ),
+        Err(reject) => (base, GrantOutcome::Rejected(reject)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn cfg_with(
+        issuer: &str,
+        key: &SigningKey,
+        secret: &[u8],
+        max_op: OpLevel,
+    ) -> CapabilityConfig {
+        let mut issuers = BTreeMap::new();
+        issuers.insert(
+            issuer.to_string(),
+            IssuerConfig {
+                pubkey: key.verifying_key(),
+                root_secret: secret.to_vec(),
+                max_op,
+                namespace_prefix: None,
+            },
+        );
+        CapabilityConfig {
+            enabled: true,
+            issuers,
+        }
+    }
+
+    fn req(action: &str, ns: &str, agent: &str, now: i64) -> CapRequest {
+        CapRequest {
+            action: action.to_string(),
+            namespace: ns.to_string(),
+            agent_id: agent.to_string(),
+            now,
+        }
+    }
+
+    fn mint_fixture(
+        caveats: Vec<Caveat>,
+    ) -> (CapabilityToken, CapabilityConfig, Vec<u8>, SigningKey) {
+        let key = signing_key(7);
+        let secret = b"root-secret-xyz".to_vec();
+        let tok = mint_with_secret(&key, &secret, "ai:issuer", "root-1", caveats).unwrap();
+        let cfg = cfg_with("ai:issuer", &key, &secret, OpLevel::Admin);
+        (tok, cfg, secret, key)
+    }
+
+    #[test]
+    fn op_level_of_is_fail_closed_high() {
+        assert_eq!(op_level_of("Store"), OpLevel::Write);
+        assert_eq!(op_level_of("Promote"), OpLevel::Write);
+        assert_eq!(op_level_of("Delete"), OpLevel::Write);
+        assert_eq!(op_level_of("Reflect"), OpLevel::Read);
+        // Unknown + ns-admin => Admin (fail-closed high).
+        assert_eq!(op_level_of("SomethingBrandNew"), OpLevel::Admin);
+        assert_eq!(op_level_of("namespace-admin"), OpLevel::Admin);
+        assert_eq!(op_level_of(""), OpLevel::Admin);
+    }
+
+    #[test]
+    fn op_level_total_order() {
+        assert!(OpLevel::None < OpLevel::Read);
+        assert!(OpLevel::Read < OpLevel::Write);
+        assert!(OpLevel::Write < OpLevel::Admin);
+    }
+
+    #[test]
+    fn canonical_cbor_round_trip_and_base64url_no_pad() {
+        let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let wire = tok.to_wire().unwrap();
+        assert!(wire.starts_with(TOKEN_PREFIX));
+        let b64 = wire.strip_prefix(TOKEN_PREFIX).unwrap();
+        // no padding
+        assert!(!b64.contains('='));
+        let back = CapabilityToken::from_wire(&wire).unwrap();
+        assert_eq!(tok, back);
+    }
+
+    #[test]
+    fn from_wire_rejects_bad_prefix_and_garbage() {
+        assert_eq!(
+            CapabilityToken::from_wire("nope"),
+            Err(CapReject::Malformed)
+        );
+        assert_eq!(
+            CapabilityToken::from_wire("cap1:!!!not-base64"),
+            Err(CapReject::Malformed)
+        );
+    }
+
+    #[test]
+    fn verify_happy_path() {
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::NamespacePrefix("team".to_string()),
+            Caveat::OpCeiling(OpLevel::Write),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        let g = verify(&tok, &cfg, &req("Store", "team/proj", "ai:a", 100)).unwrap();
+        assert_eq!(g.op_level, OpLevel::Write);
+        assert_eq!(g.namespace_prefix, "team");
+    }
+
+    #[test]
+    fn attenuation_cannot_escalate_and_narrows() {
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::OpCeiling(OpLevel::Write),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        // Narrow to Read; a Write request must now fail.
+        let narrowed = attenuate(&tok, Caveat::OpCeiling(OpLevel::Read)).unwrap();
+        assert_eq!(
+            verify(&narrowed, &cfg, &req("Store", "n", "a", 1)),
+            Err(CapReject::Caveat("op_ceiling"))
+        );
+        // A Read request still works on the narrowed token.
+        assert!(verify(&narrowed, &cfg, &req("Reflect", "n", "a", 1)).is_ok());
+    }
+
+    #[test]
+    fn forge_by_removing_a_caveat_breaks_the_chain() {
+        let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let narrowed = attenuate(&tok, Caveat::OpCeiling(OpLevel::Read)).unwrap();
+        // Attacker tries to drop the narrowing caveat but keep the new tag.
+        let mut forged = narrowed.clone();
+        forged.ext_caveats.clear();
+        assert_eq!(
+            verify(&forged, &cfg, &req("Store", "n", "a", 1)),
+            Err(CapReject::BadChain)
+        );
+    }
+
+    #[test]
+    fn tamper_or_reorder_breaks_chain() {
+        let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let a = attenuate(&tok, Caveat::Action("Store".to_string())).unwrap();
+        let b = attenuate(&a, Caveat::NamespacePrefix("x".to_string())).unwrap();
+        // Reorder ext caveats but keep the final tag → chain mismatch.
+        let mut reordered = b.clone();
+        reordered.ext_caveats.reverse();
+        assert_eq!(
+            verify(&reordered, &cfg, &req("Store", "x", "a", 1)),
+            Err(CapReject::BadChain)
+        );
+    }
+
+    #[test]
+    fn forged_root_wrong_key_is_unknown_issuer_or_bad_sig() {
+        let (tok, _, secret, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        // Config lists a DIFFERENT pubkey for the issuer but the same secret.
+        let other = signing_key(9);
+        let cfg = cfg_with("ai:issuer", &other, &secret, OpLevel::Admin);
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "n", "a", 1)),
+            Err(CapReject::BadRootSig)
+        );
+    }
+
+    #[test]
+    fn unlisted_issuer_is_unknown_issuer() {
+        let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let empty = CapabilityConfig {
+            enabled: true,
+            issuers: BTreeMap::new(),
+        };
+        assert_eq!(
+            verify(&tok, &empty, &req("Store", "n", "a", 1)),
+            Err(CapReject::UnknownIssuer)
+        );
+    }
+
+    #[test]
+    fn issuer_resolver_never_hits_registry_only_config() {
+        // An arbitrary registered-agent-shaped key that is NOT in the config
+        // must resolve to None (⇒ UnknownIssuer), proving the resolver is a
+        // closed allowlist and never a registry fallthrough.
+        let (_, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(1)]);
+        assert!(resolve_capability_issuer_pubkey(&cfg, "ai:issuer").is_some());
+        assert!(
+            resolve_capability_issuer_pubkey(&cfg, "ai:some-random-registered-agent").is_none()
+        );
+    }
+
+    #[test]
+    fn wrong_secret_breaks_chain() {
+        let (tok, _, _, key) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let cfg = cfg_with("ai:issuer", &key, b"the-wrong-secret", OpLevel::Admin);
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "n", "a", 1)),
+            Err(CapReject::BadChain)
+        );
+    }
+
+    #[test]
+    fn expired_and_not_yet_valid() {
+        let (expired, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(100)]);
+        assert_eq!(
+            verify(&expired, &cfg, &req("Store", "n", "a", 101)),
+            Err(CapReject::Expired)
+        );
+        let (future, cfg2, _, _) =
+            mint_fixture(vec![Caveat::NotBefore(500), Caveat::ExpiresAt(9_999)]);
+        assert_eq!(
+            verify(&future, &cfg2, &req("Store", "n", "a", 100)),
+            Err(CapReject::NotYetValid)
+        );
+    }
+
+    #[test]
+    fn wrong_namespace_is_caveat_reject() {
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::NamespacePrefix("team".to_string()),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "other/x", "a", 1)),
+            Err(CapReject::Caveat("namespace_prefix"))
+        );
+        // exact + descendant both accepted
+        assert!(verify(&tok, &cfg, &req("Store", "team", "a", 1)).is_ok());
+        assert!(verify(&tok, &cfg, &req("Store", "team/sub", "a", 1)).is_ok());
+        // sibling-prefix (teamX) is NOT under "team"
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "teamX", "a", 1)),
+            Err(CapReject::Caveat("namespace_prefix"))
+        );
+    }
+
+    #[test]
+    fn unsupported_version_fails_closed() {
+        let (mut tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        tok.v = 2;
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "n", "a", 1)),
+            Err(CapReject::UnsupportedVersion)
+        );
+    }
+
+    #[test]
+    fn issuer_ceiling_clamps_below_caveats() {
+        // Caveat allows Admin, but the issuer max_op is Write → an Admin op
+        // must be rejected (issuer ceiling), proving a token cannot exceed
+        // the issuer ceiling even with a permissive caveat.
+        let key = signing_key(7);
+        let secret = b"s".to_vec();
+        let tok = mint_with_secret(
+            &key,
+            &secret,
+            "ai:issuer",
+            "r",
+            vec![Caveat::OpCeiling(OpLevel::Admin), Caveat::ExpiresAt(9_999)],
+        )
+        .unwrap();
+        let cfg = cfg_with("ai:issuer", &key, &secret, OpLevel::Write);
+        assert_eq!(
+            verify(&tok, &cfg, &req("ns-admin-op", "n", "a", 1)),
+            Err(CapReject::Caveat("issuer_ceiling"))
+        );
+        // Write op is fine under the Write ceiling.
+        assert!(verify(&tok, &cfg, &req("Store", "n", "a", 1)).is_ok());
+    }
+
+    #[test]
+    fn agent_caveat_binds_principal() {
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::Agent("ai:alice".to_string()),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        assert!(verify(&tok, &cfg, &req("Store", "n", "ai:alice", 1)).is_ok());
+        assert_eq!(
+            verify(&tok, &cfg, &req("Store", "n", "ai:mallory", 1)),
+            Err(CapReject::Caveat("agent"))
+        );
+    }
+
+    #[test]
+    fn property_verify_accept_implies_request_subset_of_every_ancestor() {
+        // A chain of ceilings None-narrowing; whenever verify accepts, the
+        // request op must be <= EVERY OpCeiling in the chain.
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::OpCeiling(OpLevel::Admin),
+            Caveat::ExpiresAt(9_999),
+        ]);
+        let t2 = attenuate(&tok, Caveat::OpCeiling(OpLevel::Write)).unwrap();
+        let t3 = attenuate(&t2, Caveat::OpCeiling(OpLevel::Read)).unwrap();
+        for action in ["Reflect", "Store", "Delete", "ns-admin"] {
+            let res = verify(&t3, &cfg, &req(action, "n", "a", 1));
+            if res.is_ok() {
+                // accepted ⇒ op fits under the tightest ceiling (Read)
+                assert!(
+                    op_level_of(action) <= OpLevel::Read,
+                    "action {action} leaked past Read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_grant_flips_deny_and_ask_on_valid_token() {
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::OpCeiling(OpLevel::Write),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        let r = req("Store", "n", "a", 1);
+        // Deny → Allow
+        let (d, out) =
+            apply_capability_grant(Decision::Deny("nope".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d, Decision::Allow);
+        assert!(matches!(out, GrantOutcome::Granted { .. }));
+        // Ask(pending) → Allow
+        let (d2, out2) =
+            apply_capability_grant(Decision::Ask("court".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d2, Decision::Allow);
+        assert!(matches!(out2, GrantOutcome::Granted { .. }));
+    }
+
+    #[test]
+    fn apply_grant_identity_when_off_or_allow_or_no_token() {
+        let (tok, mut cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999)]);
+        let r = req("Store", "n", "a", 1);
+        // base Allow → unchanged, NoOp
+        let (d, out) = apply_capability_grant(Decision::Allow, &cfg, true, Some(&tok), &r);
+        assert_eq!(d, Decision::Allow);
+        assert_eq!(out, GrantOutcome::NoOp);
+        // disabled → unchanged
+        cfg.enabled = false;
+        let (d2, out2) =
+            apply_capability_grant(Decision::Deny("x".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d2, Decision::Deny("x".into()));
+        assert_eq!(out2, GrantOutcome::NoOp);
+        cfg.enabled = true;
+        // not enforce → unchanged
+        let (d3, _) =
+            apply_capability_grant(Decision::Deny("x".into()), &cfg, false, Some(&tok), &r);
+        assert_eq!(d3, Decision::Deny("x".into()));
+        // no token → unchanged
+        let (d4, out4) = apply_capability_grant(Decision::Deny("x".into()), &cfg, true, None, &r);
+        assert_eq!(d4, Decision::Deny("x".into()));
+        assert_eq!(out4, GrantOutcome::NoOp);
+    }
+
+    #[test]
+    fn apply_grant_reject_leaves_base_unchanged() {
+        let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(100)]);
+        let r = req("Store", "n", "a", 500); // expired
+        let (d, out) =
+            apply_capability_grant(Decision::Deny("orig".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d, Decision::Deny("orig".into()));
+        assert_eq!(out, GrantOutcome::Rejected(CapReject::Expired));
+    }
+
+    #[test]
+    fn pending_ask_flip_requires_adequate_issuer_ceiling() {
+        // An Admin/approve-gated op (Ask base) with only a Write-ceiling
+        // issuer must NOT flip — the bare Write token cannot skip the court.
+        let key = signing_key(7);
+        let secret = b"s".to_vec();
+        let tok = mint_with_secret(
+            &key,
+            &secret,
+            "ai:issuer",
+            "r",
+            vec![Caveat::OpCeiling(OpLevel::Admin), Caveat::ExpiresAt(9_999)],
+        )
+        .unwrap();
+        let cfg = cfg_with("ai:issuer", &key, &secret, OpLevel::Write);
+        let r = req("ns-admin-op", "n", "a", 1); // Admin op
+        let (d, out) =
+            apply_capability_grant(Decision::Ask("court".into()), &cfg, true, Some(&tok), &r);
+        assert_eq!(d, Decision::Ask("court".into()));
+        assert!(matches!(out, GrantOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn parse_capabilities_toggle_matrix() {
+        assert_eq!(parse_capabilities_toggle("on"), Some(true));
+        assert_eq!(parse_capabilities_toggle("OFF"), Some(false));
+        assert_eq!(parse_capabilities_toggle("maybe"), None);
+    }
+
+    #[test]
+    fn caveats_have_expiry_lint() {
+        assert!(caveats_have_expiry(&[Caveat::ExpiresAt(1)]));
+        assert!(!caveats_have_expiry(&[Caveat::Action("Store".into())]));
+    }
+}

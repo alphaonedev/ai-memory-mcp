@@ -100,6 +100,16 @@ pub mod wire_check;
 pub mod refusal;
 pub use refusal::{GovernanceRefusal, required_scope_refusal};
 
+// v0.9.0 G10.1 (#1827) — stateless macaroon capability tokens. The opt-in,
+// attenuation-only Deny/Pending→Allow grant primitive; inert unless
+// `[capabilities].enabled`. See `capability.rs` for the trust model.
+pub mod capability;
+pub use capability::{
+    CapReject, CapRequest, CapabilityConfig, CapabilityToken, Caveat, GrantOutcome, IssuerConfig,
+    OpLevel, RootBlock, VerifiedGrant, apply_capability_grant, op_level_of,
+    resolve_capability_issuer_pubkey,
+};
+
 // ---------------------------------------------------------------------------
 // Op tag — the five gated operations
 // ---------------------------------------------------------------------------
