@@ -136,6 +136,26 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             crate::signed_events::WitnessCheck::Unknown
             | crate::signed_events::WitnessCheck::NotDetected => {}
         }
+        // #1826 G9 — surface a three-key role-separation failure.
+        match &report.role_separation {
+            crate::signed_events::RoleSeparationCheck::Forged { detail } => writeln!(
+                out.stdout,
+                "  role-separation FORGED (three-key signing layer): {detail}"
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::RoleSeparationCheck::Misconfigured { detail } => {
+                writeln!(out.stdout, "  role-separation MISCONFIGURED: {detail}")
+                    .context(CTX_WRITE_AUDIT_REPORT)?
+            }
+            crate::signed_events::RoleSeparationCheck::Missing => writeln!(
+                out.stdout,
+                "  role-separation MISSING but AI_MEMORY_REQUIRE_ROLE_SEPARATION is set \
+                 (fail-closed)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::RoleSeparationCheck::Unknown
+            | crate::signed_events::RoleSeparationCheck::NotDetected => {}
+        }
         // #1822 G5b — surface a require-mode cause-binding coverage failure.
         if let crate::signed_events::CauseBinding::Detected { rows_without_cause } =
             report.cause_binding

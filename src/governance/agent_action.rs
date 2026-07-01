@@ -959,17 +959,24 @@ fn emit_check_event(
     let bytes =
         serde_json::to_vec(&canonical).context("emit_check_event: serialize canonical payload")?;
     let hash = payload_hash(&bytes);
-    // v0.7.0 #1035 — sign the payload_hash with the daemon's
-    // process-wide audit key when one is installed. When `init` ran
-    // with `signing_key: None` (no key on disk), the helper returns
-    // `None` and we fall through to the legacy unsigned posture.
-    let (signature, attest_level) = match crate::governance::audit::try_sign_audit_payload(&hash) {
-        Some((sig, level)) => (Some(sig), level.to_string()),
-        None => (
-            None,
-            crate::models::AttestLevel::Unsigned.as_str().to_string(),
-        ),
-    };
+    // v0.9.0 G9 (#1826) — RECORDER-sign FIRST with the distinct recorder role
+    // key (over the domain-separated preimage), falling back to the daemon
+    // signer on `None`, then to the legacy unsigned posture. With NO recorder
+    // key enrolled `try_sign_recorder_payload` returns `None`, so the row is
+    // byte-identical to the pre-G9 daemon-signed / unsigned output. The
+    // `governance.check` row carries no bound cause (`cause_hash: None`), so
+    // the recorder preimage folds `None` — C1 cause-fold machinery preserved.
+    let (signature, attest_level) =
+        match crate::governance::audit::try_sign_recorder_payload(&hash, None) {
+            Some((sig, level)) => (Some(sig), level.to_string()),
+            None => match crate::governance::audit::try_sign_audit_payload(&hash) {
+                Some((sig, level)) => (Some(sig), level.to_string()),
+                None => (
+                    None,
+                    crate::models::AttestLevel::Unsigned.as_str().to_string(),
+                ),
+            },
+        };
     let event = crate::signed_events::SignedEvent {
         id: uuid::Uuid::new_v4().to_string(),
         agent_id: agent_id.to_string(),
@@ -981,7 +988,66 @@ fn emit_check_event(
         ..crate::signed_events::SignedEvent::default()
     };
     append_signed_event(conn, &event).context("emit_check_event: append_signed_event")?;
+    // C4 (#1826) — emit a JUDGE-signed GovernanceVerdict on EVERY governed
+    // verdict (allow AND block) when a judge key is enrolled. Fire-and-forget:
+    // a failure NEVER fails the audit append. Opt-in: no judge key → no-op
+    // (byte-identical legacy).
+    maybe_emit_governance_verdict(conn, agent_id, action, decision);
     Ok(())
+}
+
+/// v0.9.0 G9 (#1826) — emit a judge-signed `GovernanceVerdict` checkpoint for
+/// `(action, decision)` if a judge key is enrolled. Fire-and-forget wrapper.
+fn maybe_emit_governance_verdict(
+    conn: &Connection,
+    agent_id: &str,
+    action: &AgentAction,
+    decision: &Decision,
+) {
+    if let Err(e) = try_emit_governance_verdict(conn, agent_id, action, decision) {
+        tracing::warn!("governance verdict checkpoint emission failed (swallowed): {e:#}");
+    }
+}
+
+/// Fallible core of [`maybe_emit_governance_verdict`]. No-op (`Ok`) when no
+/// judge signing key is enrolled.
+fn try_emit_governance_verdict(
+    conn: &Connection,
+    agent_id: &str,
+    action: &AgentAction,
+    decision: &Decision,
+) -> Result<()> {
+    let Some(keypair) = crate::governance::audit::load_judge_signing_key()? else {
+        return Ok(()); // opt-in: no judge key enrolled → no-op.
+    };
+    let (verdict, rule_id, reason) = decision_wire_parts(decision);
+    let action_bytes = action.canonical_bytes()?;
+    let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
+    let now = chrono::Utc::now().timestamp();
+    let cp = crate::governance::audit::build_signed_verdict_checkpoint(
+        agent_id,
+        action.kind(),
+        &action_hash,
+        verdict,
+        rule_id,
+        reason,
+        now,
+        &keypair,
+    )?;
+    crate::checkpoints::insert(conn, &cp).context("insert governance verdict checkpoint")?;
+    Ok(())
+}
+
+/// Map a [`Decision`] to its `(verdict, rule_id, reason)` wire parts for the
+/// judge / stopper checkpoint resolution tuple.
+#[must_use]
+pub fn decision_wire_parts(decision: &Decision) -> (&'static str, &str, &str) {
+    match decision {
+        Decision::Allow => ("allow", "", ""),
+        Decision::Refuse { rule_id, reason } => ("refuse", rule_id, reason),
+        Decision::Warn { rule_id, reason } => ("warn", rule_id, reason),
+        Decision::Escalate { rule_id, reason } => ("escalate", rule_id, reason),
+    }
 }
 
 /// v0.8.0 PE-2 (§5.5 / #697 / #1730) — governance gate for a memory READ

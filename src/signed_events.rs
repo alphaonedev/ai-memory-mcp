@@ -479,7 +479,7 @@ pub fn compute_cause_hash(
 /// pre-v73). Shared by [`SignedEvent::with_daemon_signature`] (signing)
 /// and [`verify_chain`] (verification) so the two never drift.
 #[must_use]
-fn signing_input_bytes(payload_hash: &[u8], cause_hash: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn signing_input_bytes(payload_hash: &[u8], cause_hash: Option<&[u8]>) -> Vec<u8> {
     match cause_hash {
         Some(cause) => {
             let mut hasher = Sha256::new();
@@ -609,6 +609,12 @@ pub struct ChainVerificationReport {
     pub rows_checked: u64,
     pub chain_break: Option<i64>,
     pub signature_failures: Vec<i64>,
+    /// v0.9.0 G9 (#1826) — sequences of ROLE-SEPARATION failures disjoint from
+    /// `signature_failures`: a `recorder_signed` row that failed verification
+    /// against the enrolled recorder pubkey, OR a `daemon_signed` governance
+    /// row DEMOTED because a recorder key is now enrolled (C2). Empty in the
+    /// legacy posture (no recorder key enrolled).
+    pub role_separation_failures: Vec<i64>,
 }
 
 impl ChainVerificationReport {
@@ -645,6 +651,97 @@ impl ChainVerificationReport {
 /// decode fails. A clean (chain held + zero signature failures)
 /// report is returned as `Ok`; the caller checks
 /// [`ChainVerificationReport::chain_holds`] for the chain bit.
+/// v0.9.0 G9 (#1826) — the per-row Ed25519 verdict split into a daemon
+/// `signature_failure` and a role-separation `role_separation_failure`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowSignatureVerdict {
+    /// Legacy daemon-verifier signature failure (a stripped / forged
+    /// daemon-signed row, or a malformed signature blob).
+    pub signature_failure: bool,
+    /// v0.9.0 G9 — a `recorder_signed` row failed recorder verification, OR a
+    /// `daemon_signed` governance row was DEMOTED post recorder-enrollment (C2).
+    pub role_separation_failure: bool,
+}
+
+/// v0.9.0 G9 (#1826) — classify ONE row's per-row Ed25519 verification. The
+/// SHARED verification core so the sqlite [`verify_chain`] walk and the
+/// postgres verify twin (C7) surface IDENTICAL failure sets (K3 parity):
+///
+/// - a `recorder_signed` row is verified against `recorder_verifier` over
+///   `DOMAIN_RECORDER || signing_input_bytes(payload, cause)`; when NO recorder
+///   pubkey is enrolled the row is SKIPPED (C6 — never false-failed vs daemon);
+/// - a `daemon_signed` governance row is DEMOTED to a role-separation failure
+///   once a recorder key is enrolled (C2);
+/// - every other row routes to the legacy daemon verifier (#1071 / #1452),
+///   byte-identical to the pre-G9 behaviour.
+#[must_use]
+pub fn classify_row_signature(
+    event: &SignedEvent,
+    daemon_verifier: Option<&ed25519_dalek::VerifyingKey>,
+    recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
+) -> RowSignatureVerdict {
+    use crate::models::AttestLevel;
+    if event.attest_level == AttestLevel::RecorderSigned.as_str() {
+        // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
+        let Some(rk) = recorder_verifier else {
+            return RowSignatureVerdict::default();
+        };
+        let ok = match event.signature.as_deref() {
+            Some(sig_bytes) if !sig_bytes.is_empty() => match <[u8; 64]>::try_from(sig_bytes) {
+                Ok(arr) => {
+                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                    let preimage = crate::governance::audit::recorder_signing_preimage(
+                        &event.payload_hash,
+                        event.cause_hash.as_deref(),
+                    );
+                    rk.verify_strict(&preimage, &sig).is_ok()
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        return RowSignatureVerdict {
+            signature_failure: false,
+            role_separation_failure: !ok,
+        };
+    }
+    if recorder_verifier.is_some()
+        && event.attest_level == AttestLevel::DaemonSigned.as_str()
+        && event.event_type == crate::governance::agent_action::GOVERNANCE_CHECK_EVENT_TYPE
+    {
+        // C2 DAEMON DEMOTION — a daemon-signed governance row is no longer an
+        // acceptable recorder attestation once a recorder key is enrolled.
+        return RowSignatureVerdict {
+            signature_failure: false,
+            role_separation_failure: true,
+        };
+    }
+    // Legacy daemon verifier (#1071 / #1452), unchanged.
+    let Some(vk) = daemon_verifier else {
+        return RowSignatureVerdict::default();
+    };
+    let failed = match event.signature.as_ref() {
+        Some(sig_bytes) if !sig_bytes.is_empty() => {
+            match <[u8; 64]>::try_from(sig_bytes.as_slice()) {
+                Ok(arr) => {
+                    let sig = ed25519_dalek::Signature::from_bytes(&arr);
+                    let signing_input =
+                        signing_input_bytes(&event.payload_hash, event.cause_hash.as_deref());
+                    vk.verify_strict(&signing_input, &sig).is_err()
+                }
+                Err(_) => true,
+            }
+        }
+        // #1452 — fail-closed on a missing signature when a verifier IS
+        // installed, EXCEPT the by-design legacy `unsigned` rows.
+        _ => event.attest_level != crate::models::AttestLevel::Unsigned.as_str(),
+    };
+    RowSignatureVerdict {
+        signature_failure: failed,
+        role_separation_failure: false,
+    }
+}
+
 pub fn verify_chain(
     conn: &Connection,
     since_sequence: Option<i64>,
@@ -672,7 +769,17 @@ pub fn verify_chain(
     // verifier is structure-only on an unsigned daemon.
     let verifier: Option<ed25519_dalek::VerifyingKey> =
         crate::governance::audit::resolve_daemon_verifying_key();
+    // v0.9.0 G9 (#1826) — recorder K1 pin authority. When enrolled, a
+    // `recorder_signed` row is verified against THIS pubkey over the
+    // domain-separated preimage (never the daemon key), and a `daemon_signed`
+    // governance row is demoted (C2). When unenrolled, recorder rows are
+    // withheld/skipped (C6) rather than false-failed by the daemon verifier.
+    let recorder_verifier: Option<ed25519_dalek::VerifyingKey> =
+        crate::governance::audit::load_enrolled_recorder_pubkey()
+            .ok()
+            .flatten();
     let mut signature_failures: Vec<i64> = Vec::new();
+    let mut role_separation_failures: Vec<i64> = Vec::new();
 
     let mut expected_seq = lower + 1;
     let mut prev_canonical_hash: [u8; 32] = ZERO_HASH;
@@ -755,60 +862,17 @@ pub fn verify_chain(
             }
         }
 
-        // (3) v0.7.0 #1071 — per-row Ed25519 signature verification.
-        // Only fires when a verifier is resolvable AND the row has a
-        // signature blob attached (rows written before #1035 / #1099
-        // and the legacy `attest_level == "unsigned"` rows that ship
-        // by design have `signature: None` and are skipped). On
-        // shape mismatch (signature blob not 64 bytes) or
-        // `verify_strict` failure, push the breaking sequence onto
-        // `signature_failures` and continue the walk — a signature
-        // failure is disjoint from a chain break by design (per-row
-        // forgery vs. across-row substrate tamper).
-        if let Some(vk) = verifier.as_ref() {
-            match event.signature.as_ref() {
-                Some(sig_bytes) if !sig_bytes.is_empty() => {
-                    let sig_array: Option<[u8; 64]> = sig_bytes.as_slice().try_into().ok();
-                    match sig_array {
-                        Some(arr) => {
-                            let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                            // v73 (#1822, G5a) — branch identically to
-                            // signing: when the row carries a cause the
-                            // signature is over the cause-folded digest,
-                            // else over payload_hash verbatim (legacy
-                            // rows verify byte-identically). Tampering
-                            // OR stripping the cause after signing flips
-                            // this input and surfaces as a
-                            // signature_failure.
-                            let signing_input = signing_input_bytes(
-                                &event.payload_hash,
-                                event.cause_hash.as_deref(),
-                            );
-                            if vk.verify_strict(&signing_input, &sig).is_err() {
-                                signature_failures.push(event.sequence);
-                            }
-                        }
-                        None => {
-                            // Malformed signature length — record as failure.
-                            signature_failures.push(event.sequence);
-                        }
-                    }
-                }
-                // #1452 (SEC, HIGH) — fail-closed on a missing signature
-                // when a verifier IS installed. A row whose `attest_level`
-                // is anything other than the by-design legacy `"unsigned"`
-                // marker, but which carries no signature blob (None or an
-                // empty vec), is a stripped / never-signed row on a daemon
-                // that is supposed to be signing — record it as a
-                // signature failure rather than silently skipping it.
-                // Legitimately-unsigned (`attest_level == "unsigned"`)
-                // legacy rows remain skip-by-design.
-                _ => {
-                    if event.attest_level != crate::models::AttestLevel::Unsigned.as_str() {
-                        signature_failures.push(event.sequence);
-                    }
-                }
-            }
+        // (3) v0.7.0 #1071 / v0.9.0 G9 (#1826) — per-row Ed25519 verification,
+        // via the SHARED [`classify_row_signature`] so the sqlite walk here and
+        // the postgres verify twin (C7) surface IDENTICAL signature_failures +
+        // role_separation_failures (K3 parity). A signature failure is disjoint
+        // from a chain break by design (per-row forgery vs substrate tamper).
+        let rv = classify_row_signature(&event, verifier.as_ref(), recorder_verifier.as_ref());
+        if rv.signature_failure {
+            signature_failures.push(event.sequence);
+        }
+        if rv.role_separation_failure {
+            role_separation_failures.push(event.sequence);
         }
 
         // Recompute the canonical hash for the NEXT iteration.
@@ -824,6 +888,7 @@ pub fn verify_chain(
         rows_checked,
         chain_break,
         signature_failures,
+        role_separation_failures,
     })
 }
 
@@ -954,6 +1019,144 @@ pub enum CauseBinding {
     },
 }
 
+/// v0.9.0 G9 (#1826) — verdict of the three-key Recorder/Judge/Stopper
+/// signing-layer SEPARATION check, computed by
+/// [`compute_role_separation_verdict`]. Additive/opt-in: with no role keys
+/// enrolled the verdict is [`Unknown`](RoleSeparationCheck::Unknown) and the
+/// report stays byte-identical to the legacy single-key posture.
+///
+/// - [`Unknown`](RoleSeparationCheck::Unknown) — no role keys enrolled (or no
+///   pinnable anchor) in the DEFAULT withhold posture: never a false alarm.
+/// - [`NotDetected`](RoleSeparationCheck::NotDetected) — every enrolled role's
+///   rows/checkpoints pinned + signature-valid; no forgery/demotion.
+/// - [`Forged`](RoleSeparationCheck::Forged) — a K1 pin FAILED (a judge/stopper
+///   checkpoint `resolver_pubkey` != the enrolled role pubkey), a
+///   `recorder_signed` row failed recorder verification, OR a `daemon_signed`
+///   governance row was DEMOTED post recorder-enrollment (C2). Hard-dirty.
+/// - [`Misconfigured`](RoleSeparationCheck::Misconfigured) — the enrolled
+///   recorder/judge/stopper pubkeys are NOT pairwise-distinct (C3). Dirty.
+/// - [`Missing`](RoleSeparationCheck::Missing) — require-mode
+///   (`AI_MEMORY_REQUIRE_ROLE_SEPARATION`) on but no usable role separation is
+///   available: fail-closed (dirty).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RoleSeparationCheck {
+    /// No role keys enrolled — verdict withheld (default posture).
+    Unknown,
+    /// All enrolled roles pinned + valid; no forgery/demotion.
+    NotDetected,
+    /// K1 pin failed, recorder-row forgery, or daemon-demotion detected.
+    Forged {
+        /// Human-readable reason (for the CLI/JSON surface).
+        detail: String,
+    },
+    /// Enrolled role pubkeys are not pairwise-distinct (C3).
+    Misconfigured {
+        /// Human-readable reason (for the CLI/JSON surface).
+        detail: String,
+    },
+    /// Require-mode on but no usable role separation available (fail-closed).
+    Missing,
+}
+
+/// v0.9.0 G9 (#1826) — compute the [`RoleSeparationCheck`] verdict. Clone of
+/// [`compute_witness_verdict`]'s K1-pin-FIRST discipline, applied to the newest
+/// JUDGE [`crate::models::ConditionType::GovernanceVerdict`] and STOPPER
+/// [`crate::models::ConditionType::GovernanceEnforcement`] checkpoints, plus
+/// the per-row recorder verdict (`recorder_row_failures`) and the C3 pairwise-
+/// distinctness assertion. Shared by BOTH backends so the verdict is IDENTICAL.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_role_separation_verdict(
+    latest_verdict: Option<&crate::models::Checkpoint>,
+    latest_enforcement: Option<&crate::models::Checkpoint>,
+    enrolled_recorder: Option<&ed25519_dalek::VerifyingKey>,
+    enrolled_judge: Option<&ed25519_dalek::VerifyingKey>,
+    enrolled_stopper: Option<&ed25519_dalek::VerifyingKey>,
+    recorder_row_failures: usize,
+    require: bool,
+) -> RoleSeparationCheck {
+    let any_enrolled =
+        enrolled_recorder.is_some() || enrolled_judge.is_some() || enrolled_stopper.is_some();
+    if !any_enrolled {
+        return if require {
+            RoleSeparationCheck::Missing
+        } else {
+            RoleSeparationCheck::Unknown
+        };
+    }
+    // C3 PAIRWISE-DISTINCT — recorder/judge/stopper must be pairwise distinct
+    // (a recorder==witness alias is fine; that is a different key set). Two
+    // roles sharing a key collapses the separation, so reject as Misconfigured.
+    let pairs = [
+        (enrolled_recorder, enrolled_judge, "recorder == judge"),
+        (enrolled_recorder, enrolled_stopper, "recorder == stopper"),
+        (enrolled_judge, enrolled_stopper, "judge == stopper"),
+    ];
+    for (a, b, label) in pairs {
+        if let (Some(a), Some(b)) = (a, b) {
+            if a.to_bytes() == b.to_bytes() {
+                return RoleSeparationCheck::Misconfigured {
+                    detail: format!("enrolled role pubkeys are not pairwise-distinct ({label})"),
+                };
+            }
+        }
+    }
+    // Recorder-row forgery / daemon-demotion (from the per-row verify walk).
+    if enrolled_recorder.is_some() && recorder_row_failures > 0 {
+        return RoleSeparationCheck::Forged {
+            detail: format!(
+                "{recorder_row_failures} governance row(s) failed recorder verification \
+                 or were demoted from daemon_signed after recorder enrollment"
+            ),
+        };
+    }
+    // JUDGE verdict anchor — K1 pin FIRST, then signature self-consistency.
+    if let Some(judge_pk) = enrolled_judge {
+        match latest_verdict {
+            Some(cp) => {
+                if let Some(f) = pin_and_verify_role_checkpoint(cp, judge_pk, "judge verdict") {
+                    return f;
+                }
+            }
+            None if require => return RoleSeparationCheck::Missing,
+            None => {}
+        }
+    }
+    // STOPPER enforcement anchor — K1 pin FIRST. Absence is NORMAL (enforcement
+    // anchors are emitted only on a deny), so a missing one is never Missing.
+    if let Some(stopper_pk) = enrolled_stopper {
+        if let Some(cp) = latest_enforcement {
+            if let Some(f) = pin_and_verify_role_checkpoint(cp, stopper_pk, "stopper enforcement") {
+                return f;
+            }
+        }
+    }
+    RoleSeparationCheck::NotDetected
+}
+
+/// K1 pin + signature check for one role checkpoint. Returns `Some(Forged)` on
+/// a pin mismatch or an invalid signature, else `None` (pinned + valid).
+fn pin_and_verify_role_checkpoint(
+    cp: &crate::models::Checkpoint,
+    expected: &ed25519_dalek::VerifyingKey,
+    role: &str,
+) -> Option<RoleSeparationCheck> {
+    if cp.resolver_pubkey.as_slice() != expected.to_bytes().as_slice() {
+        return Some(RoleSeparationCheck::Forged {
+            detail: format!(
+                "{role} resolver_pubkey does not match the enrolled out-of-band pubkey (K1 pin)"
+            ),
+        });
+    }
+    if !crate::checkpoints::verify(cp) {
+        return Some(RoleSeparationCheck::Forged {
+            detail: format!("{role} checkpoint signature failed verification"),
+        });
+    }
+    None
+}
+
 /// Chain-name tag for a `signed_events` witness [`WitnessCheck::Detected`].
 pub const WITNESS_CHAIN_SIGNED_EVENTS: &str = "signed_events";
 /// Chain-name tag for a `memory_revisions` witness [`WitnessCheck::Detected`].
@@ -1079,6 +1282,19 @@ pub struct AuditTrailReport {
     /// (`cause_hash IS NULL` scan). `Unknown` withholds by default;
     /// `Detected` (require-mode) is dirty. See [`CauseBinding`].
     pub cause_binding: CauseBinding,
+    /// v0.9.0 G9 (#1826) — per-row Ed25519 signature failures (sequences).
+    /// Populated IDENTICALLY by both backends (the postgres twin builds per-row
+    /// verification from scratch under C7). Informational — a daemon-signed
+    /// legacy chain surfaces its failures here without dirtying `is_clean`
+    /// (that preserves the byte-identical legacy verdict); the security-bearing
+    /// recorder/judge/stopper forgeries land in `role_separation`.
+    pub signature_failures: Vec<i64>,
+    /// v0.9.0 G9 (#1826) — three-key Recorder/Judge/Stopper signing-layer
+    /// SEPARATION verdict (K1 pin of the judge/stopper checkpoints + per-row
+    /// recorder verification + C3 distinctness + C2 daemon-demotion).
+    /// `Unknown` withholds (default, legacy-identical); `Forged` /
+    /// `Misconfigured` / `Missing` are dirty. See [`RoleSeparationCheck`].
+    pub role_separation: RoleSeparationCheck,
 }
 
 impl AuditTrailReport {
@@ -1104,6 +1320,15 @@ impl AuditTrailReport {
             )
             // Cause-binding Detected (require-mode) is dirty; Unknown withholds.
             && !matches!(self.cause_binding, CauseBinding::Detected { .. })
+            // v0.9.0 G9 (#1826) — role-separation Forged/Misconfigured/Missing
+            // are dirty; Unknown/NotDetected keep an otherwise-clean report
+            // clean (so an unconfigured deployment is byte-identical legacy).
+            && !matches!(
+                self.role_separation,
+                RoleSeparationCheck::Forged { .. }
+                    | RoleSeparationCheck::Misconfigured { .. }
+                    | RoleSeparationCheck::Missing
+            )
     }
 }
 
@@ -1314,6 +1539,43 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         .unwrap_or(0);
     let cause_binding = compute_cause_binding_verdict(rows_without_cause, require_cause);
 
+    // v0.9.0 G9 (#1826) — three-key role-separation verdict. Same shared
+    // `compute_role_separation_verdict` the postgres twin calls (K3 parity).
+    // Additive/opt-in: absent role keys → Unknown → is_clean unchanged.
+    let require_role = crate::governance::audit::require_role_separation_enabled();
+    let enrolled_recorder = crate::governance::audit::load_enrolled_recorder_pubkey()
+        .ok()
+        .flatten();
+    let enrolled_judge = crate::governance::audit::load_enrolled_judge_pubkey()
+        .ok()
+        .flatten();
+    let enrolled_stopper = crate::governance::audit::load_enrolled_stopper_pubkey()
+        .ok()
+        .flatten();
+    let latest_verdict = read_latest_role_checkpoint(
+        conn,
+        crate::governance::audit::GOVERNANCE_VERDICT_NAMESPACE,
+        crate::models::ConditionType::GovernanceVerdict,
+    )
+    .ok()
+    .flatten();
+    let latest_enforcement = read_latest_role_checkpoint(
+        conn,
+        crate::governance::audit::GOVERNANCE_ENFORCEMENT_NAMESPACE,
+        crate::models::ConditionType::GovernanceEnforcement,
+    )
+    .ok()
+    .flatten();
+    let role_separation = compute_role_separation_verdict(
+        latest_verdict.as_ref(),
+        latest_enforcement.as_ref(),
+        enrolled_recorder.as_ref(),
+        enrolled_judge.as_ref(),
+        enrolled_stopper.as_ref(),
+        report.role_separation_failures.len(),
+        require_role,
+    );
+
     Ok(AuditTrailReport {
         total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
         chain_intact: report.chain_holds(),
@@ -1324,7 +1586,36 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         truncation,
         witness,
         cause_binding,
+        signature_failures: report.signature_failures.clone(),
+        role_separation,
     })
+}
+
+/// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint
+/// (`GovernanceVerdict` or `GovernanceEnforcement`) in `namespace`, newest by
+/// `resolved_at` then `created_at`. `None` when none has been emitted. Clone of
+/// [`read_latest_witness_checkpoint`].
+///
+/// # Errors
+/// Propagates the `rusqlite` query error.
+fn read_latest_role_checkpoint(
+    conn: &Connection,
+    namespace: &str,
+    condition_type: crate::models::ConditionType,
+) -> Result<Option<crate::models::Checkpoint>> {
+    use rusqlite::OptionalExtension;
+    let sql = format!(
+        "{} WHERE namespace = ?1 AND condition_type = ?2 \
+         ORDER BY resolved_at DESC, created_at DESC LIMIT 1",
+        crate::checkpoints::CHECKPOINT_SELECT_SQL
+    );
+    conn.query_row(
+        &sql,
+        params![namespace, condition_type.as_str()],
+        crate::checkpoints::row_to_checkpoint,
+    )
+    .optional()
+    .context("read latest role-separation checkpoint")
 }
 
 /// v0.9.0 G5b (#1822) — read the NEWEST

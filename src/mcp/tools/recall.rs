@@ -328,7 +328,10 @@ const fn attest_rank(level: AttestLevel) -> u8 {
     //   - PeerAttested (2) — federation H3 inbound, allowlist-verified
     match level {
         AttestLevel::Unsigned => 0,
-        AttestLevel::SelfSigned | AttestLevel::DaemonSigned => 1,
+        // RecorderSigned (v0.9.0 G9 #1826) — the substrate's own recorder-role
+        // signature on its own governance-audit emission; same rank as
+        // DaemonSigned (substrate self-signature, distinct role key).
+        AttestLevel::SelfSigned | AttestLevel::DaemonSigned | AttestLevel::RecorderSigned => 1,
         AttestLevel::PeerAttested | AttestLevel::SignedByPeer => 2,
     }
 }

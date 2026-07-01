@@ -606,7 +606,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-01 (#1825 G8) — bumped 23_450 → 23_800: cid stamping across
     // ~10 postgres genesis INSERTs + migrate_v74 + backfill + verify +
     // T7 scrub pushed the file to 23_748.
-    ("src/store/postgres.rs", 23_800),
+    // 2026-07-01 (#1826 G9) — bumped 23_800 → 23_920: the `verify_audit_trail`
+    // twin gained C7 per-row Ed25519 recorder verification in its row walk +
+    // the two role-checkpoint fetches (`pg_read_latest_role_checkpoint`) + the
+    // shared `compute_role_separation_verdict` wiring (file grew to 23_837).
+    ("src/store/postgres.rs", 23_920),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

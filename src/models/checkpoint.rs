@@ -40,6 +40,24 @@ pub enum ConditionType {
     /// witness pubkey (K1) and detect tail-truncation of EITHER chain
     /// against an anchor a `DELETE FROM signed_events` does not touch.
     AuditHeadWitness,
+    /// v0.9.0 G9 (#1826) — a JUDGE-signed governance VERDICT anchor. Emitted
+    /// (and immediately resolved) on EVERY governed verdict (allow AND block)
+    /// when a judge signing key is enrolled, signed by the DISTINCT judge key
+    /// (separate custody from the recorder + stopper). Its `resolution`
+    /// carries the versioned verdict tuple (`agent_id`, `action_kind`,
+    /// `action_hash`, `verdict`, `rule_id`, `reason`) so `verify_audit_trail`
+    /// K1-pins the judge pubkey before trusting the signature. Free-TEXT
+    /// condition type — no schema migration (the SAL enforces the closed set).
+    GovernanceVerdict,
+    /// v0.9.0 G9 (#1826) — a STOPPER-signed governance ENFORCEMENT anchor.
+    /// Emitted (and immediately resolved) when a PreToolUse deny is dispatched
+    /// and a stopper signing key is enrolled, signed by the DISTINCT stopper
+    /// key. Its `resolution` carries the versioned enforcement tuple
+    /// (`agent_id`, `action_kind`, `action_hash`, `permission`, `rule_id`,
+    /// `reason`). K1-pinned to the enrolled stopper pubkey at verify. The
+    /// runtime `deny` is produced independent of (and BEFORE) this anchor —
+    /// the anchor is advisory/forensic, never the enforcement itself.
+    GovernanceEnforcement,
 }
 
 impl ConditionType {
@@ -52,6 +70,8 @@ impl ConditionType {
             Self::ConditionPredicate => "condition_predicate",
             Self::Deadline => "deadline",
             Self::AuditHeadWitness => "audit_head_witness",
+            Self::GovernanceVerdict => "governance_verdict",
+            Self::GovernanceEnforcement => "governance_enforcement",
         }
     }
 
@@ -64,6 +84,8 @@ impl ConditionType {
             "condition_predicate" => Some(Self::ConditionPredicate),
             "deadline" => Some(Self::Deadline),
             "audit_head_witness" => Some(Self::AuditHeadWitness),
+            "governance_verdict" => Some(Self::GovernanceVerdict),
+            "governance_enforcement" => Some(Self::GovernanceEnforcement),
             _ => None,
         }
     }
@@ -154,6 +176,8 @@ mod tests {
             ConditionType::ConditionPredicate,
             ConditionType::Deadline,
             ConditionType::AuditHeadWitness,
+            ConditionType::GovernanceVerdict,
+            ConditionType::GovernanceEnforcement,
         ] {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }
