@@ -691,7 +691,14 @@ CREATE TABLE IF NOT EXISTS signed_events (
     -- them in `PostgresStore::migrate_v33`, and the application-layer
     -- `append_signed_event` populates both on every new write.
     prev_hash    BYTEA,
-    sequence     BIGINT
+    sequence     BIGINT,
+    -- v73 (#1822, v0.9.0 G5a) — audit cause-binding. Additive nullable
+    -- 32-byte SHA-256 over a screened, identity-only pre-image of the
+    -- triggering cause (mirrors SQLite schema v73). NULL for rows with
+    -- no bound cause; a NULL cause contributes zero canonical bytes so
+    -- legacy rows hash unchanged. Pre-v73 deployments pick it up via
+    -- `PostgresStore::migrate_v73`.
+    cause_hash   BYTEA
 );
 
 CREATE INDEX IF NOT EXISTS idx_signed_events_agent     ON signed_events (agent_id);

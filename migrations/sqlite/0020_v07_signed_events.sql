@@ -101,7 +101,16 @@ CREATE TABLE IF NOT EXISTS signed_events (
     -- populates both on every new write. See doc block above + the
     -- `signed_events::canonical_chain_bytes` helper for the encoding.
     prev_hash BLOB,
-    sequence  INTEGER
+    sequence  INTEGER,
+    -- v73 (#1822, v0.9.0 G5a) — audit cause-binding. Additive nullable
+    -- 32-byte SHA-256 over a screened, identity-only pre-image of the
+    -- triggering cause (see `canonical_chain_bytes` present-only fold +
+    -- `signed_events::compute_cause_hash`). NULL for rows written
+    -- without a bound cause (additive — legacy rows hash unchanged
+    -- because a NULL cause contributes zero canonical bytes). Existing
+    -- DBs pick this up via the v73 ALTER in
+    -- `migrations/sqlite/0057_v73_signed_events_cause.sql`.
+    cause_hash BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_signed_events_agent

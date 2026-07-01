@@ -362,7 +362,7 @@ mod tests {
                  timestamp TEXT NOT NULL,
                  -- v34 (V-4 closeout, #698) — cross-row chain columns.
                  prev_hash BLOB,
-                 sequence INTEGER
+                 sequence INTEGER, cause_hash BLOB
              );",
         )
         .unwrap();

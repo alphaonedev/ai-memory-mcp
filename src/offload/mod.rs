@@ -586,6 +586,8 @@ fn append_audit_row(
         timestamp: chrono::Utc::now().to_rfc3339(),
         prev_hash: Vec::new(),
         sequence: 0,
+        // v73 (#1822, G5a): offload audit rows bind no triggering cause.
+        cause_hash: None,
     };
     append_signed_event(conn, &event)?;
     Ok(())

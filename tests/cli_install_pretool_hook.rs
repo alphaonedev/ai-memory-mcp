@@ -360,7 +360,7 @@ fn installed_hook_smoke_test_invokes_check_action() {
              timestamp TEXT NOT NULL,
              -- v34 (V-4 closeout, #698) — cross-row chain columns.
              prev_hash BLOB,
-             sequence INTEGER
+             sequence INTEGER, cause_hash BLOB
          );",
     )
     .unwrap();

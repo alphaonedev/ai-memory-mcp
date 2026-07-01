@@ -1,0 +1,32 @@
+-- v73 (#1822, v0.9.0 G5a) — audit cause-binding: add the additive,
+-- nullable `signed_events.cause_hash` column.
+--
+-- Binds the TRIGGERING CAUSE of an audit-bearing write into the
+-- tamper-evident cross-row hash chain. `cause_hash` is a 32-byte
+-- SHA-256 over a screened, identity-only pre-image
+-- (`audit-cause-v1\0 || caller_agent_id || 0x1F || action_kind ||
+--  0x1F || action_id || 0x1F || input_digest`) computed by
+-- `signed_events::compute_cause_hash`. NEVER carries raw content: the
+-- input is run through `secret_screen::screen` and only the REDACTED
+-- form feeds the (further one-way hashed) `input_digest`, so a
+-- screened credential is unrecoverable from the stored value (K4).
+--
+-- Present-only fold: when a row's `cause_hash IS NULL` it contributes
+-- ZERO bytes and ZERO separators to `canonical_chain_bytes`, so every
+-- legacy (pre-v73) row hashes byte-identically to before this
+-- migration — predecessors verify unchanged. When present, the cause
+-- is appended after the `sequence` field in the canonical bytes AND
+-- folded into the per-row Ed25519 signing input
+-- (`SHA-256(payload_hash || 0x1F || cause_hash)`), so stripping or
+-- tampering the cause is caught by BOTH the next row's `prev_hash`
+-- link and the row's own signature.
+--
+-- Nullable BLOB because the ALTER cannot retroactively populate
+-- pre-existing rows; `append_signed_event` writes it (NULL when the
+-- caller supplies no cause — additive, not every event needs one
+-- yet). SQLite has no `ADD COLUMN IF NOT EXISTS`, so the migration
+-- ladder (`storage::migrations`) runs this file only after a
+-- column-existence probe; fresh installs inherit the column inline
+-- from the CREATE TABLE in `0020_v07_signed_events.sql`.
+
+ALTER TABLE signed_events ADD COLUMN cause_hash BLOB;

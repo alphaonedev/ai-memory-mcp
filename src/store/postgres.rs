@@ -207,6 +207,14 @@ const MIGRATION_V39_SIGNED_EVENTS_DLQ: &str =
 const MIGRATION_V72_MEMORY_REVISIONS: &str =
     include_str!("../../migrations/postgres/0031_v07_memory_revisions.sql");
 
+/// v73 (#1822, v0.9.0 G5a) — audit cause-binding: add the additive
+/// nullable `signed_events.cause_hash` column (postgres mirror of the
+/// sqlite v73 arm). Postgres supports `ADD COLUMN IF NOT EXISTS`, so the
+/// DDL is a single idempotent batch — no backfill (legacy rows keep
+/// `cause_hash NULL`, which contributes zero canonical bytes).
+const MIGRATION_V73_SIGNED_EVENTS_CAUSE: &str =
+    include_str!("../../migrations/postgres/0032_v07_signed_events_cause.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -550,7 +558,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 72;
+const CURRENT_SCHEMA_VERSION: i32 = 73;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1408,8 +1416,11 @@ impl PostgresStore {
         if current_version < 71 {
             self.migrate_v71().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 72 {
             self.migrate_v72().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v73().await?;
         }
 
         Ok(())
@@ -1650,6 +1661,8 @@ impl PostgresStore {
                     timestamp: ts_dt.to_rfc3339(),
                     prev_hash: Vec::new(),
                     sequence: next_seq,
+                    // v73: v33 backfill predates the cause_hash column.
+                    cause_hash: None,
                 };
                 sqlx::query("UPDATE signed_events SET prev_hash = $1, sequence = $2 WHERE id = $3")
                     .bind(prev_hash.to_vec())
@@ -3454,6 +3467,38 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v72 applied (#1823: memory_revisions — signed \
              identity-only append-only revision ledger)"
+        );
+        Ok(())
+    }
+
+    /// v73 (#1822, v0.9.0 G5a) — audit cause-binding: add the additive
+    /// nullable `signed_events.cause_hash` column. Idempotent
+    /// `ADD COLUMN IF NOT EXISTS` — fresh installs already carry the
+    /// column from `postgres_schema.sql`, and there is NO backfill
+    /// (pre-v73 rows keep `cause_hash NULL`, which contributes zero
+    /// canonical bytes so their chain links verify unchanged).
+    async fn migrate_v73(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v73 tx", e))?;
+
+        sqlx::raw_sql(MIGRATION_V73_SIGNED_EVENTS_CAUSE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v73 signed_events cause", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v73 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v73 applied (#1822: signed_events cause_hash — \
+             audit cause-binding)"
         );
         Ok(())
     }
@@ -8504,6 +8549,8 @@ impl PostgresStore {
             signature: None,
             attest_level: crate::models::AttestLevel::Unsigned.as_str(),
             timestamp: created_at_dt,
+            // v73: no triggering cause bound on this path yet (additive).
+            cause_hash: None,
         };
         if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
             tracing::warn!(
@@ -8526,6 +8573,15 @@ struct PgSignedEventInsert<'a> {
     signature: Option<&'a [u8]>,
     attest_level: &'a str,
     timestamp: chrono::DateTime<chrono::Utc>,
+    /// v73 (#1822, G5a) — audit cause-binding. `Some` when the write
+    /// binds a triggering cause (see
+    /// [`crate::signed_events::compute_cause_hash`]); `None` for the
+    /// legacy/no-cause path. Carried into the row's `cause_hash` column
+    /// so it folds into the canonical chain bytes. NB: the postgres
+    /// append path does not itself Ed25519-sign — the caller supplies
+    /// the already-cause-folded `signature` — so this field only feeds
+    /// the canonical-bytes fold, not a signing step here.
+    cause_hash: Option<&'a [u8]>,
 }
 
 /// Postgres-side companion to
@@ -8569,11 +8625,13 @@ async fn pg_append_signed_event_with_chain_in_tx(
         signature,
         attest_level,
         timestamp,
+        cause_hash,
     } = row;
     use crate::signed_events::{ZERO_HASH, canonical_chain_bytes};
     use sha2::{Digest, Sha256};
 
-    // Read the chain head.
+    // Read the chain head — including its cause_hash so the next row's
+    // prev_hash commits to the head's present-only cause fold (v73).
     let head: Option<(
         String,
         String,
@@ -8583,9 +8641,10 @@ async fn pg_append_signed_event_with_chain_in_tx(
         String,
         chrono::DateTime<chrono::Utc>,
         Option<i64>,
+        Option<Vec<u8>>,
     )> = sqlx::query_as(
         "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-                sequence \
+                sequence, cause_hash \
          FROM signed_events \
          ORDER BY COALESCE(sequence, 0) DESC, ctid DESC \
          LIMIT 1",
@@ -8595,7 +8654,7 @@ async fn pg_append_signed_event_with_chain_in_tx(
 
     let (next_seq, prev_hash) = match head {
         None => (1_i64, ZERO_HASH.to_vec()),
-        Some((h_id, h_agent, h_type, h_payload, h_sig, h_attest, h_ts, h_seq)) => {
+        Some((h_id, h_agent, h_type, h_payload, h_sig, h_attest, h_ts, h_seq, h_cause)) => {
             let seq = h_seq.unwrap_or(0);
             let event = crate::signed_events::SignedEvent {
                 id: h_id,
@@ -8607,6 +8666,7 @@ async fn pg_append_signed_event_with_chain_in_tx(
                 timestamp: h_ts.to_rfc3339(),
                 prev_hash: Vec::new(),
                 sequence: seq,
+                cause_hash: h_cause,
             };
             let canon = canonical_chain_bytes(&event);
             let mut hasher = Sha256::new();
@@ -8620,8 +8680,8 @@ async fn pg_append_signed_event_with_chain_in_tx(
     sqlx::query(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
-             prev_hash, sequence) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             prev_hash, sequence, cause_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(agent_id)
@@ -8632,6 +8692,7 @@ async fn pg_append_signed_event_with_chain_in_tx(
     .bind(timestamp)
     .bind(&prev_hash)
     .bind(next_seq)
+    .bind(cause_hash.map(<[u8]>::to_vec))
     .execute(&mut **tx)
     .await?;
 
@@ -11315,6 +11376,8 @@ impl MemoryStore for PostgresStore {
                 signature: ev.signature.as_deref(),
                 attest_level: &ev.attest_level,
                 timestamp: event_ts,
+                // v73: no triggering cause bound on this path yet (additive).
+                cause_hash: None,
             },
         )
         .await
@@ -18047,6 +18110,10 @@ impl MemoryStore for PostgresStore {
             ctx.agent_id.clone(),
             "memory.reclassified".to_string(),
             now.to_rfc3339(),
+            // v73 (#1822, G5a): the postgres reclassify twin does not
+            // thread a cause yet — only the sqlite writer binds one in
+            // G5a (additive; the cause column still round-trips on pg).
+            None,
         );
         pg_append_signed_event_with_chain_in_tx(
             &mut tx,
@@ -18058,6 +18125,10 @@ impl MemoryStore for PostgresStore {
                 signature: event.signature.as_deref(),
                 attest_level: &event.attest_level,
                 timestamp: now,
+                // v73: postgres reclassify/undo twins do not thread a
+                // cause yet — only the sqlite reclassify writer binds one
+                // in G5a (additive; both backends round-trip the column).
+                cause_hash: None,
             },
         )
         .await
@@ -18272,6 +18343,8 @@ impl MemoryStore for PostgresStore {
                 .to_string(),
             crate::signed_events::event_types::MEMORY_UNDO_IN_PLACE_EDIT.to_string(),
             now.to_rfc3339(),
+            // v73 (#1822, G5a): no triggering cause bound on this path yet.
+            None,
         );
         let mut tx = self
             .pool
@@ -18288,6 +18361,10 @@ impl MemoryStore for PostgresStore {
                 signature: event.signature.as_deref(),
                 attest_level: &event.attest_level,
                 timestamp: now,
+                // v73: postgres reclassify/undo twins do not thread a
+                // cause yet — only the sqlite reclassify writer binds one
+                // in G5a (additive; both backends round-trip the column).
+                cause_hash: None,
             },
         )
         .await

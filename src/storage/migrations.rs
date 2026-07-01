@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 72).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 73).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -718,7 +718,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 72;
+const CURRENT_SCHEMA_VERSION: i64 = 73;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1242,6 +1242,15 @@ const MIGRATION_V66_SQLITE: &str =
 /// v72 (#1823, v0.9.0 G6) — append-only spine `memory_revisions` ledger.
 const MIGRATION_V72_SQLITE: &str =
     include_str!("../../migrations/sqlite/0056_v72_memory_revisions.sql");
+// v73 (#1822, v0.9.0 G5a) — audit cause-binding: the additive nullable
+// `signed_events.cause_hash` column. SQLite has no `ADD COLUMN IF NOT
+// EXISTS`, so the v73 ladder arm runs this ALTER only behind a
+// column-existence probe (fresh installs inherit the column inline from
+// the CREATE TABLE in `0020_v07_signed_events.sql`). No index / backfill:
+// legacy rows keep `cause_hash NULL`, which contributes zero canonical
+// bytes so their chain links verify unchanged.
+const MIGRATION_V73_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0057_v73_signed_events_cause.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3037,6 +3046,37 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             conn.execute_batch(MIGRATION_V72_SQLITE)?;
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v73 = #1822 / v0.9.0 G5a (audit cause-binding) — add the
+            // additive nullable `signed_events.cause_hash` column. The
+            // ALTER lives in the SQL file (Rust-guarded because SQLite
+            // lacks `ADD COLUMN IF NOT EXISTS`); the column-existence
+            // probe keeps the step idempotent against a partially-
+            // stamped DB. Gate on the `signed_events` table existing
+            // (same reasoning as the v34 chain step — some fixtures
+            // stamp a high schema_version without ever creating the
+            // table). NO backfill: pre-v73 rows keep `cause_hash NULL`,
+            // which contributes zero canonical bytes so their chain
+            // links verify unchanged. Fresh installs already carry the
+            // column from the CREATE TABLE, so the probe skips the ALTER.
+            let signed_events_exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'signed_events')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if signed_events_exists {
+                let has_cause_hash = conn
+                    .prepare("SELECT cause_hash FROM signed_events LIMIT 0")
+                    .is_ok();
+                if !has_cause_hash {
+                    conn.execute_batch(MIGRATION_V73_SQLITE)?;
+                }
+            }
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -3108,6 +3148,9 @@ pub fn migrate_v34_backfill_chain(conn: &Connection) -> Result<()> {
                     timestamp: row.get(7)?,
                     prev_hash: Vec::new(),
                     sequence: 0,
+                    // v73: pre-existing rows being backfilled predate the
+                    // cause_hash column — no cause to fold.
+                    cause_hash: None,
                 },
             ))
         })?
@@ -3151,6 +3194,8 @@ pub fn migrate_v34_backfill_chain(conn: &Connection) -> Result<()> {
                         timestamp: row.get(6)?,
                         sequence: row.get(7)?,
                         prev_hash: Vec::new(),
+                        // v73: v34 backfill predates cause_hash.
+                        cause_hash: None,
                     })
                 },
             )

@@ -268,6 +268,8 @@ pub(super) async fn sync_push_via_store(
                             attribute_agent.clone(),
                             "federation.quota_refused".to_string(),
                             chrono::Utc::now().to_rfc3339(),
+                            // v73 (#1822, G5a): no cause bound here yet.
+                            None,
                         ),
                     );
                     quota_refused += 1;
