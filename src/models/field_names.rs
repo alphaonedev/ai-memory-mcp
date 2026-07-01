@@ -109,6 +109,23 @@ pub const CONFIRMED_CONTRADICTIONS: &str = "confirmed_contradictions";
 pub const CONSOLIDATED: &str = "consolidated";
 /// `content_sha256` — wire/row field name.
 pub const CONTENT_SHA256: &str = "content_sha256";
+/// v0.9.0 G7 (#1824) — `contradiction_conserved` metadata JSON key.
+/// Set `true` on the loser row when a confirmed contradiction was
+/// CONSERVED (both memories retained) instead of hard-deleting the
+/// loser. The re-entry gate in `forget_if_superseded` reads this to
+/// stay idempotent. LOCAL-only: `merge_metadata` never adopts it from a
+/// peer (see `crdt_merge`).
+pub const CONTRADICTION_CONSERVED: &str = "contradiction_conserved";
+/// v0.9.0 G7 (#1824) — `contradiction_soft_loser` metadata JSON key.
+/// Set `true` on the conserved loser as a reversible, node-local soft
+/// down-weight marker (recall ranking may consult it). Cleared on
+/// rollback. LOCAL-only (never adopted from a peer).
+pub const CONTRADICTION_SOFT_LOSER: &str = "contradiction_soft_loser";
+/// v0.9.0 G7 (#1824) — `contradiction_winner_id` metadata JSON key.
+/// Carries the id of the winning (newer, higher-or-equal confidence)
+/// memory on the conserved loser row. LOCAL-only (never adopted from a
+/// peer).
+pub const CONTRADICTION_WINNER_ID: &str = "contradiction_winner_id";
 /// `correlation_id` — wire/row field name.
 pub const CORRELATION_ID: &str = "correlation_id";
 /// `created_at` — wire/row field name.

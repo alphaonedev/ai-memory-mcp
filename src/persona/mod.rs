@@ -522,7 +522,7 @@ impl<'a> PersonaGenerator<'a> {
             .context("serialise updated persona metadata envelope")?;
         self.conn
             .execute(
-                "UPDATE memories SET metadata = ?1, updated_at = ?2 WHERE id = ?3",
+                crate::storage::SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID,
                 rusqlite::params![new_metadata_str, &now, &persona_id],
             )
             .context("patch persona metadata with signature/attest_level")?;

@@ -185,6 +185,20 @@ pub enum RollbackEntry {
         before: i32,
         after: i32,
     },
+    /// v0.9.0 G7 (#1824) — a confirmed contradiction was CONSERVED (both
+    /// memories retained) instead of hard-deleting the loser. Reversal
+    /// removes the canonical `contradicts` edge and clears the three
+    /// `contradiction_*` marker keys on the loser; it appends NO
+    /// compensating revision leaf (the one SUPERSEDE leaf emitted at
+    /// conserve time is the permanent record of the event).
+    /// `canonical_src`/`canonical_tgt` are the ordered
+    /// (min-id, max-id) endpoints of that single edge.
+    ConserveContradiction {
+        loser_id: String,
+        winner_id: String,
+        canonical_src: String,
+        canonical_tgt: String,
+    },
 }
 
 impl RollbackEntry {
@@ -193,6 +207,7 @@ impl RollbackEntry {
             Self::Consolidate { .. } => crate::audit::OP_CONSOLIDATE,
             Self::Forget { .. } => "forget",
             Self::PriorityAdjust { .. } => "priority_adjust",
+            Self::ConserveContradiction { .. } => "conserve_contradiction",
         }
     }
 }
@@ -480,6 +495,28 @@ fn tier_rank(t: &Tier) -> u8 {
     }
 }
 
+/// v0.9.0 G7 (#1824) — best-effort load of the curator's signing keypair
+/// so the conserved `contradicts` edge is SIGNED when an operator has
+/// configured a key. Mirrors the CLI curator's best-effort loader: pick
+/// the lexicographically-first key under the active key dir. Returns
+/// `None` when no dir / no keys exist (the edge is then written unsigned —
+/// the same posture as every other `create_link_signed(None)` caller).
+fn curator_keypair_best_effort() -> Option<crate::identity::keypair::AgentKeypair> {
+    let dir = crate::identity::keypair::default_key_dir().ok()?;
+    let first = crate::identity::keypair::list(&dir)
+        .ok()?
+        .into_iter()
+        .next()?;
+    crate::identity::keypair::load(&first.agent_id, &dir).ok()
+}
+
+/// v0.9.0 G7 (#1824) — CONSERVE a confirmed contradiction instead of
+/// hard-deleting the loser. When a contradicting memory is both newer AND
+/// carries higher-or-equal confidence, the current `mem` is the LOSER of
+/// the pair; we retain BOTH memories, write one canonical signed
+/// `contradicts` edge, emit one identity-only SUPERSEDE leaf (flag-gated),
+/// and mark the loser with a reversible node-local soft down-weight — via
+/// [`crate::db::conserve_contradiction`]. NEITHER memory is deleted.
 fn forget_if_superseded(
     conn: &Connection,
     mem: &Memory,
@@ -499,13 +536,28 @@ fn forget_if_superseded(
         return Ok(None);
     }
 
-    // The current memory is superseded if a contradicting memory is
-    // both newer AND has higher-or-equal confidence. We never forget
-    // based on the contradicting memory alone — the decision requires
-    // both freshness and trust.
+    // v0.9.0 G7 (#1824) — re-entry gate. A memory already CONSERVED as the
+    // loser of a confirmed contradiction is idempotent: never re-process
+    // it (no second edge, no second leaf, no marker oscillation). This is
+    // the FIRST check after the empty-guard so a re-run of the pass — or a
+    // peer that (wrongly) shipped the marker — short-circuits here.
+    if mem
+        .metadata
+        .get(field_names::CONTRADICTION_CONSERVED)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Ok(None);
+    }
+
+    // The current memory is the LOSER of the pair if a contradicting
+    // memory is both newer AND has higher-or-equal confidence. We never
+    // act on the contradicting memory alone — the decision requires both
+    // freshness and trust. Under G7 the outcome is CONSERVE (retain both),
+    // not delete.
     let by_id: std::collections::HashMap<&str, &Memory> =
         all.iter().map(|m| (m.id.as_str(), m)).collect();
-    let mut superseder: Option<&Memory> = None;
+    let mut winner: Option<&Memory> = None;
     for v in contradictions {
         let Some(other_id) = v.as_str() else {
             continue;
@@ -514,32 +566,38 @@ fn forget_if_superseded(
             && other.updated_at > mem.updated_at
             && other.confidence >= mem.confidence
         {
-            superseder = Some(other);
+            winner = Some(other);
             break;
         }
     }
-    let Some(_) = superseder else {
+    let Some(winner) = winner else {
         return Ok(None);
     };
 
+    // Canonical (min, max) endpoints of the single `contradicts` edge, so
+    // the RollbackEntry describes exactly the edge the write will create.
+    let (canonical_src, canonical_tgt) = db::canonical_contradiction_pair(&mem.id, &winner.id);
+    let entry = RollbackEntry::ConserveContradiction {
+        loser_id: mem.id.clone(),
+        winner_id: winner.id.clone(),
+        canonical_src: canonical_src.to_string(),
+        canonical_tgt: canonical_tgt.to_string(),
+    };
+
+    // Dry-run: return the descriptor, write nothing.
     if dry_run {
-        return Ok(Some(RollbackEntry::Forget {
-            snapshot: mem.clone(),
-        }));
+        return Ok(Some(entry));
     }
 
-    // IMPORTANT: `db::delete` hard-deletes (no archive row). Recovery
-    // for a forgotten memory relies on the RollbackEntry::Forget
-    // snapshot we return — the caller persists it in `_curator/rollback`
-    // with the full pre-forget memory embedded. That rollback entry
-    // is long-tier so it's not auto-GC'd; `ai-memory curator --rollback
-    // <id>` reverses the forget from that snapshot. (#300 item 1:
-    // comment previously claimed db::delete archives; it does not.)
-    db::delete(conn, &mem.id)?;
-
-    Ok(Some(RollbackEntry::Forget {
-        snapshot: mem.clone(),
-    }))
+    // Live: CONSERVE the pair (retain both; one canonical signed edge; one
+    // identity-only SUPERSEDE leaf; reversible soft-down-weight marker).
+    db::conserve_contradiction(
+        conn,
+        mem,
+        &winner.id,
+        curator_keypair_best_effort().as_ref(),
+    )?;
+    Ok(Some(entry))
 }
 
 fn apply_priority_feedback(
@@ -779,6 +837,21 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
             )?;
             Ok(true)
         }
+        // v0.9.0 G7 (#1824) — reverse a CONSERVE: remove the single
+        // canonical `contradicts` edge and clear the three marker keys on
+        // the loser (updated_at preserved). No compensating leaf is
+        // appended — the one SUPERSEDE leaf emitted at conserve time is the
+        // permanent record of the event (a second SUPERSEDE would compound,
+        // and no reversal kind exists in the shipped vocabulary).
+        RollbackEntry::ConserveContradiction {
+            loser_id,
+            winner_id: _,
+            canonical_src,
+            canonical_tgt,
+        } => {
+            db::reverse_conserve_contradiction(conn, loser_id, canonical_src, canonical_tgt)?;
+            Ok(true)
+        }
     }
 }
 
@@ -879,6 +952,49 @@ pub async fn reverse_rollback_entry_store(
             match store.get(ctx, memory_id).await {
                 Ok(mut mem) => {
                     mem.priority = *before;
+                    store.store(ctx, &mem).await?;
+                    Ok(true)
+                }
+                Err(StoreError::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            }
+        }
+        // v0.9.0 G7 (#1824) — store-backed twin of the CONSERVE reversal.
+        // Removes the canonical `contradicts` edge (soft-invalidate via the
+        // SAL trait — the store-agnostic removal surface; NotFound /
+        // unsupported → treated as already-absent, idempotent) and clears
+        // the three marker keys on the loser (get → mutate → store,
+        // preserving updated_at). Parity caveat (same class as G4 above):
+        // the trait exposes no targeted metadata write, so the marker clear
+        // rides `store.store`; a compensating revision leaf is deliberately
+        // NOT appended by this code.
+        RollbackEntry::ConserveContradiction {
+            loser_id,
+            winner_id: _,
+            canonical_src,
+            canonical_tgt,
+        } => {
+            match store
+                .invalidate_link(
+                    canonical_src,
+                    canonical_tgt,
+                    crate::models::MemoryLinkRelation::Contradicts.as_str(),
+                    None,
+                )
+                .await
+            {
+                Ok(_)
+                | Err(StoreError::NotFound { .. })
+                | Err(StoreError::UnsupportedCapability { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+            match store.get(ctx, loser_id).await {
+                Ok(mut mem) => {
+                    if let Some(map) = mem.metadata.as_object_mut() {
+                        map.remove(field_names::CONTRADICTION_CONSERVED);
+                        map.remove(field_names::CONTRADICTION_SOFT_LOSER);
+                        map.remove(field_names::CONTRADICTION_WINNER_ID);
+                    }
                     store.store(ctx, &mem).await?;
                     Ok(true)
                 }
@@ -1940,13 +2056,21 @@ mod tests {
 
         let result = forget_if_superseded(&conn, &older, &[older.clone(), newer], true).unwrap();
         match result {
-            Some(RollbackEntry::Forget { snapshot }) => {
-                assert_eq!(snapshot.id, "old");
+            // v0.9.0 G7 (#1824) — dry-run now returns the CONSERVE
+            // descriptor (retain both), not a Forget.
+            Some(RollbackEntry::ConserveContradiction {
+                loser_id,
+                winner_id,
+                ..
+            }) => {
+                assert_eq!(loser_id, "old");
+                assert_eq!(winner_id, "new");
             }
-            _ => panic!("expected Forget entry from dry-run forget"),
+            _ => panic!("expected ConserveContradiction entry from dry-run conserve"),
         }
-        // Dry-run preserves the row.
+        // Dry-run preserves BOTH rows.
         assert!(db::get(&conn, "old").unwrap().is_some());
+        assert!(db::get(&conn, "new").unwrap().is_some());
     }
 
     /// `forget_if_superseded` skips non-string entries in the

@@ -259,7 +259,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-06-29 (#1849/#1844 security review) — bumped 21_250 → 21_350 for the
     // UNCAPPED `forget_distinct_namespaces` / `forget_distinct_namespaces_for_caller`
     // governance-gate query helpers (#1849) + the title/tags/metadata redact funnel.
-    ("src/storage/mod.rs", 21_600),
+    // 2026-06-30 (#1824, v0.9.0 G7) — bumped 21_600 → 21_800 for the
+    // `conserve_contradiction` + `reverse_conserve_contradiction` non-destructive
+    // contradiction-conserve primitives (transaction-wrapped, doc-heavy) and the
+    // shared `SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID` SSOT const.
+    ("src/storage/mod.rs", 21_800),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
