@@ -23834,4 +23834,527 @@ mod tests {
             "A->B edge must be preserved across archive_by_ids + archive_restore"
         );
     }
+
+    // ===================================================================
+    // v0.9.0 coverage uplift — live-PG exercise of large `MemoryStore`
+    // methods that had no direct in-module coverage: batch write + hybrid
+    // recall, consolidate, forget (guard + archive), link listing +
+    // verification, the audit-trail verifier, the AGE find-paths /
+    // kg-projection-outbox drain, and the optimistic-concurrency +
+    // append-and-archive update paths. Each runs ONLY when a live
+    // Postgres URL is configured (mirrors every `live_*` test above) and
+    // uuid-randomises its namespace so a shared DB can't cross-collide.
+    //
+    // Rust rules applied: `test-tokio-async` (`#[tokio::test]`),
+    // `test-descriptive-names`, `test-arrange-act-assert`, and
+    // M-MOCKABLE-SYSCALLS / M-TAUTOLOGICAL-TESTS (assert observable
+    // round-trip behaviour against the real backend, not restated
+    // constants).
+    // ===================================================================
+
+    #[tokio::test]
+    async fn live_cov1859_store_batch_then_recall_hybrid() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-batch-{}", uuid::Uuid::new_v4());
+        let mems: Vec<Memory> = (0..3)
+            .map(|i| {
+                sample_memory(
+                    &format!("batch-{i}-{}", uuid::Uuid::new_v4()),
+                    &ns,
+                    &format!("batch title {i}"),
+                    "distinctive corpus token qwertyzz for batch hybrid recall",
+                )
+            })
+            .collect();
+        let ids = store.store_batch(&ctx, &mems).await.expect("store_batch");
+        assert_eq!(ids.len(), 3, "store_batch returns one id per memory");
+        for id in &ids {
+            assert!(!id.is_empty(), "each batched id is non-empty");
+        }
+        let filter = Filter {
+            namespace: Some(ns.clone()),
+            limit: 10,
+            ..Filter::default()
+        };
+        let hits = store
+            .recall_hybrid(&ctx, "qwertyzz", None, &filter)
+            .await
+            .expect("recall_hybrid");
+        assert!(!hits.is_empty(), "hybrid recall surfaces the batched rows");
+        assert!(
+            hits.iter()
+                .all(|(m, score)| m.namespace == ns && score.is_finite()),
+            "hits are namespace-scoped with finite scores"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_consolidate_merges_sources_into_new_row() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-consol-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(
+            &format!("consol-a-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "source alpha",
+            "alpha body about ownership",
+        );
+        let b = sample_memory(
+            &format!("consol-b-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "source beta",
+            "beta body about borrowing",
+        );
+        let id_a = store.store(&ctx, &a).await.expect("store a");
+        let id_b = store.store(&ctx, &b).await.expect("store b");
+        let new_id = store
+            .consolidate(
+                &ctx,
+                &[id_a.clone(), id_b.clone()],
+                "consolidated summary",
+                "a durable digest of alpha and beta",
+                &ns,
+                &Tier::Long,
+                "sal-cov-consolidate",
+                "ai:sal-test",
+            )
+            .await
+            .expect("consolidate");
+        assert!(!new_id.is_empty(), "consolidate mints a new row id");
+        let got = store.get(&ctx, &new_id).await.expect("get consolidated");
+        assert_eq!(got.title, "consolidated summary");
+        assert!(matches!(got.tier, Tier::Long), "consolidated tier honoured");
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_forget_requires_filter_then_archives_namespace() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        // Guard: an all-`None` filter is rejected (never a table-wipe).
+        let err = store
+            .forget(&ctx, None, None, None, false)
+            .await
+            .expect_err("all-None forget must be rejected");
+        assert!(
+            matches!(err, StoreError::InvalidInput { .. }),
+            "empty forget filter is InvalidInput, got {err:?}"
+        );
+        // Seed a namespace then forget it with archival.
+        let ns = format!("cov1859-forget-{}", uuid::Uuid::new_v4());
+        for i in 0..2 {
+            let m = sample_memory(
+                &format!("forget-{i}-{}", uuid::Uuid::new_v4()),
+                &ns,
+                &format!("forget title {i}"),
+                "ephemeral body destined for archival",
+            );
+            store.store(&ctx, &m).await.expect("store");
+        }
+        let removed = store
+            .forget(&ctx, Some(&ns), None, None, true)
+            .await
+            .expect("forget by namespace");
+        assert!(
+            removed >= 2,
+            "forgot at least the two seeded rows, got {removed}"
+        );
+        let listed = store
+            .list(
+                &ctx,
+                &Filter {
+                    namespace: Some(ns.clone()),
+                    limit: 10,
+                    ..Filter::default()
+                },
+            )
+            .await
+            .expect("list after forget");
+        assert!(listed.is_empty(), "namespace is emptied after forget");
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_link_list_and_verify() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-links-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(
+            &format!("lk-a-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "link-a",
+            "body a",
+        );
+        let b = sample_memory(
+            &format!("lk-b-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "link-b",
+            "body b",
+        );
+        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let b_id = store.store(&ctx, &b).await.expect("store b");
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        store.link(&ctx, &link).await.expect("create link");
+        // list_links scoped to the source memory's namespace surfaces it.
+        let listed = store.list_links(Some(&ns)).await.expect("list_links");
+        assert!(
+            listed
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "list_links returns the freshly-created edge"
+        );
+        // verify_link over the source id reports on the edge; an empty
+        // filter is rejected.
+        let report = store
+            .verify_link(VerifyFilter {
+                source_id: Some(a_id.clone()),
+                ..VerifyFilter::default()
+            })
+            .await
+            .expect("verify_link by source");
+        assert_eq!(
+            report.source_id, a_id,
+            "verify_link resolves the source edge"
+        );
+        assert_eq!(
+            report.target_id, b_id,
+            "verify_link resolves the target edge"
+        );
+        let empty = store.verify_link(VerifyFilter::default()).await;
+        assert!(
+            matches!(empty, Err(StoreError::InvalidInput { .. })),
+            "verify_link with no selectors is InvalidInput"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_verify_audit_trail_reports_a_head() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // The verifier walks the whole signed_events chain and recomputes
+        // each row's hash. It must return a coherent report whether the
+        // chain is empty or populated; both the unbounded and the
+        // since-windowed calls exercise the recompute loop.
+        let full = store
+            .verify_audit_trail(None)
+            .await
+            .expect("verify full trail");
+        assert!(
+            full.head_sequence >= 0,
+            "head_sequence is non-negative, got {}",
+            full.head_sequence
+        );
+        let windowed = store
+            .verify_audit_trail(Some("2000-01-01T00:00:00Z"))
+            .await
+            .expect("verify windowed trail");
+        assert!(windowed.head_sequence >= 0, "windowed report is coherent");
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_find_paths_and_drain_kg_outbox() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-paths-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(
+            &format!("p-a-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "path-a",
+            "body a",
+        );
+        let b = sample_memory(
+            &format!("p-b-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "path-b",
+            "body b",
+        );
+        let a_id = store.store(&ctx, &a).await.expect("store a");
+        let b_id = store.store(&ctx, &b).await.expect("store b");
+        store
+            .link(
+                &ctx,
+                &crate::models::MemoryLink {
+                    source_id: a_id.clone(),
+                    target_id: b_id.clone(),
+                    relation: crate::models::MemoryLinkRelation::RelatedTo,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    signature: None,
+                    observed_by: None,
+                    valid_from: None,
+                    valid_until: None,
+                    attest_level: None,
+                },
+            )
+            .await
+            .expect("link a->b");
+        // Drain any pending AGE projection work (no-op-safe): exercises the
+        // outbox scan + projection loop and returns rows processed.
+        let drained = store
+            .drain_kg_projection_outbox(100)
+            .await
+            .expect("drain kg projection outbox");
+        assert!(drained <= 100, "drain honours the batch ceiling");
+        // The source==target shortcut is a trivial one-node path...
+        let trivial = store
+            .find_paths_cypher(&a_id, &a_id, Some(2), Some(5))
+            .await
+            .expect("find_paths self");
+        assert_eq!(
+            trivial,
+            vec![vec![a_id.clone()]],
+            "self path is the single node"
+        );
+        // ...and a real two-node query executes the AGE traversal body
+        // (depth-bounded cypher build + bind + execute). The result is
+        // backend-dependent — an AGE build that lags the link projection
+        // yields an empty set, and older AGE point-releases reject the
+        // variable-length pattern outright — so we accept either a
+        // coherent path set or a surfaced backend error, asserting only
+        // that the traversal path does not panic and any returned path
+        // spans both endpoints.
+        match store
+            .find_paths_cypher(&a_id, &b_id, Some(3), Some(10))
+            .await
+        {
+            Ok(paths) => assert!(
+                paths.iter().all(|p| p.len() >= 2),
+                "any returned path spans at least the two endpoints"
+            ),
+            Err(StoreError::BackendUnavailable { .. }) => {}
+            Err(other) => panic!("unexpected find_paths error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_update_with_expected_version_cas() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-cas-{}", uuid::Uuid::new_v4());
+        let id = format!("cas-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(&id, &ns, "cas title", "cas body v1");
+        store.store(&ctx, &mem).await.expect("store");
+        let base = store.get(&ctx, &id).await.expect("get").version;
+        // If-Match with the correct version succeeds and advances it.
+        let next = store
+            .update_with_expected_version(
+                &ctx,
+                &id,
+                UpdatePatch {
+                    content: Some("cas body v2".to_string()),
+                    ..UpdatePatch::default()
+                },
+                Some(base),
+            )
+            .await
+            .expect("expected-version update");
+        assert!(
+            next > base,
+            "version advances past the base, {next} > {base}"
+        );
+        // A stale If-Match (the now-superseded base version) must not win.
+        let stale = store
+            .update_with_expected_version(
+                &ctx,
+                &id,
+                UpdatePatch {
+                    content: Some("cas body stale".to_string()),
+                    ..UpdatePatch::default()
+                },
+                Some(base),
+            )
+            .await;
+        assert!(stale.is_err(), "a stale If-Match update is rejected");
+        let got = store.get(&ctx, &id).await.expect("get after cas");
+        assert_eq!(got.content, "cas body v2", "the winning write persists");
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_update_with_archive_on_supersede() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-supersede-{}", uuid::Uuid::new_v4());
+        let id = format!("sup-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(&id, &ns, "supersede title", "original body");
+        store.store(&ctx, &mem).await.expect("store");
+        // Append-and-archive: mint a NEW row, archive the OLD one, and wire
+        // the supersedes link. Returns (new_id, superseded_old_id).
+        let (old_id, new_id) = store
+            .update_with_archive_on_supersede(
+                &id,
+                UpdatePatch {
+                    content: Some("revised body".to_string()),
+                    ..UpdatePatch::default()
+                },
+                None,
+                crate::models::EditSource::Llm,
+            )
+            .await
+            .expect("supersede update");
+        assert_eq!(old_id, id, "the superseded row is the original id");
+        assert_ne!(new_id, id, "supersede mints a distinct new row id");
+        let fresh = store.get(&ctx, &new_id).await.expect("get superseding row");
+        assert_eq!(
+            fresh.content, "revised body",
+            "new row carries the revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_apply_remote_memory_is_idempotent() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        // Admin ctx: a federation apply is a substrate-privileged write.
+        let ctx = CallerContext::for_admin("ai:sal-test");
+        let ns = format!("cov1859-remote-{}", uuid::Uuid::new_v4());
+        let mem = sample_memory(
+            &format!("remote-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "remote-origin title",
+            "remote-origin body from a peer push",
+        );
+        // First apply INSERTs the row and clears the governance pre-write gate.
+        let first = store
+            .apply_remote_memory(&ctx, &mem)
+            .await
+            .expect("apply_remote_memory insert");
+        assert!(!first.is_empty(), "insert returns the new id");
+        let fetched = store.get(&ctx, &first).await.expect("get applied");
+        assert_eq!(fetched.title, "remote-origin title");
+        // Re-applying the same (equal updated_at) row is an insert_if_newer
+        // NOOP that returns the existing id rather than duplicating.
+        let again = store
+            .apply_remote_memory(&ctx, &mem)
+            .await
+            .expect("apply_remote_memory idempotent re-apply");
+        assert_eq!(again, first, "idempotent re-apply returns the existing id");
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_merge_inbound_and_apply_remote_link() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_admin("ai:sal-test");
+        let ns = format!("cov1859-merge-{}", uuid::Uuid::new_v4());
+        let a = sample_memory(
+            &format!("mi-a-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "merge-a",
+            "body a",
+        );
+        let b = sample_memory(
+            &format!("mi-b-{}", uuid::Uuid::new_v4()),
+            &ns,
+            "merge-b",
+            "body b",
+        );
+        // merge_inbound persists an inbound peer memory and returns its id.
+        let a_id = store
+            .merge_inbound(&ctx, &a)
+            .await
+            .expect("merge_inbound a");
+        let b_id = store
+            .merge_inbound(&ctx, &b)
+            .await
+            .expect("merge_inbound b");
+        assert!(!a_id.is_empty() && !b_id.is_empty());
+        assert_eq!(store.get(&ctx, &a_id).await.expect("get a").namespace, ns);
+        // apply_remote_link lands a peer-origin edge with an attest level.
+        let link = crate::models::MemoryLink {
+            source_id: a_id.clone(),
+            target_id: b_id.clone(),
+            relation: crate::models::MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: Some("ai:peer".to_string()),
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+        };
+        // The `memory_links_attest_signature_atomic_ck` DB constraint ties
+        // attest-level and signature together: an unsigned edge carries no
+        // signature (which this link has), so we apply it at Unsigned.
+        store
+            .apply_remote_link(&ctx, &link, crate::models::AttestLevel::Unsigned.as_str())
+            .await
+            .expect("apply_remote_link");
+        let links = store.list_links(Some(&ns)).await.expect("list_links");
+        assert!(
+            links
+                .iter()
+                .any(|l| l.source_id == a_id && l.target_id == b_id),
+            "the applied remote edge is listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_cov1859_reclassify_memory_kind() {
+        let Some(url) = postgres_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = CallerContext::for_agent("ai:sal-test");
+        let ns = format!("cov1859-reclass-{}", uuid::Uuid::new_v4());
+        let id = format!("reclass-{}", uuid::Uuid::new_v4());
+        // sample_memory defaults to MemoryKind::Observation.
+        let mem = sample_memory(&id, &ns, "reclass title", "reclass body");
+        store.store(&ctx, &mem).await.expect("store");
+        let changed = store
+            .reclassify_memory_kind(&ctx, &id, crate::models::MemoryKind::Concept)
+            .await
+            .expect("reclassify_memory_kind");
+        assert!(changed, "reclassify reports the row was changed");
+        let got = store.get(&ctx, &id).await.expect("get reclassified");
+        assert_eq!(
+            got.memory_kind,
+            crate::models::MemoryKind::Concept,
+            "the persisted memory_kind is updated"
+        );
+    }
 }
