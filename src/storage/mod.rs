@@ -25,6 +25,12 @@ const SQL_SELECT_MEMORY_ROW_BY_ID: &str = "SELECT * FROM memories WHERE id = ?1"
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across the append-only revision sites (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = ?1";
+/// Targeted metadata + updated_at UPDATE (single SQL SSOT). Preserves
+/// `updated_at` byte-for-byte when the caller passes the row's current
+/// value — used by the G7 (#1824) contradiction-conserve marker write,
+/// its reversal, and the persona metadata backfill.
+pub(crate) const SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID: &str =
+    "UPDATE memories SET metadata = ?1, updated_at = ?2 WHERE id = ?3";
 // ── #1579 A2 — sargable `list` SQL fragments ──────────────────────────────
 // The always-present expiry guard opens the WHERE clause; every other
 // filter is appended by `build_list_query` ONLY when the caller supplied
@@ -2272,6 +2278,189 @@ pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
     }
     let changed = conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
     Ok(changed > 0)
+}
+
+/// v0.9.0 G7 (#1824) — canonical `(min, max)` ordering of a contradiction
+/// pair's two endpoints. The single `contradicts` edge is always written
+/// `min -> max` regardless of which side is the loser, so the write is
+/// idempotent against the `PRIMARY KEY(source_id, target_id, relation)`
+/// no matter which direction a later pass re-derives.
+#[must_use]
+pub fn canonical_contradiction_pair<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// v0.9.0 G7 (#1824) — CONSERVE a confirmed contradiction: retain BOTH
+/// memories, record ONE canonical signed `contradicts` link, emit EXACTLY
+/// ONE identity-only SUPERSEDE revision leaf (flag-gated, reusing the G6
+/// spine), and mark the `loser` with a reversible, node-local soft
+/// down-weight — instead of hard-deleting the loser.
+///
+/// Runs the whole thing under ONE `BEGIN IMMEDIATE` / `COMMIT` (rolling
+/// back on any error). `create_link_signed` and
+/// `emit_revision_leaf_if_enabled` both run under this caller transaction
+/// (neither opens its own).
+///
+/// In-transaction order:
+///
+///  1. RE-READ the loser row by id. If it vanished (hard-deleted /
+///     forgotten) between the curator's read and now, CONSERVE commits as
+///     a no-op — the resurrection-race guard.
+///  2. Idempotent canonical `contradicts` edge (pre-checked via
+///     `get_links`, then `create_link_signed`, which is `INSERT OR IGNORE`
+///     against the link primary key).
+///  3. EXACTLY ONE identity-only SUPERSEDE leaf (no content, no winner id).
+///  4. The three `contradiction_*` marker keys, written by a TARGETED
+///     `UPDATE memories SET metadata = ?, updated_at = ?` that preserves
+///     the loser's `updated_at` byte-for-byte (no oscillation).
+///     Deliberately NOT [`overwrite_full_row_by_id`] — that would
+///     double-emit a SUPERSEDE leaf, write a `federation_merge` archive,
+///     and re-seal content, all of which would falsify this design.
+///
+/// # Errors
+///
+/// Propagates any rusqlite / serialization / leaf-append / link-write
+/// error; the transaction is rolled back before the error returns.
+pub fn conserve_contradiction(
+    conn: &Connection,
+    loser: &Memory,
+    winner_id: &str,
+    curator_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Result<()> {
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let tx_result = (|| -> Result<()> {
+        // (1) Resurrection-race guard: re-read under the write lock.
+        let Some(current) = get(conn, &loser.id)? else {
+            return Ok(());
+        };
+
+        // (2) Canonical, idempotent signed `contradicts` edge.
+        let (canonical_src, canonical_tgt) = canonical_contradiction_pair(&loser.id, winner_id);
+        let already_linked = get_links(conn, canonical_src)?.iter().any(|l| {
+            l.source_id == canonical_src
+                && l.target_id == canonical_tgt
+                && l.relation == crate::models::MemoryLinkRelation::Contradicts
+        });
+        if !already_linked {
+            create_link_signed(
+                conn,
+                canonical_src,
+                canonical_tgt,
+                crate::models::MemoryLinkRelation::Contradicts.as_str(),
+                curator_keypair,
+            )?;
+        }
+
+        // (3) EXACTLY ONE identity-only SUPERSEDE leaf (flag-gated).
+        crate::revisions::emit_revision_leaf_if_enabled(
+            conn,
+            &loser.id,
+            crate::revisions::RecordKind::Supersede,
+            Some(loser.version),
+            &loser.namespace,
+            Some(crate::identity::sentinels::AI_CURATOR),
+            &Utc::now().to_rfc3339(),
+        )?;
+
+        // (4) Reversible soft-down-weight marker via a TARGETED metadata
+        // UPDATE that preserves updated_at byte-for-byte.
+        let mut metadata = current.metadata.clone();
+        let map = metadata.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "conserve_contradiction: loser {} metadata is not a JSON object",
+                loser.id
+            )
+        })?;
+        map.insert(
+            field_names::CONTRADICTION_CONSERVED.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        map.insert(
+            field_names::CONTRADICTION_SOFT_LOSER.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        map.insert(
+            field_names::CONTRADICTION_WINNER_ID.to_string(),
+            serde_json::Value::String(winner_id.to_string()),
+        );
+        let metadata_json = serde_json::to_string(&metadata)?;
+        conn.execute(
+            SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID,
+            params![metadata_json, current.updated_at, loser.id],
+        )?;
+        Ok(())
+    })();
+    match tx_result {
+        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// v0.9.0 G7 (#1824) — REVERSE a conserved contradiction: remove the
+/// single canonical `contradicts` edge between `canonical_src` and
+/// `canonical_tgt`, and clear the three `contradiction_*` marker keys on
+/// the `loser` row via a TARGETED metadata UPDATE that preserves
+/// `updated_at` byte-for-byte. Both rows are left intact. NO compensating
+/// revision leaf is appended: the one SUPERSEDE leaf written at conserve
+/// time is the permanent record of the event (no reversal kind exists in
+/// the shipped 7-kind vocabulary, and a second SUPERSEDE would compound).
+///
+/// Runs under ONE `BEGIN IMMEDIATE` / `COMMIT`, rolling back on error.
+/// Idempotent: a missing edge or an already-cleared marker is a no-op.
+///
+/// # Errors
+///
+/// Propagates any rusqlite / serialization error; the transaction is
+/// rolled back before the error returns.
+pub fn reverse_conserve_contradiction(
+    conn: &Connection,
+    loser_id: &str,
+    canonical_src: &str,
+    canonical_tgt: &str,
+) -> Result<()> {
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+    let tx_result = (|| -> Result<()> {
+        // Remove ONLY the canonical `contradicts` edge for this pair
+        // (relation-scoped so we never disturb another relation the pair
+        // may also carry).
+        conn.execute(
+            "DELETE FROM memory_links \
+             WHERE source_id = ?1 AND target_id = ?2 AND relation = ?3",
+            params![
+                canonical_src,
+                canonical_tgt,
+                crate::models::MemoryLinkRelation::Contradicts.as_str()
+            ],
+        )?;
+
+        // Clear the three marker keys, preserving updated_at byte-for-byte.
+        if let Some(current) = get(conn, loser_id)? {
+            let mut metadata = current.metadata.clone();
+            if let Some(map) = metadata.as_object_mut() {
+                map.remove(field_names::CONTRADICTION_CONSERVED);
+                map.remove(field_names::CONTRADICTION_SOFT_LOSER);
+                map.remove(field_names::CONTRADICTION_WINNER_ID);
+            }
+            let metadata_json = serde_json::to_string(&metadata)?;
+            conn.execute(
+                SQL_UPDATE_METADATA_AND_UPDATED_AT_BY_ID,
+                params![metadata_json, current.updated_at, loser_id],
+            )?;
+        }
+        Ok(())
+    })();
+    match tx_result {
+        Ok(()) => conn.execute_batch(connection::SQL_COMMIT)?,
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Move a memory from `memories` to `archived_memories`. Used by the

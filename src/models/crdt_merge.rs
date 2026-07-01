@@ -442,6 +442,28 @@ fn merge_metadata(local: &Memory, remote: &Memory) -> Value {
         } else if let Ok(vc_value) = serde_json::to_value(&merged_vc) {
             map.insert(field_names::VERSION_VECTOR.to_string(), vc_value);
         }
+
+        // v0.9.0 G7 (#1824) — the three `contradiction_*` markers are
+        // node-local: they encode a LOCAL conserve decision + soft
+        // down-weight and MUST NOT leak to — or arrive from — a peer, or a
+        // peer's re-entry gate in `autonomy::forget_if_superseded` would
+        // trip on a marker it never authored (and a remote could otherwise
+        // silently soft-down-weight a local row). LOCAL wins: keep local's
+        // value, drop any remote-introduced key.
+        for key in [
+            field_names::CONTRADICTION_CONSERVED,
+            field_names::CONTRADICTION_SOFT_LOSER,
+            field_names::CONTRADICTION_WINNER_ID,
+        ] {
+            match local.metadata.get(key) {
+                Some(local_val) => {
+                    map.insert(key.to_string(), local_val.clone());
+                }
+                None => {
+                    map.remove(key);
+                }
+            }
+        }
     }
 
     merged
