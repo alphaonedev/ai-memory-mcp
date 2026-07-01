@@ -70,6 +70,7 @@ dependencies = [
  "hex",
  "hf-hub",
  "hkdf",
+ "hmac",
  "http-body-util",
  "instant-distance",
  "libc",
