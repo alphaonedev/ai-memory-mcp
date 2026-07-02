@@ -5706,6 +5706,272 @@ async fn http_get_links_returns_empty_array_for_unlinked_id() {
     assert_eq!(v["links"].as_array().unwrap().len(), 0);
 }
 
+// ---- GET /api/v1/memories/{id}/lineage (v0.9.0 G13-mem #1859) ----
+
+/// Fixture: A (older) <-reflects_on- R (newer); returns (state, a_id, r_id).
+/// Explicit created_at stamps keep the P-wide acyclicity guard (if a
+/// parallel test seeded the flag) deterministic.
+async fn seed_lineage_pair() -> (Db, String, String) {
+    let state = test_state();
+    let mk = |title: &str, at: &str, meta: serde_json::Value| Memory {
+        cid: None,
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-lineage-1859".into(),
+        title: title.into(),
+        content: "lineage http fixture".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        access_count: 0,
+        created_at: at.into(),
+        updated_at: at.into(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: meta,
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let (a, r) = {
+        let lock = state.lock().await;
+        let a = db::insert(
+            &lock.0,
+            &mk(
+                "lineage-a",
+                "2026-01-01T00:00:00+00:00",
+                serde_json::json!({}),
+            ),
+        )
+        .unwrap();
+        let r = db::insert(
+            &lock.0,
+            &mk(
+                "lineage-r",
+                "2026-03-01T00:00:00+00:00",
+                serde_json::json!({}),
+            ),
+        )
+        .unwrap();
+        db::create_link(&lock.0, &r, &a, "reflects_on").unwrap();
+        (a, r)
+    };
+    (state, a, r)
+}
+
+fn lineage_router(state: Db) -> Router {
+    Router::new()
+        .route(
+            crate::handlers::routes::MEMORIES_ID_LINEAGE,
+            axum::routing::get(get_lineage),
+        )
+        .with_state(test_app_state(state))
+}
+
+#[tokio::test]
+async fn http_lineage_ancestors_walks_provenance_edge_1859() {
+    let (state, a, r) = seed_lineage_pair().await;
+    let app = lineage_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{r}/lineage"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["direction"], "ancestors");
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["nodes"][0]["id"], serde_json::json!(a));
+    assert_eq!(v["nodes"][0]["relation"], "reflects_on");
+    assert_eq!(v["nodes"][0]["depth"], 1);
+}
+
+#[tokio::test]
+async fn http_lineage_descendants_reverse_walk_1859() {
+    let (state, a, r) = seed_lineage_pair().await;
+    let app = lineage_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/api/v1/memories/{a}/lineage?direction=descendants&max_depth=3"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["direction"], "descendants");
+    assert_eq!(v["nodes"][0]["id"], serde_json::json!(r));
+}
+
+#[tokio::test]
+async fn http_lineage_invalid_direction_is_400_1859() {
+    let (state, _a, r) = seed_lineage_pair().await;
+    let app = lineage_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{r}/lineage?direction=sideways"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("invalid direction"),
+        "got: {v}"
+    );
+}
+
+#[tokio::test]
+async fn http_lineage_depth_budget_violations_are_400_1859() {
+    let (state, _a, r) = seed_lineage_pair().await;
+    let app = lineage_router(state);
+    for q in ["max_depth=0", "max_depth=99"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/memories/{r}/lineage?{q}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {q}");
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            v["error"].as_str().unwrap().contains("max_depth"),
+            "query {q}: {v}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_lineage_malformed_id_is_400_1859() {
+    let state = test_state();
+    let app = lineage_router(state);
+    // validate_id rejects oversized ids; 300 chars is over the cap.
+    let long_id = "a".repeat(300);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{long_id}/lineage"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn http_lineage_private_root_refused_for_stranger_1859() {
+    // #1800/#959 discipline — a scope=private root owned by someone else
+    // must refuse the walk (403) rather than leak its provenance
+    // neighborhood; the OWNER walks it fine.
+    let state = test_state();
+    let now = "2026-03-01T00:00:00+00:00";
+    let mem = Memory {
+        cid: None,
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: "http-lineage-1859".into(),
+        title: "private-root".into(),
+        content: "private lineage root".into(),
+        tags: vec![],
+        priority: 5,
+        confidence: 1.0,
+        source: "test".into(),
+        access_count: 0,
+        created_at: now.into(),
+        updated_at: now.into(),
+        last_accessed_at: None,
+        expires_at: None,
+        metadata: serde_json::json!({"agent_id": "ai:owner", "scope": "private"}),
+        reflection_depth: 0,
+        memory_kind: crate::models::MemoryKind::Observation,
+        entity_id: None,
+        persona_version: None,
+        citations: Vec::new(),
+        source_uri: None,
+        source_span: None,
+        confidence_source: crate::models::ConfidenceSource::CallerProvided,
+        confidence_signals: None,
+        confidence_decayed_at: None,
+        version: 1,
+        lifecycle_state: crate::models::LifecycleState::Open,
+    };
+    let id = {
+        let lock = state.lock().await;
+        db::insert(&lock.0, &mem).unwrap()
+    };
+    // `test_app_state` seeds the cfg(test)-only `"*"` admin wildcard,
+    // which would bypass the visibility gate — pin a CLOSED allowlist so
+    // the stranger is a genuine non-admin (the production posture).
+    let app = Router::new()
+        .route(
+            crate::handlers::routes::MEMORIES_ID_LINEAGE,
+            axum::routing::get(get_lineage),
+        )
+        .with_state(test_app_state_with_admin(state, "ai:someadmin"));
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{id}/lineage"))
+                .header(crate::HEADER_AGENT_ID, "ai:stranger")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/memories/{id}/lineage"))
+                .header(crate::HEADER_AGENT_ID, "ai:owner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "owner may walk own lineage");
+}
+
 #[tokio::test]
 async fn http_list_namespaces_returns_empty_for_fresh_db() {
     let state = test_state();

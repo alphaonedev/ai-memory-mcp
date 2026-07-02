@@ -299,6 +299,82 @@ pg_test!(pg_link_create_and_get_links, url, {
     assert!(gbody.get("links").is_some());
 });
 
+// v0.9.0 G13-mem (#1859) — GET /api/v1/memories/{id}/lineage postgres
+// branch: SAL lineage walk (dispatcher -> AGE/CTE), the invalid-direction
+// 400 arm, and the depth-budget store_err_to_response arm.
+pg_test!(pg_lineage_walk_and_error_arms_1859, url, {
+    let r = pg_router(&url).await;
+    let ns = uniq_ns();
+    let mk = |title: &str| json!({"title": title, "content": "cov3 pg lineage anchor", "namespace": ns, "agent_id": "ai:cov3-pg"});
+    let (cs1, b1) = post_json(&r, "/api/v1/memories", mk("cov3-pg-lin-parent")).await;
+    let (cs2, b2) = post_json(&r, "/api/v1/memories", mk("cov3-pg-lin-child")).await;
+    assert!(
+        cs1.is_success() && cs2.is_success(),
+        "seed memories: {cs1} {cs2}"
+    );
+    let parent = b1["id"].as_str().unwrap().to_string();
+    let child = b2["id"].as_str().unwrap().to_string();
+
+    // child --derived_from--> parent (a lineage relation; the acyclicity
+    // guard is unseeded/OFF in this process, so ordering is not load-bearing).
+    let (ls, _lb) = post_json(
+        &r,
+        "/api/v1/links",
+        json!({"source_id": child, "target_id": parent, "relation": "derived_from"}),
+    )
+    .await;
+    assert!(
+        ls.is_success() || ls == StatusCode::CONFLICT,
+        "create_link status={ls}"
+    );
+
+    // Ancestors of the child include the parent (SAL walk).
+    let (gs, gbody) = get(&r, &format!("/api/v1/memories/{child}/lineage")).await;
+    assert_eq!(gs, StatusCode::OK);
+    assert_eq!(gbody["direction"], "ancestors");
+    assert!(
+        gbody["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == json!(parent)),
+        "parent must appear in the child's ancestry: {gbody}"
+    );
+
+    // Descendants of the parent include the child (reverse walk).
+    let (ds, dbody) = get(
+        &r,
+        &format!("/api/v1/memories/{parent}/lineage?direction=descendants"),
+    )
+    .await;
+    assert_eq!(ds, StatusCode::OK);
+    assert!(
+        dbody["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == json!(child)),
+        "child must appear in the parent's descendants: {dbody}"
+    );
+
+    // Invalid direction -> 400 (handler-side validation).
+    let (bs, _bb) = get(
+        &r,
+        &format!("/api/v1/memories/{child}/lineage?direction=sideways"),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::BAD_REQUEST);
+
+    // Depth-budget violation -> store InvalidInput -> 400 via
+    // store_err_to_response.
+    let (es, _eb) = get(
+        &r,
+        &format!("/api/v1/memories/{child}/lineage?max_depth=99"),
+    )
+    .await;
+    assert_eq!(es, StatusCode::BAD_REQUEST);
+});
+
 pg_test!(pg_link_verify_missing_args_is_400, url, {
     let r = pg_router(&url).await;
     let (status, _b) = post_json(&r, "/api/v1/links/verify", json!({})).await;
