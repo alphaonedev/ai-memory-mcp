@@ -997,3 +997,142 @@ pub async fn get_links(
         Err(e) => crate::handlers::errors::handler_error_500(&e),
     }
 }
+
+/// v0.9.0 G13-mem (#1859) — query parameters for
+/// `GET /api/v1/memories/{id}/lineage`.
+#[derive(Debug, Default, Deserialize)]
+pub struct LineageQuery {
+    /// "ancestors" (default) or "descendants".
+    pub direction: Option<String>,
+    /// Max hops (default = the shared lineage depth budget, 5).
+    pub max_depth: Option<usize>,
+}
+
+/// v0.9.0 G13-mem (#1859) — `GET /api/v1/memories/{id}/lineage`: walk the
+/// memory-derivation lineage-DAG (the provenance subset P = `derived_from`
+/// / `reflects_on` / `derives_from` of `memory_links`) from `id`, returning
+/// ancestors (default) or descendants as `{id, cid, relation, depth}`
+/// nodes. Tombstoned ancestors are included (a consolidated-away source is
+/// still an ancestor). Both backends return the identical wire shape: the
+/// postgres branch rides the SAL `lineage_ancestors`/`lineage_descendants`
+/// trait methods (AGE Cypher with CTE fallback + the deferred-projection
+/// reroute); the sqlite branch rides `db::lineage_*` (recursive CTE).
+///
+/// Visibility mirrors the MCP `memory_lineage` tool (#1800 discipline):
+/// non-admin callers are refused when the ROOT memory exists but is not
+/// visible to them, so a provenance neighborhood cannot be enumerated
+/// through a foreign private root.
+pub async fn get_lineage(
+    State(app): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LineageQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = validate::validate_id(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response();
+    }
+    let direction = q
+        .direction
+        .as_deref()
+        .unwrap_or(crate::mcp::LINEAGE_DIRECTION_ANCESTORS);
+    if direction != crate::mcp::LINEAGE_DIRECTION_ANCESTORS
+        && direction != crate::mcp::LINEAGE_DIRECTION_DESCENDANTS
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "invalid direction '{direction}' (expected '{}' or '{}')",
+                    crate::mcp::LINEAGE_DIRECTION_ANCESTORS,
+                    crate::mcp::LINEAGE_DIRECTION_DESCENDANTS
+                )
+            })),
+        )
+            .into_response();
+    }
+    let max_depth = q.max_depth.unwrap_or(db::LINEAGE_MAX_DEPTH);
+
+    // Caller resolution + root-visibility gate (the #959/#910 post-filter
+    // family `get_links` rides, applied to the walk ROOT).
+    let caller = {
+        let header_agent_id = headers
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok());
+        crate::identity::resolve_http_agent_id(None, header_agent_id)
+            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+    };
+    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+
+    #[cfg(feature = "sal")]
+    if matches!(app.storage_backend, StorageBackend::Postgres) {
+        if !caller_is_admin {
+            let ctx = crate::store::CallerContext::for_agent(&caller);
+            if let Ok(mem) = app.store.get(&ctx, &id).await
+                && !crate::visibility::is_visible_to_caller(&mem, &caller)
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
+                )
+                    .into_response();
+            }
+        }
+        let walk = if direction == crate::mcp::LINEAGE_DIRECTION_DESCENDANTS {
+            app.store.lineage_descendants(&id, max_depth).await
+        } else {
+            app.store.lineage_ancestors(&id, max_depth).await
+        };
+        return match walk {
+            Ok(nodes) => Json(json!({
+                "id": id,
+                "direction": direction,
+                "nodes": nodes,
+                "count": nodes.len(),
+            }))
+            .into_response(),
+            Err(e) => store_err_to_response(e),
+        };
+    }
+
+    let lock = app.db.lock().await;
+    if !caller_is_admin
+        && let Ok(Some(mem)) = db::get(&lock.0, &id)
+        && !crate::visibility::is_visible_to_caller(&mem, &caller)
+    {
+        drop(lock);
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": crate::errors::msg::CALLER_NOT_SOURCE_MEMORY_OWNER})),
+        )
+            .into_response();
+    }
+    let walk = if direction == crate::mcp::LINEAGE_DIRECTION_DESCENDANTS {
+        db::lineage_descendants(&lock.0, &id, max_depth)
+    } else {
+        db::lineage_ancestors(&lock.0, &id, max_depth)
+    };
+    drop(lock);
+    match walk {
+        Ok(nodes) => Json(json!({
+            "id": id,
+            "direction": direction,
+            "nodes": nodes,
+            "count": nodes.len(),
+        }))
+        .into_response(),
+        Err(e) => {
+            // Depth-budget violations are caller errors (400), mirroring
+            // the kg_query HTTP convention; everything else is a 500.
+            let msg = e.to_string();
+            if msg.contains("max_depth") {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response()
+            } else {
+                crate::handlers::errors::handler_error_500(&e)
+            }
+        }
+    }
+}

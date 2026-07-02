@@ -3005,6 +3005,48 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.9.0 G13-mem (#1859) — the lineage ANCESTORS of `id`: the older
+    /// memories `id` was derived from, transitively, by walking the
+    /// provenance edge set P = {`derived_from`, `reflects_on`,
+    /// `derives_from`} source -> target up to `max_depth`. Tombstoned
+    /// ancestors ARE included (a conserved lineage is the point).
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on storage errors; `InvalidInput` for
+    /// `max_depth` outside the supported range.
+    async fn lineage_ancestors(
+        &self,
+        _id: &str,
+        _max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LINEAGE_ANCESTORS".to_string(),
+        })
+    }
+
+    /// v0.9.0 G13-mem (#1859) — the lineage DESCENDANTS of `id`: the exact
+    /// reverse of [`Self::lineage_ancestors`], walking P edges target ->
+    /// source to reach the newer memories derived FROM `id`.
+    ///
+    /// Default returns `UnsupportedCapability`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on storage errors; `InvalidInput` for
+    /// `max_depth` outside the supported range.
+    async fn lineage_descendants(
+        &self,
+        _id: &str,
+        _max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LINEAGE_DESCENDANTS".to_string(),
+        })
+    }
+
     /// v0.7.0 ARCH-2 FX-C2-batch5 — knowledge-graph timeline scan.
     /// Closes the missing-trait reach at `kg.rs:735`.
     ///

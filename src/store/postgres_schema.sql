@@ -357,6 +357,16 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- "peer_attested". NULL is treated as "unsigned" by readers for
     -- back-compat with v0.6.3 rows written before this column existed.
     attest_level TEXT,
+    -- v0.9.0 G13-mem (#1859, schema v75) — lineage-DAG content-id mirror.
+    -- `source_cid` / `target_cid` carry the `b3:<hex>` content-address
+    -- (schema v74 `memories.cid`) of each endpoint at link-creation time so
+    -- a lineage traversal resolves stable node identity even after a source
+    -- is tombstoned. NULL for legacy rows; the query layer LEFT JOINs
+    -- `memories.cid`. Also added by `migrate_v75` for upgrading DBs. COND 8
+    -- (#1859): any future full-table rebuild of `memory_links` MUST carry
+    -- both columns forward in its explicit column lists.
+    source_cid   TEXT,
+    target_cid   TEXT,
     PRIMARY KEY (source_id, target_id, relation),
     -- v0.7.0 v0.7.1-fold (#687/#688, schema v32 postgres / v33 sqlite) —
     -- closed taxonomy CHECK constraint on `relation`. Mirrors
@@ -378,6 +388,12 @@ CREATE TABLE IF NOT EXISTS memory_links (
 
 CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links (source_id);
 CREATE INDEX IF NOT EXISTS memory_links_target_idx ON memory_links (target_id);
+-- v0.9.0 G13-mem (#1859, schema v75) — `memory_links_target_cid_idx` is
+-- DELIBERATELY NOT created here: this bootstrap runs against LEGACY
+-- databases too (before the migration ladder), where `memory_links`
+-- pre-exists WITHOUT the v75 cid columns — an index on the missing column
+-- would crash `connect()` on every legacy upgrade. `migrate_v75` owns the
+-- index on BOTH paths (fresh installs run the full ladder from 0).
 CREATE INDEX IF NOT EXISTS idx_links_temporal_src
     ON memory_links (source_id, valid_from, valid_until);
 CREATE INDEX IF NOT EXISTS idx_links_temporal_tgt

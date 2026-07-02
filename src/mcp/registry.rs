@@ -101,6 +101,9 @@ pub mod tool_names {
     pub const MEMORY_LEASE_RELEASE: &str = "memory_lease_release";
     /// v0.8.0 Pillar 1 (#1709) — heartbeat-renew an owned lease on an action.
     pub const MEMORY_LEASE_RENEW: &str = "memory_lease_renew";
+    /// v0.9.0 G13-mem (#1859) — walk a memory's derivation lineage-DAG
+    /// (ancestors/descendants over the provenance relation subset).
+    pub const MEMORY_LINEAGE: &str = "memory_lineage";
     pub const MEMORY_LINK: &str = "memory_link";
     pub const MEMORY_LIST: &str = "memory_list";
     pub const MEMORY_LIST_SUBSCRIPTIONS: &str = "memory_list_subscriptions";
@@ -221,6 +224,7 @@ pub mod tool_names {
         MEMORY_LEASE_GET,
         MEMORY_LEASE_RELEASE,
         MEMORY_LEASE_RENEW,
+        MEMORY_LINEAGE,
         MEMORY_LINK,
         MEMORY_LIST,
         MEMORY_LIST_SUBSCRIPTIONS,
@@ -395,6 +399,7 @@ pub mod tool_names {
             assert_eq!(MEMORY_LEASE_GET, "memory_lease_get");
             assert_eq!(MEMORY_LEASE_RELEASE, "memory_lease_release");
             assert_eq!(MEMORY_LEASE_RENEW, "memory_lease_renew");
+            assert_eq!(MEMORY_LINEAGE, "memory_lineage");
             assert_eq!(MEMORY_LINK, "memory_link");
             assert_eq!(MEMORY_LIST, "memory_list");
             assert_eq!(MEMORY_LIST_SUBSCRIPTIONS, "memory_list_subscriptions");
@@ -707,6 +712,9 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::kg_invalidate::KgInvalidateTool>(),
         RegisteredTool::of::<crate::mcp::kg_query::KgQueryTool>(),
         RegisteredTool::of::<crate::mcp::find_paths::FindPathsTool>(),
+        // v0.9.0 G13-mem (#1859) — derivation lineage-DAG walk
+        // (ancestors/descendants over derived_from/reflects_on/derives_from).
+        RegisteredTool::of::<crate::mcp::lineage::LineageTool>(),
         RegisteredTool::of::<crate::mcp::delete::DeleteTool>(),
         RegisteredTool::of::<crate::mcp::promote::PromoteTool>(),
         RegisteredTool::of::<crate::mcp::forget::ForgetTool>(),

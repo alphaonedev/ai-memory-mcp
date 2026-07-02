@@ -730,6 +730,38 @@
       "name": "memory_find_paths"
     },
     {
+      "description": "Walk a memory's derivation lineage (ancestors or descendants) over provenance links.",
+      "docs": "G13: directional walk over the provenance relations derived_from/reflects_on/derives_from. Returns {id, cid, relation, depth} per node; tombstoned ancestors included. max_depth<=5.",
+      "inputSchema": {
+        "properties": {
+          "direction": {
+            "description": "\"ancestors\" (default) or \"descendants\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Root memory id to walk from.",
+            "type": "string"
+          },
+          "max_depth": {
+            "description": "Max hops, default 5, ceiling 5.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lineage"
+    },
+    {
       "description": "Delete a memory by ID.",
       "docs": "Hard-delete by id (removes row, embedding, FTS, links). Use memory_forget for bulk pattern delete (archives first).",
       "inputSchema": {

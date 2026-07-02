@@ -5341,6 +5341,60 @@ pub fn find_synthesis_candidates(
 // at the module root above for `db::LINK_CYCLE_ERR_PREFIX` path
 // stability.
 
+/// v0.9.0 G13-mem (#1859) — read a memory's schema-v74 content-id
+/// (`memories.cid`), or `None` when the row is absent or carries no cid
+/// (legacy / pre-v74). Used to stamp the lineage-DAG `source_cid` /
+/// `target_cid` mirror columns on link write.
+fn read_memory_cid(conn: &Connection, id: &str) -> Option<String> {
+    conn.query_row("SELECT cid FROM memories WHERE id = ?1", params![id], |r| {
+        r.get::<_, Option<String>>(0)
+    })
+    .ok()
+    .flatten()
+}
+
+/// v0.9.0 G13-mem (#1859) — is a would-be lineage edge FORWARD (i.e. does
+/// it point older -> newer, the direction that would let the lineage graph
+/// cycle)? A lineage edge is child(`source_id`, newer) -> parent
+/// (`target_id`, older); it is forward — and must be rejected — when the
+/// TARGET's `created_at` is STRICTLY after the SOURCE's.
+///
+/// COND 4 (#1859): the comparison parses both stamps into chrono
+/// `DateTime` and compares the instants (NOT an rfc3339 string `>=`), so
+/// mixed-offset / mixed-precision timestamps order correctly. On an EXACT
+/// instant tie (a same-batch pair minted under one `Utc::now()`) this
+/// returns `false` (allow) so the write is NOT false-rejected; the
+/// read-side traversal's visited-set cycle guard is the backstop for the
+/// (pathological) equal-stamp mutual pair. An absent endpoint or an
+/// unparseable stamp also returns `false`: the FK existence check
+/// downstream owns the missing-row error, and an unparseable legacy stamp
+/// cannot PROVE forwardness.
+fn lineage_edge_is_forward(conn: &Connection, source_id: &str, target_id: &str) -> bool {
+    let read_created_at = |id: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT created_at FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+    let (Some(source_at), Some(target_at)) =
+        (read_created_at(source_id), read_created_at(target_id))
+    else {
+        return false;
+    };
+    let (Ok(source_t), Ok(target_t)) = (
+        chrono::DateTime::parse_from_rfc3339(&source_at),
+        chrono::DateTime::parse_from_rfc3339(&target_at),
+    ) else {
+        return false;
+    };
+    // STRICT: only a target genuinely newer than the source is forward.
+    // Equal instants (Ordering::Equal) and proper child->parent
+    // (Ordering::Less) both fall through to `false` (allow).
+    target_t > source_t
+}
+
 /// v0.7.0 fix-campaign A3 (LINK-PARITY) — shared pre-create validator
 /// invoked by every link-write entry point.
 ///
@@ -5381,6 +5435,12 @@ pub fn find_synthesis_candidates(
 /// `agent_id` defaults to `"system"` when the caller cannot resolve a
 /// concrete claimant (federation receive path with no claim, etc.) —
 /// the permission rule matcher uses it for `agent_pattern` matching.
+///
+/// `is_federation_import` (v0.9.0 G13-mem #1859) — federation-imported
+/// edges BYPASS the P-wide wall-clock acyclicity guard (Pass 0): cross-node
+/// clock skew can make a genuinely-DAG edge look forward, so the receiver
+/// relies on traversal cycle-detection instead. The legacy `reflects_on`
+/// structural cycle check (Pass 1) still ALWAYS runs.
 pub fn validate_link_pre_create(
     conn: &Connection,
     source_id: &str,
@@ -5388,7 +5448,37 @@ pub fn validate_link_pre_create(
     relation: &str,
     agent_id: &str,
     skip_governance: bool,
+    is_federation_import: bool,
 ) -> Result<()> {
+    // Pass 0: v0.9.0 G13-mem (#1859) — lineage-DAG acyclicity guard. When
+    // the master flag is on and the relation is in the provenance set
+    // P = {derived_from, reflects_on, derives_from}, a lineage edge must
+    // point child(source, newer) -> parent(target, older). Reject the
+    // forward (older -> newer) direction on a STRICT wall-clock comparison
+    // of `created_at`, which — combined with the append-only per-edge
+    // insert discipline — keeps the single-node lineage graph acyclic
+    // without a full traversal on every write (following any P path
+    // strictly decreases `created_at`, a total order on a finite set, so
+    // no path can return to its start). The proof is scoped to
+    // SINGLE-NODE writes; federated imports bypass this pass (COND 4).
+    //
+    // COND 4 (#1859): the comparison is a strict chrono `DateTime` `>`
+    // (NOT an rfc3339 string `>=`), so mixed-offset / mixed-precision
+    // stamps order correctly and a same-batch pair minted under one
+    // `Utc::now()` (equal instants) is NOT false-rejected.
+    if !is_federation_import
+        && crate::config::lineage_dag_enabled()
+        && crate::models::MemoryLinkRelation::from_str(relation)
+            .is_some_and(crate::models::MemoryLinkRelation::is_lineage)
+        && lineage_edge_is_forward(conn, source_id, target_id)
+    {
+        // Reuse the LINK_CYCLE_ERR_PREFIX envelope (HTTP 409 CONFLICT).
+        return Err(anyhow::Error::new(StorageError::LinkReflectionCycle {
+            source_id: source_id.to_string(),
+            target_id: target_id.to_string(),
+        }));
+    }
+
     // Pass 1: cycle check. Only `reflects_on` participates in the
     // DAG invariant — the other four relations are intentionally
     // allowed to form cycles (e.g. mutual `related_to`).
@@ -5551,6 +5641,8 @@ pub fn create_link_signed(
         relation,
         agent_id_for_eval,
         false,
+        // Outbound local write — the lineage acyclicity guard applies.
+        false,
     )?;
     // Verify both IDs exist before creating link
     let source_exists: bool = conn
@@ -5626,10 +5718,30 @@ pub fn create_link_signed(
             _ => (None, crate::models::AttestLevel::Unsigned.as_str(), None),
         };
 
+    // v0.9.0 G13-mem (#1859) — populate the lineage-DAG cid mirror columns
+    // (`source_cid` / `target_cid`) with each endpoint's schema-v74
+    // `memories.cid` AT LINK-CREATION TIME so a lineage traversal resolves
+    // stable node identity even after a source is tombstoned. Gated on
+    // `lineage_dag_enabled()`: when OFF the pair binds NULL, so the row is
+    // BYTE-IDENTICAL to the legacy shape. NULL is also bound when an
+    // endpoint carries no cid (legacy / pre-v74 rows) — the query layer
+    // LEFT JOINs `memories.cid` as the fallback there. The cids are NOT in
+    // the Ed25519 `SignableLink` preimage (byte-compat with every shipped
+    // signature + federated peer): they are advisory-resolution columns,
+    // not attested claims (COND 2).
+    let (source_cid, target_cid): (Option<String>, Option<String>) =
+        if crate::config::lineage_dag_enabled() {
+            (
+                read_memory_cid(conn, source_id),
+                read_memory_cid(conn, target_id),
+            )
+        } else {
+            (None, None)
+        };
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_links \
-            (source_id, target_id, relation, created_at, valid_from, signature, attest_level, observed_by) \
-         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7)",
+            (source_id, target_id, relation, created_at, valid_from, signature, attest_level, observed_by, source_cid, target_cid) \
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             source_id,
             target_id,
@@ -5637,7 +5749,9 @@ pub fn create_link_signed(
             now,
             signature,
             attest_level,
-            observed_by_col
+            observed_by_col,
+            source_cid,
+            target_cid
         ],
     )?;
 
@@ -5816,6 +5930,9 @@ pub fn create_link_inbound(conn: &Connection, link: &MemoryLink, attest_level: &
         link.relation.as_str(),
         peer_agent_id,
         skip_governance,
+        // Federation-imported edge — BYPASS the wall-clock acyclicity guard
+        // (cross-node clock skew); traversal cycle-detection is the backstop.
+        true,
     )?;
     // Same FK guard as create_link_signed — a missing memory means the
     // peer raced ahead of us; we surface that to the caller's warn log
@@ -6103,9 +6220,21 @@ pub fn consolidate(
         // `consolidated_from_agents` for forensic attribution.
         // The consolidator's own agent_id becomes `agent_id` on the result.
         let mut source_agent_ids: Vec<String> = Vec::new();
+        // v0.9.0 G13-mem (#1859) — per-source identity captured for the
+        // disposition + CONSOLIDATE-leaf pass below: (id, cid, version,
+        // namespace). Populated in this same read so the derived_from
+        // edges, the leaves, and `metadata.derived_from_cids` need no
+        // re-read.
+        let mut source_rows: Vec<(String, Option<String>, i64, String)> = Vec::new();
         for id in ids {
             match get(conn, id)? {
                 Some(mem) => {
+                    source_rows.push((
+                        id.clone(),
+                        mem.cid.clone(),
+                        mem.version,
+                        mem.namespace.clone(),
+                    ));
                     max_priority = max_priority.max(mem.priority);
                     all_tags.extend(mem.tags);
                     total_access = total_access.saturating_add(mem.access_count);
@@ -6179,6 +6308,25 @@ pub fn consolidate(
                 ),
             );
         }
+        // v0.9.0 G13-mem (#1859) — record the sources' content-ids on the
+        // result's `metadata.derived_from_cids` (parallel to the id-array
+        // `derived_from`) whenever the lineage-DAG is on: with the
+        // tombstone sub-flag ON it is a belt-and-suspenders anchor next to
+        // the navigable edges; with it OFF (legacy hard-delete) it is the
+        // ONLY federation-portable lineage record across the consolidation
+        // boundary. COND 2: `memories.cid` has only a NON-unique index and
+        // federation dedups on UUID, so the cids are an advisory
+        // best-effort hint — the UUID array stays authoritative.
+        if crate::config::lineage_dag_enabled() {
+            let cids: Vec<serde_json::Value> = source_rows
+                .iter()
+                .filter_map(|(_, cid, _, _)| cid.clone().map(serde_json::Value::String))
+                .collect();
+            merged_metadata.insert(
+                "derived_from_cids".to_string(),
+                serde_json::Value::Array(cids),
+            );
+        }
         let merged_metadata_value = serde_json::Value::Object(merged_metadata);
         crate::validate::validate_metadata(&merged_metadata_value)
             .context("merged metadata exceeds size limit")?;
@@ -6248,12 +6396,66 @@ pub fn consolidate(
             params![new_id, tier.as_str(), namespace, title, summary, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis],
         )?;
 
-        // Delete source memories first. Note: we intentionally do NOT create
-        // derived_from links before deletion because ON DELETE CASCADE would
-        // immediately remove them. Instead, source IDs are recorded in the
-        // consolidated memory's metadata for provenance.
-        for id in ids {
-            delete(conn, id)?;
+        // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
+        // emission site, shared-predicate-keyed with the Postgres twin
+        // (`pg_emit_consolidate_leaf_if_enabled`): EXACTLY ONE signed
+        // CONSOLIDATE leaf per source when the append-only spine AND/OR
+        // the lineage tombstone sub-flag is on; none when both are off
+        // (byte-identical legacy). Emitted BEFORE the disposition below
+        // (capture-then-compact) in this same transaction.
+        if crate::revisions::consolidate_leaf_enabled() {
+            for (id, _cid, version, source_ns) in &source_rows {
+                crate::revisions::emit_consolidate_leaf(
+                    conn,
+                    id,
+                    Some(*version),
+                    source_ns,
+                    Some(consolidator_agent_id),
+                    &now,
+                )?;
+            }
+        }
+
+        // v0.9.0 G13-mem (#1859) — source disposition. Two paths,
+        // flag-gated; the sub-flag OFF keeps the legacy hard-DELETE
+        // byte-identical.
+        if crate::config::consolidate_tombstone_sources_enabled() {
+            // TOMBSTONE path: the sources are RETAINED (id + cid preserved)
+            // and a navigable `derived_from` edge C -> source is written —
+            // the FK survives because there is no delete + cascade — so
+            // multi-hop store -> reflect -> consolidate lineage stays
+            // navigable across the consolidation boundary.
+            for (id, _cid, _version, _source_ns) in &source_rows {
+                // C -> source `derived_from`, routed through the UNSIGNED
+                // `create_link` wrapper -> `create_link_signed(.., None)`
+                // (COND 6): that path populates `source_cid`/`target_cid`.
+                // The Pass-0 acyclicity guard is satisfied by construction —
+                // C's `created_at == now` is never older than a retained
+                // source's.
+                create_link(
+                    conn,
+                    &new_id,
+                    id,
+                    crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                )?;
+                // Logical delete: exclude the source from ordinary recall
+                // while keeping the row (and its cid) reachable as a lineage
+                // ancestor. Raw UPDATE — this is a system transition, not a
+                // caller-reachable `LifecycleState::can_transition_to` edge.
+                conn.execute(
+                    "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![crate::models::LifecycleState::Tombstoned.as_str(), now, id],
+                )?;
+            }
+        } else {
+            // LEGACY hard-DELETE path. We intentionally do NOT create
+            // derived_from links before deletion because ON DELETE CASCADE
+            // would immediately remove them; source IDs live in
+            // `metadata.derived_from` (non-navigable, plus the cid twin
+            // above when the master flag is on) instead.
+            for id in ids {
+                delete(conn, id)?;
+            }
         }
 
         Ok(new_id.clone())
@@ -8122,6 +8324,138 @@ pub fn kg_query(
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// v0.9.0 G13-mem (#1859) — depth ceiling for a lineage-DAG walk. Reuses
+/// the [`kg_query`] reachability budget so both traversals share one bound.
+pub const LINEAGE_MAX_DEPTH: usize = KG_QUERY_MAX_SUPPORTED_DEPTH;
+
+/// Direction of a [`lineage_traverse`] walk over the provenance subset
+/// P = {`derived_from`, `reflects_on`, `derives_from`}.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineageDirection {
+    /// Follow edges source -> target: reach the PARENTS (older provenance).
+    Ancestors,
+    /// Follow edges target -> source: reach the CHILDREN (newer derivatives).
+    Descendants,
+}
+
+/// v0.9.0 G13-mem (#1859) — the shared recursive-CTE lineage walk. Mirrors
+/// [`kg_query`]'s SQLite traversal (depth ceiling + `json_each` visited-set
+/// cycle guard) but restricts every hop to the lineage relation set
+/// [`crate::models::MemoryLinkRelation::LINEAGE`], resolves each node's cid
+/// from the edge's stored `*_cid` mirror with a LEFT JOIN fallback to the
+/// live `memories.cid`, and — deliberately — does NOT filter
+/// `lifecycle_state`: a Tombstoned ancestor is the whole point of a
+/// conserved lineage.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidArgument`] for `max_depth` outside
+/// `[1, LINEAGE_MAX_DEPTH]`; propagates `rusqlite` errors otherwise.
+fn lineage_traverse(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+    direction: LineageDirection,
+) -> Result<Vec<crate::models::LineageNode>> {
+    if max_depth == 0 {
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
+        }));
+    }
+    if max_depth > LINEAGE_MAX_DEPTH {
+        return Err(anyhow::Error::new(StorageError::InvalidArgument {
+            reason: format!("max_depth={max_depth} exceeds supported depth={LINEAGE_MAX_DEPTH}"),
+        }));
+    }
+
+    // Per-hop predicate: the relation must be in P. Built from the typed
+    // SSOT (M-STRONG-TYPES) rather than a re-spelled literal list; the
+    // values are compile-time-known enum strings, so the interpolation
+    // carries no injection surface.
+    let p_in_list = crate::models::MemoryLinkRelation::LINEAGE
+        .iter()
+        .map(|r| format!("'{}'", r.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Direction picks which endpoint is the "next node" and which cid
+    // mirror column anchors it. Ancestors walk source -> target (node =
+    // target, cid = target_cid); descendants walk target -> source.
+    let (anchor_col, node_col, edge_cid_col) = match direction {
+        LineageDirection::Ancestors => ("source_id", "target_id", "target_cid"),
+        LineageDirection::Descendants => ("target_id", "source_id", "source_cid"),
+    };
+
+    let max_depth_i64 = i64::try_from(max_depth).unwrap_or(i64::MAX);
+    let sql = format!(
+        "WITH RECURSIVE lineage(node_id, relation, edge_cid, depth, path) AS (\
+            SELECT ml.{node_col}, ml.relation, ml.{edge_cid_col}, 1, \
+                   json_array(ml.{anchor_col}, ml.{node_col}) \
+            FROM memory_links ml \
+            WHERE ml.{anchor_col} = ?1 AND ml.relation IN ({p_in_list}) \
+            UNION ALL \
+            SELECT ml.{node_col}, ml.relation, ml.{edge_cid_col}, t.depth + 1, \
+                   json_insert(t.path, '$[' || json_array_length(t.path) || ']', ml.{node_col}) \
+            FROM memory_links ml \
+            JOIN lineage t ON ml.{anchor_col} = t.node_id \
+            WHERE t.depth < ?2 AND ml.relation IN ({p_in_list}) \
+              AND NOT EXISTS (SELECT 1 FROM json_each(t.path) WHERE value = ml.{node_col})\
+         ) \
+         SELECT t.node_id, COALESCE(t.edge_cid, m.cid), t.relation, MIN(t.depth) AS depth \
+         FROM lineage t \
+         LEFT JOIN memories m ON m.id = t.node_id \
+         GROUP BY t.node_id \
+         ORDER BY depth ASC, t.node_id ASC",
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![root_id, max_depth_i64], |row| {
+        let depth: i64 = row.get(3)?;
+        Ok(crate::models::LineageNode {
+            id: row.get(0)?,
+            cid: row.get(1)?,
+            relation: row.get(2)?,
+            depth: usize::try_from(depth).unwrap_or(0),
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// v0.9.0 G13-mem (#1859) — the lineage ANCESTORS of `root_id`: every
+/// memory reachable by following provenance edges (P = `derived_from` /
+/// `reflects_on` / `derives_from`) source -> target, i.e. the older
+/// memories this one was derived from, transitively up to `max_depth`.
+/// Each node reports the shortest hop distance and the relation on the
+/// edge that reached it. Tombstoned ancestors ARE included (a conserved
+/// lineage is the point).
+///
+/// # Errors
+///
+/// See [`lineage_traverse`].
+pub fn lineage_ancestors(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+) -> Result<Vec<crate::models::LineageNode>> {
+    lineage_traverse(conn, root_id, max_depth, LineageDirection::Ancestors)
+}
+
+/// v0.9.0 G13-mem (#1859) — the lineage DESCENDANTS of `root_id`: the exact
+/// reverse of [`lineage_ancestors`], following provenance edges target ->
+/// source to reach the newer memories derived FROM this one.
+///
+/// # Errors
+///
+/// See [`lineage_traverse`].
+pub fn lineage_descendants(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+) -> Result<Vec<crate::models::LineageNode>> {
+    lineage_traverse(conn, root_id, max_depth, LineageDirection::Descendants)
 }
 
 /// Default cap on paths returned by [`find_paths`] when the caller does

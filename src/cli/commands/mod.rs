@@ -37,6 +37,8 @@ pub mod check_duplicate;
 pub mod expand;
 pub mod find_paths;
 pub mod kg_query;
+// v0.9.0 G13-mem (#1859) — `ai-memory lineage` derivation lineage-DAG walk.
+pub mod lineage;
 pub mod recall_observations;
 // v0.7.0 #1598 — `ai-memory reembed`: full-corpus vector-space
 // migration (REPLACES every stored embedding with the resolved

@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — v0.9.0
+
+### Added — G13-mem memory-derivation lineage-DAG ([#1859](https://github.com/alphaonedev/ai-memory-mcp/issues/1859))
+
+- **Lineage-DAG query surface** over the provenance link subset
+  P = {`derived_from`, `reflects_on`, `derives_from`} (a VIEW over
+  `memory_links` — no new table, no new relation): MCP `memory_lineage`
+  (tool count 100 → 101, `graph` family), HTTP
+  `GET /api/v1/memories/{id}/lineage`, CLI `ai-memory lineage`
+  (subcommands 83/85 → 84/86), Python SDK `lineage()`. Both backends
+  return the identical `{id, cid, relation, depth}` node shape (SQLite
+  recursive CTE; Postgres AGE Cypher with CTE fallback + the
+  deferred-projection read-your-own-write reroute).
+- **Schema v75** (both ladders): additive nullable
+  `memory_links.source_cid` / `target_cid` mirror the endpoints'
+  schema-v74 `memories.cid` at link-creation time (advisory
+  federation-resolution anchor — the UUID stays authoritative).
+- **BEHAVIOR CHANGE (flag-gated):** with `AI_MEMORY_LINEAGE_DAG` +
+  `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES` on, `memory_consolidate` no
+  longer erases its sources — it **tombstones** them
+  (`lifecycle_state='tombstoned'`, id + cid retained) and writes
+  navigable `derived_from` edges, making store → reflect → consolidate
+  multi-hop lineage walkable. Erasure-required (GDPR) deployments set
+  the sub-flag off to keep the legacy hard-delete.
+- **CONSOLIDATE revision-leaf baseline corrected:** pre-#1859 the
+  Postgres consolidate already emitted a per-source `CONSOLIDATE`
+  `memory_revisions` leaf under `AI_MEMORY_APPEND_ONLY` while SQLite
+  emitted none. Both backends now emit EXACTLY ONE leaf per source
+  through the single shared predicate
+  `revisions::consolidate_leaf_enabled()` (append-only AND/OR the
+  tombstone sub-flag; never zero when either is on, never two when both
+  are).
+- **P-wide acyclicity guard** on lineage-relation link writes (strict
+  chrono `>` on `created_at`; equal same-batch instants admitted;
+  federation imports bypass — traversal cycle-detection is the
+  backstop), surfaced via the existing `LINK_CYCLE_ERR_PREFIX` 409
+  envelope on both backends.
+
 ## [0.8.1] — 2026-06-29 — `hardened-patch` — defect closure + security review ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
 
 A defect-closure + security-hardening patch that makes shipped v0.8.0 correct

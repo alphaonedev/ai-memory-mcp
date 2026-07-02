@@ -420,6 +420,26 @@ impl MemoryStore for SqliteStore {
         .map_err(box_err)
     }
 
+    async fn lineage_ancestors(
+        &self,
+        id: &str,
+        max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        // v0.9.0 G13-mem (#1859) — route the SAL trait's lineage-ancestors
+        // surface through SQLite's recursive-CTE `db::lineage_ancestors`.
+        let conn = self.state.lock().await;
+        db::lineage_ancestors(&conn, id, max_depth).map_err(box_err)
+    }
+
+    async fn lineage_descendants(
+        &self,
+        id: &str,
+        max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        let conn = self.state.lock().await;
+        db::lineage_descendants(&conn, id, max_depth).map_err(box_err)
+    }
+
     async fn link_signed(
         &self,
         _ctx: &CallerContext,

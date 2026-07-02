@@ -157,8 +157,8 @@ impl Family {
             // host-volunteered idempotent turn-capture substrate primitive).
             tn::MEMORY_UPDATE | tn::MEMORY_DELETE | tn::MEMORY_FORGET | tn::MEMORY_GC
             | tn::MEMORY_PROMOTE | tn::MEMORY_CAPTURE_TURN => Some(Self::Lifecycle),
-            // graph (11 — v0.7.0 I4 added memory_replay; v0.7 H4 added memory_verify;
-            // v0.7 J7 added memory_find_paths)
+            // graph (12 — v0.7.0 I4 added memory_replay; v0.7 H4 added memory_verify;
+            // v0.7 J7 added memory_find_paths; v0.9.0 #1859 added memory_lineage)
             tn::MEMORY_KG_QUERY
             | tn::MEMORY_KG_TIMELINE
             | tn::MEMORY_KG_INVALIDATE
@@ -169,7 +169,8 @@ impl Family {
             | tn::MEMORY_GET_TAXONOMY
             | tn::MEMORY_REPLAY
             | tn::MEMORY_VERIFY
-            | tn::MEMORY_FIND_PATHS => Some(Self::Graph),
+            | tn::MEMORY_FIND_PATHS
+            | tn::MEMORY_LINEAGE => Some(Self::Graph),
             // governance (8)
             tn::MEMORY_PENDING_LIST
             | tn::MEMORY_PENDING_APPROVE
@@ -439,6 +440,9 @@ impl Family {
                 // v0.7 J7 — enumerate up to N paths between two memories
                 // (BFS with cycle detection over memory_links).
                 tn::MEMORY_FIND_PATHS,
+                // v0.9.0 G13-mem (#1859) — derivation lineage-DAG walk
+                // (ancestors/descendants over the provenance relations).
+                tn::MEMORY_LINEAGE,
             ],
             Self::Governance => &[
                 tn::MEMORY_PENDING_LIST,

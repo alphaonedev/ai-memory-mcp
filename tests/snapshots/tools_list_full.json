@@ -738,6 +738,34 @@
       "name": "memory_find_paths"
     },
     {
+      "description": "Walk a memory's derivation",
+      "inputSchema": {
+        "properties": {
+          "direction": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "max_depth": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_lineage"
+    },
+    {
       "description": "Delete a memory by ID.",
       "inputSchema": {
         "properties": {
