@@ -167,7 +167,15 @@ async fn enforce_governance_action_denies_non_owner_on_owner_standard() {
 
     let payload = serde_json::json!({"title": "intruder write"});
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &intruder, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &intruder,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     match decision {
@@ -184,7 +192,15 @@ async fn enforce_governance_action_denies_non_owner_on_owner_standard() {
 
     // Sanity: the owner itself is allowed under the same standard.
     let allowed = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce for owner");
     assert!(matches!(allowed, GovernanceDecision::Allow));

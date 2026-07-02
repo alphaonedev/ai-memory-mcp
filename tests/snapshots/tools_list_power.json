@@ -10,6 +10,12 @@
               "null"
             ]
           },
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "confidence": {
             "format": "double",
             "type": [

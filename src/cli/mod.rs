@@ -20,6 +20,9 @@ pub mod archive;
 pub mod audit;
 pub mod backup;
 pub mod boot;
+/// v0.9.0 G10.1 (#1827) — macaroon capability-token lifecycle
+/// (`keygen` / `mint` / `attenuate` / `inspect` / `verify`).
+pub mod capability;
 /// v0.7.0 QW-1 — new-format CLI command modules (return exit codes
 /// rather than calling `process::exit`).
 pub mod commands;

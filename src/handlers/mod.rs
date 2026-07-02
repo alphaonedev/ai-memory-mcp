@@ -155,6 +155,24 @@ pub use subscriptions::*;
 pub use system::*;
 pub use transport::*;
 
+/// v0.9.0 G10.1 (#1827) — parse the optional `X-AI-Memory-Capability`
+/// header ONCE at the HTTP edge into a macaroon capability token. Inert
+/// (`None`, zero audit bytes) when the header is absent or
+/// `[capabilities].enabled = false`; a malformed header WARNs + audits and
+/// yields `None` (never a 4xx/5xx — the bare ACL decides).
+#[must_use]
+pub(crate) fn capability_from_headers(
+    headers: &axum::http::HeaderMap,
+    actor: &str,
+) -> Option<crate::governance::capability::CapabilityToken> {
+    crate::governance::capability::parse_presented_token(
+        headers
+            .get(crate::governance::capability::HTTP_CAPABILITY_HEADER)
+            .and_then(|v| v.to_str().ok()),
+        actor,
+    )
+}
+
 // Inline test scaffold (`#[cfg(test)] mod tests`) preserved verbatim
 // from the pre-split mod.rs body. Tracked for future per-domain
 // decomposition into `tests/handlers_<domain>.rs` integration test

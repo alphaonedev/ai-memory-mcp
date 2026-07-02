@@ -773,7 +773,12 @@ pub async fn import_memories(
         // but the ctx is the auth principal so visibility filters
         // applied INSIDE store_inner (e.g., upsert dedup lookup)
         // see the actual caller.
-        let ctx = crate::store::CallerContext::for_agent(caller.clone());
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE into the caller context;
+        // inert unless `[capabilities].enabled`. The same token gates
+        // every row in the batch.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone())
+            .with_capability(crate::handlers::capability_from_headers(&headers, &caller));
         let mut imported = 0usize;
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
@@ -820,6 +825,7 @@ pub async fn import_memories(
                     None,
                     None,
                     &payload_for_pending,
+                    ctx.capability.as_ref(),
                 )
                 .await
             {

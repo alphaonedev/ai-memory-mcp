@@ -157,7 +157,15 @@ async fn s34_write_to_approve_namespace_pends() {
 
     let payload = serde_json::json!({"title": "to-approve"});
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     let pending_id = match decision {
@@ -229,6 +237,7 @@ async fn s35_child_inherits_parent_policy() {
             None,
             None,
             &payload,
+            None,
         )
         .await
         .expect("enforce_governance_action");
@@ -276,7 +285,15 @@ async fn s53_enforce_owner_at_leaf() {
     // Owner writes succeed.
     let payload = serde_json::json!({"title": "owner-write"});
     let owner_decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("owner enforce");
     assert!(
@@ -286,7 +303,15 @@ async fn s53_enforce_owner_at_leaf() {
 
     // Intruder writes denied with reason that references owner-only.
     let intruder_decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &intruder, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &intruder,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("intruder enforce");
     match intruder_decision {
@@ -353,7 +378,15 @@ async fn s60_inheritance_deep_child() {
 
     // Owner can write to deep child via inheritance.
     let owner_decision = store
-        .enforce_governance_action(GovernedAction::Store, &deep, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &deep,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("owner deep enforce");
     assert!(
@@ -370,6 +403,7 @@ async fn s60_inheritance_deep_child() {
             None,
             None,
             &payload,
+            None,
         )
         .await
         .expect("intruder deep enforce");
@@ -388,6 +422,7 @@ async fn s60_inheritance_deep_child() {
             None,
             None,
             &payload,
+            None,
         )
         .await
         .expect("unrelated enforce");
@@ -441,7 +476,15 @@ async fn s80_postgres_inheritance_deep_child() {
 
     let payload = serde_json::json!({"title": "deep-write"});
     let owner_decision = store
-        .enforce_governance_action(GovernedAction::Store, &deep, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &deep,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("owner deep enforce");
     assert!(
@@ -457,6 +500,7 @@ async fn s80_postgres_inheritance_deep_child() {
             None,
             None,
             &payload,
+            None,
         )
         .await
         .expect("intruder deep enforce");
@@ -518,6 +562,7 @@ async fn inheritance_walk_capped_at_five_levels() {
             None,
             None,
             &payload,
+            None,
         )
         .await
         .expect("near-leaf enforce");
@@ -589,6 +634,7 @@ async fn bulk_create_postgres_enforces_governance() {
             None,
             None,
             &intruder_payload,
+            None,
         )
         .await
         .expect("intruder bulk enforce");
@@ -607,6 +653,7 @@ async fn bulk_create_postgres_enforces_governance() {
             None,
             None,
             &owner_payload,
+            None,
         )
         .await
         .expect("owner bulk enforce");
@@ -655,7 +702,15 @@ async fn import_memories_postgres_enforces_governance() {
 
     let payload = serde_json::json!({"title": "imported-row"});
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &importer, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &importer,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("import enforce");
     let pending_id = match decision {
@@ -720,7 +775,15 @@ async fn entity_register_postgres_enforces_governance() {
 
     // Non-owner entity_register → Deny.
     let intruder_decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &intruder, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &intruder,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("intruder entity_register enforce");
     assert!(
@@ -730,7 +793,15 @@ async fn entity_register_postgres_enforces_governance() {
 
     // Owner entity_register → Allow.
     let owner_decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("owner entity_register enforce");
     assert!(

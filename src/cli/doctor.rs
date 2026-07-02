@@ -736,6 +736,13 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     facts.push(("decisions::advisory".into(), counts.advisory.to_string()));
     facts.push(("decisions::off".into(), counts.off.to_string()));
 
+    // v0.9.0 G10.1 (#1827) — capability-token posture: master switch +
+    // issuer-allowlist size, so an operator can see at a glance whether
+    // the macaroon grant layer is live and how many issuers can mint.
+    let cap = crate::config::active_capability_config();
+    facts.push(("capabilities_enabled".into(), cap.enabled.to_string()));
+    facts.push(("capability_issuers".into(), cap.issuer_count().to_string()));
+
     let (with, without) = db::doctor_governance_coverage(conn).unwrap_or((0, 0));
     facts.push(("namespaces_with_policy".into(), with.to_string()));
     facts.push(("namespaces_without_policy".into(), without.to_string()));

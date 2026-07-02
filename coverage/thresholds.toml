@@ -109,6 +109,7 @@ min_line_coverage = 90.0
 "cli/audit.rs"             = 90    # tier B, measured 88.64 (CI, post-#697 forensic chain expansion); 2026-05-19 coverage-uplift campaign added 3 forensic-verify dispatch tests — expected lift to ~91%, floor pending re-measurement
 "cli/backup.rs"            = 90    # tier B, measured 95.74
 "cli/boot.rs"              = 90    # tier B, measured 97.90
+"cli/capability.rs"        = 80    # tier B, NEW MODULE (2026-07-02, #1827 G10.1): capability keygen/mint/attenuate/inspect/verify CLI; 6 in-file behavioural tests cover every verb happy-path + the mandatory-expiry lint / overwrite-refusal / malformed-token / unknown-issuer error arms. Conservative floor pending first CI measurement; ratchet up after.
 "cli/commands/atomise.rs"  = 90    # tier B, measured 89.03 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 3 tests (signer/db error messages, keyword tier short-circuit) — NEW MODULE
 "cli/commands/skill.rs"    = 90    # tier B, measured 80.90 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 9 tests (non-JSON human-render paths, error-exit paths, manifest-file normalisation) — expected lift to ~92%, floor pending re-measurement — NEW MODULE
 "cli/consolidate.rs"       = 90    # tier B, measured 98.33
@@ -229,6 +230,7 @@ min_line_coverage = 90.0
 "federation/receive.rs"    = 90    # tier C, measured 86.02 post-#1148 profile recalibration (was 88.05/87) — EXCEPTION: L0.7-4 structural ceiling (see coverage/policy.md)
 "federation/sync.rs"       = 86    # RECALIBRATED 2026-06-12 to measured 86.82% (floor=measured-0.5) after the cov_ga2 GA backfill campaign (~358 behavioral tests, +-1pp from historical 87.56); residual is structural (fault-injection Err=>500 arms / LLM bodies / embedder-gated / #519 dead-code / SSE stream) — see coverage/policy.md §"GA-2026-06-12 recalibration". Ratchet up toward 90 post-ship.
 "governance/agent_action.rs" = 90  # tier C, post-C-4 measured 94.55 (#699) — NEW MODULE
+"governance/capability.rs" = 85    # tier C, NEW MODULE (2026-07-02, #1827 G10.1): stateless macaroon core (32 unit tests, 9eb89a05) + the T5-T8 wiring layer (joiner/gate/edge-parse/root-secret tests this commit) + the tests/g10_capability_tokens.rs matrix. Conservative floor pending first CI measurement; ratchet up after.
 "governance/audit.rs"      = 90    # tier C, measured 81.35 (2026-05-19 cov-baseline @ 407a56744); 2026-05-19 coverage-uplift campaign added 16 tests (verify_since Parse/ChainBreak/Signature failure arms, list_forensic_files, file_date error, parse_iso_date edge cases, read_chain_tail, is_enabled, load_daemon_{signing,verifying}_key) — expected lift to ~93%, floor pending re-measurement — NEW MODULE
 "governance/mod.rs"        = 90    # tier C, post-C-4 measured 94.10 (#699)
 "governance/rules_store.rs" = 90   # tier C, measured 98.35 — NEW MODULE

@@ -29,6 +29,14 @@ pub struct PromoteRequest {
     /// Task 1.7: clone target (must be a proper ancestor).
     #[serde(default)]
     pub to_namespace: Option<String>,
+
+    // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
+    // so schemars emits only the concise attribute description.
+    #[serde(default)]
+    #[schemars(
+        description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this promote to Allow within its caveats."
+    )]
+    pub capability: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_promote`.
@@ -129,6 +137,12 @@ pub(super) fn handle_promote(
             "id": resolved_id,
             "to_namespace": params["to_namespace"].as_str(),
         });
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability`
+        // param ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            params[param_names::CAPABILITY].as_str(),
+            &agent_id,
+        );
         match db::enforce_governance(
             conn,
             GovernedAction::Promote,
@@ -137,6 +151,7 @@ pub(super) fn handle_promote(
             Some(&resolved_id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
         )
         .map_err(|e| e.to_string())?
         {

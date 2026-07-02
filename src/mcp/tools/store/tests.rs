@@ -1316,6 +1316,7 @@ fn enforce_store_with_scope(
         None,
         None,
         &payload,
+        None,
     )
     .expect("gate runs")
 }

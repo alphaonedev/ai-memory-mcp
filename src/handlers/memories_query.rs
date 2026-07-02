@@ -295,6 +295,9 @@ pub async fn search_memories(
             request_id: None,
             // #910 — tenant-facing path; never bypass the visibility filter.
             bypass_visibility: false,
+            // v0.9.0 G10.1 (#1827) — read-only search path; no
+            // governance gate runs here, so no token is carried.
+            capability: None,
         };
         return match app.store.search(&ctx, &p.q, &filter).await {
             // #1579 B4 — serialize per the negotiated format.
@@ -675,7 +678,12 @@ pub async fn bulk_create(
         // here is for visibility-filter purposes (e.g., the
         // `governance_pending_create` precondition lookup the SAL
         // path runs internally).
-        let ctx = crate::store::CallerContext::for_agent(caller.clone());
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE into the caller context;
+        // inert unless `[capabilities].enabled`. The same token gates
+        // every row in the batch.
+        let ctx = crate::store::CallerContext::for_agent(caller.clone())
+            .with_capability(crate::handlers::capability_from_headers(&headers, &caller));
         let mut errors: Vec<String> = Vec::new();
         let mut pending: Vec<serde_json::Value> = Vec::new();
         // #1481 — collect the governance-Allowed rows and persist them in
@@ -788,6 +796,7 @@ pub async fn bulk_create(
                     None,
                     None,
                     &payload_for_pending,
+                    ctx.capability.as_ref(),
                 )
                 .await
             {

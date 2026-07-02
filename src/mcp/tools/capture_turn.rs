@@ -185,6 +185,14 @@ pub struct MemoryCaptureTurnRequest {
     /// `crate::validate::RequestValidator` rules.
     #[serde(default)]
     pub metadata: Option<Value>,
+
+    // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
+    // so schemars emits only the concise attribute description.
+    #[serde(default)]
+    #[schemars(
+        description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this turn capture to Allow within its caveats."
+    )]
+    pub capability: Option<String>,
 }
 
 /// Summary of one tool call within an assistant turn. Mirrors the
@@ -368,6 +376,10 @@ pub fn handle_capture_turn(
         }
 
         use crate::models::{GovernanceDecision, GovernedAction};
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability`
+        // param ONCE; inert unless `[capabilities].enabled`.
+        let capability =
+            crate::governance::capability::parse_presented_token(req.capability.as_deref(), caller);
         match crate::db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -376,6 +388,7 @@ pub fn handle_capture_turn(
             Some(&write.memory.id),
             Some(caller),
             &gate_payload,
+            capability.as_ref(),
         )
         .map_err(|e| e.to_string())?
         {

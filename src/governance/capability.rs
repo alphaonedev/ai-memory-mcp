@@ -262,7 +262,13 @@ impl RootBlock {
 // ---------------------------------------------------------------------------
 
 /// A stateless macaroon capability token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually (below) to REDACT `root_sig` and
+/// `tag`: the token is a BEARER credential and now rides inside
+/// `CallerContext` (whose `Debug` is derived), so a debug-logged
+/// request context must never emit enough bytes to reconstruct a
+/// presentable token.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityToken {
     /// Envelope version (== [`CAPABILITY_VERSION`]).
     pub v: u16,
@@ -279,6 +285,23 @@ pub struct CapabilityToken {
     pub ext_caveats: Vec<Caveat>,
     /// The HMAC-SHA256 chain tag authenticating the whole token.
     pub tag: Vec<u8>,
+}
+
+impl std::fmt::Debug for CapabilityToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the authenticating bytes — a bearer token in a
+        // debug log is a credential leak (mirrors `IssuerConfig`'s
+        // `root_secret` redaction).
+        f.debug_struct("CapabilityToken")
+            .field("v", &self.v)
+            .field("issuer", &self.issuer)
+            .field("root_id", &self.root_id)
+            .field("root_caveats", &self.root_caveats)
+            .field("root_sig", &crate::REDACTED_PLACEHOLDER)
+            .field("ext_caveats", &self.ext_caveats)
+            .field("tag", &crate::REDACTED_PLACEHOLDER)
+            .finish()
+    }
 }
 
 impl CapabilityToken {
@@ -807,6 +830,356 @@ pub fn apply_capability_grant(
     }
 }
 
+// ---------------------------------------------------------------------------
+// G10.1-WIRING (T5–T8) — the impure gate/edge layer around the pure core.
+//
+// Everything above this line is pure (no clock, no I/O, no globals) and is
+// shared verbatim by both backends. The helpers below are the ONLY impure
+// surface: they read the process-wide `CapabilityConfig`
+// (`crate::config::active_capability_config`), the wall clock, and emit
+// forensic audit rows via `crate::governance::audit::record_decision`.
+// Both backend gates call [`apply_at_gate`]; every transport edge calls
+// [`parse_presented_token`] — one wiring shape, parity by construction.
+// ---------------------------------------------------------------------------
+
+/// HTTP request header carrying the wire-form token (`cap1:…`).
+/// Lowercase — axum normalises inbound header names to lowercase.
+pub const HTTP_CAPABILITY_HEADER: &str = "x-ai-memory-capability";
+
+/// Forensic-audit `kind` for a capability grant (Deny/Pending flipped to
+/// Allow by a verified token).
+pub const AUDIT_KIND_GRANT: &str = "capability-grant";
+
+/// Forensic-audit `kind` for a capability reject (presented token conferred
+/// nothing; base decision unchanged).
+pub const AUDIT_KIND_REJECT: &str = "capability-reject";
+
+/// File suffix for the per-issuer HMAC mint secret in the key dir
+/// (`<key_dir>/<issuer>.caproot`, mode `0o600`).
+pub const CAPROOT_SUFFIX: &str = ".caproot";
+
+/// Byte length of a freshly generated `root_secret`.
+pub const ROOT_SECRET_LEN: usize = 32;
+
+/// The reserved issuer id whose attribution pubkey resolves via the narrow
+/// operator key (`rules_store::resolve_operator_pubkey`) instead of a
+/// `<issuer>.pub` keypair file. Still must be listed under
+/// `[capabilities.issuers]` and hold a `.caproot` — there are NO implicit
+/// issuers (closed allowlist).
+pub const OPERATOR_ISSUER: &str = "operator";
+
+impl OpLevel {
+    /// Parse the config-file spelling (`none`/`read`/`write`/`admin`,
+    /// case-insensitive). Returns `None` for anything else so the loader
+    /// can skip (never default) a misconfigured issuer — fail closed.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(OpLevel::None),
+            "read" => Some(OpLevel::Read),
+            "write" => Some(OpLevel::Write),
+            "admin" => Some(OpLevel::Admin),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase spelling (config + audit rows).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            OpLevel::None => "none",
+            OpLevel::Read => "read",
+            OpLevel::Write => "write",
+            OpLevel::Admin => "admin",
+        }
+    }
+}
+
+/// The canonical [`CapRequest::action`] name for a gate-level
+/// [`crate::models::GovernedAction`]. SSOT for the gate wiring on BOTH
+/// backends so the [`op_level_of`] mapping (which matches these exact
+/// spellings and fails closed HIGH on anything else) can never drift from
+/// what the gates feed it. NOTE: this is deliberately NOT
+/// `GovernedAction::as_str()` (lowercase, the `pending_actions` column
+/// vocabulary) — feeding that spelling to `op_level_of` would fail-closed
+/// every action to `Admin` and silently dead-end the feature.
+#[must_use]
+pub fn governed_action_name(action: crate::models::GovernedAction) -> &'static str {
+    match action {
+        crate::models::GovernedAction::Store => "Store",
+        crate::models::GovernedAction::Delete => "Delete",
+        crate::models::GovernedAction::Promote => "Promote",
+        crate::models::GovernedAction::Reflect => "Reflect",
+    }
+}
+
+/// Join a capability grant onto the gate-level
+/// [`crate::models::GovernanceDecision`]. Delegates the decision algebra to
+/// the pure [`apply_capability_grant`] (mapping `Deny(refusal)`→`Deny` and
+/// `Pending(id)`→`Ask` for the flippability check) and — critically —
+/// returns the ORIGINAL `base` value untouched on every non-granted
+/// outcome, so a reject is byte-identical to the legacy decision including
+/// the typed refusal envelope.
+#[must_use]
+pub fn apply_capability_grant_gov(
+    base: crate::models::GovernanceDecision,
+    cfg: &CapabilityConfig,
+    mode_is_enforce: bool,
+    token: Option<&CapabilityToken>,
+    req: &CapRequest,
+) -> (crate::models::GovernanceDecision, GrantOutcome) {
+    use crate::models::GovernanceDecision;
+    // Shadow the gate decision into the pure joiner's `Decision` shape.
+    // Only the VARIANT drives the joiner; the payload strings are never
+    // read back (the original `base` is returned on non-grant).
+    let shadow = match &base {
+        GovernanceDecision::Allow => Decision::Allow,
+        GovernanceDecision::Deny(refusal) => Decision::Deny(refusal.reason.clone()),
+        GovernanceDecision::Pending(id) => Decision::Ask(id.clone()),
+    };
+    let (_, outcome) = apply_capability_grant(shadow, cfg, mode_is_enforce, token, req);
+    if matches!(outcome, GrantOutcome::Granted { .. }) {
+        (GovernanceDecision::Allow, outcome)
+    } else {
+        (base, outcome)
+    }
+}
+
+/// Emit the forensic-audit row for a [`GrantOutcome`]. [`GrantOutcome::NoOp`]
+/// emits NOTHING (zero new audit bytes on the identity paths — the
+/// byte-identical-legacy contract). Fire-and-forget via the existing
+/// [`crate::governance::audit::record_decision`] sink (a no-op when the
+/// forensic sink is not initialised), so this works identically behind the
+/// sqlite and postgres gates.
+pub fn audit_grant_outcome(req: &CapRequest, base_kind: &'static str, outcome: &GrantOutcome) {
+    match outcome {
+        GrantOutcome::NoOp => {}
+        GrantOutcome::Granted {
+            root_id,
+            issuer,
+            op_level,
+        } => {
+            crate::governance::audit::record_decision(
+                &req.agent_id,
+                "allow",
+                AUDIT_KIND_GRANT,
+                root_id,
+                serde_json::json!({
+                    "issuer": issuer,
+                    "op_level": op_level.as_str(),
+                    "namespace": req.namespace,
+                    "action": req.action,
+                    "flipped_from": base_kind,
+                }),
+            );
+        }
+        GrantOutcome::Rejected(rej) => {
+            crate::governance::audit::record_decision(
+                &req.agent_id,
+                base_kind,
+                AUDIT_KIND_REJECT,
+                rej.code(),
+                serde_json::json!({
+                    "namespace": req.namespace,
+                    "action": req.action,
+                    "reason": rej.to_string(),
+                }),
+            );
+        }
+    }
+}
+
+/// The single gate-side wiring hook (T7). Called by BOTH backend gates —
+/// `db::enforce_governance` (sqlite + every handler/MCP/CLI path through it)
+/// and the postgres inline gate (`PostgresStore::enforce_governance_action`)
+/// — in their **Enforce** arm, on the final coarse decision BEFORE the
+/// `Pending` row is queued (a granted `Pending` therefore never lands a
+/// stray approval row).
+///
+/// Identity fast paths (zero work, zero audit bytes): no token presented,
+/// base already `Allow`, or `[capabilities].enabled = false`.
+///
+/// The `Pending`→`Allow` flip is explicit and audited (`flipped_from:
+/// "pending"` on the grant row) and is only reachable when [`verify`]
+/// succeeded — which requires the request op to fit under the issuer
+/// ceiling, so a bare `Write` token cannot flip an approve-gated `Admin`
+/// op past a (future G10.3) human court.
+///
+/// **Impersonation seam (pinned, T6):** `agent_id` here MUST be the same
+/// principal string the coarse gate itself evaluated (`evaluate_level`'s
+/// `agent_id`). [`Caveat::Agent`] binds against exactly that identity — by
+/// construction, since this hook runs INSIDE the gates on the very same
+/// argument, a token scoped to agent A can never authorise a request the
+/// coarse gate evaluated as agent B.
+#[must_use]
+pub fn apply_at_gate(
+    base: crate::models::GovernanceDecision,
+    action: crate::models::GovernedAction,
+    namespace: &str,
+    agent_id: &str,
+    token: Option<&CapabilityToken>,
+) -> crate::models::GovernanceDecision {
+    use crate::models::GovernanceDecision;
+    if token.is_none() || matches!(base, GovernanceDecision::Allow) {
+        return base;
+    }
+    let cfg = crate::config::active_capability_config();
+    if !cfg.enabled {
+        return base;
+    }
+    let base_kind = match &base {
+        GovernanceDecision::Pending(_) => "pending",
+        _ => "deny",
+    };
+    let req = CapRequest {
+        action: governed_action_name(action).to_string(),
+        namespace: namespace.to_string(),
+        agent_id: agent_id.to_string(),
+        now: chrono::Utc::now().timestamp(),
+    };
+    // mode_is_enforce = true by construction: both gates call this hook
+    // only from their Enforce arm (Off short-circuits, Advisory returns
+    // Allow before reaching it).
+    let (decision, outcome) = apply_capability_grant_gov(base, &cfg, true, token, &req);
+    audit_grant_outcome(&req, base_kind, &outcome);
+    decision
+}
+
+/// Parse an optionally presented wire token at a transport edge (MCP
+/// `capability` param / HTTP `X-AI-Memory-Capability` header / CLI
+/// `--capability`). Additive posture (T8):
+///
+/// - absent/blank ⇒ `None` (zero work);
+/// - `[capabilities].enabled = false` ⇒ `None` WITHOUT parsing — a
+///   presented-but-malformed token emits ZERO new audit bytes while the
+///   feature is off;
+/// - parse failure ⇒ `None` + a WARN trace + a `capability-reject`
+///   forensic row (never a hard error — the request proceeds on the bare
+///   ACL).
+#[must_use]
+pub fn parse_presented_token(raw: Option<&str>, actor: &str) -> Option<CapabilityToken> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if !crate::config::active_capability_config().enabled {
+        return None;
+    }
+    match CapabilityToken::from_wire(raw) {
+        Ok(tok) => Some(tok),
+        Err(rej) => {
+            tracing::warn!(
+                target: crate::governance::GOVERNANCE_TRACE_TARGET,
+                actor = %actor,
+                code = rej.code(),
+                "capability token failed to parse at the edge; \
+                 proceeding without a token (bare ACL decides)"
+            );
+            crate::governance::audit::record_decision(
+                actor,
+                "warn",
+                AUDIT_KIND_REJECT,
+                rej.code(),
+                serde_json::json!({ "stage": "edge-parse" }),
+            );
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// root_secret key-file helpers (T5/T9) — 0o600 discipline, keypair-style
+// ---------------------------------------------------------------------------
+
+/// Path of the issuer's mint secret: `<dir>/<issuer>.caproot`.
+///
+/// # Errors
+/// Rejects issuer ids that fail the agent-id shape check (path-traversal
+/// guard — the id is consumed as a filename fragment, mirroring
+/// `identity::keypair::load`).
+pub fn caproot_path(dir: &std::path::Path, issuer: &str) -> Result<std::path::PathBuf> {
+    crate::validate::validate_agent_id_shape(issuer)?;
+    Ok(dir.join(format!("{issuer}{CAPROOT_SUFFIX}")))
+}
+
+/// Generate and persist a fresh 32-byte `root_secret` for `issuer` at
+/// `<dir>/<issuer>.caproot`, mode `0o600`. Refuses to overwrite an
+/// existing secret (rotation is an explicit delete-then-keygen so the
+/// operator consciously invalidates every outstanding token).
+///
+/// # Errors
+/// - the path already exists;
+/// - directory creation or the exclusive create/write fails.
+pub fn write_root_secret(dir: &std::path::Path, issuer: &str) -> Result<std::path::PathBuf> {
+    use rand_core::RngCore;
+    let path = caproot_path(dir, issuer)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating key dir {}", dir.display()))?;
+    let mut secret = [0u8; ROOT_SECRET_LEN];
+    rand_core::OsRng.fill_bytes(&mut secret);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&path).with_context(|| {
+        format!(
+            "creating root secret {} (already exists? rotation = delete then keygen)",
+            path.display()
+        )
+    })?;
+    use std::io::Write;
+    f.write_all(&secret)
+        .with_context(|| format!("writing root secret {}", path.display()))?;
+    use zeroize::Zeroize;
+    secret.zeroize();
+    Ok(path)
+}
+
+/// Load the issuer's `root_secret` from `<dir>/<issuer>.caproot`. On unix
+/// the file mode must grant NO group/other access (mirrors the private-key
+/// discipline in `identity::keypair::load` — open once, `fstat` on the same
+/// handle, no TOCTOU re-open window).
+///
+/// # Errors
+/// - missing/unreadable file;
+/// - insecure mode bits;
+/// - wrong length (must be exactly [`ROOT_SECRET_LEN`] bytes).
+pub fn read_root_secret(dir: &std::path::Path, issuer: &str) -> Result<Vec<u8>> {
+    let path = caproot_path(dir, issuer)?;
+    let mut f = std::fs::File::open(&path)
+        .with_context(|| format!("reading root secret {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat root secret {}", path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "root secret {} has insecure mode {:o}; refusing to load. \
+                 Restore with: chmod 0600 {}",
+                path.display(),
+                mode,
+                path.display()
+            );
+        }
+    }
+    use std::io::Read;
+    let mut secret = Vec::with_capacity(ROOT_SECRET_LEN);
+    f.read_to_end(&mut secret)
+        .with_context(|| format!("reading root secret {}", path.display()))?;
+    if secret.len() != ROOT_SECRET_LEN {
+        let actual = secret.len();
+        use zeroize::Zeroize;
+        secret.zeroize();
+        anyhow::bail!(
+            "root secret {} has {actual} bytes, expected {ROOT_SECRET_LEN}",
+            path.display()
+        );
+    }
+    Ok(secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,5 +1565,244 @@ mod tests {
     fn caveats_have_expiry_lint() {
         assert!(caveats_have_expiry(&[Caveat::ExpiresAt(1)]));
         assert!(!caveats_have_expiry(&[Caveat::Action("Store".into())]));
+    }
+
+    // -----------------------------------------------------------------
+    // G10.1-WIRING (T5–T8) unit tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn governed_action_name_is_the_op_level_vocabulary() {
+        use crate::models::GovernedAction;
+        // The SSOT invariant: the names the gates feed `op_level_of`
+        // map to the intended levels (NOT the fail-closed Admin arm).
+        assert_eq!(
+            op_level_of(governed_action_name(GovernedAction::Store)),
+            OpLevel::Write
+        );
+        assert_eq!(
+            op_level_of(governed_action_name(GovernedAction::Delete)),
+            OpLevel::Write
+        );
+        assert_eq!(
+            op_level_of(governed_action_name(GovernedAction::Promote)),
+            OpLevel::Write
+        );
+        assert_eq!(
+            op_level_of(governed_action_name(GovernedAction::Reflect)),
+            OpLevel::Read
+        );
+        // The lowercase `as_str()` spellings would fail closed HIGH —
+        // pinning why `governed_action_name` (not `as_str`) is the SSOT.
+        assert_eq!(op_level_of(GovernedAction::Store.as_str()), OpLevel::Admin);
+    }
+
+    #[test]
+    fn op_level_parse_and_as_str_round_trip() {
+        for level in [OpLevel::None, OpLevel::Read, OpLevel::Write, OpLevel::Admin] {
+            assert_eq!(OpLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(OpLevel::parse(" WRITE "), Some(OpLevel::Write));
+        assert_eq!(OpLevel::parse("supreme"), None);
+        assert_eq!(OpLevel::parse(""), None);
+    }
+
+    fn refusal(reason: &str) -> crate::models::GovernanceDecision {
+        use crate::models::{GovernanceLevel, GovernedAction};
+        crate::models::GovernanceDecision::Deny(crate::governance::GovernanceRefusal::new(
+            GovernedAction::Store,
+            GovernanceLevel::Owner,
+            "ai:mallory",
+            reason,
+        ))
+    }
+
+    #[test]
+    fn gov_joiner_flips_deny_and_pending_and_preserves_base_on_reject() {
+        use crate::models::GovernanceDecision;
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::OpCeiling(OpLevel::Write),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        let r = req("Store", "n", "a", 1);
+        // Deny → Allow on a valid token.
+        let (d, out) = apply_capability_grant_gov(refusal("nope"), &cfg, true, Some(&tok), &r);
+        assert_eq!(d, GovernanceDecision::Allow);
+        assert!(matches!(out, GrantOutcome::Granted { .. }));
+        // Pending → Allow on a valid token.
+        let (d2, out2) = apply_capability_grant_gov(
+            GovernanceDecision::Pending(String::new()),
+            &cfg,
+            true,
+            Some(&tok),
+            &r,
+        );
+        assert_eq!(d2, GovernanceDecision::Allow);
+        assert!(matches!(out2, GrantOutcome::Granted { .. }));
+        // Reject (expired) → the ORIGINAL refusal envelope is returned.
+        let expired = req("Store", "n", "a", 99_999_999_999);
+        let (d3, out3) =
+            apply_capability_grant_gov(refusal("original"), &cfg, true, Some(&tok), &expired);
+        match d3 {
+            GovernanceDecision::Deny(refu) => assert_eq!(refu.reason, "original"),
+            other => panic!("base must be unchanged on reject, got {other:?}"),
+        }
+        assert_eq!(out3, GrantOutcome::Rejected(CapReject::Expired));
+        // Allow base → identity NoOp.
+        let (d4, out4) =
+            apply_capability_grant_gov(GovernanceDecision::Allow, &cfg, true, Some(&tok), &r);
+        assert_eq!(d4, GovernanceDecision::Allow);
+        assert_eq!(out4, GrantOutcome::NoOp);
+    }
+
+    #[test]
+    fn apply_at_gate_identity_without_token_or_when_disabled() {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::clear_capability_config_for_test();
+        // No token — never consults the config, base unchanged.
+        let base = refusal("keep");
+        let d = apply_at_gate(base, GovernedAction::Store, "ns", "ai:x", None);
+        match d {
+            GovernanceDecision::Deny(r) => assert_eq!(r.reason, "keep"),
+            other => panic!("expected unchanged Deny, got {other:?}"),
+        }
+        // Token presented but the process-wide config is the compiled
+        // default (DISABLED) — still identity.
+        let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let d2 = apply_at_gate(
+            refusal("still-kept"),
+            GovernedAction::Store,
+            "ns",
+            "ai:x",
+            Some(&tok),
+        );
+        match d2 {
+            GovernanceDecision::Deny(r) => assert_eq!(r.reason, "still-kept"),
+            other => panic!("expected unchanged Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_at_gate_flips_when_enabled_and_verified() {
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _cap = crate::config::lock_capability_config_for_test();
+        let (tok, cfg, _, _) = mint_fixture(vec![
+            Caveat::OpCeiling(OpLevel::Write),
+            Caveat::ExpiresAt(9_999_999_999),
+        ]);
+        crate::config::set_active_capability_config(cfg);
+        let d = apply_at_gate(
+            refusal("deny"),
+            GovernedAction::Store,
+            "ns",
+            "ai:x",
+            Some(&tok),
+        );
+        assert_eq!(d, GovernanceDecision::Allow);
+        // An expired presentation leaves the base unchanged.
+        let (past, cfg2, _, _) = mint_fixture(vec![Caveat::ExpiresAt(1)]);
+        crate::config::set_active_capability_config(cfg2);
+        let d2 = apply_at_gate(
+            refusal("kept"),
+            GovernedAction::Store,
+            "ns",
+            "ai:x",
+            Some(&past),
+        );
+        assert!(
+            matches!(d2, GovernanceDecision::Deny(ref r) if r.reason == "kept"),
+            "expired token must confer nothing, got {d2:?}"
+        );
+        crate::config::clear_capability_config_for_test();
+    }
+
+    #[test]
+    fn parse_presented_token_is_feature_gated_and_lenient() {
+        let _cap = crate::config::lock_capability_config_for_test();
+        crate::config::clear_capability_config_for_test();
+        // Absent/blank ⇒ None regardless of the flag.
+        assert!(parse_presented_token(None, "a").is_none());
+        assert!(parse_presented_token(Some("   "), "a").is_none());
+        // Disabled ⇒ None WITHOUT parsing, even for garbage AND even for
+        // a well-formed token (zero behavioural delta while off).
+        let (tok, cfg, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let wire = tok.to_wire().unwrap();
+        assert!(parse_presented_token(Some("cap1:!!!garbage"), "a").is_none());
+        assert!(parse_presented_token(Some(&wire), "a").is_none());
+        // Enabled ⇒ a valid token parses; garbage degrades to None.
+        crate::config::set_active_capability_config(cfg);
+        assert_eq!(parse_presented_token(Some(&wire), "a"), Some(tok));
+        assert!(parse_presented_token(Some("cap1:!!!garbage"), "a").is_none());
+        crate::config::clear_capability_config_for_test();
+    }
+
+    #[test]
+    fn root_secret_round_trip_and_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = write_root_secret(dir, "ai:iss").unwrap();
+        assert!(path.ends_with("ai:iss.caproot"));
+        let secret = read_root_secret(dir, "ai:iss").unwrap();
+        assert_eq!(secret.len(), ROOT_SECRET_LEN);
+        // Refuses overwrite (rotation = delete then keygen).
+        assert!(write_root_secret(dir, "ai:iss").is_err());
+        // Path-traversal issuer ids are rejected outright.
+        assert!(caproot_path(dir, "../../etc/x").is_err());
+        assert!(write_root_secret(dir, "a/../b").is_err());
+        // Wrong length fails closed.
+        std::fs::write(dir.join("short.caproot"), b"tiny").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("short.caproot"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        assert!(read_root_secret(dir, "short").is_err());
+        // Insecure mode bits fail closed (unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let err = read_root_secret(dir, "ai:iss").unwrap_err();
+            assert!(err.to_string().contains("insecure mode"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn token_debug_redacts_bearer_bytes() {
+        let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
+        let rendered = format!("{tok:?}");
+        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(
+            !rendered.contains("root_sig: ["),
+            "root_sig bytes must never render: {rendered}"
+        );
+        assert!(
+            !rendered.contains("tag: ["),
+            "tag bytes must never render: {rendered}"
+        );
+    }
+
+    #[test]
+    fn audit_grant_outcome_noop_emits_nothing() {
+        // The forensic sink is not initialised in unit tests, so the
+        // assertion here is behavioural: NoOp must not panic and must
+        // not attempt any I/O (record_decision is a no-op sink-less).
+        let r = req("Store", "n", "a", 1);
+        audit_grant_outcome(&r, "deny", &GrantOutcome::NoOp);
+        audit_grant_outcome(
+            &r,
+            "deny",
+            &GrantOutcome::Granted {
+                root_id: "rid".into(),
+                issuer: "iss".into(),
+                op_level: OpLevel::Write,
+            },
+        );
+        audit_grant_outcome(&r, "pending", &GrantOutcome::Rejected(CapReject::Expired));
     }
 }

@@ -255,6 +255,8 @@ async fn enforce_create_governance<'a>(
         ),
     >,
     mem: &Memory,
+    // v0.9.0 G10.1 (#1827) — the edge-parsed capability token (or None).
+    capability: Option<&crate::governance::capability::CapabilityToken>,
 ) -> Result<
     tokio::sync::MutexGuard<
         'a,
@@ -296,6 +298,7 @@ async fn enforce_create_governance<'a>(
         None,
         None,
         &payload,
+        capability,
     ) {
         Ok(GovernanceDecision::Allow) => Ok(lock),
         Ok(GovernanceDecision::Deny(refusal)) => Err((
@@ -688,6 +691,9 @@ async fn create_memory_postgres(
     body: &CreateMemory,
     agent_id: &str,
     metadata: serde_json::Value,
+    // v0.9.0 G10.1 (#1827) — the edge-parsed capability token (or None),
+    // parsed once by `create_memory` from `X-AI-Memory-Capability`.
+    capability: Option<&crate::governance::capability::CapabilityToken>,
 ) -> axum::response::Response {
     let now = Utc::now();
     // v0.7.0 L5 — fire the LLM `auto_tag` hook before assembling the
@@ -838,6 +844,7 @@ async fn create_memory_postgres(
             None,
             None,
             &payload_for_pending,
+            capability,
         )
         .await
     {
@@ -1064,12 +1071,17 @@ pub async fn create_memory(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // v0.9.0 G10.1 (#1827) — edge-parse the optional
+    // `X-AI-Memory-Capability` header ONCE; inert unless
+    // `[capabilities].enabled`. Threaded to whichever backend gate runs
+    // (sqlite `enforce_create_governance` / postgres SAL branch).
+    let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
     // Postgres-backed daemons take a separate SAL-trait path with no
     // shared `Mutex<Connection>`. Kept as a top-level helper so the
     // sqlite stages below stay focused.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
-        return create_memory_postgres(&app, &body, &agent_id, metadata).await;
+        return create_memory_postgres(&app, &body, &agent_id, metadata, capability.as_ref()).await;
     }
 
     // v0.7.0 L5 — fire the LLM `auto_tag` autonomy hook BEFORE the
@@ -1265,7 +1277,7 @@ pub async fn create_memory(
     // Stage 4 — governance pre-write hook. The helper either returns
     // the original lock guard (Allow) or short-circuits with an error
     // response (Deny / Pending / failure).
-    let lock = match enforce_create_governance(&app, lock, &mem).await {
+    let lock = match enforce_create_governance(&app, lock, &mem, capability.as_ref()).await {
         Ok(lock) => lock,
         Err(resp) => return resp,
     };

@@ -123,7 +123,15 @@ async fn required_scope_refuses_mismatched_store_pg() {
     // Write declares scope=collective into a private-required namespace.
     let payload = serde_json::json!({ "metadata": { "scope": "collective" } });
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     match decision {
@@ -167,7 +175,15 @@ async fn required_scope_allows_matching_and_absent_store_pg() {
     // Matching scope=private ⇒ allowed.
     let matching = serde_json::json!({ "metadata": { "scope": "private" } });
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &matching)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &matching,
+            None,
+        )
         .await
         .expect("enforce_governance_action (matching)");
     assert!(
@@ -178,7 +194,15 @@ async fn required_scope_allows_matching_and_absent_store_pg() {
     // Absent scope ⇒ defaults to private ⇒ matches ⇒ allowed.
     let absent = serde_json::json!({ "metadata": {} });
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &owner, None, None, &absent)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &owner,
+            None,
+            None,
+            &absent,
+            None,
+        )
         .await
         .expect("enforce_governance_action (absent)");
     assert!(

@@ -91,6 +91,10 @@ pub fn enforce(
     memory_id: Option<&str>,
     memory_owner: Option<&str>,
     payload: &serde_json::Value,
+    // v0.9.0 G10.1 (#1827) — the edge-parsed `--capability` token (or
+    // None). Threaded into `db::enforce_governance`, whose Enforce arm
+    // may flip a Deny/Pending to Allow within the token's caveats.
+    capability: Option<&crate::governance::capability::CapabilityToken>,
     json_out: bool,
     out: &mut CliOutput<'_>,
 ) -> Result<GovernanceOutcome> {
@@ -102,6 +106,7 @@ pub fn enforce(
         memory_id,
         memory_owner,
         payload,
+        capability,
     )? {
         GovernanceDecision::Allow => Ok(GovernanceOutcome::Allow),
         GovernanceDecision::Deny(refusal) => {
@@ -252,6 +257,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
                 false,
                 &mut out,
             )
@@ -292,6 +298,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
                 false,
                 &mut out,
             )
@@ -334,6 +341,7 @@ mod tests {
                 Some("00000000-0000-0000-0000-000000000abc"),
                 Some("alice"),
                 &payload,
+                None,
                 true,
                 &mut out,
             )
@@ -381,6 +389,7 @@ mod tests {
                 Some("00000000-0000-0000-0000-000000000def"),
                 Some("alice"),
                 &payload,
+                None,
                 false,
                 &mut out,
             )
@@ -427,6 +436,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
                 false,
                 &mut out,
             )
@@ -470,6 +480,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
                 true,
                 &mut out,
             )

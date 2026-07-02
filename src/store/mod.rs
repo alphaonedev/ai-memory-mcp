@@ -454,6 +454,22 @@ pub struct CallerContext {
     /// NOT be set by any tenant-facing handler. Default `false` — the
     /// safe-by-default posture per the CLAUDE.md NHI contract.
     pub bypass_visibility: bool,
+    /// v0.9.0 G10.1 (#1827) — an optional macaroon capability token,
+    /// parsed ONCE at the transport edge (MCP `capability` param /
+    /// HTTP `X-AI-Memory-Capability` header / CLI `--capability`) and
+    /// threaded to the governance gates, where a verified in-caveat
+    /// token can flip a base `Deny`/`Pending` to `Allow`. Default
+    /// `None` — byte-identical legacy behaviour.
+    ///
+    /// **Identity binding (the pinned `Agent(a)` caveat semantics):**
+    /// the token's `Agent` caveat binds against the SAME principal
+    /// string the coarse gate evaluates — i.e. whatever `agent_id`
+    /// the gate call passes to `enforce_governance`/
+    /// `enforce_governance_action`, NOT [`Self::effective_principal`]'s
+    /// `as_agent` override. The joiner runs INSIDE the gates on the
+    /// gate's own `agent_id` argument, so the binding cannot diverge
+    /// from what the ACL authorised (closes the impersonation seam).
+    pub capability: Option<crate::governance::capability::CapabilityToken>,
 }
 
 impl CallerContext {
@@ -466,6 +482,7 @@ impl CallerContext {
             as_agent: None,
             request_id: None,
             bypass_visibility: false,
+            capability: None,
         }
     }
 
@@ -492,7 +509,19 @@ impl CallerContext {
             as_agent: None,
             request_id: None,
             bypass_visibility: true,
+            capability: None,
         }
+    }
+
+    /// v0.9.0 G10.1 (#1827) — attach an edge-parsed capability token to
+    /// this context (builder style). `None` is the identity (legacy).
+    #[must_use]
+    pub fn with_capability(
+        mut self,
+        capability: Option<crate::governance::capability::CapabilityToken>,
+    ) -> Self {
+        self.capability = capability;
+        self
     }
 
     /// v0.7.0 #1062 (Agent-2 #9) — admin-context constructor that
@@ -2535,6 +2564,15 @@ pub trait MemoryStore: Send + Sync {
     /// Default returns `Allow` so adapters that haven't wired the walk
     /// surface the v0.6.x posture (no governance) — consistent with
     /// `resolve_governance_policy`'s default.
+    ///
+    /// v0.9.0 G10.1 (#1827) — `capability` is the edge-parsed macaroon
+    /// token (usually `CallerContext::capability.as_ref()`). Inside the
+    /// adapter gates a verified in-caveat token flips a base
+    /// `Deny`/`Pending` to `Allow`
+    /// (`governance::capability::apply_at_gate`); `None` is
+    /// byte-identical legacy. Threading it through the trait signature
+    /// (rather than a call-site wrapper) means NO caller can be missed —
+    /// the compiler enforces exhaustiveness.
     async fn enforce_governance_action(
         &self,
         _action: GovernedAction,
@@ -2543,6 +2581,7 @@ pub trait MemoryStore: Send + Sync {
         _memory_id: Option<&str>,
         _memory_owner: Option<&str>,
         _payload: &serde_json::Value,
+        _capability: Option<&crate::governance::capability::CapabilityToken>,
     ) -> StoreResult<crate::models::GovernanceDecision> {
         Ok(crate::models::GovernanceDecision::Allow)
     }
@@ -3560,6 +3599,38 @@ mod tests {
         assert_eq!(ctx.agent_id, "alice");
         assert!(ctx.as_agent.is_none());
         assert!(ctx.request_id.is_none());
+        // v0.9.0 G10.1 (#1827) — byte-identical legacy default: no
+        // capability token unless the edge attached one.
+        assert!(ctx.capability.is_none());
+        assert!(
+            CallerContext::for_admin("op").capability.is_none(),
+            "admin contexts carry no implicit capability"
+        );
+        assert!(
+            CallerContext::for_admin_checked("t", false)
+                .capability
+                .is_none(),
+            "checked constructor defaults capability to None on both arms"
+        );
+    }
+
+    #[test]
+    fn caller_context_with_capability_attaches_and_detaches() {
+        // v0.9.0 G10.1 (#1827) — builder round trip. The token content
+        // is irrelevant here; construct a minimal one directly.
+        let tok = crate::governance::capability::CapabilityToken {
+            v: crate::governance::capability::CAPABILITY_VERSION,
+            issuer: "ai:iss".to_string(),
+            root_id: "rid".to_string(),
+            root_caveats: Vec::new(),
+            root_sig: vec![0u8; 64],
+            ext_caveats: Vec::new(),
+            tag: vec![0u8; 32],
+        };
+        let ctx = CallerContext::for_agent("alice").with_capability(Some(tok.clone()));
+        assert_eq!(ctx.capability.as_ref(), Some(&tok));
+        let ctx2 = ctx.with_capability(None);
+        assert!(ctx2.capability.is_none(), "None is the identity");
     }
 
     #[test]
@@ -4118,6 +4189,7 @@ mod tests {
                 None,
                 None,
                 &serde_json::json!({}),
+                None,
             )
             .await
             .expect("default Allow");

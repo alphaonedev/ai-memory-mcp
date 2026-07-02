@@ -50,6 +50,11 @@ pub struct ListArgs {
 #[derive(Args)]
 pub struct DeleteArgs {
     pub id: String,
+    /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
+    /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
+    /// within its caveats. Inert unless `[capabilities].enabled`.
+    #[arg(long)]
+    pub capability: Option<String>,
 }
 
 /// `get` handler. Looks up by full id then prefix; prints memory + links.
@@ -172,6 +177,12 @@ pub fn cmd_delete(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = serde_json::json!({"id": target.id, "title": target.title});
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `--capability`
+        // token ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            args.capability.as_deref(),
+            &caller_agent_id,
+        );
         match enforce_governance(
             &conn,
             GovernedAction::Delete,
@@ -180,6 +191,7 @@ pub fn cmd_delete(
             Some(&target.id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
             json_out,
             out,
         )? {
@@ -488,7 +500,10 @@ mod tests {
             let mut out = env.output();
             cmd_delete(
                 &db,
-                &DeleteArgs { id: id.clone() },
+                &DeleteArgs {
+                    id: id.clone(),
+                    capability: None,
+                },
                 false,
                 Some("test-agent"),
                 &mut out,
@@ -514,7 +529,10 @@ mod tests {
             let mut out = env.output();
             cmd_delete(
                 &db,
-                &DeleteArgs { id: prefix },
+                &DeleteArgs {
+                    id: prefix,
+                    capability: None,
+                },
                 true,
                 Some("test-agent"),
                 &mut out,
@@ -606,7 +624,10 @@ mod tests {
             let mut out = env.output();
             cmd_delete(
                 &db,
-                &DeleteArgs { id: id.clone() },
+                &DeleteArgs {
+                    id: id.clone(),
+                    capability: None,
+                },
                 true,
                 Some("bob"),
                 &mut out,

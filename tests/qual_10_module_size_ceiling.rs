@@ -761,7 +761,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // boot-seeded atomics + accessors, resolver arms) + the
     // CapabilityFeatures.lineage_dag advertisement grew the file to
     // 11_583; 11_650 = 67 headroom.
-    ("src/config.rs", 11_650),
+    // 2026-07-02 (#1827 G10.1) — bumped 11_650 → 12_050: the
+    // `[capabilities]` block (`CapabilitiesConfig` + `CapabilityIssuerEntry`),
+    // the process-wide `ACTIVE_CAPABILITY_CONFIG` handle (+ test lock/clear),
+    // `resolve_capabilities_enabled` / `load_capability_config` (closed
+    // issuer allowlist loader), the `CapabilityPermissions`
+    // capability-token posture fields, and the three resolver/loader
+    // tests grew the file to 11_959; 12_050 = 91 headroom.
+    ("src/config.rs", 12_050),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

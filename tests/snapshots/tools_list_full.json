@@ -10,6 +10,12 @@
               "null"
             ]
           },
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "confidence": {
             "format": "double",
             "type": [
@@ -769,6 +775,12 @@
       "description": "Delete a memory by ID.",
       "inputSchema": {
         "properties": {
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           }
@@ -784,6 +796,12 @@
       "description": "Promote a memory to long (or",
       "inputSchema": {
         "properties": {
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -811,6 +829,12 @@
       "description": "Bulk delete memories matching a",
       "inputSchema": {
         "properties": {
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "dry_run": {
             "type": [
               "boolean",
@@ -852,6 +876,12 @@
       "description": "Update an existing memory by ID",
       "inputSchema": {
         "properties": {
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "confidence": {
             "format": "double",
             "type": [
@@ -2053,6 +2083,12 @@
           }
         },
         "properties": {
+          "capability": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "content": {
             "type": "string"
           },

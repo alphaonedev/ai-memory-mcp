@@ -352,7 +352,15 @@ async fn seed_pending_store(
     let queued = mem(&uid("pa"), ns, "needs approval", requester);
     let payload = serde_json::to_value(&queued).expect("serialize memory payload");
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, ns, requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            ns,
+            requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     match decision {

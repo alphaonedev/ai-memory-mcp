@@ -151,6 +151,7 @@ fn refusal_envelope_carries_typed_context_and_canonical_display() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("enforce_governance must not error on a well-formed call");
 
@@ -205,6 +206,7 @@ fn refusal_renders_byte_identically_across_surfaces() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("enforce_governance must not error")
     {
@@ -281,6 +283,7 @@ fn registered_level_refusal_surfaces_typed_context() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("enforce_governance must not error")
     {
@@ -332,6 +335,7 @@ fn refusal_round_trips_through_anyhow_to_memory_error() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("enforce_governance must not error")
     {

@@ -34,6 +34,11 @@ pub struct PromoteArgs {
     /// keep the row's live TTL; long landings clear it.
     #[arg(long)]
     pub target_tier: Option<String>,
+    /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
+    /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
+    /// within its caveats. Inert unless `[capabilities].enabled`.
+    #[arg(long)]
+    pub capability: Option<String>,
 }
 
 /// `promote` handler.
@@ -72,6 +77,12 @@ pub fn cmd_promote(
             "id": resolved_id,
             (crate::models::field_names::TO_NAMESPACE): args.to_namespace,
         });
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `--capability`
+        // token ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            args.capability.as_deref(),
+            &caller_agent_id,
+        );
         match enforce_governance(
             &conn,
             GovernedAction::Promote,
@@ -80,6 +91,7 @@ pub fn cmd_promote(
             Some(&resolved_id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
             json_out,
             out,
         )? {
@@ -192,6 +204,7 @@ mod tests {
             id: id.to_string(),
             to_namespace: None,
             target_tier: None,
+            capability: None,
         }
     }
 
@@ -418,6 +431,7 @@ mod tests {
                 Some(&id),
                 Some("alice"),
                 &payload,
+                None,
                 false,
                 &mut out,
             )

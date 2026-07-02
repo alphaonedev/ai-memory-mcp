@@ -59,6 +59,8 @@ fn forget_governance_gate_one_ns(
     caller: &str,
     pattern: Option<&str>,
     tier: Option<&Tier>,
+    // v0.9.0 G10.1 (#1827) — the edge-parsed capability token (or None).
+    capability: Option<&crate::governance::capability::CapabilityToken>,
 ) -> Result<(), String> {
     use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
     let payload = json!({
@@ -94,6 +96,7 @@ fn forget_governance_gate_one_ns(
         None,
         Some(caller),
         &payload,
+        capability,
     )
     .map_err(|e| e.to_string())?
     {
@@ -162,9 +165,23 @@ pub(super) fn handle_forget(
     // hide a governed namespace sorting past the cap — the load-bearing vote
     // objection) and runs the SAME single-namespace gate for each, refusing the
     // whole forget on the FIRST namespace that denies.
+    // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability` param
+    // ONCE (inert unless `[capabilities].enabled`); the same token gates
+    // every namespace the bulk pattern touches.
+    let capability = crate::governance::capability::parse_presented_token(
+        params[crate::mcp::param_names::CAPABILITY].as_str(),
+        owner.as_deref().unwrap_or_default(),
+    );
     match (namespace, owner.as_deref()) {
         (Some(ns), Some(caller)) => {
-            forget_governance_gate_one_ns(conn, ns, caller, pattern, tier.as_ref())?;
+            forget_governance_gate_one_ns(
+                conn,
+                ns,
+                caller,
+                pattern,
+                tier.as_ref(),
+                capability.as_ref(),
+            )?;
         }
         (None, Some(caller)) => {
             // Skip when neither pattern nor tier is set — there is no forget
@@ -175,7 +192,14 @@ pub(super) fn handle_forget(
                     db::forget_distinct_namespaces_for_caller(conn, pattern, tier.as_ref(), caller)
                         .map_err(|e| e.to_string())?;
                 for ns in &namespaces {
-                    forget_governance_gate_one_ns(conn, ns, caller, pattern, tier.as_ref())?;
+                    forget_governance_gate_one_ns(
+                        conn,
+                        ns,
+                        caller,
+                        pattern,
+                        tier.as_ref(),
+                        capability.as_ref(),
+                    )?;
                 }
             }
         }
@@ -270,6 +294,14 @@ pub struct ForgetRequest {
     /// Preview without deleting.
     #[serde(default)]
     pub dry_run: Option<bool>,
+
+    // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
+    // so schemars emits only the concise attribute description.
+    #[serde(default)]
+    #[schemars(
+        description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this bulk forget to Allow within its caveats."
+    )]
+    pub capability: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_forget`.

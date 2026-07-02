@@ -13543,6 +13543,16 @@ fn namespace_owner(conn: &Connection, namespace: &str) -> Option<String> {
 /// [`crate::config::permissions_decision_counts`] so doctor +
 /// capabilities can surface gate activity.
 ///
+/// v0.9.0 G10.1 (#1827) — `capability` is the edge-parsed macaroon
+/// capability token presented with the request (MCP `capability` param /
+/// HTTP `X-AI-Memory-Capability` header / CLI `--capability`), or `None`.
+/// In `Enforce` mode a verified in-caveat token flips a base
+/// `Deny`/`Pending` to `Allow` via
+/// [`crate::governance::capability::apply_at_gate`] — applied INSIDE this
+/// gate (rather than at call sites) so no caller can be missed. `None`,
+/// `[capabilities].enabled = false`, or any non-Enforce mode is a pure
+/// identity: byte-identical legacy decisions and zero new audit bytes.
+///
 /// [`PermissionsMode`]: crate::config::PermissionsMode
 pub fn enforce_governance(
     conn: &Connection,
@@ -13552,6 +13562,7 @@ pub fn enforce_governance(
     memory_id: Option<&str>,
     memory_owner: Option<&str>,
     payload: &serde_json::Value,
+    capability: Option<&crate::governance::capability::CapabilityToken>,
 ) -> Result<GovernanceDecision> {
     use crate::config::{PermissionsMode, active_permissions_mode, record_permissions_decision};
 
@@ -13644,6 +13655,16 @@ pub fn enforce_governance(
         }
         return Ok(GovernanceDecision::Allow);
     }
+
+    // v0.9.0 G10.1 (#1827) — capability-token grant joiner. Purely
+    // additive and Enforce-only (Off/Advisory returned above): only a
+    // Deny/Pending base can flip, only when `[capabilities].enabled` and a
+    // token was presented; every other case is a pure identity with zero
+    // new audit bytes. Applied BEFORE the Pending queue below so a granted
+    // Pending never lands a stray approval row.
+    let decision = crate::governance::capability::apply_at_gate(
+        decision, action, namespace, agent_id, capability,
+    );
 
     // K3 — `Enforce`: the historical strict path. `Pending` queues a
     // `pending_actions` row and returns the canonical id.
@@ -20152,6 +20173,7 @@ mod tests {
             None,
             None,
             &payload,
+            None,
         )
         .expect("enforce_governance must not error on inherited owner policy");
         assert!(
@@ -20168,6 +20190,7 @@ mod tests {
             None,
             None,
             &payload,
+            None,
         )
         .expect("enforce_governance must not error");
         match deny {
@@ -20294,6 +20317,7 @@ mod tests {
             None,
             None,
             &serde_json::json!({}),
+            None,
         )
         .unwrap();
         assert!(

@@ -429,7 +429,15 @@ async fn pending_action_get_list_and_decide() {
 
     let payload = serde_json::json!({"title": "needs approval"});
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     let pending_id = match decision {
@@ -491,7 +499,15 @@ async fn governance_consensus_and_execute_pending() {
     let queued = mem(&uid("pa"), &ns, "consensus write", "body", &requester);
     let payload = serde_json::to_value(&queued).expect("serialize memory payload");
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce");
     let pending_id = match decision {
@@ -553,7 +569,15 @@ async fn human_arm_refuses_self_approval_and_unregistered_1793() {
 
     // (a) the requester self-approving their own Human-gated action → refused.
     let pid_self = match store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce a")
     {
@@ -574,7 +598,15 @@ async fn human_arm_refuses_self_approval_and_unregistered_1793() {
 
     // (b) a DIFFERENT but UNREGISTERED approver → refused (not a registered agent).
     let pid_unreg = match store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce b")
     {
@@ -603,7 +635,15 @@ async fn human_arm_refuses_self_approval_and_unregistered_1793() {
     };
     store.register_agent(&ctx, &reg).await.expect("register");
     let pid_ok = match store
-        .enforce_governance_action(GovernedAction::Store, &ns, &requester, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            &requester,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce c")
     {

@@ -149,6 +149,7 @@ fn shipgate_inherit_default_governance_chain_5_deep_requires_approval_at_leaf() 
         None,
         None,
         &payload,
+        None,
     )
     .expect("enforce_governance must not error on a valid policy");
 
@@ -190,6 +191,7 @@ fn shipgate_inherit_false_at_child_blocks_parent_policy() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("policy resolves cleanly");
 
@@ -221,6 +223,7 @@ fn shipgate_most_specific_policy_wins_when_both_set() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("policy resolves cleanly");
 
@@ -248,6 +251,7 @@ fn shipgate_child_with_no_policy_inherits_parent_policy() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("inherited policy must resolve");
 
@@ -288,6 +292,7 @@ fn shipgate_audit_no_silent_bypass_in_v063_compatibility_path() {
             None,
             None,
             &payload,
+            None,
         )
         .unwrap_or_else(|e| panic!("gate errored on {child}: {e}"));
         assert!(
@@ -306,6 +311,7 @@ fn shipgate_audit_no_silent_bypass_in_v063_compatibility_path() {
         None,
         None,
         &serde_json::json!({}),
+        None,
     )
     .unwrap();
     assert!(

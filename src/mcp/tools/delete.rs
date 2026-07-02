@@ -19,6 +19,14 @@ use std::path::Path;
 #[allow(dead_code)]
 pub struct DeleteRequest {
     pub id: String,
+
+    // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
+    // so schemars emits only the concise attribute description.
+    #[serde(default)]
+    #[schemars(
+        description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this delete to Allow within its caveats."
+    )]
+    pub capability: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_delete`.
@@ -161,6 +169,12 @@ pub(super) fn handle_delete(
             .and_then(|v| v.as_str())
             .map(str::to_string);
         let payload = json!({"id": target.id, "title": target.title});
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability`
+        // param ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            params[param_names::CAPABILITY].as_str(),
+            &agent_id,
+        );
         match db::enforce_governance(
             conn,
             GovernedAction::Delete,
@@ -169,6 +183,7 @@ pub(super) fn handle_delete(
             Some(&target.id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
         )
         .map_err(|e| e.to_string())?
         {
