@@ -3726,6 +3726,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_lineage_walks_unsupported_1859() {
+        // v0.9.0 G13-mem (#1859) — adapters that don't implement the
+        // lineage-DAG walk surface report UnsupportedCapability from the
+        // trait defaults (sqlite + postgres both override).
+        let s = MinimalStore;
+        let err = s.lineage_ancestors("any", 3).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+        let err = s.lineage_descendants("any", 3).await.unwrap_err();
+        assert!(matches!(err, StoreError::UnsupportedCapability { .. }));
+    }
+
+    #[tokio::test]
     async fn default_undo_in_place_edit_unsupported() {
         // #1727 — adapters that don't implement the undo surface (in-memory /
         // test mocks) return UnsupportedCapability from the default body.
