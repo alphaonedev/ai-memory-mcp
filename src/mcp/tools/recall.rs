@@ -331,7 +331,15 @@ const fn attest_rank(level: AttestLevel) -> u8 {
         // RecorderSigned (v0.9.0 G9 #1826) — the substrate's own recorder-role
         // signature on its own governance-audit emission; same rank as
         // DaemonSigned (substrate self-signature, distinct role key).
-        AttestLevel::SelfSigned | AttestLevel::DaemonSigned | AttestLevel::RecorderSigned => 1,
+        // LineageSigned (v0.9.0 G13 #1828) — an identity-lineage witness
+        // row's succession signature: signed by the agent's own retiring
+        // key over its own handoff, so it ranks with the writer-local
+        // self-signature class (it never appears on recall rows in
+        // practice — the level is exclusive to signed_events witnesses).
+        AttestLevel::SelfSigned
+        | AttestLevel::DaemonSigned
+        | AttestLevel::RecorderSigned
+        | AttestLevel::LineageSigned => 1,
         AttestLevel::PeerAttested | AttestLevel::SignedByPeer => 2,
     }
 }

@@ -272,7 +272,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the consolidate tombstone/leaf disposition, and the
     // lineage_traverse/ancestors/descendants recursive-CTE walk) grew the
     // file to 22_218; 22_300 = 82 headroom.
-    ("src/storage/mod.rs", 22_300),
+    //
+    // 2026-07-01 — bumped 22_300 → 22_800 by the #1828 G13
+    // identity-lineage landing: the sqlite SSOT for the succession
+    // chain (append_lineage_record single-tx C4 atom, read_lineage /
+    // lineage_head / lineage_witness_hashes, verify_agent_lineage,
+    // current_authoritative_key resolver, enroll_lineage +
+    // append_succession helpers) plus the agent_lineage bootstrap
+    // SCHEMA mirror. Growth justified: the dual-backend agent-registry
+    // convention keeps the sqlite lineage SSOT in this file next to
+    // bind_agent_pubkey/agent_pubkey; no speculative surface. Measured
+    // 22_704 + 96 headroom.
+    ("src/storage/mod.rs", 22_800),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -635,7 +646,17 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // tombstone + single CONSOLIDATE-leaf emission, and the
     // lineage_cte/lineage_cypher/lineage_traverse dispatcher) grew the file
     // to 24_979; 25_050 = 71 headroom.
-    ("src/store/postgres.rs", 25_050),
+    //
+    // 2026-07-01 — bumped 25_050 → 25_500 by the #1828 G13
+    // identity-lineage postgres twins (append_lineage_record C4
+    // single-tx atom via pg_append_signed_event_with_chain_in_tx,
+    // read_lineage / lineage_witness_hashes /
+    // current_authoritative_key, migrate_v76, and the
+    // verify_audit_trail lineage-verdict computation +
+    // verify_agent_lineage_pg). Growth justified: K3 backend parity
+    // for the new SAL surface, no speculative code. Measured 25_391 +
+    // 109 headroom.
+    ("src/store/postgres.rs", 25_500),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

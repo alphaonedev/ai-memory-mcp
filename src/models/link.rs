@@ -73,6 +73,16 @@ pub enum AttestLevel {
     /// `AI_MEMORY_RECORDER_PUBKEY` in `verify_chain`. Additive/opt-in:
     /// unset recorder key → rows stay `DaemonSigned` (byte-identical legacy).
     RecorderSigned,
+    /// v0.9.0 G13 (#1828) — `signed_events` WITNESS row for an
+    /// identity-lineage succession record (`identity.lineage.*` event
+    /// types). The row's `signature` is the succession signature by the
+    /// record's PREDECESSOR key over the `LINEAGE_DOMAIN`-tagged
+    /// canonical bytes — NOT a daemon/recorder signature — so the
+    /// per-row chain verifier skips it and
+    /// `crate::identity::lineage::verify_lineage` owns its validity
+    /// (chain-linkage vs succession-validity are disjoint properties,
+    /// same split `verify_chain` documents for role keys).
+    LineageSigned,
 }
 
 impl AttestLevel {
@@ -94,6 +104,7 @@ impl AttestLevel {
             "signed_by_peer" => Some(Self::SignedByPeer),
             "daemon_signed" => Some(Self::DaemonSigned),
             "recorder_signed" => Some(Self::RecorderSigned),
+            "lineage_signed" => Some(Self::LineageSigned),
             _ => None,
         }
     }
@@ -110,6 +121,7 @@ impl AttestLevel {
             Self::SignedByPeer => "signed_by_peer",
             Self::DaemonSigned => "daemon_signed",
             Self::RecorderSigned => "recorder_signed",
+            Self::LineageSigned => "lineage_signed",
         }
     }
 }

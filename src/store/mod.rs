@@ -1196,6 +1196,74 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v0.9.0 G13 (#1828) — append one signed identity-lineage record
+    /// ATOMICALLY: `agent_lineage` body INSERT + flat
+    /// `metadata.agent_pubkey` sync + append-only `signed_events`
+    /// witness in ONE transaction (C4; the `(agent_id, epoch)` PK is
+    /// the C5 anti-equivocation constraint). Sqlite delegates to the
+    /// `db::append_lineage_record` SSOT; postgres implements the twin.
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter without
+    /// lineage wiring fails loudly rather than silently dropping a
+    /// succession an operator believes is recorded.
+    async fn append_lineage_record(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _record: &crate::identity::lineage::LineageRecord,
+        _signature: &[u8],
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "APPEND_LINEAGE_RECORD".to_string(),
+        })
+    }
+
+    /// v0.9.0 G13 (#1828) — read an agent's lineage records (ascending
+    /// epoch) with their stored signatures. `Ok(vec![])` = no lineage
+    /// enrolled (the byte-identical legacy posture).
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// `append_lineage_record`) so a lineage-unaware adapter is loud.
+    async fn read_lineage(
+        &self,
+        _agent_id: &str,
+    ) -> StoreResult<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "READ_LINEAGE".to_string(),
+        })
+    }
+
+    /// v0.9.0 G13 (#1828) — the `payload_hash` blobs of the agent's
+    /// `identity.lineage.*` witness rows in the append-only
+    /// `signed_events` chain (the C1/C3 anchor set).
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// `append_lineage_record`).
+    async fn lineage_witness_hashes(&self, _agent_id: &str) -> StoreResult<Vec<Vec<u8>>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "LINEAGE_WITNESS_HASHES".to_string(),
+        })
+    }
+
+    /// v0.9.0 G13 (#1828) — the lineage-aware authoritative-key
+    /// resolver (URL-safe-no-pad base64), ADVISORY/verdict-only this
+    /// train (C6 — `attest_write` does not call this):
+    ///
+    /// - no lineage enrolled → byte-identical fall-through to
+    ///   [`Self::agent_pubkey`];
+    /// - lineage present → the full genesis→head walk (C1 witness
+    ///   anchor + C3 truncation reconciliation + head-key cross-check);
+    ///   a broken chain resolves `Ok(None)` (fail-closed), never the
+    ///   flat key.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors
+    /// `append_lineage_record`).
+    async fn current_authoritative_key(&self, _agent_id: &str) -> StoreResult<Option<String>> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "CURRENT_AUTHORITATIVE_KEY".to_string(),
+        })
+    }
+
     /// v0.7.0 Wave-3 Continuation — adapter-specific downcast hatch.
     ///
     /// Returns the adapter as `&dyn Any` so that downstream callers
@@ -3832,6 +3900,32 @@ mod tests {
         ));
         assert!(matches!(
             s.lease_sweep_expired(0).await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        // v0.9.0 G13 (#1828) — identity-lineage defaults are LOUD
+        // (Unsupported), never silently-dropped successions.
+        let genesis = crate::identity::lineage::LineageRecord::genesis(
+            "agent",
+            "k0-b64",
+            None,
+            "2026-06-30T00:00:00+00:00",
+        );
+        assert!(matches!(
+            s.append_lineage_record(&ctx, "agent", &genesis, &[0u8; 64])
+                .await
+                .unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.read_lineage("agent").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.lineage_witness_hashes("agent").await.unwrap_err(),
+            StoreError::UnsupportedCapability { .. }
+        ));
+        assert!(matches!(
+            s.current_authoritative_key("agent").await.unwrap_err(),
             StoreError::UnsupportedCapability { .. }
         ));
 

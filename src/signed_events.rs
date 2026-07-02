@@ -225,7 +225,38 @@ pub mod event_types {
     /// rule's canonical signing bytes and `signature` is the operator's
     /// Ed25519 signature over that hash.
     pub const GOVERNANCE_RULE_REMOVED: &str = "governance.rule_removed";
+
+    /// v0.9.0 G13 (#1828) — witness row for an identity-lineage GENESIS
+    /// record (epoch 0, self-signed by `K0`). `payload_hash` =
+    /// SHA-256 over the `LINEAGE_DOMAIN`-tagged canonical bytes the
+    /// predecessor signed; `signature` = the succession signature;
+    /// `attest_level` = `"lineage_signed"`. Written in the SAME
+    /// transaction as the `agent_lineage` body row (C4) — this row is
+    /// the append-only anchor that pins genesis at enroll-time (C1).
+    pub const IDENTITY_LINEAGE_GENESIS: &str = "identity.lineage.genesis";
+
+    /// v0.9.0 G13 (#1828) — witness row for an identity-lineage
+    /// ROTATION record (`K_old` hands off to `K_new`). Same payload /
+    /// signature shape as [`IDENTITY_LINEAGE_GENESIS`].
+    pub const IDENTITY_LINEAGE_SUCCESSION: &str = "identity.lineage.succession";
+
+    /// v0.9.0 G13 (#1828) — witness row for an identity-lineage
+    /// RECOVERY record. RESERVED for the v1.0 recovery path: the slug
+    /// exists now so the event-type vocabulary is forward-stable, but
+    /// no v0.9.0 production writer emits it (the append paths refuse
+    /// `reason = recovery` until the recovery VERIFY path lands).
+    pub const IDENTITY_LINEAGE_RECOVERY: &str = "identity.lineage.recovery";
 }
+
+/// v0.9.0 G13 (#1828) — the three `identity.lineage.*` witness event
+/// types, in one place for the (agent-scoped) witness reads both
+/// backends run. Order matches the epoch-0-first narrative; the SQL
+/// reads treat it as a set.
+pub const IDENTITY_LINEAGE_EVENT_TYPES: [&str; 3] = [
+    event_types::IDENTITY_LINEAGE_GENESIS,
+    event_types::IDENTITY_LINEAGE_SUCCESSION,
+    event_types::IDENTITY_LINEAGE_RECOVERY,
+];
 
 /// One row of the `signed_events` audit table.
 ///
@@ -681,6 +712,18 @@ pub fn classify_row_signature(
     recorder_verifier: Option<&ed25519_dalek::VerifyingKey>,
 ) -> RowSignatureVerdict {
     use crate::models::AttestLevel;
+    if event.attest_level == AttestLevel::LineageSigned.as_str() {
+        // v0.9.0 G13 (#1828) — identity-lineage WITNESS row. Its
+        // `signature` is the succession signature by the record's
+        // PREDECESSOR key over the `LINEAGE_DOMAIN`-tagged bytes, not a
+        // daemon/recorder signature over `signing_input_bytes`, so the
+        // daemon verifier would ALWAYS false-fail it. Succession
+        // validity is owned by `identity::lineage::verify_lineage`
+        // (surfaced as `AuditTrailReport::lineage`); this walk still
+        // audits the row's CHAIN LINKAGE — the same disjoint-property
+        // split the module docs pin for chain-break vs signature.
+        return RowSignatureVerdict::default();
+    }
     if event.attest_level == AttestLevel::RecorderSigned.as_str() {
         // RECORDER-signed row (C6: withhold when no recorder pubkey enrolled).
         let Some(rk) = recorder_verifier else {
@@ -1295,6 +1338,16 @@ pub struct AuditTrailReport {
     /// `Unknown` withholds (default, legacy-identical); `Forged` /
     /// `Misconfigured` / `Missing` are dirty. See [`RoleSeparationCheck`].
     pub role_separation: RoleSeparationCheck,
+    /// v0.9.0 G13 (#1828) — identity-lineage verdict: every enrolled
+    /// agent's succession chain is walked genesis→head through
+    /// [`crate::identity::lineage::verify_lineage`] (C1 witness anchor
+    /// + C3 truncation reconciliation included). `Unknown` withholds
+    /// (default — no lineage enrolled, byte-identical legacy);
+    /// `Forged` / `Missing` (require-mode
+    /// `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`) are dirty. Populated
+    /// IDENTICALLY by both backends via
+    /// [`crate::identity::lineage::compute_lineage_check`].
+    pub lineage: crate::identity::lineage::LineageCheck,
 }
 
 impl AuditTrailReport {
@@ -1328,6 +1381,14 @@ impl AuditTrailReport {
                 RoleSeparationCheck::Forged { .. }
                     | RoleSeparationCheck::Misconfigured { .. }
                     | RoleSeparationCheck::Missing
+            )
+            // v0.9.0 G13 (#1828) — identity-lineage Forged/Missing are
+            // dirty; Unknown/NotDetected keep an otherwise-clean report
+            // clean (no lineage enrolled = byte-identical legacy).
+            && !matches!(
+                self.lineage,
+                crate::identity::lineage::LineageCheck::Forged { .. }
+                    | crate::identity::lineage::LineageCheck::Missing
             )
     }
 }
@@ -1576,6 +1637,14 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         require_role,
     );
 
+    // v0.9.0 G13 (#1828) — identity-lineage verdict. Walks every
+    // enrolled agent's chain through `verify_lineage` (C1/C3 enforced);
+    // additive: no `agent_lineage` table / no rows → Unknown (or
+    // Missing under AI_MEMORY_REQUIRE_IDENTITY_LINEAGE). Shared verdict
+    // fn → identical to the postgres twin (K3 parity).
+    let require_lineage = crate::identity::lineage::require_identity_lineage_enabled();
+    let lineage = compute_identity_lineage_verdict(conn, require_lineage);
+
     Ok(AuditTrailReport {
         total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
         chain_intact: report.chain_holds(),
@@ -1588,7 +1657,47 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         cause_binding,
         signature_failures: report.signature_failures.clone(),
         role_separation,
+        lineage,
     })
+}
+
+/// v0.9.0 G13 (#1828) — compute the sqlite-side [`crate::identity::lineage::LineageCheck`]
+/// verdict for [`verify_audit_trail`].
+///
+/// Enumerates every agent with `agent_lineage` rows and walks each
+/// chain through `crate::storage::verify_agent_lineage` (which enforces
+/// the C1 witness anchor + C3 truncation reconciliation + head-key
+/// cross-check). Additive posture: a legacy / partial-schema DB whose
+/// `agent_lineage` table is absent (or unreadable) has definitionally
+/// no lineage → the agent LIST read degrades to empty → `Unknown`
+/// withhold (require-mode still fail-closes to `Missing`). A PER-AGENT
+/// verify failure — including an infra read error once we know the
+/// agent HAS lineage — is fail-closed `Forged`.
+fn compute_identity_lineage_verdict(
+    conn: &Connection,
+    require: bool,
+) -> crate::identity::lineage::LineageCheck {
+    let agents: Vec<String> = conn
+        .prepare("SELECT DISTINCT agent_id FROM agent_lineage ORDER BY agent_id")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    let outcomes: Vec<(String, Option<String>)> = agents
+        .into_iter()
+        .map(|agent| {
+            let outcome = match crate::storage::verify_agent_lineage(conn, &agent) {
+                Ok(Ok(_)) => None,
+                Ok(Err(walk_err)) => Some(walk_err.to_string()),
+                // Infra read failure on an agent KNOWN to have lineage
+                // rows — fail-closed (never silently withhold).
+                Err(read_err) => Some(format!("lineage read failed: {read_err:#}")),
+            };
+            (agent, outcome)
+        })
+        .collect();
+    crate::identity::lineage::compute_lineage_check(&outcomes, require)
 }
 
 /// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint

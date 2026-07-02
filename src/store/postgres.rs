@@ -119,8 +119,26 @@ const CTX_VERIFY_LINK_SELECT: &str = "verify_link select";
 /// #1823 G6 — `to_store_err` context for the supersede revision-leaf
 /// append, referenced by every append-only spine site (single SSOT).
 const CTX_APPEND_SUPERSEDE_LEAF: &str = "append supersede revision leaf";
+/// Shared `to_store_err` label for the agent-id lookup that precedes a
+/// flag-gated supersede leaf (pm-v3.1 literal de-dup — bind / revoke /
+/// lineage-append all run the same read).
+const CTX_READ_AGENT_ID_FOR_LEAF: &str = "read agent id for supersede leaf";
+/// Metadata key stamped next to `agent_pubkey` on every bind/sync so
+/// rotation provenance is auditable (pm-v3.1 literal de-dup).
+const META_PUBKEY_BOUND_AT: &str = "pubkey_bound_at";
 const COL_CONTENT_LEN: &str = "content_len";
 const TABLE_ARCHIVED_MEMORIES: &str = "archived_memories";
+
+/// Refusal for a pubkey bind/sync against an unregistered agent —
+/// shared by `bind_agent_pubkey` and `append_lineage_record` (pm-v3.1
+/// literal de-dup; mirrors the sqlite `db::bind_agent_pubkey` message).
+fn agent_not_registered_for_bind(agent_id: &str) -> StoreError {
+    StoreError::InvalidInput {
+        detail: format!(
+            "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
+        ),
+    }
+}
 
 /// Bootstrap schema run at adapter init — idempotent via IF NOT EXISTS.
 const INIT_SCHEMA: &str = include_str!("postgres_schema.sql");
@@ -234,6 +252,14 @@ const MIGRATION_V74_MEMORIES_CID: &str =
 /// idempotent batch; no backfill (legacy edges keep NULL cids).
 const MIGRATION_V75_MEMORY_LINKS_LINEAGE_CID: &str =
     include_str!("../../migrations/postgres/0034_v75_memory_links_lineage_cid.sql");
+
+/// v76 (#1828, v0.9.0 G13) — identity-lineage succession chain: the
+/// dedicated `agent_lineage` table (postgres mirror of the sqlite v76
+/// arm). Composite PK `(agent_id, epoch)` = the C5 anti-equivocation
+/// constraint. Pure additive CREATE TABLE IF NOT EXISTS — idempotent;
+/// fresh schemas also carry the table inline in `postgres_schema.sql`.
+const MIGRATION_V76_AGENT_LINEAGE: &str =
+    include_str!("../../migrations/postgres/0035_v76_agent_lineage.sql");
 
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
@@ -578,7 +604,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 75;
+const CURRENT_SCHEMA_VERSION: i32 = 76;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1445,8 +1471,11 @@ impl PostgresStore {
         if current_version < 74 {
             self.migrate_v74().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 75 {
             self.migrate_v75().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v76().await?;
         }
 
         Ok(())
@@ -3603,7 +3632,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v75 memory_links lineage cid", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // v75 is no longer the ladder head (v76 is); stamp the literal
+        // so the same-run v76 arm advances past it (the v74 precedent).
+        record_schema_version(&mut tx, 75).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v75 ddl", e))?;
@@ -3612,6 +3643,39 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v75 applied (#1859: memory_links.source_cid / \
              target_cid — additive lineage-DAG content-id mirror)"
+        );
+        Ok(())
+    }
+
+    /// v0.9.0 G13 (#1828) — identity-lineage succession chain: create
+    /// the `agent_lineage` table (postgres twin of the sqlite v76 arm).
+    /// Single idempotent `CREATE TABLE IF NOT EXISTS` batch; the
+    /// composite PK `(agent_id, epoch)` is both the C5
+    /// anti-equivocation constraint and the covering index for the
+    /// epoch-ordered `read_lineage` scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v76(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v76 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V76_AGENT_LINEAGE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v76 agent_lineage", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v76 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v76 applied (#1828: agent_lineage — identity-lineage \
+             succession chain, rotation-survival core)"
         );
         Ok(())
     }
@@ -9678,6 +9742,32 @@ impl PostgresStore {
             require_role,
         );
 
+        // v0.9.0 G13 (#1828) — identity-lineage verdict (postgres twin
+        // of the sqlite `compute_identity_lineage_verdict`). Same
+        // additive posture: an unreadable/absent `agent_lineage` table
+        // degrades the agent LIST to empty → Unknown withhold; a
+        // per-agent failure once lineage is known to exist fail-closes
+        // to Forged. Shared `compute_lineage_check` → identical
+        // verdicts to sqlite (K3 parity).
+        let require_lineage = crate::identity::lineage::require_identity_lineage_enabled();
+        let lineage_agents: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT agent_id FROM agent_lineage ORDER BY agent_id")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+        let mut lineage_outcomes: Vec<(String, Option<String>)> =
+            Vec::with_capacity(lineage_agents.len());
+        for agent in lineage_agents {
+            let outcome = match self.verify_agent_lineage_pg(&agent).await {
+                Ok(Ok(_)) => None,
+                Ok(Err(walk_err)) => Some(walk_err.to_string()),
+                Err(read_err) => Some(format!("lineage read failed: {read_err}")),
+            };
+            lineage_outcomes.push((agent, outcome));
+        }
+        let lineage =
+            crate::identity::lineage::compute_lineage_check(&lineage_outcomes, require_lineage);
+
         Ok(crate::signed_events::AuditTrailReport {
             total_events,
             chain_intact,
@@ -9690,7 +9780,32 @@ impl PostgresStore {
             cause_binding,
             signature_failures,
             role_separation,
+            lineage,
         })
+    }
+
+    /// v0.9.0 G13 (#1828) — postgres twin of
+    /// `crate::storage::verify_agent_lineage`: the full genesis→head
+    /// walk for one agent against the stored records, the append-only
+    /// witness set, and the bound flat key. Outer `Err` = infra read
+    /// failure; inner `Err` = the chain does not verify.
+    async fn verify_agent_lineage_pg(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<
+        std::result::Result<
+            crate::identity::lineage::VerifiedLineage,
+            crate::identity::lineage::LineageError,
+        >,
+    > {
+        let records = self.read_lineage(agent_id).await?;
+        let witnesses = self.lineage_witness_hashes(agent_id).await?;
+        let bound = self.agent_pubkey(agent_id).await?;
+        Ok(crate::identity::lineage::verify_lineage(
+            &records,
+            &witnesses,
+            bound.as_deref(),
+        ))
     }
 
     /// v0.9.0 G9 (#1826) — read the NEWEST role-separation checkpoint in
@@ -15287,11 +15402,7 @@ impl MemoryStore for PostgresStore {
                 .map_err(|e| to_store_err("read agent metadata for pubkey bind", e))?;
 
         let Some((mut meta,)) = existing else {
-            return Err(StoreError::InvalidInput {
-                detail: format!(
-                    "cannot bind pubkey: agent '{agent_id}' is not registered (register it first)"
-                ),
-            });
+            return Err(agent_not_registered_for_bind(agent_id));
         };
 
         if let Some(obj) = meta.as_object_mut() {
@@ -15300,7 +15411,7 @@ impl MemoryStore for PostgresStore {
                 serde_json::Value::String(pubkey_b64.to_string()),
             );
             obj.insert(
-                "pubkey_bound_at".to_string(),
+                META_PUBKEY_BOUND_AT.to_string(),
                 serde_json::Value::String(now.clone()),
             );
         }
@@ -15337,7 +15448,7 @@ impl MemoryStore for PostgresStore {
                 .bind(&title)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+                .map_err(|e| to_store_err(CTX_READ_AGENT_ID_FOR_LEAF, e))?;
             pg_emit_revision_leaf_if_enabled(
                 &mut tx,
                 &mid,
@@ -15402,7 +15513,7 @@ impl MemoryStore for PostgresStore {
 
         if let Some(obj) = meta.as_object_mut() {
             obj.remove(field_names::AGENT_PUBKEY);
-            obj.remove("pubkey_bound_at");
+            obj.remove(META_PUBKEY_BOUND_AT);
             obj.insert(
                 "pubkey_revoked_at".to_string(),
                 serde_json::Value::String(now.clone()),
@@ -15441,7 +15552,7 @@ impl MemoryStore for PostgresStore {
                 .bind(&title)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("read agent id for supersede leaf", e))?;
+                .map_err(|e| to_store_err(CTX_READ_AGENT_ID_FOR_LEAF, e))?;
             pg_emit_revision_leaf_if_enabled(
                 &mut tx,
                 &mid,
@@ -15459,6 +15570,323 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("revoke_agent_pubkey commit tx", e))?;
 
         Ok(())
+    }
+
+    // ----- v0.9.0 G13 (#1828) — identity lineage (postgres twins) ------
+    // Mirrors the sqlite SSOT (`crate::storage::append_lineage_record`
+    // et al.) so both backends produce IDENTICAL verdicts (K3 parity):
+    // same pre-flight refusals, same single-transaction C4 atom (body
+    // INSERT + flat-pubkey sync + in-tx `signed_events` witness via
+    // `pg_append_signed_event_with_chain_in_tx` — NEVER the deferred
+    // drainer), same C5 composite-PK duplicate-epoch refusal.
+
+    async fn append_lineage_record(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        record: &crate::identity::lineage::LineageRecord,
+        signature: &[u8],
+    ) -> StoreResult<()> {
+        use crate::identity::lineage::{LineageReason, verify_succession};
+        use crate::models::AGENTS_NAMESPACE;
+
+        let invalid = |detail: String| StoreError::InvalidInput { detail };
+        if record.agent_id != agent_id {
+            return Err(invalid(format!(
+                "lineage record agent_id '{}' does not match '{agent_id}'",
+                record.agent_id
+            )));
+        }
+        if record.reason == LineageReason::Recovery {
+            return Err(invalid(
+                "recovery lineage records cannot be minted in v0.9.0 — the recovery \
+                 VERIFY path lands in v1.0"
+                    .to_string(),
+            ));
+        }
+        // Chain-consistency pre-flight against the current head
+        // (identical refusal set to the sqlite SSOT).
+        let head = self.read_lineage(agent_id).await?.into_iter().next_back();
+        match (&head, record.reason) {
+            (None, LineageReason::Genesis) => {}
+            (None, _) => {
+                return Err(invalid(format!(
+                    "no lineage enrolled for '{agent_id}' — enroll a genesis record first"
+                )));
+            }
+            (Some(_), LineageReason::Genesis) => {
+                return Err(invalid(format!(
+                    "lineage for '{agent_id}' already has a genesis record — append a \
+                     rotation instead"
+                )));
+            }
+            (Some((head_rec, _)), _) => {
+                let head_hash =
+                    head_rec
+                        .record_hash()
+                        .map_err(|e| StoreError::IntegrityFailed {
+                            detail: format!("hash lineage head: {e:#}"),
+                        })?;
+                if record.epoch != head_rec.epoch + 1
+                    || record.predecessor_pubkey_b64 != head_rec.successor_pubkey_b64
+                    || record.prev_record_hash != head_hash
+                {
+                    return Err(invalid(format!(
+                        "lineage record does not chain onto the current head for '{agent_id}' \
+                         (epoch/predecessor/prev_record_hash mismatch)"
+                    )));
+                }
+            }
+        }
+        // Never persist a record the walk would reject.
+        let predecessor =
+            crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
+                .map_err(|e| invalid(format!("lineage predecessor pubkey: {e:#}")))?;
+        verify_succession(record, signature, &predecessor).map_err(|e| {
+            invalid(format!(
+                "refusing to persist unverifiable lineage record: {e}"
+            ))
+        })?;
+
+        let record_bytes = record
+            .canonical_bytes()
+            .map_err(|e| StoreError::IntegrityFailed {
+                detail: format!("encode lineage record: {e:#}"),
+            })?;
+        let witness_hash =
+            record
+                .witness_payload_hash()
+                .map_err(|e| StoreError::IntegrityFailed {
+                    detail: format!("hash lineage witness payload: {e:#}"),
+                })?;
+        let now = Utc::now();
+        let now_rfc = now.to_rfc3339();
+        let title = crate::models::agent_registration_title(agent_id);
+
+        // The pubkey sync requires a registered agent — read its
+        // metadata FIRST so an unregistered id refuses before any write.
+        let existing: Option<(serde_json::Value,)> =
+            sqlx::query_as(SQL_SELECT_METADATA_BY_NS_TITLE)
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("read agent metadata for lineage append", e))?;
+        let Some((mut meta,)) = existing else {
+            return Err(agent_not_registered_for_bind(agent_id));
+        };
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert(
+                field_names::AGENT_PUBKEY.to_string(),
+                serde_json::Value::String(record.successor_pubkey_b64.clone()),
+            );
+            obj.insert(
+                META_PUBKEY_BOUND_AT.to_string(),
+                serde_json::Value::String(now_rfc.clone()),
+            );
+        }
+        let content = serde_json::to_string(&meta).map_err(|e| StoreError::IntegrityFailed {
+            detail: format!("serialize agent metadata for lineage append: {e}"),
+        })?;
+
+        // C4 — ONE transaction: body INSERT + pubkey sync + witness.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
+        let epoch_i64 = i64::try_from(record.epoch)
+            .map_err(|_| invalid("lineage epoch exceeds i64".to_string()))?;
+        sqlx::query(
+            "INSERT INTO agent_lineage \
+                (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+                 recovery_pubkey, not_before, prev_record_hash, signature, \
+                 record_bytes, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&record.agent_id)
+        .bind(epoch_i64)
+        .bind(record.reason.as_str())
+        .bind(&record.predecessor_pubkey_b64)
+        .bind(&record.successor_pubkey_b64)
+        .bind(&record.recovery_pubkey_b64)
+        .bind(&record.not_before)
+        .bind(&record.prev_record_hash)
+        .bind(signature)
+        .bind(&record_bytes)
+        .bind(&now_rfc)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            to_store_err(
+                "append_lineage_record insert body (duplicate epoch is refused by the C5 PK)",
+                e,
+            )
+        })?;
+
+        // APPEND-ONLY-SANCTIONED (#1823 G6) — COW SUPERSEDE: the flat
+        // agent_pubkey sync rewrites the registration row's content in
+        // the SAME tx as the lineage body + witness (C4/C6 — the
+        // untouched attest_write gate keeps reading this key). Same
+        // UPDATE shape as bind_agent_pubkey, including the flag-gated
+        // identity-only supersede leaf below.
+        sqlx::query(
+            "UPDATE memories SET metadata = $3, content = $4, updated_at = $5::timestamptz
+             WHERE namespace = $1 AND title = $2",
+        )
+        .bind(AGENTS_NAMESPACE)
+        .bind(&title)
+        .bind(&meta)
+        .bind(&content)
+        .bind(&now_rfc)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err(crate::handlers::BIND_AGENT_PUBKEY_ACTION, e))?;
+        if crate::config::append_only_enabled() {
+            let (mid,): (String,) = sqlx::query_as(SQL_SELECT_ID_BY_NS_TITLE)
+                .bind(AGENTS_NAMESPACE)
+                .bind(&title)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| to_store_err(CTX_READ_AGENT_ID_FOR_LEAF, e))?;
+            pg_emit_revision_leaf_if_enabled(
+                &mut tx,
+                &mid,
+                crate::revisions::RecordKind::Supersede,
+                None,
+                AGENTS_NAMESPACE,
+                None,
+                &now_rfc,
+            )
+            .await
+            .map_err(|e| to_store_err(CTX_APPEND_SUPERSEDE_LEAF, e))?;
+        }
+
+        // C1/C3 witness — the IN-TX signed_events append (clone of the
+        // capture_turn_idempotent contract; never the deferred drainer).
+        let witness_id = uuid::Uuid::new_v4().to_string();
+        let reason = record.reason;
+        let event_type = match reason {
+            LineageReason::Genesis => crate::signed_events::event_types::IDENTITY_LINEAGE_GENESIS,
+            LineageReason::Rotation => {
+                crate::signed_events::event_types::IDENTITY_LINEAGE_SUCCESSION
+            }
+            LineageReason::Recovery => crate::signed_events::event_types::IDENTITY_LINEAGE_RECOVERY,
+        };
+        pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &witness_id,
+                agent_id,
+                event_type,
+                payload_hash: &witness_hash,
+                signature: Some(signature),
+                attest_level: crate::models::AttestLevel::LineageSigned.as_str(),
+                timestamp: now,
+                cause_hash: None,
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("append_lineage_record witness", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("append_lineage_record commit tx", e))?;
+        Ok(())
+    }
+
+    async fn read_lineage(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
+        use crate::identity::lineage::{LineageReason, LineageRecord};
+        let rows: Vec<(
+            String,
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            String,
+            Vec<u8>,
+            Vec<u8>,
+        )> = sqlx::query_as(
+            "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+                    recovery_pubkey, not_before, prev_record_hash, signature \
+             FROM agent_lineage WHERE agent_id = $1 ORDER BY epoch ASC",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("read_lineage", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (aid, epoch, reason, pred, succ, recovery, not_before, prev_hash, sig) in rows {
+            let reason =
+                LineageReason::from_str(&reason).ok_or_else(|| StoreError::IntegrityFailed {
+                    detail: format!("unknown lineage reason '{reason}' for '{aid}'"),
+                })?;
+            let epoch = u64::try_from(epoch).map_err(|_| StoreError::IntegrityFailed {
+                detail: format!("negative lineage epoch for '{aid}'"),
+            })?;
+            out.push((
+                LineageRecord {
+                    agent_id: aid,
+                    epoch,
+                    reason,
+                    predecessor_pubkey_b64: pred,
+                    successor_pubkey_b64: succ,
+                    recovery_pubkey_b64: recovery,
+                    not_before,
+                    prev_record_hash: prev_hash,
+                },
+                sig,
+            ));
+        }
+        Ok(out)
+    }
+
+    async fn lineage_witness_hashes(&self, agent_id: &str) -> StoreResult<Vec<Vec<u8>>> {
+        let [t_genesis, t_succession, t_recovery] =
+            crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT payload_hash FROM signed_events \
+             WHERE agent_id = $1 AND event_type IN ($2, $3, $4) \
+             ORDER BY COALESCE(sequence, 0) ASC",
+        )
+        .bind(agent_id)
+        .bind(t_genesis)
+        .bind(t_succession)
+        .bind(t_recovery)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| to_store_err("lineage_witness_hashes", e))?;
+        Ok(rows.into_iter().map(|(h,)| h).collect())
+    }
+
+    async fn current_authoritative_key(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let records = self.read_lineage(agent_id).await?;
+        if records.is_empty() {
+            // Byte-identical legacy fall-through to the flat binding.
+            return self.agent_pubkey(agent_id).await;
+        }
+        let witnesses = self.lineage_witness_hashes(agent_id).await?;
+        let bound = self.agent_pubkey(agent_id).await?;
+        match crate::identity::lineage::verify_lineage(&records, &witnesses, bound.as_deref()) {
+            Ok(verified) => Ok(Some(crate::identity::lineage::pubkey_b64(
+                &verified.head_key,
+            ))),
+            Err(e) => {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    agent_id,
+                    error = %e,
+                    "identity lineage failed verification — resolving NO authoritative key \
+                     (fail-closed; the flat agent_pubkey is NOT trusted for an enrolled chain)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     // v0.7.0 Wave-3 Continuation 3 — lifecycle write paths on postgres.

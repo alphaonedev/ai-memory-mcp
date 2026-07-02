@@ -1345,13 +1345,15 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
         Command::Identity(a) => {
             // v0.7 H1 — keypair lifecycle is DB-free. The handler
             // resolves the key directory itself (via --key-dir or the
-            // default <config>/ai-memory/keys).
+            // default <config>/ai-memory/keys). The db_path backs ONLY
+            // the v0.9.0 G13 lineage verbs (enroll-lineage / succeed /
+            // register-recovery-key); the H1 verbs never open it.
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::identity::run(a, j, &mut out)
+            cli::identity::run(&db_path, a, j, &mut out)
         }
         Command::Offload(a) => {
             // v0.7.0 QW-3 — context-offload substrate primitive.
