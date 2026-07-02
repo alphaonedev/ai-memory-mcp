@@ -663,7 +663,12 @@ pub async fn delete_memory(
             .and_then(|v| v.to_str().ok());
         let agent_id = crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| sentinels::AI_HTTP.to_string());
-        let ctx = crate::store::CallerContext::for_agent(agent_id.clone());
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE into the caller context;
+        // inert unless `[capabilities].enabled`.
+        let ctx = crate::store::CallerContext::for_agent(agent_id.clone()).with_capability(
+            crate::handlers::capability_from_headers(&headers, &agent_id),
+        );
         let target = app.store.get(&ctx, &id).await.ok();
 
         // F-A2A1.2 (#700) — governance enforcement on the postgres delete
@@ -691,6 +696,7 @@ pub async fn delete_memory(
                     Some(&mem.id),
                     memory_owner.as_deref(),
                     &payload,
+                    ctx.capability.as_ref(),
                 )
                 .await
             {
@@ -842,6 +848,10 @@ pub async fn delete_memory(
             return resp;
         }
         let payload = json!({"id": target.id, "title": target.title});
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE; inert unless
+        // `[capabilities].enabled`.
+        let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
         match db::enforce_governance(
             &lock.0,
             GovernedAction::Delete,
@@ -850,6 +860,7 @@ pub async fn delete_memory(
             Some(&target.id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
         ) {
             Ok(GovernanceDecision::Allow) => {}
             Ok(GovernanceDecision::Deny(refusal)) => {
@@ -1054,7 +1065,12 @@ pub async fn promote_memory(
                     .into_response();
             }
         };
-        let ctx = crate::store::CallerContext::for_agent(&agent_id);
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE into the caller context;
+        // inert unless `[capabilities].enabled`.
+        let ctx = crate::store::CallerContext::for_agent(&agent_id).with_capability(
+            crate::handlers::capability_from_headers(&headers, &agent_id),
+        );
         // F-A2A1.4 (#700, S16/S49) — bounded retry on NotFound. A
         // freshly-stored row that travelled through a read replica or
         // is still settling in WAL flush can briefly return
@@ -1099,6 +1115,7 @@ pub async fn promote_memory(
                     Some(&target.id),
                     memory_owner.as_deref(),
                     &payload,
+                    ctx.capability.as_ref(),
                 )
                 .await
             {
@@ -1278,6 +1295,10 @@ pub async fn promote_memory(
             return resp;
         }
         let payload = json!({"id": target.id});
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE; inert unless
+        // `[capabilities].enabled`.
+        let capability = crate::handlers::capability_from_headers(&headers, &agent_id);
         match db::enforce_governance(
             &lock.0,
             GovernedAction::Promote,
@@ -1286,6 +1307,7 @@ pub async fn promote_memory(
             Some(&target.id),
             mem_owner.as_deref(),
             &payload,
+            capability.as_ref(),
         ) {
             Ok(GovernanceDecision::Allow) => {}
             Ok(GovernanceDecision::Deny(refusal)) => {

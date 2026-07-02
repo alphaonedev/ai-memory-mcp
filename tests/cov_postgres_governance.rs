@@ -257,7 +257,15 @@ async fn enforce_governance_action_allows_ungated_namespace() {
     let agent = "ai:cov4";
     let payload = serde_json::json!({"title": "free write"});
     let decision = store
-        .enforce_governance_action(GovernedAction::Store, &ns, agent, None, None, &payload)
+        .enforce_governance_action(
+            GovernedAction::Store,
+            &ns,
+            agent,
+            None,
+            None,
+            &payload,
+            None,
+        )
         .await
         .expect("enforce_governance_action");
     assert!(matches!(

@@ -125,6 +125,10 @@
           "lifecycle_state": {
             "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
             "type": "string"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this store to Allow within its caveats.",
+            "type": "string"
           }
         },
         "required": [
@@ -768,6 +772,10 @@
         "properties": {
           "id": {
             "type": "string"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this delete to Allow within its caveats.",
+            "type": "string"
           }
         },
         "required": [
@@ -795,6 +803,10 @@
           },
           "to_namespace": {
             "description": "Task 1.7: clone target (must be a proper ancestor).",
+            "type": "string"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this promote to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -827,6 +839,10 @@
               "mid",
               "long"
             ],
+            "type": "string"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this bulk forget to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -913,6 +929,10 @@
           },
           "lifecycle_state": {
             "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
+            "type": "string"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this update to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -2340,6 +2360,10 @@
           "tool_calls": {
             "description": "Optional summary of tool invocations within this assistant turn. Each entry is `{tool: string, brief: string}`. The substrate preserves the list verbatim but does not (at v0.7.0) classify or index per-tool-call.",
             "type": "array"
+          },
+          "capability": {
+            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this turn capture to Allow within its caveats.",
+            "type": "string"
           }
         },
         "required": [

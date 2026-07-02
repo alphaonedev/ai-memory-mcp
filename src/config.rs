@@ -435,6 +435,11 @@ impl TierConfig {
                 // capability-build time so operators can correlate
                 // doctor reports with capability responses.
                 decision_counts: Some(permissions_decision_counts()),
+                // v0.9.0 G10.1 (#1827): capability-token posture —
+                // master switch + issuer-allowlist size, mirroring the
+                // `ai-memory doctor` governance section.
+                capability_tokens_enabled: Some(active_capability_config().enabled),
+                capability_issuers: Some(active_capability_config().issuer_count()),
             },
             hooks: CapabilityHooks::default(),
             compaction: CapabilityCompaction::planned(),
@@ -950,6 +955,17 @@ pub struct CapabilityPermissions {
     /// older responses (`#[serde(default)]` round-trips cleanly).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_counts: Option<PermissionsDecisionCounts>,
+    /// v0.9.0 G10.1 (#1827): whether the macaroon capability-token
+    /// grant layer is enabled (`[capabilities].enabled` resolved with
+    /// the `AI_MEMORY_CAPABILITIES` override). `None` on older
+    /// responses (`#[serde(default)]` round-trips cleanly).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_tokens_enabled: Option<bool>,
+    /// v0.9.0 G10.1 (#1827): size of the closed capability-issuer
+    /// allowlist (`[capabilities.issuers]` entries that resolved a
+    /// pubkey + root secret at boot). `None` on older responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_issuers: Option<usize>,
 }
 
 /// Hook-pipeline block (capabilities schema v2). Pre-v0.7 reports webhook
@@ -2825,6 +2841,16 @@ pub struct AppConfig {
     /// gate). New installs that want the strict gate set
     /// `[permissions] mode = "enforce"` explicitly.
     pub permissions: Option<PermissionsConfig>,
+    /// v0.9.0 G10.1 (#1827) — `[capabilities]` block. Macaroon
+    /// capability-token layer: master `enabled` switch (compiled default
+    /// FALSE — the GA posture is inert/byte-identical-legacy) plus the
+    /// CLOSED per-issuer allowlist (`[capabilities.issuers."<id>"]` with
+    /// a required `max_op` ceiling and optional `namespace_prefix`).
+    /// Env override: `AI_MEMORY_CAPABILITIES=on|off` (see
+    /// [`crate::governance::capability::ENV_CAPABILITIES`]). Resolved
+    /// into the process-wide [`active_capability_config`] at boot by
+    /// [`AppConfig::load_capability_config`].
+    pub capabilities: Option<CapabilitiesConfig>,
     /// v0.7.0 I3 — `[transcripts]` block. Per-namespace TTL and
     /// archive-grace overrides for the transcript lifecycle sweeper.
     /// Unset → compiled defaults apply globally
@@ -3082,6 +3108,7 @@ impl std::fmt::Debug for AppConfig {
             .field("boot", &self.boot)
             .field("mcp", &self.mcp)
             .field("permissions", &self.permissions)
+            .field(crate::models::field_names::CAPABILITIES, &self.capabilities)
             .field("transcripts", &self.transcripts)
             .field("hooks", &self.hooks)
             .field("subscriptions", &self.subscriptions)
@@ -5555,6 +5582,107 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.0 G10.1 (#1827) — [capabilities] block + process-wide handle
+// ---------------------------------------------------------------------------
+
+/// `[capabilities]` — the macaroon capability-token layer (G10.1, #1827).
+///
+/// `enabled` defaults to **false** (compiled GA posture: the wrapper at the
+/// governance gates is a pure identity function and no edge parses tokens —
+/// byte-identical to a legacy deployment). `issuers` is the CLOSED
+/// allowlist; there are NO implicit issuers and the resolver NEVER falls
+/// through to the broad `db::agent_pubkey` registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CapabilitiesConfig {
+    /// Master switch. `None`/absent ⇒ false. Env override:
+    /// `AI_MEMORY_CAPABILITIES=on|off` wins over this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Closed issuer allowlist keyed by issuer id
+    /// (`[capabilities.issuers."<id>"]`). Each entry needs a
+    /// `<id>.caproot` mint secret (mode 0o600) in the key dir plus an
+    /// attribution pubkey: `<id>.pub` via the keypair store, or — for the
+    /// reserved id `operator` — the narrow operator key
+    /// (`rules_store::resolve_operator_pubkey`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub issuers: std::collections::BTreeMap<String, CapabilityIssuerEntry>,
+}
+
+/// One `[capabilities.issuers."<id>"]` entry: the issuer's authority
+/// ceiling. `max_op` is REQUIRED (`none`/`read`/`write`/`admin`) — an
+/// unparseable value skips the issuer entirely (fail closed; never
+/// defaults up).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityIssuerEntry {
+    /// Maximum op level this issuer may ever grant.
+    pub max_op: String,
+    /// Optional namespace-prefix ceiling (`/`-segment semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_prefix: Option<String>,
+}
+
+/// Process-wide loaded capability config, mirroring the
+/// [`ACTIVE_PERMISSIONS_MODE`] shape (last-writer-wins `RwLock` so a
+/// future SIGHUP / reload surface can refresh without restart). Unset —
+/// the case for unit tests and library embeddings that never booted —
+/// reads as the compiled-default DISABLED config, which is the safe
+/// byte-identical-legacy posture.
+static ACTIVE_CAPABILITY_CONFIG: std::sync::RwLock<
+    Option<std::sync::Arc<crate::governance::capability::CapabilityConfig>>,
+> = std::sync::RwLock::new(None);
+
+/// Install the process-wide [`crate::governance::capability::CapabilityConfig`].
+/// Called from the daemon/CLI boot path (`daemon_runtime::run`) with the
+/// value resolved by [`AppConfig::load_capability_config`].
+pub fn set_active_capability_config(cfg: crate::governance::capability::CapabilityConfig) {
+    if let Ok(mut w) = ACTIVE_CAPABILITY_CONFIG.write() {
+        *w = Some(std::sync::Arc::new(cfg));
+    }
+}
+
+/// Read the process-wide capability config. Falls back to the compiled
+/// default (disabled, zero issuers) when boot has not installed one —
+/// every gate and edge then takes its identity fast path.
+#[must_use]
+pub fn active_capability_config() -> std::sync::Arc<crate::governance::capability::CapabilityConfig>
+{
+    if let Some(cfg) = ACTIVE_CAPABILITY_CONFIG.read().ok().and_then(|g| g.clone()) {
+        return cfg;
+    }
+    static DISABLED: std::sync::OnceLock<
+        std::sync::Arc<crate::governance::capability::CapabilityConfig>,
+    > = std::sync::OnceLock::new();
+    DISABLED
+        .get_or_init(|| {
+            std::sync::Arc::new(crate::governance::capability::CapabilityConfig::default())
+        })
+        .clone()
+}
+
+/// Test-only: clear the installed capability config so subsequent reads
+/// see the compiled-default DISABLED posture.
+#[doc(hidden)]
+pub fn clear_capability_config_for_test() {
+    if let Ok(mut w) = ACTIVE_CAPABILITY_CONFIG.write() {
+        *w = None;
+    }
+}
+
+/// Test-only: acquire the capability-config serialization lock. Tests that
+/// install an enabled config (via [`set_active_capability_config`]) MUST
+/// hold this guard for their duration so parallel tests cannot race the
+/// process-wide slot — mirrors [`lock_permissions_mode_for_test`].
+#[doc(hidden)]
+#[must_use]
+pub fn lock_capability_config_for_test() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+    static CAP_LOCK: Mutex<()> = Mutex::new(());
+    CAP_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------------
 // Decision counters per mode (K3 — surfaced by doctor + capabilities)
 // ---------------------------------------------------------------------------
 
@@ -6719,6 +6847,8 @@ impl AppConfig {
             "boot",
             "mcp",
             "permissions",
+            // v0.9.0 G10.1 (#1827) — [capabilities] block.
+            crate::models::field_names::CAPABILITIES,
             "transcripts",
             "hooks",
             "security",
@@ -6865,6 +6995,116 @@ impl AppConfig {
             .as_ref()
             .and_then(|s| s.secret_screen_mode)
             .unwrap_or(SecretScreenMode::Refuse)
+    }
+
+    /// v0.9.0 G10.1 (#1827) — resolve the capability-token master switch.
+    /// Ladder: `AI_MEMORY_CAPABILITIES` env (`on`/`off`, case-insensitive;
+    /// unrecognised values fall through) > `[capabilities].enabled` >
+    /// compiled default **false** (inert — byte-identical legacy). Mirrors
+    /// [`Self::resolve_secret_screen_mode`].
+    #[must_use]
+    pub fn resolve_capabilities_enabled(&self) -> bool {
+        if let Some(v) = crate::governance::capability::capabilities_env_override() {
+            return v;
+        }
+        self.capabilities
+            .as_ref()
+            .and_then(|c| c.enabled)
+            .unwrap_or(false)
+    }
+
+    /// v0.9.0 G10.1 (#1827) — build the runtime
+    /// [`crate::governance::capability::CapabilityConfig`] from the
+    /// `[capabilities]` block: for every listed issuer, resolve the
+    /// attribution pubkey (keypair store `<id>.pub`, or the narrow operator
+    /// key for the reserved id `operator`), load the `<id>.caproot` mint
+    /// secret (mode 0o600), and parse the REQUIRED `max_op` ceiling. Any
+    /// failure skips that issuer with an operator-visible warning — the
+    /// closed allowlist only ever SHRINKS on misconfiguration (fail
+    /// closed), and it NEVER consults the broad `db::agent_pubkey`
+    /// registry.
+    #[must_use]
+    pub fn load_capability_config(&self) -> crate::governance::capability::CapabilityConfig {
+        use crate::governance::capability as cap;
+        let enabled = self.resolve_capabilities_enabled();
+        let mut issuers = std::collections::BTreeMap::new();
+        let entries = self
+            .capabilities
+            .as_ref()
+            .map(|c| &c.issuers)
+            .filter(|m| !m.is_empty());
+        if let Some(entries) = entries {
+            let key_dir = match crate::identity::keypair::default_key_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!(
+                        "ai-memory: [capabilities.issuers] configured but the key dir is \
+                         unresolvable ({e}); NO issuers loaded (fail closed)"
+                    );
+                    return cap::CapabilityConfig { enabled, issuers };
+                }
+            };
+            // Single warn site so the skip message exists exactly once
+            // (pm-v3.1 no-hardcoded-literal discipline).
+            let skip = |issuer: &str, why: &str| {
+                eprintln!(
+                    "ai-memory: [capabilities.issuers.\"{issuer}\"] {why}; \
+                     skipping issuer (fail closed)"
+                );
+            };
+            for (issuer, entry) in entries {
+                let Some(max_op) = cap::OpLevel::parse(&entry.max_op) else {
+                    skip(
+                        issuer,
+                        &format!(
+                            "max_op = {:?} is not one of none/read/write/admin",
+                            entry.max_op
+                        ),
+                    );
+                    continue;
+                };
+                let pubkey = if issuer == cap::OPERATOR_ISSUER {
+                    crate::governance::rules_store::resolve_operator_pubkey()
+                } else {
+                    crate::identity::keypair::load(issuer, &key_dir)
+                        .ok()
+                        .map(|kp| kp.public)
+                };
+                let Some(pubkey) = pubkey else {
+                    skip(
+                        issuer,
+                        &format!(
+                            "has no resolvable attribution pubkey (expected {issuer}.pub \
+                             in the key dir, or the operator key for \"operator\")"
+                        ),
+                    );
+                    continue;
+                };
+                let root_secret = match cap::read_root_secret(&key_dir, issuer) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        skip(
+                            issuer,
+                            &format!(
+                                "root secret unavailable ({e}). Generate with: \
+                                 ai-memory capability keygen {issuer}"
+                            ),
+                        );
+                        continue;
+                    }
+                };
+                issuers.insert(
+                    issuer.clone(),
+                    cap::IssuerConfig {
+                        pubkey,
+                        root_secret,
+                        max_op,
+                        namespace_prefix: entry.namespace_prefix.clone(),
+                    },
+                );
+            }
+        }
+        cap::CapabilityConfig { enabled, issuers }
     }
 
     /// v0.8.0 #1734 (PE-1) — resolve the declared `[hooks].required_events`
@@ -9320,6 +9560,7 @@ legacy_scoring = false
             boot: Some(BootConfig::default()),
             mcp: Some(McpConfig::default()),
             permissions: Some(PermissionsConfig::default()),
+            capabilities: Some(CapabilitiesConfig::default()),
             transcripts: Some(TranscriptsConfig::default()),
             hooks: Some(HooksConfig::default()),
             security: Some(SecurityConfig::default()),
@@ -9377,6 +9618,7 @@ legacy_scoring = false
             "boot",
             "mcp",
             "permissions",
+            crate::models::field_names::CAPABILITIES,
             "transcripts",
             "hooks",
             "security",
@@ -9558,6 +9800,150 @@ legacy_scoring = false
         );
         // Restore the unset state for subsequent tests.
         clear_permissions_mode_override_for_test();
+    }
+
+    #[test]
+    fn capabilities_enabled_resolution_ladder() {
+        // v0.9.0 G10.1 (#1827) — env `AI_MEMORY_CAPABILITIES` >
+        // `[capabilities].enabled` > compiled default false. The
+        // capability lock doubles as the env-var serializer for this
+        // knob (the only tests touching it hold this guard).
+        let _guard = lock_capability_config_for_test();
+        let env = crate::governance::capability::ENV_CAPABILITIES;
+        unsafe {
+            std::env::remove_var(env);
+        }
+        let mut cfg = AppConfig::default();
+        assert!(
+            !cfg.resolve_capabilities_enabled(),
+            "compiled default must be FALSE (inert GA posture)"
+        );
+        cfg.capabilities = Some(CapabilitiesConfig {
+            enabled: Some(true),
+            issuers: std::collections::BTreeMap::new(),
+        });
+        assert!(cfg.resolve_capabilities_enabled(), "config true wins");
+        unsafe {
+            std::env::set_var(env, "off");
+        }
+        assert!(
+            !cfg.resolve_capabilities_enabled(),
+            "env off overrides config true"
+        );
+        unsafe {
+            std::env::set_var(env, "on");
+        }
+        cfg.capabilities = None;
+        assert!(
+            cfg.resolve_capabilities_enabled(),
+            "env on overrides absent config"
+        );
+        unsafe {
+            std::env::set_var(env, "bogus");
+        }
+        assert!(
+            !cfg.resolve_capabilities_enabled(),
+            "unrecognised env falls through to config (absent => false)"
+        );
+        unsafe {
+            std::env::remove_var(env);
+        }
+    }
+
+    #[test]
+    fn active_capability_config_defaults_disabled_then_honours_setter() {
+        let _guard = lock_capability_config_for_test();
+        clear_capability_config_for_test();
+        let cfg = active_capability_config();
+        assert!(!cfg.enabled, "unset slot must read as DISABLED");
+        assert_eq!(cfg.issuer_count(), 0);
+        set_active_capability_config(crate::governance::capability::CapabilityConfig {
+            enabled: true,
+            issuers: std::collections::BTreeMap::new(),
+        });
+        assert!(active_capability_config().enabled, "setter must win");
+        clear_capability_config_for_test();
+        assert!(
+            !active_capability_config().enabled,
+            "clear must restore the disabled default"
+        );
+    }
+
+    #[test]
+    fn load_capability_config_is_a_closed_allowlist_that_only_shrinks() {
+        use crate::governance::capability as cap;
+        // Serialise AI_MEMORY_KEY_DIR against the keypair tests.
+        let _env = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prior = std::env::var("AI_MEMORY_KEY_DIR").ok();
+        unsafe {
+            std::env::set_var("AI_MEMORY_KEY_DIR", tmp.path());
+        }
+
+        // Issuer A: fully provisioned (keypair + caproot + valid max_op).
+        let kp = crate::identity::keypair::generate("ai:capa").expect("gen");
+        crate::identity::keypair::save(&kp, tmp.path()).expect("save");
+        cap::write_root_secret(tmp.path(), "ai:capa").expect("caproot");
+        // Issuer B: bad max_op (must be skipped — never defaulted UP).
+        // Issuer C: valid max_op but NO key material (skipped).
+        let mut issuers = std::collections::BTreeMap::new();
+        issuers.insert(
+            "ai:capa".to_string(),
+            CapabilityIssuerEntry {
+                max_op: "write".to_string(),
+                namespace_prefix: Some("team".to_string()),
+            },
+        );
+        issuers.insert(
+            "ai:capb".to_string(),
+            CapabilityIssuerEntry {
+                max_op: "supreme".to_string(),
+                namespace_prefix: None,
+            },
+        );
+        issuers.insert(
+            "ai:capc".to_string(),
+            CapabilityIssuerEntry {
+                max_op: "admin".to_string(),
+                namespace_prefix: None,
+            },
+        );
+        // Issuer D: the reserved "operator" id — resolves via the narrow
+        // operator key ladder; with no operator key/caproot staged under
+        // the temp key dir it must be SKIPPED, never implicitly granted.
+        issuers.insert(
+            crate::governance::capability::OPERATOR_ISSUER.to_string(),
+            CapabilityIssuerEntry {
+                max_op: "admin".to_string(),
+                namespace_prefix: None,
+            },
+        );
+        let cfg = AppConfig {
+            capabilities: Some(CapabilitiesConfig {
+                enabled: Some(true),
+                issuers,
+            }),
+            ..AppConfig::default()
+        };
+        let loaded = cfg.load_capability_config();
+        assert!(loaded.enabled);
+        assert_eq!(
+            loaded.issuer_count(),
+            1,
+            "misconfigured issuers must be SKIPPED (closed allowlist only shrinks)"
+        );
+        let ic = loaded.issuers.get("ai:capa").expect("provisioned issuer");
+        assert_eq!(ic.max_op, cap::OpLevel::Write);
+        assert_eq!(ic.namespace_prefix.as_deref(), Some("team"));
+        assert_eq!(ic.root_secret.len(), cap::ROOT_SECRET_LEN);
+        assert_eq!(ic.pubkey, kp.public);
+
+        match prior {
+            Some(v) => unsafe { std::env::set_var("AI_MEMORY_KEY_DIR", v) },
+            None => unsafe { std::env::remove_var("AI_MEMORY_KEY_DIR") },
+        }
     }
 
     #[test]

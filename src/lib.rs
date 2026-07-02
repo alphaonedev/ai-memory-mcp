@@ -373,8 +373,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 78;
 /// `UndoEdit` for the CLI-ONLY `ai-memory undo-edit` NON-DESTRUCTIVE
 /// in-place-edit undo, bumping 82 → 83; v0.9.0 G13-mem #1859 added
 /// `Lineage` for the `ai-memory lineage` derivation lineage-DAG walk,
-/// bumping 83 → 84.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 84;
+/// bumping 83 → 84; v0.9.0 G10.1 #1827 added `Capability` for the
+/// `ai-memory capability keygen|mint|attenuate|inspect|verify`
+/// macaroon capability-token lifecycle, bumping 84 → 85.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 85;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -385,8 +387,10 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 84;
 /// bumping 82 → 83; v0.8.0 #1709/#1720 WS-B B2 added `Reown`, bumping
 /// 83 → 84; #1727 added `UndoEdit` for the CLI-ONLY `ai-memory
 /// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85;
-/// v0.9.0 G13-mem #1859 added `Lineage`, bumping 85 → 86.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 86;
+/// v0.9.0 G13-mem #1859 added `Lineage`, bumping 85 → 86; v0.9.0
+/// G10.1 #1827 added `Capability` (macaroon capability-token
+/// lifecycle), bumping 86 → 87.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 87;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification

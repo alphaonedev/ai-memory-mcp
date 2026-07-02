@@ -126,6 +126,7 @@ fn k3_enforce_mode_blocks_with_pending() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("gate must not error in Enforce mode");
 
@@ -180,6 +181,7 @@ fn k3_advisory_mode_logs_and_allows_no_pending_row() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("gate must not error in Advisory mode");
 
@@ -234,6 +236,7 @@ fn k3_off_mode_skips_gate_entirely() {
         None,
         None,
         &payload,
+        None,
     )
     .expect("gate must not error in Off mode");
 
@@ -279,6 +282,7 @@ fn k3_capabilities_reports_active_mode_and_decision_counts() {
         None,
         None,
         &serde_json::json!({"title": "caps-probe"}),
+        None,
     )
     .unwrap();
 

@@ -52,6 +52,10 @@ pub const BYTE_ESTIMATE: &str = "byte_estimate";
 pub const CALLER_AGENT_ID: &str = "caller_agent_id";
 pub const CANONICAL_NAME: &str = crate::models::field_names::CANONICAL_NAME;
 pub const CAPABILITIES: &str = crate::models::field_names::CAPABILITIES;
+// v0.9.0 G10.1 (#1827) — the optional macaroon capability token
+// (`cap1:<base64url>`) accepted by the governed mutation tools
+// (store / update / delete / forget / promote / capture_turn).
+pub const CAPABILITY: &str = "capability";
 pub const CITATIONS: &str = "citations";
 pub const CLAIMED_BY: &str = "claimed_by";
 pub const CONDITION: &str = "condition";
@@ -196,6 +200,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CALLER_AGENT_ID,
     CANONICAL_NAME,
     CAPABILITIES,
+    CAPABILITY,
     CITATIONS,
     CLAIMED_BY,
     CONDITION,
@@ -320,9 +325,11 @@ mod tests {
         //      confirm no orphan-literal drift.
         // v0.9.0 G13-mem (#1859) — 121 → 122: `DIRECTION` for the
         // `memory_lineage` walk direction.
+        // v0.9.0 G10.1 (#1827) — 122 → 123: `CAPABILITY` for the macaroon
+        // capability token on the governed mutation tools.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            122,
+            123,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

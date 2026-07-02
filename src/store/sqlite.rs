@@ -1511,6 +1511,7 @@ impl MemoryStore for SqliteStore {
         memory_id: Option<&str>,
         memory_owner: Option<&str>,
         payload: &serde_json::Value,
+        capability: Option<&crate::governance::capability::CapabilityToken>,
     ) -> StoreResult<crate::models::GovernanceDecision> {
         let db_action = match action {
             super::GovernedAction::Store => crate::models::GovernedAction::Store,
@@ -1522,6 +1523,11 @@ impl MemoryStore for SqliteStore {
             super::GovernedAction::Reflect => crate::models::GovernedAction::Reflect,
         };
         let conn = self.state.lock().await;
+        // v0.9.0 G10.1 (#1827) — `capability` threads straight into
+        // `db::enforce_governance`, whose Enforce arm applies the
+        // capability grant joiner (`governance::capability::apply_at_gate`)
+        // — the same single wiring hook the postgres adapter calls, so the
+        // two backends cannot drift.
         db::enforce_governance(
             &conn,
             db_action,
@@ -1530,6 +1536,7 @@ impl MemoryStore for SqliteStore {
             memory_id,
             memory_owner,
             payload,
+            capability,
         )
         .map_err(box_err)
     }
@@ -3224,6 +3231,7 @@ mod tests {
                 None,
                 None,
                 &serde_json::json!({}),
+                None,
             )
             .await
             .expect("enforce_governance_action");

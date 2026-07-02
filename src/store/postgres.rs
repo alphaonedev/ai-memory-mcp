@@ -18855,6 +18855,7 @@ impl MemoryStore for PostgresStore {
         memory_id: Option<&str>,
         memory_owner: Option<&str>,
         payload: &serde_json::Value,
+        capability: Option<&crate::governance::capability::CapabilityToken>,
     ) -> StoreResult<crate::models::GovernanceDecision> {
         use crate::config::{
             PermissionsMode, active_permissions_mode, record_permissions_decision,
@@ -19065,6 +19066,20 @@ impl MemoryStore for PostgresStore {
             // Drop the tx (no writes); advisory mode is read-only.
             return Ok(GovernanceDecision::Allow);
         }
+
+        // v0.9.0 G10.1 (#1827) — capability-token grant joiner. The SAME
+        // single wiring hook the sqlite gate (`db::enforce_governance`)
+        // calls, applied to this adapter's inline decision at the identical
+        // point (Enforce-only, before the Pending queue below) — parity by
+        // construction. Pure identity when no token / disabled / base
+        // Allow; a granted Pending never lands a stray approval row.
+        let decision = crate::governance::capability::apply_at_gate(
+            decision,
+            model_action,
+            namespace,
+            agent_id,
+            capability,
+        );
 
         // Enforce mode — Pending queues a pending_actions row inside
         // the same tx so the audit trail is atomic with the decision.
@@ -23334,6 +23349,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
             )
             .await
             .expect("enforce_governance_action");
@@ -23384,6 +23400,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
             )
             .await
             .expect("enforce_governance_action");
@@ -23413,6 +23430,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
             )
             .await
             .expect("enforce_governance_action owner");
@@ -23458,6 +23476,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
             )
             .await
             .expect("enforce_governance_action");
@@ -23532,6 +23551,7 @@ mod tests {
                 None,
                 None,
                 &payload,
+                None,
             )
             .await
             .expect("enforce_governance_action");

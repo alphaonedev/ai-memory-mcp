@@ -270,6 +270,15 @@ pub enum Command {
     /// key storage (TPM/HSM/Secure Enclave) is out of OSS scope and
     /// lives in the AgenticMem commercial layer.
     Identity(IdentityArgs),
+    /// v0.9.0 G10.1 (#1827) — macaroon capability-token lifecycle:
+    /// `keygen` (per-issuer `.caproot` mint secret, mode 0600) /
+    /// `mint` (root token; mandatory-expiry lint) / `attenuate`
+    /// (keyless narrowing) / `inspect` / `verify`. Tokens are stateless
+    /// bearer grants consumed by the governance gates via the MCP
+    /// `capability` param, the `X-AI-Memory-Capability` header, or the
+    /// `--capability` flag on governed CLI verbs; inert unless
+    /// `[capabilities].enabled`.
+    Capability(crate::cli::capability::CapabilityArgs),
     /// v0.7.0 QW-3 — context-offload substrate primitive. Persists a
     /// file (or `-` for stdin) into the `offloaded_blobs` substrate
     /// and prints the short `ref_id` callers keep in their working
@@ -990,6 +999,18 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // receive/internal paths degrade to redact. Seeded on every subcommand
     // path (serve / mcp / CLI) before any write.
     crate::secret_screen::set_screen_mode(app_config.resolve_secret_screen_mode());
+    // v0.9.0 G10.1 (#1827) — seed the process-wide capability-token config
+    // from the resolved `[capabilities]` block (env `AI_MEMORY_CAPABILITIES`
+    // > `[capabilities].enabled` > compiled default FALSE). Every governance
+    // gate (`db::enforce_governance` + the postgres inline gate) and every
+    // transport edge (MCP `capability` param / `X-AI-Memory-Capability`
+    // header / CLI `--capability`) reads it via
+    // `config::active_capability_config`. Default disabled ⇒ the gate
+    // wrapper is a pure identity and the edges parse nothing —
+    // byte-identical legacy. Seeded on every subcommand path
+    // (serve / mcp / CLI) before any write, mirroring the secret-screen
+    // seed above.
+    crate::config::set_active_capability_config(app_config.load_capability_config());
     // #1604 — seed the process-wide rerank input-sequence cap from the
     // resolved `[reranker]` config (env `AI_MEMORY_RERANK_MAX_SEQ` >
     // `[reranker].max_seq_tokens` > compiled default). Every subsequent
@@ -1354,6 +1375,19 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::identity::run(&db_path, a, j, &mut out)
+        }
+        Command::Capability(a) => {
+            // v0.9.0 G10.1 (#1827) — capability-token lifecycle is
+            // DB-free: keygen/mint/attenuate resolve the key directory
+            // themselves (--key-dir > AI_MEMORY_KEY_DIR > platform
+            // default); verify resolves issuers via the loaded
+            // [capabilities] config.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::capability::run(a, j, app_config, &mut out)
         }
         Command::Offload(a) => {
             // v0.7.0 QW-3 — context-offload substrate primitive.
@@ -7735,6 +7769,36 @@ mod tests {
         ])
         .unwrap();
         run(cli, &cfg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_dispatch_capability_keygen_command() {
+        // v0.9.0 G10.1 (#1827) — covers the `Command::Capability(a)`
+        // dispatch arm: stdout/stderr lock + `cli::capability::run`
+        // hand-off. `capability keygen` is DB-free; a tempdir --key-dir
+        // keeps it hermetic. The verb-level behaviour (0o600 mode,
+        // overwrite refusal, mint lint, verify rejects) is unit-tested
+        // in `src/cli/capability.rs`.
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let key_dir = env.db_path.parent().unwrap().join("cap-keys");
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "capability",
+            "--key-dir",
+            key_dir.to_str().unwrap(),
+            "keygen",
+            "ai:dispatch-issuer",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+        assert!(
+            key_dir.join("ai:dispatch-issuer.caproot").exists(),
+            "keygen must land the caproot via the dispatch arm"
+        );
     }
 
     #[tokio::test]

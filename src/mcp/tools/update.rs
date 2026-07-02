@@ -76,6 +76,14 @@ pub struct UpdateRequest {
     )]
     #[serde(default)]
     pub lifecycle_state: Option<String>,
+
+    // v0.9.0 G10.1 (#1827) — optional macaroon capability token. Plain `//`
+    // so schemars emits only the concise attribute description.
+    #[serde(default)]
+    #[schemars(
+        description = "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this update to Allow within its caveats."
+    )]
+    pub capability: Option<String>,
 }
 
 /// v0.7.0 #972 D1.6 (#987) — `McpTool` impl for `memory_update`.
@@ -311,6 +319,12 @@ pub(super) fn handle_update(
         }
 
         use crate::models::{GovernanceDecision, GovernedAction};
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `capability`
+        // param ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            params[param_names::CAPABILITY].as_str(),
+            &agent_id,
+        );
         match db::enforce_governance(
             conn,
             GovernedAction::Store,
@@ -319,6 +333,7 @@ pub(super) fn handle_update(
             Some(&resolved_id),
             mem_owner.as_deref(),
             &gate_payload,
+            capability.as_ref(),
         )
         .map_err(|e| e.to_string())?
         {

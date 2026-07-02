@@ -148,7 +148,11 @@ pub async fn entity_register(
         let aid = agent_id
             .clone()
             .unwrap_or_else(|| "anonymous:entity-register".to_string());
-        let ctx = crate::store::CallerContext::for_agent(aid.clone());
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional
+        // `X-AI-Memory-Capability` header ONCE into the caller context;
+        // inert unless `[capabilities].enabled`.
+        let ctx = crate::store::CallerContext::for_agent(aid.clone())
+            .with_capability(crate::handlers::capability_from_headers(&headers, &aid));
 
         // F-A2A1.5 (#705) — governance enforcement runs BEFORE the
         // entity_register trait call so deny / pending / 403 / 202
@@ -174,6 +178,7 @@ pub async fn entity_register(
                     None,
                     None,
                     &payload_for_pending,
+                    ctx.capability.as_ref(),
                 )
                 .await
             {

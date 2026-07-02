@@ -90,6 +90,11 @@ pub struct StoreArgs {
     /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, which rejects it.
     #[arg(long)]
     pub sign: bool,
+    /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
+    /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
+    /// within its caveats. Inert unless `[capabilities].enabled`.
+    #[arg(long)]
+    pub capability: Option<String>,
 }
 
 /// Resolve the content payload: literal `-` means read stdin via the
@@ -285,6 +290,12 @@ pub fn run(
     {
         use models::GovernedAction;
         let payload = serde_json::to_value(&mem).unwrap_or_default();
+        // v0.9.0 G10.1 (#1827) — edge-parse the optional `--capability`
+        // token ONCE; inert unless `[capabilities].enabled`.
+        let capability = crate::governance::capability::parse_presented_token(
+            args.capability.as_deref(),
+            &agent_id,
+        );
         match enforce_governance(
             &conn,
             GovernedAction::Store,
@@ -293,6 +304,7 @@ pub fn run(
             None,
             None,
             &payload,
+            capability.as_ref(),
             json_out,
             out,
         )? {
@@ -386,6 +398,7 @@ mod tests {
             source_span: None,
             entity_id: None,
             sign: false,
+            capability: None,
         }
     }
 
