@@ -224,7 +224,8 @@ pub async fn handle_reflect_http(
         .as_ref()
         .map(|e| e as &dyn crate::embeddings::Embed);
     let vec_lock = app.vector_index.lock().await;
-    let vector_index = vec_lock.as_ref();
+    // v0.9 #1005 — deref through the boxed seam to the trait object.
+    let vector_index = vec_lock.as_deref();
     let active_keypair = app.active_keypair.as_ref().as_ref();
     let result = crate::mcp::handle_reflect(
         &lock.0,

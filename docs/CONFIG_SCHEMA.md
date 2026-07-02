@@ -137,6 +137,12 @@ max_inflight_requests = 0          # #1733 HTTP admission cap; 0 = disabled
                                    # (opt-in). Positive n sheds >n concurrent
                                    # in-flight requests with a typed 503.
                                    # Env: AI_MEMORY_MAX_INFLIGHT_REQUESTS.
+vector_index_capacity = 100000     # #1005 G2 in-memory vector-index residency
+                                   # cap (entries); default = compiled 100k.
+                                   # Env: AI_MEMORY_VECTOR_INDEX_CAPACITY.
+vector_index_hard_fail_at_cap = false  # #1005 G2 opt-in: reject inserts AT cap
+                                   # (ERROR log) instead of evicting oldest.
+                                   # Env: AI_MEMORY_VECTOR_INDEX_HARD_FAIL.
 
 # ---------------------------------------------------------------------
 # Existing sections at v0.7.x — see env-var table in CLAUDE.md.

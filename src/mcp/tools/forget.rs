@@ -124,7 +124,7 @@ pub(super) fn handle_forget(
     // vectors can be evicted from RAM (the embedding survives the row DELETE
     // in the in-memory graph and keeps answering recall until the next
     // rebuild). `None` on paths with no index (CLI, tests).
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
 ) -> Result<Value, String> {
     let namespace = params["namespace"].as_str();
     let pattern = params["pattern"].as_str();

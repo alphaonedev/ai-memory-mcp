@@ -5,7 +5,7 @@
 
 use crate::db;
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::mcp::param_names;
 use crate::models::field_names;
 use crate::models::{GovernedAction, Tier};
@@ -226,7 +226,7 @@ pub fn handle_reflect(
     db_path: &Path,
     params: &Value,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
     // Issue #815 — when `Some`, every `reflects_on` edge written by
     // this reflect call is signed with this keypair. When `None`

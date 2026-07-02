@@ -768,7 +768,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // issuer allowlist loader), the `CapabilityPermissions`
     // capability-token posture fields, and the three resolver/loader
     // tests grew the file to 11_959; 12_050 = 91 headroom.
-    ("src/config.rs", 12_050),
+    // 2026-07-02 (#1005 G2) — bumped 12_050 → 12_250: the
+    // `[limits].vector_index_capacity` / `vector_index_hard_fail_at_cap`
+    // knob pair (LimitsSection + ResolvedLimits fields, the two
+    // ENV_VECTOR_INDEX_* consts, the resolver arms) + five
+    // resolver/round-trip tests grew the file to 12_143; 12_250 = 107
+    // headroom.
+    ("src/config.rs", 12_250),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

@@ -340,9 +340,14 @@ fn sr3_1087_hnsw_search_caches_valid_ids() {
         "cosine_distance(&[f32], &[f32]) helper must exist post-#1087"
     );
     let search_fn = source
-        .split("pub fn search(&self, query: &[f32]")
+        // v0.9 #1005 — the search body (graph walk + overflow scan)
+        // moved verbatim into `search_filtered` (the allowlist-aware
+        // seam entry); the 2-arg `search` is now a thin
+        // `search_filtered(q, k, None)` delegator. The #1087 invariant
+        // lives in the shared body, so the pin tracks `search_filtered`.
+        .split("pub fn search_filtered(")
         .nth(1)
-        .expect("search fn body");
+        .expect("search_filtered fn body");
     let end = search_fn.find("\n    /// ").expect("search fn end");
     let body = &search_fn[..end];
     assert!(

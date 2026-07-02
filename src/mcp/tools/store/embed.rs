@@ -19,7 +19,7 @@
 //! resolves the skip flag and gates this helper accordingly.
 
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::models::Memory;
 use crate::{db, models::AutoAtomiseMode};
 
@@ -58,7 +58,7 @@ pub(super) fn store_source_embedding(
     embedder: &dyn Embed,
     mem: &Memory,
     actual_id: &str,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     precomputed: Option<Vec<f32>>,
 ) {
     let embed_result = match precomputed {

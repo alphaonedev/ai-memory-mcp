@@ -59,13 +59,132 @@ pub const CLI_HNSW_BUILD_MIN_ENTRIES: usize = 20_000;
 
 /// Maximum entries before evicting oldest to prevent unbounded memory growth.
 ///
-/// Production code uses the constant 100_000. Tests may construct a
-/// `VectorIndex` with a custom cap via [`VectorIndex::with_max_entries_for_test`]
-/// — that knob is stored on the index instance itself, so it does
-/// NOT affect concurrent tests running with the default cap. The
-/// constant lives here so call sites (and the per-event tracing
-/// payload) reference one canonical value.
-const MAX_ENTRIES: usize = 100_000;
+/// Compiled default 100_000. v0.9 #1005 (G2) — operators can now tune
+/// the cap via `[limits].vector_index_capacity` /
+/// `AI_MEMORY_VECTOR_INDEX_CAPACITY` (resolved by
+/// [`crate::config::AppConfig::resolve_limits`] and threaded into the
+/// index constructors at daemon / MCP / CLI boot), closing the gap
+/// where the eviction-rate ERROR named a knob that was never wired.
+/// Tests may construct a `VectorIndex` with a custom cap via
+/// [`VectorIndex::with_max_entries_for_test`] — the knob is stored on
+/// the index instance itself, so it does NOT affect concurrent tests
+/// running with the default cap. The constant lives here so call
+/// sites (and the per-event tracing payload) reference one canonical
+/// value.
+pub const DEFAULT_MAX_ENTRIES: usize = 100_000;
+
+// ---------------------------------------------------------------------------
+// v0.9 #1005 — minimal vector-search slice: opt-in flags.
+//
+// All three knobs below are INERT by default (the shipped
+// G5b/G9/G10.1 idiom): unset ⇒ byte-identical legacy behavior.
+// ---------------------------------------------------------------------------
+
+/// v0.9 #1005 (G4) — env flag that flips the [`cosine_distance`]
+/// zip-truncation residual + the index write boundary from tolerant
+/// (silently compare the shared prefix of mismatched-dimension
+/// embeddings) to strict (rank the pair LAST / reject the insert,
+/// with a typed [`EmbeddingDimMismatch`] in the log). Truthy set
+/// (`1`/`true`/`yes`/`on`) mirrors the `AI_MEMORY_REQUIRE_*` gates
+/// (`governance::audit::env_flag_enabled`). Default: unset ⇒
+/// tolerant, byte-identical legacy.
+pub const ENV_REQUIRE_DIM_MATCH: &str = "AI_MEMORY_REQUIRE_DIM_MATCH";
+
+/// v0.9 #1005 (§5.2) — env flag that switches the recall pipeline's
+/// ANN phase from the legacy global-cutoff search to the
+/// allowlist-aware lazy walk ([`VectorSearchIndex::search`] with
+/// `allowlist = Some(namespace member ids)`), closing the
+/// small-namespace starvation hazard where a namespace's rows never
+/// surface because the fixed `ann_limit` global cutoff fills with
+/// out-of-namespace neighbors. Truthy set (`1`/`true`/`yes`/`on`).
+/// Default: unset ⇒ legacy unfiltered search, byte-identical.
+pub const ENV_VECTOR_NS_ALLOWLIST: &str = "AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST";
+
+/// Shared truthy-set parse for the #1005 flags. Clone of the
+/// `governance::audit::env_flag_enabled` truthy set (the K2-gate
+/// precedent — see `identity::lineage::require_identity_lineage_enabled`)
+/// so opt-in spelling stays uniform across the require-mode surfaces.
+fn env_flag_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false)
+}
+
+/// `true` when the §5.2 namespace-allowlist recall path is enabled
+/// ([`ENV_VECTOR_NS_ALLOWLIST`]). Read per recall (cold path — one
+/// env read per request, the lineage/require-gate precedent).
+#[must_use]
+pub fn vector_ns_allowlist_enabled() -> bool {
+    env_flag_truthy(ENV_VECTOR_NS_ALLOWLIST)
+}
+
+/// G4 strict-dim mode cache. [`cosine_distance`] sits on the graph
+/// build/search hot path (O(N log N) invocations per rebuild), so the
+/// env flag is read ONCE and cached behind an atomic instead of
+/// paying the process-env lock per distance call (M-HOTPATH /
+/// M-LOG-OVERHEAD). Tri-state: 0 = uninitialised (read env), 1 =
+/// off, 2 = on. Tests flip it via [`set_strict_dim_for_test`].
+static STRICT_DIM_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `true` when [`ENV_REQUIRE_DIM_MATCH`] strict-dimension mode is on.
+#[must_use]
+pub fn strict_dim_enabled() -> bool {
+    match STRICT_DIM_STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = env_flag_truthy(ENV_REQUIRE_DIM_MATCH);
+            STRICT_DIM_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Test-only override for the G4 strict-dim cache. `Some(v)` forces
+/// the mode; `None` resets to "re-read the env on next check".
+/// Process-global — tests that flip it must restore `None` before
+/// returning (RAII guard recommended) so parallel tests observe the
+/// unset default.
+#[doc(hidden)]
+pub fn set_strict_dim_for_test(forced: Option<bool>) {
+    let v = match forced {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    STRICT_DIM_STATE.store(v, Ordering::Relaxed);
+}
+
+/// v0.9 #1005 (G4) — typed record of a dimension mismatch caught at
+/// the vector-index boundary under [`ENV_REQUIRE_DIM_MATCH`] strict
+/// mode. Carried in the rejection log line (and available to future
+/// callers that want a typed error) instead of the silent
+/// zip-truncation the tolerant default performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingDimMismatch {
+    /// Dimensionality of the reference embedding (the index side).
+    pub expected: usize,
+    /// Dimensionality of the offending embedding (the incoming side).
+    pub actual: usize,
+}
+
+impl std::fmt::Display for EmbeddingDimMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "embedding dimension mismatch: expected {}, got {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for EmbeddingDimMismatch {}
 
 // ---------------------------------------------------------------------------
 // v0.6.3.1 (P3, G2): eviction observability
@@ -214,8 +333,34 @@ pub struct EmbeddingPoint(pub Vec<f32>);
 /// against the stored `Vec<f32>` without cloning each overflow
 /// embedding into a fresh `EmbeddingPoint`. Embeddings are
 /// L2-normalised so dot product = cosine similarity.
+/// v0.9 #1005 (G4): under [`ENV_REQUIRE_DIM_MATCH`] strict mode a
+/// dimension mismatch no longer silently compares the zip-truncated
+/// shared prefix — the pair is collapsed to `f32::MAX` (ranks LAST,
+/// and the recall pipeline's cosine gate drops it), with a one-shot
+/// WARN carrying the typed [`EmbeddingDimMismatch`]. Tolerant default
+/// (flag unset) keeps the legacy truncating comparison byte-identical.
 #[inline]
 fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() && strict_dim_enabled() {
+        // #1005 G4 — WARN once per process, not once per pair: this
+        // helper runs O(N log N) times per rebuild, and a per-call
+        // WARN would flood the daemon log during one poisoned build.
+        static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        let mismatch = EmbeddingDimMismatch {
+            expected: a.len(),
+            actual: b.len(),
+        };
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                expected_dim = mismatch.expected,
+                actual_dim = mismatch.actual,
+                flag = ENV_REQUIRE_DIM_MATCH,
+                "strict-dim mode: {mismatch}; ranking mismatched pair last \
+                 instead of comparing the zip-truncated prefix (#1005 G4)"
+            );
+        });
+        return f32::MAX;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let dist = 1.0 - dot;
     // #1684 — a NaN/±Inf component (local seed/insert paths bypass
@@ -380,13 +525,27 @@ struct IndexState {
     /// All entries (for rebuild). Kept in sync with the index + overflow.
     all_entries: Vec<(String, Vec<f32>)>,
     /// v0.7.0 R3-S1 — per-instance eviction cap. Defaults to
-    /// [`MAX_ENTRIES`] (the production 100k). Tests construct an
+    /// [`DEFAULT_MAX_ENTRIES`] (the production 100k). Tests construct an
     /// index with a smaller cap via
     /// [`VectorIndex::with_max_entries_for_test`] so the eviction
     /// edge can be exercised without inserting 100k vectors. Storing
     /// the cap per-instance (rather than as a process-wide atomic)
     /// keeps concurrent tests independent.
+    ///
+    /// v0.9 #1005 (G2) — production caps now flow from
+    /// `[limits].vector_index_capacity` /
+    /// `AI_MEMORY_VECTOR_INDEX_CAPACITY` through
+    /// [`VectorIndex::empty_with_capacity`] /
+    /// [`VectorIndex::build_with_capacity`]; the compiled default
+    /// stays [`DEFAULT_MAX_ENTRIES`].
     max_entries: usize,
+    /// v0.9 #1005 (G2) — opt-in hard-fail-at-cap mode
+    /// ([`crate::config::ENV_VECTOR_INDEX_HARD_FAIL`]). `true` ⇒ an
+    /// insert arriving at capacity is REJECTED (ERROR log, index
+    /// unchanged) instead
+    /// of evicting the oldest entries. `false` (default) preserves
+    /// the legacy evict-oldest behavior byte-identically.
+    hard_fail_at_cap: bool,
     /// v0.7.0 #1074 (SR-2 #2, HIGH) — generation counter bumped on
     /// every `overflow.clear()` (eviction-edge path). Snapshots
     /// captured before a clear carry the old generation; the swap
@@ -431,9 +590,138 @@ pub struct VectorHit {
     pub distance: f32,
 }
 
+/// v0.9 #1005 — the swappable vector-search seam.
+///
+/// Named `VectorSearchIndex` (NOT `VectorIndex` — that name is the
+/// concrete HNSW struct below, with 23+ callers). The existing
+/// [`VectorIndex`] implements this trait verbatim as the inert
+/// default backend; the shared daemon state holds
+/// `Arc<tokio::sync::Mutex<Option<Box<dyn VectorSearchIndex>>>>`
+/// (previously `Option<VectorIndex>`), so an alternative backend
+/// (the deferred #1860 v1.0 substrate) can slot in without touching
+/// the recall/write pipelines. Signatures are matched to the live
+/// reality: `&self` + interior mutability (the callers share the
+/// index across threads behind non-exclusive refs) and `String`
+/// memory-id keys (the live cid shape).
+///
+/// `Send + Sync` supertraits (M-TYPES-SEND): every holder shares the
+/// boxed index across the tokio runtime and the #968 rebuild thread.
+///
+/// Dyn-dispatch cost note (M-DI-HIERARCHY / trait-dyn-vs-generic):
+/// each trait method is called at most a handful of times per
+/// request (one `search` per recall, one `insert` per write), and
+/// every method body is milliseconds-scale (ANN walk, lock
+/// acquisition), so the vtable hop is noise. The hot inner loops
+/// (`cosine_distance`, the graph walk) remain static calls inside
+/// the concrete impl.
+pub trait VectorSearchIndex: Send + Sync {
+    /// Add a new entry to the index (goes to overflow until the next
+    /// rebuild). See [`VectorIndex::insert`] for the default
+    /// backend's eviction / strict-dim semantics.
+    fn insert(&self, id: String, embedding: Vec<f32>);
+
+    /// Search for the `k` nearest neighbors, optionally restricted to
+    /// an id `allowlist` (the §5.2 lazy walk). `None` = the legacy
+    /// unfiltered global-cutoff search, byte-identical to pre-#1005.
+    /// Results are sorted by ascending distance (closest first).
+    fn search(&self, query: &[f32], k: usize, allowlist: Option<&[String]>) -> Vec<VectorHit>;
+
+    /// Remove an entry by id (excluded from results immediately;
+    /// physically dropped on the next rebuild).
+    fn remove(&self, id: &str);
+
+    /// Total number of live entries (graph + overflow).
+    fn len(&self) -> usize;
+
+    /// `true` when the index holds no live entries.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `true` when a search can observe every live entry (#1579
+    /// async-boot coverage accounting).
+    fn is_fully_searchable(&self) -> bool;
+
+    /// Schedule a full background rebuild; returns the build thread's
+    /// handle (#968 double-buffer contract).
+    fn rebuild_async(&self) -> JoinHandle<()>;
+
+    /// Bulk-seed boot entries and schedule the graph build (#1579 B3
+    /// async-boot path).
+    fn seed_and_rebuild_async(&self, entries: Vec<(String, Vec<f32>)>) -> JoinHandle<()>;
+
+    /// Blocking boot warm-up: seed + drive rebuild→swap to
+    /// completion; returns the number of entries seeded (#1579 B3).
+    fn warm_boot(&self, entries: Vec<(String, Vec<f32>)>) -> usize;
+
+    /// Wire the eviction-event sink (v0.7.0 R3-S1 hook plumbing).
+    fn set_eviction_sink(&self, sink: Sender<EvictionEvent>);
+}
+
+/// v0.9 #1005 — the inert default backend: the existing HNSW
+/// [`VectorIndex`] implements the seam verbatim. Every method
+/// forwards to the pre-existing inherent method; behavior through the
+/// trait is byte-identical to a direct call.
+impl VectorSearchIndex for VectorIndex {
+    fn insert(&self, id: String, embedding: Vec<f32>) {
+        VectorIndex::insert(self, id, embedding);
+    }
+
+    fn search(&self, query: &[f32], k: usize, allowlist: Option<&[String]>) -> Vec<VectorHit> {
+        self.search_filtered(query, k, allowlist)
+    }
+
+    fn remove(&self, id: &str) {
+        VectorIndex::remove(self, id);
+    }
+
+    fn len(&self) -> usize {
+        VectorIndex::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        VectorIndex::is_empty(self)
+    }
+
+    fn is_fully_searchable(&self) -> bool {
+        VectorIndex::is_fully_searchable(self)
+    }
+
+    fn rebuild_async(&self) -> JoinHandle<()> {
+        VectorIndex::rebuild_async(self)
+    }
+
+    fn seed_and_rebuild_async(&self, entries: Vec<(String, Vec<f32>)>) -> JoinHandle<()> {
+        VectorIndex::seed_and_rebuild_async(self, entries)
+    }
+
+    fn warm_boot(&self, entries: Vec<(String, Vec<f32>)>) -> usize {
+        VectorIndex::warm_boot(self, entries)
+    }
+
+    fn set_eviction_sink(&self, sink: Sender<EvictionEvent>) {
+        VectorIndex::set_eviction_sink(self, sink);
+    }
+}
+
+/// v0.9 #1005 (G2) — construct the default backend as a boxed seam
+/// object with the operator-resolved capacity + hard-fail mode. The
+/// single funnel the daemon boot path uses, so the knob wiring cannot
+/// drift between surfaces.
+#[must_use]
+pub fn boxed_default_index(capacity: usize, hard_fail_at_cap: bool) -> Box<dyn VectorSearchIndex> {
+    Box::new(VectorIndex::empty_with_capacity(capacity, hard_fail_at_cap))
+}
+
 impl VectorIndex {
-    /// Build a new index from a list of (`memory_id`, embedding) pairs.
-    pub fn build(entries: Vec<(String, Vec<f32>)>) -> Self {
+    /// Shared constructor body — every public constructor funnels
+    /// through here so the `IndexState` field set cannot drift
+    /// between them (v0.9 #1005 G2 refactor; behavior-identical).
+    fn new_with(
+        entries: Vec<(String, Vec<f32>)>,
+        max_entries: usize,
+        hard_fail_at_cap: bool,
+    ) -> Self {
         let hnsw = Self::build_hnsw(&entries);
         let graph_entry_count = entries.len();
         VectorIndex {
@@ -441,7 +729,8 @@ impl VectorIndex {
                 hnsw,
                 overflow: Vec::new(),
                 all_entries: entries,
-                max_entries: MAX_ENTRIES,
+                max_entries,
+                hard_fail_at_cap,
                 overflow_generation: 0,
                 valid_ids_cache: None,
                 graph_entry_count,
@@ -452,22 +741,42 @@ impl VectorIndex {
         }
     }
 
+    /// Build a new index from a list of (`memory_id`, embedding) pairs.
+    pub fn build(entries: Vec<(String, Vec<f32>)>) -> Self {
+        Self::new_with(entries, DEFAULT_MAX_ENTRIES, false)
+    }
+
     /// Build an empty index.
     pub fn empty() -> Self {
-        VectorIndex {
-            inner: Mutex::new(IndexState {
-                hnsw: None,
-                overflow: Vec::new(),
-                all_entries: Vec::new(),
-                max_entries: MAX_ENTRIES,
-                overflow_generation: 0,
-                valid_ids_cache: None,
-                graph_entry_count: 0,
-            }),
-            eviction_sink: Mutex::new(None),
-            warming: Arc::new(Mutex::new(None)),
-            rebuild_in_flight: Arc::new(AtomicBool::new(false)),
-        }
+        Self::new_with(Vec::new(), DEFAULT_MAX_ENTRIES, false)
+    }
+
+    /// v0.9 #1005 (G2) — build an index from entries with an
+    /// operator-resolved eviction cap + hard-fail mode (the
+    /// `[limits].vector_index_capacity` /
+    /// [`crate::config::ENV_VECTOR_INDEX_HARD_FAIL`] wiring). `capacity` of `0` is
+    /// treated as "unset" and falls back to [`DEFAULT_MAX_ENTRIES`]
+    /// (matching the resolver's non-positive-is-unset ladder rule).
+    #[must_use]
+    pub fn build_with_capacity(
+        entries: Vec<(String, Vec<f32>)>,
+        capacity: usize,
+        hard_fail_at_cap: bool,
+    ) -> Self {
+        let cap = if capacity == 0 {
+            DEFAULT_MAX_ENTRIES
+        } else {
+            capacity
+        };
+        Self::new_with(entries, cap, hard_fail_at_cap)
+    }
+
+    /// v0.9 #1005 (G2) — empty-index variant of
+    /// [`Self::build_with_capacity`]. Used by the daemon / MCP boot
+    /// paths, which bind an empty index and warm it asynchronously.
+    #[must_use]
+    pub fn empty_with_capacity(capacity: usize, hard_fail_at_cap: bool) -> Self {
+        Self::build_with_capacity(Vec::new(), capacity, hard_fail_at_cap)
     }
 
     /// v0.7.0 R3-S1 — Build an empty index with a custom eviction
@@ -479,20 +788,7 @@ impl VectorIndex {
     #[doc(hidden)]
     #[must_use]
     pub fn with_max_entries_for_test(max_entries: usize) -> Self {
-        VectorIndex {
-            inner: Mutex::new(IndexState {
-                hnsw: None,
-                overflow: Vec::new(),
-                all_entries: Vec::new(),
-                max_entries,
-                overflow_generation: 0,
-                valid_ids_cache: None,
-                graph_entry_count: 0,
-            }),
-            eviction_sink: Mutex::new(None),
-            warming: Arc::new(Mutex::new(None)),
-            rebuild_in_flight: Arc::new(AtomicBool::new(false)),
-        }
+        Self::new_with(Vec::new(), max_entries, false)
     }
 
     /// v0.7.0 (R3-S1) — wire the eviction sink.
@@ -543,6 +839,46 @@ impl VectorIndex {
                 Ok(s) => s,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            // v0.9 #1005 (G4) — strict-dim write boundary. Under
+            // AI_MEMORY_REQUIRE_DIM_MATCH an embedding whose
+            // dimensionality disagrees with the index's established
+            // dimension is REJECTED here instead of poisoning the
+            // graph (where every distance against it would silently
+            // zip-truncate). Tolerant default: no check, legacy
+            // byte-identical.
+            if strict_dim_enabled()
+                && let Some((_, first)) = state.all_entries.first()
+                && first.len() != embedding.len()
+            {
+                let mismatch = EmbeddingDimMismatch {
+                    expected: first.len(),
+                    actual: embedding.len(),
+                };
+                tracing::error!(
+                    memory_id = %id,
+                    expected_dim = mismatch.expected,
+                    actual_dim = mismatch.actual,
+                    flag = ENV_REQUIRE_DIM_MATCH,
+                    "strict-dim mode: rejecting vector-index insert — {mismatch} (#1005 G4)"
+                );
+                return;
+            }
+            // v0.9 #1005 (G2) — opt-in hard-fail-at-cap. When the
+            // operator turned AI_MEMORY_VECTOR_INDEX_HARD_FAIL on,
+            // an index AT capacity rejects the NEW insert (index
+            // unchanged) instead of silently evicting the oldest
+            // entries. Legacy default: fall through to the
+            // evict-oldest edge below, byte-identical.
+            if state.hard_fail_at_cap && state.all_entries.len() >= state.max_entries {
+                tracing::error!(
+                    target: EVICTION_TRACE_TARGET,
+                    memory_id = %id,
+                    max_entries = state.max_entries,
+                    "vector index at capacity: rejecting insert (hard-fail-at-cap mode); \
+                     increase vector_index_capacity or move to dedicated vector DB (#1005 G2)"
+                );
+                return;
+            }
             state.all_entries.push((id.clone(), embedding.clone()));
             state.overflow.push((id, embedding));
             // v0.7.0 #1087 — invalidate cached valid_ids set; rebuilt
@@ -761,7 +1097,35 @@ impl VectorIndex {
     ///
     /// Combines HNSW approximate search with linear scan of overflow entries.
     /// Returns results sorted by ascending distance (closest first).
+    ///
+    /// Legacy 2-arg entry — byte-identical to the pre-#1005 search.
+    /// The allowlist-aware variant is [`Self::search_filtered`].
     pub fn search(&self, query: &[f32], k: usize) -> Vec<VectorHit> {
+        self.search_filtered(query, k, None)
+    }
+
+    /// v0.9 #1005 (§5.2) — allowlist-aware nearest-neighbor search.
+    ///
+    /// * `allowlist = None` — EXACTLY today's behavior: the graph walk
+    ///   collects the first `k * 2` live hits (the legacy global
+    ///   cutoff), merges the full overflow scan, dedupes, sorts by
+    ///   ascending distance, truncates to `k`.
+    /// * `allowlist = Some(ids)` — the §5.2 namespace-starvation fix:
+    ///   the `hnsw.search` iterator (nearest-first) is consumed
+    ///   LAZILY, skipping out-of-allowlist candidates, until `k`
+    ///   in-allowlist hits are collected **or the iterator is
+    ///   exhausted** (the walk is bounded by the library's search
+    ///   beam, so termination is guaranteed — no fixed global cutoff
+    ///   can starve a small namespace behind `k * 2` foreign
+    ///   neighbors any more). The overflow linear scan applies the
+    ///   same membership filter. Ranking order (nearest-first) is
+    ///   preserved on both paths.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowlist: Option<&[String]>,
+    ) -> Vec<VectorHit> {
         // #968 — opportunistic swap-on-read. If a background rebuild has
         // parked a warmed graph in the `warming` slot, swap it into
         // `active` BEFORE we serve this search. The swap is a single
@@ -800,19 +1164,53 @@ impl VectorIndex {
             .as_ref()
             .expect("valid_ids_cache populated above");
 
+        // v0.9 #1005 (§5.2) — O(1)-membership view of the allowlist
+        // (coll-set-membership; the slice shape is the accepted seam
+        // signature, the set is a per-call internal detail).
+        let allow: Option<std::collections::HashSet<&str>> =
+            allowlist.map(|ids| ids.iter().map(String::as_str).collect());
+
         // Search the HNSW index
         if let Some(ref hnsw) = state.hnsw {
             let mut search = Search::default();
-            for item in hnsw.search(&query_point, &mut search) {
-                if !valid_ids.contains(item.value.as_str()) {
-                    continue; // Removed entry
+            match allow.as_ref() {
+                // LEGACY path (allowlist unset) — byte-identical: first
+                // k*2 live hits, nearest-first.
+                None => {
+                    for item in hnsw.search(&query_point, &mut search) {
+                        if !valid_ids.contains(item.value.as_str()) {
+                            continue; // Removed entry
+                        }
+                        results.push(VectorHit {
+                            id: item.value.clone(),
+                            distance: item.distance,
+                        });
+                        if results.len() >= k * 2 {
+                            break;
+                        }
+                    }
                 }
-                results.push(VectorHit {
-                    id: item.value.clone(),
-                    distance: item.distance,
-                });
-                if results.len() >= k * 2 {
-                    break;
+                // §5.2 lazy walk — consume the nearest-first iterator
+                // until k IN-ALLOWLIST hits or iterator exhaustion.
+                // Out-of-allowlist candidates no longer consume cutoff
+                // slots, so a small namespace's members surface even
+                // when thousands of foreign neighbors rank closer.
+                Some(allow) => {
+                    for item in hnsw.search(&query_point, &mut search) {
+                        if !valid_ids.contains(item.value.as_str()) {
+                            continue; // Removed entry
+                        }
+                        if !allow.contains(item.value.as_str()) {
+                            continue; // Out of scope for this recall
+                        }
+                        results.push(VectorHit {
+                            id: item.value.clone(),
+                            distance: item.distance,
+                        });
+                        if results.len() >= k {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -825,6 +1223,14 @@ impl VectorIndex {
         // the stored slice instead.
         let mut overflow_hits: Vec<VectorHit> = Vec::with_capacity(state.overflow.len());
         for (id, emb) in &state.overflow {
+            // v0.9 #1005 (§5.2) — the overflow scan is already
+            // exhaustive (no cutoff), so the allowlist is a pure
+            // membership filter here.
+            if let Some(allow) = allow.as_ref()
+                && !allow.contains(id.as_str())
+            {
+                continue;
+            }
             overflow_hits.push(VectorHit {
                 id: id.clone(),
                 distance: cosine_distance(&query_point.0, emb),
@@ -2050,5 +2456,408 @@ mod d1_968_tests {
             idx.is_fully_searchable(),
             "remove only shrinks all_entries — coverage preserved"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v0.9 #1005 — minimal vector-search slice: seam + §5.2 allowlist +
+// G4 strict-dim + G2 capacity/hard-fail regression tests.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod v1005_tests {
+    use super::*;
+
+    fn make_embedding(values: &[f32]) -> Vec<f32> {
+        let norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+        values.iter().map(|v| v / norm).collect()
+    }
+
+    /// RAII guard for the process-global strict-dim override: forces
+    /// the mode on for the test body and restores "re-read env"
+    /// (which resolves to OFF in the test environment) on drop, even
+    /// on panic.
+    struct StrictDimGuard;
+    impl StrictDimGuard {
+        fn on() -> Self {
+            set_strict_dim_for_test(Some(true));
+            StrictDimGuard
+        }
+    }
+    impl Drop for StrictDimGuard {
+        fn drop(&mut self) {
+            set_strict_dim_for_test(None);
+        }
+    }
+
+    /// §5.2 starvation fixture: 40 decoys STRICTLY nearer to the
+    /// query than every one of the 10 "tiny namespace" members, all
+    /// distances pairwise distinct, everything within the library's
+    /// search beam (52 total ≪ default ef). Models the production
+    /// hazard: a huge foreign corpus crowds a small namespace out of
+    /// the fixed global cutoff.
+    #[allow(clippy::cast_precision_loss)]
+    fn starvation_fixture() -> (Vec<(String, Vec<f32>)>, Vec<String>, Vec<f32>) {
+        let query = make_embedding(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let mut entries = Vec::new();
+        for i in 0..40_usize {
+            // Tiny, distinct angles off the query axis → distances
+            // ≈ 5e-5 .. 0.02, all below every member distance.
+            let mut v = vec![0.0_f32; 8];
+            v[0] = 1.0;
+            v[1] = 0.01 + 0.005 * i as f32;
+            entries.push((format!("decoy-{i}"), make_embedding(&v)));
+        }
+        let mut members = Vec::new();
+        for i in 0..10_usize {
+            // Large, distinct angles → distances ≥ 0.29.
+            let mut v = vec![0.0_f32; 8];
+            v[0] = 1.0;
+            v[2] = 1.0 + 0.05 * i as f32;
+            let id = format!("member-{i}");
+            members.push(id.clone());
+            entries.push((id, make_embedding(&v)));
+        }
+        (entries, members, query)
+    }
+
+    /// §5.2 REGRESSION — the pre-fix global cutoff starves a small
+    /// namespace: with 40 nearer foreign decoys, the legacy top-k
+    /// contains ZERO members, so the recall pipeline's post-ANN
+    /// namespace filter yields an EMPTY result. The allowlist lazy
+    /// walk finds ALL of them.
+    #[test]
+    fn allowlist_walk_fixes_namespace_starvation_5_2_1005() {
+        let (entries, members, query) = starvation_fixture();
+        let idx = VectorIndex::build(entries);
+        let k = 10;
+
+        // Pre-fix behavior (allowlist=None): every hit is a decoy.
+        let legacy = idx.search(&query, k);
+        assert_eq!(legacy.len(), k);
+        assert!(
+            legacy.iter().all(|h| h.id.starts_with("decoy-")),
+            "fixture must reproduce the hazard: legacy top-{k} is all decoys, got {:?}",
+            legacy.iter().map(|h| &h.id).collect::<Vec<_>>()
+        );
+        // …so the production post-ANN namespace filter starves:
+        let post_filtered: Vec<&VectorHit> =
+            legacy.iter().filter(|h| members.contains(&h.id)).collect();
+        assert!(
+            post_filtered.is_empty(),
+            "§5.2 hazard pin: post-filtering the legacy cutoff by namespace must \
+             come up EMPTY on this fixture"
+        );
+
+        // The fix: lazy allowlist walk surfaces every member.
+        let fixed = idx.search_filtered(&query, k, Some(&members));
+        let fixed_ids: Vec<&str> = fixed.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            fixed.len(),
+            members.len(),
+            "allowlist walk must return ALL {} in-namespace members, got {fixed_ids:?}",
+            members.len()
+        );
+        for m in &members {
+            assert!(fixed_ids.contains(&m.as_str()), "missing member {m}");
+        }
+        // Ranking order preserved: ascending distance (nearest-first).
+        for w in fixed.windows(2) {
+            assert!(
+                w[0].distance <= w[1].distance,
+                "allowlist results must stay nearest-first: {} > {}",
+                w[0].distance,
+                w[1].distance
+            );
+        }
+    }
+
+    /// §5.2 — a namespace with FEWER than `k` members returns ALL of
+    /// them (iterator-exhaustion termination, no infinite loop, no
+    /// starvation behind the cutoff).
+    #[test]
+    fn allowlist_smaller_than_k_returns_all_members_1005() {
+        let (entries, members, query) = starvation_fixture();
+        let idx = VectorIndex::build(entries);
+        let tiny: Vec<String> = members.into_iter().take(3).collect();
+        let hits = idx.search_filtered(&query, 10, Some(&tiny));
+        let got: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(
+            hits.len(),
+            3,
+            "all 3 reachable members must surface: {got:?}"
+        );
+        for m in &tiny {
+            assert!(got.contains(&m.as_str()), "missing member {m}");
+        }
+    }
+
+    /// §5.2 — the overflow linear scan applies the same allowlist
+    /// membership filter (overflow entries are outside the graph
+    /// until the next rebuild but must obey the same scope).
+    #[test]
+    fn allowlist_covers_overflow_entries_1005() {
+        let (entries, mut members, query) = starvation_fixture();
+        let idx = VectorIndex::build(entries);
+        // One member + one decoy land in overflow (post-build inserts).
+        let mut v = vec![0.0_f32; 8];
+        v[0] = 1.0;
+        v[3] = 1.5;
+        idx.insert("member-ovf".into(), make_embedding(&v));
+        let mut d = vec![0.0_f32; 8];
+        d[0] = 1.0;
+        d[1] = 0.001;
+        idx.insert("decoy-ovf".into(), make_embedding(&d));
+        members.push("member-ovf".into());
+
+        let hits = idx.search_filtered(&query, members.len(), Some(&members));
+        let got: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            got.contains(&"member-ovf"),
+            "overflow member must surface: {got:?}"
+        );
+        assert!(
+            !got.contains(&"decoy-ovf"),
+            "overflow non-member must be filtered: {got:?}"
+        );
+    }
+
+    /// PARITY — `allowlist = None` is byte-identical to the legacy
+    /// search: same ids, same order, on a seeded corpus where the
+    /// legacy contract is exactly known (corpus ≪ beam, distinct
+    /// distances ⇒ legacy = brute-force top-k). Also pins the 2-arg
+    /// inherent `search` ≡ `search_filtered(…, None)`.
+    #[test]
+    fn search_filtered_none_is_byte_identical_to_legacy_1005() {
+        let (entries, _, query) = starvation_fixture();
+        let idx = VectorIndex::build(entries.clone());
+        // A couple of overflow entries so BOTH branches participate.
+        let mut o = vec![0.0_f32; 8];
+        o[0] = 1.0;
+        o[4] = 0.5;
+        idx.insert("ovf-a".into(), make_embedding(&o));
+        o[4] = 2.5;
+        idx.insert("ovf-b".into(), make_embedding(&o));
+
+        let k = 7;
+        // Brute-force expectation over every live entry.
+        let mut expected: Vec<(String, f32)> = {
+            let state = idx.inner.lock().expect("state lock");
+            state
+                .all_entries
+                .iter()
+                .map(|(id, emb)| (id.clone(), cosine_distance(&query, emb)))
+                .collect()
+        };
+        expected.sort_by(|a, b| a.1.total_cmp(&b.1));
+        expected.truncate(k);
+
+        let legacy = idx.search(&query, k);
+        let none_path = idx.search_filtered(&query, k, None);
+
+        let legacy_pairs: Vec<(String, f32)> =
+            legacy.iter().map(|h| (h.id.clone(), h.distance)).collect();
+        let none_pairs: Vec<(String, f32)> = none_path
+            .iter()
+            .map(|h| (h.id.clone(), h.distance))
+            .collect();
+        assert_eq!(
+            legacy_pairs, none_pairs,
+            "search(q,k) and search_filtered(q,k,None) must be byte-identical"
+        );
+        assert_eq!(
+            none_pairs, expected,
+            "allowlist=None must preserve the exactly-known legacy result \
+             (brute-force top-k on a sub-beam corpus): same ids, same order"
+        );
+    }
+
+    /// SEAM — the trait object (`Box<dyn VectorSearchIndex>` via
+    /// [`boxed_default_index`]) is behavior-identical to the concrete
+    /// default backend, method by method.
+    #[test]
+    fn boxed_seam_is_behavior_identical_1005() {
+        let boxed: Box<dyn VectorSearchIndex> = boxed_default_index(0, false);
+        let concrete = VectorIndex::empty();
+        assert!(boxed.is_empty() && concrete.is_empty());
+
+        let (entries, members, query) = starvation_fixture();
+        for (id, emb) in entries.clone() {
+            boxed.insert(id, emb);
+        }
+        for (id, emb) in entries {
+            concrete.insert(id, emb);
+        }
+        assert_eq!(boxed.len(), concrete.len());
+        assert!(boxed.is_fully_searchable());
+
+        let via_trait = boxed.search(&query, 5, None);
+        let via_concrete = concrete.search(&query, 5);
+        assert_eq!(
+            via_trait.iter().map(|h| &h.id).collect::<Vec<_>>(),
+            via_concrete.iter().map(|h| &h.id).collect::<Vec<_>>(),
+            "trait-object search must match the concrete backend"
+        );
+        // Allowlist through the seam too.
+        let scoped = boxed.search(&query, 10, Some(&members));
+        assert_eq!(scoped.len(), members.len());
+
+        boxed.remove(&members[0]);
+        assert_eq!(boxed.len(), concrete.len() - 1);
+        let after = boxed.search(&query, 10, Some(&members));
+        assert!(after.iter().all(|h| h.id != members[0]));
+
+        // Lifecycle methods stay wired through the vtable.
+        let handle = boxed.rebuild_async();
+        let _ = handle.join();
+        let seeded = boxed.warm_boot(vec![(
+            "warm-1".into(),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )]);
+        assert_eq!(seeded, 1);
+        let (tx, _rx) = std::sync::mpsc::channel::<EvictionEvent>();
+        boxed.set_eviction_sink(tx);
+    }
+
+    /// G4 — strict-dim guard: the cosine zip-truncation residual is
+    /// collapsed to `f32::MAX` (ranks last) and the index write
+    /// boundary rejects mismatched-dimension inserts; the tolerant
+    /// default keeps the legacy truncating behavior byte-identically.
+    #[test]
+    fn strict_dim_guard_g4_1005() {
+        // Tolerant (default) — zip truncation compares the shared
+        // prefix: dot over 2 dims = 1.0 → distance 0.
+        set_strict_dim_for_test(Some(false));
+        let legacy = cosine_distance(&[1.0, 0.0, 0.0], &[1.0, 0.0]);
+        assert!(legacy.abs() < 1e-6, "tolerant mode truncates: got {legacy}");
+        let idx_tolerant = VectorIndex::empty();
+        idx_tolerant.insert("a".into(), make_embedding(&[1.0, 0.0, 0.0]));
+        idx_tolerant.insert("short".into(), vec![1.0, 0.0]);
+        assert_eq!(
+            idx_tolerant.len(),
+            2,
+            "tolerant mode accepts mismatched dims"
+        );
+
+        // Strict — mismatch ranks LAST; equal dims unaffected.
+        {
+            let _g = StrictDimGuard::on();
+            assert_eq!(
+                cosine_distance(&[1.0, 0.0, 0.0], &[1.0, 0.0]),
+                f32::MAX,
+                "strict mode must collapse a dim mismatch to f32::MAX"
+            );
+            assert!(
+                cosine_distance(&[1.0, 0.0], &[1.0, 0.0]).abs() < 1e-6,
+                "equal dims must be unaffected by strict mode"
+            );
+            // Write boundary: second insert with a different dim is
+            // rejected, index unchanged.
+            let idx = VectorIndex::empty();
+            idx.insert("a".into(), make_embedding(&[1.0, 0.0, 0.0]));
+            idx.insert("bad".into(), vec![1.0, 0.0]);
+            assert_eq!(idx.len(), 1, "strict mode rejects the mismatched insert");
+            let hits = idx.search(&make_embedding(&[1.0, 0.0, 0.0]), 5);
+            assert!(hits.iter().all(|h| h.id != "bad"));
+        }
+
+        // Typed record renders a useful message.
+        let m = EmbeddingDimMismatch {
+            expected: 384,
+            actual: 768,
+        };
+        assert_eq!(
+            m.to_string(),
+            "embedding dimension mismatch: expected 384, got 768"
+        );
+        set_strict_dim_for_test(None);
+    }
+
+    /// G2 — hard-fail-at-cap: at capacity the NEW insert is rejected
+    /// (index unchanged, oldest retained); the legacy default at the
+    /// same capacity evicts the oldest instead.
+    #[test]
+    fn hard_fail_at_cap_rejects_insert_g2_1005() {
+        let unit = |i: usize| {
+            let mut v = vec![0.0_f32; 4];
+            v[i % 4] = 1.0
+                + 0.01 * {
+                    #[allow(clippy::cast_precision_loss)]
+                    let f = i as f32;
+                    f
+                };
+            make_embedding(&v)
+        };
+
+        let idx = VectorIndex::empty_with_capacity(3, true);
+        for i in 0..3 {
+            idx.insert(format!("keep-{i}"), unit(i));
+        }
+        assert_eq!(idx.len(), 3);
+        idx.insert("rejected".into(), unit(3));
+        assert_eq!(idx.len(), 3, "hard-fail mode must reject the at-cap insert");
+        let hits = idx.search(&unit(0), 10);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"rejected"),
+            "newcomer must be absent: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"keep-0"),
+            "oldest must NOT be evicted: {ids:?}"
+        );
+
+        // Legacy contrast (hard-fail off): oldest is evicted instead.
+        let legacy = VectorIndex::build_with_capacity(Vec::new(), 3, false);
+        for i in 0..4 {
+            legacy.insert(format!("keep-{i}"), unit(i));
+        }
+        assert_eq!(legacy.len(), 3);
+        // The eviction edge cleared overflow and scheduled the graph
+        // rebuild asynchronously — drive it to completion (the #1037
+        // sync shim spin-waits on the in-flight build) so the search
+        // below observes the post-eviction survivors.
+        legacy.rebuild();
+        let hits = legacy.search(&unit(0), 10);
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(
+            ids.contains(&"keep-3"),
+            "legacy admits the newcomer: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"keep-0"),
+            "legacy evicts the oldest: {ids:?}"
+        );
+    }
+
+    /// G2 — a `0` capacity (the resolver's "unset" sentinel) falls
+    /// back to the compiled [`DEFAULT_MAX_ENTRIES`].
+    #[test]
+    fn capacity_zero_falls_back_to_default_1005() {
+        let idx = VectorIndex::empty_with_capacity(0, false);
+        let cap = idx.inner.lock().expect("state lock").max_entries;
+        assert_eq!(cap, DEFAULT_MAX_ENTRIES);
+        let idx = VectorIndex::build_with_capacity(Vec::new(), 42, true);
+        let state = idx.inner.lock().expect("state lock");
+        assert_eq!(state.max_entries, 42);
+        assert!(state.hard_fail_at_cap);
+    }
+
+    /// §5.2 — env-flag spelling for the allowlist opt-in matches the
+    /// uniform truthy set of the `AI_MEMORY_REQUIRE_*` gates.
+    #[test]
+    fn vector_ns_allowlist_env_flag_parse_1005() {
+        // SAFETY: process-env mutation; the var is scoped to this
+        // test and removed before returning (K2-gate test precedent).
+        unsafe { std::env::remove_var(ENV_VECTOR_NS_ALLOWLIST) };
+        assert!(!vector_ns_allowlist_enabled(), "unset ⇒ inert default");
+        for v in ["1", "true", "YES", "on"] {
+            unsafe { std::env::set_var(ENV_VECTOR_NS_ALLOWLIST, v) };
+            assert!(vector_ns_allowlist_enabled(), "{v} must enable");
+        }
+        for v in ["0", "false", "off", ""] {
+            unsafe { std::env::set_var(ENV_VECTOR_NS_ALLOWLIST, v) };
+            assert!(!vector_ns_allowlist_enabled(), "{v:?} must stay inert");
+        }
+        unsafe { std::env::remove_var(ENV_VECTOR_NS_ALLOWLIST) };
     }
 }

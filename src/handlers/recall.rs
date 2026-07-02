@@ -607,6 +607,37 @@ async fn recall_response(
     // not N per-row attestation queries. Regression pin lives at
     // `tests/recall_no_lock_across_hnsw.rs`.
 
+    // v0.9 #1005 (§5.2) — opt-in namespace allowlist for the ANN
+    // phase. When AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST is truthy AND
+    // this recall is namespace-filtered, fetch the in-scope embedded
+    // id set on the read pool (one indexed SELECT, outside both the
+    // vector-index and writer locks) so the search below can walk the
+    // nearest-first iterator lazily to k IN-NAMESPACE hits instead of
+    // letting the global cutoff starve a small namespace. Flag unset
+    // (the default) or no namespace filter: `None` — the search is
+    // byte-identical legacy. A fetch error degrades to the legacy
+    // unfiltered search (WARN), never blocks the recall.
+    let ns_allowlist: Option<Vec<String>> = match namespace {
+        Some(ns) if query_emb.is_some() && crate::hnsw::vector_ns_allowlist_enabled() => {
+            let ns_owned = ns.to_string();
+            match super::read_pool::db_read_op(app.db.clone(), move |conn| {
+                db::vector_recall_allowlist_ids(conn, &ns_owned)
+            })
+            .await
+            {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    tracing::warn!(
+                        "recall: §5.2 allowlist fetch failed; falling back to legacy \
+                         unfiltered ANN search: {e}"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     // Stage (a) — HNSW search OUTSIDE the DB lock. The vector_index
     // mutex is its own lock and does not touch the DB connection,
     // so taking + releasing it here costs nothing in DB-mutex
@@ -617,7 +648,7 @@ async fn recall_response(
         let vi_guard = app.vector_index.lock().await;
         let hits = if let Some(idx) = vi_guard.as_ref() {
             let ann_limit = (limit * 5).max(50);
-            idx.search(qe, ann_limit)
+            idx.search(qe, ann_limit, ns_allowlist.as_deref())
         } else {
             // No HNSW index → empty hit slice. `semantic_phase`
             // skips the per-hit loop on an empty slice and falls

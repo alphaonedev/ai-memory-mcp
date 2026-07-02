@@ -413,7 +413,11 @@ pub(crate) fn run_with_embedder(
                     args.tags.as_deref(),
                     effective_since.as_deref(),
                     args.until.as_deref(),
-                    vector_index.as_ref(),
+                    // v0.9 #1005 — coerce the concrete CLI-local index to
+                    // the seam trait object at the pipeline boundary.
+                    vector_index
+                        .as_ref()
+                        .map(|i| i as &dyn hnsw::VectorSearchIndex),
                     resolved_ttl.short_extend_secs,
                     resolved_ttl.mid_extend_secs,
                     args.as_agent.as_deref(),

@@ -1122,7 +1122,7 @@ pub async fn create_memory(
         vi.as_ref()
             .filter(|idx| idx.is_fully_searchable() && !idx.is_empty())
             .map(|idx| {
-                idx.search(qe, db::PROACTIVE_CONFLICT_INDEX_K)
+                idx.search(qe, db::PROACTIVE_CONFLICT_INDEX_K, None)
                     .into_iter()
                     .map(|h| h.id)
                     .collect()

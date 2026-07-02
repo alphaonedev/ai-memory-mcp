@@ -7313,7 +7313,7 @@ pub fn proactive_conflict_check_with_index(
     conn: &Connection,
     mem: &Memory,
     query_embedding: &[f32],
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
 ) -> Result<Option<ProactiveConflict>> {
     if query_embedding.is_empty() {
         return Ok(None);
@@ -7326,7 +7326,7 @@ pub fn proactive_conflict_check_with_index(
         // `crate::hnsw::VectorIndex::is_empty`.
         && !idx.is_empty()
     {
-        let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K);
+        let hits = idx.search(query_embedding, PROACTIVE_CONFLICT_INDEX_K, None);
         let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
         return proactive_conflict_check_candidates(conn, mem, query_embedding, &ids);
     }
@@ -11740,7 +11740,7 @@ pub fn recall_hybrid(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
     short_extend: i64,
     mid_extend: i64,
     as_agent: Option<&str>,
@@ -12074,6 +12074,50 @@ fn fts_keyword_phase(
     Ok(rows)
 }
 
+/// v0.9 #1005 (§5.2) — the in-scope embedded-row id set for a
+/// namespace-filtered recall: the ids the ANN allowlist walk may
+/// return. Mirrors the [`semantic_phase`] namespace post-filter
+/// semantics exactly — a hierarchical query namespace (`a/b/c`)
+/// admits rows whose namespace is any of its ancestors
+/// (`crate::models::namespace_ancestors`, the Task 1.12 contract); a
+/// flat namespace admits only exact matches. Only rows WITH an
+/// embedding are listed (the vector index cannot hold others).
+///
+/// Called once per allowlist-enabled recall
+/// ([`crate::hnsw::ENV_VECTOR_NS_ALLOWLIST`]); flag-off recalls never
+/// reach this query (zero-cost inert default).
+///
+/// # Errors
+/// Propagates the underlying SQL error.
+pub fn vector_recall_allowlist_ids(conn: &Connection, namespace: &str) -> Result<Vec<String>> {
+    let sql = if namespace.contains('/') {
+        // Hierarchy expansion — same interpolated-IN + quote-doubling
+        // idiom as `hierarchy_in_clause` (inputs are
+        // `validate_namespace`-approved; doubling is defensive).
+        let ancestors = crate::models::namespace_ancestors(namespace);
+        let quoted: Vec<String> = ancestors
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "''")))
+            .collect();
+        format!(
+            "SELECT id FROM memories WHERE embedding IS NOT NULL AND namespace IN ({})",
+            quoted.join(",")
+        )
+    } else {
+        "SELECT id FROM memories WHERE embedding IS NOT NULL AND namespace = ?1".to_string()
+    };
+    let mut stmt = conn.prepare_cached(&sql)?;
+    fn id_col(row: &rusqlite::Row<'_>) -> rusqlite::Result<String> {
+        row.get(0)
+    }
+    let collected: rusqlite::Result<Vec<String>> = if namespace.contains('/') {
+        stmt.query_map([], id_col)?.collect()
+    } else {
+        stmt.query_map(params![namespace], id_col)?.collect()
+    };
+    collected.map_err(Into::into)
+}
+
 /// #871 stage 3 — semantic phase. Two paths share the same `scored`
 /// HashMap mutation contract:
 ///
@@ -12096,7 +12140,7 @@ fn semantic_phase(
     conn: &Connection,
     prep: &HybridPrep<'_>,
     query_embedding: &[f32],
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
     // FX-4 / PERF-2 (2026-05-26) — when supplied, the HNSW search
     // has already been executed OUTSIDE the DB lock by the caller
     // (HTTP recall handler) and the hits are passed in here. The
@@ -12136,9 +12180,24 @@ fn semantic_phase(
             pre
         } else {
             let ann_limit = (limit * 5).max(50);
+            // v0.9 #1005 (§5.2) — opt-in namespace allowlist. When
+            // AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST is truthy AND this
+            // recall is namespace-filtered, the ANN walk consumes the
+            // nearest-first iterator lazily until `ann_limit`
+            // IN-NAMESPACE hits (or exhaustion) instead of letting the
+            // global cutoff fill with out-of-namespace neighbors that
+            // the post-filter below would discard — the small-namespace
+            // starvation hazard. Flag unset / no namespace: `None`,
+            // byte-identical legacy search.
+            let allowlist_ids: Option<Vec<String>> = match namespace {
+                Some(ns) if crate::hnsw::vector_ns_allowlist_enabled() => {
+                    Some(vector_recall_allowlist_ids(conn, ns)?)
+                }
+                _ => None,
+            };
             owned_hits = vector_index
                 .expect("vector_index set in legacy branch")
-                .search(query_embedding, ann_limit);
+                .search(query_embedding, ann_limit, allowlist_ids.as_deref());
             owned_hits.as_slice()
         };
         // v0.7.0 #981 — pre-#981 this branch called `get(conn, &hit.id)`
@@ -12484,7 +12543,7 @@ pub fn recall_hybrid_with_telemetry(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
     short_extend: i64,
     mid_extend: i64,
     as_agent: Option<&str>,
@@ -12607,7 +12666,7 @@ fn recall_hybrid_with_telemetry_inner(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
-    vector_index: Option<&crate::hnsw::VectorIndex>,
+    vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
     precomputed_hnsw_hits: Option<&[crate::hnsw::VectorHit]>,
     short_extend: i64,
     mid_extend: i64,

@@ -3,7 +3,7 @@
 
 //! MCP `memory_delete` handler.
 
-use crate::mcp::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::{db, validate};
@@ -78,7 +78,7 @@ pub(super) fn handle_delete(
     conn: &rusqlite::Connection,
     db_path: &Path,
     params: &Value,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"]

@@ -28,7 +28,7 @@ mod validation;
 
 use crate::db;
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
@@ -284,7 +284,7 @@ pub(crate) fn handle_store(
     params: &Value,
     embedder: Option<&dyn Embed>,
     llm: Option<&OllamaClient>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
     autonomous_hooks: bool,
     mcp_client: Option<&str>,

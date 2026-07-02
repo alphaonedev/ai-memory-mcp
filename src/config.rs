@@ -3746,6 +3746,22 @@ pub struct LimitsSection {
     /// concurrent in-flight requests and sheds the rest with a typed
     /// `503`. `None` / `Some(0)` leaves admission control disabled.
     pub max_inflight_requests: Option<usize>,
+
+    /// v0.9 #1005 (G2) — in-memory vector-index residency cap
+    /// (entries). The eviction-rate ERROR in `src/hnsw.rs` has told
+    /// operators to "increase vector_index_capacity" since v0.7.0 M8;
+    /// this field finally wires that knob:
+    /// `AI_MEMORY_VECTOR_INDEX_CAPACITY` env > this section >
+    /// compiled [`crate::hnsw::DEFAULT_MAX_ENTRIES`] (100k). Omitted
+    /// / non-positive falls through the ladder.
+    pub vector_index_capacity: Option<usize>,
+
+    /// v0.9 #1005 (G2) — opt-in hard-fail-at-cap mode for the vector
+    /// index. `true` ⇒ inserts arriving at capacity are REJECTED
+    /// (ERROR log, index unchanged) instead of evicting the oldest
+    /// entries. `AI_MEMORY_VECTOR_INDEX_HARD_FAIL` env > this section
+    /// > compiled default `false` (legacy evict-oldest).
+    pub vector_index_hard_fail_at_cap: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4199,6 +4215,12 @@ pub struct ResolvedLimits {
     /// #1733 (Pillar-4 4.A) — global HTTP admission-control concurrency
     /// cap. `0` means disabled (no inflight layer composed).
     pub max_inflight_requests: usize,
+    /// v0.9 #1005 (G2) — vector-index residency cap (entries). Falls
+    /// back to [`crate::hnsw::DEFAULT_MAX_ENTRIES`].
+    pub vector_index_capacity: usize,
+    /// v0.9 #1005 (G2) — opt-in hard-fail-at-cap mode. `false` =
+    /// legacy evict-oldest.
+    pub vector_index_hard_fail_at_cap: bool,
     /// Provenance of the resolved configuration.
     pub source: ConfigSource,
 }
@@ -4221,6 +4243,18 @@ pub const ENV_MAX_INFLIGHT_REQUESTS: &str = "AI_MEMORY_MAX_INFLIGHT_REQUESTS";
 /// operators set `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or
 /// `[limits].max_inflight_requests`) to a positive cap to enable load-shedding.
 pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 0;
+
+/// v0.9 #1005 (G2) — env override for `[limits].vector_index_capacity`,
+/// the in-memory vector-index residency cap (entries). Positive
+/// integer; non-positive / unparseable falls through the ladder to the
+/// section then the compiled [`crate::hnsw::DEFAULT_MAX_ENTRIES`].
+pub const ENV_VECTOR_INDEX_CAPACITY: &str = "AI_MEMORY_VECTOR_INDEX_CAPACITY";
+/// v0.9 #1005 (G2) — env override for
+/// `[limits].vector_index_hard_fail_at_cap` (truthy `1`/`true`, falsy
+/// `0`/`false`; anything else falls through to the section then the
+/// compiled default `false`). When ON, the vector index REJECTS
+/// inserts at capacity instead of evicting the oldest entries.
+pub const ENV_VECTOR_INDEX_HARD_FAIL: &str = "AI_MEMORY_VECTOR_INDEX_HARD_FAIL";
 
 /// #1579 B7 — env override for the sqlite `PRAGMA mmap_size`
 /// (`[storage].db_mmap_size_bytes`), in whole bytes. `0` disables
@@ -8108,11 +8142,40 @@ impl AppConfig {
             .or(inflight_cfg)
             .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
 
+        // v0.9 #1005 (G2) — vector-index residency cap. Same
+        // non-positive-is-unset ladder as the quota knobs; the
+        // compiled default is the canonical `hnsw::DEFAULT_MAX_ENTRIES`
+        // (no numeric literal here).
+        let vec_cap_env = env_pos_usize(ENV_VECTOR_INDEX_CAPACITY);
+        let vec_cap_cfg = cfg.and_then(|l| l.vector_index_capacity).filter(|n| *n > 0);
+        let vector_index_capacity = vec_cap_env
+            .or(vec_cap_cfg)
+            .unwrap_or(crate::hnsw::DEFAULT_MAX_ENTRIES);
+
+        // v0.9 #1005 (G2) — hard-fail-at-cap. Truthy (`1`/`true`) or
+        // falsy (`0`/`false`) env wins; anything else falls through to
+        // the section then the compiled default `false` (the
+        // ENV_APPEND_ONLY tri-state idiom).
+        fn env_bool(name: &str) -> Option<bool> {
+            match std::env::var(name).ok()?.trim() {
+                "1" => Some(true),
+                "0" => Some(false),
+                s if s.eq_ignore_ascii_case("true") => Some(true),
+                s if s.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            }
+        }
+        let hard_fail_env = env_bool(ENV_VECTOR_INDEX_HARD_FAIL);
+        let hard_fail_cfg = cfg.and_then(|l| l.vector_index_hard_fail_at_cap);
+        let vector_index_hard_fail_at_cap = hard_fail_env.or(hard_fail_cfg).unwrap_or(false);
+
         let source = if mem_env.is_some()
             || bytes_env.is_some()
             || links_env.is_some()
             || page_env.is_some()
             || inflight_env.is_some()
+            || vec_cap_env.is_some()
+            || hard_fail_env.is_some()
         {
             ConfigSource::Env
         } else if mem_cfg.is_some()
@@ -8120,6 +8183,8 @@ impl AppConfig {
             || links_cfg.is_some()
             || page_cfg.is_some()
             || inflight_cfg.is_some()
+            || vec_cap_cfg.is_some()
+            || hard_fail_cfg.is_some()
         {
             ConfigSource::Config
         } else {
@@ -8132,6 +8197,8 @@ impl AppConfig {
             max_links_per_day,
             max_page_size,
             max_inflight_requests,
+            vector_index_capacity,
+            vector_index_hard_fail_at_cap,
             source,
         }
     }
@@ -10342,6 +10409,8 @@ legacy_scoring = false
             ENV_MAX_LINKS_PER_DAY,
             ENV_MAX_PAGE_SIZE,
             ENV_MAX_INFLIGHT_REQUESTS,
+            ENV_VECTOR_INDEX_CAPACITY,
+            ENV_VECTOR_INDEX_HARD_FAIL,
         ] {
             unsafe {
                 std::env::remove_var(k);
@@ -10382,6 +10451,7 @@ legacy_scoring = false
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
             max_inflight_requests: Some(64),
+            ..LimitsSection::default()
         });
         let r = cfg.resolve_limits();
         assert_eq!(r.max_memories_per_day, 5_000_000);
@@ -10407,6 +10477,7 @@ legacy_scoring = false
             max_links_per_day: Some(4_000_000),
             max_page_size: Some(250_000),
             max_inflight_requests: Some(64),
+            ..LimitsSection::default()
         });
         let r = cfg.resolve_limits();
         // env wins for the two it sets …
@@ -10456,6 +10527,109 @@ legacy_scoring = false
         let r = cfg.resolve_limits();
         assert_eq!(r.max_page_size, crate::handlers::MAX_BULK_SIZE);
         assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9 #1005 (G2) — vector-index capacity + hard-fail-at-cap knobs
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_limits_vector_index_compiled_defaults_1005() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.vector_index_capacity,
+            crate::hnsw::DEFAULT_MAX_ENTRIES,
+            "unset capacity must fall back to the canonical hnsw default"
+        );
+        assert!(
+            !r.vector_index_hard_fail_at_cap,
+            "hard-fail-at-cap must default OFF (legacy evict-oldest)"
+        );
+        assert_eq!(r.source, ConfigSource::CompiledDefault);
+    }
+
+    #[test]
+    fn resolve_limits_vector_index_config_section_1005() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            vector_index_capacity: Some(250_000),
+            vector_index_hard_fail_at_cap: Some(true),
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.vector_index_capacity, 250_000);
+        assert!(r.vector_index_hard_fail_at_cap);
+        assert_eq!(r.source, ConfigSource::Config);
+    }
+
+    #[test]
+    fn resolve_limits_vector_index_env_overrides_config_1005() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_VECTOR_INDEX_CAPACITY, "500000");
+            std::env::set_var(ENV_VECTOR_INDEX_HARD_FAIL, "0");
+        }
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            vector_index_capacity: Some(250_000),
+            vector_index_hard_fail_at_cap: Some(true),
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(r.vector_index_capacity, 500_000, "env beats config");
+        assert!(
+            !r.vector_index_hard_fail_at_cap,
+            "falsy env (`0`) must beat the truthy config section"
+        );
+        assert_eq!(r.source, ConfigSource::Env);
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_vector_index_garbage_env_falls_through_1005() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_VECTOR_INDEX_CAPACITY, "0"); // non-positive -> ignored
+            std::env::set_var(ENV_VECTOR_INDEX_HARD_FAIL, "maybe"); // unrecognised -> ignored
+        }
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            vector_index_capacity: Some(123_456),
+            vector_index_hard_fail_at_cap: Some(true),
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.vector_index_capacity, 123_456,
+            "stray `0` env must fall through to the config section"
+        );
+        assert!(
+            r.vector_index_hard_fail_at_cap,
+            "unrecognised env token must fall through to the config section"
+        );
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn limits_vector_index_knobs_round_trip_through_toml_1005() {
+        let toml = r#"
+schema_version = 2
+
+[limits]
+vector_index_capacity = 200000
+vector_index_hard_fail_at_cap = true
+"#;
+        let cfg: AppConfig = toml::from_str(toml).expect("parse [limits] toml");
+        let l = cfg.limits.as_ref().expect("limits section present");
+        assert_eq!(l.vector_index_capacity, Some(200_000));
+        assert_eq!(l.vector_index_hard_fail_at_cap, Some(true));
     }
 
     #[test]

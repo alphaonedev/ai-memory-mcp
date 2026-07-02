@@ -35,7 +35,7 @@ use crate::identity::keypair::AgentKeypair;
 use crate::llm::OllamaClient;
 use crate::mcp::param_names;
 use crate::models::{GovernancePolicy, Memory, MemoryLinkRelation};
-use crate::{db, hnsw::VectorIndex};
+use crate::{db, hnsw::VectorSearchIndex};
 
 use super::AUTONOMY_MIN_CONTENT_LEN;
 
@@ -267,7 +267,7 @@ pub(super) fn apply_synthesis_updates_and_deletes(
     mem: &Memory,
     existing: &[Memory],
     embedder: Option<&dyn crate::embeddings::Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     outcome: &SynthesisOutcome,
     active_keypair: Option<&AgentKeypair>,
 ) -> Option<Value> {
