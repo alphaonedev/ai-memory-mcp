@@ -448,6 +448,7 @@ mod entity_register;
 mod expand_query;
 #[path = "tools/find_paths.rs"]
 mod find_paths;
+// v0.9.0 G13-mem (#1859) — derivation lineage-DAG walk.
 #[path = "tools/forget.rs"]
 mod forget;
 #[path = "tools/get.rs"]
@@ -462,6 +463,8 @@ mod kg_invalidate;
 mod kg_query;
 #[path = "tools/kg_timeline.rs"]
 mod kg_timeline;
+#[path = "tools/lineage.rs"]
+mod lineage;
 #[path = "tools/link.rs"]
 mod link;
 #[path = "tools/list.rs"]
@@ -571,6 +574,10 @@ pub use capabilities::{
     overlay_tool_payloads,
 };
 pub use find_paths::handle_find_paths;
+// v0.9.0 G13-mem (#1859) — CLI parity export: `ai-memory lineage`
+// dispatches into the same substrate primitive the MCP `memory_lineage`
+// tool consumes, guaranteeing wire envelope parity across surfaces.
+pub use lineage::{LINEAGE_DIRECTION_ANCESTORS, LINEAGE_DIRECTION_DESCENDANTS, handle_lineage};
 // v0.7.0 ARCH-3 / FX-12 — CLI parity exports for handlers previously
 // private to the MCP module (`pub(super)`). The CLI subcommands under
 // `src/cli/commands/kg_query.rs` / `src/cli/commands/check_duplicate.rs`
@@ -1650,6 +1657,12 @@ fn dispatch_memory_find_paths(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String
     handle_find_paths(ctx.conn, ctx.arguments, caller.as_deref())
 }
 
+fn dispatch_memory_lineage(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // v0.9.0 G13-mem (#1859) — same #1800 visibility gate as find_paths.
+    let caller = crate::identity::resolve_read_visibility_caller();
+    handle_lineage(ctx.conn, ctx.arguments, caller.as_deref())
+}
+
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_delete(
         ctx.conn,
@@ -2157,6 +2170,7 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         ),
         register_mcp_tool!(tool_names::MEMORY_KG_QUERY, dispatch_memory_kg_query),
         register_mcp_tool!(tool_names::MEMORY_FIND_PATHS, dispatch_memory_find_paths),
+        register_mcp_tool!(tool_names::MEMORY_LINEAGE, dispatch_memory_lineage),
         register_mcp_tool!(tool_names::MEMORY_DELETE, dispatch_memory_delete),
         register_mcp_tool!(tool_names::MEMORY_PROMOTE, dispatch_memory_promote),
         register_mcp_tool!(
@@ -4312,9 +4326,10 @@ mod tests {
         assert_eq!(core_row["tool_count"], 7);
         let graph_row = families.iter().find(|r| r["name"] == "graph").unwrap();
         assert_eq!(graph_row["loaded"], false);
-        // v0.7 J7 — graph now ships 11 tools (8 baseline + memory_replay
-        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
-        assert_eq!(graph_row["tool_count"], 11);
+        // v0.7 J7 — graph ships 11 tools (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]);
+        // v0.9.0 #1859 added memory_lineage → 12.
+        assert_eq!(graph_row["tool_count"], 12);
 
         let always_on = v["always_on"].as_array().unwrap();
         assert_eq!(always_on.len(), 1);
@@ -4328,14 +4343,16 @@ mod tests {
         assert_eq!(v["family"], "graph");
         assert_eq!(v["loaded_under_active_profile"], false);
         let tools = v["tools"].as_array().unwrap();
-        // v0.7 J7 — graph now lists 11 tools (8 baseline + memory_replay
-        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
-        assert_eq!(tools.len(), 11);
+        // v0.7 J7 — graph lists 11 tools (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]);
+        // v0.9.0 #1859 added memory_lineage → 12.
+        assert_eq!(tools.len(), 12);
         // Spot-check known graph tool present.
         assert!(tools.iter().any(|t| t == "memory_kg_query"));
         assert!(tools.iter().any(|t| t == "memory_replay"));
         assert!(tools.iter().any(|t| t == "memory_verify"));
         assert!(tools.iter().any(|t| t == "memory_find_paths"));
+        assert!(tools.iter().any(|t| t == "memory_lineage"));
     }
 
     #[test]
@@ -4350,9 +4367,10 @@ mod tests {
         assert_eq!(v["family"], "graph");
         assert_eq!(v["verbose"], true);
         let tools = v["tools"].as_array().unwrap();
-        // v0.7 J7 — graph now ships 11 schemas (8 baseline + memory_replay
-        // [I4] + memory_verify [H4] + memory_find_paths [J7]).
-        assert_eq!(tools.len(), 11);
+        // v0.7 J7 — graph ships 11 schemas (8 baseline + memory_replay
+        // [I4] + memory_verify [H4] + memory_find_paths [J7]);
+        // v0.9.0 #1859 added memory_lineage → 12.
+        assert_eq!(tools.len(), 12);
         // Each row must carry the full MCP tool definition shape.
         for tool in tools {
             assert!(tool.get("name").is_some(), "missing name");

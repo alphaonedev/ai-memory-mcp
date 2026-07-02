@@ -423,6 +423,61 @@ pub fn emit_revision_leaf_if_enabled(
     append_revision_leaf(conn, &leaf)
 }
 
+/// v0.9.0 G13-mem (#1859, COND 1) — the SINGLE predicate that decides
+/// whether `consolidate` appends its per-source `CONSOLIDATE` leaf, shared
+/// verbatim by BOTH backends (`db::consolidate` here and
+/// `PostgresStore::consolidate` via `pg_emit_consolidate_leaf_if_enabled`).
+///
+/// A leaf is emitted when EITHER spine is on:
+///   * `append_only` (#1823 G6) — the capture-then-compact discipline that
+///     already emitted the Postgres CONSOLIDATE leaf pre-#1859, OR
+///   * `consolidate_tombstone_sources` (#1859 G13) — the lineage-DAG
+///     tombstone path, whose acceptance invariant ("a CONSOLIDATE leaf is
+///     appended") must hold even when the append-only spine is off. This
+///     is the DELIBERATE decoupling COND 1 requires: the gated
+///     [`emit_revision_leaf_if_enabled`] helper hard-returns unless
+///     `append_only_enabled()`, so routing the lineage emission through it
+///     would silently no-op.
+///
+/// Keying every consolidate emission to this ONE predicate — and calling
+/// [`emit_consolidate_leaf`] exactly once per source — is what guarantees
+/// EXACTLY ONE leaf per source under every flag combination (never zero
+/// when either spine is on, never two when both are).
+#[must_use]
+pub fn consolidate_leaf_enabled() -> bool {
+    crate::config::append_only_enabled() || crate::config::consolidate_tombstone_sources_enabled()
+}
+
+/// v0.9.0 G13-mem (#1859, COND 1) — append EXACTLY ONE signed
+/// `CONSOLIDATE` leaf for one merged-away source, in the caller's open
+/// transaction. The sqlite half of the single emission site; callers gate
+/// on [`consolidate_leaf_enabled`] and call this at most once per source.
+///
+/// # Errors
+///
+/// Propagates the chain-head read / INSERT error from
+/// [`append_revision_leaf`]. The caller MUST roll back its own transaction.
+pub fn emit_consolidate_leaf(
+    conn: &Connection,
+    memory_id: &str,
+    prior_version: Option<i64>,
+    namespace: &str,
+    agent_id: Option<&str>,
+    created_at: &str,
+) -> Result<()> {
+    let leaf = RevisionLeaf::new(
+        uuid::Uuid::new_v4().to_string(),
+        memory_id,
+        RecordKind::Consolidate,
+        prior_version,
+        namespace,
+        agent_id.map(str::to_string),
+        created_at,
+    )
+    .signed();
+    append_revision_leaf(conn, &leaf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

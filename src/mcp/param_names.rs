@@ -65,6 +65,9 @@ pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
 pub const CREATED_BY: &str = "created_by";
 pub const DEADLINE_AT: &str = "deadline_at";
 pub const DEPTH: &str = "depth";
+/// v0.9.0 G13-mem (#1859) — `memory_lineage` walk direction
+/// ("ancestors" | "descendants").
+pub const DIRECTION: &str = "direction";
 pub const DRY_RUN: &str = "dry_run";
 pub const EDGE_TYPE: &str = "edge_type";
 pub const EDIT_SOURCE: &str = "edit_source";
@@ -205,6 +208,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CREATED_BY,
     DEADLINE_AT,
     DEPTH,
+    DIRECTION,
     DRY_RUN,
     EDGE_TYPE,
     EDIT_SOURCE,
@@ -314,9 +318,11 @@ mod tests {
         //   3. Bumping this assertion
         //   4. Re-running tests/mcp_param_names_invariant.rs to
         //      confirm no orphan-literal drift.
+        // v0.9.0 G13-mem (#1859) — 121 → 122: `DIRECTION` for the
+        // `memory_lineage` walk direction.
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            121,
+            122,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

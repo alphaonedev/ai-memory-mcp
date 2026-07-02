@@ -397,6 +397,9 @@ impl TierConfig {
                 // cap=3). The MCP/HTTP wrapper overlays the live wrapper
                 // config when a `BatchedReranker` handle is available.
                 reflection_boost: ReflectionBoostReport::default(),
+                // v0.9.0 G13-mem (#1859) — live process-wide flag; false
+                // until the boot seed (or a caller) flips it on.
+                lineage_dag: crate::config::lineage_dag_enabled(),
             },
             models: build_capability_models(self, models),
             // v2 dynamic blocks — start at zero-state defaults. The MCP
@@ -751,6 +754,15 @@ pub struct CapabilityFeatures {
     /// capabilities consumers round-trip cleanly.
     #[serde(default = "default_reflection_boost")]
     pub reflection_boost: ReflectionBoostReport,
+    /// v0.9.0 G13-mem (#1859) — whether the memory-derivation
+    /// lineage-DAG surface is live in this daemon (edge cid mirror,
+    /// P-wide acyclicity guard, `memory_lineage` / `GET
+    /// /api/v1/memories/{id}/lineage` / `ai-memory lineage` query
+    /// surface). Reflects the PROCESS-WIDE seeded flag
+    /// ([`crate::config::lineage_dag_enabled`]), so an embedder that
+    /// never boots the resolver honestly reports `false`.
+    #[serde(default)]
+    pub lineage_dag: bool,
 }
 
 /// v0.7.0 L2-8 — per-field report of the reflection-aware reranker
@@ -3642,6 +3654,22 @@ pub struct StorageSection {
     /// Default `false` (OFF). Env override: `AI_MEMORY_APPEND_ONLY`
     /// ([`ENV_APPEND_ONLY`]).
     pub append_only: Option<bool>,
+
+    /// v0.9.0 G13-mem (#1859) — memory-derivation lineage-DAG master
+    /// switch. When `true` (the compiled default), edge writes populate
+    /// `memory_links.source_cid`/`target_cid`, the P-wide acyclicity guard
+    /// runs on `derived_from`/`reflects_on`/`derives_from` writes, and the
+    /// lineage query surface is live. `false` = byte-identical legacy. Env
+    /// override: `AI_MEMORY_LINEAGE_DAG` ([`ENV_LINEAGE_DAG`]).
+    pub lineage_dag: Option<bool>,
+
+    /// v0.9.0 G13-mem (#1859) — when consolidation runs, tombstone source
+    /// memories (retain id + cid, write navigable `derived_from` edges,
+    /// emit a CONSOLIDATE leaf) instead of hard-deleting them. Default: ON
+    /// when `lineage_dag` is on. Env override:
+    /// `AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES`
+    /// ([`ENV_CONSOLIDATE_TOMBSTONE_SOURCES`]).
+    pub consolidate_tombstone_sources: Option<bool>,
 }
 
 /// v0.7.x — `[limits]` sectioned operator-tunable capacity limits.
@@ -4032,6 +4060,19 @@ pub struct ResolvedStorage {
     /// [`crate::config::append_only_enabled`]. STEP 1: resolved + exposed
     /// but NOT yet wired into any mutation path (that is step 2+).
     pub append_only: bool,
+    /// v0.9.0 G13-mem (#1859) — resolved lineage-DAG master flag
+    /// (`AI_MEMORY_LINEAGE_DAG` env > `[storage].lineage_dag` > compiled
+    /// default `true`). Exposed process-wide via
+    /// [`crate::config::lineage_dag_enabled`] once seeded through
+    /// [`crate::config::set_lineage_dag`].
+    pub lineage_dag: bool,
+    /// v0.9.0 G13-mem (#1859) — resolved consolidate-tombstone-sources
+    /// sub-flag (`AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES` env >
+    /// `[storage].consolidate_tombstone_sources` > compiled default: ON
+    /// when `lineage_dag` is on). Exposed process-wide via
+    /// [`crate::config::consolidate_tombstone_sources_enabled`] once seeded
+    /// through [`crate::config::set_consolidate_tombstone_sources`].
+    pub consolidate_tombstone_sources: bool,
     /// #1590 — per-field provenance of `default_namespace`:
     /// [`ConfigSource::Config`] when `[storage].default_namespace` is
     /// explicitly set, [`ConfigSource::Legacy`] when only the
@@ -4173,6 +4214,20 @@ pub const ENV_AGE_PROJECTION_MODE: &str = "AI_MEMORY_AGE_PROJECTION_MODE";
 /// route memory mutations through the signed `memory_revisions` ledger
 /// instead of mutating rows in place. Default-OFF is the opt-in posture.
 pub const ENV_APPEND_ONLY: &str = "AI_MEMORY_APPEND_ONLY";
+
+/// v0.9.0 G13-mem (#1859) — env override for the lineage-DAG master flag
+/// (`[storage].lineage_dag`). Truthy (`1`/`true`) or falsy (`0`/`false`);
+/// the compiled default is ON. `false` restores byte-identical legacy
+/// behavior (no cid mirror on edges, no P-wide acyclicity guard, no
+/// lineage query surface).
+pub const ENV_LINEAGE_DAG: &str = "AI_MEMORY_LINEAGE_DAG";
+
+/// v0.9.0 G13-mem (#1859) — env override for the consolidate-tombstone-
+/// sources sub-flag (`[storage].consolidate_tombstone_sources`).
+/// Truthy/falsy; the compiled default tracks [`ENV_LINEAGE_DAG`] (ON when
+/// the lineage-DAG is on). OFF restores the legacy consolidation
+/// hard-DELETE (GDPR-erasure deployments opt out here).
+pub const ENV_CONSOLIDATE_TOMBSTONE_SOURCES: &str = "AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES";
 
 /// #1463 Tier 1 — env override for the operational-log sink destination
 /// (`[logging].sink`). Highest layer of the `env > [logging].sink > file`
@@ -5233,6 +5288,65 @@ pub fn set_append_only(enabled: bool) {
 #[must_use]
 pub fn append_only_enabled() -> bool {
     APPEND_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v0.9.0 G13-mem (#1859) — process-wide master flag for the
+/// memory-derivation lineage-DAG, seeded once at daemon boot from
+/// [`ResolvedStorage::lineage_dag`] (`AI_MEMORY_LINEAGE_DAG` env >
+/// `[storage].lineage_dag` > compiled default `true`). The RESOLVED
+/// production default is ON ("master default on"); the compile-time
+/// atomic below defaults to `false` (OFF) so any process that never
+/// boots the config resolver — every `db::*` unit test and legacy
+/// integration harness — observes BYTE-IDENTICAL legacy behavior
+/// (`lineage_dag` OFF = no cid population on edges, no P-wide
+/// acyclicity guard, no lineage tombstone consolidation). This mirrors
+/// the [`set_append_only`] boot-seeded-global precedent exactly.
+// M-DOCUMENTED-MAGIC: the atomic default (false) is deliberately the
+// INVERSE of the resolved production default (true) — the unseeded
+// value must be the legacy-preserving one for test isolation.
+static LINEAGE_DAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// v0.9.0 G13-mem (#1859) — process-wide sub-flag: when consolidation
+/// runs, TOMBSTONE source memories (retain id + cid, write navigable
+/// `derived_from` edges, emit a CONSOLIDATE leaf) instead of the legacy
+/// hard-DELETE. Seeded at boot from
+/// [`ResolvedStorage::consolidate_tombstone_sources`]
+/// (`AI_MEMORY_CONSOLIDATE_TOMBSTONE_SOURCES` env >
+/// `[storage].consolidate_tombstone_sources` > compiled default: ON when
+/// `lineage_dag` is on). Compile-time atomic defaults `false` for the same
+/// test-isolation reason as [`LINEAGE_DAG`]: an unseeded process keeps the
+/// legacy hard-delete consolidation path.
+static CONSOLIDATE_TOMBSTONE_SOURCES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Seed the process-wide lineage-DAG master flag (#1859). Called once at
+/// boot from [`ResolvedStorage::lineage_dag`].
+pub fn set_lineage_dag(enabled: bool) {
+    LINEAGE_DAG.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the lineage-DAG is enabled process-wide (#1859). Defaults to
+/// `false` (OFF, byte-identical legacy) until seeded by [`set_lineage_dag`].
+#[must_use]
+pub fn lineage_dag_enabled() -> bool {
+    LINEAGE_DAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Seed the process-wide consolidate-tombstone-sources sub-flag (#1859).
+/// Called once at boot from
+/// [`ResolvedStorage::consolidate_tombstone_sources`].
+pub fn set_consolidate_tombstone_sources(enabled: bool) {
+    CONSOLIDATE_TOMBSTONE_SOURCES.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether consolidation tombstones (vs hard-deletes) its sources (#1859).
+/// Gated additionally by [`lineage_dag_enabled`]: tombstoning only makes
+/// sense when the lineage-DAG is on to navigate the retained provenance.
+/// Defaults to `false` (OFF, legacy hard-delete) until seeded.
+#[must_use]
+pub fn consolidate_tombstone_sources_enabled() -> bool {
+    lineage_dag_enabled()
+        && CONSOLIDATE_TOMBSTONE_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `[permissions]` block in `config.toml`. Carries the gate's
@@ -7642,6 +7756,30 @@ impl AppConfig {
                 .unwrap_or(false)
         };
 
+        // v0.9.0 G13-mem (#1859) — lineage-DAG flags, same truthy/falsy env
+        // ladder. The master flag's compiled default is ON ("master default
+        // on"); `false` restores byte-identical legacy behavior. The
+        // sub-flag's default tracks the master: a deployment that leaves
+        // both unset gets navigable (tombstoning) consolidation.
+        let parse_bool_env = |name: &str| -> Option<bool> {
+            std::env::var(name).ok().and_then(|v| {
+                let t = v.trim();
+                if t == "1" || t.eq_ignore_ascii_case("true") {
+                    Some(true)
+                } else if t == "0" || t.eq_ignore_ascii_case("false") {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        };
+        let lineage_dag = parse_bool_env(ENV_LINEAGE_DAG)
+            .or_else(|| cfg.and_then(|s| s.lineage_dag))
+            .unwrap_or(true);
+        let consolidate_tombstone_sources = parse_bool_env(ENV_CONSOLIDATE_TOMBSTONE_SOURCES)
+            .or_else(|| cfg.and_then(|s| s.consolidate_tombstone_sources))
+            .unwrap_or(lineage_dag);
+
         let source = if cfg.is_some() {
             ConfigSource::Config
         } else if self.default_namespace.is_some()
@@ -7662,6 +7800,8 @@ impl AppConfig {
             db_mmap_size_bytes,
             age_projection_mode,
             append_only,
+            lineage_dag,
+            consolidate_tombstone_sources,
             default_namespace_source,
             source,
         }

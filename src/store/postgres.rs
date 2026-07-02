@@ -100,6 +100,10 @@ const SQL_SELECT_ID_BY_NS_TITLE: &str =
 /// #1823 G6 — prior-version (namespace, version) read for the COW leaf,
 /// shared across every append-only revision site (single SQL SSOT).
 const SQL_SELECT_NS_VERSION_BY_ID: &str = "SELECT namespace, version FROM memories WHERE id = $1";
+
+/// v0.9.0 G13-mem (#1859) — endpoint content-id read for the lineage-DAG
+/// `memory_links.source_cid`/`target_cid` mirror stamp.
+const SQL_SELECT_CID_BY_ID: &str = "SELECT cid FROM memories WHERE id = $1";
 const SQL_LOAD_AGE: &str = "LOAD 'age'";
 const SQL_SET_AGE_SEARCH_PATH: &str = "SET LOCAL search_path = ag_catalog, \"$user\", public";
 /// AGE graph bootstrap — shared with `ai-memory schema-init`
@@ -222,6 +226,14 @@ const MIGRATION_V73_SIGNED_EVENTS_CAUSE: &str =
 /// batch; the `cid` backfill for legacy rows runs in `migrate_v74`.
 const MIGRATION_V74_MEMORIES_CID: &str =
     include_str!("../../migrations/postgres/0033_v74_memories_cid.sql");
+
+/// v75 (#1859, v0.9.0 G13-mem) — additive lineage-DAG content-id mirror:
+/// the `memory_links.source_cid` + `.target_cid` (TEXT) columns +
+/// `memory_links_target_cid_idx` (postgres mirror of the sqlite v75 arm).
+/// Postgres supports `ADD COLUMN IF NOT EXISTS`, so the DDL is a single
+/// idempotent batch; no backfill (legacy edges keep NULL cids).
+const MIGRATION_V75_MEMORY_LINKS_LINEAGE_CID: &str =
+    include_str!("../../migrations/postgres/0034_v75_memory_links_lineage_cid.sql");
 
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
@@ -566,7 +578,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 74;
+const CURRENT_SCHEMA_VERSION: i32 = 75;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1430,8 +1442,11 @@ impl PostgresStore {
         if current_version < 73 {
             self.migrate_v73().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 74 {
             self.migrate_v74().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v75().await?;
         }
 
         Ok(())
@@ -3552,7 +3567,9 @@ impl PostgresStore {
                 .begin()
                 .await
                 .map_err(|e| to_store_err("begin v74 stamp tx", e))?;
-            record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+            // v74 is no longer the ladder head (v75 is); stamp the literal
+            // so the same-run v75 arm advances past it.
+            record_schema_version(&mut tx, 74).await?;
             tx.commit()
                 .await
                 .map_err(|e| to_store_err("commit v74 stamp", e))?;
@@ -3563,6 +3580,38 @@ impl PostgresStore {
             stamped,
             "schema migration v74 applied (#1825: memories.cid / cid_genesis — \
              additive BLAKE3 content-id; backfilled {stamped} legacy genesis rows)"
+        );
+        Ok(())
+    }
+
+    /// v0.9.0 G13-mem (#1859) — additive lineage-DAG content-id mirror on
+    /// `memory_links` (postgres twin of the sqlite v75 arm). Single
+    /// idempotent `ADD COLUMN IF NOT EXISTS` batch + the target-cid index;
+    /// no backfill (legacy edges keep NULL cids and the query layer LEFT
+    /// JOINs `memories.cid`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v75(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v75 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V75_MEMORY_LINKS_LINEAGE_CID)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v75 memory_links lineage cid", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v75 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v75 applied (#1859: memory_links.source_cid / \
+             target_cid — additive lineage-DAG content-id mirror)"
         );
         Ok(())
     }
@@ -6206,7 +6255,7 @@ impl PostgresStore {
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let depth_raw: String = r
                     .try_get::<String, _>("depth")
-                    .map_err(|e| to_store_err("read depth", e))?;
+                    .map_err(|e| to_store_err(READ_DEPTH, e))?;
                 let path: String = r
                     .try_get::<String, _>("path")
                     .map_err(|e| to_store_err("read path", e))?;
@@ -6318,7 +6367,7 @@ impl PostgresStore {
                     .map_err(|e| to_store_err(READ_RELATION, e))?;
                 let depth_i: i32 = r
                     .try_get::<i32, _>("depth")
-                    .map_err(|e| to_store_err("read depth", e))?;
+                    .map_err(|e| to_store_err(READ_DEPTH, e))?;
                 let path: String = r
                     .try_get::<String, _>("path")
                     .map_err(|e| to_store_err("read path", e))?;
@@ -7023,6 +7072,255 @@ impl PostgresStore {
     /// Returns `StoreError::InvalidInput` for `max_depth == 0` or above
     /// the supported ceiling, and `StoreError::BackendUnavailable` for
     /// any underlying SQL or Cypher error.
+    /// v0.9.0 G13-mem (#1859) — recursive-CTE lineage walk over the
+    /// provenance subset P = {`derived_from`, `reflects_on`,
+    /// `derives_from`} (postgres twin of `db::lineage_ancestors` /
+    /// `db::lineage_descendants`). `ancestors=true` walks source ->
+    /// target (older provenance); `false` walks target -> source (newer
+    /// derivatives). Resolves each node's cid from the edge's stored
+    /// `*_cid` mirror with a LEFT JOIN fallback to `memories.cid`;
+    /// deliberately does NOT filter `lifecycle_state` — a Tombstoned
+    /// ancestor is the whole point of a conserved lineage.
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::InvalidInput` for `max_depth` outside
+    /// `[1, LINEAGE_MAX_DEPTH]`; `BackendUnavailable` for sqlx errors.
+    pub async fn lineage_cte(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+        ancestors: bool,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        validate_lineage_depth(max_depth)?;
+        let depth_cap = i32::try_from(max_depth).unwrap_or(i32::MAX);
+        let p_in_list = lineage_relation_in_list();
+        let (anchor_col, node_col, edge_cid_col) = if ancestors {
+            ("source_id", "target_id", "target_cid")
+        } else {
+            ("target_id", "source_id", "source_cid")
+        };
+        // Diamond-shaped provenance can reach one node through several
+        // paths; DISTINCT ON keeps the shortest-hop row per node so the
+        // wire shape matches the sqlite MIN(depth) GROUP BY.
+        let sql = format!(
+            "SELECT node_id, cid, relation, depth FROM (
+                SELECT DISTINCT ON (t.node_id)
+                       t.node_id, COALESCE(t.edge_cid, m.cid) AS cid,
+                       t.relation, t.depth
+                FROM (
+                    WITH RECURSIVE lineage(node_id, relation, edge_cid, depth, path) AS (
+                        SELECT ml.{node_col}, ml.relation, ml.{edge_cid_col}, 1,
+                               ARRAY[ml.{anchor_col}, ml.{node_col}]::TEXT[]
+                        FROM memory_links ml
+                        WHERE ml.{anchor_col} = $1 AND ml.relation IN ({p_in_list})
+                        UNION ALL
+                        SELECT ml.{node_col}, ml.relation, ml.{edge_cid_col}, t.depth + 1,
+                               t.path || ml.{node_col}
+                        FROM memory_links ml
+                        JOIN lineage t ON ml.{anchor_col} = t.node_id
+                        WHERE t.depth < $2 AND ml.relation IN ({p_in_list})
+                          AND NOT (ml.{node_col} = ANY(t.path))
+                    )
+                    SELECT node_id, relation, edge_cid, depth FROM lineage
+                ) t
+                LEFT JOIN memories m ON m.id = t.node_id
+                ORDER BY t.node_id, t.depth ASC
+            ) q
+            ORDER BY depth ASC, node_id ASC"
+        );
+
+        let rows = sqlx::query(&sql)
+            .bind(root_id)
+            .bind(depth_cap)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| to_store_err("cte lineage", e))?;
+
+        rows.iter()
+            .map(|r| {
+                use sqlx::Row;
+                let depth_i: i32 = r
+                    .try_get::<i32, _>("depth")
+                    .map_err(|e| to_store_err(READ_DEPTH, e))?;
+                Ok(crate::models::LineageNode {
+                    id: r
+                        .try_get::<String, _>("node_id")
+                        .map_err(|e| to_store_err("read node_id", e))?,
+                    cid: r
+                        .try_get::<Option<String>, _>("cid")
+                        .map_err(|e| to_store_err("read cid", e))?,
+                    relation: r
+                        .try_get::<String, _>(READ_RELATION_COL)
+                        .map_err(|e| to_store_err(READ_RELATION, e))?,
+                    depth: usize::try_from(depth_i).unwrap_or(0),
+                })
+            })
+            .collect()
+    }
+
+    /// v0.9.0 G13-mem (#1859) — Cypher (Apache AGE) lineage walk over the
+    /// `memory_graph` projection. COND 5: the relation is peeled from the
+    /// path's RELATIONSHIPS (`last(r).relation`, the `kg_query_cypher`
+    /// shape — an edge property, never `nodes(p)`), and cids live on the
+    /// RELATIONAL side, so after the graph walk the node ids are JOINed
+    /// back to `memories` for the cid fill — keeping the
+    /// `{id, cid, relation, depth}` wire shape byte-compatible with the
+    /// CTE branch. Duplicate multi-path hits collapse to the minimum
+    /// depth per node (the CTE's DISTINCT ON twin).
+    ///
+    /// # Errors
+    ///
+    /// `StoreError::InvalidInput` for an out-of-range `max_depth`;
+    /// `BackendUnavailable` for any sqlx or AGE error (the dispatcher
+    /// falls back to [`Self::lineage_cte`] on the latter).
+    pub async fn lineage_cypher(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+        ancestors: bool,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        validate_lineage_depth(max_depth)?;
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err(CTX_BEGIN_AGE_TX, e))?;
+        load_age_tolerated(&mut tx).await?;
+        sqlx::query(SQL_SET_AGE_SEARCH_PATH)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err(CTX_SET_SEARCH_PATH, e))?;
+
+        // The projection types each edge by its relation label
+        // (`project_link_into_age`), so the P filter is a label
+        // alternation on the variable-length pattern. `max_depth` is
+        // clamped upstream (no injection surface); the start id binds
+        // through AGE's `$vars` JSON.
+        let labels = crate::models::MemoryLinkRelation::LINEAGE
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        let pattern = if ancestors {
+            format!("(a)-[r:{labels}*1..{max_depth}]->(b)")
+        } else {
+            format!("(a)<-[r:{labels}*1..{max_depth}]-(b)")
+        };
+        let cypher = format!(
+            "MATCH p = {pattern} WHERE a.id = $start_id \
+             RETURN b.id AS node_id, last(r).relation AS relation, length(r) AS depth"
+        );
+        let params_lit = age_params_literal(&[("start_id", root_id)]);
+        let sql = format!(
+            "SELECT node_id, relation, depth FROM cypher('memory_graph', $$ {cypher} $$, \
+             {params_lit}) AS (node_id agtype, relation agtype, depth agtype)"
+        );
+
+        // #1482 — per-call-unique cypher text; run unnamed.
+        let rows = sqlx::query(&sql)
+            .persistent(false)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("cypher lineage", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
+
+        // Decode agtype cells + collapse multi-path duplicates to the
+        // minimum depth per node.
+        let mut best: std::collections::BTreeMap<String, (String, usize)> =
+            std::collections::BTreeMap::new();
+        for r in &rows {
+            use sqlx::Row;
+            let node_id: String = r
+                .try_get::<String, _>("node_id")
+                .map_err(|e| to_store_err("read node_id", e))?;
+            let relation: String = r
+                .try_get::<String, _>(READ_RELATION_COL)
+                .map_err(|e| to_store_err(READ_RELATION, e))?;
+            let depth_raw: String = r
+                .try_get::<String, _>("depth")
+                .map_err(|e| to_store_err(READ_DEPTH, e))?;
+            let depth: usize = strip_agtype_quotes(&depth_raw).parse().map_err(|_| {
+                StoreError::IntegrityFailed {
+                    detail: format!("non-numeric AGE depth: {depth_raw}"),
+                }
+            })?;
+            let node_id = strip_agtype_quotes(&node_id).to_string();
+            let relation = strip_agtype_quotes(&relation).to_string();
+            match best.get(&node_id) {
+                Some((_, d)) if *d <= depth => {}
+                _ => {
+                    best.insert(node_id, (relation, depth));
+                }
+            }
+        }
+
+        // COND 5(c) — cid fill from the relational source of truth.
+        let node_ids: Vec<String> = best.keys().cloned().collect();
+        let mut cids: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        if !node_ids.is_empty() {
+            let rows: Vec<(String, Option<String>)> =
+                sqlx::query_as("SELECT id, cid FROM memories WHERE id = ANY($1)")
+                    .bind(&node_ids)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("lineage cid fill", e))?;
+            cids.extend(rows);
+        }
+
+        let mut out: Vec<crate::models::LineageNode> = best
+            .into_iter()
+            .map(|(id, (relation, depth))| crate::models::LineageNode {
+                cid: cids.get(&id).cloned().flatten(),
+                id,
+                relation,
+                depth,
+            })
+            .collect();
+        out.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// v0.9.0 G13-mem (#1859) — backend dispatcher for a lineage walk.
+    /// COND 5(a): mirrors `find_paths`'s FULL dispatch — under
+    /// `KgBackend::Age` with `age_projection_mode() == Deferred` the walk
+    /// routes to the always-current relational CTE (a just-written edge
+    /// sits in `kg_projection_outbox`, and a healthy-but-stale AGE would
+    /// return a successful-EMPTY ancestry the runtime-failure fallback
+    /// cannot catch — breaking read-your-own-write on the
+    /// store -> reflect -> consolidate acceptance path). Sync-mode AGE
+    /// keeps the Cypher fast path with the graceful CTE fallback.
+    pub async fn lineage_traverse(
+        &self,
+        root_id: &str,
+        max_depth: usize,
+        ancestors: bool,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        match self.kg_backend {
+            KgBackend::Age => {
+                if matches!(
+                    crate::config::age_projection_mode(),
+                    crate::config::AgeProjectionMode::Deferred
+                ) {
+                    return self.lineage_cte(root_id, max_depth, ancestors).await;
+                }
+                match self.lineage_cypher(root_id, max_depth, ancestors).await {
+                    Ok(rows) => Ok(rows),
+                    Err(err) if is_age_runtime_failure(&err) => {
+                        warn_age_fallback("lineage", root_id, &err);
+                        self.lineage_cte(root_id, max_depth, ancestors).await
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            KgBackend::Cte => self.lineage_cte(root_id, max_depth, ancestors).await,
+        }
+    }
+
     pub async fn find_paths(
         &self,
         source_id: &str,
@@ -7438,6 +7736,46 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("resolve link source namespace", e))?;
         let link_ns = link_ns.unwrap_or_else(|| crate::DEFAULT_NAMESPACE.to_string());
 
+        // Pass 0: v0.9.0 G13-mem (#1859) — lineage-DAG acyclicity guard
+        // (postgres twin of the sqlite `validate_link_pre_create` Pass 0).
+        // When the master flag is on and the relation is in the provenance
+        // set P, reject a FORWARD (older -> newer) edge on a STRICT chrono
+        // `>` compare of the endpoints' `created_at` (COND 4: equal
+        // instants — a same-batch pair — are ALLOWED; an absent endpoint
+        // defers to `link_internal`'s FK pre-flight). Federation inbound
+        // (`apply_remote_link`) does not route through this gate, matching
+        // the sqlite `is_federation_import` bypass (clock skew).
+        if crate::config::lineage_dag_enabled() && link.relation.is_lineage() {
+            let stamps: Vec<(String, chrono::DateTime<chrono::Utc>)> =
+                sqlx::query_as("SELECT id, created_at FROM memories WHERE id = $1 OR id = $2")
+                    .bind(&link.source_id)
+                    .bind(&link.target_id)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("lineage guard created_at fetch", e))?;
+            let source_at = stamps
+                .iter()
+                .find(|(id, _)| *id == link.source_id)
+                .map(|(_, at)| *at);
+            let target_at = stamps
+                .iter()
+                .find(|(id, _)| *id == link.target_id)
+                .map(|(_, at)| *at);
+            if let (Some(source_at), Some(target_at)) = (source_at, target_at)
+                && target_at > source_at
+            {
+                return Err(StoreError::LinkRefused {
+                    // Byte-identical wire body to the sqlite guard (the
+                    // LINK_CYCLE_ERR_PREFIX envelope, HTTP 409).
+                    detail: crate::storage::StorageError::LinkReflectionCycle {
+                        source_id: link.source_id.clone(),
+                        target_id: link.target_id.clone(),
+                    }
+                    .to_string(),
+                });
+            }
+        }
+
         // Pass 1: cycle gate — only `reflects_on` participates in the
         // DAG invariant; the other relations may legally form cycles.
         if link.relation == crate::models::MemoryLinkRelation::ReflectsOn {
@@ -7619,6 +7957,33 @@ impl PostgresStore {
             _ => (None, crate::models::AttestLevel::Unsigned.as_str(), None),
         };
 
+        // v0.9.0 G13-mem (#1859) — populate the lineage-DAG cid mirror
+        // columns with each endpoint's schema-v74 `memories.cid` at
+        // link-creation time (postgres twin of the `db::create_link_signed`
+        // stamp). Gated on `lineage_dag_enabled()`: when OFF the pair binds
+        // NULL, byte-identical to the legacy row shape. The cids are NOT in
+        // the Ed25519 `SignableLink` preimage (COND 2 — advisory columns,
+        // not attested claims).
+        let (source_cid, target_cid): (Option<String>, Option<String>) =
+            if crate::config::lineage_dag_enabled() {
+                (
+                    sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
+                        .bind(&link.source_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| to_store_err("read source cid", e))?
+                        .flatten(),
+                    sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
+                        .bind(&link.target_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|e| to_store_err("read target cid", e))?
+                        .flatten(),
+                )
+            } else {
+                (None, None)
+            };
+
         // v0.7.0.1 G4 — wrap the SQL `INSERT INTO memory_links` write
         // and the AGE `memory_graph` projection MERGE in a single
         // transaction so a successful link write never leaves a
@@ -7641,8 +8006,9 @@ impl PostgresStore {
         sqlx::query(
             "INSERT INTO memory_links
                  (source_id, target_id, relation, created_at, valid_from,
-                  valid_until, signature, attest_level, observed_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                  valid_until, signature, attest_level, observed_by,
+                  source_cid, target_cid)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (source_id, target_id, relation) DO NOTHING",
         )
         .bind(&link.source_id)
@@ -7654,6 +8020,8 @@ impl PostgresStore {
         .bind(signature)
         .bind(attest_level)
         .bind(observed_by_col)
+        .bind(source_cid)
+        .bind(target_cid)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
@@ -9529,6 +9897,56 @@ async fn pg_emit_revision_leaf_if_enabled(
     .await
 }
 
+/// v0.9.0 G13-mem (#1859, COND 1) — the postgres half of the SINGLE
+/// consolidate-leaf emission site. Appends EXACTLY ONE signed
+/// `CONSOLIDATE` leaf for one merged-away source in the caller's open
+/// transaction, gated on the SHARED predicate
+/// [`crate::revisions::consolidate_leaf_enabled`] (append-only spine
+/// AND/OR the lineage tombstone sub-flag) — DELIBERATELY decoupled from
+/// the `append_only_enabled()`-gated [`pg_emit_revision_leaf_if_enabled`]
+/// so the lineage acceptance invariant ("a CONSOLIDATE leaf is appended")
+/// holds when `lineage_dag` is on and the append-only spine is off.
+/// `db::consolidate` mirrors this via
+/// [`crate::revisions::emit_consolidate_leaf`], so both backends land the
+/// same one leaf per source under every flag combination.
+async fn pg_emit_consolidate_leaf_if_enabled(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    memory_id: &str,
+    prior_version: Option<i64>,
+    namespace: &str,
+    agent_id: Option<&str>,
+    created_at: &str,
+) -> Result<(), sqlx::Error> {
+    if !crate::revisions::consolidate_leaf_enabled() {
+        return Ok(());
+    }
+    let kind = crate::revisions::RecordKind::Consolidate;
+    let signable = crate::revisions::revision_leaf_signable_bytes(
+        memory_id,
+        kind,
+        prior_version,
+        namespace,
+        agent_id,
+        created_at,
+    );
+    let signature = crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    let id = uuid::Uuid::new_v4().to_string();
+    pg_append_revision_leaf_in_tx(
+        tx,
+        PgRevisionLeafInsert {
+            id: &id,
+            memory_id,
+            kind,
+            prior_version,
+            namespace,
+            agent_id,
+            created_at,
+            signature: signature.as_deref(),
+        },
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // #1558 batch 5 wave 2 — shared sqlx `row.try_get` context labels.
 //
@@ -9540,6 +9958,11 @@ async fn pg_emit_revision_leaf_if_enabled(
 // ---------------------------------------------------------------------------
 const READ_NAMESPACE: &str = "read namespace";
 const READ_RELATION: &str = "read relation";
+/// v0.9.0 G13-mem (#1859) — shared `relation` column name for the lineage
+/// row decodes.
+const READ_RELATION_COL: &str = "relation";
+/// v0.9.0 G13-mem (#1859) — shared `read depth` decode-context label.
+const READ_DEPTH: &str = "read depth";
 const READ_TARGET_ID: &str = "read target_id";
 const READ_VALID_FROM: &str = "read valid_from";
 const READ_VALID_UNTIL: &str = "read valid_until";
@@ -10026,6 +10449,35 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 /// CTE branch can't paper over.
 fn is_age_runtime_failure(err: &StoreError) -> bool {
     matches!(err, StoreError::BackendUnavailable { .. })
+}
+
+/// v0.9.0 G13-mem (#1859) — validate a lineage-walk depth against the
+/// shared [`crate::storage::LINEAGE_MAX_DEPTH`] budget (postgres twin of
+/// the `db::lineage_traverse` gate, byte-identical error text).
+fn validate_lineage_depth(max_depth: usize) -> StoreResult<()> {
+    if max_depth == 0 {
+        return Err(StoreError::InvalidInput {
+            detail: crate::errors::msg::MAX_DEPTH_MIN.to_string(),
+        });
+    }
+    let cap = crate::storage::LINEAGE_MAX_DEPTH;
+    if max_depth > cap {
+        return Err(StoreError::InvalidInput {
+            detail: format!("max_depth={max_depth} exceeds supported depth={cap}"),
+        });
+    }
+    Ok(())
+}
+
+/// v0.9.0 G13-mem (#1859) — the SQL `IN (...)` literal list for the
+/// lineage provenance set, built from the typed SSOT
+/// (`MemoryLinkRelation::LINEAGE`) so no traversal re-spells the strings.
+fn lineage_relation_in_list() -> String {
+    crate::models::MemoryLinkRelation::LINEAGE
+        .iter()
+        .map(|r| format!("'{}'", r.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// v0.7.0 fold-A2A1.3 (#700) — structured warning emitted when a
@@ -15284,6 +15736,24 @@ impl MemoryStore for PostgresStore {
         Ok(rows.into_iter().map(|(ns,)| ns).collect())
     }
 
+    async fn lineage_ancestors(
+        &self,
+        id: &str,
+        max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        // v0.9.0 G13-mem (#1859) — route through the AGE/CTE dispatcher
+        // (Deferred-mode AGE routes to the CTE per COND 5).
+        self.lineage_traverse(id, max_depth, true).await
+    }
+
+    async fn lineage_descendants(
+        &self,
+        id: &str,
+        max_depth: usize,
+    ) -> StoreResult<Vec<crate::models::LineageNode>> {
+        self.lineage_traverse(id, max_depth, false).await
+    }
+
     async fn consolidate(
         &self,
         _ctx: &CallerContext,
@@ -15312,11 +15782,15 @@ impl MemoryStore for PostgresStore {
         let mut total_access: i64 = 0;
         let mut merged_metadata = serde_json::Map::new();
         let mut source_agent_ids: Vec<String> = Vec::new();
+        // v0.9.0 G13-mem (#1859) — per-source content-ids captured for the
+        // `metadata.derived_from_cids` record + the tombstone-path edge
+        // stamps below.
+        let mut source_cids: Vec<Option<String>> = Vec::with_capacity(ids.len());
 
         for id in ids {
             use sqlx::Row;
             let row = sqlx::query(
-                "SELECT tags, priority, access_count, metadata FROM memories WHERE id = $1",
+                "SELECT tags, priority, access_count, metadata, cid FROM memories WHERE id = $1",
             )
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -15325,6 +15799,7 @@ impl MemoryStore for PostgresStore {
             let Some(row) = row else {
                 return Err(StoreError::NotFound { id: id.clone() });
             };
+            source_cids.push(row.try_get::<Option<String>, _>("cid").unwrap_or(None));
             let priority: i32 = row.try_get("priority").unwrap_or(5);
             max_priority = max_priority.max(priority);
             let access_count: i64 = row.try_get(field_names::ACCESS_COUNT).unwrap_or(0);
@@ -15380,6 +15855,20 @@ impl MemoryStore for PostgresStore {
                         .map(serde_json::Value::String)
                         .collect(),
                 ),
+            );
+        }
+        // v0.9.0 G13-mem (#1859) — record the sources' content-ids on the
+        // result's `metadata.derived_from_cids` (parallel to the id-array
+        // `derived_from`), mirroring `db::consolidate`. COND 2: advisory
+        // best-effort anchor — the UUID array stays authoritative.
+        if crate::config::lineage_dag_enabled() {
+            let cids: Vec<serde_json::Value> = source_cids
+                .iter()
+                .filter_map(|cid| cid.clone().map(serde_json::Value::String))
+                .collect();
+            merged_metadata.insert(
+                "derived_from_cids".to_string(),
+                serde_json::Value::Array(cids),
             );
         }
         let merged_metadata_value = serde_json::Value::Object(merged_metadata);
@@ -15536,15 +16025,35 @@ impl MemoryStore for PostgresStore {
         // we delete the row we just upserted into and leave the caller
         // with a 201-but-vanished memory. Skip the deletion for the
         // upserted-into row; only the genuine source rows go away.
-        for id in ids {
+        // v0.9.0 G13-mem (#1859) — the consolidated row's own cid for the
+        // tombstone-path `source_cid` stamp. Read back from the upserted row
+        // (the UPSERT branch keeps the EXISTING row's genesis cid, so the
+        // freshly-minted `consolidate_cid` may not be what landed).
+        let new_row_cid: Option<String> = if crate::config::consolidate_tombstone_sources_enabled()
+        {
+            sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
+                .bind(&new_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("consolidate read result cid", e))?
+                .flatten()
+        } else {
+            None
+        };
+        for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
             }
-            // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: the
-            // merged-away source is consolidated INTO new_id; append ONE
-            // identity-only CONSOLIDATE leaf for the source IN THIS tx BEFORE
-            // its delete. Gated → flag-OFF unchanged.
-            if crate::config::append_only_enabled()
+            // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
+            // emission site (shared-predicate twin of
+            // `crate::revisions::emit_consolidate_leaf` on sqlite): EXACTLY
+            // ONE identity-only CONSOLIDATE leaf per source, appended IN
+            // THIS tx BEFORE the disposition (capture-then-compact), when
+            // the append-only spine (#1823) AND/OR the lineage tombstone
+            // sub-flag is on. Both-flags-off = no leaf (byte-identical
+            // legacy). Replaces the pre-#1859 `append_only_enabled()`-only
+            // gate; there is NO second emit anywhere in this method.
+            if crate::revisions::consolidate_leaf_enabled()
                 && let Some((ns, ver)) =
                     sqlx::query_as::<_, (String, i64)>(SQL_SELECT_NS_VERSION_BY_ID)
                         .bind(id)
@@ -15552,27 +16061,136 @@ impl MemoryStore for PostgresStore {
                         .await
                         .map_err(|e| to_store_err("consolidate read source for leaf", e))?
             {
-                pg_emit_revision_leaf_if_enabled(
+                pg_emit_consolidate_leaf_if_enabled(
                     &mut tx,
                     id,
-                    crate::revisions::RecordKind::Consolidate,
                     Some(ver),
                     &ns,
-                    None,
+                    Some(consolidator_agent_id),
                     &chrono::Utc::now().to_rfc3339(),
                 )
                 .await
                 .map_err(|e| to_store_err("append consolidate revision leaf", e))?;
             }
-            sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+            if crate::config::consolidate_tombstone_sources_enabled() {
+                // v0.9.0 G13-mem (#1859) — TOMBSTONE path (mirrors
+                // `db::consolidate`): retain the source row (id + cid), write
+                // a navigable `derived_from` edge C -> source carrying the
+                // cid mirror, and flip `lifecycle_state` to `tombstoned`.
+                // The source's own inbound provenance edges survive (no
+                // delete, no CASCADE), so multi-hop lineage stays walkable.
+                sqlx::query(
+                    "INSERT INTO memory_links
+                         (source_id, target_id, relation, created_at, valid_from,
+                          attest_level, source_cid, target_cid)
+                     VALUES ($1, $2, $3, $4, $4, $5, $6, $7)
+                     ON CONFLICT (source_id, target_id, relation) DO NOTHING",
+                )
+                .bind(&new_id)
+                .bind(id)
+                .bind(crate::models::MemoryLinkRelation::DerivedFrom.as_str())
+                .bind(now)
+                .bind(crate::models::AttestLevel::Unsigned.as_str())
+                .bind(new_row_cid.as_deref())
+                .bind(source_cid.as_deref())
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
+                sqlx::query(
+                    "UPDATE memories SET lifecycle_state = $1, updated_at = $2 WHERE id = $3",
+                )
+                .bind(crate::models::LifecycleState::Tombstoned.as_str())
+                .bind(now)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("consolidate delete source", e))?;
-            // #1783 — remove the merged-away source's AGE projection in
-            // this tx so kg_query/find_paths don't keep a ghost edge to it.
-            if matches!(self.kg_backend, KgBackend::Age) {
-                unproject_memory_from_age(&mut tx, id).await?;
+                .map_err(|e| to_store_err("consolidate tombstone source", e))?;
+                // Project the new edge into AGE (mirroring `link_internal`'s
+                // discipline) so the lineage Cypher path sees it: deferred
+                // mode enqueues to the outbox in this tx; sync mode rides a
+                // tolerated SAVEPOINT (best-effort — the relational row is
+                // the source of truth and the CTE fallback stays correct).
+                // The source node is DELIBERATELY NOT unprojected — a
+                // tombstoned ancestor must stay reachable.
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    if matches!(
+                        crate::config::age_projection_mode(),
+                        crate::config::AgeProjectionMode::Deferred
+                    ) {
+                        sqlx::query(
+                            "INSERT INTO kg_projection_outbox (source_id, target_id, relation) \
+                             VALUES ($1, $2, $3)",
+                        )
+                        .bind(&new_id)
+                        .bind(id)
+                        .bind(crate::models::MemoryLinkRelation::DerivedFrom.as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| to_store_err("enqueue kg_projection_outbox", e))?;
+                    } else {
+                        sqlx::query("SAVEPOINT age_consolidate_projection")
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| to_store_err("savepoint age_consolidate_projection", e))?;
+                        match project_link_into_age(
+                            &mut tx,
+                            &new_id,
+                            id,
+                            crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                sqlx::query("RELEASE SAVEPOINT age_consolidate_projection")
+                                    .execute(&mut *tx)
+                                    .await
+                                    .map_err(|e| {
+                                        to_store_err(
+                                            "release savepoint age_consolidate_projection",
+                                            e,
+                                        )
+                                    })?;
+                            }
+                            Err(e) if is_age_runtime_failure(&e) => {
+                                sqlx::query("ROLLBACK TO SAVEPOINT age_consolidate_projection")
+                                    .execute(&mut *tx)
+                                    .await
+                                    .map_err(|e2| {
+                                        to_store_err(
+                                            "rollback savepoint age_consolidate_projection",
+                                            e2,
+                                        )
+                                    })?;
+                                warn_age_fallback_pair("consolidate_lineage_edge", &new_id, id, &e);
+                            }
+                            Err(e) => {
+                                sqlx::query("ROLLBACK TO SAVEPOINT age_consolidate_projection")
+                                    .execute(&mut *tx)
+                                    .await
+                                    .map_err(|e2| {
+                                        to_store_err(
+                                            "rollback savepoint age_consolidate_projection",
+                                            e2,
+                                        )
+                                    })?;
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // LEGACY hard-DELETE path (sub-flag OFF) — byte-identical
+                // pre-#1859 behavior.
+                sqlx::query(SQL_DELETE_MEMORY_BY_ID)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| to_store_err("consolidate delete source", e))?;
+                // #1783 — remove the merged-away source's AGE projection in
+                // this tx so kg_query/find_paths don't keep a ghost edge to it.
+                if matches!(self.kg_backend, KgBackend::Age) {
+                    unproject_memory_from_age(&mut tx, id).await?;
+                }
             }
         }
 

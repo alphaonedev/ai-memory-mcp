@@ -47,6 +47,9 @@ pub const LINKS_ID: &str = "/api/v1/links/{id}";
 pub const MEMORIES: &str = "/api/v1/memories";
 pub const MEMORIES_BULK: &str = "/api/v1/memories/bulk";
 pub const MEMORIES_ID: &str = "/api/v1/memories/{id}";
+/// v0.9.0 G13-mem (#1859) — derivation lineage-DAG walk
+/// (ancestors/descendants over the provenance link subset).
+pub const MEMORIES_ID_LINEAGE: &str = "/api/v1/memories/{id}/lineage";
 pub const MEMORIES_ID_PROMOTE: &str = "/api/v1/memories/{id}/promote";
 pub const MEMORY_ATOMISE: &str = "/api/v1/memory_atomise";
 pub const MEMORY_CALIBRATE_CONFIDENCE: &str = "/api/v1/memory_calibrate_confidence";

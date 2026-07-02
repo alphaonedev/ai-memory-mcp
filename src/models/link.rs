@@ -273,6 +273,53 @@ impl MemoryLinkRelation {
             Self::Advances,
         ]
     }
+
+    /// v0.9.0 G13-mem (#1859) — the provenance subset of relations that
+    /// constitute the memory-derivation lineage-DAG. Every edge in this set
+    /// points child(`source_id`) -> parent(`target_id`) (newer/derived ->
+    /// older/source), so a recursive traversal restricted to exactly this
+    /// set walks a strict provenance DAG. All three are already members of
+    /// the closed `memory_links.relation` CHECK allowlist, so the
+    /// lineage-DAG is a VIEW over existing edges — it adds NO new relation.
+    /// Keep this array in lockstep with [`Self::is_lineage`]; the pairing
+    /// is pinned by `tests/memory_link_relation_count_invariant.rs`.
+    // M-STRONG-TYPES: the lineage set is a typed const, not a stringly
+    // literal list re-spelled at each traversal / query call site.
+    pub const LINEAGE: [Self; 3] = [Self::DerivedFrom, Self::ReflectsOn, Self::DerivesFrom];
+
+    /// Whether this relation participates in the lineage-DAG provenance set
+    /// [`Self::LINEAGE`] (`derived_from` / `reflects_on` / `derives_from`).
+    #[must_use]
+    pub const fn is_lineage(self) -> bool {
+        matches!(
+            self,
+            Self::DerivedFrom | Self::ReflectsOn | Self::DerivesFrom
+        )
+    }
+}
+
+/// v0.9.0 G13-mem (#1859) — one node on a memory-derivation lineage-DAG
+/// walk (an ancestor or a descendant of the query root), carrying the
+/// edge relation that reached it and its hop-distance from the root.
+///
+/// `cid` is the node's stable content-address, resolved from the edge's
+/// stored `source_cid`/`target_cid` mirror when present, else a LEFT JOIN
+/// fallback to the live `memories.cid`. `None` when neither carries one
+/// (legacy edge into a pre-v74 row). Per COND 2 (#1859) the cid is an
+/// advisory anchor — `memories.cid` has only a NON-unique index and
+/// federation dedups on UUID, so the row `id` remains the authoritative
+/// 1:1 key; the cid is a best-effort federation-resolution hint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageNode {
+    /// The reached memory's UUID (authoritative identity).
+    pub id: String,
+    /// The reached memory's content-address, or `None` (see type docs).
+    pub cid: Option<String>,
+    /// The lineage relation on the edge that reached this node
+    /// (`derived_from` / `reflects_on` / `derives_from`).
+    pub relation: String,
+    /// Hop distance from the query root (1 = a direct parent/child).
+    pub depth: usize,
 }
 
 impl std::fmt::Display for MemoryLinkRelation {

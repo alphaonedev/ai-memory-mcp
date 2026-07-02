@@ -453,6 +453,11 @@ pub enum Command {
     /// Enumerate up to N paths through the KG between two memories
     /// (BFS, `max_depth<=7`). CLI parity for `memory_find_paths`.
     FindPaths(crate::cli::commands::find_paths::FindPathsArgs),
+    /// v0.9.0 G13-mem (#1859) — `ai-memory lineage` subcommand. Walk a
+    /// memory's derivation lineage-DAG (ancestors/descendants over the
+    /// provenance relations `derived_from` / `reflects_on` /
+    /// `derives_from`, `max_depth<=5`). CLI parity for `memory_lineage`.
+    Lineage(crate::cli::commands::lineage::LineageArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory recall-observations`
     /// subcommand. List rows from the recall-consumption ledger
     /// (#886). CLI parity for `memory_recall_observations`.
@@ -955,6 +960,27 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     // `PostgresStore::link_internal` reads it at write time. Default sync =
     // byte-identical inline AGE MERGE; harmless on sqlite/mcp/CLI paths.
     crate::config::set_age_projection_mode(resolved_storage.age_projection_mode);
+    // v0.9.0 G13-mem (#1859) — the resolved lineage-DAG flags
+    // (`resolved_storage.lineage_dag` / `.consolidate_tombstone_sources`,
+    // master default ON) are DELIBERATELY NOT seeded into the process-wide
+    // atomics here. Mirrors the G6 `append_only` precedent: the flag is a
+    // BEHAVIOR-CHANGING process-wide `AtomicBool`, and `daemon_runtime::run`
+    // is exercised by the lib unit-test binary (the Identity/Rules/Governance
+    // dispatch tests), so seeding it here would flip the flag ON for every
+    // concurrently-running storage/cycle/consolidate unit test in the same
+    // process and make the suite order-dependent. The edge-write cid
+    // population, the P-wide acyclicity guard, the lineage query surface, and
+    // `db::consolidate`'s tombstone path all read `lineage_dag_enabled()` /
+    // `consolidate_tombstone_sources_enabled()`, which stay OFF (byte-identical
+    // legacy) until explicitly seeded. Wiring the production master-on seed
+    // (behind a test-isolation reset in the daemon_runtime harness) is the
+    // tracked follow-up; callers opt in today via `AI_MEMORY_LINEAGE_DAG` +
+    // `crate::config::set_lineage_dag` / `set_consolidate_tombstone_sources`
+    // (which `resolve_storage` already resolves the values for).
+    let _ = (
+        resolved_storage.lineage_dag,
+        resolved_storage.consolidate_tombstone_sources,
+    );
     // v0.8.1 W1 (#1821 / gap G29) — seed the process-wide credential-screen
     // mode from the resolved `[security]` config (env
     // `AI_MEMORY_SECRET_SCREEN_MODE` > `[security].secret_screen_mode` >
@@ -1790,6 +1816,14 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::commands::find_paths::cmd_find_paths(&db_path, &a, &mut out)
+        }
+        Command::Lineage(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::commands::lineage::cmd_lineage(&db_path, &a, &mut out)
         }
         Command::RecallObservations(a) => {
             let stdout = std::io::stdout();

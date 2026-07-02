@@ -266,7 +266,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-01 (#1825 G8) — bumped 21_800 → 21_900: the additive
     // BLAKE3 content-id genesis stamping (insert/insert_if_newer/
     // consolidate/restore) + verify + T7 scrub pushed the file to 21_880.
-    ("src/storage/mod.rs", 21_900),
+    // 2026-07-01 (#1859 G13-mem) — bumped 21_900 → 22_300: the lineage-DAG
+    // landing (read_memory_cid + lineage_edge_is_forward + the Pass-0 guard
+    // in validate_link_pre_create, the cid mirror in create_link_signed,
+    // the consolidate tombstone/leaf disposition, and the
+    // lineage_traverse/ancestors/descendants recursive-CTE walk) grew the
+    // file to 22_218; 22_300 = 82 headroom.
+    ("src/storage/mod.rs", 22_300),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -318,7 +324,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // pre_signal_send_decision block_on_local bridge + dispatch_memory_signal_send
     // gate wiring + run_mcp_server inert-by-default install + the
     // map_chain_result_to_signal_decision_1752 unit test) landed the file at 15_213.
-    ("src/mcp/mod.rs", 15_300),
+    // 2026-07-01 (#1859 G13-mem) — bumped 15_300 → 15_400: the
+    // memory_lineage module mount + dispatch wrapper + TOOL_DISPATCH_TABLE
+    // entry grew the file to 15_303; 15_400 = 97 headroom.
+    ("src/mcp/mod.rs", 15_400),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -620,7 +629,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // reclassify_memory_kind). Pure `#[cfg(test)]` coverage additions, ZERO new
     // production surface; file grew to 24_342. 24_400 = 24_342 + 58 headroom,
     // far under the 1.5x aspirational cap.
-    ("src/store/postgres.rs", 24_400),
+    // 2026-07-01 (#1859 G13-mem) — bumped 24_400 → 25_050: the lineage-DAG
+    // postgres twin (migrate_v75, link_internal cid mirror, the Pass-0
+    // lineage guard in validate_link_pre_create_pg, the consolidate
+    // tombstone + single CONSOLIDATE-leaf emission, and the
+    // lineage_cte/lineage_cypher/lineage_traverse dispatcher) grew the file
+    // to 24_979; 25_050 = 71 headroom.
+    ("src/store/postgres.rs", 25_050),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -720,7 +735,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `[security]` section (`SecurityConfig.secret_screen_mode`),
     // `ENV_SECRET_SCREEN_MODE`, and `resolve_secret_screen_mode()` for the
     // pre-write credential screen (actual 11_353; 47 headroom).
-    ("src/config.rs", 11_500),
+    // 2026-07-01 (#1859 G13-mem) — bumped 11_500 → 11_650: the lineage-DAG
+    // flag pair (StorageSection/ResolvedStorage fields, env consts, the
+    // boot-seeded atomics + accessors, resolver arms) + the
+    // CapabilityFeatures.lineage_dag advertisement grew the file to
+    // 11_583; 11_650 = 67 headroom.
+    ("src/config.rs", 11_650),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -838,7 +858,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // bootstrap_serve call site + 6 `boot_posture_*` unit tests (loud
     // non-loopback boot security-posture WARNs). Ceiling is aspirational, not
     // a ratchet — see `qual_10_ceiling_table_is_aspirational_not_ratcheting_up`.
-    ("src/daemon_runtime.rs", 9_200),
+    // 2026-07-01 (#1859 G13-mem) — bumped 9_200 → 9_300: the Lineage CLI
+    // subcommand variant + dispatch arm + the documented deferred
+    // lineage-flag boot-seed note grew the file to 9_208; 9_300 = 92
+    // headroom.
+    ("src/daemon_runtime.rs", 9_300),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -904,7 +928,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // it at 4_560.
     // 2026-07-01 (#1825 G8) — bumped 4_700 → 4_850: the v74 ladder arm +
     // MIGRATION_V74_SQLITE + backfill_memory_cids pushed the file to 4_816.
-    ("src/storage/migrations.rs", 4_850),
+    // 2026-07-01 (#1859 G13-mem) — bumped 4_850 → 4_950: the v75 ladder arm
+    // (probe-guarded ALTER) + MIGRATION_V75_SQLITE + the bootstrap-SCHEMA
+    // cid-mirror columns/index + the COND-8 rebuild-drift comments grew the
+    // file to 4_871; 4_950 = 79 headroom.
+    ("src/storage/migrations.rs", 4_950),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

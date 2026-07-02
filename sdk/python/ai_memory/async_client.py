@@ -289,6 +289,20 @@ class AsyncAiMemoryClient:
         raw = await self._request("GET", f"/api/v1/links/{memory_id}")
         return raw.get("links", raw) if isinstance(raw, dict) else raw
 
+    async def lineage(
+        self,
+        memory_id: str,
+        *,
+        direction: str = "ancestors",
+        max_depth: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /api/v1/memories/{id}/lineage`` (v0.9.0 G13-mem, #1859)."""
+        return await self._request(
+            "GET",
+            f"/api/v1/memories/{memory_id}/lineage",
+            params={"direction": direction, "max_depth": max_depth},
+        )
+
     async def stats(self) -> Stats:
         return Stats.model_validate(await self._request("GET", "/api/v1/stats"))
 

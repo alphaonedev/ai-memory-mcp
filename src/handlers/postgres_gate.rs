@@ -115,6 +115,9 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
         // Wave-3 phase 3 — core CRUD (commit c049500).
         ("POST", super::routes::MEMORIES) | ("GET", super::routes::MEMORIES) => true,
         ("GET" | "PUT" | "DELETE", p) if memory_id_path(p) => true,
+        // v0.9.0 G13-mem (#1859) — lineage walk rides the SAL
+        // `lineage_ancestors`/`lineage_descendants` trait methods on postgres.
+        ("GET", p) if memory_lineage_path(p) => true,
         ("GET", super::routes::SEARCH) => true,
         ("POST", super::routes::LINKS) => true,
         ("GET", p) if links_id_path(p) => true,
@@ -233,7 +236,7 @@ pub fn postgres_endpoint_supported(method: &axum::http::Method, path: &str) -> b
 /// Path matcher for `/api/v1/memories/{id}/promote`.
 #[cfg(feature = "sal")]
 fn memory_promote_path(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix("/api/v1/memories/") else {
+    let Some(rest) = p.strip_prefix(MEMORIES_ID_PREFIX) else {
         return false;
     };
     rest.ends_with("/promote") && rest.split('/').count() == 2
@@ -282,9 +285,14 @@ fn namespace_standard_delete_path(p: &str) -> bool {
 }
 
 /// Path matcher for `/api/v1/memories/{id}` (no further sub-segment).
+/// Shared `/api/v1/memories/{id}…` path prefix for the sub-resource
+/// matchers below (single spelling; pm-v3.1 literal gate).
+#[cfg(feature = "sal")]
+const MEMORIES_ID_PREFIX: &str = "/api/v1/memories/";
+
 #[cfg(feature = "sal")]
 fn memory_id_path(p: &str) -> bool {
-    let Some(rest) = p.strip_prefix("/api/v1/memories/") else {
+    let Some(rest) = p.strip_prefix(MEMORIES_ID_PREFIX) else {
         return false;
     };
     // Reject the bulk path and any further sub-segments.
@@ -292,6 +300,16 @@ fn memory_id_path(p: &str) -> bool {
         return false;
     }
     !rest.contains('/')
+}
+
+/// v0.9.0 G13-mem (#1859) — path matcher for
+/// `/api/v1/memories/{id}/lineage`.
+#[cfg(feature = "sal")]
+fn memory_lineage_path(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix(MEMORIES_ID_PREFIX) else {
+        return false;
+    };
+    rest.ends_with("/lineage") && rest.split('/').count() == 2
 }
 
 /// Path matcher for `/api/v1/links/{id}`.
@@ -476,6 +494,8 @@ pub fn path_is_registered_route(method: &axum::http::Method, path: &str) -> bool
         ("GET" | "PUT" | "DELETE", p) if memory_id_path(p) => true,
         // /api/v1/memories/{id}/promote
         ("POST", p) if memory_promote_path(p) => true,
+        // /api/v1/memories/{id}/lineage (#1859)
+        ("GET", p) if memory_lineage_path(p) => true,
         // /api/v1/links/{id}
         ("GET", p) if links_id_path(p) => true,
         // /api/v1/namespaces/{ns}/standard (GET/POST/DELETE all registered)

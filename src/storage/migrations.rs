@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 74).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 75).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -261,6 +261,21 @@ CREATE TABLE IF NOT EXISTS memory_links (
     signature    BLOB,
     -- v23 attest_level column (added historically via ALTER).
     attest_level TEXT,
+    -- v0.9.0 G13-mem (#1859, schema v75) — lineage-DAG content-id mirror.
+    -- `source_cid` / `target_cid` carry the `b3:<hex>` content-address
+    -- (schema v74 `memories.cid`) of each endpoint AT LINK-CREATION TIME so
+    -- a lineage traversal resolves stable node identity even after a source
+    -- is tombstoned. NULL when the endpoint has no cid (legacy rows); the
+    -- query layer LEFT JOINs `memories.cid` as a fallback. Also added by
+    -- migration v75 (file 0059) for upgrading DBs; carried inline here so a
+    -- fresh bootstrap that applies SCHEMA has them even before the ladder
+    -- runs. COND 8 (#1859): any FUTURE full-table CHECK rebuild of
+    -- `memory_links` (the 0027/0053-style
+    -- `CREATE TABLE memory_links_new ... INSERT ... SELECT` dance) MUST add
+    -- `source_cid` + `target_cid` to its explicit INSERT + SELECT column
+    -- lists, or the rebuild silently drops the lineage cids.
+    source_cid   TEXT,
+    target_cid   TEXT,
     PRIMARY KEY (source_id, target_id, relation),
     -- v33 (v0.7.0 v0.7.1-fold) — SQL-side CHECK constraint promoting the
     -- v23 RAISE-trigger validation to a column-level invariant. Closed
@@ -271,6 +286,12 @@ CREATE TABLE IF NOT EXISTS memory_links (
     -- / `advances` for the Goal/Plan/Step wiring relations.
     CHECK (relation IN ('related_to', 'supersedes', 'contradicts', 'derived_from', 'reflects_on', 'derives_from', 'decomposes_into', 'depends_on', 'advances'))
 );
+-- v0.9.0 G13-mem (#1859, schema v75) — `idx_memory_links_target_cid` is
+-- DELIBERATELY NOT created inline here: `open()` replays this bootstrap
+-- SCHEMA against LEGACY databases too (BEFORE the migration ladder), where
+-- `memory_links` pre-exists WITHOUT the v75 cid columns — an inline index
+-- on the missing column would crash every legacy open. The v75 ladder arm
+-- owns the index on both the fresh and the upgrade path.
 
 -- v70 (#1771) — edge-preservation snapshot table. Mirrors memory_links
 -- columns but carries NO `REFERENCES memories(id)` FK (it is an archive
@@ -733,7 +754,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 74;
+const CURRENT_SCHEMA_VERSION: i64 = 75;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1233,6 +1254,12 @@ const MIGRATION_V62_SQLITE: &str = include_str!("../../migrations/sqlite/0052_v6
 // `depends_on` / `advances` to the closed `relation` CHECK (6 -> 9).
 // Mirrors the v33 (0027) and v36 (MIGRATION_V36_REBUILD_LINKS_SQL)
 // rebuild dance exactly; the only delta is the extended CHECK clause.
+//
+// COND 8 (#1859, schema v75): any FUTURE full-table rebuild of
+// `memory_links` in this 0027/0053 style MUST add the v75 lineage columns
+// `source_cid` + `target_cid` to BOTH the `CREATE TABLE memory_links_new`
+// and the explicit `INSERT INTO memory_links_new (...) SELECT ...` column
+// lists, or the rebuild silently drops the lineage-DAG cids on upgrade.
 const MIGRATION_V63_SQLITE: &str =
     include_str!("../../migrations/sqlite/0053_v63_memory_links_typed_cognition_relations.sql");
 
@@ -1275,6 +1302,15 @@ const MIGRATION_V73_SQLITE: &str =
 // legacy rows runs after the ALTER in the same arm.
 const MIGRATION_V74_SQLITE: &str =
     include_str!("../../migrations/sqlite/0058_v74_memories_cid.sql");
+// v75 (#1859, v0.9.0 G13-mem) — additive lineage-DAG content-id mirror:
+// the `memory_links.source_cid` + `memory_links.target_cid` (TEXT) columns
+// + the `idx_memory_links_target_cid` index. SQLite has no `ADD COLUMN IF
+// NOT EXISTS` and adds one column per ALTER, so the v75 ladder arm runs
+// this only behind a column-existence probe (fresh installs inherit the
+// columns inline from the CREATE TABLE in `SCHEMA`). No backfill: legacy
+// edges keep NULL cids and the query layer LEFT JOINs `memories.cid`.
+const MIGRATION_V75_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0059_v75_memory_links_lineage_cid.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3119,6 +3155,38 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 conn.execute_batch(MIGRATION_V74_SQLITE)?;
             }
             backfill_memory_cids(conn)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v75 = #1859 / v0.9.0 G13-mem (lineage-DAG) — add the
+            // `memory_links.source_cid` + `.target_cid` (TEXT) columns +
+            // `idx_memory_links_target_cid`. COND 3 (#1859): the columns are
+            // ALSO mirrored byte-identically into the bootstrap SCHEMA const
+            // (the `CREATE TABLE memory_links`), so a FRESH install already
+            // carries them — running the ALTER unconditionally would crash
+            // that fresh install with `duplicate column name`. Guard the
+            // ALTER behind the v73/v74 column-existence probe: a fresh DB
+            // (columns present from SCHEMA) skips it; a legacy upgrade DB
+            // (columns absent) runs it exactly once. No backfill — legacy
+            // edges keep NULL cids and the query layer LEFT JOINs
+            // `memories.cid` as a fallback.
+            let has_source_cid = conn
+                .prepare("SELECT source_cid FROM memory_links LIMIT 0")
+                .is_ok();
+            if !has_source_cid {
+                conn.execute_batch(MIGRATION_V75_SQLITE)?;
+            } else {
+                // Fresh install: the columns came inline from the bootstrap
+                // SCHEMA, which deliberately does NOT carry the index (an
+                // inline index would crash a LEGACY open — the bootstrap
+                // replays before this ladder, when the column is still
+                // absent). Create it here; idempotent by name.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memory_links_target_cid \
+                     ON memory_links(target_cid)",
+                    [],
+                )?;
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

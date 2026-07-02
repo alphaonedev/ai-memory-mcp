@@ -319,6 +319,29 @@ class AiMemoryClient:
         raw = self._request("GET", f"/api/v1/links/{memory_id}")
         return raw.get("links", raw) if isinstance(raw, dict) else raw
 
+    def lineage(
+        self,
+        memory_id: str,
+        *,
+        direction: str = "ancestors",
+        max_depth: int | None = None,
+    ) -> dict[str, Any]:
+        """``GET /api/v1/memories/{id}/lineage`` (v0.9.0 G13-mem, #1859).
+
+        Walk the memory-derivation lineage-DAG from ``memory_id`` over the
+        provenance link relations (``derived_from`` / ``reflects_on`` /
+        ``derives_from``). ``direction`` is ``"ancestors"`` (default) or
+        ``"descendants"``; ``max_depth`` caps the walk (server ceiling 5).
+        Returns the ``{id, direction, nodes, count}`` envelope where each
+        node is ``{id, cid, relation, depth}``. Tombstoned ancestors are
+        included.
+        """
+        return self._request(
+            "GET",
+            f"/api/v1/memories/{memory_id}/lineage",
+            params={"direction": direction, "max_depth": max_depth},
+        )
+
     def stats(self) -> Stats:
         """``GET /api/v1/stats``."""
         return Stats.model_validate(self._request("GET", "/api/v1/stats"))

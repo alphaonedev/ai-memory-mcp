@@ -317,7 +317,9 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 // contributes regardless of which test module declares it.
 // ---------------------------------------------------------------------------
 
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 91;
+// 2026-07-01 (#1859 G13-mem) — bumped 91 → 92: the derivation lineage-DAG
+// read surface `GET /api/v1/memories/{id}/lineage` (`handlers::get_lineage`).
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 92;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -341,7 +343,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/actions/{id}/transition` (coordination action-transition write).
 // 2026-06-22 (#1718 Commit C2) — bumped 76 → 77: the new unique path
 // `/api/v1/signals` (signal send write surface).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
+// 2026-07-01 (#1859 G13-mem) — bumped 77 → 78: the new unique path
+// `/api/v1/memories/{id}/lineage` (derivation lineage-DAG read surface).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 78;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -356,9 +360,9 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 // ---------------------------------------------------------------------------
 
 /// Variants in `pub enum Command` (src/daemon_runtime.rs) that
-/// COMPILE under the default build. The source file declares 85
+/// COMPILE under the default build. The source file declares 86
 /// variants; two (`Migrate`, `SchemaInit`) are `#[cfg(feature =
-/// "sal")]`-gated and excluded from default builds, leaving 83.
+/// "sal")]`-gated and excluded from default builds, leaving 84.
 /// (v0.7.0 #1443 added `Expand` for the `ai-memory expand` CLI parity
 /// surface, bumping 78 → 79; #1598 added `Reembed` for the
 /// `ai-memory reembed` vector-space migration, bumping 79 → 80;
@@ -367,8 +371,10 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 77;
 /// #1709/#1720 WS-B B2 added `Reown` for the `ai-memory reown`
 /// namespace-ownership re-stamp CLI, bumping 81 → 82; #1727 added
 /// `UndoEdit` for the CLI-ONLY `ai-memory undo-edit` NON-DESTRUCTIVE
-/// in-place-edit undo, bumping 82 → 83.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 83;
+/// in-place-edit undo, bumping 82 → 83; v0.9.0 G13-mem #1859 added
+/// `Lineage` for the `ai-memory lineage` derivation lineage-DAG walk,
+/// bumping 83 → 84.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 84;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -378,8 +384,9 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 83;
 /// v0.8.0 §22 PE-8 (#697 / EPIC #1709) added `VerifyAuditTrail`,
 /// bumping 82 → 83; v0.8.0 #1709/#1720 WS-B B2 added `Reown`, bumping
 /// 83 → 84; #1727 added `UndoEdit` for the CLI-ONLY `ai-memory
-/// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 85;
+/// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85;
+/// v0.9.0 G13-mem #1859 added `Lineage`, bumping 85 → 86.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 86;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification
@@ -918,6 +925,13 @@ pub fn build_router_with_timeout(
         .route(handlers::routes::LINKS, post(handlers::create_link))
         .route(handlers::routes::LINKS, delete(handlers::delete_link))
         .route(handlers::routes::LINKS_ID, get(handlers::get_links))
+        // v0.9.0 G13-mem (#1859) — derivation lineage-DAG walk
+        // (ancestors/descendants over derived_from/reflects_on/derives_from;
+        // SAL-backed on postgres, recursive CTE on sqlite).
+        .route(
+            handlers::routes::MEMORIES_ID_LINEAGE,
+            get(handlers::get_lineage),
+        )
         // HTTP parity for MCP-only tools. The `/api/v1/namespaces` surface
         // serves three verbs: GET lists namespaces OR (when ?namespace=…)
         // fetches the namespace standard, POST sets a standard, DELETE

@@ -68,3 +68,33 @@ fn memory_link_relation_all_contains_default_relation() {
          omit the schema default."
     );
 }
+
+/// v0.9.0 G13-mem (#1859) — the lineage-DAG provenance set is EXACTLY
+/// {`derived_from`, `reflects_on`, `derives_from`}, and `LINEAGE` /
+/// `is_lineage` agree. Pins the SSOT so a future relation cannot silently
+/// drift into (or out of) the lineage traversal set.
+#[test]
+fn memory_link_relation_lineage_set_is_the_three_provenance_relations() {
+    let lineage: std::collections::BTreeSet<&str> = MemoryLinkRelation::LINEAGE
+        .iter()
+        .map(MemoryLinkRelation::as_str)
+        .collect();
+    let want: std::collections::BTreeSet<&str> = ["derived_from", "reflects_on", "derives_from"]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        lineage, want,
+        "LINEAGE drift: the lineage-DAG provenance set must be exactly \
+         {{derived_from, reflects_on, derives_from}}."
+    );
+
+    // LINEAGE and is_lineage() are two spellings of one set — they must
+    // agree for every variant.
+    for variant in MemoryLinkRelation::all() {
+        assert_eq!(
+            variant.is_lineage(),
+            MemoryLinkRelation::LINEAGE.contains(variant),
+            "is_lineage()/LINEAGE disagree for {variant:?}"
+        );
+    }
+}

@@ -276,6 +276,13 @@ pub enum LifecycleState {
     Done,
     /// Withdrawn before completion (terminal).
     Abandoned,
+    /// v0.9.0 G13-mem (#1859) — logical delete: the row is retained in
+    /// `memories` (id + cid preserved) so lineage-DAG traversal can still
+    /// reach it as a provenance ancestor, but it is excluded from ordinary
+    /// recall/list. Set ONLY by the system consolidation-tombstone path via
+    /// a raw UPDATE (it is not a caller-reachable [`Self::can_transition_to`]
+    /// target); terminal, mirroring [`crate::revisions::RecordKind::Tombstone`].
+    Tombstoned,
 }
 
 impl LifecycleState {
@@ -288,6 +295,7 @@ impl LifecycleState {
             Self::Blocked => "blocked",
             Self::Done => "done",
             Self::Abandoned => "abandoned",
+            Self::Tombstoned => "tombstoned",
         }
     }
 
@@ -302,6 +310,7 @@ impl LifecycleState {
             "blocked" => Some(Self::Blocked),
             "done" => Some(Self::Done),
             "abandoned" => Some(Self::Abandoned),
+            "tombstoned" => Some(Self::Tombstoned),
             _ => None,
         }
     }
@@ -316,13 +325,16 @@ impl LifecycleState {
             Self::Blocked,
             Self::Done,
             Self::Abandoned,
+            Self::Tombstoned,
         ]
     }
 
-    /// Terminal states accept no outbound transition.
+    /// Terminal states accept no outbound transition. `Tombstoned` (the
+    /// v0.9.0 G13-mem logical-delete state) is terminal like `Done` /
+    /// `Abandoned`.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::Abandoned)
+        matches!(self, Self::Done | Self::Abandoned | Self::Tombstoned)
     }
 
     /// Whether `self → to` is a legal lifecycle transition. No self-loops;
@@ -2208,6 +2220,7 @@ mod tests {
             LifecycleState::Blocked,
             LifecycleState::Done,
             LifecycleState::Abandoned,
+            LifecycleState::Tombstoned,
         ] {
             assert_eq!(LifecycleState::from_str(s.as_str()), Some(s));
         }
@@ -2235,6 +2248,7 @@ mod tests {
                 LifecycleState::Blocked,
                 LifecycleState::Done,
                 LifecycleState::Abandoned,
+                LifecycleState::Tombstoned,
             ]
         );
     }
@@ -2243,6 +2257,9 @@ mod tests {
     fn lifecycle_state_is_terminal_only_done_and_abandoned() {
         assert!(LifecycleState::Done.is_terminal());
         assert!(LifecycleState::Abandoned.is_terminal());
+        // v0.9.0 G13-mem (#1859) — the consolidation logical-delete state
+        // is terminal too.
+        assert!(LifecycleState::Tombstoned.is_terminal());
         assert!(!LifecycleState::Open.is_terminal());
         assert!(!LifecycleState::Active.is_terminal());
         assert!(!LifecycleState::Blocked.is_terminal());
