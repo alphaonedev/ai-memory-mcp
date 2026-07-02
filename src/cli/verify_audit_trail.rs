@@ -156,6 +156,22 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             crate::signed_events::RoleSeparationCheck::Unknown
             | crate::signed_events::RoleSeparationCheck::NotDetected => {}
         }
+        // #1828 G13 — surface an identity-lineage failure.
+        match &report.lineage {
+            crate::identity::lineage::LineageCheck::Forged { detail } => writeln!(
+                out.stdout,
+                "  identity-lineage FORGED (succession chain failed verification): {detail}"
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::identity::lineage::LineageCheck::Missing => writeln!(
+                out.stdout,
+                "  identity-lineage MISSING but AI_MEMORY_REQUIRE_IDENTITY_LINEAGE is set \
+                 (fail-closed)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::identity::lineage::LineageCheck::Unknown
+            | crate::identity::lineage::LineageCheck::NotDetected => {}
+        }
         // #1822 G5b — surface a require-mode cause-binding coverage failure.
         if let crate::signed_events::CauseBinding::Detected { rows_without_cause } =
             report.cause_binding

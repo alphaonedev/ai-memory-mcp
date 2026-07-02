@@ -860,6 +860,173 @@ pub fn sign_routine_freeze(
     Ok(sig.to_bytes().to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// v0.9.0 G13 (#1828) — SignableSuccession + sign_succession
+// (identity-lineage rotation-survival core)
+// ---------------------------------------------------------------------------
+
+/// Domain-separation prefix for the identity-lineage succession signing
+/// input (#1828 G13). NUL-terminated + versioned, mirroring
+/// [`crate::identity::cid::CID_DOMAIN`] and `signed_events`'
+/// `CAUSE_PREIMAGE_DOMAIN`.
+///
+/// This prefix is LOAD-BEARING and deliberately closes the historical
+/// gap that the other `Signable*` types in this module share: their
+/// domain separation is *implicit* in the per-type field set (they all
+/// sign bare canonical CBOR under `verify_strict`). A succession record
+/// hands off an *identity*, so a cross-protocol reinterpretation of its
+/// signature would be catastrophic — the explicit domain byte-string
+/// makes reuse of a succession signature as any other payload (or vice
+/// versa) impossible.
+// M-DOCUMENTED-MAGIC: versioned (`-v1`) so a future pre-image change is
+// a distinct domain rather than a silent collision.
+pub const LINEAGE_DOMAIN: &[u8] = b"agent-lineage-succession-v1\0";
+
+/// The eight fields an identity-lineage succession signature commits to
+/// (#1828 G13).
+///
+/// Decoupled from `crate::identity::lineage::LineageRecord` (the owned
+/// storage shape) on purpose, mirroring the [`SignableLink`] /
+/// [`SignableWrite`] convention: a single audited borrowed surface the
+/// canonical encoder commits to, so the verifier can re-derive the
+/// bytes from a persisted `agent_lineage` row without dragging the
+/// owned record shape.
+///
+/// `recovery_pubkey` is carried NOW for forward-compatibility (the
+/// recovery VERIFY path lands in v1.0) so enrolling a cold recovery key
+/// never requires a record-format change. `prev_record_hash` is the
+/// SHA-256 over the canonical bytes of the PRIOR record (32 zero bytes
+/// for genesis), which chains the records against splicing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableSuccession<'a> {
+    /// The identity that persists across the key handoff.
+    pub agent_id: &'a str,
+    /// Genesis = 0, +1 per record. Total order / anti-reorder.
+    pub epoch: u64,
+    /// Wire slug: `"genesis"` | `"rotation"` | `"recovery"`.
+    pub reason: &'a str,
+    /// URL-safe-no-pad base64 of the key that SIGNS this record
+    /// (`K_old`); equals `successor_pubkey` for genesis.
+    pub predecessor_pubkey: &'a str,
+    /// URL-safe-no-pad base64 of the key handed off (`K_new`); equals
+    /// `predecessor_pubkey` for genesis.
+    pub successor_pubkey: &'a str,
+    /// Optional pre-registered cold recovery key (base64). Committed
+    /// inside the signed bytes NOW; the recovery VERIFY path is v1.0.
+    pub recovery_pubkey: Option<&'a str>,
+    /// RFC3339 instant the successor becomes authoritative; monotonic
+    /// non-decreasing up the chain.
+    pub not_before: &'a str,
+    /// SHA-256 (32 bytes) over the canonical CBOR of the prior record;
+    /// 32 zero bytes for genesis.
+    pub prev_record_hash: &'a [u8],
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the eight signable
+/// succession fields (#1828 G13).
+///
+/// Same construction discipline as [`canonical_cbor`]: a
+/// `BTreeMap<&str, ciborium::Value>` so map-key order is enforced at
+/// build time, `recovery_pubkey` lifted via [`text_or_null`] so the key
+/// set is fixed across records, `epoch` as a CBOR integer and
+/// `prev_record_hash` as CBOR `bytes`. Encoding the same
+/// `SignableSuccession` twice (or on a different host) produces
+/// identical bytes — the precondition Ed25519 needs.
+///
+/// NB: these are the canonical *body* bytes. The Ed25519 signing input
+/// additionally prefixes [`LINEAGE_DOMAIN`] — see
+/// [`lineage_signing_input`] / [`sign_succession`].
+///
+/// # Errors
+///
+/// Returns an error only when CBOR serialization fails — in practice
+/// unreachable for the fixed-shape input above, surfaced as a `Result`
+/// so callers don't have to choose between panicking and silently
+/// signing a truncated payload.
+pub fn canonical_cbor_succession(s: &SignableSuccession<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("agent_id", ciborium::Value::Text(s.agent_id.to_string()));
+    map.insert(
+        "epoch",
+        ciborium::Value::Integer(ciborium::value::Integer::from(s.epoch)),
+    );
+    map.insert("reason", ciborium::Value::Text(s.reason.to_string()));
+    map.insert(
+        "predecessor_pubkey",
+        ciborium::Value::Text(s.predecessor_pubkey.to_string()),
+    );
+    map.insert(
+        "successor_pubkey",
+        ciborium::Value::Text(s.successor_pubkey.to_string()),
+    );
+    map.insert("recovery_pubkey", text_or_null(s.recovery_pubkey));
+    map.insert(
+        "not_before",
+        ciborium::Value::Text(s.not_before.to_string()),
+    );
+    map.insert(
+        "prev_record_hash",
+        ciborium::Value::Bytes(s.prev_record_hash.to_vec()),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableSuccession")?;
+    Ok(out)
+}
+
+/// The exact bytes a succession signature is minted (and verified)
+/// over: `LINEAGE_DOMAIN ∥ canonical_body_bytes`.
+///
+/// Shared by [`sign_succession`] (signing) and
+/// `crate::identity::lineage::verify_succession` (verification) so the
+/// two can never drift; the `signed_events` witness `payload_hash` is
+/// the SHA-256 over exactly these bytes (C1).
+#[must_use]
+pub fn lineage_signing_input(canonical_body: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(LINEAGE_DOMAIN.len() + canonical_body.len());
+    input.extend_from_slice(LINEAGE_DOMAIN);
+    input.extend_from_slice(canonical_body);
+    input
+}
+
+/// Sign a succession record with `k_old`'s private key (#1828 G13).
+///
+/// Encodes via [`canonical_cbor_succession`], prefixes
+/// [`LINEAGE_DOMAIN`], then runs Ed25519 over the domain-tagged bytes.
+/// Returns the 64-byte signature ready for the `agent_lineage.signature`
+/// column and the `signed_events` witness row.
+///
+/// The signer MUST be the record's `predecessor_pubkey` holder (`K_old`
+/// for a rotation; `K0` self-signing genesis) — the verify walk rejects
+/// anything else with `SignatureInvalid`.
+///
+/// # Errors
+///
+/// - `k_old.private` is `None` (public-only handle — verification only).
+/// - The CBOR encoding step fails (in practice unreachable; surfaced
+///   for completeness).
+pub fn sign_succession(
+    k_old: &AgentKeypair,
+    succession: &SignableSuccession<'_>,
+) -> Result<Vec<u8>> {
+    let signing = k_old.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign succession",
+            k_old.agent_id
+        )
+    })?;
+    let body = canonical_cbor_succession(succession)?;
+    let sig = signing.sign(&lineage_signing_input(&body));
+    Ok(sig.to_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1800,5 +1967,193 @@ mod tests {
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
         assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9.0 G13 (#1828) — SignableSuccession + sign_succession
+    // -----------------------------------------------------------------
+
+    fn succession_fixture<'a>(prev_hash: &'a [u8; 32]) -> SignableSuccession<'a> {
+        SignableSuccession {
+            agent_id: "ai:planner",
+            epoch: 1,
+            reason: "rotation",
+            predecessor_pubkey: "predKeyB64",
+            successor_pubkey: "succKeyB64",
+            recovery_pubkey: Some("recKeyB64"),
+            not_before: "2026-06-30T00:00:00+00:00",
+            prev_record_hash: prev_hash,
+        }
+    }
+
+    #[test]
+    fn canonical_cbor_succession_is_deterministic() {
+        // Three distinct permutations of the SignableSuccession literal
+        // must collapse to identical bytes (BTreeMap key-sort at encode
+        // time) — the round-trip precondition for Ed25519 across hosts.
+        let prev = body_hash_fixture(0x50);
+        let agent_id = "ai:planner";
+        let epoch = 3_u64;
+        let reason = "rotation";
+        let predecessor_pubkey = "pk-old";
+        let successor_pubkey = "pk-new";
+        let recovery_pubkey = Some("pk-rec");
+        let not_before = "2026-06-30T00:00:00+00:00";
+
+        let perm1 = SignableSuccession {
+            agent_id,
+            epoch,
+            reason,
+            predecessor_pubkey,
+            successor_pubkey,
+            recovery_pubkey,
+            not_before,
+            prev_record_hash: &prev,
+        };
+        let perm2 = SignableSuccession {
+            prev_record_hash: &prev,
+            not_before,
+            recovery_pubkey,
+            successor_pubkey,
+            predecessor_pubkey,
+            reason,
+            epoch,
+            agent_id,
+        };
+        let perm3 = SignableSuccession {
+            reason,
+            agent_id,
+            successor_pubkey,
+            epoch,
+            not_before,
+            predecessor_pubkey,
+            prev_record_hash: &prev,
+            recovery_pubkey,
+        };
+
+        let b1 = canonical_cbor_succession(&perm1).expect("encode perm1");
+        let b2 = canonical_cbor_succession(&perm2).expect("encode perm2");
+        let b3 = canonical_cbor_succession(&perm3).expect("encode perm3");
+        assert_eq!(b1, b2);
+        assert_eq!(b2, b3);
+        assert_eq!(b1, canonical_cbor_succession(&perm1).expect("re-encode"));
+    }
+
+    #[test]
+    fn canonical_cbor_succession_differs_on_field_change() {
+        let prev = body_hash_fixture(0x51);
+        let base = succession_fixture(&prev);
+        // Epoch is bound — a signature minted for epoch 1 cannot be
+        // replayed as epoch 2 (anti-reorder).
+        let altered_epoch = SignableSuccession {
+            epoch: 2,
+            ..base.clone()
+        };
+        let a = canonical_cbor_succession(&base).expect("encode base");
+        let b = canonical_cbor_succession(&altered_epoch).expect("encode altered epoch");
+        assert_ne!(a, b, "different epoch must produce different bytes");
+
+        // The successor key is bound — the whole point of the record.
+        let altered_succ = SignableSuccession {
+            successor_pubkey: "pk-attacker",
+            ..base.clone()
+        };
+        let c = canonical_cbor_succession(&altered_succ).expect("encode altered successor");
+        assert_ne!(a, c, "different successor must produce different bytes");
+
+        // The reason is bound — a rotation signature cannot be replayed
+        // as a recovery record.
+        let altered_reason = SignableSuccession {
+            reason: "recovery",
+            ..base.clone()
+        };
+        let d = canonical_cbor_succession(&altered_reason).expect("encode altered reason");
+        assert_ne!(a, d, "different reason must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_succession_handles_no_recovery_key() {
+        let prev = body_hash_fixture(0x52);
+        let s = SignableSuccession {
+            recovery_pubkey: None,
+            ..succession_fixture(&prev)
+        };
+        let bytes = canonical_cbor_succession(&s).expect("encode");
+        assert!(!bytes.is_empty());
+        assert_eq!(bytes, canonical_cbor_succession(&s).expect("re-encode"));
+        // None vs Some must differ — the recovery commitment is signed.
+        let with_rec = succession_fixture(&prev);
+        assert_ne!(
+            bytes,
+            canonical_cbor_succession(&with_rec).expect("encode with recovery")
+        );
+    }
+
+    #[test]
+    fn sign_succession_signs_domain_tagged_bytes() {
+        // The signature must verify over LINEAGE_DOMAIN || canonical and
+        // must NOT verify over the bare canonical bytes — the explicit
+        // domain tag is the load-bearing cross-protocol separator.
+        let kp = keypair::generate("ai:planner").expect("generate");
+        let prev = body_hash_fixture(0x53);
+        let s = succession_fixture(&prev);
+        let sig_bytes = sign_succession(&kp, &s).expect("sign");
+        assert_eq!(sig_bytes.len(), 64, "Ed25519 signatures are 64 bytes");
+
+        let body = canonical_cbor_succession(&s).expect("encode");
+        let tagged = lineage_signing_input(&body);
+        assert!(tagged.starts_with(LINEAGE_DOMAIN));
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        kp.public.verify(&tagged, &sig).expect("verify tagged");
+        assert!(
+            kp.public.verify(&body, &sig).is_err(),
+            "signature must NOT verify over the bare (untagged) canonical bytes"
+        );
+    }
+
+    #[test]
+    fn sign_succession_refuses_public_only_keypair() {
+        let kp = keypair::generate("ai:planner").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "ai:planner".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let prev = body_hash_fixture(0x54);
+        let err = sign_succession(&pub_only, &succession_fixture(&prev)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no private key"), "got: {msg}");
+    }
+
+    #[test]
+    fn sign_succession_does_not_verify_against_other_pub() {
+        // Cross-key non-replayability — a succession signed by Alice's
+        // key must not verify under Bob's (the forged-succession core).
+        let alice = keypair::generate("alice").unwrap();
+        let bob = keypair::generate("bob").unwrap();
+        let prev = body_hash_fixture(0x55);
+        let s = succession_fixture(&prev);
+        let sig_bytes = sign_succession(&alice, &s).unwrap();
+        let tagged = lineage_signing_input(&canonical_cbor_succession(&s).unwrap());
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
+        assert!(bob.public.verify(&tagged, &sig).is_err());
+    }
+
+    #[test]
+    fn lineage_domain_is_nul_terminated_and_versioned() {
+        // Pins the CID_DOMAIN / CAUSE_PREIMAGE_DOMAIN convention: a
+        // versioned, NUL-terminated prefix (an unterminated prefix would
+        // be ambiguous against an agent_id sharing the leading bytes).
+        assert_eq!(LINEAGE_DOMAIN.last(), Some(&0u8));
+        assert!(
+            std::str::from_utf8(&LINEAGE_DOMAIN[..LINEAGE_DOMAIN.len() - 1])
+                .expect("prefix is ASCII")
+                .contains("-v1"),
+            "domain must carry an explicit version"
+        );
     }
 }

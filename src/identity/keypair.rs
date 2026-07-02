@@ -391,6 +391,77 @@ pub fn rotate(agent_id: &str, dir: &Path) -> Result<RotateOutcome> {
     })
 }
 
+/// v0.9.0 G13 (#1828) — rotate the keypair WITH a signed lineage
+/// succession, so the retiring key cryptographically hands the identity
+/// off before it is destroyed.
+///
+/// The ordering is the entire point of this seam: legacy [`rotate`]
+/// `generate`s + `save`s immediately, destroying `K_old.private` with
+/// no signed link — the exact "rotation orphans history" defect G13
+/// closes. This variant:
+///
+/// 1. loads the CURRENT keypair (`K_old`) — it must exist and carry its
+///    private key (a public-only handle cannot sign a handoff);
+/// 2. generates the successor (`K_new`) IN MEMORY (nothing on disk yet);
+/// 3. runs `sign_and_persist(K_old, K_new)` — the caller signs the
+///    succession record with `K_old` and lands it (body + flat-pubkey
+///    sync + `signed_events` witness, one transaction — see
+///    `crate::storage::append_lineage_record`). Any failure here leaves
+///    the on-disk keys UNTOUCHED — the rotation simply did not happen;
+/// 4. only then archives the prior `.pub` and overwrites `.pub`/`.priv`
+///    with `K_new` (same forward-secure posture as [`rotate`]: the old
+///    PRIVATE key is destroyed, the archived `.pub` survives).
+///
+/// Residual crash window: if the process dies between step 3 and step 4
+/// the DB head is `K_new` while the disk still holds `K_old`. That is
+/// recoverable (re-import `K_new` or re-run the succession CLI, which
+/// detects the head) and — unlike the inverse order — never destroys
+/// the only key able to sign the handoff. Legacy [`rotate`] is
+/// UNTOUCHED for callers that want the old behaviour.
+///
+/// # Errors
+///
+/// - no current keypair (or a public-only one) for `agent_id`;
+/// - `sign_and_persist` failure (keys on disk unchanged);
+/// - archive/save failure after a successful persist (see above).
+pub fn rotate_with_succession<F>(
+    agent_id: &str,
+    dir: &Path,
+    sign_and_persist: F,
+) -> Result<RotateOutcome>
+where
+    F: FnOnce(&AgentKeypair, &AgentKeypair) -> Result<()>,
+{
+    validate::validate_agent_id_shape(agent_id)?;
+    let old_kp = load(agent_id, dir)?;
+    if !old_kp.can_sign() {
+        bail!(
+            "keypair for {agent_id} is public-only — cannot sign a lineage succession; \
+             a rotation without the old private key is a key-LOSS event (recovery lands in v1.0)"
+        );
+    }
+    // Successor exists only in memory until the succession is durably
+    // signed + persisted — a failure below leaves the identity intact.
+    let new_kp = generate(agent_id)?;
+    sign_and_persist(&old_kp, &new_kp)?;
+
+    // Succession persisted — now (and only now) touch the disk. Same
+    // archive-then-overwrite discipline as `rotate` (#1679).
+    let pub_path = agent_pub_path(dir, agent_id);
+    let old_pub = fs::read(&pub_path)
+        .with_context(|| format!("reading current public key {}", pub_path.display()))?;
+    let ts = chrono::Utc::now().timestamp();
+    let archived_pub = dir.join(format!("{agent_id}{PUB_SUFFIX}.{ts}"));
+    ensure_parent(&archived_pub)?;
+    write_with_mode(&archived_pub, &old_pub, 0o644)
+        .with_context(|| format!("archiving prior public key to {}", archived_pub.display()))?;
+    save(&new_kp, dir)?;
+    Ok(RotateOutcome {
+        archived_pub,
+        new_pub: pub_path,
+    })
+}
+
 /// Load `agent_id`'s keypair from `dir`.
 ///
 /// The public file must exist (errors otherwise). The private file is
@@ -901,6 +972,98 @@ mod tests {
         let err = rotate("ghost", dir.path()).expect_err("must refuse with no existing key");
         assert!(
             err.to_string().contains("no existing keypair"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // ----- v0.9.0 G13 (#1828) rotate_with_succession -------------------
+
+    /// The closure sees `K_old` WITH its private key (it must sign the
+    /// succession) and the in-memory `K_new`; only after it succeeds do
+    /// the on-disk keys change (archive + overwrite, like `rotate`).
+    #[test]
+    fn rotate_with_succession_signs_before_destroying_old_key() {
+        let dir = tmp_dir();
+        let old = generate("alice").unwrap();
+        save(&old, dir.path()).unwrap();
+        let old_pub = old.public.to_bytes();
+
+        let seen: std::cell::RefCell<Option<([u8; 32], [u8; 32], bool)>> =
+            std::cell::RefCell::new(None);
+        let outcome = rotate_with_succession("alice", dir.path(), |k_old, k_new| {
+            // At closure time the DISK still holds the old keypair —
+            // nothing has been archived or overwritten yet.
+            let on_disk = load("alice", dir.path()).unwrap();
+            assert_eq!(on_disk.public.to_bytes(), k_old.public.to_bytes());
+            seen.replace(Some((
+                k_old.public.to_bytes(),
+                k_new.public.to_bytes(),
+                k_old.can_sign(),
+            )));
+            Ok(())
+        })
+        .expect("rotate_with_succession");
+
+        let (seen_old, seen_new, old_could_sign) = seen.into_inner().expect("closure ran");
+        assert_eq!(seen_old, old_pub, "closure must see the retiring key");
+        assert!(old_could_sign, "closure must be able to sign with K_old");
+
+        // After: the active key IS the successor the closure saw.
+        let active = load("alice", dir.path()).unwrap();
+        assert_eq!(active.public.to_bytes(), seen_new);
+        assert_ne!(active.public.to_bytes(), old_pub);
+        assert!(outcome.archived_pub.exists(), "prior .pub archived");
+        assert_eq!(
+            fs::read(&outcome.archived_pub).unwrap().as_slice(),
+            old_pub.as_slice(),
+            "archived bytes must be the prior public key"
+        );
+    }
+
+    /// A failed sign/persist leaves the on-disk identity UNTOUCHED —
+    /// the rotation simply did not happen (no archive, no overwrite).
+    #[test]
+    fn rotate_with_succession_persist_failure_leaves_keys_untouched() {
+        let dir = tmp_dir();
+        let old = generate("alice").unwrap();
+        save(&old, dir.path()).unwrap();
+        let old_pub = old.public.to_bytes();
+
+        let err = rotate_with_succession("alice", dir.path(), |_k_old, _k_new| {
+            anyhow::bail!("db is down")
+        })
+        .expect_err("closure failure must propagate");
+        assert!(err.to_string().contains("db is down"), "got: {err}");
+
+        // Disk unchanged: same key, no archived sibling.
+        let active = load("alice", dir.path()).unwrap();
+        assert_eq!(active.public.to_bytes(), old_pub, "old key must survive");
+        let archived = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("alice.pub."))
+            });
+        assert!(!archived, "no archive sibling on a failed succession");
+    }
+
+    #[test]
+    fn rotate_with_succession_refuses_missing_and_public_only_keys() {
+        let dir = tmp_dir();
+        // No key at all.
+        let err = rotate_with_succession("ghost", dir.path(), |_, _| Ok(()))
+            .expect_err("must refuse with no existing key");
+        assert!(!err.to_string().is_empty());
+        // Public-only handle cannot sign the handoff — that is a
+        // key-LOSS event, out of scope this train (recovery = v1.0).
+        let kp = generate("alice").unwrap();
+        save_public_only(&kp, dir.path()).unwrap();
+        let err = rotate_with_succession("alice", dir.path(), |_, _| Ok(()))
+            .expect_err("public-only key must refuse");
+        assert!(
+            err.to_string().contains("public-only"),
             "unexpected error: {err}"
         );
     }

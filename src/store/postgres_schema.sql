@@ -734,6 +734,33 @@ CREATE INDEX IF NOT EXISTS idx_signed_events_timestamp ON signed_events (timesta
 CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_events_sequence ON signed_events (sequence);
 
 -- ─────────────────────────────────────────────────────────────────────
+-- agent_lineage — identity-lineage succession chain
+-- (v0.9.0 G13 #1828, schema v76; mirrors
+-- migrations/postgres/0035_v76_agent_lineage.sql — see the sqlite twin
+-- migrations/sqlite/0060_v76_agent_lineage.sql for the full design
+-- rationale). One signed succession record per (agent_id, epoch); the
+-- composite PRIMARY KEY is the DB-enforced anti-equivocation defense
+-- (C5). `not_before` stays TEXT (the exact RFC3339 string inside the
+-- signed bytes) so re-canonicalisation is byte-stable across backends.
+-- Every INSERT co-transacts with the flat `metadata.agent_pubkey` sync
+-- and a `signed_events` witness row (C4/C1).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_lineage (
+    agent_id            TEXT    NOT NULL,
+    epoch               BIGINT  NOT NULL,
+    reason              TEXT    NOT NULL CHECK (reason IN ('genesis', 'rotation', 'recovery')),
+    predecessor_pubkey  TEXT    NOT NULL,
+    successor_pubkey    TEXT    NOT NULL,
+    recovery_pubkey     TEXT,
+    not_before          TEXT    NOT NULL,
+    prev_record_hash    BYTEA   NOT NULL,
+    signature           BYTEA   NOT NULL,
+    record_bytes        BYTEA   NOT NULL,
+    created_at          TEXT    NOT NULL,
+    PRIMARY KEY (agent_id, epoch)
+);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- signed_events_dlq — deferred-audit drainer dead-letter queue
 -- (v0.7.0 Cluster-C SEC-3, issue #767, schema v39 Postgres / v40 SQLite).
 --

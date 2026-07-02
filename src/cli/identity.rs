@@ -95,6 +95,46 @@ pub enum IdentityAction {
         #[arg(long)]
         agent_id: String,
     },
+    /// v0.9.0 G13 (#1828) — enroll an identity lineage: mint the
+    /// epoch-0 self-signed GENESIS record anchored in the agent's
+    /// current keypair, persisted atomically with its append-only
+    /// `signed_events` witness. The agent must already be registered
+    /// (`ai-memory agents register`). Single-node ROTATION-survival
+    /// only — this is NOT key-loss protection (recovery lands in v1.0).
+    EnrollLineage {
+        /// Agent identifier. Defaults to the NHI-hardened id.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Optional base64 Ed25519 recovery public key committed into
+        /// the genesis record. Carried for v1.0 forward-compat; the
+        /// recovery VERIFY path does NOT exist in v0.9.0.
+        #[arg(long, value_name = "PUBKEY_B64")]
+        recovery_pubkey: Option<String>,
+    },
+    /// v0.9.0 G13 (#1828) — rotate the keypair WITH a signed lineage
+    /// succession: the retiring key signs the handoff BEFORE it is
+    /// destroyed, so the identity survives the rotation. Requires an
+    /// enrolled lineage (`identity enroll-lineage`). The legacy
+    /// `identity generate --force` rotation (no lineage) is unchanged.
+    Succeed {
+        /// Agent identifier. Defaults to the NHI-hardened id.
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
+    /// v0.9.0 G13 (#1828) — (re-)register the cold recovery public key
+    /// by appending a self-succession record (the head key re-signs
+    /// itself carrying the new recovery commitment). The recovery
+    /// VERIFY path lands in v1.0 — registering the key today only
+    /// commits it into the signed chain for forward-compat.
+    RegisterRecoveryKey {
+        /// Agent identifier. Defaults to the NHI-hardened id.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// base64 Ed25519 recovery public key (URL-safe-no-pad or
+        /// standard padding accepted).
+        #[arg(long, value_name = "PUBKEY_B64")]
+        recovery_pubkey: String,
+    },
 }
 
 /// Resolve the key storage directory from `--key-dir` (caller override)
@@ -119,7 +159,16 @@ fn resolve_id(explicit: Option<&str>) -> Result<String> {
 /// Returns `Ok(())` on success, propagates errors otherwise. The
 /// caller is `daemon_runtime::dispatch_command` which prints the error
 /// + exits non-zero in the standard way.
-pub fn run(args: IdentityArgs, json_out: bool, out: &mut CliOutput<'_>) -> Result<()> {
+///
+/// `db_path` backs ONLY the G13 lineage verbs (`enroll-lineage` /
+/// `succeed` / `register-recovery-key`) — the H1 keypair-lifecycle
+/// verbs stay DB-free and never open it.
+pub fn run(
+    db_path: &Path,
+    args: IdentityArgs,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
     let dir = resolve_key_dir(args.key_dir.as_deref())?;
     match args.action {
         IdentityAction::Generate {
@@ -134,6 +183,31 @@ pub fn run(args: IdentityArgs, json_out: bool, out: &mut CliOutput<'_>) -> Resul
         } => import(&dir, &agent_id, &public, private.as_deref(), json_out, out),
         IdentityAction::List => list(&dir, json_out, out),
         IdentityAction::ExportPub { agent_id } => export_pub(&dir, &agent_id, json_out, out),
+        IdentityAction::EnrollLineage {
+            agent_id,
+            recovery_pubkey,
+        } => enroll_lineage(
+            db_path,
+            &dir,
+            agent_id.as_deref(),
+            recovery_pubkey.as_deref(),
+            json_out,
+            out,
+        ),
+        IdentityAction::Succeed { agent_id } => {
+            succeed(db_path, &dir, agent_id.as_deref(), json_out, out)
+        }
+        IdentityAction::RegisterRecoveryKey {
+            agent_id,
+            recovery_pubkey,
+        } => register_recovery_key(
+            db_path,
+            &dir,
+            agent_id.as_deref(),
+            &recovery_pubkey,
+            json_out,
+            out,
+        ),
     }
 }
 
@@ -336,6 +410,164 @@ fn export_pub(dir: &Path, agent_id: &str, json_out: bool, out: &mut CliOutput<'_
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// v0.9.0 G13 (#1828) — identity-lineage verbs.
+//
+// Honest scope (C7): single-node key-ROTATION survival. NOT key-loss
+// resilience (the recovery VERIFY path lands in v1.0), and invisible
+// cross-host (federation peers resolve via the on-disk key store, not
+// this chain). Advisory-only (C6): the attest_write enforcement path
+// keeps reading the flat `metadata.agent_pubkey`, which every lineage
+// append keeps in sync.
+// ---------------------------------------------------------------------------
+
+/// Resolve the lineage-verb agent id: shape-validate an explicit id
+/// (reserved sentinels allowed — same carve-out as `generate`, #1234),
+/// else the NHI default.
+fn resolve_lineage_id(explicit: Option<&str>) -> Result<String> {
+    match explicit {
+        Some(id) if !id.is_empty() => {
+            validate::validate_agent_id_shape(id)?;
+            Ok(id.to_string())
+        }
+        _ => resolve_id(explicit),
+    }
+}
+
+fn enroll_lineage(
+    db_path: &Path,
+    dir: &Path,
+    explicit_agent_id: Option<&str>,
+    recovery_pubkey: Option<&str>,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    let kp = keypair::load(&id, dir)
+        .with_context(|| format!("loading keypair for {id} (run `identity generate` first)"))?;
+    let conn = crate::db::open(db_path)?;
+    let record = crate::db::enroll_lineage(&conn, &id, &kp, recovery_pubkey)?;
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "enrolled": true,
+                "agent_id": id,
+                "epoch": record.epoch,
+                (PUBLIC_KEY_B64_FIELD): record.successor_pubkey_b64,
+                "recovery_pubkey_registered": record.recovery_pubkey_b64.is_some(),
+            })
+        )?;
+    } else {
+        writeln!(out.stdout, "enrolled identity lineage for {id} (epoch 0)")?;
+        writeln!(
+            out.stdout,
+            "  head_pub_b64 = {}",
+            record.successor_pubkey_b64
+        )?;
+        if record.recovery_pubkey_b64.is_some() {
+            writeln!(
+                out.stdout,
+                "  recovery key committed (VERIFY path lands in v1.0 — this is \
+                 forward-compat registration, not key-loss protection yet)"
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn succeed(
+    db_path: &Path,
+    dir: &Path,
+    explicit_agent_id: Option<&str>,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    let conn = crate::db::open(db_path)?;
+    let recorded: std::cell::RefCell<Option<crate::identity::lineage::LineageRecord>> =
+        std::cell::RefCell::new(None);
+    // Sign-then-rotate seam: the succession is signed by K_old and
+    // durably persisted (body + pubkey sync + witness, one tx) BEFORE
+    // `save` destroys K_old on disk.
+    let outcome = keypair::rotate_with_succession(&id, dir, |k_old, k_new| {
+        let record = crate::db::append_succession(&conn, &id, k_old, &k_new.public_base64(), None)?;
+        recorded.replace(Some(record));
+        Ok(())
+    })?;
+    let record = recorded
+        .into_inner()
+        .context("succession closure did not run")?;
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "succeeded": true,
+                "agent_id": id,
+                "epoch": record.epoch,
+                (PUBLIC_KEY_B64_FIELD): record.successor_pubkey_b64,
+                "archived_pub": outcome.archived_pub.display().to_string(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "rotated keypair for {id} with signed succession (epoch {})",
+            record.epoch
+        )?;
+        writeln!(
+            out.stdout,
+            "  head_pub_b64 = {}",
+            record.successor_pubkey_b64
+        )?;
+        writeln!(
+            out.stdout,
+            "  archived_prior_pub = {}",
+            outcome.archived_pub.display()
+        )?;
+    }
+    Ok(())
+}
+
+fn register_recovery_key(
+    db_path: &Path,
+    dir: &Path,
+    explicit_agent_id: Option<&str>,
+    recovery_pubkey: &str,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    let kp = keypair::load(&id, dir)
+        .with_context(|| format!("loading keypair for {id} (run `identity generate` first)"))?;
+    let conn = crate::db::open(db_path)?;
+    // Self-succession: the head key re-signs itself carrying the new
+    // recovery commitment — the head does not change, the epoch does.
+    let record =
+        crate::db::append_succession(&conn, &id, &kp, &kp.public_base64(), Some(recovery_pubkey))?;
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "recovery_key_registered": true,
+                "agent_id": id,
+                "epoch": record.epoch,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "registered recovery key for {id} (epoch {}) — the recovery VERIFY path \
+             lands in v1.0; this commits the key for forward-compat only",
+            record.epoch
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +579,19 @@ mod tests {
         (env, dir)
     }
 
+    /// Test shim for the DB-free H1 verbs: the db_path parameter backs
+    /// only the G13 lineage verbs and is opened lazily, so a
+    /// never-created placeholder proves the legacy verbs stay DB-free
+    /// (opening it would error the test loudly).
+    fn run_nodb(args: IdentityArgs, json_out: bool, out: &mut CliOutput<'_>) -> Result<()> {
+        run(
+            Path::new("/nonexistent/ai-memory-identity-h1-verbs-are-db-free.db"),
+            args,
+            json_out,
+            out,
+        )
+    }
+
     #[test]
     fn generate_then_list_then_export() {
         let (mut env, dir) = fresh_env();
@@ -355,7 +600,7 @@ mod tests {
         // generate
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Generate {
@@ -380,7 +625,7 @@ mod tests {
         env.stderr.clear();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::List,
@@ -399,7 +644,7 @@ mod tests {
         env.stderr.clear();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::ExportPub {
@@ -429,7 +674,7 @@ mod tests {
         // First generate
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Generate {
@@ -448,7 +693,7 @@ mod tests {
         // Second generate WITHOUT --force should error (refuse-by-default).
         let result = {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Generate {
@@ -474,7 +719,7 @@ mod tests {
         env.stderr.clear();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::Generate {
@@ -525,7 +770,7 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Generate {
@@ -543,7 +788,7 @@ mod tests {
         env.stderr.clear();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::List,
@@ -576,7 +821,7 @@ mod tests {
 
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Import {
@@ -615,7 +860,7 @@ mod tests {
 
         let result = {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::Import {
@@ -645,7 +890,7 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::Generate {
@@ -679,7 +924,7 @@ mod tests {
         std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Import {
@@ -715,7 +960,7 @@ mod tests {
         std::fs::write(&pub_file, kp.public.to_bytes()).unwrap();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::Import {
@@ -750,7 +995,7 @@ mod tests {
         std::fs::write(&priv_file, kp.private.as_ref().unwrap().to_bytes()).unwrap();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::Import {
@@ -775,7 +1020,7 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::List,
@@ -796,7 +1041,7 @@ mod tests {
         let dir_path = dir.path().to_path_buf();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::List,
@@ -819,7 +1064,7 @@ mod tests {
         // First generate so there is something to export.
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::Generate {
@@ -837,7 +1082,7 @@ mod tests {
         env.stderr.clear();
         {
             let mut out = env.output();
-            run(
+            run_nodb(
                 IdentityArgs {
                     key_dir: Some(dir_path),
                     action: IdentityAction::ExportPub {
@@ -867,5 +1112,228 @@ mod tests {
             Ok(p) => assert!(p.as_os_str().len() > 0),
             Err(_) => {}
         }
+    }
+
+    // ----- v0.9.0 G13 (#1828) lineage verbs ----------------------------
+
+    /// Full CLI lifecycle: generate → register → enroll-lineage →
+    /// succeed → register-recovery-key, asserting the printed surfaces
+    /// and the DB-side chain state after each verb.
+    #[test]
+    fn lineage_verbs_end_to_end() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, "lin-alice", "ai:test", &[]).unwrap();
+        }
+        // generate the K0 keypair.
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Generate {
+                        agent_id: Some("lin-alice".to_string()),
+                        force: false,
+                        no_overwrite: false,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+
+        // enroll-lineage (JSON mode).
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some("lin-alice".to_string()),
+                        recovery_pubkey: None,
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["enrolled"], true);
+        assert_eq!(v["epoch"], 0);
+        assert_eq!(v["recovery_pubkey_registered"], false);
+
+        // succeed (text mode) — rotates on disk AND appends the chain.
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some("lin-alice".to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let stdout = env.stdout_str().to_string();
+        assert!(
+            stdout.contains("signed succession (epoch 1)"),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("archived_prior_pub"), "got: {stdout}");
+
+        // register-recovery-key (JSON) — self-succession at epoch 2.
+        let recovery = keypair::generate("lin-alice").unwrap();
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::RegisterRecoveryKey {
+                        agent_id: Some("lin-alice".to_string()),
+                        recovery_pubkey: recovery.public_base64(),
+                    },
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["recovery_key_registered"], true);
+        assert_eq!(v["epoch"], 2);
+
+        // DB-side: the chain verifies and the head is the ACTIVE key.
+        let conn = crate::db::open(&db_path).unwrap();
+        let active = keypair::load("lin-alice", &dir_path).unwrap();
+        let verified = crate::db::verify_agent_lineage(&conn, "lin-alice")
+            .unwrap()
+            .expect("chain verifies");
+        assert_eq!(verified.epoch, 2);
+        assert_eq!(verified.head_key.to_bytes(), active.public.to_bytes());
+    }
+
+    #[test]
+    fn lineage_text_surfaces_and_refusals() {
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, "lin-bob", "ai:test", &[]).unwrap();
+        }
+        // enroll without a keypair on disk → clear error.
+        {
+            let mut out = env.output();
+            let err = run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some("lin-bob".to_string()),
+                        recovery_pubkey: None,
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("identity generate"),
+                "got: {err:#}"
+            );
+        }
+        // succeed without an enrolled lineage → refused (and the disk
+        // keypair is untouched by the failed rotation).
+        let k0 = keypair::generate("lin-bob").unwrap();
+        keypair::save(&k0, &dir_path).unwrap();
+        {
+            let mut out = env.output();
+            let err = run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::Succeed {
+                        agent_id: Some("lin-bob".to_string()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("enroll-lineage"),
+                "got: {err:#}"
+            );
+            let on_disk = keypair::load("lin-bob", &dir_path).unwrap();
+            assert_eq!(on_disk.public.to_bytes(), k0.public.to_bytes());
+        }
+        // enroll with a recovery key, text mode — surfaces the honest
+        // v1.0 scoping line.
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let recovery = keypair::generate("lin-bob").unwrap();
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action: IdentityAction::EnrollLineage {
+                        agent_id: Some("lin-bob".to_string()),
+                        recovery_pubkey: Some(recovery.public_base64()),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let stdout = env.stdout_str().to_string();
+        assert!(
+            stdout.contains("enrolled identity lineage"),
+            "got: {stdout}"
+        );
+        assert!(stdout.contains("v1.0"), "got: {stdout}");
+        // register-recovery-key text mode carries the scoping too.
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let recovery = keypair::generate("lin-bob").unwrap();
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path),
+                    action: IdentityAction::RegisterRecoveryKey {
+                        agent_id: Some("lin-bob".to_string()),
+                        recovery_pubkey: recovery.public_base64(),
+                    },
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let stdout = env.stdout_str().to_string();
+        assert!(stdout.contains("registered recovery key"), "got: {stdout}");
+        assert!(stdout.contains("v1.0"), "got: {stdout}");
     }
 }

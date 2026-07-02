@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 75).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 76).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -360,6 +360,27 @@ CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
     ON memory_revisions(memory_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_revisions_sequence
     ON memory_revisions(sequence);
+
+-- v0.9.0 G13 (#1828, schema v76) — identity-lineage succession chain.
+-- One row per (agent_id, epoch); the composite PK is the DB-enforced
+-- anti-equivocation defense (C5). Created by migration v76 for
+-- upgrading DBs; inline here so a fresh bootstrap has it. No secondary
+-- index (the PK covers the epoch-ordered read); indexes stay
+-- ladder-owned per the v75 bootstrap-inline-index lesson.
+CREATE TABLE IF NOT EXISTS agent_lineage (
+    agent_id            TEXT    NOT NULL,
+    epoch               INTEGER NOT NULL,
+    reason              TEXT    NOT NULL CHECK (reason IN ('genesis', 'rotation', 'recovery')),
+    predecessor_pubkey  TEXT    NOT NULL,
+    successor_pubkey    TEXT    NOT NULL,
+    recovery_pubkey     TEXT,
+    not_before          TEXT    NOT NULL,
+    prev_record_hash    BLOB    NOT NULL,
+    signature           BLOB    NOT NULL,
+    record_bytes        BLOB    NOT NULL,
+    created_at          TEXT    NOT NULL,
+    PRIMARY KEY (agent_id, epoch)
+);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     title,
@@ -754,7 +775,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 75;
+const CURRENT_SCHEMA_VERSION: i64 = 76;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1311,6 +1332,14 @@ const MIGRATION_V74_SQLITE: &str =
 // edges keep NULL cids and the query layer LEFT JOINs `memories.cid`.
 const MIGRATION_V75_SQLITE: &str =
     include_str!("../../migrations/sqlite/0059_v75_memory_links_lineage_cid.sql");
+// v76 (#1828, v0.9.0 G13) — identity-lineage succession chain: the
+// dedicated `agent_lineage` table (composite PK (agent_id, epoch) = the
+// C5 anti-equivocation constraint). Pure additive CREATE TABLE IF NOT
+// EXISTS — idempotent with no probe needed (the v72 memory_revisions
+// precedent); fresh installs also carry the table inline in the
+// bootstrap `SCHEMA` const.
+const MIGRATION_V76_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0060_v76_agent_lineage.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3187,6 +3216,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                     [],
                 )?;
             }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v76 = #1828 / v0.9.0 G13 (identity lineage) — create the
+            // `agent_lineage` succession-record table. Pure additive
+            // CREATE TABLE IF NOT EXISTS: no probe needed (a fresh
+            // install already carries it inline from the bootstrap
+            // SCHEMA and the re-run is a no-op — the v72
+            // memory_revisions precedent). No index arm: the composite
+            // PRIMARY KEY (agent_id, epoch) is both the C5
+            // anti-equivocation constraint and the covering index for
+            // the epoch-ordered `read_lineage` scan.
+            conn.execute_batch(MIGRATION_V76_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

@@ -8949,6 +8949,496 @@ pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// v0.9.0 G13 (#1828) — identity-lineage persistence (sqlite SSOT).
+//
+// Honest scope (C7): single-node key-ROTATION survival only — NOT
+// key-LOSS resilience (the recovery VERIFY path lands in v1.0, and the
+// append paths below refuse `reason = recovery`). Federation peers
+// resolve identities via the on-disk key store
+// (`identity::verify::lookup_peer_public_key`), not this chain, so a
+// locally-survived rotation is still a fresh key cross-host. C6: the
+// resolver below is advisory/verdict-only — `attest_write` keeps
+// reading the flat `metadata.agent_pubkey`, which every append keeps
+// in sync.
+// ---------------------------------------------------------------------------
+
+/// Map a lineage reason onto its `signed_events` witness event type.
+fn lineage_witness_event_type(reason: crate::identity::lineage::LineageReason) -> &'static str {
+    use crate::identity::lineage::LineageReason;
+    match reason {
+        LineageReason::Genesis => crate::signed_events::event_types::IDENTITY_LINEAGE_GENESIS,
+        LineageReason::Rotation => crate::signed_events::event_types::IDENTITY_LINEAGE_SUCCESSION,
+        LineageReason::Recovery => crate::signed_events::event_types::IDENTITY_LINEAGE_RECOVERY,
+    }
+}
+
+/// Append one signed lineage record ATOMICALLY (#1828 G13, C4/C5).
+///
+/// One `BEGIN IMMEDIATE` transaction (the `capture_turn_idempotent`
+/// single-tx contract — NEVER the deferred audit drainer) covers all
+/// three writes, so a crash can never half-migrate the identity:
+///
+/// 1. `agent_lineage` body INSERT — the composite PK
+///    `(agent_id, epoch)` is the C5 anti-equivocation constraint
+///    (a duplicate epoch is refused by the DATABASE, not just code);
+/// 2. flat `metadata.agent_pubkey` sync to the record's successor via
+///    [`bind_agent_pubkey`] (the untouched `attest_write` gate keeps
+///    reading that key — C6);
+/// 3. the append-only `signed_events` WITNESS row
+///    (`payload_hash` = SHA-256 over the exact domain-tagged bytes the
+///    predecessor signed) via the in-transaction
+///    [`crate::signed_events::append_signed_event_no_tx`] — the C1/C3
+///    anchor `verify_lineage` cross-checks.
+///
+/// Pre-flight (fail-closed, nothing persisted on violation): the
+/// record must belong to `agent_id`, must not be a `recovery` record
+/// (v1.0), must chain onto the current head (contiguous epoch,
+/// predecessor == head successor, `prev_record_hash` == head's
+/// canonical hash; genesis only on an empty chain), and its signature
+/// must `verify_strict` under the predecessor key.
+///
+/// # Errors
+///
+/// Any pre-flight violation, an unregistered agent (the pubkey sync
+/// requires a `_agents` row), the C5 duplicate-epoch constraint, or an
+/// underlying SQL failure — all of which roll the whole append back.
+pub fn append_lineage_record(
+    conn: &Connection,
+    agent_id: &str,
+    record: &crate::identity::lineage::LineageRecord,
+    signature: &[u8],
+) -> Result<()> {
+    use crate::identity::lineage::{LineageReason, verify_succession};
+
+    if record.agent_id != agent_id {
+        anyhow::bail!(
+            "lineage record agent_id '{}' does not match '{agent_id}'",
+            record.agent_id
+        );
+    }
+    if record.reason == LineageReason::Recovery {
+        anyhow::bail!(
+            "recovery lineage records cannot be minted in v0.9.0 — the recovery VERIFY \
+             path (and its same-epoch fork tie-break) lands in v1.0"
+        );
+    }
+    // Chain-consistency pre-flight against the current head.
+    let head = lineage_head(conn, agent_id)?;
+    match (&head, record.reason) {
+        (None, LineageReason::Genesis) => {}
+        (None, _) => {
+            anyhow::bail!("no lineage enrolled for '{agent_id}' — enroll a genesis record first")
+        }
+        (Some(_), LineageReason::Genesis) => anyhow::bail!(
+            "lineage for '{agent_id}' already has a genesis record — append a rotation instead"
+        ),
+        (Some((head_rec, _)), _) => {
+            if record.epoch != head_rec.epoch + 1 {
+                anyhow::bail!(
+                    "lineage epoch {} does not succeed the head epoch {} for '{agent_id}'",
+                    record.epoch,
+                    head_rec.epoch
+                );
+            }
+            if record.predecessor_pubkey_b64 != head_rec.successor_pubkey_b64 {
+                anyhow::bail!(
+                    "lineage record predecessor is not the current head key for '{agent_id}'"
+                );
+            }
+            if record.prev_record_hash != head_rec.record_hash()? {
+                anyhow::bail!(
+                    "lineage record prev_record_hash does not link to the head record \
+                     for '{agent_id}'"
+                );
+            }
+        }
+    }
+    // The signature must already verify under the predecessor key —
+    // never persist a record the walk would reject.
+    let predecessor =
+        crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
+            .context("decoding lineage predecessor pubkey")?;
+    verify_succession(record, signature, &predecessor)
+        .map_err(|e| anyhow::anyhow!("refusing to persist unverifiable lineage record: {e}"))?;
+
+    let record_bytes = record.canonical_bytes()?;
+    let witness_hash = record.witness_payload_hash()?;
+    let now = Utc::now().to_rfc3339();
+
+    // C4 — one IMMEDIATE transaction for body + pubkey sync + witness
+    // (clone of the capture_turn_idempotent single-tx contract).
+    conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)
+        .context("append_lineage_record: begin tx")?;
+    let tx_result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT INTO agent_lineage \
+                (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+                 recovery_pubkey, not_before, prev_record_hash, signature, \
+                 record_bytes, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                record.agent_id,
+                i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
+                record.reason.as_str(),
+                record.predecessor_pubkey_b64,
+                record.successor_pubkey_b64,
+                record.recovery_pubkey_b64,
+                record.not_before,
+                record.prev_record_hash,
+                signature,
+                record_bytes,
+                now,
+            ],
+        )
+        .context("append_lineage_record: insert body (duplicate epoch is refused by the C5 PK)")?;
+
+        // Flat-binding sync — attest_write keeps trusting this key (C6).
+        bind_agent_pubkey(conn, agent_id, &record.successor_pubkey_b64)?;
+
+        // Append-only witness (C1/C3 anchor), in THIS transaction.
+        let witness = crate::signed_events::SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: agent_id.to_string(),
+            event_type: lineage_witness_event_type(record.reason).to_string(),
+            payload_hash: witness_hash,
+            signature: Some(signature.to_vec()),
+            attest_level: crate::models::AttestLevel::LineageSigned
+                .as_str()
+                .to_string(),
+            timestamp: now.clone(),
+            ..crate::signed_events::SignedEvent::default()
+        };
+        crate::signed_events::append_signed_event_no_tx(conn, &witness)
+            .context("append_lineage_record: witness append")?;
+        Ok(())
+    })();
+
+    match tx_result {
+        Ok(()) => {
+            conn.execute_batch(connection::SQL_COMMIT)
+                .context("append_lineage_record: commit")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(connection::SQL_ROLLBACK);
+            Err(e)
+        }
+    }
+}
+
+/// Read `agent_id`'s lineage records in ascending-epoch order, each
+/// paired with its stored signature (#1828 G13).
+///
+/// A DB without the `agent_lineage` table (legacy / partial-schema
+/// fixture) definitionally has no lineage → `Ok(vec![])`, preserving
+/// the byte-identical legacy fall-through in
+/// [`current_authoritative_key`].
+///
+/// # Errors
+///
+/// SQL failure, or a stored `reason` slug outside the closed set
+/// (fail-closed: never guess a reason).
+pub fn read_lineage(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
+    use crate::identity::lineage::{LineageReason, LineageRecord};
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'agent_lineage')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
+                    recovery_pubkey, not_before, prev_record_hash, signature \
+             FROM agent_lineage WHERE agent_id = ?1 ORDER BY epoch ASC",
+        )
+        .context("read_lineage: prepare")?;
+    let rows = stmt
+        .query_map(params![agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, Vec<u8>>(8)?,
+            ))
+        })
+        .context("read_lineage: query")?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (aid, epoch, reason, pred, succ, recovery, not_before, prev_hash, sig) =
+            row.context("read_lineage: row decode")?;
+        let reason = LineageReason::from_str(&reason)
+            .with_context(|| format!("unknown lineage reason '{reason}' for '{aid}'"))?;
+        out.push((
+            LineageRecord {
+                agent_id: aid,
+                epoch: u64::try_from(epoch).context("negative lineage epoch")?,
+                reason,
+                predecessor_pubkey_b64: pred,
+                successor_pubkey_b64: succ,
+                recovery_pubkey_b64: recovery,
+                not_before,
+                prev_record_hash: prev_hash,
+            },
+            sig,
+        ));
+    }
+    Ok(out)
+}
+
+/// Highest-epoch lineage record for `agent_id` (with its signature),
+/// or `None` when no lineage is enrolled (#1828 G13).
+///
+/// # Errors
+/// Propagates [`read_lineage`] failures.
+pub fn lineage_head(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Option<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
+    Ok(read_lineage(conn, agent_id)?.into_iter().next_back())
+}
+
+/// The `payload_hash` blobs of every `identity.lineage.*` witness row
+/// for `agent_id` in the append-only `signed_events` chain — the
+/// C1/C3 anchor set [`crate::identity::lineage::verify_lineage`]
+/// reconciles the mutable `agent_lineage` table against.
+///
+/// A DB without the `signed_events` table degrades to empty (such a DB
+/// cannot carry lineage either — the C4 append is all-or-nothing).
+///
+/// # Errors
+/// SQL failure.
+pub fn lineage_witness_hashes(conn: &Connection, agent_id: &str) -> Result<Vec<Vec<u8>>> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'signed_events')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(Vec::new());
+    }
+    let [t_genesis, t_succession, t_recovery] = crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT payload_hash FROM signed_events \
+             WHERE agent_id = ?1 AND event_type IN (?2, ?3, ?4) \
+             ORDER BY sequence ASC",
+        )
+        .context("lineage_witness_hashes: prepare")?;
+    let rows = stmt
+        .query_map(
+            params![agent_id, t_genesis, t_succession, t_recovery],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .context("lineage_witness_hashes: query")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("lineage_witness_hashes: collect")
+}
+
+/// Run the full genesis→head walk for `agent_id` against the stored
+/// records, the append-only witness set, and the bound flat key
+/// (#1828 G13).
+///
+/// Outer `Err` = infrastructure read failure; inner
+/// `Err(LineageError)` = the chain is present but does not verify.
+///
+/// # Errors
+/// SQL / decode failures on the three reads.
+pub fn verify_agent_lineage(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<
+    std::result::Result<
+        crate::identity::lineage::VerifiedLineage,
+        crate::identity::lineage::LineageError,
+    >,
+> {
+    let records = read_lineage(conn, agent_id)?;
+    let witnesses = lineage_witness_hashes(conn, agent_id)?;
+    let bound = agent_pubkey(conn, agent_id)?;
+    Ok(crate::identity::lineage::verify_lineage(
+        &records,
+        &witnesses,
+        bound.as_deref(),
+    ))
+}
+
+/// THE lineage-aware resolver: the current authoritative key for
+/// `agent_id` (#1828 G13). ADVISORY/verdict-only this train (C6) —
+/// the `attest_write` enforcement hot path does NOT call this.
+///
+/// - **No lineage enrolled** → byte-identical legacy fall-through:
+///   exactly [`agent_pubkey`] decoded (`None` when no key is bound).
+///   No lineage code influences the result.
+/// - **Lineage present** → the full [`verify_agent_lineage`] walk.
+///   `Ok` ⇒ the verified head key. Any [`crate::identity::lineage::LineageError`]
+///   ⇒ `Ok(None)` + WARN — fail-closed: a broken chain never silently
+///   falls back to the flat key (which is exactly the forgery target
+///   the walk exists to catch).
+///
+/// # Errors
+///
+/// Infrastructure failures only: SQL read errors, or a bound flat key
+/// that does not decode on the legacy fall-through path.
+pub fn current_authoritative_key(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Option<ed25519_dalek::VerifyingKey>> {
+    let records = read_lineage(conn, agent_id)?;
+    if records.is_empty() {
+        // Legacy fall-through — byte-identical to the flat binding.
+        return match agent_pubkey(conn, agent_id)? {
+            Some(b64) => Ok(Some(
+                crate::identity::keypair::decode_public_base64(&b64)
+                    .context("decoding bound agent_pubkey")?,
+            )),
+            None => Ok(None),
+        };
+    }
+    let witnesses = lineage_witness_hashes(conn, agent_id)?;
+    let bound = agent_pubkey(conn, agent_id)?;
+    match crate::identity::lineage::verify_lineage(&records, &witnesses, bound.as_deref()) {
+        Ok(verified) => Ok(Some(verified.head_key)),
+        Err(e) => {
+            tracing::warn!(
+                agent_id,
+                error = %e,
+                "identity lineage failed verification — resolving NO authoritative key \
+                 (fail-closed; the flat agent_pubkey is NOT trusted for an enrolled chain)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Enroll an identity lineage: mint + persist the epoch-0 self-signed
+/// GENESIS record anchored in `keypair` (#1828 G13).
+///
+/// The agent must already be registered, and any currently-bound
+/// `metadata.agent_pubkey` must equal `keypair`'s public key — genesis
+/// anchors the chain in the key the registry ALREADY trusts, so
+/// enrollment needs no external trust bootstrap (and cannot silently
+/// re-key an identity). The genesis witness row written in the same
+/// transaction pins the genesis at enroll-time (C1).
+///
+/// # Errors
+///
+/// Public-only `keypair`, an already-enrolled lineage, a bound-key
+/// mismatch, an undecodable `recovery_pubkey_b64`, or any
+/// [`append_lineage_record`] failure.
+pub fn enroll_lineage(
+    conn: &Connection,
+    agent_id: &str,
+    keypair: &crate::identity::keypair::AgentKeypair,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    if !keypair.can_sign() {
+        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot self-sign a genesis");
+    }
+    if lineage_head(conn, agent_id)?.is_some() {
+        anyhow::bail!("lineage already enrolled for '{agent_id}'");
+    }
+    let k0_b64 = keypair.public_base64();
+    if let Some(bound) = agent_pubkey(conn, agent_id)? {
+        let bound_key = crate::identity::keypair::decode_public_base64(&bound)
+            .context("decoding bound agent_pubkey")?;
+        if bound_key.to_bytes() != keypair.public.to_bytes() {
+            anyhow::bail!(
+                "bound agent_pubkey for '{agent_id}' does not match the enrolling keypair — \
+                 genesis must anchor in the key the registry already trusts"
+            );
+        }
+    }
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context("decoding recovery pubkey")?;
+    }
+    let record = crate::identity::lineage::LineageRecord::genesis(
+        agent_id,
+        &k0_b64,
+        recovery_pubkey_b64.map(str::to_string),
+        &Utc::now().to_rfc3339(),
+    );
+    let sig = crate::identity::sign::sign_succession(keypair, &record.to_signable())?;
+    append_lineage_record(conn, agent_id, &record, &sig)?;
+    Ok(record)
+}
+
+/// Mint + persist a ROTATION succession from the current head to
+/// `successor_pubkey_b64`, signed by `k_old` (#1828 G13).
+///
+/// `k_old` must hold the private half of the CURRENT head key.
+/// `recovery_pubkey_b64 = None` carries the head's recovery commitment
+/// forward unchanged; `Some(key)` re-registers it (the
+/// `register-recovery-key` CLI passes the current head as successor —
+/// a self-rotation that only updates the recovery commitment).
+///
+/// # Errors
+///
+/// No enrolled lineage, a `k_old` that is public-only or not the head
+/// key, an undecodable successor/recovery key, or any
+/// [`append_lineage_record`] failure.
+pub fn append_succession(
+    conn: &Connection,
+    agent_id: &str,
+    k_old: &crate::identity::keypair::AgentKeypair,
+    successor_pubkey_b64: &str,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    let Some((head, _)) = lineage_head(conn, agent_id)? else {
+        anyhow::bail!("no lineage enrolled for '{agent_id}' — run enroll-lineage first");
+    };
+    if !k_old.can_sign() {
+        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot sign a succession");
+    }
+    let head_key = crate::identity::keypair::decode_public_base64(&head.successor_pubkey_b64)
+        .context("decoding lineage head key")?;
+    if head_key.to_bytes() != k_old.public.to_bytes() {
+        anyhow::bail!(
+            "signing keypair is not the current lineage head for '{agent_id}' — only the \
+             head key can hand the identity off (key-LOSS recovery lands in v1.0)"
+        );
+    }
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context("decoding recovery pubkey")?;
+    }
+    // None carries the existing recovery commitment forward so a plain
+    // rotation never silently drops an enrolled recovery key.
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| head.recovery_pubkey_b64.clone());
+    let record = crate::identity::lineage::LineageRecord::rotation(
+        &head,
+        successor_pubkey_b64,
+        recovery,
+        &Utc::now().to_rfc3339(),
+    )?;
+    let sig = crate::identity::sign::sign_succession(k_old, &record.to_signable())?;
+    append_lineage_record(conn, agent_id, &record, &sig)?;
+    Ok(record)
+}
+
 pub fn stats(conn: &Connection, db_path: &Path) -> Result<Stats> {
     let total: usize = conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
 

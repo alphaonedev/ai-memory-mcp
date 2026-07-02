@@ -104,6 +104,13 @@ pub mod sentinels;
 // OUTER address hash only — the inner content digest + the audit spine stay
 // on SHA-256.
 pub mod cid;
+// v0.9.0 G13 (#1828) — identity lineage: signed key-succession chains
+// (single-node ROTATION-survival core). Opt-in/additive: no lineage
+// enrolled ⇒ byte-identical legacy resolution through the flat
+// `metadata.agent_pubkey`. The recovery VERIFY path, time-windowed
+// resolution, and cross-host federation are deferred to v1.0 — G13
+// stays OPEN this train (see the module docs' honest-scope section).
+pub mod lineage;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).

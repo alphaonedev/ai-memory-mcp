@@ -557,6 +557,42 @@ impl MemoryStore for SqliteStore {
         db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)
     }
 
+    // ----- v0.9.0 G13 (#1828) — identity lineage ----------------------
+    // Thin delegations to the sqlite SSOT in `crate::storage`, so the
+    // C4 single-transaction append and the C1/C3-anchored walk live in
+    // exactly one place (the CLI + verify surfaces share them).
+
+    async fn append_lineage_record(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        record: &crate::identity::lineage::LineageRecord,
+        signature: &[u8],
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        db::append_lineage_record(&conn, agent_id, record, signature).map_err(box_err)
+    }
+
+    async fn read_lineage(
+        &self,
+        agent_id: &str,
+    ) -> StoreResult<Vec<(crate::identity::lineage::LineageRecord, Vec<u8>)>> {
+        let conn = self.state.lock().await;
+        db::read_lineage(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn lineage_witness_hashes(&self, agent_id: &str) -> StoreResult<Vec<Vec<u8>>> {
+        let conn = self.state.lock().await;
+        db::lineage_witness_hashes(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn current_authoritative_key(&self, agent_id: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        Ok(db::current_authoritative_key(&conn, agent_id)
+            .map_err(box_err)?
+            .map(|key| crate::identity::lineage::pubkey_b64(&key)))
+    }
+
     // ----- v0.7.0 Wave-3 Continuation 2 — federation surface ---------
 
     async fn list_memories_updated_since(

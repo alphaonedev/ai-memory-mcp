@@ -155,6 +155,10 @@ mod tests {
             AttestLevel::from_str("recorder_signed"),
             Some(AttestLevel::RecorderSigned)
         );
+        assert_eq!(
+            AttestLevel::from_str("lineage_signed"),
+            Some(AttestLevel::LineageSigned)
+        );
     }
 
     #[test]
@@ -170,6 +174,7 @@ mod tests {
         assert_eq!(AttestLevel::SignedByPeer.as_str(), "signed_by_peer");
         assert_eq!(AttestLevel::DaemonSigned.as_str(), "daemon_signed");
         assert_eq!(AttestLevel::RecorderSigned.as_str(), "recorder_signed");
+        assert_eq!(AttestLevel::LineageSigned.as_str(), "lineage_signed");
     }
 
     #[test]
@@ -189,6 +194,7 @@ mod tests {
             AttestLevel::SignedByPeer,
             AttestLevel::DaemonSigned,
             AttestLevel::RecorderSigned,
+            AttestLevel::LineageSigned,
         ] {
             let s = lvl.as_str();
             assert_eq!(
