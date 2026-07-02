@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### Added — vector-search minimal opt-in slice ([#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005); full substrate deferred to [#1860](https://github.com/alphaonedev/ai-memory-mcp/issues/1860))
+
+Every item below is byte-identical to legacy behavior until its flag /
+allowlist is set (the shipped G5b/G9/G10.1 inert-until-enabled idiom).
+No schema migration; no new dependencies.
+
+- **`VectorSearchIndex` seam** (`src/hnsw.rs`): the swappable
+  vector-search trait (named to avoid colliding with the concrete
+  `VectorIndex` struct). The existing HNSW `VectorIndex` implements it
+  verbatim as the inert default backend; the shared daemon state and
+  the recall/write pipelines now hold
+  `Arc<tokio::sync::Mutex<Option<Box<dyn VectorSearchIndex>>>>` /
+  `Option<&dyn VectorSearchIndex>` instead of the concrete struct, so
+  an alternative backend (the v1.0 #1860 substrate) can slot in
+  without touching the pipelines. Signatures preserve `&self` +
+  interior mutability and `String` memory-id keys.
+- **§5.2 recall fix — namespace starvation (opt-in,
+  `AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST`):** when enabled and the
+  recall is namespace-filtered, the ANN phase threads the namespace's
+  embedded-row id set into the search and consumes the nearest-first
+  iterator LAZILY until `k` in-namespace hits or iterator exhaustion —
+  replacing the fixed `k*2`/`ann_limit = max(limit*5, 50)` global
+  cutoff that let a large foreign corpus crowd a small namespace's
+  rows out of semantic recall entirely. Hierarchical namespaces admit
+  ancestor rows (the Task 1.12 contract). `None`/flag-off is
+  byte-identical legacy (regression + parity tests pin both).
+- **G4 strict embedding-dimension guard (opt-in,
+  `AI_MEMORY_REQUIRE_DIM_MATCH`):** the HNSW `cosine_distance`
+  zip-truncation residual now (under the flag) collapses a
+  mismatched-dimension pair to `f32::MAX` (ranks last; dropped by the
+  recall cosine gate) with a typed `EmbeddingDimMismatch` record, and
+  the index write boundary rejects mismatched-dimension inserts.
+  Default stays tolerant (legacy truncating comparison).
+- **G2 capacity knob wired (`[limits].vector_index_capacity` /
+  `AI_MEMORY_VECTOR_INDEX_CAPACITY`):** the residency cap the
+  v0.7.0 M8 eviction-rate ERROR has told operators to tune is now an
+  actual knob (resolved by `AppConfig::resolve_limits`, threaded into
+  every index construction site). Plus opt-in hard-fail-at-cap mode
+  (`[limits].vector_index_hard_fail_at_cap` /
+  `AI_MEMORY_VECTOR_INDEX_HARD_FAIL`): reject inserts at capacity
+  (ERROR log, index unchanged; the row stays keyword/FTS-recallable)
+  instead of silently evicting the oldest embeddings.
+
 ### Added — G13-mem memory-derivation lineage-DAG ([#1859](https://github.com/alphaonedev/ai-memory-mcp/issues/1859))
 
 - **Lineage-DAG query surface** over the provenance link subset

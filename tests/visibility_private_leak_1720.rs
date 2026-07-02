@@ -410,7 +410,7 @@ fn search_null_caller_fail_closed_1720() {
 fn do_hybrid(
     conn: &rusqlite::Connection,
     query_emb: &[f32],
-    index: Option<&VectorIndex>,
+    index: Option<&dyn ai_memory::hnsw::VectorSearchIndex>,
     caller: Option<&str>,
 ) -> Vec<(Memory, f64)> {
     let scoring = ResolvedScoring::default();

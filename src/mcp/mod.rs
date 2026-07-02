@@ -23,7 +23,7 @@ use std::time::Instant;
 use crate::config::{AppConfig, FeatureTier, ResolvedModels, TierConfig};
 use crate::db;
 use crate::embeddings::{Embed, Embedder};
-use crate::hnsw::VectorIndex;
+use crate::hnsw::{VectorIndex, VectorSearchIndex};
 use crate::llm::OllamaClient;
 use crate::reranker::{BatchedReranker, CrossEncoder};
 
@@ -864,7 +864,7 @@ pub mod tools {
         params: &serde_json::Value,
         embedder: Option<&dyn crate::embeddings::Embed>,
         llm: Option<&crate::llm::OllamaClient>,
-        vector_index: Option<&crate::hnsw::VectorIndex>,
+        vector_index: Option<&dyn crate::hnsw::VectorSearchIndex>,
         resolved_ttl: &crate::config::ResolvedTtl,
         autonomous_hooks: bool,
         mcp_client: Option<&str>,
@@ -1166,7 +1166,7 @@ pub(crate) struct ToolDispatchCtx<'a> {
     /// preset. Built once at MCP serve startup via
     /// `AppConfig::resolve_models()` and reused for every dispatch.
     pub resolved_models: &'a ResolvedModels,
-    pub vector_index: Option<&'a VectorIndex>,
+    pub vector_index: Option<&'a dyn VectorSearchIndex>,
     pub resolved_ttl: &'a crate::config::ResolvedTtl,
     pub resolved_scoring: &'a crate::config::ResolvedScoring,
     pub archive_on_gc: bool,
@@ -2454,7 +2454,7 @@ fn handle_request(
     // `run_mcp_server` (and tests) through to
     // `dispatch_memory_capabilities`.
     resolved_models: &ResolvedModels,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     resolved_ttl: &crate::config::ResolvedTtl,
     resolved_scoring: &crate::config::ResolvedScoring,
     archive_on_gc: bool,
@@ -3535,9 +3535,19 @@ pub fn run_mcp_server(
     // bounded-scan fallback (`is_fully_searchable` gating). The
     // `Arc` exists solely so the warm thread can share the index with
     // the single-threaded stdio loop; handlers still receive
-    // `Option<&VectorIndex>` via `as_deref()`.
-    let vector_index: Option<std::sync::Arc<VectorIndex>> = if embedder.is_some() {
-        let idx = std::sync::Arc::new(VectorIndex::empty());
+    // `Option<&dyn VectorSearchIndex>` via `as_deref()`.
+    // v0.9 #1005 — the index is held as the seam trait object
+    // (`Arc<dyn VectorSearchIndex>`) and constructed with the
+    // operator-resolved `[limits].vector_index_capacity` +
+    // hard-fail-at-cap knobs (G2). Defaults preserve the legacy
+    // 100k-evict-oldest behavior byte-identically.
+    let vector_index: Option<std::sync::Arc<dyn VectorSearchIndex>> = if embedder.is_some() {
+        let index_limits = app_config.resolve_limits();
+        let idx: std::sync::Arc<dyn VectorSearchIndex> =
+            std::sync::Arc::new(VectorIndex::empty_with_capacity(
+                index_limits.vector_index_capacity,
+                index_limits.vector_index_hard_fail_at_cap,
+            ));
         eprintln!(
             "ai-memory: HNSW index warming in background; semantic recall \
              serves keyword/FTS results until the swap lands (#1579 B3)"
@@ -4043,7 +4053,7 @@ mod tests {
             Option<&BatchedReranker>,
             &TierConfig,
             &crate::config::ResolvedModels,
-            Option<&VectorIndex>,
+            Option<&dyn VectorSearchIndex>,
             &crate::config::ResolvedTtl,
             &crate::config::ResolvedScoring,
             bool,

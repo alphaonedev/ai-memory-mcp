@@ -534,6 +534,9 @@ fn test_limits_env_overrides_config_and_default() {
             max_page_size: Some(250_000),
             // #1733 (Pillar-4 4.A) — admission-control inflight cap.
             max_inflight_requests: Some(64),
+            // v0.9 #1005 (G2) — vector-index knobs exercised in their
+            // own dedicated tests; default (unset) here.
+            ..LimitsSection::default()
         }),
         ..AppConfig::default()
     };

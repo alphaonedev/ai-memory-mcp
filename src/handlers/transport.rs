@@ -16,7 +16,7 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{ResolvedTtl, TierConfig};
 use crate::db;
 use crate::embeddings::{Embed, Embedder};
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::profile::Family;
 
 pub type Db = Arc<Mutex<(rusqlite::Connection, std::path::PathBuf, ResolvedTtl, bool)>>;
@@ -137,7 +137,10 @@ impl StorageBackend {
 pub struct AppState {
     pub db: Db,
     pub embedder: Arc<Option<Embedder>>,
-    pub vector_index: Arc<Mutex<Option<VectorIndex>>>,
+    /// v0.9 #1005 — the swappable vector-search seam: holds the boxed
+    /// [`VectorSearchIndex`] backend (today always the default HNSW
+    /// `hnsw::VectorIndex`) instead of the concrete struct.
+    pub vector_index: Arc<Mutex<Option<Box<dyn VectorSearchIndex>>>>,
     /// v0.7 federation config — `Some` when `--quorum-writes N` +
     /// `--quorum-peers` are configured at serve time. Writes fan out
     /// to peers via `FederationConfig::broadcast_store_quorum` when

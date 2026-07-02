@@ -4,7 +4,7 @@
 //! MCP `memory_consolidate` handler.
 
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::llm::OllamaClient;
 use crate::models::Tier;
 use crate::models::field_names;
@@ -17,7 +17,7 @@ pub(super) fn handle_consolidate(
     params: &Value,
     llm: Option<&OllamaClient>,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let ids_arr = params["ids"]

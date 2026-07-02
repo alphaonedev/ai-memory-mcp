@@ -4,7 +4,7 @@
 //! MCP `memory_recall` handler and namespace-chain helpers.
 
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{
@@ -184,7 +184,7 @@ pub async fn handle_recall_with_pre_recall_hook(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     reranker: Option<&BatchedReranker>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
@@ -782,7 +782,7 @@ pub fn handle_recall(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     reranker: Option<&BatchedReranker>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
@@ -815,7 +815,7 @@ pub fn handle_recall_caller(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     reranker: Option<&BatchedReranker>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,
@@ -874,7 +874,7 @@ pub fn handle_recall_dto(
     conn: &rusqlite::Connection,
     req: &RecallRequest,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     reranker: Option<&BatchedReranker>,
     archive_on_gc: bool,
     resolved_ttl: &crate::config::ResolvedTtl,

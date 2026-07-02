@@ -1244,7 +1244,7 @@ fn run_store_with_embedder(
     db_path: &PathBuf,
     llm: &OllamaClient,
     embedder: &dyn ai_memory::embeddings::Embed,
-    vector_index: Option<&ai_memory::hnsw::VectorIndex>,
+    vector_index: Option<&dyn ai_memory::hnsw::VectorSearchIndex>,
     params: Value,
 ) -> Result<Value, String> {
     let ttl = ResolvedTtl::default();

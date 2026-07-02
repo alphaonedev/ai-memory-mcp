@@ -2648,7 +2648,9 @@ pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec
 /// time-to-semantic-ready in the daemon log.
 pub fn spawn_vector_index_boot_load(
     db_path: std::path::PathBuf,
-    vector_index: Arc<tokio::sync::Mutex<Option<VectorIndex>>>,
+    // v0.9 #1005 — the shared seam type: boxed [`crate::hnsw::VectorSearchIndex`]
+    // (today always the default HNSW backend) behind the AppState mutex.
+    vector_index: Arc<tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -4119,9 +4121,20 @@ pub async fn bootstrap_serve(
     // proactive conflict check uses its bounded-scan fallback. The
     // pre-#1579 synchronous build held boot for 40 s at 10k vectors
     // and >28 min at 100k (P1 audit).
-    let vector_index_state: Arc<Mutex<Option<VectorIndex>>> = Arc::new(Mutex::new(
-        embedder.is_some().then(hnsw::VectorIndex::empty),
-    ));
+    // v0.9 #1005 (G2) — the index is constructed with the
+    // operator-resolved `[limits].vector_index_capacity` /
+    // AI_MEMORY_VECTOR_INDEX_CAPACITY cap + the opt-in
+    // hard-fail-at-cap mode, wiring the knob the eviction-rate ERROR
+    // has named since v0.7.0 M8. Defaults preserve the legacy
+    // 100k-evict-oldest behavior byte-identically.
+    let index_limits = app_config.resolve_limits();
+    let vector_index_state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
+        Arc::new(Mutex::new(embedder.is_some().then(|| {
+            hnsw::boxed_default_index(
+                index_limits.vector_index_capacity,
+                index_limits.vector_index_hard_fail_at_cap,
+            )
+        })));
     if embedder.is_some() {
         let _boot_index_loader =
             spawn_vector_index_boot_load(db_path.to_path_buf(), Arc::clone(&vector_index_state));
@@ -7029,8 +7042,8 @@ mod tests {
 
         // The daemon-shaped state: empty index behind the AppState
         // mutex — exactly what `serve` now constructs before binding.
-        let state: Arc<Mutex<Option<VectorIndex>>> =
-            Arc::new(Mutex::new(Some(hnsw::VectorIndex::empty())));
+        let state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
+            Arc::new(Mutex::new(Some(Box::new(hnsw::VectorIndex::empty()) as _)));
         let handle = spawn_vector_index_boot_load(env.db_path.clone(), Arc::clone(&state));
 
         // Readiness: the state is immediately lockable (no long-held
@@ -7055,7 +7068,7 @@ mod tests {
             idx.is_fully_searchable(),
             "loader must drive the #968 rebuild to a swapped-in graph"
         );
-        let hits = idx.search(&[1.0, 0.0, 0.0], 1);
+        let hits = idx.search(&[1.0, 0.0, 0.0], 1, None);
         assert_eq!(
             hits.first().map(|h| h.id.as_str()),
             Some(expected_ids[0].as_str()),

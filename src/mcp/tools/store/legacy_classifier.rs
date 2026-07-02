@@ -37,9 +37,9 @@
 use crate::models::field_names;
 use serde_json::{Value, json};
 
+use crate::db;
 use crate::llm::OllamaClient;
 use crate::models::{GovernancePolicy, Memory};
-use crate::{db, hnsw::VectorIndex};
 
 use super::AUTONOMY_MIN_CONTENT_LEN;
 
@@ -192,4 +192,4 @@ pub(super) fn merge_autonomy_outcome_into_response(
 /// callers in the store handler don't need a separate `use` line.
 /// The compiler removes the alias under `--release`.
 #[allow(dead_code)]
-pub(super) type Idx = VectorIndex;
+pub(super) type Idx = dyn crate::hnsw::VectorSearchIndex;

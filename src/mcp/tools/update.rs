@@ -4,7 +4,7 @@
 //! MCP `memory_update` handler.
 
 use crate::embeddings::Embed;
-use crate::hnsw::VectorIndex;
+use crate::hnsw::VectorSearchIndex;
 use crate::mcp::param_names;
 use crate::mcp::registry::McpTool;
 use crate::models::{EditSource, LifecycleState, Tier};
@@ -134,7 +134,7 @@ pub(super) fn handle_update(
     conn: &rusqlite::Connection,
     params: &Value,
     embedder: Option<&dyn Embed>,
-    vector_index: Option<&VectorIndex>,
+    vector_index: Option<&dyn VectorSearchIndex>,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let id = params["id"]
