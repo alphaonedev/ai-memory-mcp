@@ -138,8 +138,10 @@ pub const REQUIRE_WRITE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG";
 /// by the #238 envelope attestation + #29 signature + #30 nonce + #43
 /// enrollment) stay faith-based. A *forged* signature is rejected
 /// unconditionally regardless of this knob (the [`crate::identity::verify::attest_write`]
-/// gate). Mirrors the secure-opt-in shape of `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
-/// (#48, the local-write sibling).
+/// gate). Mirrors the pre-v0.9 secure-opt-in shape of
+/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (#48, the local-write sibling,
+/// whose store-path default flipped to required in v0.9 per #1751 — this
+/// federation knob deliberately keeps its own permissive opt-in default).
 #[must_use]
 pub fn require_write_sig_enabled() -> bool {
     std::env::var(REQUIRE_WRITE_SIG_ENV)

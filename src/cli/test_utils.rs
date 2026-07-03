@@ -110,6 +110,11 @@ impl TestEnv {
         // real config. See `ensure_no_config_env` for the full
         // rationale.
         ensure_no_config_env();
+        // #1751 — pin the lib-test binary to the explicit permissive
+        // attestation opt-out so unsigned CLI store fixtures keep
+        // exercising their actual subject matter (same Once discipline
+        // as `ensure_no_config_env` above).
+        crate::identity::attest::permissive_attestation_for_lib_tests();
         let _tmp = tempfile::tempdir().expect("tempdir");
         let db_path = _tmp.path().join("ai-memory.db");
         Self {

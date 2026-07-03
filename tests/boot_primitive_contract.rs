@@ -25,6 +25,9 @@ use tempfile::TempDir;
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #1751 — pin the explicit permissive attestation opt-out so the
+        // suite's unsigned `store` seeding keeps exercising boot behavior.
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().unwrap()]);
     cmd
 }

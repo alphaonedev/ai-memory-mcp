@@ -8867,11 +8867,11 @@ pub fn bind_agent_pubkey(conn: &Connection, agent_id: &str, pubkey_b64: &str) ->
 /// Layer-3, Task 1.3 / C3).
 ///
 /// Returns `Ok(None)` when the agent is registered but has no bound key
-/// (the permissive-default attestation posture: such an agent can still
-/// write *claimed* rows), and also when the agent is not registered at
-/// all — both collapse to "no key to verify against". The verifier
-/// distinguishes the two only when `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
-/// is set, where a missing key on a required write is a hard reject.
+/// (under the explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out
+/// such an agent can still write *claimed* rows), and also when the
+/// agent is not registered at all — both collapse to "no key to verify
+/// against". Under required attestation (the v0.9 default, #1751) a
+/// missing key on an unsigned write is a hard reject.
 ///
 /// # Errors
 ///

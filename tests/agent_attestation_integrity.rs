@@ -388,6 +388,87 @@ fn cli_require_attestation_rejects_unsigned_store() {
     );
 }
 
+/// #1751 (v0.9) — the COMPILED DEFAULT is now the strict posture: with
+/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` entirely ABSENT from the child
+/// env (`env_clear()`, no explicit set), an unsigned CLI store must be
+/// rejected. This is the flip promised by the v0.8.0 one-cycle
+/// deprecation WARN (#1464 vote); a regression that silently reverted
+/// the compiled default to permissive surfaces here, independent of the
+/// parse-ladder pins in `tests/config_precedence.rs`.
+#[test]
+fn cli_default_requires_attestation_rejects_unsigned_store_1751() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("cli-attest-default.db");
+    let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
+    let assert = cmd
+        .env_clear()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1751")
+        .args([
+            "--db",
+            db.to_str().expect("utf8 path"),
+            "store",
+            "--title",
+            "cli-unsigned-default",
+            "--content",
+            "Body of the unsigned CLI write under the v0.9 default, real prose.",
+            "--namespace",
+            "attest-cli-default",
+        ])
+        .assert()
+        .failure();
+    let out = assert.get_output();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("attestation"),
+        "the v0.9 compiled default must reject an unsigned store; got stderr: {stderr}"
+    );
+}
+
+/// #1751 (v0.9) — the explicit `=0` opt-out is honoured: same unsigned
+/// CLI store as above, but with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`
+/// in the child env, the write lands `attest_level = "claimed"` (the
+/// documented pre-v0.9 permissive posture).
+#[test]
+fn cli_opt_out_zero_lands_unsigned_store_claimed_1751() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("cli-attest-optout.db");
+    let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
+    cmd.env_clear()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1751")
+        .args([
+            "--db",
+            db.to_str().expect("utf8 path"),
+            "store",
+            "--title",
+            "cli-unsigned-optout",
+            "--content",
+            "Body of the unsigned CLI write under the explicit opt-out, real prose.",
+            "--namespace",
+            "attest-cli-optout",
+        ])
+        .assert()
+        .success();
+    // The row landed and is claimed, not attested.
+    let conn = ai_memory::db::open(&db).expect("db::open");
+    let (count, level): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(json_extract(metadata, '$.attest_level')) \
+             FROM memories WHERE namespace = 'attest-cli-optout'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("count query");
+    assert_eq!(count, 1, "opt-out write must persist exactly one row");
+    assert_eq!(
+        level.as_deref(),
+        None,
+        "an opt-out unsigned write takes the legacy no-stamp path (no attest_level key)"
+    );
+}
+
 /// #626 Layer-3 — the *signed* arm of the same MCP `handle_store` gate. A
 /// caller presents a valid detached signature over the canonical envelope
 /// plus the matching `created_at`; the gate adopts the timestamp, re-derives

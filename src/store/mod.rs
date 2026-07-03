@@ -1196,13 +1196,15 @@ pub trait MemoryStore: Send + Sync {
     /// Layer-3, Task 1.3 / C3).
     ///
     /// `Ok(None)` means "no key to verify against" — the agent is
-    /// registered without a key (permissive-default posture) OR is not
-    /// registered at all. The verifier treats both alike unless
-    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set.
+    /// registered without a key OR is not registered at all. The verifier
+    /// treats both alike: under required attestation (the v0.9 default,
+    /// #1751) an unsigned write with no key is rejected; under the
+    /// explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out it lands
+    /// *claimed*.
     ///
-    /// Default returns `Ok(None)` (permissive): an adapter without key
-    /// provisioning behaves as "no agent has an attestable key", so
-    /// every write stays at the *claimed* level rather than erroring.
+    /// Default returns `Ok(None)`: an adapter without key provisioning
+    /// behaves as "no agent has an attestable key", so the gate's
+    /// require/opt-out disposition decides the write's fate.
     async fn agent_pubkey(&self, _agent_id: &str) -> StoreResult<Option<String>> {
         Ok(None)
     }

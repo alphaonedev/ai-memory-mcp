@@ -344,9 +344,10 @@ pub(crate) fn handle_store(
     // remote signer must supply the timestamp it used; the server validates
     // it against a bounded freshness window (replay / post-dating guard)
     // and then adopts it verbatim so the verifier re-derives the identical
-    // envelope. With no signature the path is byte-equal to the legacy
-    // build unless the operator set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`,
-    // in which case the unsigned write is rejected by the gate.
+    // envelope. With no signature the unsigned write is rejected by the
+    // gate under the v0.9 required-attestation default (#1751); only the
+    // explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out keeps the
+    // unsigned path byte-equal to the legacy build.
     {
         let presented_sig = params["signature"]
             .as_str()

@@ -33,7 +33,19 @@ use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 /// Build the production router over a fresh on-disk sqlite DB. The
 /// `app.store` SqliteStore is opened against the SAME path so seed →
 /// read works through both the legacy `db` path and the SAL trait.
+/// #1751 — pin this test binary to the explicit permissive agent-attestation
+/// opt-out; the v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned HTTP store fixtures. The required default itself is
+/// pinned in `tests/agent_attestation_integrity.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
+
 fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+    permissive_attestation_for_tests();
     let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");

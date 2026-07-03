@@ -57,7 +57,19 @@ fn unique_db() -> std::path::PathBuf {
     root().join(format!("mcp-{}.db", uuid::Uuid::new_v4()))
 }
 
+/// #1751 — pin this test binary (and any spawned `ai-memory` child, which
+/// inherits the process env) to the explicit permissive agent-attestation
+/// opt-out. The v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned store fixtures; the required default itself is pinned
+/// in `tests/agent_attestation_integrity.rs` + `tests/config_precedence.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
 fn spawn_mcp(db_path: &std::path::Path, mode: &str) -> (McpChild, mpsc::Receiver<String>) {
+    permissive_attestation_for_tests();
     let key_dir = db_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))

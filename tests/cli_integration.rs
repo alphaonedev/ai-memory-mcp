@@ -26,6 +26,7 @@ use tempfile::TempDir;
 fn ai_memory(db: &std::path::Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().unwrap()]);
     cmd
 }
@@ -35,6 +36,7 @@ fn ai_memory(db: &std::path::Path) -> Command {
 fn ai_memory_std(db: &std::path::Path) -> StdCommand {
     let mut cmd = StdCommand::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().unwrap()]);
     cmd
 }
@@ -44,6 +46,7 @@ fn binary_help_succeeds() {
     Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .arg("--help")
         .assert()
         .success()
@@ -55,6 +58,7 @@ fn binary_version_succeeds() {
     Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .arg("--version")
         .assert()
         .success()
@@ -106,6 +110,7 @@ fn each_subcommand_help() {
         Command::cargo_bin("ai-memory")
             .unwrap()
             .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
             .args([sub, "--help"])
             .assert()
             .success();
@@ -541,6 +546,7 @@ fn invalid_subcommand_errors_with_useful_message() {
     Command::cargo_bin("ai-memory")
         .unwrap()
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .arg("notarealcommand")
         .assert()
         .failure()

@@ -54,6 +54,8 @@ use tempfile::TempDir;
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").unwrap();
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #1751 — permissive attestation opt-out for unsigned store dispatches.
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args(["--db", db.to_str().unwrap()]);
     cmd
 }
