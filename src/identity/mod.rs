@@ -322,6 +322,49 @@ pub(crate) fn agent_id_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// #1874 — RAII fixture for lib tests that DEPEND on `AI_MEMORY_AGENT_ID`
+/// being UNSET (the single-operator trust-all default that skips the
+/// #1786 owner gates, e.g. the `mcp::link` supersedes/invalidation-walk
+/// tests). Such a test previously ran lock-free, so a sibling test
+/// setting the var process-wide (`promote.rs`/`delete.rs`/`forget.rs`
+/// owner-gate tests) could leak `ai:alice`/`ai:bob` into its
+/// `resolve_read_visibility_caller()` window → spurious
+/// "caller does not own this memory" refusals.
+///
+/// Acquires the crate-wide [`agent_id_env_test_lock`] for its lifetime
+/// (serialising against every well-behaved mutator), REMOVES any value —
+/// including one leaked by a mutator that panicked before its manual
+/// restore — and restores the pre-guard state on drop. Same RAII
+/// discipline as the #1853 HMAC fix (`tests/cov_ga2_r4_handlers.rs`).
+#[cfg(test)]
+pub(crate) struct AgentIdEnvUnsetGuard {
+    prev: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) fn agent_id_env_unset_guard() -> AgentIdEnvUnsetGuard {
+    let lock = agent_id_env_test_lock();
+    let prev = std::env::var_os(ENV_AGENT_ID);
+    // SAFETY: process-global env mutation serialized on the crate-wide
+    // test lock; every mutator of this var acquires the same lock.
+    unsafe { std::env::remove_var(ENV_AGENT_ID) };
+    AgentIdEnvUnsetGuard { prev, _lock: lock }
+}
+
+#[cfg(test)]
+impl Drop for AgentIdEnvUnsetGuard {
+    fn drop(&mut self) {
+        match self.prev.take() {
+            // SAFETY: still holding the crate-wide test lock (`_lock`
+            // outlives this restore within the same struct drop).
+            Some(v) => unsafe { std::env::set_var(ENV_AGENT_ID, v) },
+            None => unsafe { std::env::remove_var(ENV_AGENT_ID) },
+        }
+    }
+}
+
 /// #1720 B3 — env flag that turns a detected boot-time owner-lockout into a
 /// hard REFUSAL instead of a WARN. Truthy (`1`/`true`/`yes`/`on`) makes
 /// [`enforce_owner_lockout_guard`] return an error (aborting MCP boot) when

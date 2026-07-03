@@ -125,6 +125,8 @@ mod d1_6_987_tests {
 
     #[test]
     fn update_tool_metadata_987() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         assert_eq!(UpdateTool::name(), "memory_update");
         assert_eq!(UpdateTool::family(), "lifecycle");
     }
@@ -557,6 +559,8 @@ mod tests {
     // A. happy path — update multiple fields, no embedder
     #[test]
     fn happy_path_updates_all_fields_no_embedder() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("orig");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -594,6 +598,8 @@ mod tests {
     // A. prefix resolution branch
     #[test]
     fn prefix_resolution_branch() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mut mem = make_mem("p");
         mem.id = "fedcba98-1111-2222-3333-444455556666".to_string();
@@ -612,6 +618,8 @@ mod tests {
     // Embedder Some-path: content changed → re-embed + index touched
     #[test]
     fn embedder_some_path_reembeds_when_content_changes() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("xyz");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -634,6 +642,8 @@ mod tests {
     // Embedder Some-path but no content change (only tags) → no re-embed
     #[test]
     fn embedder_some_path_skips_when_content_unchanged() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("nochange");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -655,6 +665,8 @@ mod tests {
     // B. missing id
     #[test]
     fn missing_id_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_update(&conn, &json!({}), None, None, None).unwrap_err();
         assert!(err.contains("id is required"));
@@ -663,6 +675,8 @@ mod tests {
     // B. invalid id format
     #[test]
     fn invalid_id_format_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_update(&conn, &json!({"id": ""}), None, None, None).unwrap_err();
         assert!(!err.is_empty());
@@ -671,6 +685,8 @@ mod tests {
     // D. id not found
     #[test]
     fn unknown_id_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_update(
             &conn,
@@ -686,6 +702,8 @@ mod tests {
     // B. invalid title (empty)
     #[test]
     fn invalid_title_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -697,6 +715,8 @@ mod tests {
     // B. invalid content (empty)
     #[test]
     fn invalid_content_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -708,6 +728,8 @@ mod tests {
     // B. invalid namespace (has space)
     #[test]
     fn invalid_namespace_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -725,6 +747,8 @@ mod tests {
     // B. invalid priority (out of range)
     #[test]
     fn invalid_priority_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -736,6 +760,8 @@ mod tests {
     // B. invalid confidence
     #[test]
     fn invalid_confidence_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -753,6 +779,8 @@ mod tests {
     // B. invalid expires_at format
     #[test]
     fn invalid_expires_at_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("ok");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -770,6 +798,8 @@ mod tests {
     // metadata.agent_id immutability when caller tries to overwrite
     #[test]
     fn metadata_preserves_existing_agent_id() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("immut");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -792,6 +822,8 @@ mod tests {
     // E. idempotency
     #[test]
     fn idempotent_repeated_update() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("idem");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -812,6 +844,8 @@ mod tests {
     // NEW row + vector-index insert.
     #[test]
     fn edit_source_llm_appends_and_archives_with_embedder() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("pre-supersede");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -859,6 +893,8 @@ mod tests {
     // happy-path return for the supersede shape (lines 141-147).
     #[test]
     fn edit_source_hook_appends_and_archives_no_embedder() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("pre-hook");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -894,6 +930,8 @@ mod tests {
     // 199-208 (the VersionConflict downcast arm) end-to-end.
     #[test]
     fn expected_version_conflict_returns_json_envelope() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("verconflict");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -928,6 +966,8 @@ mod tests {
     // reject branch for a bare string without a recognised scheme.
     #[test]
     fn source_uri_valid_passes_through_and_invalid_rejects() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("srcuri");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -1000,6 +1040,8 @@ mod tests {
 
     #[test]
     fn governance_deny_blocks_update_by_non_owner() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let _gate = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Enforce,
@@ -1032,6 +1074,8 @@ mod tests {
     /// `edit_source = "agent"`.
     #[test]
     fn issue_1600_explicit_agent_edit_source_mutates_in_place() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("agent-inplace");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -1065,6 +1109,8 @@ mod tests {
     /// defaulted to Human and mutated in place).
     #[test]
     fn issue_1600_unknown_edit_source_errors_listing_valid_values() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("robot-reject");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -1098,6 +1144,8 @@ mod tests {
     /// historical `human` default.
     #[test]
     fn issue_1600_omitted_edit_source_derives_from_caller_id() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("derive-default");
         let id = db::insert(&conn, &mem).expect("ins");
@@ -1134,6 +1182,8 @@ mod tests {
 
     #[test]
     fn governance_allows_update_in_ungoverned_namespace() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         // Default (no namespace standard) → write-gate is transparent.
         let conn = fresh_conn();
         let mem = make_mem("ok");
@@ -1155,6 +1205,8 @@ mod tests {
 
     #[test]
     fn lifecycle_legal_open_to_active_to_done_persists() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("lc-legal");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -1192,6 +1244,8 @@ mod tests {
 
     #[test]
     fn lifecycle_illegal_open_to_done_is_rejected() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("lc-skip");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -1218,6 +1272,8 @@ mod tests {
 
     #[test]
     fn lifecycle_illegal_terminal_done_to_active_is_rejected() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("lc-terminal");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -1255,6 +1311,8 @@ mod tests {
 
     #[test]
     fn lifecycle_unknown_value_is_rejected() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("lc-bogus");
         let id = db::insert(&conn, &mem).expect("insert");
@@ -1274,6 +1332,8 @@ mod tests {
 
     #[test]
     fn lifecycle_same_state_is_noop_not_error() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mem = make_mem("lc-noop");
         let id = db::insert(&conn, &mem).expect("insert");

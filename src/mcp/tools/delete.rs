@@ -681,11 +681,6 @@ mod tests {
         crate::config::clear_permissions_mode_override_for_test();
     }
 
-    fn agent_id_env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
-
     #[test]
     fn cross_owner_delete_refused_1786() {
         // #1786 — when AI_MEMORY_AGENT_ID is SET (the multi-tenant opt-in), the
@@ -693,9 +688,9 @@ mod tests {
         // owner delete. (Unset = trust-all single-tenant default, no gate — that
         // path is covered by every other handle_delete test, which run without
         // the env set and still pass.)
-        let _envg = agent_id_env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // #1874 — crate-wide lock (was a module-local mutex, which could not
+        // exclude the cross-module readers/mutators of AI_MEMORY_AGENT_ID).
+        let _envg = crate::identity::agent_id_env_test_lock();
         let _pm = crate::config::lock_permissions_mode_for_test();
         crate::config::override_active_permissions_mode_for_test(
             crate::config::PermissionsMode::Off,
