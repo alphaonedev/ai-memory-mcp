@@ -20,8 +20,15 @@ use rusqlite::{Connection, params};
 /// Environment variable controlling the TTL window in days. Unset /
 /// invalid → [`DEFAULT_TTL_DAYS`]. Negative or zero values keep the
 /// default (a runtime "delete everything" mode is intentionally NOT
-/// exposed — operators can drop the table directly if they need
-/// that).
+/// exposed).
+///
+/// v0.9.0 P0-1 (#1869) — the ledger is now LOAD-BEARING for
+/// retention: with recall pure by default, unfolded (`folded = 0`)
+/// rows carry the not-yet-applied access signal (TTL extensions,
+/// promotion, priority). Do NOT truncate or drop the table by hand —
+/// discarding unfolded rows loses TTL extensions and can let the gc
+/// evict hot memories. Run the fold first (`ai-memory gc` folds
+/// before evicting), then prune.
 pub const TTL_ENV_VAR: &str = "AI_MEMORY_OBSERVATIONS_TTL_DAYS";
 
 /// Default TTL window — one week. Matches the operator agreement
@@ -45,31 +52,53 @@ pub fn ttl_days() -> i64 {
 /// older than the configured TTL. Returns the number of rows
 /// pruned.
 ///
+/// v0.9.0 P0-1 (#1869) — the pruner is guarded to `folded = 1` rows,
+/// PLUS an age-capped safety valve: unfolded rows older than the same
+/// TTL are also pruned but each such sweep logs a WARN, because a
+/// healthy fold loop should have consumed them long ago (an unfolded
+/// backlog at TTL age means the fold loop is dead or a third-party SAL
+/// impl ships the no-op fold default). The valve keeps the table
+/// bounded either way; the WARN makes the signal loss loud.
+///
 /// # Errors
 ///
 /// Returns the underlying `rusqlite::Error` on SQL failure.
 pub fn prune(conn: &Connection) -> Result<usize> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(ttl_days())).to_rfc3339();
-    let n = conn.execute(
-        "DELETE FROM recall_observations WHERE observed_at < ?1",
-        params![cutoff],
-    )?;
-    Ok(n)
+    prune_before(conn, &cutoff)
 }
 
 /// Variant of [`prune`] that uses an explicit cutoff timestamp
 /// instead of consulting the environment + clock. Exists for tests
-/// so the cutoff is deterministic and replayable.
+/// so the cutoff is deterministic and replayable. Same `folded = 1`
+/// guard + unfolded-row safety valve as [`prune`].
 ///
 /// # Errors
 ///
 /// Returns the underlying `rusqlite::Error` on SQL failure.
 pub fn prune_before(conn: &Connection, cutoff_rfc3339: &str) -> Result<usize> {
-    let n = conn.execute(
-        "DELETE FROM recall_observations WHERE observed_at < ?1",
+    let folded = conn.execute(
+        "DELETE FROM recall_observations WHERE observed_at < ?1 AND folded = 1",
         params![cutoff_rfc3339],
     )?;
-    Ok(n)
+    // #1869 safety valve — unfolded rows past the TTL cannot be left
+    // to accumulate forever (dead fold loop / third-party no-op SAL
+    // fold), but pruning them DISCARDS un-applied access signal, so it
+    // is loud.
+    let unfolded = conn.execute(
+        "DELETE FROM recall_observations WHERE observed_at < ?1 AND folded = 0",
+        params![cutoff_rfc3339],
+    )?;
+    if unfolded > 0 {
+        tracing::warn!(
+            target: "observations",
+            "recall_observations pruner deleted {unfolded} UNFOLDED row(s) older than the \
+             ledger TTL — their access signal (TTL extensions / promotion / priority) is \
+             lost. The fold loop appears dead or unwired; check \
+             AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS and the daemon gc loop."
+        );
+    }
+    Ok(folded + unfolded)
 }
 
 #[cfg(test)]

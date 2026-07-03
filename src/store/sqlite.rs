@@ -734,14 +734,51 @@ impl MemoryStore for SqliteStore {
         // is set; this post-filter is the belt-and-suspenders mirror
         // of the SAL contract so callers that pass an empty `as_agent`
         // (or rely on the trait default) still fail-closed.
-        if ctx.bypass_visibility {
-            return Ok(results);
+        let results = if ctx.bypass_visibility {
+            results
+        } else {
+            let caller = ctx.effective_principal();
+            results
+                .into_iter()
+                .filter(|(m, _)| is_visible_to_caller(m, caller))
+                .collect()
+        };
+        // v0.9.0 P0-1 (#1869) — close the SAL-sqlite ledger gap: with
+        // recall pure by default, a recall that writes no ledger row
+        // vanishes from the access signal entirely (its counts freeze).
+        // Best-effort, table-probe-gated append on the post-filter
+        // RETURNED set, mirroring the MCP/HTTP/CLI writers; rows are
+        // stamped pre-folded under the sync legacy flag via the shared
+        // insert-layer stamp. A ledger error never blocks the recall.
+        if crate::observations::table_exists(&conn) {
+            let recall_id = uuid::Uuid::new_v4().to_string();
+            let mode = if query_embedding.is_some() {
+                "hybrid"
+            } else {
+                "keyword"
+            };
+            #[allow(clippy::cast_possible_wrap)]
+            let candidates: Vec<crate::observations::Candidate<'_>> = results
+                .iter()
+                .enumerate()
+                .map(|(i, (m, s))| crate::observations::Candidate {
+                    memory_id: m.id.as_str(),
+                    retriever: mode,
+                    rank: (i + 1) as i64,
+                    score: *s,
+                })
+                .collect();
+            if let Err(e) = crate::observations::record_recall_with_identity(
+                &conn,
+                &recall_id,
+                &candidates,
+                Some(ctx.effective_principal()),
+                filter.namespace.as_deref(),
+            ) {
+                tracing::warn!("recall (SAL-sqlite): ledger append failed (non-fatal): {e}");
+            }
         }
-        let caller = ctx.effective_principal();
-        Ok(results
-            .into_iter()
-            .filter(|(m, _)| is_visible_to_caller(m, caller))
-            .collect())
+        Ok(results)
     }
 
     async fn touch_after_recall(&self, ids: &[String]) -> StoreResult<()> {
@@ -784,6 +821,15 @@ impl MemoryStore for SqliteStore {
             }
         }
         Ok(())
+    }
+
+    async fn fold_recall_accesses(&self) -> StoreResult<usize> {
+        // v0.9.0 P0-1 (#1869) — delegate to the substrate fold
+        // (`db::fold_recall_accesses`) with the same compiled default
+        // extend windows the SAL touch verb uses (1h short / 1d mid),
+        // which equal the daemon's resolved-TTL defaults.
+        let conn = self.state.lock().await;
+        db::fold_recall_accesses(&conn, crate::SECS_PER_HOUR, crate::SECS_PER_DAY).map_err(box_err)
     }
 
     async fn pending_decide(

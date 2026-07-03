@@ -261,6 +261,18 @@ const MIGRATION_V75_MEMORY_LINKS_LINEAGE_CID: &str =
 const MIGRATION_V76_AGENT_LINEAGE: &str =
     include_str!("../../migrations/postgres/0035_v76_agent_lineage.sql");
 
+/// v77 (#1869, v0.9.0 P0-1 recall purity) — `folded` fold-state column
+/// + partial unfolded index on `recall_observations` (postgres mirror
+/// of the sqlite v77 arm). The DDL file is replay-safe (ADD COLUMN IF
+/// NOT EXISTS + CREATE INDEX IF NOT EXISTS); the BACKFILL
+/// (`SET folded = TRUE` — pre-existing rows were sync-touched at
+/// recall time) runs in the probe-guarded `migrate_v77` arm ONLY when
+/// the column was just added, so a replay can never re-mark rows the
+/// fold has not yet consumed. Fresh schemas carry the column + index
+/// inline in `postgres_schema.sql`.
+const MIGRATION_V77_RECALL_OBSERVATIONS_FOLDED: &str =
+    include_str!("../../migrations/postgres/0036_v77_recall_observations_folded.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -604,7 +616,12 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       snapshot/restore is a tracked follow-up. Additive CREATE TABLE
 //       IF NOT EXISTS (v59/v60/v69 precedent) — replay-safe.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 76;
+// v77 = #1869 (v0.9.0 P0-1 recall purity) — `folded` fold-state column
+//       + partial unfolded index on `recall_observations`; backfill
+//       `folded = TRUE` for pre-existing (sync-touched) rows, probe-
+//       guarded so a replay never re-marks unconsumed rows.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
+const CURRENT_SCHEMA_VERSION: i32 = 77;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1474,8 +1491,11 @@ impl PostgresStore {
         if current_version < 75 {
             self.migrate_v75().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 76 {
             self.migrate_v76().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v77().await?;
         }
 
         Ok(())
@@ -3667,7 +3687,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v76 agent_lineage", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // v76 is no longer the ladder head (v77 is); stamp the literal
+        // so the same-run v77 arm advances past it (the v75 precedent).
+        record_schema_version(&mut tx, 76).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v76 ddl", e))?;
@@ -3676,6 +3698,59 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v76 applied (#1828: agent_lineage — identity-lineage \
              succession chain, rotation-survival core)"
+        );
+        Ok(())
+    }
+
+    /// v0.9.0 P0-1 (#1869) — recall purity: add the `folded` fold-state
+    /// column + partial unfolded index to `recall_observations`
+    /// (postgres twin of the sqlite v77 arm) and BACKFILL every
+    /// pre-existing row to `folded = TRUE` — those rows were recorded
+    /// in the sync-touch era and their accesses were already applied at
+    /// recall time; folding them would double-count. The backfill is
+    /// probe-guarded (fires only when the column was just added) so an
+    /// idempotent replay can never re-mark rows the fold has not yet
+    /// consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / backfill / stamp failure.
+    async fn migrate_v77(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v77 ddl tx", e))?;
+        // Probe BEFORE the DDL: does the column already exist?
+        let column_present: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM information_schema.columns
+             WHERE table_name = 'recall_observations' AND column_name = 'folded'",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("probe v77 folded column", e))?;
+        sqlx::raw_sql(MIGRATION_V77_RECALL_OBSERVATIONS_FOLDED)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v77 recall_observations folded", e))?;
+        if column_present.is_none() {
+            // Column was just added — every existing row predates the
+            // fold ledger discipline and was sync-touched at recall
+            // time. Mark folded so the fold never double-counts.
+            sqlx::query("UPDATE recall_observations SET folded = TRUE")
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("backfill v77 folded = TRUE", e))?;
+        }
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v77 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v77 applied (#1869: recall_observations.folded — \
+             recall-purity fold ledger state)"
         );
         Ok(())
     }
@@ -4752,6 +4827,14 @@ impl PostgresStore {
         if candidates.is_empty() {
             return Ok(0);
         }
+        // v0.9.0 P0-1 (#1869) — sync-mode double-count guard: rows
+        // written while the deprecated AI_MEMORY_RECALL_TOUCH_SYNC=1
+        // legacy flag is ON are inserted pre-marked `folded = TRUE`
+        // (the recall already touched synchronously), so the
+        // always-running fold never re-applies them. Pure default
+        // inserts `FALSE` and the fold applies the ladders exactly
+        // once. Flag evaluated once per batch, never per row.
+        let folded = crate::config::recall_touch_sync_enabled();
         let mut tx = self
             .pool
             .begin()
@@ -4761,8 +4844,8 @@ impl PostgresStore {
         for (memory_id, retriever, rank, score) in candidates {
             let n = sqlx::query(
                 "INSERT INTO recall_observations
-                    (recall_id, memory_id, retriever, rank, score, agent_id, namespace)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (recall_id, memory_id, retriever, rank, score, agent_id, namespace, folded)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (recall_id, memory_id) DO NOTHING",
             )
             .bind(recall_id)
@@ -4772,6 +4855,7 @@ impl PostgresStore {
             .bind(score)
             .bind(agent_id)
             .bind(namespace)
+            .bind(folded)
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("insert recall_observation", e))?
@@ -4793,13 +4877,127 @@ impl PostgresStore {
     /// concurrently with `recall_observation_insert`.
     pub async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
-        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| to_store_err("recall_observation_gc", e))?
-            .rows_affected();
-        Ok(usize::try_from(n).unwrap_or(0))
+        self.recall_observation_prune_guarded(cutoff).await
+    }
+
+    /// v0.9.0 P0-1 (#1869) — folded-guarded ledger prune shared by the
+    /// inherent + trait `recall_observation_gc` twins. Folded rows
+    /// prune silently; unfolded rows older than the same cutoff are
+    /// ALSO pruned (age-capped safety valve — a dead fold loop or a
+    /// third-party no-op SAL fold must not grow the table forever) but
+    /// each such sweep WARNs, because their access signal (TTL
+    /// extensions / promotion / priority) is discarded. Mirrors
+    /// [`crate::observations::gc::prune_before`].
+    async fn recall_observation_prune_guarded(
+        &self,
+        cutoff: chrono::DateTime<Utc>,
+    ) -> StoreResult<usize> {
+        let folded =
+            sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1 AND folded")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("recall_observation_gc (folded)", e))?
+                .rows_affected();
+        let unfolded =
+            sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1 AND NOT folded")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| to_store_err("recall_observation_gc (unfolded valve)", e))?
+                .rows_affected();
+        if unfolded > 0 {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                "recall_observations pruner deleted {unfolded} UNFOLDED row(s) older than \
+                 the ledger TTL — their access signal is lost. The fold loop appears dead \
+                 or unwired; check AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS and the daemon's \
+                 postgres fold loop."
+            );
+        }
+        Ok(usize::try_from(folded + unfolded).unwrap_or(0))
+    }
+
+    /// v0.9.0 P0-1 (#1869) — postgres confidence-decay stamp shared by
+    /// the explicit [`MemoryStore::touch_after_recall`] verb and the
+    /// FOLD job. #1572 parity contract preserved verbatim: same
+    /// `AI_MEMORY_CONFIDENCE_DECAY=1` gate, same math
+    /// (`base * 2^(-age_days / half_life)`, age anchored on
+    /// `confidence_decayed_at` falling back to `created_at`, negative
+    /// age clamped to 0, result clamped to [0,1]), same provenance
+    /// stamps (`confidence_source = 'decayed'`, fresh RFC3339
+    /// `confidence_decayed_at`), same non-version-bumping contract
+    /// (#1036), same n15 per-namespace half-life CASE. Failures degrade
+    /// to a WARN — decay is opportunistic, never a recall/fold failure.
+    async fn apply_confidence_decay_stamp(&self, ids: &[String]) {
+        if ids.is_empty() || !crate::confidence::decay::decay_enabled() {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let secs_per_day = crate::SECS_PER_DAY as f64;
+        let now_stamp = Utc::now().to_rfc3339();
+        let source = crate::models::ConfidenceSource::Decayed.as_str();
+        // n15 — when per-namespace half-life overrides are configured,
+        // the divisor becomes a `CASE namespace ... ELSE default END`
+        // so the postgres bulk path applies the SAME per-namespace
+        // half-life the sqlite per-id path does (no backend drift).
+        // The common case (no overrides) keeps the original simple
+        // single-half-life UPDATE. QueryBuilder makes the dynamic
+        // CASE injection-safe (every namespace + half-life is a bind).
+        let result =
+            if let Some(overrides) = crate::confidence::decay::namespace_half_life_overrides() {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "UPDATE memories SET confidence = LEAST(GREATEST(confidence * POWER(2.0, -(\
+                 GREATEST(EXTRACT(EPOCH FROM (NOW() - COALESCE(confidence_decayed_at::timestamptz, \
+                 created_at))), 0.0) / ",
+                );
+                qb.push_bind(secs_per_day);
+                qb.push(") / (CASE namespace");
+                for (ns, hl) in overrides {
+                    qb.push(" WHEN ");
+                    qb.push_bind(ns.clone());
+                    qb.push(" THEN ");
+                    qb.push_bind(*hl);
+                }
+                qb.push(" ELSE ");
+                qb.push_bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS);
+                qb.push(" END))), 0.0), 1.0), confidence_source = ");
+                qb.push_bind(source);
+                qb.push(", confidence_decayed_at = ");
+                qb.push_bind(now_stamp.clone());
+                qb.push(" WHERE id = ANY(");
+                qb.push_bind(ids);
+                qb.push(")");
+                qb.build().execute(&self.pool).await
+            } else {
+                sqlx::query(
+                    "UPDATE memories SET
+                    confidence = LEAST(GREATEST(
+                        confidence * POWER(2.0, -(
+                            GREATEST(EXTRACT(EPOCH FROM
+                                (NOW() - COALESCE(confidence_decayed_at::timestamptz,
+                                                  created_at))), 0.0)
+                            / $2) / $3),
+                        0.0), 1.0),
+                    confidence_source = $4,
+                    confidence_decayed_at = $5
+                 WHERE id = ANY($1)",
+                )
+                .bind(ids)
+                .bind(secs_per_day)
+                .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
+                .bind(source)
+                .bind(now_stamp)
+                .execute(&self.pool)
+                .await
+            };
+        if let Err(e) = result {
+            tracing::warn!(
+                target: TRACE_TARGET,
+                "confidence decay touch failed for {} memories: {e}",
+                ids.len()
+            );
+        }
     }
 
     /// v0.7.0 issue #860 — Postgres twin of
@@ -15197,90 +15395,12 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("touch_after_recall", e))?;
 
         // #1572 (M1 residual) — postgres parity for the sqlite
-        // recall-path confidence-decay touch
-        // (`src/store/sqlite.rs::touch_after_recall` →
-        // `crate::confidence::decay::apply_decay_touch`). Pre-fix the
-        // decay opt-in (`AI_MEMORY_CONFIDENCE_DECAY=1`) was honored on
-        // the sqlite read path only; a postgres-backed daemon silently
-        // never decayed. Same gate, same math
-        // (`base * 2^(-age_days / half_life)`, age anchored on
-        // `confidence_decayed_at` falling back to `created_at`,
-        // negative age clamped to 0, result clamped to [0,1]), same
-        // provenance stamps (`confidence_source = 'decayed'`, fresh
-        // RFC3339 `confidence_decayed_at`), same non-version-bumping
-        // contract (#1036). Set-based single UPDATE instead of the
-        // sqlite per-id loop since the whole computation is
-        // expressible in SQL. Failures degrade to a WARN, matching
-        // the sqlite arm — decay is opportunistic, never a recall
-        // failure.
-        if crate::confidence::decay::decay_enabled() {
-            #[allow(clippy::cast_precision_loss)]
-            let secs_per_day = crate::SECS_PER_DAY as f64;
-            let now_stamp = Utc::now().to_rfc3339();
-            let source = crate::models::ConfidenceSource::Decayed.as_str();
-            // n15 — when per-namespace half-life overrides are configured,
-            // the divisor becomes a `CASE namespace ... ELSE default END`
-            // so the postgres bulk path applies the SAME per-namespace
-            // half-life the sqlite per-id path does (no backend drift).
-            // The common case (no overrides) keeps the original simple
-            // single-half-life UPDATE. QueryBuilder makes the dynamic
-            // CASE injection-safe (every namespace + half-life is a bind).
-            let result = if let Some(overrides) =
-                crate::confidence::decay::namespace_half_life_overrides()
-            {
-                let mut qb = sqlx::QueryBuilder::new(
-                    "UPDATE memories SET confidence = LEAST(GREATEST(confidence * POWER(2.0, -(\
-                     GREATEST(EXTRACT(EPOCH FROM (NOW() - COALESCE(confidence_decayed_at::timestamptz, \
-                     created_at))), 0.0) / ",
-                );
-                qb.push_bind(secs_per_day);
-                qb.push(") / (CASE namespace");
-                for (ns, hl) in overrides {
-                    qb.push(" WHEN ");
-                    qb.push_bind(ns.clone());
-                    qb.push(" THEN ");
-                    qb.push_bind(*hl);
-                }
-                qb.push(" ELSE ");
-                qb.push_bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS);
-                qb.push(" END))), 0.0), 1.0), confidence_source = ");
-                qb.push_bind(source);
-                qb.push(", confidence_decayed_at = ");
-                qb.push_bind(now_stamp.clone());
-                qb.push(" WHERE id = ANY(");
-                qb.push_bind(ids);
-                qb.push(")");
-                qb.build().execute(&self.pool).await
-            } else {
-                sqlx::query(
-                    "UPDATE memories SET
-                        confidence = LEAST(GREATEST(
-                            confidence * POWER(2.0, -(
-                                GREATEST(EXTRACT(EPOCH FROM
-                                    (NOW() - COALESCE(confidence_decayed_at::timestamptz,
-                                                      created_at))), 0.0)
-                                / $2) / $3),
-                            0.0), 1.0),
-                        confidence_source = $4,
-                        confidence_decayed_at = $5
-                     WHERE id = ANY($1)",
-                )
-                .bind(ids)
-                .bind(secs_per_day)
-                .bind(crate::confidence::DEFAULT_HALF_LIFE_DAYS)
-                .bind(source)
-                .bind(now_stamp)
-                .execute(&self.pool)
-                .await
-            };
-            if let Err(e) = result {
-                tracing::warn!(
-                    target: TRACE_TARGET,
-                    "confidence decay touch failed for {} memories: {e}",
-                    ids.len()
-                );
-            }
-        }
+        // recall-path confidence-decay touch. #1869 hoisted the block
+        // into [`Self::apply_confidence_decay_stamp`] so the FOLD job
+        // applies the IDENTICAL stamp when the sync flag is off —
+        // gating this method without carrying the stamp into the fold
+        // would silently re-introduce the never-decays bug on postgres.
+        self.apply_confidence_decay_stamp(ids).await;
 
         Ok(())
     }
@@ -16798,15 +16918,118 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn recall_observation_gc(&self, ttl_days: i64) -> StoreResult<usize> {
-        // #1705 — inlined (avoids the inherent same-name collision).
+        // #1705 (inherent same-name collision) / #1869 — both twins
+        // route through the folded-guarded prune + unfolded-row safety
+        // valve.
         let cutoff = chrono::Utc::now() - chrono::Duration::days(ttl_days.max(1));
-        let n = sqlx::query("DELETE FROM recall_observations WHERE observed_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
+        self.recall_observation_prune_guarded(cutoff).await
+    }
+
+    async fn fold_recall_accesses(&self) -> StoreResult<usize> {
+        // v0.9.0 P0-1 (#1869) — postgres FOLD: batch-apply the legacy
+        // touch ladders from unfolded ledger rows in ONE data-modifying
+        // CTE statement per chunk, so the mark and the count derive
+        // from the SAME snapshot: `marked` flips `folded` and RETURNS
+        // exactly the rows it flipped (a concurrent fold that loses the
+        // row-lock race re-checks `NOT folded` post-lock and flips
+        // nothing, so its aggregate is empty and it bumps nothing —
+        // no double-count, no lost rows). Chunked to
+        // `db::FOLD_CHUNK_MEMORIES` distinct memories per statement
+        // with a zero-work early return (vote condition 4).
+        //
+        // Ladders mirror `touch_after_recall` (Wave-2 Tier-A4 CASE
+        // style) exactly, generalised from n=1 to n=COUNT(*), with the
+        // TTL floor-extension anchored on MAX(observed_at) (the last
+        // recall dominates the legacy per-recall GREATEST chain):
+        // access cap 1M; mid→long promotion at access_count' >= 5
+        // (expires NULL + updated_at bump); priority + decades crossed
+        // capped at 10.
+        let chunk_limit = i64::try_from(crate::storage::FOLD_CHUNK_MEMORIES).unwrap_or(i64::MAX);
+        let mut total = 0_usize;
+        loop {
+            let has_unfolded: Option<i32> =
+                sqlx::query_scalar("SELECT 1 FROM recall_observations WHERE NOT folded LIMIT 1")
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| to_store_err("fold: unfolded probe", e))?;
+            if has_unfolded.is_none() {
+                break;
+            }
+            // APPEND-ONLY-SANCTIONED (#1823 G6 / #1869 P0-1) —
+            // forward-compat documentation for the append-only
+            // discipline: this UPDATE is the explicit FOLD maintenance
+            // verb applying metadata-only access bookkeeping (the same
+            // sanction class as the legacy touch); it never rewrites
+            // memory content.
+            let folded_ids: Vec<String> = sqlx::query_scalar(
+                "WITH batch AS (
+                    SELECT memory_id
+                      FROM recall_observations
+                     WHERE NOT folded
+                     GROUP BY memory_id
+                     ORDER BY memory_id
+                     LIMIT $1
+                ),
+                marked AS (
+                    UPDATE recall_observations ro
+                       SET folded = TRUE
+                      FROM batch b
+                     WHERE ro.memory_id = b.memory_id AND NOT ro.folded
+                    RETURNING ro.memory_id, ro.observed_at
+                ),
+                agg AS (
+                    SELECT memory_id, COUNT(*) AS n, MAX(observed_at) AS t_max
+                      FROM marked
+                     GROUP BY memory_id
+                )
+                UPDATE memories m SET
+                    access_count = LEAST(m.access_count + a.n, 1000000),
+                    priority = LEAST(m.priority
+                        + (LEAST(m.access_count + a.n, 1000000) / 10
+                           - m.access_count / 10)::int, 10),
+                    last_accessed_at = GREATEST(
+                        COALESCE(m.last_accessed_at, a.t_max), a.t_max),
+                    expires_at = CASE
+                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NULL
+                        WHEN m.tier = 'long' THEN m.expires_at
+                        WHEN m.tier = 'short' AND m.expires_at IS NOT NULL
+                            THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 hour')
+                        WHEN m.tier = 'mid' AND m.expires_at IS NOT NULL
+                            THEN GREATEST(m.expires_at, a.t_max + INTERVAL '1 day')
+                        ELSE m.expires_at
+                    END,
+                    tier = CASE
+                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN 'long'
+                        ELSE m.tier
+                    END,
+                    updated_at = CASE
+                        WHEN m.tier = 'mid' AND m.access_count + a.n >= 5 THEN NOW()
+                        ELSE m.updated_at
+                    END
+                 FROM agg a
+                 WHERE m.id = a.memory_id
+                RETURNING m.id",
+            )
+            .bind(chunk_limit)
+            .fetch_all(&self.pool)
             .await
-            .map_err(|e| to_store_err("recall_observation_gc (trait)", e))?
-            .rows_affected();
-        Ok(usize::try_from(n).unwrap_or(0))
+            .map_err(|e| to_store_err("fold_recall_accesses", e))?;
+
+            if folded_ids.is_empty() {
+                // Unfolded rows existed at the probe but a concurrent
+                // fold consumed them between probe and statement — done.
+                break;
+            }
+            // #1572 / vote condition 2 — the decay stamp moves off the
+            // recall path onto the fold; omitting it here would
+            // re-introduce the postgres never-decays bug.
+            self.apply_confidence_decay_stamp(&folded_ids).await;
+            total += folded_ids.len();
+            if folded_ids.len() < crate::storage::FOLD_CHUNK_MEMORIES {
+                break; // drained
+            }
+        }
+        Ok(total)
     }
 
     async fn reown(

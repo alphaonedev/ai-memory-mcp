@@ -76,6 +76,37 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
                 None,
             ) {
                 Ok((results, _outcome)) => {
+                    // v0.9.0 P0-1 (#1869, T8) — shell ledger append on
+                    // the returned set (recall is pure by default; the
+                    // ledger carries the access signal for the fold).
+                    // Best-effort + table-probe-gated; never blocks
+                    // the REPL output.
+                    if crate::observations::table_exists(conn) {
+                        let recall_id = uuid::Uuid::new_v4().to_string();
+                        #[allow(clippy::cast_possible_wrap)]
+                        let candidates: Vec<
+                            crate::observations::Candidate<'_>,
+                        > = results
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (m, s))| crate::observations::Candidate {
+                                memory_id: m.id.as_str(),
+                                retriever: "keyword",
+                                rank: (i + 1) as i64,
+                                score: *s,
+                            })
+                            .collect();
+                        if let Err(e) = crate::observations::record_recall_with_identity(
+                            conn,
+                            &recall_id,
+                            &candidates,
+                            None,
+                            None,
+                        ) {
+                            let _ =
+                                writeln!(out.stderr, "ai-memory: recall ledger append failed: {e}");
+                        }
+                    }
                     for (mem, score) in &results {
                         let _ = writeln!(
                             out.stdout,

@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 76).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 77).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -781,7 +781,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 76;
+const CURRENT_SCHEMA_VERSION: i64 = 77;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1351,6 +1351,15 @@ const MIGRATION_V75_SQLITE: &str =
 // bootstrap `SCHEMA` const.
 const MIGRATION_V76_SQLITE: &str =
     include_str!("../../migrations/sqlite/0060_v76_agent_lineage.sql");
+// v77 (#1869, v0.9.0 P0-1 recall purity) — `folded` fold-state column
+// + backfill (`SET folded = 1`: pre-existing rows were sync-touched at
+// recall time; folding them would double-count) + the partial
+// unfolded index on `recall_observations`. SQLite has no `ADD COLUMN
+// IF NOT EXISTS`, so the ladder arm probes the column before replaying
+// this file (the v75 precedent); the table itself may be absent on
+// synthetic fixtures (the v58 precedent), in which case the arm skips.
+const MIGRATION_V77_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0061_v77_recall_observations_folded.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3252,6 +3261,41 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             // anti-equivocation constraint and the covering index for
             // the epoch-ordered `read_lineage` scan.
             conn.execute_batch(MIGRATION_V76_SQLITE)?;
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v77 = #1869 / v0.9.0 P0-1 (recall purity) — `folded`
+            // fold-state column + backfill + partial unfolded index on
+            // `recall_observations`. Probe the column first (SQLite has
+            // no ADD COLUMN IF NOT EXISTS — the v75 precedent) and the
+            // table first (synthetic fixtures may stamp a version
+            // without the 0038 table-create — the v58 precedent). The
+            // backfill inside the migration file marks every
+            // pre-existing row `folded = 1` (already sync-touched at
+            // recall time; folding would double-count) and MUST only
+            // run when the column was just added, which the probe
+            // guarantees.
+            let cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(recall_observations)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v77: recall_observations table absent (test fixture); \
+                     skipping folded column"
+                );
+            } else if cols.contains("folded") {
+                // Column already present (idempotent re-entry) — the
+                // partial index is ladder-owned; ensure it by name.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_recall_observations_unfolded \
+                     ON recall_observations(memory_id) WHERE folded = 0",
+                    [],
+                )?;
+            } else {
+                conn.execute_batch(MIGRATION_V77_SQLITE)?;
+            }
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

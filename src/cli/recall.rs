@@ -500,6 +500,37 @@ pub(crate) fn run_with_embedder(
             .collect(),
     };
 
+    // v0.9.0 P0-1 (#1869, T8) — CLI ledger append: with recall pure by
+    // default, a recall that writes no `recall_observations` row
+    // vanishes from the access signal (its counts freeze). Record the
+    // post-filter RETURNED set, best-effort + table-probe-gated,
+    // mirroring the MCP/HTTP writers; rows are stamped pre-folded
+    // under the sync legacy flag via the shared insert-layer stamp.
+    // A ledger error never blocks the recall output.
+    if crate::observations::table_exists(conn) {
+        let recall_id = uuid::Uuid::new_v4().to_string();
+        #[allow(clippy::cast_possible_wrap)]
+        let candidates: Vec<crate::observations::Candidate<'_>> = results
+            .iter()
+            .enumerate()
+            .map(|(i, (m, s))| crate::observations::Candidate {
+                memory_id: m.id.as_str(),
+                retriever: mode,
+                rank: (i + 1) as i64,
+                score: *s,
+            })
+            .collect();
+        if let Err(e) = crate::observations::record_recall_with_identity(
+            conn,
+            &recall_id,
+            &candidates,
+            args.as_agent.as_deref(),
+            effective_namespace.as_deref(),
+        ) {
+            writeln!(out.stderr, "ai-memory: recall ledger append failed: {e}")?;
+        }
+    }
+
     if json_out {
         let scored: Vec<serde_json::Value> = results
             .iter()

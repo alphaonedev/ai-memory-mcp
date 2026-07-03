@@ -283,7 +283,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // convention keeps the sqlite lineage SSOT in this file next to
     // bind_agent_pubkey/agent_pubkey; no speculative surface. Measured
     // 22_704 + 96 headroom.
-    ("src/storage/mod.rs", 22_800),
+    //
+    // 2026-07-03 — bumped 22_800 → 23_100 by #1869 P0-1 (recall
+    // purity): the `fold_recall_accesses` FOLD maintenance verb (+ the
+    // `FOLD_CHUNK_MEMORIES` bound and its doc contract) landed beside
+    // `touch_many`, and the two internal recall touches grew their
+    // legacy-flag gates + pure-default doc rewrites (~186 LOC at
+    // 22_986). Growth is justified: the fold is the single writer that
+    // replaces the recall-path touch, zero speculative surface.
+    // 23_100 = 22_986 + 114 headroom; far under the 1.5x cap.
+    ("src/storage/mod.rs", 23_100),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -656,7 +665,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // verify_agent_lineage_pg). Growth justified: K3 backend parity
     // for the new SAL surface, no speculative code. Measured 25_391 +
     // 109 headroom.
-    ("src/store/postgres.rs", 25_500),
+    //
+    // 2026-07-03 — bumped 25_500 → 25_750 by #1869 P0-1 (recall
+    // purity): `migrate_v77` (probe-guarded folded column + backfill),
+    // the postgres `fold_recall_accesses` single-statement CTE fold,
+    // the shared `apply_confidence_decay_stamp` hoist (moved out of
+    // `touch_after_recall` so the fold carries the #1572 decay parity),
+    // and the folded-guarded ledger pruner (~151 LOC at 25_651).
+    // Growth is justified: the fold/migration pair is the P0-1 core,
+    // zero speculative surface. 25_750 = 25_651 + 99 headroom.
+    ("src/store/postgres.rs", 25_750),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -774,7 +792,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // ENV_VECTOR_INDEX_* consts, the resolver arms) + five
     // resolver/round-trip tests grew the file to 12_143; 12_250 = 107
     // headroom.
-    ("src/config.rs", 12_250),
+    //
+    // 2026-07-03 — bumped 12_250 → 12_350 by #1869 P0-1 (recall
+    // purity): the two T1 flags (`recall_touch_sync_enabled` /
+    // `access_fold_interval_secs` + env consts + parsing/default unit
+    // tests, ~91 LOC at 12_234, which was already within 16 LOC of the
+    // old ceiling). Growth is justified: operator flags for the P0-1
+    // behavior change, zero speculative surface. 12_350 = 12_234 + 116
+    // headroom.
+    ("src/config.rs", 12_350),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -900,7 +926,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 9_400: the graceful-shutdown audit-head witness wire
     // (`shutdown_witness_flush_and_checkpoint` helper + its serve()
     // call site + docs) grew the file to 9_301; 9_400 = 99 headroom.
-    ("src/daemon_runtime.rs", 9_400),
+    //
+    // 2026-07-03 — bumped 9_400 → 9_500 by #1869 P0-1 (recall purity):
+    // fold-before-gc at the top of the gc loop body, the dedicated
+    // fold-loop spawn (INTERVAL=0 → gc-tick-only), and the postgres
+    // SAL fold + ledger-pruner loop (~93 LOC at 9_396, which was
+    // within 4 LOC of the old ceiling). Growth is justified: the fold
+    // wiring is load-bearing for TTL correctness (a recalled row must
+    // be extended before eviction is evaluated). 9_500 = 9_396 + 104
+    // headroom.
+    ("src/daemon_runtime.rs", 9_500),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -970,7 +1005,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (probe-guarded ALTER) + MIGRATION_V75_SQLITE + the bootstrap-SCHEMA
     // cid-mirror columns/index + the COND-8 rebuild-drift comments grew the
     // file to 4_871; 4_950 = 79 headroom.
-    ("src/storage/migrations.rs", 4_950),
+    //
+    // 2026-07-03 — bumped 4_950 → 5_050 by #1869 P0-1 (recall purity):
+    // the v77 ladder arm (probe-guarded `recall_observations.folded`
+    // column + backfill + partial unfolded index) + the
+    // `MIGRATION_V77_SQLITE` sourcing (~44 LOC at 4_993, which was
+    // within 1 LOC of the old ceiling). 5_050 = 4_993 + 57 headroom.
+    ("src/storage/migrations.rs", 5_050),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

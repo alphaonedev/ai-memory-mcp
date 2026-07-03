@@ -2840,6 +2840,25 @@ pub fn spawn_gc_loop_with_shadow_retention(
         loop {
             tokio::time::sleep(interval).await;
             let lock = state.lock().await;
+            // v0.9.0 P0-1 (#1869) — fold-before-gc is LOAD-BEARING:
+            // with recall pure by default, a recalled row's TTL
+            // extension lives in unfolded `recall_observations` rows
+            // until a fold applies it. Folding at the TOP of every gc
+            // tick guarantees a recalled row is extended before
+            // eviction is evaluated — including when
+            // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0 disables the
+            // dedicated fold loop (the fold then rides this tick).
+            match db::fold_recall_accesses(
+                &lock.0,
+                lock.2.short_extend_secs,
+                lock.2.mid_extend_secs,
+            ) {
+                Ok(n) if n > 0 => {
+                    tracing::info!("gc: folded recall accesses for {n} memories (pre-gc)");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("recall-access fold failed (pre-gc): {e}"),
+            }
             match db::gc(&lock.0, lock.3) {
                 Ok(n) if n > 0 => tracing::info!("gc: expired {n} memories"),
                 _ => {}
@@ -4788,6 +4807,76 @@ pub async fn bootstrap_serve(
         db_state.clone(),
         crate::background::lease_sweep::DEFAULT_INTERVAL,
     ));
+
+    // v0.9.0 P0-1 (#1869) — dedicated recall-access FOLD loop (default
+    // 60 s). With recall pure by default, this loop applies the access
+    // ladders from unfolded `recall_observations` rows. INTERVAL=0
+    // disables the dedicated loop; the fold still runs at the top of
+    // every gc tick (spawn_gc_loop_with_shadow_retention), so count
+    // freshness degrades to the 30-min gc cadence rather than stopping.
+    let fold_interval_secs = crate::config::access_fold_interval_secs();
+    if fold_interval_secs > 0 {
+        task_handles.push(crate::background::access_fold::spawn(
+            db_state.clone(),
+            Duration::from_secs(fold_interval_secs),
+        ));
+    } else {
+        tracing::info!(
+            "recall-access fold: dedicated loop disabled \
+             (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0); folding rides the gc tick \
+             every {GC_INTERVAL_SECS}s"
+        );
+    }
+
+    // v0.9.0 P0-1 (#1869) — postgres SAL fold loop: the sqlite loops
+    // above fold the local sqlite ledger only; a postgres-backed daemon
+    // records its recalls through the SAL trait, so the fold (and the
+    // previously caller-less `recall_observation_gc` ledger pruner —
+    // T7c) must run through the trait too. The pruner rides the same
+    // loop on a coarser cadence (~hourly).
+    #[cfg(feature = "sal")]
+    if matches!(
+        app_state.storage_backend,
+        crate::handlers::StorageBackend::Postgres
+    ) {
+        let fold_store = app_state.store.clone();
+        let interval = Duration::from_secs(if fold_interval_secs == 0 {
+            GC_INTERVAL_SECS
+        } else {
+            fold_interval_secs
+        });
+        let prune_every = (crate::SECS_PER_HOUR.unsigned_abs() / interval.as_secs().max(1)).max(1);
+        task_handles.push(tokio::spawn(async move {
+            let mut ticks: u64 = 0;
+            loop {
+                tokio::time::sleep(interval).await;
+                match fold_store.fold_recall_accesses().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        target: crate::background::access_fold::TRACE_TARGET,
+                        "recall-access fold (postgres) applied {n} memory(ies)"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: crate::background::access_fold::TRACE_TARGET,
+                        "recall-access fold (postgres) failed: {e}"
+                    ),
+                }
+                ticks += 1;
+                if ticks % prune_every == 0 {
+                    match fold_store
+                        .recall_observation_gc(crate::observations::gc::ttl_days())
+                        .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!("recall_observations gc (postgres): pruned {n} row(s)")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("recall_observations gc (postgres) failed: {e}"),
+                    }
+                }
+            }
+        }));
+    }
 
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
     // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
@@ -6827,19 +6916,21 @@ mod tests {
         assert!(bs.app_state.embedder.is_none());
         let vi = bs.app_state.vector_index.lock().await;
         assert!(vi.is_none());
-        // Eight task handles spawned (v0.7 policy-engine item 3 added
+        // Nine task handles spawned (v0.7 policy-engine item 3 added
         // the deferred-audit supervisor + gc + wal_checkpoint +
         // v0.7 K2 pending_actions timeout sweep + v0.7 I3 transcript
         // archive→prune lifecycle sweep + v0.7 K8 agent_quotas
         // daily-counter reset sweep + #1690 offloaded_blobs TTL sweep +
-        // #1709 Pillar-1 expired-lease reclaim sweep).
+        // #1709 Pillar-1 expired-lease reclaim sweep + #1869 P0-1
+        // recall-access fold loop, spawned whenever
+        // AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS != 0 — the default).
         // v0.7 B3-fix2 gates the family-descriptor embedding precompute
         // behind `AI_MEMORY_PRECOMPUTE_FAMILY_EMBEDDINGS=1` (default OFF)
         // so it does not contend with HTTP request-path embeds under
         // parallel CI load — see the gate site in `bootstrap_serve`
-        // for the rationale. The task count reverts to eight when the
+        // for the rationale. The task count reverts to nine when the
         // env var is unset.
-        assert_eq!(bs.task_handles.len(), 8);
+        assert_eq!(bs.task_handles.len(), 9);
         // Cleanly abort the spawned tasks so they don't leak across tests.
         for h in bs.task_handles {
             h.abort();

@@ -1557,12 +1557,19 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 ///
 /// Equivalent to invoking [`touch`] K times in sequence, but
 /// collapses the per-row `BEGIN IMMEDIATE` … `COMMIT` cycle into a
-/// SINGLE outer transaction so a K-row recall pays the SQLite
+/// SINGLE outer transaction so a K-row batch pays the SQLite
 /// write-lock + commit cost ONCE instead of K times. The three
 /// per-row UPDATE statements still run (same semantics: access bump
 /// + TTL extend, mid→long promotion at `PROMOTION_THRESHOLD`,
 /// priority+1 every 10 accesses); only the transaction framing
 /// changes.
+///
+/// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
+/// ungated. The RECALL paths no longer call it by default (recall is
+/// pure); they call it only under the deprecated
+/// `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag. The pure-default
+/// access signal flows through the `recall_observations` ledger and
+/// is applied by [`fold_recall_accesses`].
 ///
 /// A failure mid-batch rolls back the entire transaction (no partial
 /// touches survive) and surfaces a single error to the caller — which
@@ -1583,11 +1590,13 @@ pub fn touch_many(
     // #1580 — the WAL read-pool opens its connections with
     // `PRAGMA query_only = ON`. `touch_many` is best-effort access
     // bookkeeping (access_count bump / TTL extend / promotion), so on a
-    // read-only pool connection it no-ops: the read path stays
-    // write-free and the *authoritative* touch runs afterwards on the
-    // writer connection (see `handlers::recall`). Without this guard the
-    // recall SELECT, when dispatched through the read-pool, would hit a
-    // guaranteed `BEGIN IMMEDIATE` failure + a WARN on every request.
+    // read-only pool connection it no-ops. #1869 note: in the pure
+    // default the recall paths never reach this function at all; under
+    // `AI_MEMORY_RECALL_TOUCH_SYNC=1` the legacy split applies — the
+    // read phase no-ops here and the authoritative touch runs on the
+    // writer connection (see `handlers::recall`). Without this guard a
+    // sync-mode recall SELECT dispatched through the read-pool would
+    // hit a guaranteed `BEGIN IMMEDIATE` failure + a WARN per request.
     // The pragma read is one cheap round-trip; on the writer connection
     // `query_only` is `0` and the touch proceeds normally.
     let query_only: i64 = conn
@@ -1652,6 +1661,183 @@ pub fn touch_many(
         }
     }
 }
+
+/// v0.9.0 P0-1 (#1869) — FOLD maintenance verb: batch-apply the legacy
+/// recall-touch ladders from unfolded `recall_observations` ledger rows.
+///
+/// With recall pure by default (`AI_MEMORY_RECALL_TOUCH_SYNC` unset),
+/// this is the ONLY writer of recall-driven access state. Per unfolded
+/// `(memory_id, n = COUNT(*), t_max = MAX(observed_at))` aggregate it
+/// applies exactly the [`touch_many`] ladders, equivalence-exact:
+///
+/// * `access_count' = MIN(access_count + n, 1_000_000)`
+/// * `last_accessed_at = MAX(last_accessed_at, t_max)`
+/// * `expires_at = MAX(expires_at, t_max + window)` per tier (floor
+///   extension anchored on the LAST observation, which is what the
+///   legacy per-recall MAX chain converged to; `long` / NULL-expiry
+///   rows untouched)
+/// * mid→long promotion at `access_count' >= PROMOTION_THRESHOLD`
+///   (`expires_at = NULL`, `updated_at = now`)
+/// * `priority = MIN(priority + (ac'/10 − ac/10), 10)` — decade
+///   boundaries crossed ≡ the legacy per-step `% 10 == 0` firing
+///   (the sole divergence is at the 1M access ceiling, where the
+///   legacy per-step form kept firing; accepted, documented)
+/// * when `AI_MEMORY_CONFIDENCE_DECAY=1`, the confidence-decay stamp
+///   ([`crate::confidence::decay::apply_decay_touch`]) moves off the
+///   recall path onto the fold
+///
+/// Consumed ledger rows are marked `folded = 1` in the same
+/// transaction. Rows inserted pre-marked `folded = 1` (sync-mode
+/// recalls — see [`crate::config::recall_touch_sync_enabled`]) are
+/// never re-applied, so sync-touched accesses cannot double-count.
+///
+/// Chunked: at most [`FOLD_CHUNK_MEMORIES`] distinct memories' worth
+/// of ledger rows per `BEGIN IMMEDIATE` transaction, looping until
+/// drained, with a zero-work early return (no transaction when no
+/// unfolded rows exist) so the writer mutex is never held for an
+/// unbounded batch. Idempotent: a second fold over the same ledger is
+/// a no-op (returns 0).
+///
+/// Returns the number of distinct memories folded.
+///
+/// # Errors
+///
+/// Returns the underlying `rusqlite` error on SQL failure; the
+/// in-flight chunk rolls back (no partial fold survives).
+pub fn fold_recall_accesses(
+    conn: &Connection,
+    short_extend: i64,
+    mid_extend: i64,
+) -> Result<usize> {
+    // Hand-rolled fixtures that skip `storage::open` may lack the
+    // ledger table entirely — nothing to fold.
+    if !crate::observations::table_exists(conn) {
+        return Ok(0);
+    }
+    // Zero-work early return OUTSIDE any transaction: the common case
+    // (no recalls since the last fold) costs one indexed probe.
+    let has_unfolded = |conn: &Connection| -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM recall_observations WHERE folded = 0 LIMIT 1",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some())
+    };
+    if !has_unfolded(conn)? {
+        return Ok(0);
+    }
+
+    let decay = crate::confidence::decay::decay_enabled();
+    let mut total = 0_usize;
+    loop {
+        conn.execute_batch(connection::SQL_BEGIN_IMMEDIATE)?;
+        let chunk = (|| -> Result<usize> {
+            // ≤ FOLD_CHUNK_MEMORIES distinct memories per transaction.
+            let agg: Vec<(String, i64, String)> = conn
+                .prepare_cached(
+                    "SELECT memory_id, COUNT(*), MAX(observed_at)
+                       FROM recall_observations
+                      WHERE folded = 0
+                      GROUP BY memory_id
+                      ORDER BY memory_id
+                      LIMIT ?1",
+                )?
+                .query_map(params![FOLD_CHUNK_MEMORIES], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            if agg.is_empty() {
+                return Ok(0);
+            }
+            let now_str = Utc::now().to_rfc3339();
+            // APPEND-ONLY-SANCTIONED (#1823 G6 / #1869 P0-1) —
+            // forward-compat documentation for the append-only
+            // discipline: these UPDATEs are the explicit FOLD
+            // maintenance verb applying metadata-only access
+            // bookkeeping (the same sanction class as the legacy
+            // touch); they never rewrite memory content.
+            let mut bump_stmt = conn.prepare_cached(
+                "UPDATE memories SET
+                    access_count = MIN(access_count + ?1, 1000000),
+                    priority = MIN(priority
+                        + (MIN(access_count + ?1, 1000000) / 10 - access_count / 10), 10),
+                    last_accessed_at = CASE
+                        WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
+                        ELSE last_accessed_at
+                    END,
+                    expires_at = CASE
+                        WHEN tier = 'long' THEN expires_at
+                        WHEN tier = 'short' AND expires_at IS NOT NULL THEN MAX(expires_at, ?3)
+                        WHEN tier = 'mid' AND expires_at IS NOT NULL THEN MAX(expires_at, ?4)
+                        ELSE expires_at
+                    END
+                 WHERE id = ?5",
+            )?;
+            let mut promote_stmt = conn.prepare_cached(
+                "UPDATE memories SET tier = 'long', expires_at = NULL, updated_at = ?1
+                 WHERE id = ?2 AND tier = 'mid' AND access_count >= ?3",
+            )?;
+            let mut mark_stmt = conn.prepare_cached(
+                "UPDATE recall_observations SET folded = 1
+                 WHERE folded = 0 AND memory_id = ?1",
+            )?;
+            for (id, n, t_max_raw) in &agg {
+                // Normalize the ledger's `observed_at` stamp (sqlite
+                // strftime `...Z` form) into the substrate-wide
+                // `to_rfc3339()` (`+00:00`) spelling so the SQL text
+                // comparisons against `expires_at` /
+                // `last_accessed_at` stay format-consistent.
+                let t_max = chrono::DateTime::parse_from_rfc3339(t_max_raw)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let t_max_str = t_max.to_rfc3339();
+                let short_exp = (t_max + chrono::Duration::seconds(short_extend)).to_rfc3339();
+                let mid_exp = (t_max + chrono::Duration::seconds(mid_extend)).to_rfc3339();
+                bump_stmt.execute(params![n, t_max_str, short_exp, mid_exp, id])?;
+                promote_stmt.execute(params![now_str, id, PROMOTION_THRESHOLD])?;
+                if decay {
+                    // #1572 parity — the decay stamp moves off the
+                    // recall path onto the fold.
+                    if let Err(e) = crate::confidence::decay::apply_decay_touch(conn, id) {
+                        tracing::warn!("fold: confidence decay touch failed for {id}: {e}");
+                    }
+                }
+                mark_stmt.execute(params![id])?;
+            }
+            Ok(agg.len())
+        })();
+        match chunk {
+            Ok(0) => {
+                conn.execute_batch(connection::SQL_COMMIT)?;
+                break;
+            }
+            Ok(n) => {
+                conn.execute_batch(connection::SQL_COMMIT)?;
+                total += n;
+                if n < FOLD_CHUNK_MEMORIES {
+                    break; // drained
+                }
+            }
+            Err(e) => {
+                if let Err(rb) = conn.execute_batch(connection::SQL_ROLLBACK) {
+                    tracing::error!("ROLLBACK failed in fold_recall_accesses: {rb}");
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// #1869 — fold-transaction chunk bound: at most this many distinct
+/// memories' worth of unfolded ledger rows are applied per
+/// `BEGIN IMMEDIATE` transaction, so the fold never concentrates an
+/// unbounded write burst on the sqlite writer mutex (vote condition 4).
+pub const FOLD_CHUNK_MEMORIES: usize = 1000;
 
 #[allow(clippy::too_many_arguments)]
 /// Update a memory by ID. Returns (found, `content_changed`) so callers can
@@ -4991,13 +5177,19 @@ pub fn recall(
     // (AFTER proximity). Returns BudgetOutcome with all R1 meta fields.
     let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
 
-    // Cluster-F PERF-6 — collapse K per-row touches into a single
-    // `BEGIN IMMEDIATE` transaction. Same semantics (access bump,
-    // TTL extend, promotion, priority bump every 10 accesses); the
-    // 3K UPDATE round-trips now share one commit instead of K.
-    let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
-    if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
-        tracing::warn!("touch_many failed for recall set: {}", e);
+    // v0.9.0 P0-1 (#1869) — recall is PURE by default: the legacy
+    // synchronous touch (access bump, TTL extend, promotion, priority
+    // ladder — Cluster-F PERF-6 batched form) fires ONLY under the
+    // deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` opt-back-in. In the
+    // pure default the access signal is preserved by the append-only
+    // `recall_observations` ledger (written by the MCP/HTTP/CLI/SAL
+    // entry layers) and applied in batch by [`fold_recall_accesses`].
+    // The flag is evaluated once per recall, never per row.
+    if crate::config::recall_touch_sync_enabled() {
+        let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
+        if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
+            tracing::warn!("touch_many failed for recall set: {}", e);
+        }
     }
     Ok((budgeted, outcome))
 }
@@ -11856,10 +12048,10 @@ pub fn recall_hybrid_precomputed_hnsw(
 // `archived_source_clause`, etc., and the SQL is tightly tied to
 // the schema living in this module.
 //
-// Behaviour is byte-for-byte preserved: the same SQL runs, the same
-// fusion produces the same blended scores, and `touch_many` mutates
-// the same surviving set. Only the function-internal structure
-// changes.
+// Behaviour is byte-for-byte preserved: the same SQL runs and the
+// same fusion produces the same blended scores. (v0.9.0 P0-1 #1869:
+// the stage-5 `touch_many` mutation is now legacy-flag-gated — the
+// pure default mutates nothing; see `apply_recall_post_ops`.)
 // ---------------------------------------------------------------------------
 
 /// Result of [`prepare_hybrid_query`] — the pre-computed SQL
@@ -12483,9 +12675,12 @@ fn blend_and_rank(
 }
 
 /// #871 stage 5 — post-fusion ops: proximity boost (when hierarchy
-/// expansion is active), token-budget application, and the batched
-/// `touch_many` write that bumps `access_count` + slides the per-tier
-/// expiry on every memory in the surviving set.
+/// expansion is active) and token-budget application. v0.9.0 P0-1
+/// (#1869): the batched `touch_many` write that used to bump
+/// `access_count` + slide the per-tier expiry here is now gated on the
+/// deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag — the pure
+/// default performs ZERO writes; [`fold_recall_accesses`] applies the
+/// ladders from the `recall_observations` ledger instead.
 fn apply_recall_post_ops(
     conn: &Connection,
     results: Vec<(Memory, f64)>,
@@ -12501,9 +12696,13 @@ fn apply_recall_post_ops(
         results
     };
     let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
-    let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
-    if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
-        tracing::warn!("touch_many failed for hybrid recall set: {}", e);
+    // #1869 — flag evaluated once per recall; see [`recall`] for the
+    // pure-default contract.
+    if crate::config::recall_touch_sync_enabled() {
+        let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
+        if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
+            tracing::warn!("touch_many failed for hybrid recall set: {}", e);
+        }
     }
     (budgeted, outcome)
 }

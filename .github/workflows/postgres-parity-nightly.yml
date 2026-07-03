@@ -89,4 +89,5 @@ jobs:
             --test secret_screen_postgres_parity_g29 \
             --test postgres_l2_rehydration_1693 \
             --test erasure_fanout_postgres_g30 \
+            --test recall_purity_p01_postgres \
             -- --include-ignored --test-threads=1
