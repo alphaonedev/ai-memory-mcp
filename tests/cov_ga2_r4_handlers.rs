@@ -98,6 +98,23 @@ const NON_ADMIN_AGENT: &str = "ai:cov-ga2-r4-nonadmin";
 /// (hex-decoded) key branch.
 const HMAC_SECRET_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+/// v0.9.0 pre-GA (#1853) — serialise every test that flips the
+/// PROCESS-GLOBAL hooks HMAC secret (`config::set_active_hooks_hmac_secret`
+/// writes `RuntimeContext::global().hooks_hmac_secret`, one value per
+/// process). Without this, `approval_no_secret_is_401` (sets `None`) racing
+/// a sibling that just set `Some(..)` and is mid-request flips that
+/// sibling's expected 404/400/200 into a spurious 401 —
+/// `approval_decide_approve_unknown_id_sqlite_is_404` was the observed
+/// 401-vs-404 flake in the full `--features sal` run (green in isolation).
+/// Tokio mutex so the guard may be held across the request `.await`s;
+/// same module-local-lock discipline as
+/// `tests/audit_witness_truncation_1822.rs`. Guards are held for the WHOLE
+/// test body (acquire before the set, drop at end of test).
+fn hmac_secret_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn pg_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()
@@ -1187,6 +1204,7 @@ async fn links_get_sqlite_admin_bypass_path() {
 async fn approval_no_secret_is_401() {
     // No hooks HMAC secret configured → strict-by-default 401 even with a
     // present (but unverifiable) signature.
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(None);
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1210,6 +1228,7 @@ async fn approval_no_secret_is_401() {
 
 #[tokio::test]
 async fn approval_missing_signature_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1232,6 +1251,7 @@ async fn approval_missing_signature_is_401() {
 
 #[tokio::test]
 async fn approval_missing_timestamp_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1251,6 +1271,7 @@ async fn approval_missing_timestamp_is_401() {
 
 #[tokio::test]
 async fn approval_noninteger_timestamp_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1271,6 +1292,7 @@ async fn approval_noninteger_timestamp_is_401() {
 
 #[tokio::test]
 async fn approval_stale_timestamp_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1283,6 +1305,7 @@ async fn approval_stale_timestamp_is_401() {
 
 #[tokio::test]
 async fn approval_future_skew_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1295,6 +1318,7 @@ async fn approval_future_skew_is_401() {
 
 #[tokio::test]
 async fn approval_signature_mismatch_is_401() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1326,6 +1350,7 @@ async fn approval_signature_mismatch_is_401() {
 
 #[tokio::test]
 async fn approval_decide_bad_body_is_400() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     let pending_id = uid("ns");
@@ -1337,6 +1362,7 @@ async fn approval_decide_bad_body_is_400() {
 
 #[tokio::test]
 async fn approval_decide_invalid_id_is_400() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     // The path id is malformed; sign over it so HMAC passes and the
@@ -1366,6 +1392,7 @@ async fn approval_decide_invalid_id_is_400() {
 
 #[tokio::test]
 async fn approval_decide_deny_unknown_id_sqlite_is_404() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     // Valid HMAC, no such pending row → sqlite deny arm Ok(false) → 404.
@@ -1380,6 +1407,7 @@ async fn approval_decide_deny_unknown_id_sqlite_is_404() {
 
 #[tokio::test]
 async fn approval_decide_approve_unknown_id_sqlite_is_404() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, _db) = sqlite_router();
     // Valid HMAC, no such pending row → sqlite approve arm NotFound → 404.
@@ -1394,6 +1422,7 @@ async fn approval_decide_approve_unknown_id_sqlite_is_404() {
 
 #[tokio::test]
 async fn approval_decide_approve_sqlite_execute_path() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, db) = sqlite_router();
     // Seed an approve-gated pending Store action whose payload is a full
@@ -1446,6 +1475,7 @@ async fn approval_decide_approve_sqlite_execute_path() {
 
 #[tokio::test]
 async fn approval_decide_deny_sqlite_path() {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (r, _t, db) = sqlite_router();
     let ns = uid("cov-ga2-r4-deny");
@@ -1766,6 +1796,7 @@ pg_test!(pg_verify_link_nonexistent_postgres_arm, url, {
 
 // approvals::approval_decide_postgres — unknown id deny arm → 404.
 pg_test!(pg_approval_unknown_id_postgres_arm, url, {
+    let _hmac_guard = hmac_secret_lock().lock().await;
     ai_memory::config::set_active_hooks_hmac_secret(Some(HMAC_SECRET_HEX.to_string()));
     let (_store, router) = pg_store_and_router(&url).await;
     let pending_id = uid("nope");

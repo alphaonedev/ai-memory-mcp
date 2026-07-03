@@ -349,6 +349,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: needs.classify.outputs.docs_only != 'true'
 
+      # v0.9.0 pre-GA (#1853) — e1 macOS anti-flake. The
+      # tests/e1_orchestration_dry_run.rs harness historically ran a NESTED
+      # `cargo build --release` for the tools/t0-orchestrate sibling crate
+      # INSIDE the test process; on the resource-constrained macOS runner
+      # that nested build intermittently failed, false-redding the whole
+      # Check (macos-latest) gate. Build the tool binary HERE — as its own
+      # step, with nothing else competing for the runner — and advertise it
+      # via AI_MEMORY_T0_ORCHESTRATOR_BIN; the test uses the artifact and
+      # skips the nested build (falling back to building when unset, so
+      # local runs and the other OSes are unchanged). macOS-only: the
+      # nested build never flaked on ubuntu/windows, and skipping the step
+      # there keeps the tool build off the windows critical path.
+      - name: Prebuild t0 orchestrator (macOS e1 anti-flake, #1853)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --quiet --release \
+            --manifest-path tools/t0-orchestrate/Cargo.toml \
+            --target-dir .local-runs/ci-prebuilt-t0
+          BIN="$PWD/.local-runs/ci-prebuilt-t0/release/ai-memory-t0"
+          test -x "$BIN"
+          echo "AI_MEMORY_T0_ORCHESTRATOR_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "::notice::[#1853] e1 orchestrator prebuilt at $BIN"
+
       # v0.7.0 Task #12 (#1399) — test-impact-aware test dispatch.
       # ALWAYS runs `cargo test --lib` so every inline `#[cfg(test)] mod
       # tests` in `src/` exercises on every push (huge surface, one
