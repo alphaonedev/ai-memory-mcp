@@ -896,7 +896,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // subcommand variant + dispatch arm + the documented deferred
     // lineage-flag boot-seed note grew the file to 9_208; 9_300 = 92
     // headroom.
-    ("src/daemon_runtime.rs", 9_300),
+    // 2026-07-02 (#1822 G5b follow-up, pre-GA #1853) — bumped 9_300 →
+    // 9_400: the graceful-shutdown audit-head witness wire
+    // (`shutdown_witness_flush_and_checkpoint` helper + its serve()
+    // call site + docs) grew the file to 9_301; 9_400 = 99 headroom.
+    ("src/daemon_runtime.rs", 9_400),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

@@ -26,7 +26,12 @@
 //! - (f) `#[cfg(feature = "sal-postgres")]` postgres parity repeating
 //!   truncation + witness + verify (proves K3);
 //! - (g) a grep-guard asserting the pg append chokepoint references the
-//!   witness + watermark emitters.
+//!   witness + watermark emitters;
+//! - (h) the #1822-follow-up daemon graceful-shutdown wire
+//!   (`daemon_runtime::shutdown_witness_flush_and_checkpoint`): a clean
+//!   shutdown emits EXACTLY ONE witness when a key is enrolled and ZERO
+//!   when not (byte-identical legacy), and `daemon_runtime::serve`'s post-quiesce
+//!   block is grep-pinned to call it.
 //!
 //! The witness key-dir / pubkey / require env vars are process-global, so
 //! every test serialises via a module-local lock and clears the env on exit.
@@ -389,6 +394,121 @@ fn witness_throttle_fires_once_per_interval() {
     assert!(
         !witness::witness_claim_slot(1_000_064, false),
         "the same boundary must not double-emit"
+    );
+}
+
+// ── (h) #1822 follow-up: daemon graceful-shutdown witness wire ──
+
+/// Count the audit-head witness checkpoints in the reserved namespace.
+fn witness_checkpoint_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM checkpoints WHERE namespace = ?1",
+        [witness::WITNESS_CHECKPOINT_NAMESPACE],
+        |r| r.get(0),
+    )
+    .expect("count witness checkpoints")
+}
+
+/// Wrap a fresh DB connection into the daemon's shared [`ai_memory::handlers::Db`]
+/// tuple (the shape `daemon_runtime::serve`'s `checkpoint_state` carries at shutdown).
+fn daemon_db(path: &std::path::Path) -> ai_memory::handlers::Db {
+    let conn = ai_memory::db::open(path).expect("reopen for daemon Db");
+    std::sync::Arc::new(tokio::sync::Mutex::new((
+        conn,
+        path.to_path_buf(),
+        ai_memory::config::ResolvedTtl::default(),
+        true,
+    )))
+}
+
+/// Drive the async shutdown flush from these sync (env-lock-holding) tests.
+fn run_shutdown_flush(db: &ai_memory::handlers::Db) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(ai_memory::daemon_runtime::shutdown_witness_flush_and_checkpoint(db));
+}
+
+#[test]
+fn graceful_shutdown_flush_emits_exactly_one_witness_when_enrolled() {
+    let _g = lock();
+    let kdir = fresh_dir("h-keys");
+    let ddir = fresh_dir("h-db");
+    let _kp = enrol_witness(kdir.path());
+    let (path, conn) = open_db(ddir.path());
+
+    // 3 appends — far below WATERMARK_INTERVAL, so the throttled per-append
+    // emitter never fires and the final head is UNWITNESSED until shutdown.
+    append_rows(&conn, 3);
+    assert_eq!(
+        witness_checkpoint_count(&conn),
+        0,
+        "precondition: sub-interval head must be unwitnessed before shutdown"
+    );
+    drop(conn);
+
+    let db = daemon_db(&path);
+    run_shutdown_flush(&db);
+
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    assert_eq!(
+        witness_checkpoint_count(&conn),
+        1,
+        "a graceful shutdown must emit exactly one audit-head witness"
+    );
+
+    clear_witness_env();
+}
+
+#[test]
+fn graceful_shutdown_flush_emits_zero_witness_when_not_enrolled() {
+    let _g = lock();
+    let kdir = fresh_dir("h2-keys");
+    let ddir = fresh_dir("h2-db");
+    // Pin the custody dir to an EMPTY tempdir (no enrolled key) so the test
+    // cannot pick up a real key from the developer's default custody dir.
+    unsafe {
+        std::env::set_var(witness::WITNESS_KEY_DIR_ENV, kdir.path());
+        std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+    }
+    let (path, conn) = open_db(ddir.path());
+    append_rows(&conn, 3);
+    drop(conn);
+
+    let db = daemon_db(&path);
+    run_shutdown_flush(&db);
+
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    assert_eq!(
+        witness_checkpoint_count(&conn),
+        0,
+        "no witness key enrolled → a graceful shutdown emits NOTHING \
+         (byte-identical legacy shutdown)"
+    );
+
+    clear_witness_env();
+}
+
+/// Grep-pin the wire itself: `daemon_runtime::serve`'s post-quiesce shutdown block must
+/// call the flush helper, and the helper must force-emit the witness before
+/// the final WAL checkpoint (the #1822 follow-up this suite exists for).
+#[test]
+fn daemon_shutdown_path_wires_the_witness_flush() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/daemon_runtime.rs"
+    ))
+    .expect("read daemon_runtime.rs");
+    assert!(
+        src.contains("shutdown_witness_flush_and_checkpoint(&checkpoint_state)"),
+        "serve()'s post-quiesce shutdown block must call \
+         shutdown_witness_flush_and_checkpoint"
+    );
+    assert!(
+        src.contains("force_emit_audit_head_witness(&lock.0)"),
+        "the shutdown flush helper must force-emit the audit-head witness \
+         before the final WAL checkpoint"
     );
 }
 

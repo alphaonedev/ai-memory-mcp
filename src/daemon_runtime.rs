@@ -5106,16 +5106,30 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         );
     }
 
-    // Final WAL checkpoint now that every writer (HTTP handlers + the
-    // deferred-audit drainer) has quiesced. The drainer's appends share
-    // this database's WAL file, so this single checkpoint folds them in
-    // even though the drainer holds its own connection.
-    {
-        let lock = checkpoint_state.lock().await;
-        let _ = db::checkpoint(&lock.0);
-    }
+    // Final witness flush + WAL checkpoint now that every writer (HTTP
+    // handlers + the deferred-audit drainer) has quiesced. The drainer's
+    // appends share this database's WAL file, so this single checkpoint
+    // folds them in even though the drainer holds its own connection.
+    shutdown_witness_flush_and_checkpoint(&checkpoint_state).await;
 
     Ok(())
+}
+
+/// v0.9.0 G5b (#1822 follow-up) — graceful-shutdown audit flush: emit a
+/// final dual-chain audit-head witness anchor for the CURRENT chain head
+/// (bypassing the `WATERMARK_INTERVAL` throttle), then run the final WAL
+/// checkpoint so the witness row itself is folded in.
+///
+/// Called by [`serve`] AFTER the HTTP server has fully quiesced and the
+/// deferred-audit queue has drained, so the witnessed head includes every
+/// append of the daemon's life. Inherits the emitter's own gating: with no
+/// enrolled witness key the emission is a no-op (byte-identical legacy
+/// shutdown); emission failures are logged + swallowed (fire-and-forget —
+/// shutdown never fails on a witness error).
+pub async fn shutdown_witness_flush_and_checkpoint(db_state: &Db) {
+    let lock = db_state.lock().await;
+    crate::signed_events::force_emit_audit_head_witness(&lock.0);
+    let _ = db::checkpoint(&lock.0);
 }
 
 // ---------------------------------------------------------------------------
