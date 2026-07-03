@@ -17,13 +17,25 @@
 //! persisted. Both delegate to the I/O-free [`stamp_attestation`] core so
 //! the decision logic is unit-tested without a database.
 //!
-//! # Permissive default
+//! # Required by default (v0.9, #1751)
 //!
-//! When `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is unset, an unsigned write
-//! (or a write whose agent has no bound key) stamps `attest_level =
-//! "claimed"` and proceeds — Layer-3 is opt-in, not a hard cutover. A
+//! Since v0.9 the STORE-path default is fail-closed: when
+//! `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is unset, an unsigned write (or a
+//! write whose agent has no bound key) is REJECTED instead of landing
+//! `attest_level = "claimed"`. This is the flip promised by the v0.8.0
+//! one-cycle deprecation WARN (#1464 5-agent vote, UNANIMOUS Option A).
+//! Operators opt out explicitly with
+//! `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`), restoring the
+//! pre-v0.9 permissive posture where unsigned writes land `claimed`. A
 //! *presented* signature that fails to verify is always rejected (see
-//! [`crate::identity::verify::attest_write`]).
+//! [`crate::identity::verify::attest_write`]) regardless of the flag.
+//!
+//! SCOPE: this gate covers the direct CLI/MCP/HTTP store surfaces only.
+//! The federation receive path attests via the per-peer authorship
+//! allowlist (`resolve_inbound_attribution`, #1464), NOT this flag — the
+//! flip does not change the network boundary. Curator/autonomy self-writes
+//! go through the SAL `store()` surface (`CallerContext::for_admin`) and
+//! never traverse this gate.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -43,53 +55,69 @@ use crate::models::Memory;
 /// future timestamp) while leaving room for ordinary clock skew + transit.
 pub const ATTEST_CREATED_AT_SKEW_SECS: i64 = 300;
 
-/// `true` when the operator has opted into strict agent attestation by
-/// setting `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (or `=true`). Default
-/// `false` (permissive). Mirrors the federation
-/// `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` convention.
+/// `true` unless the operator has explicitly opted OUT of strict agent
+/// attestation with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`).
+///
+/// #1751 (v0.9) — the compiled STORE-path default is `true` (required):
+/// the flip promised by the v0.8.0 one-cycle deprecation WARN (#1464
+/// 5-agent vote, UNANIMOUS Option A). `=1`/`=true` remains the explicit
+/// opt-in spelling (now redundant with the default); any other value
+/// falls through to the required default so a typo fails CLOSED, never
+/// open. Env still wins over the compiled default — the standard
+/// `CLI flag > env > config > compiled default` ladder.
+///
+/// SCOPE: direct CLI/MCP/HTTP store writes only; the federation receive
+/// boundary attests via the peer-authorship allowlist
+/// (`resolve_inbound_attribution`, #1464), not this flag.
 #[must_use]
 pub fn require_agent_attestation_enabled() -> bool {
-    std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    parse_require_agent_attestation(
+        std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
+            .ok()
+            .as_deref(),
+    )
 }
 
-/// #1464 — `true` when an unsigned write landed `claimed` under the permissive
-/// default: exactly the writes the v0.9 store-path flip (#1751) will start
-/// rejecting, so exactly when the one-cycle deprecation WARN is relevant. A
-/// signed write (→ `AgentAttested`) is unaffected by the flip and stays quiet;
-/// strict mode (`require == true`) has nothing to deprecate.
-fn should_warn_permissive_default(require: bool, level: AttestLevel) -> bool {
-    !require && level == AttestLevel::Claimed
+/// I/O-free parse core for [`require_agent_attestation_enabled`] (#1751).
+///
+/// Explicit falsy (`0`/`false`, case-insensitive) → permissive opt-out;
+/// explicit truthy (`1`/`true`, case-insensitive) → required; unset or any
+/// unrecognized value → the required v0.9 compiled default (fail-closed).
+fn parse_require_agent_attestation(value: Option<&str>) -> bool {
+    match value {
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => true,
+    }
 }
 
-/// #1464 (v0.8.0, P0) — one-shot deprecation WARN for the permissive
-/// agent-attestation default. Emitted at most once per process the first time
-/// an UNSIGNED direct-store write lands `attest_level = "claimed"` under the
-/// default-permissive posture (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset).
+/// #1751 — pin the parallel lib-test binary to the explicit permissive
+/// opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`), exactly once per
+/// process.
 ///
-/// Announces the v0.9 STORE-path default flip (tracked: #1751), giving
-/// operators a one-cycle runway to start signing writes (`store --sign` + a
-/// bound key) or opt in early via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
+/// The v0.9 store-path default is REQUIRED, so every lib unit test that
+/// incidentally stores unsigned through a gated surface (MCP
+/// `handle_store`, the HTTP create handlers, CLI `store::run`) would
+/// otherwise be rejected. The strict-posture rejection paths are covered
+/// by the dedicated env-serialised integration binaries
+/// (`tests/agent_attestation_integrity.rs`, `tests/config_precedence.rs`,
+/// `tests/agent_attestation_postgres.rs`) which own their child-process /
+/// guarded env.
 ///
-/// SCOPE: store/direct-write path ONLY. The federation receive boundary
-/// attests via the per-peer authorship allowlist (`resolve_inbound_attribution`,
-/// #1464) — NOT this flag — so the message deliberately does not imply the
-/// flip hardens the network boundary. Chosen by the #1464 5-agent vote
-/// (UNANIMOUS Option A, memory `45a27602`).
-fn warn_permissive_attestation_default_once() {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        tracing::warn!(
-            target: "identity::attest",
-            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION is unset (permissive default): \
-             unsigned direct-store writes land attest_level=claimed. v0.9 will flip \
-             this store-path default to REQUIRE attestation (#1751) — sign writes now \
-             (`ai-memory store --sign` with a bound key, or set \
-             AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1) to opt in early. NOTE: this gate \
-             covers direct CLI/MCP/HTTP writes only; the federation receive path \
-             attests via the peer-authorship allowlist, not this flag."
-        );
+/// Monotonic set-once discipline (the #1609 rule, updated for the flip):
+/// the lib-test binary never sets the flag to a STRICT value and never
+/// clears it — every concurrent reader observes either "unset" (before
+/// the first gated fixture runs, at which point no gated store has been
+/// issued yet) or the stable `"0"`, so no set/restore window can leak a
+/// strict posture into a sibling test.
+#[cfg(test)]
+pub(crate) fn permissive_attestation_for_lib_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: single-shot, before the calling test issues any gated
+        // store; the value is never mutated again for the process
+        // lifetime, matching the crate's accepted env-in-tests discipline
+        // (see `src/cli/store.rs` env-test notes).
+        unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
     });
 }
 
@@ -236,13 +264,7 @@ pub fn stamp_attestation_sync(
 ) -> Result<AttestLevel> {
     let bound = crate::db::agent_pubkey(conn, agent_id)?;
     let require = require_agent_attestation_enabled();
-    let level = stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)?;
-    // #1464 — warn (once) when an unsigned write lands claimed under the
-    // permissive default, announcing the v0.9 flip (#1751).
-    if should_warn_permissive_default(require, level) {
-        warn_permissive_attestation_default_once();
-    }
-    Ok(level)
+    stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)
 }
 
 /// MCP / HTTP wrapper: resolve the bound key via
@@ -267,13 +289,7 @@ pub async fn stamp_attestation_async(
         .await
         .map_err(|e| anyhow::anyhow!("resolve bound agent pubkey: {e}"))?;
     let require = require_agent_attestation_enabled();
-    let level = stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)?;
-    // #1464 — warn (once) when an unsigned write lands claimed under the
-    // permissive default, announcing the v0.9 flip (#1751).
-    if should_warn_permissive_default(require, level) {
-        warn_permissive_attestation_default_once();
-    }
-    Ok(level)
+    stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)
 }
 
 #[cfg(test)]
@@ -314,28 +330,6 @@ mod tests {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
         }
-    }
-
-    /// #1464 — the deprecation-WARN trigger predicate fires for exactly the
-    /// writes the v0.9 store-path flip (#1751) will reject: unsigned-→claimed
-    /// under the permissive default. Signed (AgentAttested) and strict-mode
-    /// writes stay quiet.
-    #[test]
-    fn should_warn_permissive_default_only_for_unsigned_claimed() {
-        assert!(should_warn_permissive_default(false, AttestLevel::Claimed));
-        assert!(!should_warn_permissive_default(
-            false,
-            AttestLevel::AgentAttested
-        ));
-        assert!(!should_warn_permissive_default(true, AttestLevel::Claimed));
-        assert!(!should_warn_permissive_default(
-            true,
-            AttestLevel::AgentAttested
-        ));
-        // The one-shot emitter is best-effort and idempotent — calling it
-        // never panics regardless of prior calls.
-        warn_permissive_attestation_default_once();
-        warn_permissive_attestation_default_once();
     }
 
     /// Build a SignableWrite matching `make_memory`'s fields so a test can
@@ -432,21 +426,35 @@ mod tests {
         assert!(err.to_string().contains("attestation failed"), "got: {err}");
     }
 
+    /// #1751 — the I/O-free parse core behind
+    /// `require_agent_attestation_enabled`. No process-env mutation here
+    /// (the parallel lib-test binary must never set the require flag —
+    /// see `src/mcp/tools/store/tests.rs` §#626); the env-backed reader
+    /// is covered by the env-serialised `tests/config_precedence.rs`.
     #[test]
-    fn require_flag_parses_truthy_values() {
-        // No reliance on process env here — exercise the gate directly via
-        // the `require` parameter; the env reader is covered separately by
-        // its own truthy-string contract below.
-        for v in ["1", "true", "TRUE", "True"] {
+    fn require_flag_parse_core_v09_default_required() {
+        // Unset → the v0.9 compiled default: REQUIRED (fail-closed).
+        assert!(parse_require_agent_attestation(None));
+        // Explicit opt-OUT spellings → permissive.
+        for v in ["0", "false", "FALSE", "False"] {
             assert!(
-                v == "1" || v.eq_ignore_ascii_case("true"),
-                "{v} must read as enabled"
+                !parse_require_agent_attestation(Some(v)),
+                "{v} must read as the explicit permissive opt-out"
             );
         }
-        for v in ["0", "false", "no", ""] {
+        // Explicit opt-IN spellings (redundant with the default) → required.
+        for v in ["1", "true", "TRUE", "True"] {
             assert!(
-                !(v == "1" || v.eq_ignore_ascii_case("true")),
-                "{v} must read as disabled"
+                parse_require_agent_attestation(Some(v)),
+                "{v} must read as required"
+            );
+        }
+        // Unrecognized values fall through to the required default: a typo
+        // fails CLOSED, never open.
+        for v in ["no", "", "yes-please", "off", "2"] {
+            assert!(
+                parse_require_agent_attestation(Some(v)),
+                "{v:?} must fall through to the required default"
             );
         }
     }

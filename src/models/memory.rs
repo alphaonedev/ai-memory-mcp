@@ -1207,9 +1207,10 @@ pub struct CreateMemory {
     /// sha256(content)`). When present, `created_at` MUST also be supplied
     /// (the signer cannot predict the server clock); a signature that
     /// fails to verify against the agent's bound public key is rejected
-    /// with 403. Absent ⇒ legacy unsigned write unless the operator set
-    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, in which case the gate
-    /// rejects the unsigned store.
+    /// with 403. Absent ⇒ unsigned write, which the gate REJECTS under
+    /// the v0.9 required-attestation default (#1751) unless the operator
+    /// set the `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out (in which
+    /// case it lands `attest_level = "claimed"`).
     #[serde(default)]
     pub signature: Option<String>,
     /// #626 Layer-3 (C7) — RFC3339 timestamp the caller signed. Required

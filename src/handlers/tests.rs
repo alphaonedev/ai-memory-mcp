@@ -376,6 +376,11 @@ use axum::{Router, body::Body, routing::get as axum_get, routing::post as axum_p
 use tower::ServiceExt as _;
 
 fn test_app_state(db: Db) -> AppState {
+    // #1751 — pin the lib-test binary to the explicit permissive
+    // attestation opt-out so the unsigned HTTP create fixtures below
+    // keep exercising their actual subject matter (required-default
+    // rejection is covered by `tests/agent_attestation_integrity.rs`).
+    crate::identity::attest::permissive_attestation_for_lib_tests();
     // v0.7.0 Wave-3 — test helper. Test fixtures use `:memory:`
     // SQLite for the legacy `db` field (no on-disk path) so the
     // trait-routed `store` field is set to a separate SqliteStore

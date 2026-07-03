@@ -155,6 +155,9 @@ fn try_spawn_serve_once(
     let port_s = port.to_string();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
+        // #1751 — permissive attestation opt-out; this suite's unsigned
+        // HTTP stores exercise serve wiring, not the attestation gate.
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         // #976 (2026-05-20) — admin allowlist so the post-#946
         // admin-gated routes (stats, archive, forget, …) exercise the
         // happy-path 200 in this test fixture. Negative admin

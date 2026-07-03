@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### Breaking / secure-default changes — store-path agent attestation now REQUIRED by default ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751); deprecation cycle from [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464))
+
+- **`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` compiled default flipped
+  `false → true`** (`src/identity/attest.rs::require_agent_attestation_enabled`,
+  env-table row #48). An UNSIGNED direct-store write — MCP `memory_store`,
+  HTTP `POST /api/v1/memories`, CLI `store` — is now rejected
+  (`403 ATTESTATION_FAILED` / CLI error) instead of landing
+  `attest_level = "claimed"`. A presented signature is verified against the
+  agent's bound key exactly as before (valid → `agent_attested`; forged →
+  reject, unconditionally). This is the flip promised by the v0.8.0
+  one-cycle deprecation WARN (#1464 5-agent vote, UNANIMOUS Option A); that
+  one-shot WARN is now removed, its obligation fulfilled.
+- **Migration:** operators with unsigned store workflows must either sign
+  writes (`ai-memory store --sign` with a keypair bound via
+  `ai-memory agents bind-key`) or set the explicit opt-out
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`, case-insensitive)
+  to restore the pre-v0.9 permissive posture. Any other value falls
+  through to the required default, so a typo fails closed.
+- **Scope (per the #1464 vote):** the STORE/direct-write path ONLY. The
+  federation receive path attests via the per-peer authorship allowlist
+  (`resolve_inbound_attribution`, #1464) — NOT this flag — so this flip
+  does not change the network boundary; per-write cryptographic
+  verification of federated memories remains tracked under #1719.
+  Curator/autonomy self-writes go through the SAL `store()` surface
+  (`CallerContext::for_admin`) and never traverse this gate. The
+  non-loopback boot posture WARN (R-12) now describes the permissive
+  posture as the explicit opt-out rather than the default.
+- Tested: `tests/config_precedence.rs::test_require_agent_attestation_env_parsing`
+  (unset ⇒ REQUIRED; `0`/`false` ⇒ permissive; `1`/`true` ⇒ required;
+  unrecognized ⇒ required) +
+  `src/identity/attest.rs::tests::require_flag_parse_core_v09_default_required` +
+  the pre-existing strict-posture rejection suites
+  (`tests/agent_attestation_integrity.rs`, `tests/agent_attestation_postgres.rs`).
+
 ### Added — vector-search minimal opt-in slice ([#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005); full substrate deferred to [#1860](https://github.com/alphaonedev/ai-memory-mcp/issues/1860))
 
 Every item below is byte-identical to legacy behavior until its flag /

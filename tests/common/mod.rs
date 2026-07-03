@@ -91,6 +91,7 @@ use tempfile::NamedTempFile;
 #[allow(dead_code)]
 pub fn pg_test_client(agent_id: &str) -> reqwest::Client {
     use reqwest::header::{HeaderMap, HeaderValue};
+    permissive_attestation_for_tests();
     let mut headers = HeaderMap::new();
     headers.insert(
         "X-Agent-Id",
@@ -157,6 +158,35 @@ pub fn ensure_no_config_env() {
         // against.
         unsafe {
             std::env::set_var("AI_MEMORY_NO_CONFIG", "1");
+        }
+    });
+}
+
+/// #1751 — pin this test binary (and every `ai-memory` child process it
+/// spawns, which inherits the env) to the explicit permissive
+/// agent-attestation opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`).
+///
+/// The v0.9 store-path default is REQUIRED, so any test that
+/// incidentally stores unsigned — MCP `memory_store`, HTTP
+/// `POST /api/v1/memories`, CLI `store` — would otherwise be rejected
+/// with `ATTESTATION_FAILED` instead of exercising its actual subject
+/// matter. The required-default posture itself is covered by the
+/// dedicated env-owning suites (`tests/agent_attestation_integrity.rs`,
+/// `tests/config_precedence.rs`, `tests/agent_attestation_postgres.rs`),
+/// which override or remove this value under their own serialisation.
+///
+/// Same `Once` discipline as [`ensure_no_config_env`] above: set once,
+/// to one stable value, never cleared — a concurrent reader observes
+/// either "unset" (only before the first store-capable fixture runs) or
+/// `"0"`, never a strict flicker.
+pub fn permissive_attestation_for_tests() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // SAFETY: `Once`-gated process-global env write before the
+        // calling test issues any gated store; never mutated again by
+        // this helper for the process lifetime.
+        unsafe {
+            std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
         }
     });
 }
@@ -349,6 +379,10 @@ pub fn age_url() -> Option<String> {
 /// test files; this helper standardises the one-liner shape.
 #[must_use]
 pub fn free_port() -> u16 {
+    // #1751 — daemon-spawning suites grab a port first; pin the
+    // permissive attestation opt-out here so the spawned child (which
+    // inherits this process env) accepts the suite's unsigned stores.
+    permissive_attestation_for_tests();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral 127.0.0.1:0");
     listener.local_addr().expect("local_addr").port()
 }
@@ -363,6 +397,7 @@ pub fn free_port() -> u16 {
 /// `db::open`'s migration ladder.
 #[must_use]
 pub fn fresh_conn() -> Connection {
+    permissive_attestation_for_tests();
     ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 
@@ -397,6 +432,7 @@ pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) 
 /// handlers that take `&Path`.
 #[must_use]
 pub fn fresh_db_tempfile_path() -> (NamedTempFile, PathBuf) {
+    permissive_attestation_for_tests();
     let f = NamedTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
@@ -409,6 +445,7 @@ pub fn fresh_db_tempfile_path() -> (NamedTempFile, PathBuf) {
 /// connection and the tempfile guard.
 #[must_use]
 pub fn fresh_db_tempfile_conn() -> (NamedTempFile, Connection) {
+    permissive_attestation_for_tests();
     let tmp = NamedTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("db::open");
     (tmp, conn)

@@ -5545,6 +5545,10 @@ mod tests {
     /// in-memory connection. Returns the response so individual tests
     /// can assert on `error` / `result` shape.
     fn invoke_handle_request(conn: &rusqlite::Connection, req: &RpcRequest) -> RpcResponse {
+        // #1751 — pin the lib-test binary to the explicit permissive
+        // attestation opt-out so unsigned `memory_store` dispatches keep
+        // exercising their actual subject matter.
+        crate::identity::attest::permissive_attestation_for_lib_tests();
         let tier_config = FeatureTier::Keyword.config();
         let resolved_ttl = crate::config::ResolvedTtl::default();
         let resolved_scoring = crate::config::ResolvedScoring::default();

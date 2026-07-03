@@ -38,12 +38,16 @@
 //!    `env::vars()` walk).
 //!
 //! 4. **`test_require_agent_attestation_env_parsing`** (#626 Layer-3
-//!    C7) — the `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` gate flag
-//!    (table row #48) is a fail-CLOSED opt-in: `1`/`true`
-//!    (case-insensitive) enable it, anything else (including unset)
-//!    leaves the permissive default. Pins the truthy-parse semantics
-//!    of `require_agent_attestation_enabled()` so a regression that
-//!    flipped the default to fail-CLOSED, or that broadened the truthy
+//!    C7; #1751 v0.9 default flip) — the
+//!    `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` gate flag (table row #48)
+//!    is fail-CLOSED **by default** since v0.9: unset resolves to
+//!    REQUIRED, the explicit `0`/`false` (case-insensitive) opt-out
+//!    restores the permissive posture, `1`/`true` remains the
+//!    (now-redundant) opt-in spelling, and any unrecognized value
+//!    falls through to the required default so a typo fails closed.
+//!    Pins the parse semantics of
+//!    `require_agent_attestation_enabled()` so a regression that
+//!    silently reverted the #1751 flip, or that broadened the falsy
 //!    set, surfaces here.
 //!
 //! 5. **`test_limits_env_overrides_config_and_default`** (#1156
@@ -280,21 +284,40 @@ fn test_secret_not_in_capabilities() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. AI_MEMORY_REQUIRE_AGENT_ATTESTATION (#626 Layer-3 C7) truthy parsing.
+// 4. AI_MEMORY_REQUIRE_AGENT_ATTESTATION (#626 Layer-3 C7; #1751 v0.9
+//    store-path default flip) parse ladder.
 // ---------------------------------------------------------------------------
 #[test]
 fn test_require_agent_attestation_env_parsing() {
     use ai_memory::identity::attest::require_agent_attestation_enabled;
 
-    // ---- Default (unset) → permissive ----
+    // ---- Default (unset) → REQUIRED (the #1751 v0.9 flip: the compiled
+    // store-path default is fail-closed; the v0.8.0 deprecation WARN
+    // promised exactly this) ----
     let guard = EnvVarGuard::remove("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
     assert!(
-        !require_agent_attestation_enabled(),
-        "unset AI_MEMORY_REQUIRE_AGENT_ATTESTATION MUST resolve permissive (false)",
+        require_agent_attestation_enabled(),
+        "unset AI_MEMORY_REQUIRE_AGENT_ATTESTATION MUST resolve REQUIRED (#1751 v0.9 default)",
     );
     drop(guard);
 
-    // ---- "1" → enabled ----
+    // ---- "0" → the explicit documented permissive opt-OUT ----
+    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0".to_string());
+    assert!(
+        !require_agent_attestation_enabled(),
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 MUST opt out to the permissive posture",
+    );
+    drop(guard);
+
+    // ---- "false"/"FALSE" → opt-out (case-insensitive) ----
+    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "FALSE".to_string());
+    assert!(
+        !require_agent_attestation_enabled(),
+        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=FALSE MUST opt out (case-insensitive)",
+    );
+    drop(guard);
+
+    // ---- "1" → required (explicit, now redundant with the default) ----
     let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "1".to_string());
     assert!(
         require_agent_attestation_enabled(),
@@ -302,7 +325,7 @@ fn test_require_agent_attestation_env_parsing() {
     );
     drop(guard);
 
-    // ---- "true"/"TRUE" → enabled (case-insensitive) ----
+    // ---- "true"/"TRUE" → required (case-insensitive) ----
     let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "TRUE".to_string());
     assert!(
         require_agent_attestation_enabled(),
@@ -310,21 +333,15 @@ fn test_require_agent_attestation_env_parsing() {
     );
     drop(guard);
 
-    // ---- Any other value → permissive (no broad truthiness) ----
-    let guard = EnvVarGuard::set("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0".to_string());
-    assert!(
-        !require_agent_attestation_enabled(),
-        "AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 MUST stay permissive",
-    );
-    drop(guard);
-
+    // ---- Any unrecognized value → falls through to the REQUIRED default
+    // (a typo fails CLOSED, never open) ----
     let _guard = EnvVarGuard::set(
         "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
         "yes-please".to_string(),
     );
     assert!(
-        !require_agent_attestation_enabled(),
-        "a non-1/true value MUST NOT be treated as truthy",
+        require_agent_attestation_enabled(),
+        "a non-0/false value MUST fall through to the required default (fail-closed)",
     );
 }
 

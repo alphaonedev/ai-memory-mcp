@@ -115,10 +115,22 @@ fn app_state_for(
     }
 }
 
+/// #1751 — pin this test binary (and any spawned `ai-memory` child, which
+/// inherits the process env) to the explicit permissive agent-attestation
+/// opt-out. The v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned store fixtures; the required default itself is pinned
+/// in `tests/agent_attestation_integrity.rs` + `tests/config_precedence.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
 /// Production router over a fresh on-disk sqlite DB. The legacy `app.db`
 /// connection and the SAL `SqliteStore` open the SAME path so a seed via
 /// either surface is visible through the other.
 fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+    permissive_attestation_for_tests();
     let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
@@ -144,6 +156,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
 /// with no live postgres. Returns the router plus the store's backing
 /// path so a test can seed rows the SAL branch will read.
 fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
+    permissive_attestation_for_tests();
     let scratch = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(AsyncMutex::new((
         scratch,

@@ -46,9 +46,10 @@ pub mod error_codes {
     /// path. Emitted (403 FORBIDDEN) by the HTTP create-handler
     /// (`src/handlers/create.rs`) when a presented Ed25519 signature fails
     /// to verify against the agent's bound public key, or when
-    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set and the write is
-    /// unsigned / the agent has no bound key. The MCP store path surfaces
-    /// the same condition as a plain error string.
+    /// attestation is required — the v0.9 default (#1751), unless the
+    /// operator set the `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out —
+    /// and the write is unsigned / the agent has no bound key. The MCP
+    /// store path surfaces the same condition as a plain error string.
     pub const ATTESTATION_FAILED: &str = "ATTESTATION_FAILED";
 
     // ---- StorageError-side (substrate-facing) -------------------------------

@@ -35,7 +35,18 @@ fn pg_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// #1751 — pin this test binary to the explicit permissive agent-attestation
+/// opt-out; the v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned HTTP store fixtures.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
+
 async fn pg_router(url: &str) -> axum::Router {
+    permissive_attestation_for_tests();
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(Mutex::new((
         conn,

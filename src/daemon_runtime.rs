@@ -3860,9 +3860,10 @@ fn boot_security_posture_warnings(
     if !attestation_required {
         warnings.push(format!(
             "SECURITY POSTURE (#1798 R-12): daemon bound to non-loopback {host:?} with agent \
-             attestation PERMISSIVE (the default) — writes from any reachable caller land \
+             attestation PERMISSIVE (explicit AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 opt-out; \
+             required is the v0.9 default, #1751) — writes from any reachable caller land \
              attest_level=claimed with unverified identity. For off-host / multi-tenant \
-             deployments set AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 to reject unsigned writes."
+             deployments remove the opt-out so unsigned writes are rejected."
         ));
     }
     warnings
@@ -5985,8 +5986,9 @@ mod tests {
         assert!(w.is_empty(), "advisory mode does not trip R-04, got {w:?}");
     }
 
-    /// Non-loopback + permissive attestation (the default) → the R-12 warning
-    /// fires; requiring attestation silences it.
+    /// Non-loopback + permissive attestation (the explicit `=0` opt-out —
+    /// required is the v0.9 default, #1751) → the R-12 warning fires;
+    /// required attestation silences it.
     #[test]
     fn boot_posture_permissive_attestation_warns_r12() {
         let permissive =

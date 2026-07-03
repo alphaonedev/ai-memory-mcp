@@ -41,10 +41,23 @@ impl Drop for McpChild {
     }
 }
 
+/// #1751 — pin this test binary (and any spawned `ai-memory` child, which
+/// inherits the process env) to the explicit permissive agent-attestation
+/// opt-out. The v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned store fixtures; the required default itself is pinned
+/// in `tests/agent_attestation_integrity.rs` + `tests/config_precedence.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value for
+    // the process lifetime, set before the caller issues any gated store.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
+
 /// Spawn `ai-memory mcp --tier keyword` and return the child + a worker
 /// thread reading stdout line-by-line into an mpsc channel. The caller
 /// can pop responses with a bounded `recv_timeout`.
 fn spawn_mcp(db: &std::path::Path) -> (McpChild, mpsc::Receiver<String>) {
+    permissive_attestation_for_tests();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
         .env("AI_MEMORY_NO_CONFIG", "1")
         // v0.6.4-002: tests written against the v0.6.3 full surface

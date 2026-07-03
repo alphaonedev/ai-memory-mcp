@@ -328,6 +328,7 @@ fn cli_one_shot_does_not_install_hook() {
     // Now run `ai-memory store` against the seeded DB.
     let output = std::process::Command::new(bin)
         .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .args([
             "--db",
             db_path.to_str().unwrap(),
@@ -412,6 +413,7 @@ fn spawn_healthy_serve(
         let port = free_port();
         let mut child = std::process::Command::new(bin)
             .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
             .env("AI_MEMORY_OPERATOR_PUBKEY", pub_b64)
             .args([
                 "--db",

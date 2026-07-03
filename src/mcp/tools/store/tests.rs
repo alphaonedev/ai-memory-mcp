@@ -19,6 +19,13 @@ use crate::models::{ConfidenceSource, Tier};
 use crate::storage as db;
 
 fn fresh_conn() -> rusqlite::Connection {
+    // #1751 — pin the lib-test binary to the explicit permissive
+    // attestation opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`) so
+    // the unsigned store fixtures below keep exercising their actual
+    // subject matter; the required-default rejection path is covered by
+    // the env-serialised integration binaries. See the #626 section
+    // header below for the no-strict-value rule this preserves.
+    crate::identity::attest::permissive_attestation_for_lib_tests();
     db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
 }
 

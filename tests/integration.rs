@@ -27,6 +27,11 @@ const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 fn cmd(binary: &str) -> std::process::Command {
     let mut c = std::process::Command::new(binary);
     c.env("AI_MEMORY_NO_CONFIG", "1");
+    // #1751 — the v0.9 store-path default REQUIRES attestation; this suite's
+    // unsigned CLI/daemon stores exercise other subject matter, so pin the
+    // explicit documented opt-out on every spawned child. The required
+    // default itself is pinned in tests/agent_attestation_integrity.rs.
+    c.env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
     // #1501 — the CLI `recall`/`store` subprocesses default to the semantic
     // tier, which lazily downloads the MiniLM weights from HuggingFace Hub on
     // first touch. Spawned once per test, many of these race on the shared

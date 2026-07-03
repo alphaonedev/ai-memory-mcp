@@ -86,8 +86,10 @@ pub struct StoreArgs {
     /// rather than merely *claimed*. Requires a `<agent_id>.priv` under
     /// the key directory (`AI_MEMORY_KEY_DIR` or the platform default);
     /// the bound public key must match (see `ai-memory agents bind-key`).
-    /// When unset, the write is *claimed* unless
-    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, which rejects it.
+    /// When unset, the unsigned write is REJECTED under the v0.9
+    /// required-attestation default (#1751) unless the operator set the
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out, in which case it
+    /// lands *claimed*.
     #[arg(long)]
     pub sign: bool,
     /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
@@ -267,10 +269,11 @@ pub fn run(
     // #626 Layer-3 (Task 1.3 / C5) — agent attestation gate. When
     // `--sign` is set, load the agent's local keypair and sign the
     // attestable surface; the gate then stamps `metadata.attest_level =
-    // "agent_attested"`. The gate is also invoked (with no signature) when
-    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is on, so an unsigned write is
-    // rejected under the strict posture. When neither applies the write
-    // path is byte-equal to the pre-Layer-3 behavior (no stamp).
+    // "agent_attested"`. The gate is also invoked (with no signature)
+    // when attestation is required — the v0.9 default (#1751) — so an
+    // unsigned write is rejected. Only under the explicit
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out does the unsigned
+    // path stay byte-equal to the pre-Layer-3 behavior (no stamp).
     let signature: Option<Vec<u8>> = if args.sign {
         let dir = identity::keypair::default_key_dir()?;
         let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
@@ -788,11 +791,6 @@ mod tests {
             unsafe { std::env::set_var(key, val) };
             Self { key, prev }
         }
-        fn clear(key: &'static str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::remove_var(key) };
-            Self { key, prev }
-        }
     }
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
@@ -808,7 +806,13 @@ mod tests {
         let _lock = locked_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
-        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+        // #1751 — pin "0" (never clear): clearing would open a strict
+        // required-default window that leaks into concurrent unsigned
+        // store tests in this parallel lib-test binary.
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("0"),
+        );
 
         // Persist the agent's keypair on disk so `--sign` can load + sign.
         let kp = crate::identity::keypair::generate("test-agent").unwrap();
@@ -844,7 +848,11 @@ mod tests {
         // Empty key dir — no `<agent_id>.priv` to load.
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
-        let _req = EnvVarGuard::clear("AI_MEMORY_REQUIRE_AGENT_ATTESTATION");
+        // #1751 — pin "0" (never clear); see the sibling test above.
+        let _req = EnvVarGuard::set(
+            "AI_MEMORY_REQUIRE_AGENT_ATTESTATION",
+            std::ffi::OsStr::new("0"),
+        );
 
         let mut env = TestEnv::fresh();
         let db = env.db_path.clone();

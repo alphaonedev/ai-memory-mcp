@@ -1224,9 +1224,10 @@ pub async fn create_memory(
     // by default), so the remote signer supplies the timestamp it used;
     // the server validates the freshness window then adopts it verbatim.
     // A presented signature that fails to verify against the agent's
-    // bound key is a 403; with no signature the path is unchanged unless
-    // the operator set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`, which
-    // rejects unsigned writes.
+    // bound key is a 403; with no signature the unsigned write is a 403
+    // under the v0.9 required-attestation default (#1751) — only the
+    // explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out keeps the
+    // unsigned path unchanged.
     {
         let presented_sig = body
             .signature
