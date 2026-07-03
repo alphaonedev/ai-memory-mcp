@@ -76,6 +76,13 @@ trap cleanup EXIT
 FAIL_COUNT=0
 PASS_COUNT=0
 
+# #1751 — the v0.9 store-path default REQUIRES attestation; this suite's
+# DB-bootstrap `store` seeds (and the install script's writes) are
+# unsigned, so pin the documented explicit opt-out for the whole suite.
+# The subject under test is Batman-mode rule enforcement, not the
+# attestation gate (which owns tests/agent_attestation_integrity.rs).
+export AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0
+
 assert() {
     local label="$1"
     local cond="$2"

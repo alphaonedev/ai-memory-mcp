@@ -35,6 +35,11 @@
 
 set -uo pipefail
 
+# #1751 — the v0.9 store-path default REQUIRES attestation; this harness's
+# unsigned `store` seeds are incidental to its subject matter, so pin the
+# documented explicit opt-out for the harness process.
+export AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0
+
 DB="${AI_MEMORY_DB:-}"
 NAMESPACE="${BATMAN_NAMESPACE:-main}"
 JSON_OUT=0
