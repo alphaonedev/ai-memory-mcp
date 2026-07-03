@@ -52,20 +52,51 @@ fn skip_under_llvm_cov() -> bool {
     }
 }
 
-/// Build the orchestrator binary once per `cargo test` run and
-/// return the absolute path to it.
+/// v0.9.0 pre-GA (#1853) — CI hands the test a PREBUILT `ai-memory-t0`
+/// binary through this env var so the resource-constrained macOS runner
+/// never runs the nested `cargo build --release` inside the test process
+/// (that nested build intermittently failed there, false-redding the
+/// suite). Unset (every local run) the test falls back to building the
+/// tool itself, so the e2e coverage is unchanged.
+const PREBUILT_BIN_ENV: &str = "AI_MEMORY_T0_ORCHESTRATOR_BIN";
+
+/// Resolve the orchestrator binary once per `cargo test` run and
+/// return the absolute path to it: the CI-prebuilt artifact if
+/// [`PREBUILT_BIN_ENV`] names an existing file, else a nested build.
 ///
 /// Historically (when this was a bash script) each test fn invoked
 /// `bash scripts/t0-orchestrate.sh` directly. With the Rust port,
 /// `--test-threads > 1` would otherwise race parallel `cargo build`
 /// invocations against the shared `--target-dir`. A process-wide
 /// `OnceLock` lets the first thread to reach `orchestrator_bin()`
-/// build the binary; every other thread blocks, then re-uses the
+/// resolve the binary; every other thread blocks, then re-uses the
 /// cached `PathBuf`. Same pattern `tests/g11_auto_link_detector.rs`
 /// and `tests/transcript_extractor.rs` use for their sibling crates.
 fn orchestrator_bin() -> &'static PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(build_orchestrator_once)
+    BIN.get_or_init(|| prebuilt_orchestrator().unwrap_or_else(build_orchestrator_once))
+}
+
+/// #1853 — the CI-prebuilt artifact path, if advertised AND present.
+/// A set-but-missing path falls back to the nested build (with a stderr
+/// note) rather than failing: the env var is a fast-path hint, never a
+/// correctness input.
+fn prebuilt_orchestrator() -> Option<PathBuf> {
+    let bin = PathBuf::from(std::env::var_os(PREBUILT_BIN_ENV)?);
+    if bin.is_file() {
+        eprintln!(
+            "E1 (#1853): using CI-prebuilt orchestrator at {}",
+            bin.display()
+        );
+        Some(bin)
+    } else {
+        eprintln!(
+            "E1 (#1853): {PREBUILT_BIN_ENV} set but {} is not a file — \
+             falling back to the nested build",
+            bin.display()
+        );
+        None
+    }
 }
 
 fn build_orchestrator_once() -> PathBuf {
@@ -90,19 +121,38 @@ fn build_orchestrator_once() -> PathBuf {
         std::process::id()
     ));
 
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--quiet",
-            "--release",
-            "--manifest-path",
-            manifest_path.to_str().expect("utf-8 manifest path"),
-            "--target-dir",
-            target_dir.to_str().expect("utf-8 target dir"),
-        ])
-        .status()
-        .expect("invoke cargo build for ai-memory-t0");
-    assert!(status.success(), "cargo build for ai-memory-t0 failed");
+    // #1853 — one bounded retry: on the resource-constrained macOS CI
+    // runner this nested build intermittently failed on transient
+    // resource pressure. CI now prefers the prebuilt artifact (see
+    // `PREBUILT_BIN_ENV`), so this path is local-dev / fallback only —
+    // but keep it robust rather than single-shot.
+    let build_once = || {
+        Command::new("cargo")
+            .args([
+                "build",
+                "--quiet",
+                "--release",
+                "--manifest-path",
+                manifest_path.to_str().expect("utf-8 manifest path"),
+                "--target-dir",
+                target_dir.to_str().expect("utf-8 target dir"),
+            ])
+            .status()
+            .expect("invoke cargo build for ai-memory-t0")
+    };
+    let mut status = build_once();
+    if !status.success() {
+        eprintln!(
+            "E1 (#1853): nested cargo build for ai-memory-t0 failed \
+             (status={:?}); retrying once",
+            status.code()
+        );
+        status = build_once();
+    }
+    assert!(
+        status.success(),
+        "cargo build for ai-memory-t0 failed twice"
+    );
 
     let bin = target_dir.join("release").join(if cfg!(windows) {
         "ai-memory-t0.exe"
