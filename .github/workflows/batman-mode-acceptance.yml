@@ -107,6 +107,12 @@ jobs:
           AI_MEMORY_NO_CONFIG: '1'
         run: cargo test --release --test form_7_agent_external_wiring -- --test-threads=1
       - name: Assert binary refuses /tmp write under R001 end-to-end
+        env:
+          # #1751 — the v0.9 store-path default REQUIRES attestation; the
+          # schema-bootstrap `store` below is an unsigned seed, so pin the
+          # documented explicit opt-out. The rules-check subject under test
+          # (R001 /tmp refusal) is unrelated to the attestation gate.
+          AI_MEMORY_REQUIRE_AGENT_ATTESTATION: '0'
         run: |
           set -euo pipefail
           mkdir -p .local-runs/ci-form7
