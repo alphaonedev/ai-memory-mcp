@@ -381,6 +381,8 @@ mod tests {
     // Validation: missing memory_id.
     #[test]
     fn missing_memory_id_errors() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_replay(&conn, &json!({}), None, None).unwrap_err();
         assert!(err.contains("memory_id"), "got: {err}");
@@ -389,6 +391,8 @@ mod tests {
     // Validation: invalid memory_id.
     #[test]
     fn invalid_memory_id_rejected() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let err = handle_replay(&conn, &json!({"memory_id": "  "}), None, None).unwrap_err();
         assert!(!err.is_empty());
@@ -397,6 +401,8 @@ mod tests {
     // Validation: depth must be integer or null.
     #[test]
     fn depth_non_integer_rejected() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-ns", "obs");
         let err = handle_replay(
@@ -412,6 +418,8 @@ mod tests {
     // Validation: negative depth clamps to 0 (no error).
     #[test]
     fn negative_depth_clamped() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-clamp", "obs");
         let resp =
@@ -423,6 +431,8 @@ mod tests {
     // Happy path with no transcripts — count=0, array empty.
     #[test]
     fn no_transcripts_returns_empty() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-empty", "obs");
         let resp = handle_replay(&conn, &json!({"memory_id": mid}), None, None).expect("ok");
@@ -433,6 +443,8 @@ mod tests {
     // Happy path with a tiny transcript — content surfaced (below threshold).
     #[test]
     fn small_transcript_returns_content() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-small", "obs");
         let t =
@@ -450,6 +462,8 @@ mod tests {
     // unless `verbose=true`.
     #[test]
     fn large_transcript_truncated_unless_verbose() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-large", "obs");
         // 101 KB of content — above the 100 KB threshold.
@@ -468,6 +482,8 @@ mod tests {
     // the caller cannot distinguish existence vs visibility.
     #[test]
     fn cross_tenant_replay_returns_empty_under_zero_config_1075() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         // Insert a private memory owned by alice.
         let now = chrono::Utc::now().to_rfc3339();
@@ -540,6 +556,8 @@ mod tests {
     // transcripts visible to alice.
     #[test]
     fn spoofed_agent_id_param_does_not_widen_visibility_1571() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
@@ -615,6 +633,8 @@ mod tests {
     // verbose=true forces content even on large transcripts.
     #[test]
     fn verbose_flag_returns_content_for_large() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let mid = seed_observation(&conn, "rp-verbose", "obs");
         let big = "y".repeat(101 * 1024);
@@ -655,6 +675,8 @@ mod tests {
     /// transcripts wired" from "broken substrate."
     #[test]
     fn memory_replay_capabilities_matches_actual_behavior_1324() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID (see mcp::link tests).
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         use crate::config::ResolvedModels;
         use crate::mcp::handle_capabilities_with_conn;
 

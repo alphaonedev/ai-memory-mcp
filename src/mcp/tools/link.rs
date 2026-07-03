@@ -540,6 +540,12 @@ mod tests {
     // A. happy path — unsigned attest level when no keypair
     #[test]
     fn happy_path_creates_unsigned_link() {
+        // #1874 — this test DEPENDS on `AI_MEMORY_AGENT_ID` being unset
+        // (trust-all default skips the #1786 owner gate). Hold the crate-wide
+        // RAII unset-guard so a sibling owner-gate test's process-global
+        // `set_var("AI_MEMORY_AGENT_ID", ...)` can never leak into this
+        // test's `resolve_read_visibility_caller()` window.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
@@ -558,6 +564,8 @@ mod tests {
     // A. happy path — default relation (omitted) → "related_to"
     #[test]
     fn default_relation_when_omitted() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
@@ -637,6 +645,8 @@ mod tests {
     // operation is safe under retry without producing a duplicate row.
     #[test]
     fn duplicate_link_is_idempotent() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
@@ -668,6 +678,8 @@ mod tests {
     // F. audit — signed_events table is populated (best-effort via storage).
     #[test]
     fn signed_events_records_link() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
@@ -696,6 +708,8 @@ mod tests {
     // handle_get_links — happy
     #[test]
     fn handle_get_links_returns_links() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         db::create_link(&conn, &a, &b, "related_to").unwrap();
@@ -725,6 +739,8 @@ mod tests {
     // same empty shape an unknown id yields (no neighbor-id leak / existence oracle).
     #[test]
     fn handle_get_links_masks_other_agents_private_anchor() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         db::create_link(&conn, &a, &b, "related_to").unwrap();
@@ -804,6 +820,8 @@ mod tests {
 
     #[test]
     fn k9_ask_returns_ask_envelope() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         use crate::permissions::{PermissionRule, RuleDecision, set_active_permission_rules};
         let _g = rules_scope();
         let conn = fresh_conn();
@@ -883,6 +901,8 @@ mod tests {
     // edge then attempts B → A which closes the cycle.
     #[test]
     fn reflects_on_cycle_refused() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let a = make_reflection("ref-a", "cycle-ns");
         let b = make_reflection("ref-b", "cycle-ns");
@@ -917,6 +937,8 @@ mod tests {
     // memories the notified list is empty but the path is exercised.
     #[test]
     fn supersedes_between_reflections_walks_invalidation() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let winner = make_reflection("win", "sup-ns");
         let loser = make_reflection("lose", "sup-ns");
@@ -940,6 +962,8 @@ mod tests {
     // invalidation walker entirely (no Reflection on both sides).
     #[test]
     fn supersedes_between_observations_skips_invalidation() {
+        // #1874 — depends-on-unset AI_MEMORY_AGENT_ID; see the first guarded test.
+        let _agent_env = crate::identity::agent_id_env_unset_guard();
         let conn = fresh_conn();
         let (a, b) = insert_two(&conn);
         let db_path = db_path();
