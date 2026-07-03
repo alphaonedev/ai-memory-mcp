@@ -245,9 +245,18 @@ fn recall_hybrid_loop_does_not_call_get_embedding_per_row() {
 // PERF-6 — recall touch collapses to a SINGLE transaction
 // ---------------------------------------------------------------------------
 
+/// v0.9.0 P0-1 (#1869) — converted to the sync-flag expectation: the
+/// PERF-6 single-transaction contract now applies ONLY under the
+/// deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag (the pure
+/// default performs ZERO write transactions on recall, pinned by the
+/// trailing pure-default section below and by
+/// `tests/recall_purity_p01.rs`).
 #[test]
 fn recall_touch_uses_single_transaction_per_call() {
     let _g = TRACE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    // SAFETY: serialized via TRACE_GUARD (every recall-tracing test in
+    // this binary takes it); removed before the guard drops.
+    unsafe { std::env::set_var("AI_MEMORY_RECALL_TOUCH_SYNC", "1") };
     let (mut conn, _path) = open_db("perf6");
     let ns = "perf6/ns".to_string();
     // Seed 4 memories so K > 1.
@@ -262,23 +271,25 @@ fn recall_touch_uses_single_transaction_per_call() {
 
     install_trace(&mut conn);
 
-    let (results, _outcome) = db::recall(
-        &conn,
-        "needle haystack",
-        Some(&ns),
-        10,
-        None,
-        None,
-        None,
-        ai_memory::SECS_PER_HOUR,
-        ai_memory::SECS_PER_DAY,
-        None,
-        None,
-        false,
-        None,
-        None, // #1720 caller
-    )
-    .expect("recall ok");
+    let recall = |conn: &rusqlite::Connection| {
+        db::recall(
+            conn,
+            "needle haystack",
+            Some(&ns),
+            10,
+            None,
+            None,
+            None,
+            ai_memory::SECS_PER_HOUR,
+            ai_memory::SECS_PER_DAY,
+            None,
+            None,
+            false,
+            None,
+            None, // #1720 caller
+        )
+    };
+    let (results, _outcome) = recall(&conn).expect("recall ok");
     assert!(
         results.len() >= 2,
         "expected ≥2 recall hits to stress the touch fan-out, got {}",
@@ -290,20 +301,39 @@ fn recall_touch_uses_single_transaction_per_call() {
     conn.trace(None);
     let log = snapshot_trace();
 
-    let begin_count = count_matching(&log, |stmt| {
-        stmt.trim_start().starts_with("BEGIN IMMEDIATE")
-    });
-    let commit_count = count_matching(&log, |stmt| stmt.trim_start().starts_with("COMMIT"));
+    let count_tx = |log: &[String]| {
+        (
+            count_matching(log, |stmt| stmt.trim_start().starts_with("BEGIN IMMEDIATE")),
+            count_matching(log, |stmt| stmt.trim_start().starts_with("COMMIT")),
+        )
+    };
+    let (begin_count, commit_count) = count_tx(&log);
 
-    // Cluster-F PERF-6 — exactly one BEGIN / COMMIT pair for the
-    // entire touch fan-out, regardless of K.
+    // Cluster-F PERF-6 (sync mode) — exactly one BEGIN / COMMIT pair
+    // for the entire touch fan-out, regardless of K.
     assert_eq!(
         begin_count, 1,
-        "PERF-6 regression: expected exactly 1 BEGIN IMMEDIATE in the recall trace, got {begin_count}. Log: {log:#?}"
+        "PERF-6 regression: expected exactly 1 BEGIN IMMEDIATE in the sync-mode recall trace, got {begin_count}. Log: {log:#?}"
     );
     assert_eq!(
         commit_count, 1,
-        "PERF-6 regression: expected exactly 1 COMMIT in the recall trace, got {commit_count}. Log: {log:#?}"
+        "PERF-6 regression: expected exactly 1 COMMIT in the sync-mode recall trace, got {commit_count}. Log: {log:#?}"
+    );
+
+    // #1869 pure default — the same recall issues ZERO write
+    // transactions (the internal touch is flag-gated off).
+    // SAFETY: serialized via TRACE_GUARD.
+    unsafe { std::env::remove_var("AI_MEMORY_RECALL_TOUCH_SYNC") };
+    install_trace(&mut conn);
+    let _ = recall(&conn).expect("pure recall ok");
+    conn.trace(None);
+    let pure_log = snapshot_trace();
+    let (pure_begin, pure_commit) = count_tx(&pure_log);
+    assert_eq!(
+        (pure_begin, pure_commit),
+        (0, 0),
+        "#1869 purity regression: pure-default recall must issue zero write \
+         transactions. Log: {pure_log:#?}"
     );
 }
 

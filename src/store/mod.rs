@@ -1576,8 +1576,34 @@ pub trait MemoryStore: Send + Sync {
     ///
     /// Idempotent on a per-id basis; missing ids are silently skipped.
     /// Default returns `Ok(())` — adapters that wire touch ops override.
+    ///
+    /// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
+    /// ungated; the recall paths call it only under the deprecated
+    /// `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag. The pure-default
+    /// access signal flows through the `recall_observations` ledger
+    /// and [`Self::fold_recall_accesses`].
     async fn touch_after_recall(&self, _ids: &[String]) -> StoreResult<()> {
         Ok(())
+    }
+
+    /// v0.9.0 P0-1 (#1869) — FOLD maintenance verb: batch-apply the
+    /// legacy recall-touch ladders (access_count bump capped at 1M,
+    /// `last_accessed_at`, per-tier TTL floor-extend anchored on
+    /// `observed_at`, mid→long promotion at the promotion threshold,
+    /// priority decade ladder capped at 10, and — when
+    /// `AI_MEMORY_CONFIDENCE_DECAY=1` — the confidence-decay stamp)
+    /// from unfolded `recall_observations` ledger rows, marking them
+    /// folded once applied. Idempotent: a second fold over the same
+    /// ledger is a no-op.
+    ///
+    /// Returns the number of distinct memories folded.
+    ///
+    /// Default is a no-op returning `Ok(0)` — third-party adapters
+    /// that do not implement the fold freeze their access counts
+    /// (documented deferral; the ledger pruner's age-capped safety
+    /// valve keeps the table bounded either way).
+    async fn fold_recall_accesses(&self) -> StoreResult<usize> {
+        Ok(0)
     }
 
     // ==================================================================
@@ -4138,6 +4164,14 @@ mod tests {
         s.touch_after_recall(&["a".to_string(), "b".to_string()])
             .await
             .expect("touch default ok");
+    }
+
+    #[tokio::test]
+    async fn default_fold_recall_accesses_is_noop_zero() {
+        // #1869 P0-1 — third-party adapters inherit a no-op fold
+        // (documented deferral: their access counts freeze).
+        let s = MinimalStore;
+        assert_eq!(s.fold_recall_accesses().await.expect("fold default ok"), 0);
     }
 
     #[tokio::test]

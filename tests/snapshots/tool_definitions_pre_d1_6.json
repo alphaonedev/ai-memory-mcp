@@ -1884,7 +1884,7 @@
     },
     {
       "description": "List messages sent to an agent via memory_notify.",
-      "docs": "Read _messages/<agent_id>. access_count==0 is the unread marker.",
+      "docs": "Read _messages/<agent_id>. access_count==0 is the unread marker (eventually consistent under pure recall: the periodic recall-access fold, default 60s, read-marks recalled messages).",
       "inputSchema": {
         "properties": {
           "agent_id": {

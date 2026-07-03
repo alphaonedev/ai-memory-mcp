@@ -256,7 +256,16 @@ impl McpTool for InboxTool {
         "List messages sent to an agent via memory_notify."
     }
     fn docs() -> &'static str {
-        "Read _messages/<agent_id>. access_count==0 is the unread marker."
+        // v0.9.0 P0-1 (#1869) — recall is pure by default, so
+        // read-marking is EVENTUALLY consistent: recalling a message
+        // appends a ledger row and the periodic fold (default 60 s;
+        // gc-tick fallback) is what bumps access_count past 0. A
+        // just-recalled message can list as unread for up to one fold
+        // interval. Pinned by
+        // `tests/recall_purity_p01.rs::fold_flips_inbox_unread_marker`.
+        "Read _messages/<agent_id>. access_count==0 is the unread marker \
+         (eventually consistent under pure recall: the periodic \
+         recall-access fold, default 60s, read-marks recalled messages)."
     }
     fn input_schema() -> Value {
         crate::mcp::registry::input_schema_for::<InboxRequest>()

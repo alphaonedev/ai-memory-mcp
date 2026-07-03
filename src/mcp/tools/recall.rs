@@ -289,6 +289,14 @@ pub async fn handle_recall_with_pre_recall_hook(
 /// `"warm"` (the substrate sees activity recently enough to surface
 /// it via recall, so blocking it on a timestamp parse would be
 /// hostile). Pure function; no DB queries.
+///
+/// v0.9.0 P0-1 (#1869) — recall is pure by default, so
+/// `access_count` / `last_accessed_at` reflect the state as of the
+/// LAST FOLD, not the current request: `freshness_state` lags recall
+/// activity by up to the fold interval (default 60 s;
+/// `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0` degrades to the 30-min gc
+/// tick). At day-scale thresholds (30 d / 1 d) the lag is invisible in
+/// practice; documented for completeness.
 pub(crate) fn freshness_state(mem: &Memory) -> &'static str {
     let now = chrono::Utc::now();
     if let Some(exp) = mem.expires_at.as_deref()

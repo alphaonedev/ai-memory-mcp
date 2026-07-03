@@ -17,6 +17,22 @@ pub fn run_gc(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let conn = db::open(db_path)?;
+    // v0.9.0 P0-1 (#1869) — fold-before-gc: apply pending recall-access
+    // TTL extensions from the `recall_observations` ledger BEFORE
+    // eviction is evaluated. This is also the ONLY fold trigger in
+    // CLI-only (no-daemon) topologies, where counts otherwise stay
+    // frozen between manual `gc` runs (documented deferral).
+    let resolved_ttl = app_config.effective_ttl();
+    if let Err(e) = db::fold_recall_accesses(
+        &conn,
+        resolved_ttl.short_extend_secs,
+        resolved_ttl.mid_extend_secs,
+    ) {
+        writeln!(
+            out.stderr,
+            "ai-memory: recall-access fold failed (pre-gc): {e}"
+        )?;
+    }
     let count = db::gc(&conn, app_config.effective_archive_on_gc())?;
     if json_out {
         writeln!(

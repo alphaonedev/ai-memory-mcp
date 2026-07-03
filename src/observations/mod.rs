@@ -70,10 +70,11 @@ pub fn record_recall(
     if candidates.is_empty() {
         return Ok(0);
     }
+    let folded = folded_stamp_for_insert();
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO recall_observations \
-                (recall_id, memory_id, retriever, rank, score) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+                (recall_id, memory_id, retriever, rank, score, folded) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     let mut written = 0_usize;
     for c in candidates {
@@ -82,11 +83,27 @@ pub fn record_recall(
             c.memory_id,
             c.retriever,
             c.rank,
-            c.score
+            c.score,
+            folded
         ])?;
         written += n;
     }
     Ok(written)
+}
+
+/// v0.9.0 P0-1 (#1869) — `folded` stamp for recall-path ledger inserts.
+///
+/// Pure default (`AI_MEMORY_RECALL_TOUCH_SYNC` unset): rows land
+/// `folded = 0` and the periodic FOLD job
+/// ([`crate::storage::fold_recall_accesses`]) later applies the access
+/// ladders exactly once. Legacy sync mode (`=1`): the recall path
+/// already touched the rows synchronously, so the ledger rows are
+/// written PRE-MARKED `folded = 1` — the always-running fold must
+/// never re-apply a sync-touched access (the #1869 vote's unanimous
+/// double-count condition). Every recall-path ledger writer (HTTP both
+/// backends, MCP, CLI, shell, SAL) routes through this stamp.
+fn folded_stamp_for_insert() -> i64 {
+    i64::from(crate::config::recall_touch_sync_enabled())
 }
 
 /// Flip the `consumed` flag (and capture `consumed_at` +
@@ -151,10 +168,11 @@ pub fn record_recall_with_identity(
     if candidates.is_empty() {
         return Ok(0);
     }
+    let folded = folded_stamp_for_insert();
     let mut stmt = conn.prepare_cached(
         "INSERT OR IGNORE INTO recall_observations \
-                (recall_id, memory_id, retriever, rank, score, agent_id, namespace) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (recall_id, memory_id, retriever, rank, score, agent_id, namespace, folded) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     let mut written = 0_usize;
     for c in candidates {
@@ -165,7 +183,8 @@ pub fn record_recall_with_identity(
             c.rank,
             c.score,
             agent_id,
-            namespace
+            namespace,
+            folded
         ])?;
     }
     Ok(written)

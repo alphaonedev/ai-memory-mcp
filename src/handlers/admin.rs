@@ -575,6 +575,14 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     // envelope so wire shape is backend-blind.
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {
+        // v0.9.0 P0-1 (#1869) — fold-before-gc: this admin endpoint is
+        // the ONLY postgres eviction path, so the recall-access fold
+        // MUST run first or an unfolded TTL extension could be evicted
+        // out from under a hot memory. Best-effort: a fold failure is
+        // WARNed, never blocks the sweep.
+        if let Err(e) = app.store.fold_recall_accesses().await {
+            tracing::warn!("run_gc (postgres): recall-access fold failed (pre-gc): {e}");
+        }
         let archive_flag = {
             let lock = app.db.lock().await;
             lock.3
@@ -589,6 +597,13 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 
     let lock = app.db.lock().await;
+    // v0.9.0 P0-1 (#1869) — fold-before-gc (sqlite branch): apply
+    // pending recall-access TTL extensions before evaluating eviction.
+    if let Err(e) =
+        db::fold_recall_accesses(&lock.0, lock.2.short_extend_secs, lock.2.mid_extend_secs)
+    {
+        tracing::warn!("run_gc (sqlite): recall-access fold failed (pre-gc): {e}");
+    }
     match db::gc(&lock.0, lock.3) {
         Ok(n) => Json(json!({(field_names::EXPIRED_DELETED): n})).into_response(),
         Err(e) => crate::handlers::errors::handler_error_500(&e),

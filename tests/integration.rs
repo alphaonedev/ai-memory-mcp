@@ -925,7 +925,8 @@ fn test_auto_promotion() {
     let stored: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let id = stored["id"].as_str().unwrap().to_string();
 
-    // Recall 6 times (promotion threshold is 5)
+    // Recall 6 times (promotion threshold is 5). v0.9.0 P0-1 (#1869):
+    // recall is PURE by default — the recalls append ledger rows only.
     for _ in 0..6 {
         let output = cmd(binary)
             .args([
@@ -942,6 +943,15 @@ fn test_auto_promotion() {
         assert!(output.status.success());
     }
 
+    // #1869 — the FOLD applies the promotion ladder from the ledgered
+    // recalls; `ai-memory gc` folds first (the CLI-topology fold
+    // trigger), so promotion lands here, not at recall time.
+    let output = cmd(binary)
+        .args(["--db", db_path.to_str().unwrap(), "--json", "gc"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
     // Verify it became long-term
     let output = cmd(binary)
         .args(["--db", db_path.to_str().unwrap(), "--json", "get", &id])
@@ -951,7 +961,7 @@ fn test_auto_promotion() {
     let got: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(
         got["memory"]["tier"], "long",
-        "memory should have been auto-promoted to long"
+        "memory should have been auto-promoted to long by the recall-access fold"
     );
     assert!(
         got["memory"]["expires_at"].is_null(),

@@ -49,6 +49,21 @@ are advisory targets.
 > are loaded. Both surfaces are kept in agreement; this file is the
 > canonical aggregate contract that the `bench.yml` CI guard reads.
 
+> **v0.9.0 P0-1 (#1869) — pure recall (informational, budgets
+> unchanged):** recall no longer performs its synchronous write-back
+> (the `BEGIN IMMEDIATE` + 3 UPDATEs per returned row touch) on any
+> path — the access ladders are applied by the periodic fold job off
+> the hot path, and the only recall-time write left is the append-only
+> `recall_observations` ledger insert (which predates #1869). This is
+> a strict hot-path win (the recall p95 loses a writer-lock
+> acquisition + 3K UPDATE round-trips per call); the budgets above are
+> deliberately NOT tightened in the same change (10% gate tolerance,
+> noisy runners) — new baselines are recorded informationally at the
+> next scheduled bench refresh. The fold itself is bounded (≤1000
+> memories per transaction, zero-work early return when no unfolded
+> rows exist) so it cannot concentrate an unbounded write burst on the
+> sqlite writer mutex or postgres row locks.
+
 ## Boot Time-to-Ready — Async HNSW Warm-up (#1579 B3)
 
 Since #1579 (v0.7.0 performance final gate), the daemon (`serve`) and

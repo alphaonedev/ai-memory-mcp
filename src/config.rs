@@ -4451,6 +4451,97 @@ pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
 /// resolver per the no-hardcoded-literals discipline (#1598).
 pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
 
+/// v0.9.0 P0-1 (#1869) — legacy opt-back-in for the synchronous
+/// recall-time touch. Default OFF: recall is PURE (zero writes to
+/// `memories` or any other table except the append-only
+/// `recall_observations` audit ledger); the access ladders
+/// (access_count bump, `last_accessed_at`, per-tier TTL floor-extend,
+/// mid→long promotion, priority decade ladder) are applied by the
+/// periodic FOLD maintenance job from unfolded ledger rows. `"1"`
+/// restores the pre-v0.9 strict-legacy synchronous touch on every
+/// recall path — deprecated at birth, removal targeted v1.0. When the
+/// flag is ON, every recall-path ledger insert is written pre-marked
+/// `folded = 1` so the always-running fold never double-applies a
+/// sync-touched access (the #1869 vote's unanimous condition).
+pub const ENV_RECALL_TOUCH_SYNC: &str = "AI_MEMORY_RECALL_TOUCH_SYNC";
+/// v0.9.0 P0-1 (#1869) — cadence (whole seconds) of the dedicated
+/// recall-access FOLD loop. Default `60`. `0` disables the dedicated
+/// loop — the fold then rides the gc tick only (every
+/// `GC_INTERVAL_SECS` = 30 min), so access-count freshness degrades
+/// to that cadence. Invalid / unparseable values fall back to the
+/// default.
+pub const ENV_ACCESS_FOLD_INTERVAL_SECS: &str = "AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS";
+
+/// Compiled-default fold-loop cadence in seconds (see
+/// [`ENV_ACCESS_FOLD_INTERVAL_SECS`]).
+pub const DEFAULT_ACCESS_FOLD_INTERVAL_SECS: u64 = 60;
+
+/// Returns `true` when [`ENV_RECALL_TOUCH_SYNC`] is set to `"1"` —
+/// the legacy synchronous recall-touch posture. Pattern mirrors
+/// [`crate::confidence::decay::decay_enabled`]. Callers on the recall
+/// path MUST evaluate this ONCE per recall (never per row) and only
+/// on write paths.
+#[must_use]
+pub fn recall_touch_sync_enabled() -> bool {
+    std::env::var(ENV_RECALL_TOUCH_SYNC).is_ok_and(|v| v == "1")
+}
+
+/// Resolve the fold-loop cadence from [`ENV_ACCESS_FOLD_INTERVAL_SECS`].
+/// `0` is a VALID value meaning "no dedicated loop; fold rides the gc
+/// tick". Unset / unparseable values fall back to
+/// [`DEFAULT_ACCESS_FOLD_INTERVAL_SECS`].
+#[must_use]
+pub fn access_fold_interval_secs() -> u64 {
+    std::env::var(ENV_ACCESS_FOLD_INTERVAL_SECS)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ACCESS_FOLD_INTERVAL_SECS)
+}
+
+#[cfg(test)]
+mod recall_purity_flag_tests {
+    //! #1869 P0-1 T1 — parsing/default pins for the two recall-purity
+    //! flags. Env mutation is process-global, so each flag gets ONE
+    //! test covering unset → set → reset (the `decay_env_gating`
+    //! precedent in `src/confidence/decay.rs`).
+    use super::*;
+
+    #[test]
+    fn recall_touch_sync_default_off_and_opt_in() {
+        // SAFETY: single test owns this var; no concurrent reader in
+        // this binary mutates it.
+        unsafe { std::env::remove_var(ENV_RECALL_TOUCH_SYNC) };
+        assert!(!recall_touch_sync_enabled(), "default is pure (OFF)");
+        unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "1") };
+        assert!(recall_touch_sync_enabled());
+        // Only the exact "1" spelling opts in — a typo stays pure.
+        unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "true") };
+        assert!(!recall_touch_sync_enabled());
+        unsafe { std::env::remove_var(ENV_RECALL_TOUCH_SYNC) };
+    }
+
+    #[test]
+    fn access_fold_interval_default_zero_and_garbage() {
+        // SAFETY: single test owns this var (see above).
+        unsafe { std::env::remove_var(ENV_ACCESS_FOLD_INTERVAL_SECS) };
+        assert_eq!(
+            access_fold_interval_secs(),
+            DEFAULT_ACCESS_FOLD_INTERVAL_SECS
+        );
+        unsafe { std::env::set_var(ENV_ACCESS_FOLD_INTERVAL_SECS, "0") };
+        assert_eq!(access_fold_interval_secs(), 0, "0 = gc-tick-only");
+        unsafe { std::env::set_var(ENV_ACCESS_FOLD_INTERVAL_SECS, "5") };
+        assert_eq!(access_fold_interval_secs(), 5);
+        unsafe { std::env::set_var(ENV_ACCESS_FOLD_INTERVAL_SECS, "-3") };
+        assert_eq!(
+            access_fold_interval_secs(),
+            DEFAULT_ACCESS_FOLD_INTERVAL_SECS,
+            "garbage falls back to the default"
+        );
+        unsafe { std::env::remove_var(ENV_ACCESS_FOLD_INTERVAL_SECS) };
+    }
+}
+
 /// Compiled-default embedding model id (the v0.7.0 autonomous-tier
 /// nomic default), shared by the resolver and its precedence tests.
 pub(crate) const DEFAULT_EMBED_MODEL: &str = "nomic-embed-text-v1.5";

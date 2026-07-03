@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### Behavior change — recall is PURE by default (P0-1, [#1869](https://github.com/alphaonedev/ai-memory-mcp/issues/1869); 2×5-wave vote `38d5af91-835d-4053-86eb-60d7cf1391e2`)
+
+- **Pure recall (scoped claim):** recall mutates **zero rows in
+  `memories` (and every other table) except the sanctioned append-only
+  `recall_observations` audit ledger, which is neither silent nor
+  memory state** — on EVERY entry path (HTTP GET/POST on both backends,
+  MCP `memory_recall`, CLI `recall`, the shell REPL, and the SAL
+  `recall_hybrid` surface). Pre-#1869 every recall path synchronously
+  rewrote the returned rows (access_count bump, `last_accessed_at`,
+  per-tier TTL floor-extend, mid→long promotion, priority decade
+  ladder — including the hidden HTTP phase-2 writer at
+  `src/handlers/recall.rs` and the postgres `touch_after_recall`),
+  which the v0.9.0 epic kill-test (exit criterion 8) classified as
+  silent mutation of memory state.
+- **The access signal is decoupled, not deleted:** every recall appends
+  to the `recall_observations` ledger (the CLI/shell/SAL-sqlite paths,
+  which never wrote it, now do — closing their signal gap), and a
+  periodic **FOLD** maintenance job (`db::fold_recall_accesses` /
+  `MemoryStore::fold_recall_accesses`) batch-applies the exact legacy
+  touch ladders from unfolded rows in bounded, chunked transactions
+  (≤1000 memories per tx, zero-work early return; snapshot-consistent
+  single-statement CTE on postgres). The fold deliberately touches the
+  RETURNED (post-filter) set, fixing the pre-filter-set inconsistency
+  vs #757. Scheduling: dedicated loop (default 60 s,
+  `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`, env row #119; `0` =
+  gc-tick-only) **plus** fold-before-gc on every eviction path (sqlite
+  gc loop, admin HTTP `run_gc` both backends, CLI `gc`) so a recalled
+  row is extended before eviction is evaluated. Bounded staleness
+  (≤ fold interval) applies to access-count consumers (ranking frecency
+  term, tier promotion, TTL slide, autonomy priority feedback, curator
+  reflection clustering, opt-in confidence decay — which moves onto the
+  fold on BOTH backends, preserving the #1572 postgres decay parity —
+  doctor validation, the `memory_inbox` `access_count==0` unread
+  marker, and the recall response's `freshness_state`; the
+  `skill_compositional_context` recall_score and the `crdt_merge`
+  access_count max-merge are fold-safe/monotonic), and holds only
+  while a daemon runs: CLI-only topologies freeze counts between manual
+  `ai-memory gc` runs.
+- **Legacy opt-back-in:** `AI_MEMORY_RECALL_TOUCH_SYNC=1` (env row
+  #118) restores the strict-legacy synchronous touch; recall-path
+  ledger rows are then written pre-marked `folded = 1` so the
+  always-running fold never double-applies a sync-touched access.
+  **Deprecated at birth — removal targeted v1.0.** Mixed-version
+  caveat: a pre-v77 binary sharing a v77 postgres DB sync-touches AND
+  inserts unfolded rows a v77 daemon then folds (bounded double-count,
+  capped by the 7d ledger TTL + the 1M/priority ceilings) — upgrade all
+  daemons together.
+- **Schema v77** (76→77, both backends in lockstep):
+  `recall_observations.folded` + partial unfolded index
+  (`migrations/sqlite/0061_v77_recall_observations_folded.sql`,
+  `migrations/postgres/0036_v77_recall_observations_folded.sql`,
+  greenfield mirror in `src/store/postgres_schema.sql`); the migration
+  BACKFILLS `folded = 1` on pre-existing rows (already sync-touched —
+  folding them would double-count), probe-guarded on both backends.
+  The ledger is now **load-bearing for retention**: both pruners delete
+  `folded = 1` rows only, with an age-capped safety valve (unfolded
+  rows older than the ledger TTL are pruned with a WARN) so a dead fold
+  loop or a third-party no-op SAL fold cannot grow the table forever —
+  do not truncate the table by hand.
+- Tested (all CI-run): `tests/recall_purity_p01.rs` — dump-compare
+  purity across `db::recall` / `db::recall_hybrid` / MCP / HTTP (real
+  axum router) / CLI / shell / SAL-sqlite, N=25 iterations with
+  result-set stability + exact ledger growth, the decay variant, the
+  sync-mode no-double-count companion, fold idempotency + twin-DB
+  equivalence vs `touch_many` + promotion/priority/cap edges +
+  chunk-boundary + inbox unread flip + fold-before-gc retention + the
+  v77 backfill + the `INTERVAL=0` gc-tick fold pin;
+  `tests/recall_purity_p01_postgres.rs` (postgres-parity-nightly
+  allowlist) — SAL + HTTP purity dump-compare, cross-backend fold
+  parity (promotion + decade crossing in one window, decay-enabled
+  with timestamp normalization), postgres fold-before-gc retention;
+  `tests/recall_purity_caller_guard_p01.rs` — touch-verb caller-census
+  regression guard; `src/background/access_fold.rs` + `src/config.rs`
+  unit suites. Bench note: the pure default REMOVES the `BEGIN
+  IMMEDIATE` + 3K-UPDATE write burst from the recall hot path (a strict
+  win); PERFORMANCE.md p95 budgets are intentionally NOT tightened in
+  this change.
+
 ### Breaking / secure-default changes — store-path agent attestation now REQUIRED by default ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751); deprecation cycle from [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464))
 
 - **`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` compiled default flipped

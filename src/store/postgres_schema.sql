@@ -978,6 +978,14 @@ CREATE TABLE IF NOT EXISTS recall_observations (
     -- migrate_v58. Existing schemas pick these up via migrate_v58().
     agent_id               TEXT        NULL,
     namespace              TEXT        NULL,
+    -- v0.9.0 P0-1 (#1869, schema v77) — fold-state marker. FALSE =
+    -- access not yet applied to `memories` (recall is pure by default;
+    -- the periodic fold job applies the touch ladders and flips this
+    -- TRUE). Rows written under the deprecated
+    -- AI_MEMORY_RECALL_TOUCH_SYNC=1 legacy flag are inserted TRUE
+    -- (already sync-touched — never double-count). Existing schemas
+    -- pick this up via migrate_v77().
+    folded                 BOOLEAN     NOT NULL DEFAULT FALSE,
     PRIMARY KEY (recall_id, memory_id)
 );
 
@@ -991,6 +999,14 @@ CREATE INDEX IF NOT EXISTS idx_recall_observations_agent_id
     ON recall_observations(agent_id);
 CREATE INDEX IF NOT EXISTS idx_recall_observations_namespace
     ON recall_observations(namespace);
+-- v77 (#1869) — the partial unfolded index
+-- (`idx_recall_observations_unfolded ON recall_observations(memory_id)
+-- WHERE NOT folded`) is LADDER-OWNED (migrate_v77 / the 0036 file),
+-- NOT bootstrap-inline: this schema replays against LEGACY databases
+-- BEFORE the ladder adds the `folded` column, and an inline index on
+-- the missing column crashes every legacy open (the #1861 sqlite
+-- precedent, postgres flavor). Fresh installs still land it because
+-- the migration ladder runs (idempotently) after bootstrap.
 
 -- ─────────────────────────────────────────────────────────────────────
 -- F6 Gap 1 (v0.7.0) — SAL knowledge-graph SQL views.
