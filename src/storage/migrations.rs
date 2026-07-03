@@ -178,9 +178,15 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
--- #1825 (v74) — content-id lookup index. Also added by migration v74
--- (file 0058) for upgrading DBs; inline here so a fresh bootstrap has it.
-CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories(cid);
+-- #1861 (v0.9.0 pre-GA) — the v74 `idx_memories_cid` content-id lookup
+-- index is DELIBERATELY NOT created inline here: `open()` replays this
+-- bootstrap SCHEMA against LEGACY databases too (BEFORE the migration
+-- ladder), where a pre-v74 `memories` table exists WITHOUT the `cid`
+-- column — an inline index on the missing column would crash every
+-- legacy open (the exact hazard class the v75
+-- `idx_memory_links_target_cid` landing proved empirically; see the
+-- memory_links comment below). The v74 ladder arm owns the index on
+-- both the fresh-install and the upgrade path.
 CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace);
 CREATE INDEX IF NOT EXISTS idx_memories_priority ON memories(priority DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
@@ -1320,7 +1326,12 @@ const MIGRATION_V73_SQLITE: &str =
 // and adds one column per ALTER, so the v74 ladder arm runs this only
 // behind a column-existence probe (fresh installs inherit the columns
 // inline from the CREATE TABLE in `SCHEMA`). The `cid` backfill for
-// legacy rows runs after the ALTER in the same arm.
+// legacy rows runs after the ALTER in the same arm. #1861 — the index is
+// LADDER-OWNED on both paths (this file for upgrades; an explicit
+// `CREATE INDEX IF NOT EXISTS` in the arm's fresh-install branch): an
+// inline bootstrap-SCHEMA index on `memories(cid)` crashes every legacy
+// pre-v74 open, exactly as the v75 landing proved for
+// `idx_memory_links_target_cid`.
 const MIGRATION_V74_SQLITE: &str =
     include_str!("../../migrations/sqlite/0058_v74_memories_cid.sql");
 // v75 (#1859, v0.9.0 G13-mem) — additive lineage-DAG content-id mirror:
@@ -3182,6 +3193,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             let has_cid = conn.prepare("SELECT cid FROM memories LIMIT 0").is_ok();
             if !has_cid {
                 conn.execute_batch(MIGRATION_V74_SQLITE)?;
+            } else {
+                // #1861 — fresh install: the columns came inline from the
+                // bootstrap SCHEMA, which (post-#1861) deliberately does
+                // NOT carry the index (an inline index would crash a
+                // LEGACY open — the bootstrap replays before this ladder,
+                // when the `cid` column is still absent; the v75 arm
+                // below established the pattern). Create it here;
+                // idempotent by name.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories(cid)",
+                    [],
+                )?;
             }
             backfill_memory_cids(conn)?;
         }

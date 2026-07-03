@@ -8,6 +8,13 @@
 //! never-edited genesis rows (`version <= 1`, no in-place-edit snapshot);
 //! and an undecryptable row is SKIPPED (left NULL) without aborting the
 //! sweep.
+//!
+//! #1861 pins: `idx_memories_cid` is LADDER-owned, not bootstrap-inline —
+//! a legacy pre-v74 database (no `cid` column) must survive `db::open`
+//! (the bootstrap SCHEMA replays against legacy DBs BEFORE the ladder, so
+//! an inline index on the missing column crashed every legacy open), a
+//! fresh install must still land the index via the arm's fresh-install
+//! branch, and an already-migrated reopen keeps it.
 
 use ai_memory::db;
 use ai_memory::identity::cid;
@@ -77,6 +84,93 @@ fn v74_columns_and_version_both_backends() {
             .prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")
             .is_ok()
     );
+}
+
+/// `1` when `idx_memories_cid` exists in `sqlite_master`, else `0`.
+fn cid_index_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'index' AND name = 'idx_memories_cid'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// #1861 — a FRESH install (cid columns inline from the bootstrap SCHEMA,
+/// which post-#1861 deliberately does NOT carry the index) must still land
+/// `idx_memories_cid` via the v74 arm's fresh-install branch, and keep it
+/// across an idempotent reopen.
+#[test]
+fn fresh_install_lands_idx_memories_cid_via_ladder() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("ai-memory.db");
+
+    let conn = db::open(&path).unwrap();
+    assert_eq!(
+        cid_index_count(&conn),
+        1,
+        "fresh install must carry idx_memories_cid (ladder-owned post-#1861)"
+    );
+    drop(conn);
+
+    // Already-migrated reopen: ladder early-returns; the index survives.
+    let conn2 = db::open(&path).unwrap();
+    assert_eq!(
+        cid_index_count(&conn2),
+        1,
+        "already-migrated reopen keeps idx_memories_cid"
+    );
+}
+
+/// #1861 — the legacy-open hazard itself: a pre-v74 database (no `cid` /
+/// `cid_genesis` columns, no `idx_memories_cid`, `schema_version` 73) must
+/// OPEN cleanly — the bootstrap SCHEMA replays against it BEFORE the
+/// ladder, so a bootstrap-inline `CREATE INDEX ... ON memories(cid)`
+/// crashed here with `no such column: cid`. Post-open, the v74 arm must
+/// land the columns + index and reach the current tip.
+#[test]
+fn legacy_pre_v74_open_survives_and_lands_index() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("ai-memory.db");
+
+    // Build a current DB, then rewind it to the pre-v74 legacy shape:
+    // drop the ladder-owned index, drop the v74 columns, stamp v73.
+    drop(db::open(&path).unwrap());
+    let raw = Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "DROP INDEX IF EXISTS idx_memories_cid;\n\
+         ALTER TABLE memories DROP COLUMN cid_genesis;\n\
+         ALTER TABLE memories DROP COLUMN cid;\n\
+         DELETE FROM schema_version;\n\
+         INSERT INTO schema_version (version) VALUES (73);",
+    )
+    .unwrap();
+    drop(raw);
+
+    // The legacy open MUST NOT crash (the #1861 hazard), and the ladder
+    // must land the v74 columns + index and reach the current tip.
+    let conn = db::open(&path).unwrap();
+    assert_eq!(
+        schema_version(&conn),
+        db::migrations::current_schema_version_for_tests(),
+        "legacy open re-runs the ladder to the tip"
+    );
+    assert!(
+        conn.prepare("SELECT cid, cid_genesis FROM memories LIMIT 0")
+            .is_ok(),
+        "v74 arm restores the cid columns on the legacy-upgrade path"
+    );
+    assert_eq!(
+        cid_index_count(&conn),
+        1,
+        "v74 arm restores idx_memories_cid on the legacy-upgrade path"
+    );
+    drop(conn);
+
+    // Idempotent reopen of the freshly-upgraded DB.
+    let conn2 = db::open(&path).unwrap();
+    assert_eq!(cid_index_count(&conn2), 1);
 }
 
 #[test]
