@@ -96,11 +96,23 @@ fn uniq_ns() -> String {
 // Router builders
 // ---------------------------------------------------------------------------
 
+/// #1751 — pin this test binary to the explicit permissive agent-attestation
+/// opt-out; the v0.9 store-path default is REQUIRED and would reject this
+/// suite's unsigned store/seed fixtures. One stable `Once` value for the
+/// process lifetime — no set/restore window, so no cross-test race (the
+/// #1609 class this binary's attestation NOTE documents). The required
+/// default itself is pinned in `tests/agent_attestation_integrity.rs`.
+fn permissive_attestation_for_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: `Once`-gated process-global env write, one stable value.
+    ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
+}
 /// Build the production router over a fresh on-disk SQLite DB (the
 /// default `StorageBackend::Sqlite`). The `app.store` SqliteStore opens
 /// against the SAME path so seed → read works through both the legacy
 /// `db` path and the SAL trait. Mirrors `tests/cov3_handlers_sqlite.rs`.
 fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+    permissive_attestation_for_tests();
     let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
@@ -157,6 +169,7 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
 /// (`llm_arc.is_none()` after passing the Smart-tier `llm_model` gate).
 /// Mirrors the `pg_router` harness in `tests/cov_ga2_pg_handlers_2.rs`.
 async fn pg_router_smart(url: &str) -> axum::Router {
+    permissive_attestation_for_tests();
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
     let db: Db = Arc::new(Mutex::new((
         conn,
@@ -712,6 +725,7 @@ mod store_handle {
     use serde_json::json;
 
     fn store_conn() -> rusqlite::Connection {
+        super::permissive_attestation_for_tests();
         ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite")
     }
 
