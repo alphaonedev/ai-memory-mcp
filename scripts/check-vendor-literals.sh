@@ -85,6 +85,11 @@ ALLOWED_FILES=(
     "src/cli/commands/recover_previous_session.rs"
     "src/secret_screen.rs"
     "tools/t0-orchestrate/src/main.rs"
+    # v0.9.0 §25.3 S1 (#1870) — the conservative model-FAMILY normalizer
+    # table (`family_of`): the vendor-family stems (claude/anthropic/grok/
+    # deepseek/mistral/gemini/…) ARE the routing key of the normalization,
+    # exactly the `src/mine.rs::Format::Claude` vendor-keyed-enum precedent.
+    "src/identity/model_family.rs"
 )
 
 # Vendor identifiers to gate. Keep this list narrow — over-broad gates
