@@ -78,6 +78,7 @@ pub mod deferred_audit;
 // installers); never a global singleton. The per-instance design
 // closes the cross-connection poisoning hole that reverted #983 via
 // #990. See `rule_cache.rs` module docs for the full rationale.
+pub mod policy_version;
 pub mod rule_cache;
 pub mod rules_store;
 

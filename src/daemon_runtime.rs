@@ -64,6 +64,7 @@ use crate::cli::install::InstallArgs;
 use crate::cli::io::{ImportArgs, MineArgs};
 use crate::cli::link::{LinkArgs, ResolveArgs};
 use crate::cli::logs::LogsArgs;
+use crate::cli::model_attest::ModelAttestArgs;
 use crate::cli::promote::PromoteArgs;
 use crate::cli::recall::RecallArgs;
 use crate::cli::rules::RulesArgs;
@@ -296,6 +297,10 @@ pub enum Command {
     /// refuse with `governance.no_operator_key`. Read verbs (list /
     /// check) are unprivileged.
     Rules(RulesArgs),
+    /// v0.9.0 §25.3 S1 (D3-012, #1870) — inspect / enroll model-family
+    /// attestations (`model_attestations` substrate). `enroll` requires
+    /// the operator key; `list` is unprivileged.
+    ModelAttest(ModelAttestArgs),
     /// List / approve / reject governance-pending actions (Task 1.9)
     Pending(PendingArgs),
     /// v0.6.0.0: snapshot the `SQLite` database to a timestamped backup
@@ -1422,6 +1427,16 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::rules::run(&db_path, a, j, &mut out)
+        }
+        Command::ModelAttest(a) => {
+            // v0.9.0 §25.3 S1 (#1870) — model-attestation substrate CLI.
+            // `enroll` requires the operator key; `list` is unprivileged.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::model_attest::run(&db_path, a, j, &mut out)
         }
         Command::Pending(a) => {
             let stdout = std::io::stdout();

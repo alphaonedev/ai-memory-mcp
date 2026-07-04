@@ -640,6 +640,17 @@ impl OllamaClient {
         &self.model
     }
 
+    /// v0.9.0 §25.3 S1 (D3-012, #1870) — the resolved backend/provider
+    /// wire-shape selector, for model-family attestation
+    /// (`model_attestations.provider`).
+    #[must_use]
+    pub fn provider_label(&self) -> &'static str {
+        match &self.provider {
+            LlmProvider::Ollama => "ollama",
+            LlmProvider::OpenAiCompatible { .. } => "openai-compatible",
+        }
+    }
+
     /// Creates a new `OllamaClient` with the default Ollama URL (<http://localhost:11434>).
     /// Checks that Ollama is reachable before returning.
     #[allow(dead_code)]

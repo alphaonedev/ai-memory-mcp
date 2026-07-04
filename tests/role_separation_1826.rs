@@ -263,6 +263,8 @@ fn judge_verdict_checkpoint_pins() {
         "allow",
         "",
         "",
+        0,
+        "",
         now,
         &judge,
     )
@@ -284,6 +286,8 @@ fn judge_verdict_checkpoint_pins() {
         "abcd",
         "allow",
         "",
+        "",
+        0,
         "",
         now + 5,
         &attacker,
@@ -316,6 +320,8 @@ fn stopper_enforcement_checkpoint_pins() {
         "deny",
         "R001",
         "blocked",
+        0,
+        "",
         now,
         &stopper,
     )
@@ -337,6 +343,8 @@ fn stopper_enforcement_checkpoint_pins() {
         "deny",
         "R001",
         "blocked",
+        0,
+        "",
         now + 5,
         &attacker,
     )
@@ -392,6 +400,8 @@ fn cross_role_forgery_is_rejected() {
             "refuse",
             "R",
             "x",
+            0,
+            "",
             chrono::Utc::now().timestamp(),
             &stopper,
         )
@@ -419,6 +429,8 @@ fn cross_role_forgery_is_rejected() {
             "deny",
             "R",
             "x",
+            0,
+            "",
             chrono::Utc::now().timestamp(),
             &recorder,
         )
@@ -524,6 +536,8 @@ fn recorder_key_alone_allow_for_refused_scope() {
         &action_hash,
         "allow",
         "",
+        "",
+        0,
         "",
         chrono::Utc::now().timestamp(),
         &judge,

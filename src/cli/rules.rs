@@ -317,7 +317,10 @@ pub fn run(
             let sig = signing_key.sign(&canonical);
             rule.signature = Some(sig.to_bytes().to_vec());
             rule.attest_level = OPERATOR_SIGNED_LEVEL.to_string();
-            rules_store::insert(&conn, &rule)?;
+            // v0.9.0 §25.3 S4 (F-41, #1853) — insert + advance the policy
+            // version atomically, so a signed rule ADD bumps the monotonic
+            // policy surface in the same transaction as the insert.
+            rules_store::insert_signed(&conn, &rule, &signing_key, OPERATOR_KEY_ID)?;
             emit_ok(json, out, "rules.add", &rule_to_json(&rule))?;
             Ok(())
         }
@@ -343,19 +346,18 @@ pub fn run(
                 bail!("governance.no_operator_key: `rules enable` requires --sign");
             }
             let signing_key = load_operator_signing_key_from_dir(&key_dir)?;
-            let Some(mut rule) = rules_store::get(&conn, &id)? else {
+            // v0.9.0 §25.3 S3 (F-40, #1853) — route through the audited,
+            // atomic signed path. `set_enabled_signed` flips `enabled`,
+            // re-signs the canonical (post-state) bytes, appends the
+            // operator-signed `governance.rule_enabled` audit row, and
+            // advances the policy version — all in ONE transaction,
+            // closing the two-statement atomicity gap the old
+            // set_enabled + update_signature pair had.
+            let updated_flag =
+                rules_store::set_enabled_signed(&conn, &id, true, &signing_key, OPERATOR_KEY_ID)?;
+            if !updated_flag {
                 bail!("rules.enable: no rule with id={id}");
-            };
-            rule.enabled = true;
-            // Issue #800 critical fix: signer must use the same
-            // canonical encoding as `verify_rule_signature`
-            // (otherwise the L1-6 enforcement gate skips every rule
-            // and Form 7 returns `allow` for every action). See the
-            // matching comment in the `Add` arm.
-            let canonical = rules_store::canonical_bytes_for_signing(&rule)?;
-            let sig = signing_key.sign(&canonical);
-            rules_store::set_enabled(&conn, &id, true)?;
-            rules_store::update_signature(&conn, &id, &sig.to_bytes(), OPERATOR_SIGNED_LEVEL)?;
+            }
             let updated =
                 rules_store::get(&conn, &id)?.context("rules.enable: row vanished after update")?;
             emit_ok(json, out, "rules.enable", &rule_to_json(&updated))?;
@@ -366,16 +368,15 @@ pub fn run(
                 bail!("governance.no_operator_key: `rules disable` requires --sign");
             }
             let signing_key = load_operator_signing_key_from_dir(&key_dir)?;
-            let Some(mut rule) = rules_store::get(&conn, &id)? else {
+            // v0.9.0 §25.3 S3 (F-40, #1853) — audited, atomic disable:
+            // a disable is a silent neuter of an enforcement rule, so it
+            // MUST leave an operator-signed `governance.rule_disabled`
+            // residue on the chain. See the Enable arm.
+            let updated_flag =
+                rules_store::set_enabled_signed(&conn, &id, false, &signing_key, OPERATOR_KEY_ID)?;
+            if !updated_flag {
                 bail!("rules.disable: no rule with id={id}");
-            };
-            rule.enabled = false;
-            // Issue #800 critical fix: parity with the Enable arm —
-            // signer + verifier must use the same canonical bytes.
-            let canonical = rules_store::canonical_bytes_for_signing(&rule)?;
-            let sig = signing_key.sign(&canonical);
-            rules_store::set_enabled(&conn, &id, false)?;
-            rules_store::update_signature(&conn, &id, &sig.to_bytes(), OPERATOR_SIGNED_LEVEL)?;
+            }
             let updated = rules_store::get(&conn, &id)?
                 .context("rules.disable: row vanished after update")?;
             emit_ok(json, out, "rules.disable", &rule_to_json(&updated))?;
@@ -853,7 +854,7 @@ fn sign_seed_rules(
 
 /// Resolve the operator key directory, honoring `--key-dir` →
 /// `AI_MEMORY_KEY_DIR` → `kp::default_key_dir()`.
-fn resolve_key_dir(override_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+pub(crate) fn resolve_key_dir(override_dir: Option<&std::path::Path>) -> Result<PathBuf> {
     if let Some(p) = override_dir {
         return Ok(p.to_path_buf());
     }
@@ -882,7 +883,7 @@ fn resolve_key_dir(override_dir: Option<&std::path::Path>) -> Result<PathBuf> {
 /// bits are not 0600 on Unix, or if the parsed bytes are not a valid
 /// 32-byte Ed25519 signing key. Returns the typed `SigningKey` ready
 /// to call `.sign()`.
-fn load_operator_signing_key_from_dir(
+pub(crate) fn load_operator_signing_key_from_dir(
     key_dir: &std::path::Path,
 ) -> Result<ed25519_dalek::SigningKey> {
     // Layout 1 — `operator.priv` + `operator.pub` (the legacy dir
@@ -1129,7 +1130,7 @@ fn rule_to_json(rule: &Rule) -> serde_json::Value {
     })
 }
 
-fn emit_ok(
+pub(crate) fn emit_ok(
     json: bool,
     out: &mut CliOutput<'_>,
     verb: &str,

@@ -434,6 +434,7 @@ pub(crate) mod connection;
 pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
+pub mod model_attest;
 pub(crate) mod reflect;
 
 // Re-exports — every `pub` item that previously lived in `src/db.rs`

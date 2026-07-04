@@ -464,6 +464,9 @@ fn emit_stopper_enforcement(
     let action_bytes = action.canonical_bytes().ok()?;
     let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
     let now = chrono::Utc::now().timestamp();
+    // v0.9.0 §25.3 S4 (F-41) — bind the live governance policy version
+    // (sqlite governance DB is the sole source of truth on all backends).
+    let pv = crate::governance::policy_version::current_policy_version(conn).ok()?;
     let cp = crate::governance::audit::build_signed_enforcement_checkpoint(
         agent_id,
         kind,
@@ -471,6 +474,8 @@ fn emit_stopper_enforcement(
         "deny",
         rule_id,
         reason,
+        pv.seq,
+        &pv.digest_hex(),
         now,
         &keypair,
     )

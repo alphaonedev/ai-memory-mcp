@@ -258,7 +258,13 @@ pub(super) fn handle_update(
         let existing = db::get(conn, &resolved_id)
             .map_err(|e| e.to_string())?
             .map_or_else(|| serde_json::json!({}), |m| m.metadata);
-        Some(crate::identity::preserve_provenance_keys(&existing, &m))
+        let mut merged = crate::identity::preserve_provenance_keys(&existing, &m);
+        // v0.9.0 §25.3 S1 (D3-012, #1870) — a caller mutating metadata
+        // can NOT carry (or forge) a `loader_observed` model-family
+        // attestation: only the substrate loader may assert it. Downgrade
+        // to `claimed` (fail-safe: attestation is only ever LOST here).
+        crate::identity::downgrade_loader_attest_on_caller_mutation(&mut merged);
+        Some(merged)
     } else {
         None
     };

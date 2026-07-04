@@ -5306,6 +5306,30 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
         .unwrap_or_default()
 }
 
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — write-time attested-family quorum N.
+/// See [`reflect_decorrelation_quorum_n`].
+pub const ENV_REFLECT_DECORRELATION_QUORUM_N: &str = "AI_MEMORY_REFLECT_DECORRELATION_QUORUM_N";
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — resolve the write-time
+/// attested-model-family quorum N (the minimum count of DISTINCT attested
+/// families required before a reflection write clears the decorrelation
+/// gate). Env-only direct-read
+/// (`AI_MEMORY_REFLECT_DECORRELATION_QUORUM_N` > compiled default `3`); a
+/// parseable integer `>= 2` wins, anything else (incl. unset, or a
+/// nonsensical `< 2`) yields `3`. The gate itself is inert unless
+/// `AI_MEMORY_REFLECT_DECORRELATION_MODE` is `advisory`/`enforce`
+/// (compiled default `off`); the live/default flip to enforce is v1.0.
+#[must_use]
+pub fn reflect_decorrelation_quorum_n() -> usize {
+    const DEFAULT: usize = 3;
+    const MIN: usize = 2;
+    std::env::var(ENV_REFLECT_DECORRELATION_QUORUM_N)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|v| *v >= MIN)
+        .unwrap_or(DEFAULT)
+}
+
 /// v0.8.0 #1764 — resolve the producer-dominance threshold for the probe.
 /// Env-only direct-read (`AI_MEMORY_REFLECT_DECORRELATION_DOMINANCE_THRESHOLD`
 /// > compiled default `0.8`). A parseable `f64` in `(0.0, 1.0]` wins; an

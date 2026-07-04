@@ -1490,7 +1490,18 @@ pub const JUDGE_RESOLVED_BY: &str = "governance:judge";
 /// `created_by` / `resolved_by` pseudo-actor for stopper anchors.
 pub const STOPPER_RESOLVED_BY: &str = "governance:stopper";
 /// Schema version embedded in the verdict / enforcement `resolution` JSON.
-const ROLE_RESOLUTION_VERSION: i64 = 1;
+///
+/// v0.9.0 §25.3 S4 (F-41, #1853) — bumped 1 → 2 when `policy_seq` +
+/// `policy_digest_hex` were added to the verdict/enforcement wire so a
+/// resolved verdict records WHICH governance policy version evaluated it.
+/// Back-compat is preserved: old (`v: 1`) resolved checkpoints were
+/// signed over their exact stored `resolution` JSON string (which never
+/// carried the new fields), and verification re-checks the operator/role
+/// signature over that stored string verbatim — it never re-serialises
+/// from this struct — so pre-bump checkpoints continue to verify
+/// unchanged. The new fields deserialise with `#[serde(default)]` for any
+/// reader that parses a legacy tuple.
+const ROLE_RESOLUTION_VERSION: i64 = 2;
 
 /// Lowercase-hex SHA-256 of the canonical action bytes — the JOIN key that
 /// binds a judge verdict / stopper enforcement anchor to the action it judged
@@ -1515,6 +1526,14 @@ struct VerdictResolutionWire {
     verdict: String,
     rule_id: String,
     reason: String,
+    /// v0.9.0 §25.3 S4 — the live governance policy sequence that
+    /// evaluated this verdict (append-only advance count).
+    #[serde(default)]
+    policy_seq: i64,
+    /// v0.9.0 §25.3 S4 — lowercase-hex whole-ruleset policy digest at
+    /// verdict time. Binds the verdict to a concrete enabled-rule set.
+    #[serde(default)]
+    policy_digest_hex: String,
 }
 
 /// Versioned STOPPER enforcement `resolution` wire shape.
@@ -1527,6 +1546,14 @@ struct EnforcementResolutionWire {
     permission: String,
     rule_id: String,
     reason: String,
+    /// v0.9.0 §25.3 S4 — live governance policy sequence at enforcement
+    /// time (append-only advance count).
+    #[serde(default)]
+    policy_seq: i64,
+    /// v0.9.0 §25.3 S4 — lowercase-hex whole-ruleset policy digest at
+    /// enforcement time.
+    #[serde(default)]
+    policy_digest_hex: String,
 }
 
 /// Build + SIGN a resolved [`crate::models::ConditionType::GovernanceVerdict`]
@@ -1543,6 +1570,8 @@ pub fn build_signed_verdict_checkpoint(
     verdict: &str,
     rule_id: &str,
     reason: &str,
+    policy_seq: i64,
+    policy_digest_hex: &str,
     now: i64,
     keypair: &crate::identity::keypair::AgentKeypair,
 ) -> Result<crate::models::Checkpoint> {
@@ -1554,6 +1583,8 @@ pub fn build_signed_verdict_checkpoint(
         verdict: verdict.to_string(),
         rule_id: rule_id.to_string(),
         reason: reason.to_string(),
+        policy_seq,
+        policy_digest_hex: policy_digest_hex.to_string(),
     };
     build_signed_role_checkpoint(
         crate::models::ConditionType::GovernanceVerdict,
@@ -1581,6 +1612,8 @@ pub fn build_signed_enforcement_checkpoint(
     permission: &str,
     rule_id: &str,
     reason: &str,
+    policy_seq: i64,
+    policy_digest_hex: &str,
     now: i64,
     keypair: &crate::identity::keypair::AgentKeypair,
 ) -> Result<crate::models::Checkpoint> {
@@ -1592,6 +1625,8 @@ pub fn build_signed_enforcement_checkpoint(
         permission: permission.to_string(),
         rule_id: rule_id.to_string(),
         reason: reason.to_string(),
+        policy_seq,
+        policy_digest_hex: policy_digest_hex.to_string(),
     };
     build_signed_role_checkpoint(
         crate::models::ConditionType::GovernanceEnforcement,
@@ -2747,6 +2782,8 @@ mod tests {
             "allow",
             "rule-7",
             "policy permits",
+            5,
+            "deadbeefcafe",
             1_700_000_000,
             &kp,
         )
@@ -2768,6 +2805,12 @@ mod tests {
             res.contains("rule-7") && res.contains("allow"),
             "resolution binds the tuple"
         );
+        // v0.9.0 §25.3 S4 — the policy version binds into the resolution.
+        assert!(
+            res.contains("deadbeefcafe") && res.contains("\"policy_seq\":5"),
+            "resolution records the evaluating policy version: {res}"
+        );
+        assert!(res.contains("\"v\":2"), "wire version bumped to 2: {res}");
     }
 
     #[test]
@@ -2780,6 +2823,8 @@ mod tests {
             "deny",
             "rule-9",
             "blocked by policy",
+            3,
+            "0badc0de",
             1_700_000_100,
             &kp,
         )
@@ -2793,6 +2838,10 @@ mod tests {
         assert!(!cp.signature.is_empty(), "enforcement checkpoint is signed");
         let res = cp.resolution.expect("resolution json present");
         assert!(res.contains("deny") && res.contains("rule-9"));
+        assert!(
+            res.contains("0badc0de") && res.contains("\"policy_seq\":3"),
+            "enforcement resolution records the policy version: {res}"
+        );
     }
 
     #[test]
@@ -2829,6 +2878,8 @@ mod tests {
             &action_hash_hex(b"act-wrongtype"),
             "allow",
             "rule-1",
+            "",
+            0,
             "",
             1_700_000_300,
             &kp,

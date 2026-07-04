@@ -1024,6 +1024,11 @@ fn try_emit_governance_verdict(
     let action_bytes = action.canonical_bytes()?;
     let action_hash = crate::governance::audit::action_hash_hex(&action_bytes);
     let now = chrono::Utc::now().timestamp();
+    // v0.9.0 §25.3 S4 (F-41) — bind the live governance policy version
+    // that evaluated this verdict. The governance rules DB is always the
+    // sqlite `conn` here (Postgres ships no governance_rules table), so
+    // this reads the single source of truth on all backends.
+    let pv = crate::governance::policy_version::current_policy_version(conn)?;
     let cp = crate::governance::audit::build_signed_verdict_checkpoint(
         agent_id,
         action.kind(),
@@ -1031,6 +1036,8 @@ fn try_emit_governance_verdict(
         verdict,
         rule_id,
         reason,
+        pv.seq,
+        &pv.digest_hex(),
         now,
         &keypair,
     )?;

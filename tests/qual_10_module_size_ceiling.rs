@@ -947,7 +947,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // aspirational / never ratchets down (see
     // qual_10_ceiling_table_is_aspirational_not_ratcheting_up), so 9_500
     // stands (7 LOC headroom).
-    ("src/daemon_runtime.rs", 9_500),
+    // 2026-07-04 (#1870 §25.3 S1) — bumped 9_500 → 9_560 for the
+    // `ModelAttest` CLI subcommand variant + its dispatch arm.
+    ("src/daemon_runtime.rs", 9_560),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
@@ -1023,7 +1025,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // column + backfill + partial unfolded index) + the
     // `MIGRATION_V77_SQLITE` sourcing (~44 LOC at 4_993, which was
     // within 1 LOC of the old ceiling). 5_050 = 4_993 + 57 headroom.
-    ("src/storage/migrations.rs", 5_050),
+    // 2026-07-04 (#1870 §25.3 S1) — bumped 5_050 → 5_130 for the v78
+    // model_attestations migration arm + const + bootstrap SCHEMA mirror
+    // + fresh-install/upgrade ladder tests.
+    ("src/storage/migrations.rs", 5_130),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

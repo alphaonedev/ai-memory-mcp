@@ -53,6 +53,7 @@ pub mod io;
 pub mod io_writer;
 pub mod link;
 pub mod logs;
+pub mod model_attest;
 /// v0.7.0 (issue #800) — `ai-memory namespace` subcommand. CRUD over
 /// the per-namespace standard policy memory pointer. Closes Crack 1
 /// from the Batman Mode acceptance review by giving operators a
