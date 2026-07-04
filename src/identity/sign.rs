@@ -748,6 +748,139 @@ pub fn sign_checkpoint_resolution(
     Ok(sig.to_bytes().to_vec())
 }
 
+/// v0.9.0 §25.3 S5 (RQ-10, #1853) — the signable surface of an epoch
+/// manifest (the monotonic panel/utility-weight freeze for one epoch).
+/// The operator signs the canonical CBOR of THESE fields, so a captured
+/// signature cannot be replayed onto a different epoch, prior link,
+/// governance policy binding, content, or timestamp. Mirrors
+/// [`SignableCheckpointResolution`]'s replay-pinning discipline.
+///
+/// `content_sha256` is the SHA-256 over the manifest file's canonical
+/// JSON bytes — a bounded fingerprint so the signed payload stays small
+/// (the `SignableWrite` discipline) while binding the full document.
+///
+/// The type name is deliberately `SignableEpochManifest` (no underscore
+/// between `Epoch` and `Manifest`) so it is L3-boundary-gate clean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableEpochManifest<'a> {
+    /// Monotonic epoch sequence (`prior + 1`).
+    pub epoch_seq: i64,
+    /// The id of the epoch this one succeeds (`""` for the genesis epoch).
+    pub prior_epoch_id: &'a str,
+    /// The governance policy sequence this manifest binds to. `epoch-apply`
+    /// refuses a manifest whose `(policy_seq, policy_digest_hex)` does not
+    /// match the live `current_policy_version()` (stale-policy manifests
+    /// are dead on arrival).
+    pub policy_seq: i64,
+    /// Lowercase-hex whole-ruleset governance policy digest at freeze time.
+    pub policy_digest_hex: &'a str,
+    /// SHA-256 over the manifest file's canonical JSON bytes.
+    pub content_sha256: &'a [u8; 32],
+    /// RFC3339 creation instant, inside the signed surface so a captured
+    /// signature cannot back- or forward-date the epoch.
+    pub created_at: &'a str,
+}
+
+/// RFC 8949 §4.2.1 deterministic CBOR encoding of the signable epoch
+/// manifest fields. Same `BTreeMap`-keyed discipline as
+/// [`canonical_cbor_checkpoint_resolution`].
+///
+/// The function name is deliberately shortened to `canonical_cbor_epoch`
+/// so it stays clean under the L3-boundary gate (see ROADMAP §25.2/§25.3).
+///
+/// # Errors
+/// Returns an error only when CBOR serialization fails (unreachable for
+/// the fixed-shape input; surfaced as a `Result` for parity).
+pub fn canonical_cbor_epoch(m: &SignableEpochManifest<'_>) -> Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert(
+        "epoch_seq",
+        ciborium::Value::Integer(ciborium::value::Integer::from(m.epoch_seq)),
+    );
+    map.insert(
+        "prior_epoch_id",
+        ciborium::Value::Text(m.prior_epoch_id.to_string()),
+    );
+    map.insert(
+        "policy_seq",
+        ciborium::Value::Integer(ciborium::value::Integer::from(m.policy_seq)),
+    );
+    map.insert(
+        "policy_digest_hex",
+        ciborium::Value::Text(m.policy_digest_hex.to_string()),
+    );
+    map.insert(
+        "content_sha256",
+        ciborium::Value::Bytes(m.content_sha256.to_vec()),
+    );
+    map.insert(
+        crate::models::field_names::CREATED_AT,
+        ciborium::Value::Text(m.created_at.to_string()),
+    );
+
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableEpochManifest")?;
+    Ok(out)
+}
+
+/// Sign an epoch manifest with `keypair`'s private key over the canonical
+/// CBOR of [`SignableEpochManifest`]. Returns the 64-byte signature.
+///
+/// Named `sign_epoch` (not the longer form) to stay L3-boundary clean.
+///
+/// # Errors
+/// - `keypair.private` is `None` (public-only handle).
+/// - CBOR encoding fails (unreachable; surfaced for parity).
+pub fn sign_epoch(keypair: &AgentKeypair, manifest: &SignableEpochManifest<'_>) -> Result<Vec<u8>> {
+    let signing = keypair.private.as_ref().with_context(|| {
+        format!(
+            "AgentKeypair for {} has no private key — cannot sign epoch manifest",
+            keypair.agent_id
+        )
+    })?;
+    let bytes = canonical_cbor_epoch(manifest)?;
+    let sig = signing.sign(&bytes);
+    Ok(sig.to_bytes().to_vec())
+}
+
+/// Verify an epoch-manifest signature against `operator_pubkey` over the
+/// canonical CBOR of `manifest`. Returns `Ok(())` on a valid signature.
+///
+/// Named `verify_epoch` (not the longer form) to stay L3-boundary clean.
+///
+/// # Errors
+/// - CBOR encoding fails (unreachable; surfaced for parity).
+/// - The Ed25519 verification fails (tampered manifest / wrong key /
+///   replayed signature).
+pub fn verify_epoch(
+    operator_pubkey: &ed25519_dalek::VerifyingKey,
+    manifest: &SignableEpochManifest<'_>,
+    signature: &[u8],
+) -> Result<()> {
+    use ed25519_dalek::Verifier;
+    if signature.len() != ed25519_dalek::SIGNATURE_LENGTH {
+        anyhow::bail!(
+            "epoch manifest signature is not {} bytes",
+            ed25519_dalek::SIGNATURE_LENGTH
+        );
+    }
+    let mut arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+    arr.copy_from_slice(signature);
+    let sig = ed25519_dalek::Signature::from_bytes(&arr);
+    let bytes = canonical_cbor_epoch(manifest)?;
+    operator_pubkey
+        .verify(&bytes, &sig)
+        .context("epoch manifest signature verification failed")?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // v0.8.0 Pillar-1 (#1709) — SignableRoutineFreeze + sign_routine_freeze
 // ---------------------------------------------------------------------------
@@ -1852,6 +1985,73 @@ mod tests {
         sig_arr.copy_from_slice(&sig_bytes);
         let sig = ed25519_dalek::Signature::from_bytes(&sig_arr);
         assert!(bob.public.verify(&payload, &sig).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9.0 §25.3 S5 (RQ-10, #1853) — SignableEpochManifest
+    // -----------------------------------------------------------------
+
+    fn epoch_fixture<'a>(content: &'a [u8; 32]) -> SignableEpochManifest<'a> {
+        SignableEpochManifest {
+            epoch_seq: 7,
+            prior_epoch_id: "epoch-006",
+            policy_seq: 3,
+            policy_digest_hex: "deadbeef",
+            content_sha256: content,
+            created_at: "2026-07-04T00:00:00+00:00",
+        }
+    }
+
+    #[test]
+    fn epoch_sign_verify_round_trip() {
+        let content = [9u8; 32];
+        let kp = keypair::generate("operator").unwrap();
+        let m = epoch_fixture(&content);
+        let sig = sign_epoch(&kp, &m).expect("sign");
+        assert_eq!(sig.len(), 64);
+        verify_epoch(&kp.public, &m, &sig).expect("verify");
+    }
+
+    #[test]
+    fn epoch_canonical_cbor_is_deterministic() {
+        let content = [1u8; 32];
+        let m = epoch_fixture(&content);
+        let a = canonical_cbor_epoch(&m).unwrap();
+        let b = canonical_cbor_epoch(&m).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn epoch_tamper_breaks_verification() {
+        let content = [2u8; 32];
+        let kp = keypair::generate("operator").unwrap();
+        let m = epoch_fixture(&content);
+        let sig = sign_epoch(&kp, &m).unwrap();
+
+        // Tamper the epoch sequence — signature must no longer verify.
+        let mut tampered = epoch_fixture(&content);
+        tampered.epoch_seq = 8;
+        assert!(verify_epoch(&kp.public, &tampered, &sig).is_err());
+
+        // Wrong operator key — must not verify.
+        let other = keypair::generate("other").unwrap();
+        assert!(verify_epoch(&other.public, &m, &sig).is_err());
+
+        // Malformed signature length.
+        assert!(verify_epoch(&kp.public, &m, &[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn epoch_public_only_keypair_cannot_sign() {
+        let content = [3u8; 32];
+        let kp = keypair::generate("operator").unwrap();
+        let pub_only = AgentKeypair {
+            agent_id: "operator".to_string(),
+            public: kp.public,
+            private: None,
+        };
+        let err = sign_epoch(&pub_only, &epoch_fixture(&content)).unwrap_err();
+        assert!(format!("{err:#}").contains("no private key"));
     }
 
     // -----------------------------------------------------------------

@@ -71,6 +71,25 @@ jobs:
         # allowlist, a broken test-boundary heuristic) trips here.
         run: bash scripts/check-vendor-literals.sh --self-test
 
+  l3-boundary-gate:
+    name: L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # v0.9.0 §25.3 S5 — the epoch-closure lane ships under strictly ruled
+    # public identifiers; certain internal design-doc identifiers are
+    # PERMANENTLY BANNED from src/ (any string literal or comment). This
+    # gate HARD-BLOCKS `rqgm|epoch_manifest|red.?queen` in src/. The
+    # ruled public identifiers (SignableEpochManifest, epoch.manifest_applied,
+    # EpochAdvance, EPOCH_APPLIED) are gate-clean by construction.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run L3-boundary perma-ban gate
+        run: bash scripts/check-l3-boundary.sh
+      - name: Self-test the gate (regression evidence)
+        # Proves the gate is load-bearing: passes a clean tree, fails on
+        # a planted `epoch_manifest` violation in a tmpdir, cleans up.
+        run: bash scripts/check-l3-boundary.sh --self-test
+
   hardcoded-literal-gate:
     name: Hardcoded-literal duplication ratchet (pm-v3.1)
     runs-on: ubuntu-latest

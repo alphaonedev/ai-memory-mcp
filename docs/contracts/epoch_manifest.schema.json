@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://alpha-one.mobi/ai-memory/contracts/epoch_manifest.schema.json",
+  "title": "Epoch Manifest",
+  "description": "v0.9.0 §25.3 S5 (RQ-10, #1853) — the operator-signed, verify-only manifest that freezes the evaluation panel + utility weights for one epoch. `ai-memory epoch-apply` verifies the operator signature over the canonical CBOR of {epoch_seq, prior_epoch_id, policy_seq, policy_digest_hex, content_sha256(canonical JSON of this file), created_at}, checks epoch_seq == prior + 1 and the policy binding against the live current_policy_version(), then writes the triple anchor (this signed file + a resolved EpochAdvance checkpoint + an epoch.manifest_applied audit row) under ONE SHA-256. The manifest STRUCTURALLY CANNOT assert diversity/decorrelation: no such field exists (explicitly reserved-absent), so a manifest cannot launder unattested diversity. The runtime contract is the serde struct in src/; this schema is the git-tracked documentation contract, asserted schema-vs-struct-conformant in tests/ ONLY (never include_str!'d from src/).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "epoch_seq",
+    "prior_epoch_id",
+    "policy_seq",
+    "policy_digest_hex",
+    "panel",
+    "utility_weights",
+    "created_at",
+    "content_hash"
+  ],
+  "properties": {
+    "epoch_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Monotonic epoch sequence. Must equal the last applied epoch_seq + 1 at apply time."
+    },
+    "prior_epoch_id": {
+      "type": "string",
+      "description": "The id of the epoch this one succeeds. Empty string for the genesis epoch."
+    },
+    "policy_seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The governance policy sequence this manifest binds to. Apply REFUSES a manifest whose policy binding != the live current_policy_version() (stale-policy manifests are dead on arrival)."
+    },
+    "policy_digest_hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]*$",
+      "description": "Lowercase-hex whole-ruleset governance policy digest at freeze time."
+    },
+    "panel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slots"],
+      "description": "The frozen evaluator panel.",
+      "properties": {
+        "slots": {
+          "type": "array",
+          "description": "The frozen panel slots for this epoch.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["id"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable slot identifier."
+              }
+            }
+          }
+        }
+      }
+    },
+    "utility_weights": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["frozen_within_epoch"],
+      "description": "The utility weights, frozen for the epoch's duration.",
+      "properties": {
+        "frozen_within_epoch": {
+          "type": "boolean",
+          "const": true,
+          "description": "MUST be true — utility weights do not change within an epoch."
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "description": "RFC3339 creation instant, inside the signed surface."
+    },
+    "content_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase-hex SHA-256 over the canonical JSON bytes of this manifest (excluding the signature envelope). The triple anchor shares this hash."
+    }
+  }
+}

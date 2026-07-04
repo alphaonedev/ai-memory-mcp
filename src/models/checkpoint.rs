@@ -58,6 +58,16 @@ pub enum ConditionType {
     /// runtime `deny` is produced independent of (and BEFORE) this anchor —
     /// the anchor is advisory/forensic, never the enforcement itself.
     GovernanceEnforcement,
+    /// v0.9.0 §25.3 S5 (RQ-10, #1853) — a VERIFY-ONLY epoch-advance
+    /// anchor. Emitted (and immediately resolved) by `ai-memory
+    /// epoch-apply` when it accepts an operator-signed epoch manifest:
+    /// the monotonic panel/utility-weight freeze for one epoch. Its
+    /// `resolution` is the hex of the manifest's content hash; the
+    /// triple-anchor (signed manifest file + this resolved checkpoint +
+    /// the `epoch.manifest_applied` audit row) shares ONE SHA-256.
+    /// Free-TEXT condition type — no schema migration (the SAL enforces
+    /// the closed set; the `GovernanceVerdict` precedent).
+    EpochAdvance,
 }
 
 impl ConditionType {
@@ -72,6 +82,7 @@ impl ConditionType {
             Self::AuditHeadWitness => "audit_head_witness",
             Self::GovernanceVerdict => "governance_verdict",
             Self::GovernanceEnforcement => "governance_enforcement",
+            Self::EpochAdvance => "epoch_advance",
         }
     }
 
@@ -86,6 +97,7 @@ impl ConditionType {
             "audit_head_witness" => Some(Self::AuditHeadWitness),
             "governance_verdict" => Some(Self::GovernanceVerdict),
             "governance_enforcement" => Some(Self::GovernanceEnforcement),
+            "epoch_advance" => Some(Self::EpochAdvance),
             _ => None,
         }
     }
