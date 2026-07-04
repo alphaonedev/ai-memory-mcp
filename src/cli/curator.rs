@@ -786,7 +786,8 @@ async fn run_reflect(
     run_decorrelation_probe_step(
         store.as_ref(),
         &decorrelation_agent_id,
-        args,
+        args.namespace.as_deref(),
+        args.json,
         config::reflect_decorrelation_mode(),
         config::reflect_decorrelation_dominance_threshold(),
         out,
@@ -803,11 +804,46 @@ async fn run_reflect(
 /// `enforce` is INERT at v0.8.0 (the runner degrades it to advisory with a
 /// one-shot WARN) — write-time N≥3 model-family-distinct REFUSAL is the tracked
 /// v0.9 lane (#1719 / #1171).
+///
+/// # RQ-PARITY-01 (#1872) — the loop-callable per-cycle seam
+///
+/// This is the SINGLE backend-blind entry point RQ-11 later wires into all four
+/// curator cycle arms (sqlite `--once`, sqlite daemon loop, SAL `--once`, SAL
+/// daemon loop). Its parameters are the only cycle-varying inputs — `store`
+/// (`&dyn MemoryStore`, so it is byte-identical on SQLite and Postgres),
+/// `agent_id`, `namespace`, `json`, `mode`, `threshold` — deliberately decoupled
+/// from `&CuratorArgs` so a loop can call it without the CLI arg struct.
+/// RQ-PARITY-01 lands only the seam + the live-Postgres equivalence proof
+/// (`tests/decorrelation_probe_postgres_parity.rs`); it does NOT wire the four
+/// cycle arms — that is RQ-11's work. SEAM-HONESTY NOTE: the sqlite daemon arm
+/// (`cli/curator.rs` → `run_curator_daemon_with_primitives` → blocking
+/// `curator::run_daemon` via `spawn_blocking`) has NO per-cycle async hook;
+/// bridging it (a cycle callback in `run_daemon` or a documented interval
+/// sidecar) is RQ-11's recorded problem, not silently assumed solved here.
+/// `AI_MEMORY_REFLECT_DECORRELATION_MODE=off` (the default) keeps every path
+/// byte-silent; this item adds no new flags or env vars.
+///
+/// # S2 (#1767) fail-safe consumption contract — PROVISIONAL input to S2's own design vote
+///
+/// When S2 activates `enforce` it MUST first verify attestation readability on
+/// the bound store via the S1/#1870 SAL read; a `StoreError::UnsupportedCapability`
+/// ⇒ enforce MUST NOT activate — a hard step error (non-zero `--once`; per-cycle
+/// ERROR + NO reflection writes that cycle in daemon mode), never a silent
+/// degrade to advisory, and never enforcement over CLAIMED `producer_signal`
+/// tiers (the v0.8 degrade WARN in `decorrelation_probe.rs` is superseded by S2).
+/// Unattested rows count as NON-diverse toward the N≥3 quorum (missing evidence
+/// can only cause refusal, never satisfy the gate). A `scan_capped` namespace is
+/// partial coverage: under enforce it resolves toward refusal / advisory-WARN,
+/// never toward "diverse". S2 must also resolve the step-ordering tension
+/// (pre-sweep probe when enforce is active, or an explicitly recorded one-cycle
+/// lag). This whole block is PROVISIONAL input to S2's design decision, not S2's
+/// decided contract.
 #[cfg(feature = "sal")]
 async fn run_decorrelation_probe_step(
     store: &dyn crate::store::MemoryStore,
     agent_id: &str,
-    args: &CuratorArgs,
+    namespace: Option<&str>,
+    json: bool,
     mode: config::ReflectDecorrelationMode,
     threshold: f64,
     out: &mut CliOutput<'_>,
@@ -818,14 +854,14 @@ async fn run_decorrelation_probe_step(
     let probe_result = crate::curator::decorrelation_probe::run_decorrelation_probe(
         store,
         agent_id,
-        args.namespace.as_deref(),
+        namespace,
         mode,
         threshold,
         crate::curator::decorrelation_probe::MIN_REFLECTIONS_FLOOR,
     )
     .await;
     match probe_result {
-        Ok(probe) => print_decorrelation_report(&probe, args.json, out)?,
+        Ok(probe) => print_decorrelation_report(&probe, json, out)?,
         Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
     }
     Ok(())
@@ -848,12 +884,13 @@ fn print_decorrelation_report(
     writeln!(
         out.stdout,
         "decorrelation-probe: mode={} threshold={:.2} namespaces={} \
-         reflections={} advisories={}{}",
+         reflections={} advisories={} capped={}{}",
         probe.mode,
         probe.threshold,
         probe.namespaces_scanned,
         probe.reflections_scanned,
         probe.advisories.len(),
+        probe.namespaces_capped,
         if probe.enforce_degraded_to_advisory {
             " (enforce INERT at v0.8.0 → advisory)"
         } else {
@@ -863,11 +900,16 @@ fn print_decorrelation_report(
     for adv in &probe.advisories {
         writeln!(
             out.stdout,
-            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={} — {}",
+            "  ADVISORY ns={} dominance={:.2} dominant={} distinct={}{} — {}",
             adv.namespace,
             adv.report.dominance_ratio,
             adv.report.dominant_producer.as_deref().unwrap_or("?"),
             adv.report.distinct_producers,
+            if adv.scan_capped {
+                " [SCAN CAPPED — dominance over newest window only]"
+            } else {
+                ""
+            },
             adv.caveat,
         )?;
     }
@@ -1935,7 +1977,9 @@ mod tests {
                 },
                 threshold: 0.8,
                 caveat: CLAIMED_NOT_ATTESTED_CAVEAT.to_string(),
+                scan_capped: false,
             }],
+            namespaces_capped: 0,
         }
     }
 
@@ -1993,7 +2037,8 @@ mod tests {
             run_decorrelation_probe_step(
                 store.as_ref(),
                 "ai:curator",
-                &args,
+                args.namespace.as_deref(),
+                args.json,
                 config::ReflectDecorrelationMode::Off,
                 0.8,
                 &mut out,
@@ -2021,7 +2066,8 @@ mod tests {
             run_decorrelation_probe_step(
                 store.as_ref(),
                 "ai:curator",
-                &args,
+                args.namespace.as_deref(),
+                args.json,
                 config::ReflectDecorrelationMode::Advisory,
                 0.8,
                 &mut out,
