@@ -178,6 +178,14 @@ pub struct DecorrelationAdvisory {
     pub threshold: f64,
     /// The mandated CLAIMED-not-attested caveat ([`CLAIMED_NOT_ATTESTED_CAVEAT`]).
     pub caveat: String,
+    /// `true` when this namespace's probe scan hit [`PROBE_SCAN_LIMIT`] rows —
+    /// the dominance figure then covers only the newest-priority window, NOT the
+    /// full corpus (honest truncation, keyed on the pre-Reflection-filter row
+    /// count). Additive + backward-compatible via `#[serde(default)]`
+    /// (serde-default-compat); [`evaluate_namespace`] leaves it `false` and the
+    /// `sal`-gated runner sets it from the raw window length.
+    #[serde(default)]
+    pub scan_capped: bool,
 }
 
 /// Evaluate one namespace's reflections. Returns `Some` advisory iff at least
@@ -203,11 +211,14 @@ pub fn evaluate_namespace(
         report,
         threshold,
         caveat: CLAIMED_NOT_ATTESTED_CAVEAT.to_string(),
+        // Pure evaluator can't see the scan window; the `sal`-gated runner
+        // overrides this from the raw `list` length.
+        scan_capped: false,
     })
 }
 
 /// Aggregated probe outcome, serialised for the curator log / `--json` surface.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DecorrelationProbeReport {
     /// Resolved mode (`off` / `advisory` / `enforce`) as requested. `enforce`
     /// is reported verbatim even though it ran inert-as-advisory at v0.8.0.
@@ -222,15 +233,32 @@ pub struct DecorrelationProbeReport {
     pub reflections_scanned: usize,
     /// Per-namespace advisories (corpus dominated past threshold).
     pub advisories: Vec<DecorrelationAdvisory>,
+    /// Number of namespaces whose probe scan hit [`PROBE_SCAN_LIMIT`] rows
+    /// (dominated or not) — the honest, backend-identical truncation surface.
+    /// Additive + backward-compatible via `#[serde(default)]`.
+    #[serde(default)]
+    pub namespaces_capped: usize,
 }
 
 #[cfg(feature = "sal")]
 use crate::store::{CallerContext, Filter, MemoryStore};
 
-/// Upper bound on reflections pulled per namespace per probe pass (visibility
-/// is a sampled signal; an unbounded scan on a huge corpus is not warranted).
+/// Upper bound on rows pulled per namespace per probe pass. Bound BY REFERENCE
+/// to [`crate::storage::LIST_MAX_LIMIT`] (never a bare literal) so BOTH SAL
+/// backends scan the identical newest-priority window:
+/// [`crate::store::sqlite::SqliteStore`]'s `list` passes the filter limit
+/// through UNCLAMPED, while `PostgresStore::list` clamps to `LIST_MAX_LIMIT`.
+/// Any probe limit above that clamp made the two backends read *different*
+/// windows and emit *different* advisories from identical data — the
+/// RQ-PARITY-01 defect (#1872). Window identity holds modulo `updated_at`
+/// ties at the cutoff: both backends `ORDER BY priority DESC, updated_at DESC`
+/// (`storage/mod.rs`, `store/postgres.rs`) with no third sort key. The
+/// [`DecorrelationAdvisory::scan_capped`] / [`DecorrelationProbeReport::namespaces_capped`]
+/// markers key on the PRE-Reflection-filter row count (the raw `list` length),
+/// surfacing honest truncation instead of silent sampling. Paging past the cap
+/// needs a `Filter` offset (out of scope — #1625 lineage).
 #[cfg(feature = "sal")]
-const PROBE_SCAN_LIMIT: usize = 5_000;
+const PROBE_SCAN_LIMIT: usize = crate::storage::LIST_MAX_LIMIT;
 
 /// Run the reflection-corpus decorrelation VISIBILITY probe over `namespace`
 /// (when `Some`) or every non-`_` namespace. Read-only: lists Reflection-kind
@@ -309,11 +337,21 @@ pub async fn run_decorrelation_probe(
             // A single namespace's read failure must not abort the whole sweep.
             Err(_) => continue,
         };
+        // Honest truncation marker, keyed on the PRE-Reflection-filter row count
+        // (the raw window the store returned). Both backends now scan the
+        // identical `PROBE_SCAN_LIMIT` window (see the const doc-comment), so
+        // this fires — and the dominance denominators it qualifies match —
+        // on SQLite and Postgres alike.
+        let scan_capped = memories.len() == PROBE_SCAN_LIMIT;
+        if scan_capped {
+            report.namespaces_capped += 1;
+        }
         let reflections: Vec<Memory> = memories
             .into_iter()
             .filter(|m| m.memory_kind == MemoryKind::Reflection)
             .collect();
-        if let Some(advisory) = evaluate_namespace(&reflections, ns, threshold, floor) {
+        if let Some(mut advisory) = evaluate_namespace(&reflections, ns, threshold, floor) {
+            advisory.scan_capped = scan_capped;
             report.reflections_scanned += advisory.report.total;
             tracing::warn!(
                 target: TRACE_TARGET,
@@ -323,6 +361,7 @@ pub async fn run_decorrelation_probe(
                 dominant_producer = advisory.report.dominant_producer.as_deref().unwrap_or("?"),
                 dominance_ratio = advisory.report.dominance_ratio,
                 threshold = advisory.threshold,
+                scan_capped = advisory.scan_capped,
                 "reflection corpus is producer-dominated past threshold — {}",
                 advisory.caveat,
             );
