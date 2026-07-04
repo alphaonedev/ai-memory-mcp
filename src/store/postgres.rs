@@ -15131,7 +15131,19 @@ impl MemoryStore for PostgresStore {
             })
             .collect();
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // v0.9.0 P0-1 (#1869) — determinism, parity with the sqlite
+        // `blend_and_rank` fix. `scored` is a `HashMap`, so
+        // `into_values()` yields candidates in per-instance random-seed
+        // order; a score-only stable sort would preserve that order for
+        // tied blended scores, so two recalls over an IDENTICAL corpus
+        // could return the same set in a different order. The unique-`id`
+        // secondary key makes the ranking a total order independent of
+        // iteration seed (the sqlite twin caught this on the macOS runner).
+        results.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
         // Belt-and-suspenders: drop any row that slipped past the SQL
         // predicate (defense-in-depth against SQL drift). Filter then
         // truncate so the limit reflects what the caller can actually
