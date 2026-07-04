@@ -12669,7 +12669,20 @@ fn blend_and_rank(
             (mem, blended * decay)
         })
         .collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // v0.9.0 P0-1 (#1869) — determinism. `scored` is a `HashMap`, so
+    // `into_values()` yields candidates in per-instance random-seed
+    // order (`coll-map-choice`: HashMap is unordered). A score-only
+    // stable sort therefore preserves that random order for tied
+    // blended scores, so two recalls over an IDENTICAL corpus can
+    // return the same set in a different order — the drift the pure-
+    // recall stability kill-test (recall_purity_p01) caught on the
+    // macOS runner. The unique-`id` secondary key makes the ranking a
+    // total order independent of iteration seed and platform.
+    results.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.id.cmp(&b.0.id))
+    });
     results.truncate(limit);
     (results, weights)
 }
