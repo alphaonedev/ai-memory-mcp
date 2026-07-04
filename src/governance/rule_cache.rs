@@ -59,10 +59,9 @@
 //! **invalidate-on-restart-only** at v0.7.0:
 //!
 //! - The substrate-internal rule-write surface
-//!   ([`crate::governance::rules_store::insert`] /
-//!   [`crate::governance::rules_store::remove`] /
-//!   [`crate::governance::rules_store::set_enabled`] /
-//!   [`crate::governance::rules_store::update_signature`]) does NOT
+//!   ([`crate::governance::rules_store::insert_signed`] /
+//!   [`crate::governance::rules_store::remove_signed`] /
+//!   [`crate::governance::rules_store::set_enabled_signed`]) does NOT
 //!   hold an `Arc<RuleCache>` reference and does NOT call
 //!   [`RuleCache::invalidate_all`] after a write.
 //! - Rule writes happen exclusively via the CLI (`ai-memory rules
@@ -277,7 +276,7 @@ impl RuleCache {
     }
 
     /// Drop every cached entry. Used by the rules_store write paths
-    /// (insert / remove / set_enabled / update_signature) so the next
+    /// (insert_signed / remove_signed / set_enabled_signed) so the next
     /// reader rebuilds against the post-write state.
     #[inline]
     pub fn invalidate_all(&self) {

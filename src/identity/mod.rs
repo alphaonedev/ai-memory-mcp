@@ -70,6 +70,10 @@ use crate::validate;
 // will plumb the loaded `AgentKeypair` through `AppState` for outbound
 // link signing.
 pub mod keypair;
+
+/// v0.9.0 §25.3 S1 (D3-012, #1870) — conservative model-family
+/// normalizer for the model-attestation substrate.
+pub mod model_family;
 // H2 — outbound link signing. Canonical CBOR + Ed25519 sign over the
 // six signable link fields. Consumed by `db::create_link_signed` to
 // fill the previously-dead `signature` BLOB column on `memory_links`.
@@ -566,6 +570,44 @@ pub const IMMUTABLE_PROVENANCE_KEYS: [&str; 3] = [
     crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
     crate::META_KEY_CONSOLIDATED_FROM_AGENTS,
 ];
+
+/// v0.9.0 §25.3 S1 (D3-012, #1870) — metadata key carrying the
+/// normalized model family that produced a memory/reflection.
+pub const META_KEY_MODEL_FAMILY: &str = "model_family";
+/// v0.9.0 §25.3 S1 — metadata key carrying the ATTESTATION LEVEL of
+/// [`META_KEY_MODEL_FAMILY`]: `"loader_observed"` (stamped by the
+/// substrate at generation time) vs `"claimed"` (caller-supplied,
+/// untrusted). Absent ⇒ claimed.
+pub const META_KEY_MODEL_FAMILY_ATTEST: &str = "model_family_attest";
+/// Attest level stamped by the substrate at the LLM-client boundary.
+pub const ATTEST_MODEL_LOADER_OBSERVED: &str = "loader_observed";
+/// Attest level for caller-supplied / downgraded family stamps.
+pub const ATTEST_MODEL_CLAIMED: &str = "claimed";
+
+/// v0.9.0 §25.3 S1 (D3-012, #1870) — fail-safe metadata mutation guard.
+/// When a CALLER mutates a memory's metadata (e.g. via `memory_update`),
+/// any `model_family_attest = "loader_observed"` stamp MUST be
+/// downgraded to `"claimed"`: only the substrate loader may assert
+/// `loader_observed`, so a caller who rewrites metadata cannot preserve
+/// (or forge) a loader attestation. This is the strip/downgrade idiom
+/// (amendment 3) — the fail-SAFE direction (attestation is only ever
+/// LOST across a caller mutation, never gained). Operates in place on
+/// the already-merged metadata object.
+pub fn downgrade_loader_attest_on_caller_mutation(merged: &mut serde_json::Value) {
+    let Some(obj) = merged.as_object_mut() else {
+        return;
+    };
+    if obj
+        .get(META_KEY_MODEL_FAMILY_ATTEST)
+        .and_then(serde_json::Value::as_str)
+        == Some(ATTEST_MODEL_LOADER_OBSERVED)
+    {
+        obj.insert(
+            META_KEY_MODEL_FAMILY_ATTEST.to_string(),
+            serde_json::Value::String(ATTEST_MODEL_CLAIMED.to_string()),
+        );
+    }
+}
 
 /// Preserve the immutable provenance keys ([`IMMUTABLE_PROVENANCE_KEYS`])
 /// from `existing` through an update/dedup metadata overwrite. Returns

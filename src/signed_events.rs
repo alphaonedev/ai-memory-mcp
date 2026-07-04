@@ -226,6 +226,35 @@ pub mod event_types {
     /// Ed25519 signature over that hash.
     pub const GOVERNANCE_RULE_REMOVED: &str = "governance.rule_removed";
 
+    /// v0.9.0 §25.3 S3 (F-40, #1853) — `signed_events.event_type` for an
+    /// operator-authorized governance-rule DISABLE via
+    /// `ai-memory rules disable --sign`
+    /// (`src/governance/rules_store.rs::set_enabled_signed`). Closes the
+    /// two-statement atomicity gap the CLI had before: a disable is a
+    /// silent neuter of an enforcement rule, so it MUST leave a
+    /// tamper-evident residue. `payload_hash` = SHA-256 over the rule's
+    /// canonical signing bytes with `enabled = false` committed;
+    /// `signature` = the operator's Ed25519 over that hash.
+    pub const GOVERNANCE_RULE_DISABLED: &str = "governance.rule_disabled";
+
+    /// v0.9.0 §25.3 S3 (F-40, #1853) — the ENABLE twin of
+    /// [`GOVERNANCE_RULE_DISABLED`], emitted by
+    /// `set_enabled_signed` on `ai-memory rules enable --sign`. Same
+    /// payload/signature shape with `enabled = true` committed.
+    pub const GOVERNANCE_RULE_ENABLED: &str = "governance.rule_enabled";
+
+    /// v0.9.0 §25.3 S4 (F-41, #1853) — `signed_events.event_type` for a
+    /// monotonic policy-version advance, emitted INSIDE the same
+    /// transaction as every signed governance-rule mutation
+    /// (`remove_signed`, `set_enabled_signed`, and the CLI `rules add
+    /// --sign` path). `payload_hash` = SHA-256 over `seq.to_be_bytes()
+    /// || digest`, where `digest` is the whole-ruleset policy digest
+    /// (SHA-256 over the id-sorted canonical bytes of all ENABLED rules,
+    /// see `src/governance/policy_version.rs`) and `seq` is the
+    /// post-advance sequence; `signature` = the operator's Ed25519 over
+    /// that hash. Monotonicity is the append-only event count.
+    pub const GOVERNANCE_POLICY_ADVANCED: &str = "governance.policy_version_advanced";
+
     /// v0.9.0 G13 (#1828) — witness row for an identity-lineage GENESIS
     /// record (epoch 0, self-signed by `K0`). `payload_hash` =
     /// SHA-256 over the `LINEAGE_DOMAIN`-tagged canonical bytes the
@@ -246,6 +275,20 @@ pub mod event_types {
     /// no v0.9.0 production writer emits it (the append paths refuse
     /// `reason = recovery` until the recovery VERIFY path lands).
     pub const IDENTITY_LINEAGE_RECOVERY: &str = "identity.lineage.recovery";
+
+    /// v0.9.0 §25.3 S5 (RQ-10, #1853) — witness row for an accepted,
+    /// operator-signed epoch manifest (the monotonic panel/utility-weight
+    /// freeze for one epoch), written by `ai-memory epoch-apply` in the
+    /// SAME transaction as the resolved `EpochAdvance` checkpoint. The
+    /// row's `payload_hash` is the manifest's content SHA-256 (the triple
+    /// anchor: signed file + resolved checkpoint + this row share ONE
+    /// hash) and `signature` is the operator's Ed25519. The const NAME is
+    /// deliberately `EPOCH_APPLIED` (the L3-boundary gate bans the
+    /// underscore-joined `epoch`+`manifest` spelling in src/ — see
+    /// ROADMAP §25.2/§25.3); the ruled STRING value
+    /// `"epoch.manifest_applied"` is gate-clean because the `.` separator
+    /// breaks the banned pattern.
+    pub const EPOCH_APPLIED: &str = "epoch.manifest_applied";
 }
 
 /// v0.9.0 G13 (#1828) — the three `identity.lineage.*` witness event

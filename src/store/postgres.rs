@@ -273,6 +273,14 @@ const MIGRATION_V76_AGENT_LINEAGE: &str =
 const MIGRATION_V77_RECALL_OBSERVATIONS_FOLDED: &str =
     include_str!("../../migrations/postgres/0036_v77_recall_observations_folded.sql");
 
+/// v78 (#1870, v0.9.0 §25.3 S1 / D3-012) — model attestation substrate
+/// (postgres mirror of the sqlite v78 arm). Pure additive, replay-safe
+/// DDL: CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS. Fresh
+/// schemas carry the table + index inline in `postgres_schema.sql`;
+/// existing schemas pick them up via `migrate_v78`.
+const MIGRATION_V78_MODEL_ATTESTATIONS: &str =
+    include_str!("../../migrations/postgres/0037_v78_model_attestations.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -621,7 +629,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       `folded = TRUE` for pre-existing (sync-touched) rows, probe-
 //       guarded so a replay never re-marks unconsumed rows.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 77;
+const CURRENT_SCHEMA_VERSION: i32 = 78;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1494,8 +1502,11 @@ impl PostgresStore {
         if current_version < 76 {
             self.migrate_v76().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 77 {
             self.migrate_v77().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v78().await?;
         }
 
         Ok(())
@@ -3742,7 +3753,9 @@ impl PostgresStore {
                 .await
                 .map_err(|e| to_store_err("backfill v77 folded = TRUE", e))?;
         }
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // v77 is no longer the ladder head (v78 is); stamp the literal so
+        // the same-run v78 arm advances past it (the v75/v76 precedent).
+        record_schema_version(&mut tx, 77).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v77 ddl", e))?;
@@ -3751,6 +3764,39 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v77 applied (#1869: recall_observations.folded — \
              recall-purity fold ledger state)"
+        );
+        Ok(())
+    }
+
+    /// v0.9.0 §25.3 S1 (D3-012, #1870) — model attestation substrate:
+    /// create the `model_attestations` TOFU table + ladder-owned family
+    /// index (postgres twin of the sqlite v78 arm). Pure additive,
+    /// replay-safe DDL (CREATE TABLE / CREATE INDEX IF NOT EXISTS) in a
+    /// single transaction; stamps `CURRENT_SCHEMA_VERSION` as the new
+    /// ladder head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v78(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v78 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V78_MODEL_ATTESTATIONS)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v78 model_attestations", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v78 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v78 applied (#1870: model_attestations — \
+             loader/operator model-family attestation substrate)"
         );
         Ok(())
     }

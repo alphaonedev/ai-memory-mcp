@@ -89,15 +89,49 @@ fn store_remove_with_no_signature_check_succeeds_at_sql_level() {
 }
 
 #[test]
-fn store_set_enabled_round_trips() {
+fn store_set_enabled_signed_round_trips_and_audits() {
+    // v0.9.0 §25.3 S3 (F-40) — the raw `set_enabled` is now internal
+    // (pub(crate)); the public, audited path is `set_enabled_signed`,
+    // which co-transacts the flip with an operator-signed audit row. This
+    // integration test exercises that path end-to-end (a signed_events +
+    // governance_rules pair, a deterministic operator key).
     let conn = fresh_conn();
+    conn.execute_batch(
+        "CREATE TABLE signed_events (
+             id TEXT PRIMARY KEY,
+             agent_id TEXT NOT NULL,
+             event_type TEXT NOT NULL,
+             payload_hash BLOB NOT NULL,
+             signature BLOB,
+             attest_level TEXT NOT NULL DEFAULT 'unsigned',
+             timestamp TEXT NOT NULL,
+             prev_hash BLOB,
+             sequence INTEGER, cause_hash BLOB
+         );
+         CREATE UNIQUE INDEX idx_signed_events_sequence ON signed_events(sequence);",
+    )
+    .unwrap();
     insert_rule(&conn, "R1");
-    rules_store::set_enabled(&conn, "R1", false).unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+
+    assert!(rules_store::set_enabled_signed(&conn, "R1", false, &key, "operator").unwrap());
     let rule = rules_store::get(&conn, "R1").unwrap().unwrap();
     assert!(!rule.enabled);
-    rules_store::set_enabled(&conn, "R1", true).unwrap();
+
+    assert!(rules_store::set_enabled_signed(&conn, "R1", true, &key, "operator").unwrap());
     let rule = rules_store::get(&conn, "R1").unwrap().unwrap();
     assert!(rule.enabled);
+
+    // Each signed flip left an operator-signed audit row.
+    let audit_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events
+             WHERE event_type IN ('governance.rule_disabled','governance.rule_enabled')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audit_rows, 2, "each signed flip audits exactly once");
 }
 
 #[test]

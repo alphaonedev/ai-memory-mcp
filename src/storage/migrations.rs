@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 77).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 78).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -386,6 +386,27 @@ CREATE TABLE IF NOT EXISTS agent_lineage (
     record_bytes        BLOB    NOT NULL,
     created_at          TEXT    NOT NULL,
     PRIMARY KEY (agent_id, epoch)
+);
+
+-- v0.9.0 §25.3 S1 (#1870, schema v78) — model attestation substrate.
+-- Append-only TOFU record of which model family produced a generation.
+-- Created by migration v78 for upgrading DBs; inline here so a fresh
+-- bootstrap carries it. `agent_id TEXT NOT NULL DEFAULT ''` (NOT
+-- nullable) keeps the UNIQUE TOFU constraint backend-identical. The
+-- `idx_model_attestations_family` index is LADDER-OWNED (the v78 arm),
+-- NOT inline here — the #1861 / v75 bootstrap-inline-index lesson.
+CREATE TABLE IF NOT EXISTS model_attestations (
+    id            TEXT NOT NULL PRIMARY KEY,
+    provider      TEXT NOT NULL,
+    model_ref     TEXT NOT NULL,
+    model_digest  TEXT,
+    model_family  TEXT NOT NULL,
+    attest_level  TEXT NOT NULL
+        CHECK (attest_level IN ('loader_observed','operator_signed')),
+    agent_id      TEXT NOT NULL DEFAULT '',
+    signature     BLOB,
+    created_at    TEXT NOT NULL,
+    UNIQUE (provider, model_ref, model_family, agent_id)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -781,7 +802,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 77;
+const CURRENT_SCHEMA_VERSION: i64 = 78;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1360,6 +1381,15 @@ const MIGRATION_V76_SQLITE: &str =
 // synthetic fixtures (the v58 precedent), in which case the arm skips.
 const MIGRATION_V77_SQLITE: &str =
     include_str!("../../migrations/sqlite/0061_v77_recall_observations_folded.sql");
+// v78 (#1870, v0.9.0 §25.3 S1 / D3-012) — model attestation substrate:
+// the `model_attestations` TOFU table + ladder-owned family index. Pure
+// additive CREATE TABLE IF NOT EXISTS (its own idempotence probe — the
+// v76 precedent); the CREATE INDEX IF NOT EXISTS is ladder-owned and
+// re-asserted unconditionally by the v78 arm (the #1861 bootstrap-inline
+// -index lesson). Fresh installs carry the TABLE (not the index) inline
+// in the bootstrap `SCHEMA` const.
+const MIGRATION_V78_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0062_v78_model_attestations.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3298,6 +3328,23 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v78 = #1870 / v0.9.0 §25.3 S1 (D3-012) — model attestation
+            // substrate. Pure additive CREATE TABLE IF NOT EXISTS (its
+            // own idempotence probe — the v76 precedent): a fresh install
+            // already carries the TABLE inline from the bootstrap SCHEMA
+            // and the re-run is a no-op. Then re-assert the ladder-owned
+            // family index unconditionally (covers both fresh-install and
+            // legacy-open paths — the v74/v77 arm shape; the #1861 lesson
+            // that a bootstrap-INLINE index crashes legacy opens).
+            conn.execute_batch(MIGRATION_V78_SQLITE)?;
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_model_attestations_family \
+                 ON model_attestations(model_family, agent_id)",
+                [],
+            )?;
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -4618,6 +4665,56 @@ mod tests {
         // agent_id_idx proof shape above.
         assert!(column_exists(&conn, "memories", "target_agent_id_idx"));
         assert!(index_exists(&conn, "idx_memories_target_agent_id"));
+
+        // v78 (#1870 / §25.3 S1) — model_attestations table + the
+        // ladder-owned family index. Absent from the legacy v1 schema, so
+        // their presence proves the v78 arm ran on the UPGRADE path.
+        assert!(table_exists(&conn, "model_attestations"));
+        assert!(index_exists(&conn, "idx_model_attestations_family"));
+    }
+
+    /// v0.9.0 §25.3 S1 (#1870) — the FRESH-install path (bootstrap SCHEMA
+    /// + migrate on an empty db) must ALSO carry the model_attestations
+    /// table + its ladder-owned index, column-for-column equivalent to
+    /// the upgrade path. This pins the bootstrap-mirror ↔ migration-arm
+    /// consistency (the v75/#1861 lesson).
+    #[test]
+    fn fresh_install_carries_model_attestations_table_and_index() {
+        // A true fresh install applies the bootstrap SCHEMA (which ships
+        // the model_attestations TABLE inline) THEN runs the ladder
+        // (which adds the ladder-owned index). Mirror that ordering.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).expect("apply bootstrap SCHEMA");
+        migrate(&conn).expect("fresh migrate to CURRENT");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+        assert!(table_exists(&conn, "model_attestations"));
+        assert!(index_exists(&conn, "idx_model_attestations_family"));
+
+        // Column-level shape: the fresh-install table must accept the
+        // TOFU write-once insert AND reject a duplicate (proving the
+        // UNIQUE(provider, model_ref, model_family, agent_id) constraint
+        // with agent_id NOT NULL DEFAULT '' is present).
+        conn.execute(
+            "INSERT INTO model_attestations
+                 (id, provider, model_ref, model_digest, model_family,
+                  attest_level, agent_id, signature, created_at)
+             VALUES ('a','ollama','llama3','x','llama','loader_observed','','',
+                     '2026-07-04T00:00:00Z')",
+            [],
+        )
+        .expect("fresh table accepts a loader row");
+        let dup = conn.execute(
+            "INSERT INTO model_attestations
+                 (id, provider, model_ref, model_digest, model_family,
+                  attest_level, agent_id, signature, created_at)
+             VALUES ('b','ollama','llama3','y','llama','loader_observed','','',
+                     '2026-07-04T00:00:01Z')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "duplicate (provider, model_ref, model_family, agent_id) must violate UNIQUE"
+        );
     }
 
     #[test]

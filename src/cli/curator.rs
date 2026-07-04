@@ -220,6 +220,12 @@ pub async fn run(
 
     if args.once {
         let conn = db::open(db_path)?;
+        // v0.9.0 §25.3 S1 (D3-012, #1870) — TOFU-capture the substrate's
+        // resolved model family at the LLM boundary. Best-effort: a
+        // capture failure never blocks the curator cycle. Only
+        // substrate-invoked generation is attestable, so loader coverage
+        // hard-caps ~40% (ROADMAP.md:1229).
+        capture_loader_attestation(&conn, llm.as_ref());
         let report = curator::run_once(&conn, llm.as_ref(), &cfg, None)?;
         if args.json {
             writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
@@ -257,6 +263,32 @@ pub async fn run(
         shutdown,
     )
     .await
+}
+
+/// v0.9.0 §25.3 S1 (D3-012, #1870) — record a `loader_observed`
+/// model-family attestation for the substrate's resolved LLM client, if
+/// its model normalizes to a known family. Best-effort + TOFU
+/// (write-once): a `None` client, an unknown family, or a SQLite error
+/// is a silent no-op — attestation must never block a curator cycle.
+///
+/// This is a PROCESS-LIFETIME trusted-substrate self-report (the daemon
+/// observed which model IT was configured to call), NOT per-write
+/// cryptographic provenance. Externally authored reflections never reach
+/// this boundary, so loader coverage hard-caps ~40% (ROADMAP.md:1229).
+fn capture_loader_attestation(conn: &rusqlite::Connection, llm: Option<&llm::OllamaClient>) {
+    let Some(client) = llm else {
+        return;
+    };
+    let provider = client.provider_label();
+    let model_ref = client.model_name();
+    let Some(family) = crate::identity::model_family::family_of(provider, model_ref) else {
+        return; // unknown model — never guessed (fail-safe: stays CLAIMED)
+    };
+    if let Err(e) =
+        crate::storage::model_attest::record_loader_observed(conn, provider, model_ref, &family)
+    {
+        tracing::debug!("model-attest: loader_observed capture skipped (swallowed): {e:#}");
+    }
 }
 
 /// v0.8.0 #1749/#1750 — build the curator's [`curator::CompactionConfig`] from

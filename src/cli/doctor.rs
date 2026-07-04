@@ -786,6 +786,38 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
     let pending_count = db::count_pending_actions_by_status(conn, "pending").unwrap_or(0);
     facts.push(("pending_actions_total".into(), pending_count.to_string()));
 
+    // v0.9.0 §25.3 S4 (F-41, #1853) — surface the monotonic policy
+    // version + the ADVISORY digest-reconciliation check. A drift (live
+    // enabled-rule digest != the digest committed by the last signed
+    // `governance.policy_version_advanced` event) means a rule was
+    // mutated outside the signed path. In v0.9 this is advisory ONLY —
+    // it is reported here but never fails the daemon; fail-closed refusal
+    // is the v1.0 cross-node gate.
+    if let Ok(pv) = crate::governance::policy_version::current_policy_version(conn) {
+        facts.push(("policy_version_seq".into(), pv.seq.to_string()));
+        facts.push(("policy_digest".into(), pv.digest_hex()));
+    }
+    match crate::governance::policy_version::verify_policy_digest_advisory(conn) {
+        Ok(true) => {
+            facts.push(("policy_digest_reconciled".into(), "true".into()));
+        }
+        Ok(false) => {
+            facts.push(("policy_digest_reconciled".into(), "false (advisory)".into()));
+            if !matches!(severity, Severity::Critical) {
+                severity = Severity::Warning;
+            }
+            if note.is_none() {
+                note = Some(
+                    "governance policy digest drifted from the last signed policy \
+                     advance (advisory in v0.9; a rule was likely mutated outside the \
+                     signed path)"
+                        .into(),
+                );
+            }
+        }
+        Err(_) => {}
+    }
+
     ReportSection {
         name: "Governance".into(),
         severity,

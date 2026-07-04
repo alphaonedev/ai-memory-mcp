@@ -375,8 +375,11 @@ pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 78;
 /// `Lineage` for the `ai-memory lineage` derivation lineage-DAG walk,
 /// bumping 83 → 84; v0.9.0 G10.1 #1827 added `Capability` for the
 /// `ai-memory capability keygen|mint|attenuate|inspect|verify`
-/// macaroon capability-token lifecycle, bumping 84 → 85.)
-pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 85;
+/// macaroon capability-token lifecycle, bumping 84 → 85; v0.9.0 §25.3
+/// S1 #1870 added `ModelAttest` for the `ai-memory model-attest
+/// list|enroll` model-family attestation substrate CLI, bumping
+/// 85 → 86.)
+pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 86;
 
 /// Variants in `pub enum Command` that COMPILE under `--features sal`
 /// (or `sal-postgres`, which implies sal in `Cargo.toml`). Equals the
@@ -389,8 +392,9 @@ pub const EXPECTED_CLI_SUBCOMMANDS_DEFAULT: usize = 85;
 /// undo-edit` NON-DESTRUCTIVE in-place-edit undo, bumping 84 → 85;
 /// v0.9.0 G13-mem #1859 added `Lineage`, bumping 85 → 86; v0.9.0
 /// G10.1 #1827 added `Capability` (macaroon capability-token
-/// lifecycle), bumping 86 → 87.
-pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 87;
+/// lifecycle), bumping 86 → 87; v0.9.0 §25.3 S1 #1870 added
+/// `ModelAttest`, bumping 87 → 88.
+pub const EXPECTED_CLI_SUBCOMMANDS_SAL: usize = 88;
 
 // ---------------------------------------------------------------------------
 // ARCH-10 (FX-C4-batch2, 2026-05-26) — minimal FFI self-identification

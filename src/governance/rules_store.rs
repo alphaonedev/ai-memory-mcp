@@ -576,16 +576,166 @@ pub fn remove_signed(
         .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
         .with_context(|| format!("rules_store::remove_signed: delete id={id}"))?;
 
+    // v0.9.0 §25.3 S4 (F-41) — advance the policy version in the SAME
+    // transaction as the removal, so the policy surface and the rule
+    // audit row commit atomically together.
+    crate::governance::policy_version::append_policy_advance_no_tx(
+        &tx,
+        signing_key,
+        operator_agent_id,
+    )?;
+
     tx.commit()
         .context("rules_store::remove_signed: commit tx")?;
     Ok(affected > 0)
 }
 
+/// v0.9.0 §25.3 S3 (F-40, #1853) — operator-signed, audited rule
+/// enable/disable. Clones the [`remove_signed`] shape: one
+/// `BEGIN IMMEDIATE` transaction that (1) flips `enabled`, (2) signs the
+/// rule's canonical bytes with `enabled` already committed to the new
+/// value (the L1-6 property — the signature commits to the post-state),
+/// (3) appends the operator-signed `governance.rule_enabled` /
+/// `governance.rule_disabled` audit row, and (4) persists `enabled` +
+/// `signature` + `attest_level = operator_signed` — ALL in the same
+/// transaction. This closes the two-statement atomicity gap the CLI had
+/// before (`set_enabled` then a separate `update_signature`): a disable
+/// is a silent neuter of an enforcement rule, so it must be atomic and
+/// tamper-evident.
+///
+/// Returns `true` when a row was updated, `false` when no row matched
+/// (in which case the empty transaction is committed to release the
+/// write-lock and NO audit event is emitted — mirrors `remove_signed`).
+///
+/// # Errors
+///
+/// Propagates SQLite errors, signing-key/serialisation errors, and
+/// audit-chain INSERT errors.
+pub fn set_enabled_signed(
+    conn: &Connection,
+    id: &str,
+    enabled: bool,
+    signing_key: &ed25519_dalek::SigningKey,
+    operator_agent_id: &str,
+) -> Result<bool> {
+    use ed25519_dalek::Signer;
+
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("rules_store::set_enabled_signed: begin IMMEDIATE tx")?;
+
+    let Some(mut rule) = get(&tx, id)? else {
+        // No matching row — nothing to flip or audit. Commit the empty
+        // transaction so the IMMEDIATE write-lock is released cleanly.
+        tx.commit()
+            .context("rules_store::set_enabled_signed: commit empty tx")?;
+        return Ok(false);
+    };
+
+    // Sign the POST-state: the canonical bytes commit to the new
+    // `enabled` value, so the recorded signature verifies against the
+    // row exactly as it will be persisted (the L1-6 gate property).
+    rule.enabled = enabled;
+    let canonical = canonical_bytes_for_signing(&rule)?;
+
+    // Two signatures, two surfaces, one operator key:
+    //   * `rule_sig` over the RAW canonical bytes goes in the
+    //     `governance_rules.signature` column — this is exactly what the
+    //     load-time L1-6 gate re-checks via `verify_rule_signature`
+    //     (which verifies over `canonical`, not over its hash), so the
+    //     enabled rule keeps passing enforcement after the flip.
+    //   * `event_sig` over the `payload_hash` goes in the audit row —
+    //     the `remove_signed` idiom (the chain commits to the hash).
+    let rule_sig = signing_key.sign(&canonical);
+    let payload_hash = crate::signed_events::payload_hash(&canonical);
+    let event_sig = signing_key.sign(&payload_hash);
+
+    let event_type = if enabled {
+        crate::signed_events::event_types::GOVERNANCE_RULE_ENABLED
+    } else {
+        crate::signed_events::event_types::GOVERNANCE_RULE_DISABLED
+    };
+    let event = crate::signed_events::SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: operator_agent_id.to_string(),
+        event_type: event_type.to_string(),
+        payload_hash,
+        signature: Some(event_sig.to_bytes().to_vec()),
+        attest_level: OPERATOR_SIGNED_ATTEST_LEVEL.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..crate::signed_events::SignedEvent::default()
+    };
+    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+
+    // Persist enabled + signature + attest_level in the SAME tx (folds
+    // in what the separate `update_signature` call did before).
+    tx.execute(
+        "UPDATE governance_rules
+             SET enabled = ?1, signature = ?2, attest_level = ?3
+             WHERE id = ?4",
+        params![
+            i64::from(enabled),
+            rule_sig.to_bytes().to_vec(),
+            OPERATOR_SIGNED_ATTEST_LEVEL,
+            id
+        ],
+    )
+    .with_context(|| format!("rules_store::set_enabled_signed: id={id} enabled={enabled}"))?;
+
+    // v0.9.0 §25.3 S4 (F-41) — advance the policy version in the SAME
+    // transaction as the rule mutation, so the monotonic policy surface
+    // and the rule audit row commit atomically together.
+    crate::governance::policy_version::append_policy_advance_no_tx(
+        &tx,
+        signing_key,
+        operator_agent_id,
+    )?;
+
+    tx.commit()
+        .context("rules_store::set_enabled_signed: commit tx")?;
+    Ok(true)
+}
+
+/// v0.9.0 §25.3 S4 (F-41, #1853) — insert an operator-signed rule and
+/// advance the policy version in ONE transaction. The `rule` is expected
+/// to already carry its operator `signature` + `attest_level`
+/// (the CLI `rules add --sign` path computes them). Used so a signed rule
+/// ADD advances the monotonic policy surface atomically with the insert,
+/// exactly as `remove_signed` / `set_enabled_signed` do for their
+/// mutations.
+///
+/// # Errors
+///
+/// Propagates SQLite errors, canonicalisation errors, and audit-chain
+/// INSERT errors.
+pub fn insert_signed(
+    conn: &Connection,
+    rule: &Rule,
+    signing_key: &ed25519_dalek::SigningKey,
+    operator_agent_id: &str,
+) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .context("rules_store::insert_signed: begin IMMEDIATE tx")?;
+    insert(&tx, rule)?;
+    crate::governance::policy_version::append_policy_advance_no_tx(
+        &tx,
+        signing_key,
+        operator_agent_id,
+    )?;
+    tx.commit()
+        .context("rules_store::insert_signed: commit tx")?;
+    Ok(())
+}
+
 /// Flip the `enabled` column on an existing rule. Returns `true`
 /// when a row was updated, `false` when no row matched.
 ///
-/// Used by `ai-memory rules enable` / `ai-memory rules disable` —
-/// the CLI verifies the operator signature before calling here.
+/// v0.9.0 §25.3 S3 (F-40): SUPERSEDED for production use by the audited,
+/// atomic [`set_enabled_signed`] — the CLI `rules enable`/`disable` verbs
+/// and every `src/` caller now route through that signed path, which
+/// co-transacts the enabled flip with its operator-signed audit row
+/// (closing the two-statement atomicity gap). This raw, unaudited variant
+/// is retained ONLY as an internal / test-fixture primitive; no
+/// production `src/` code calls it.
 ///
 /// # Errors
 ///
@@ -966,6 +1116,124 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM signed_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0, "no audit row may be emitted for a no-op removal");
+    }
+
+    /// v0.9.0 §25.3 S3 (F-40) — `set_enabled_signed` DISABLE must (1)
+    /// flip `enabled` to false, (2) leave exactly one operator-signed
+    /// `governance.rule_disabled` audit row whose signature verifies over
+    /// the payload hash, and (3) persist a rule-column signature that
+    /// still verifies via `verify_rule_signature` (the L1-6 gate) over
+    /// the post-state canonical bytes — all atomically.
+    #[test]
+    fn set_enabled_signed_disable_emits_audit_and_flips_atomically() {
+        use ed25519_dalek::Verifier;
+        let conn = fresh_conn_with_audit();
+        insert(&conn, &make_rule("R1", "bash", true)).unwrap();
+
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let operator_pubkey = signing.verifying_key();
+
+        let ok = set_enabled_signed(&conn, "R1", false, &signing, "operator").unwrap();
+        assert!(ok, "row must be reported updated");
+        let got = get(&conn, "R1").unwrap().unwrap();
+        assert!(!got.enabled, "enabled flipped to false");
+        assert_eq!(got.attest_level, OPERATOR_SIGNED_ATTEST_LEVEL);
+
+        // Rule-column signature verifies over the post-state canonical
+        // bytes (the L1-6 gate keeps accepting the rule).
+        verify_rule_signature(&got, &operator_pubkey)
+            .expect("post-state rule signature must verify over canonical bytes");
+
+        // Exactly one governance.rule_disabled audit row (plus the policy
+        // advance row); its signature verifies over the payload hash.
+        let (event_type, attest_level, payload_hash, sig): (String, String, Vec<u8>, Vec<u8>) =
+            conn.query_row(
+                "SELECT event_type, attest_level, payload_hash, signature FROM signed_events
+                 WHERE event_type = ?1",
+                [crate::signed_events::event_types::GOVERNANCE_RULE_DISABLED],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .expect("exactly one governance.rule_disabled row");
+        assert_eq!(
+            event_type,
+            crate::signed_events::event_types::GOVERNANCE_RULE_DISABLED
+        );
+        assert_eq!(attest_level, OPERATOR_SIGNED_ATTEST_LEVEL);
+        let expected_hash =
+            crate::signed_events::payload_hash(&canonical_bytes_for_signing(&got).unwrap());
+        assert_eq!(payload_hash, expected_hash);
+        let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+        sig_arr.copy_from_slice(&sig);
+        operator_pubkey
+            .verify(
+                &payload_hash,
+                &ed25519_dalek::Signature::from_bytes(&sig_arr),
+            )
+            .expect("event signature verifies over payload hash");
+    }
+
+    /// v0.9.0 §25.3 S3 — the ENABLE twin emits `governance.rule_enabled`.
+    #[test]
+    fn set_enabled_signed_enable_emits_enabled_event() {
+        let conn = fresh_conn_with_audit();
+        insert(&conn, &make_rule("R1", "bash", false)).unwrap();
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+
+        assert!(set_enabled_signed(&conn, "R1", true, &signing, "operator").unwrap());
+        assert!(get(&conn, "R1").unwrap().unwrap().enabled);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+                [crate::signed_events::event_types::GOVERNANCE_RULE_ENABLED],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one governance.rule_enabled row");
+    }
+
+    /// v0.9.0 §25.3 S3 — a missing id returns false and emits NOTHING
+    /// (no rule event, no policy advance).
+    #[test]
+    fn set_enabled_signed_missing_id_returns_false_and_emits_nothing() {
+        let conn = fresh_conn_with_audit();
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        assert!(!set_enabled_signed(&conn, "nope", false, &signing, "operator").unwrap());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM signed_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no audit rows for a no-op flip");
+    }
+
+    /// v0.9.0 §25.3 S3 — tampering the post-state rule row (direct SQL
+    /// mutation after the signed flip) must fail `verify_rule_signature`.
+    #[test]
+    fn set_enabled_signed_tampered_post_state_fails_verification() {
+        let conn = fresh_conn_with_audit();
+        insert(&conn, &make_rule("R1", "bash", true)).unwrap();
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let operator_pubkey = signing.verifying_key();
+        set_enabled_signed(&conn, "R1", false, &signing, "operator").unwrap();
+
+        // Bypass the signed path: directly flip enabled back to true
+        // WITHOUT re-signing. The stored signature now commits to the
+        // wrong post-state and must be rejected.
+        conn.execute(
+            "UPDATE governance_rules SET enabled = 1 WHERE id = 'R1'",
+            [],
+        )
+        .unwrap();
+        let tampered = get(&conn, "R1").unwrap().unwrap();
+        assert!(
+            verify_rule_signature(&tampered, &operator_pubkey).is_err(),
+            "a post-signing direct SQL mutation must fail verification"
+        );
     }
 
     #[test]

@@ -761,6 +761,32 @@ CREATE TABLE IF NOT EXISTS agent_lineage (
 );
 
 -- ─────────────────────────────────────────────────────────────────────
+-- model_attestations — model-family attestation substrate
+-- (v0.9.0 §25.3 S1 #1870 / D3-012, schema v78; mirrors
+-- migrations/postgres/0037_v78_model_attestations.sql — see the sqlite
+-- twin migrations/sqlite/0062_v78_model_attestations.sql for the full
+-- design + honest coverage note). Append-only TOFU record of which model
+-- family produced a generation. `agent_id TEXT NOT NULL DEFAULT ''` (NOT
+-- nullable) keeps the UNIQUE TOFU constraint backend-identical with
+-- sqlite (NULLs would be pairwise-distinct, breaking write-once).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS model_attestations (
+    id            TEXT NOT NULL PRIMARY KEY,
+    provider      TEXT NOT NULL,
+    model_ref     TEXT NOT NULL,
+    model_digest  TEXT,
+    model_family  TEXT NOT NULL,
+    attest_level  TEXT NOT NULL
+        CHECK (attest_level IN ('loader_observed','operator_signed')),
+    agent_id      TEXT NOT NULL DEFAULT '',
+    signature     BYTEA,
+    created_at    TEXT NOT NULL,
+    UNIQUE (provider, model_ref, model_family, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_model_attestations_family
+    ON model_attestations(model_family, agent_id);
+
+-- ─────────────────────────────────────────────────────────────────────
 -- signed_events_dlq — deferred-audit drainer dead-letter queue
 -- (v0.7.0 Cluster-C SEC-3, issue #767, schema v39 Postgres / v40 SQLite).
 --

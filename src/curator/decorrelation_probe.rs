@@ -166,6 +166,101 @@ pub fn compute_producer_dominance(reflections: &[Memory]) -> DominanceReport {
     }
 }
 
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — outcome of the write-time
+/// attested-model-family quorum check. The distinct-family count is
+/// computed over ATTESTED families ONLY: caller-CLAIMED (unattested)
+/// rows contribute NOTHING to the count, so an unattested monoculture can
+/// never be laundered into a "diverse" verdict (the anti-theater
+/// property the D3-021 acceptance mandates).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum QuorumOutcome {
+    /// The corpus + incoming write span `k >= quorum_n` DISTINCT ATTESTED
+    /// model families — the quorum is met.
+    MeetsQuorum {
+        /// The distinct attested-family count (`>= quorum_n`).
+        distinct_attested_families: usize,
+    },
+    /// At least [`MIN_REFLECTIONS_FLOOR`] ATTESTED rows exist but they span
+    /// fewer than `quorum_n` distinct families — a real, evidence-backed
+    /// monoculture. This is the ONLY outcome an `enforce` mode refuses on.
+    AttestedMonoculture {
+        /// Distinct attested families present (`< quorum_n`).
+        distinct_attested_families: usize,
+        /// Total attested rows considered.
+        attested_rows: usize,
+    },
+    /// Fewer than [`MIN_REFLECTIONS_FLOOR`] ATTESTED rows — there is not
+    /// enough attested evidence to assert EITHER diversity OR monoculture.
+    /// A claimed-only corpus lands here (zero attested rows) and is NEVER
+    /// refused (anti-theater; the evasion asymmetry is documented below).
+    InsufficientAttested {
+        /// Attested rows present (`< MIN_REFLECTIONS_FLOOR`).
+        attested_rows: usize,
+    },
+}
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — PURE write-time quorum decision.
+///
+/// `corpus_attested_families` is the multiset of ATTESTED model families
+/// already present in the target namespace's reflection corpus (one entry
+/// per attested row; unattested rows are NOT included by the caller).
+/// `incoming_attested_family` is the incoming write's family IF (and only
+/// if) it is itself attested — a claimed/unknown incoming family is
+/// `None` and contributes nothing.
+///
+/// The distinct-family count is over the DISTINCT attested families across
+/// the corpus + the incoming attested family. `quorum_n` is clamped to a
+/// floor of 2 (a "quorum of 1" is meaningless).
+///
+/// # Evasion asymmetry (honest limitation)
+///
+/// Because refusal fires ONLY on `attested_rows >= MIN_REFLECTIONS_FLOOR`
+/// AND `distinct < quorum_n`, an adversary can AVOID refusal simply by
+/// keeping the attested-row count below the floor with UNATTESTED writes.
+/// This is the deliberate fail-safe direction — the check never refuses on
+/// absent evidence — but it means the gate raises the cost of a
+/// monoculture, it does not make one impossible. The default-live flip
+/// (enforce-as-default) is the v1.0 lane.
+#[must_use]
+pub fn evaluate_write_quorum(
+    corpus_attested_families: &[String],
+    incoming_attested_family: Option<&str>,
+    quorum_n: usize,
+) -> QuorumOutcome {
+    use std::collections::HashSet;
+
+    let quorum_n = quorum_n.max(2);
+
+    // Count attested ROWS (corpus rows + the incoming row iff attested).
+    let attested_rows =
+        corpus_attested_families.len() + usize::from(incoming_attested_family.is_some());
+
+    // Distinct attested families across corpus + incoming.
+    let mut families: HashSet<&str> = corpus_attested_families
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if let Some(f) = incoming_attested_family {
+        families.insert(f);
+    }
+    let distinct = families.len();
+
+    if attested_rows < MIN_REFLECTIONS_FLOOR {
+        return QuorumOutcome::InsufficientAttested { attested_rows };
+    }
+    if distinct >= quorum_n {
+        QuorumOutcome::MeetsQuorum {
+            distinct_attested_families: distinct,
+        }
+    } else {
+        QuorumOutcome::AttestedMonoculture {
+            distinct_attested_families: distinct,
+            attested_rows,
+        }
+    }
+}
+
 /// One namespace's advisory finding — emitted only when the corpus is BOTH big
 /// enough ([`MIN_REFLECTIONS_FLOOR`]) AND dominated past the threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -379,6 +474,95 @@ pub async fn run_decorrelation_probe(
 mod tests {
     use super::*;
     use crate::models::{Memory, MemoryKind, Tier};
+
+    fn fams(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ── v0.9.0 §25.3 S2 (D3-021) evaluate_write_quorum pure core ──────
+
+    #[test]
+    fn quorum_met_with_three_distinct_attested_families() {
+        let corpus = fams(&["llama", "claude"]);
+        let out = evaluate_write_quorum(&corpus, Some("gemma"), 3);
+        assert_eq!(
+            out,
+            QuorumOutcome::MeetsQuorum {
+                distinct_attested_families: 3
+            }
+        );
+    }
+
+    #[test]
+    fn attested_monoculture_refuses_only_on_attested_evidence() {
+        // 3 attested rows, all ONE family → evidence-backed monoculture.
+        let corpus = fams(&["llama", "llama"]);
+        let out = evaluate_write_quorum(&corpus, Some("llama"), 3);
+        assert_eq!(
+            out,
+            QuorumOutcome::AttestedMonoculture {
+                distinct_attested_families: 1,
+                attested_rows: 3
+            }
+        );
+    }
+
+    #[test]
+    fn claimed_only_corpus_is_insufficient_never_refused() {
+        // Zero attested rows (all claimed → excluded by the caller): the
+        // incoming is also unattested. Must be InsufficientAttested, NOT
+        // a monoculture refusal — unattested rows are never laundered
+        // NOR weaponized into a refusal (anti-theater).
+        let out = evaluate_write_quorum(&[], None, 3);
+        assert_eq!(
+            out,
+            QuorumOutcome::InsufficientAttested { attested_rows: 0 }
+        );
+    }
+
+    #[test]
+    fn below_floor_attested_is_insufficient() {
+        // 2 attested rows (< MIN_REFLECTIONS_FLOOR=3) even though distinct.
+        let corpus = fams(&["llama"]);
+        let out = evaluate_write_quorum(&corpus, Some("claude"), 3);
+        assert_eq!(
+            out,
+            QuorumOutcome::InsufficientAttested { attested_rows: 2 }
+        );
+    }
+
+    #[test]
+    fn unattested_incoming_contributes_nothing() {
+        // Corpus has 3 distinct attested families → meets quorum
+        // regardless of the (unattested) incoming.
+        let corpus = fams(&["llama", "claude", "gemma"]);
+        assert_eq!(
+            evaluate_write_quorum(&corpus, None, 3),
+            QuorumOutcome::MeetsQuorum {
+                distinct_attested_families: 3
+            }
+        );
+        // But with only 2 attested families + an UNATTESTED incoming,
+        // the incoming cannot manufacture the third distinct family.
+        let corpus2 = fams(&["llama", "claude", "llama"]);
+        assert_eq!(
+            evaluate_write_quorum(&corpus2, None, 3),
+            QuorumOutcome::AttestedMonoculture {
+                distinct_attested_families: 2,
+                attested_rows: 3
+            }
+        );
+    }
+
+    #[test]
+    fn quorum_n_clamped_to_floor_of_two() {
+        // A nonsensical quorum_n=1 clamps to 2; 2 distinct attested = met.
+        let corpus = fams(&["llama", "claude", "gemma"]);
+        assert!(matches!(
+            evaluate_write_quorum(&corpus, None, 1),
+            QuorumOutcome::MeetsQuorum { .. }
+        ));
+    }
 
     /// Minimal Reflection-kind memory with the given metadata, for dominance math.
     fn refl(id: &str, metadata: serde_json::Value, source: &str) -> Memory {
