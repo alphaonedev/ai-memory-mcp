@@ -2824,6 +2824,60 @@ pub fn spawn_gc_loop(
     )
 }
 
+/// v0.9.0 P0-1 (#1869) — spawn the dedicated sqlite-ledger recall-access
+/// FOLD loop onto `task_handles`, unless
+/// `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0` disables it (the fold then
+/// rides the gc tick in [`spawn_gc_loop_with_shadow_retention`], so count
+/// freshness degrades to the gc cadence rather than stopping). Split out
+/// of `bootstrap_serve` so both arms are unit-tested without a full boot.
+fn spawn_sqlite_fold_loop_if_enabled(
+    task_handles: &mut Vec<JoinHandle<()>>,
+    db_state: &Db,
+    fold_interval_secs: u64,
+) {
+    if fold_interval_secs > 0 {
+        task_handles.push(crate::background::access_fold::spawn(
+            db_state.clone(),
+            Duration::from_secs(fold_interval_secs),
+        ));
+    } else {
+        tracing::info!(
+            "recall-access fold: dedicated loop disabled \
+             (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0); folding rides the gc tick \
+             every {GC_INTERVAL_SECS}s"
+        );
+    }
+}
+
+/// v0.9.0 P0-1 (#1869) — a postgres-backed daemon records recalls through
+/// the SAL trait, so its fold (and the `recall_observation_gc` ledger
+/// pruner) run through the trait via
+/// [`crate::background::access_fold::spawn_sal`]; the sqlite loop above
+/// only folds the local sqlite ledger. Spawns onto `task_handles` only
+/// when `backend` is [`crate::handlers::StorageBackend::Postgres`]. Split
+/// out of `bootstrap_serve` so the backend/interval decision is unit-
+/// tested (with any `MemoryStore`) without a live-PG boot.
+#[cfg(feature = "sal")]
+fn spawn_postgres_fold_loop_if_enabled(
+    task_handles: &mut Vec<JoinHandle<()>>,
+    backend: crate::handlers::StorageBackend,
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    fold_interval_secs: u64,
+) {
+    if matches!(backend, crate::handlers::StorageBackend::Postgres) {
+        let interval = Duration::from_secs(if fold_interval_secs == 0 {
+            GC_INTERVAL_SECS
+        } else {
+            fold_interval_secs
+        });
+        task_handles.push(crate::background::access_fold::spawn_sal(
+            store.clone(),
+            interval,
+            crate::observations::gc::ttl_days(),
+        ));
+    }
+}
+
 /// Cluster G (#767) — `spawn_gc_loop` variant that takes an explicit
 /// shadow-observation retention window. Used by `bootstrap_serve` so
 /// the operator-tunable `[confidence] shadow_retention_days` from
@@ -4808,75 +4862,21 @@ pub async fn bootstrap_serve(
         crate::background::lease_sweep::DEFAULT_INTERVAL,
     ));
 
-    // v0.9.0 P0-1 (#1869) — dedicated recall-access FOLD loop (default
-    // 60 s). With recall pure by default, this loop applies the access
-    // ladders from unfolded `recall_observations` rows. INTERVAL=0
-    // disables the dedicated loop; the fold still runs at the top of
-    // every gc tick (spawn_gc_loop_with_shadow_retention), so count
-    // freshness degrades to the 30-min gc cadence rather than stopping.
+    // v0.9.0 P0-1 (#1869) — recall-access FOLD loops. The dedicated
+    // sqlite-ledger loop (default 60 s) + the postgres SAL loop each live
+    // behind a small `*_if_enabled` helper so the interval/backend
+    // decisions are unit-tested without a full daemon boot (the spawn-
+    // then-abort tests below); the loop bodies live in
+    // `background::access_fold`.
     let fold_interval_secs = crate::config::access_fold_interval_secs();
-    if fold_interval_secs > 0 {
-        task_handles.push(crate::background::access_fold::spawn(
-            db_state.clone(),
-            Duration::from_secs(fold_interval_secs),
-        ));
-    } else {
-        tracing::info!(
-            "recall-access fold: dedicated loop disabled \
-             (AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS=0); folding rides the gc tick \
-             every {GC_INTERVAL_SECS}s"
-        );
-    }
-
-    // v0.9.0 P0-1 (#1869) — postgres SAL fold loop: the sqlite loops
-    // above fold the local sqlite ledger only; a postgres-backed daemon
-    // records its recalls through the SAL trait, so the fold (and the
-    // previously caller-less `recall_observation_gc` ledger pruner —
-    // T7c) must run through the trait too. The pruner rides the same
-    // loop on a coarser cadence (~hourly).
+    spawn_sqlite_fold_loop_if_enabled(&mut task_handles, &db_state, fold_interval_secs);
     #[cfg(feature = "sal")]
-    if matches!(
+    spawn_postgres_fold_loop_if_enabled(
+        &mut task_handles,
         app_state.storage_backend,
-        crate::handlers::StorageBackend::Postgres
-    ) {
-        let fold_store = app_state.store.clone();
-        let interval = Duration::from_secs(if fold_interval_secs == 0 {
-            GC_INTERVAL_SECS
-        } else {
-            fold_interval_secs
-        });
-        let prune_every = (crate::SECS_PER_HOUR.unsigned_abs() / interval.as_secs().max(1)).max(1);
-        task_handles.push(tokio::spawn(async move {
-            let mut ticks: u64 = 0;
-            loop {
-                tokio::time::sleep(interval).await;
-                match fold_store.fold_recall_accesses().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(
-                        target: crate::background::access_fold::TRACE_TARGET,
-                        "recall-access fold (postgres) applied {n} memory(ies)"
-                    ),
-                    Err(e) => tracing::warn!(
-                        target: crate::background::access_fold::TRACE_TARGET,
-                        "recall-access fold (postgres) failed: {e}"
-                    ),
-                }
-                ticks += 1;
-                if ticks % prune_every == 0 {
-                    match fold_store
-                        .recall_observation_gc(crate::observations::gc::ttl_days())
-                        .await
-                    {
-                        Ok(n) if n > 0 => {
-                            tracing::info!("recall_observations gc (postgres): pruned {n} row(s)")
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("recall_observations gc (postgres) failed: {e}"),
-                    }
-                }
-            }
-        }));
-    }
+        &app_state.store,
+        fold_interval_secs,
+    );
 
     // v0.6.0 GA: periodic WAL checkpoint. Under continuous writes the WAL
     // file grows until SQLite's auto-checkpoint fires (every 1000 pages by
@@ -6935,6 +6935,105 @@ mod tests {
         for h in bs.task_handles {
             h.abort();
         }
+    }
+
+    // ----- P0-1 (#1869) fold-loop wiring helpers ------------------------
+    // These cover the interval/backend DECISIONS in bootstrap_serve
+    // without a full daemon boot: a throwaway sqlite store stands in for
+    // any `MemoryStore`, and the spawned loops are aborted before their
+    // first interval elapses, so no background pass ever runs.
+
+    #[tokio::test]
+    async fn spawn_sqlite_fold_loop_if_enabled_spawns_when_interval_positive() {
+        let env = TestEnv::fresh();
+        let db_state: Db = Arc::new(Mutex::new((
+            db::open(&env.db_path).unwrap(),
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_sqlite_fold_loop_if_enabled(&mut handles, &db_state, 60);
+        assert_eq!(handles.len(), 1, "positive interval spawns the loop");
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_sqlite_fold_loop_if_enabled_skips_when_interval_zero() {
+        let env = TestEnv::fresh();
+        let db_state: Db = Arc::new(Mutex::new((
+            db::open(&env.db_path).unwrap(),
+            env.db_path.clone(),
+            ResolvedTtl::default(),
+            true,
+        )));
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_sqlite_fold_loop_if_enabled(&mut handles, &db_state, 0);
+        assert!(
+            handles.is_empty(),
+            "INTERVAL=0 disables the dedicated loop (fold rides the gc tick)"
+        );
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn spawn_postgres_fold_loop_if_enabled_spawns_for_postgres_backend() {
+        // The backend TAG is independent of the store type, so a cheap
+        // real sqlite store stands in — no postgres connection, no
+        // schema mutation. The loop is aborted before its first tick.
+        let env = TestEnv::fresh();
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
+        );
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_postgres_fold_loop_if_enabled(
+            &mut handles,
+            crate::handlers::StorageBackend::Postgres,
+            &store,
+            60,
+        );
+        assert_eq!(
+            handles.len(),
+            1,
+            "postgres backend spawns the SAL fold loop"
+        );
+        // Also exercise the INTERVAL=0 → gc-cadence interval branch.
+        spawn_postgres_fold_loop_if_enabled(
+            &mut handles,
+            crate::handlers::StorageBackend::Postgres,
+            &store,
+            0,
+        );
+        assert_eq!(
+            handles.len(),
+            2,
+            "INTERVAL=0 still spawns on the gc cadence"
+        );
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn spawn_postgres_fold_loop_if_enabled_skips_for_sqlite_backend() {
+        let env = TestEnv::fresh();
+        let store: std::sync::Arc<dyn crate::store::MemoryStore> = std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open sqlite store"),
+        );
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
+        spawn_postgres_fold_loop_if_enabled(
+            &mut handles,
+            crate::handlers::StorageBackend::Sqlite,
+            &store,
+            60,
+        );
+        assert!(
+            handles.is_empty(),
+            "the sqlite backend does not spawn the SAL fold loop"
+        );
     }
 
     #[tokio::test]

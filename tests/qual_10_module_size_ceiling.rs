@@ -935,6 +935,18 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // wiring is load-bearing for TTL correctness (a recalled row must
     // be extended before eviction is evaluated). 9_500 = 9_396 + 104
     // headroom.
+    // 2026-07-04 — #1869 P0-1 coverage follow-up (Per-Module Coverage
+    // gate went RED at 85.73% < 86% because the inline postgres SAL fold
+    // loop was reachable only via a live-PG boot). EXTRACTED that loop
+    // body into the mock-tested `background::access_fold::spawn_sal`
+    // (mirroring the sqlite `spawn` twin) and split the bootstrap fold-
+    // wiring decisions into `spawn_{sqlite,postgres}_fold_loop_if_enabled`
+    // helpers + their four deterministic unit tests (spawn-then-abort, no
+    // daemon boot). Net: the file settled at 9_493 — the extracted loop
+    // body left, the helpers + coverage tests arrived. The ceiling is
+    // aspirational / never ratchets down (see
+    // qual_10_ceiling_table_is_aspirational_not_ratcheting_up), so 9_500
+    // stands (7 LOC headroom).
     ("src/daemon_runtime.rs", 9_500),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
