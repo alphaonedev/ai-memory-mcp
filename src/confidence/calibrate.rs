@@ -85,6 +85,16 @@ pub struct PerSourceBaseline {
     /// `[0.0, 0.1)` … `[0.9, 1.0]` so a downstream UI can plot a
     /// histogram without re-reading the observation table.
     pub buckets: [u64; 10],
+    /// v0.9.0 §11.5 (#1706) — `COUNT(recall_outcome = 'consumed') /
+    /// COUNT(recall_outcome IS NOT NULL)` for this `(namespace, source)`
+    /// group. **SHADOW MODE — logged only, never consulted by
+    /// [`crate::storage::recall`].** `None` when no shadow row in the
+    /// window has a correlated `recall_observations` ledger entry yet
+    /// (either the ledger is absent/empty, or the offline sweep hasn't
+    /// run — see [`crate::confidence::shadow::backfill_recall_outcomes`]).
+    /// This is the future #1707/#C live-wire decision's evidence base,
+    /// not a ranking input.
+    pub consumption_utility: Option<f64>,
 }
 
 /// Top-level calibration report emitted by the sweep.
@@ -113,29 +123,51 @@ pub fn calibrate_from_shadow(
     let since_dt = now - Duration::days(days);
     let since = since_dt.to_rfc3339();
 
-    // Pass 1: per-group count + mean, computed entirely in SQL. The
-    // denormalised `source` column (schema v40) lets us avoid the
-    // INNER JOIN against `memories` that pre-Cluster-G code carried.
+    // v0.9.0 §11.5 (#1706) — offline sweep step, ridden on this existing
+    // cadence (no new hot-path code, no new schema): backfill
+    // `recall_outcome` for any shadow row a `recall_observations` ledger
+    // entry has since appeared for. SHADOW MODE — the backfilled column
+    // only feeds `consumption_utility` below; it is never read by
+    // `crate::storage::recall`. Skip-with-WARN (item 4) is handled
+    // inside `backfill_recall_outcomes` itself, so this call never fails
+    // the report just because the ledger is absent.
+    let backfilled = crate::confidence::shadow::backfill_recall_outcomes(conn)?;
+    if backfilled > 0 {
+        tracing::info!(
+            target: "confidence.calibrate",
+            backfilled,
+            "shadow sweep: backfilled recall_outcome from the recall_observations ledger"
+        );
+    }
+
+    // Pass 1: per-group count + mean + consumption tallies, computed
+    // entirely in SQL. The denormalised `source` column (schema v40)
+    // lets us avoid the INNER JOIN against `memories` that
+    // pre-Cluster-G code carried.
     let mut stmt = conn.prepare(
-        "SELECT namespace, source, COUNT(*), AVG(derived_confidence)
+        "SELECT namespace, source, COUNT(*), AVG(derived_confidence),
+                SUM(CASE WHEN recall_outcome = 'consumed' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN recall_outcome IS NOT NULL THEN 1 ELSE 0 END)
          FROM confidence_shadow_observations
          WHERE observed_at >= ?1
          GROUP BY namespace, source
          ORDER BY namespace, source",
     )?;
-    let groups: Vec<(String, String, i64, f64)> = stmt
+    let groups: Vec<(String, String, i64, f64, i64, i64)> = stmt
         .query_map(params![since.as_str()], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, f64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
-    let total_observations: u64 = groups.iter().map(|(_, _, c, _)| *c as u64).sum();
+    let total_observations: u64 = groups.iter().map(|(_, _, c, ..)| *c as u64).sum();
 
     // Pass 2: per-group cursor scan for median + bucket histogram.
     // The compound (namespace, source, observed_at) index from
@@ -150,7 +182,7 @@ pub fn calibrate_from_shadow(
     )?;
 
     let mut baselines: Vec<PerSourceBaseline> = Vec::with_capacity(groups.len());
-    for (namespace, source, count_i64, mean) in groups {
+    for (namespace, source, count_i64, mean, consumed_i64, judged_i64) in groups {
         if count_i64 <= 0 {
             continue;
         }
@@ -174,6 +206,31 @@ pub fn calibrate_from_shadow(
         } else {
             values[values.len() / 2]
         };
+
+        // v0.9.0 §11.5 (#1706) — consumption_utility = consumed / judged,
+        // over the rows this window's backfill could actually correlate
+        // against the ledger. `None` (not zero) when `judged_i64 == 0` —
+        // an honest "no evidence yet" rather than a misleading 0.0 that
+        // would read as "never consumed".
+        let consumption_utility = if judged_i64 > 0 {
+            Some(consumed_i64 as f64 / judged_i64 as f64)
+        } else {
+            None
+        };
+        if let Some(cu) = consumption_utility {
+            // SHADOW MODE — logged only; `crate::storage::recall` never
+            // reads this. Evidence for the future #1707/#C live-wire
+            // decision, not a ranking input.
+            tracing::info!(
+                target: "confidence.calibrate",
+                namespace = %namespace,
+                source = %source,
+                consumption_utility = cu,
+                judged = judged_i64,
+                "shadow consumption utility (SHADOW MODE — not consulted by recall())"
+            );
+        }
+
         baselines.push(PerSourceBaseline {
             namespace,
             source,
@@ -181,6 +238,7 @@ pub fn calibrate_from_shadow(
             median,
             mean,
             buckets,
+            consumption_utility,
         });
     }
     drop(median_stmt);
@@ -297,5 +355,84 @@ mod tests {
         let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
         assert_eq!(report.total_observations, 0);
         assert!(report.baselines.is_empty());
+    }
+
+    /// v0.9.0 §11.5 (#1706) — no `recall_observations` ledger entry for
+    /// any shadow row in the window ⇒ `consumption_utility` stays
+    /// `None` (an honest "no evidence yet", never a misleading `0.0`).
+    #[test]
+    fn consumption_utility_is_none_without_ledger_evidence() {
+        let (conn, _dir) = open_tmp();
+        seed_mem(&conn, "m1", "ns", "user");
+        observe(&conn, "m1", "ns", "user", 0.9, 0.5, &signals(), None).unwrap();
+
+        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let b = &report.baselines[0];
+        assert_eq!(
+            b.consumption_utility, None,
+            "no ledger row correlated ⇒ None, not 0.0"
+        );
+    }
+
+    /// v0.9.0 §11.5 (#1706) — `calibrate_from_shadow` rides the offline
+    /// sweep: it backfills `recall_outcome` from the
+    /// `recall_observations` ledger BEFORE aggregating, so
+    /// `consumption_utility` reflects consumption that happened after
+    /// the shadow row was first observed.
+    #[test]
+    fn calibrate_from_shadow_backfills_and_computes_consumption_utility() {
+        let (conn, _dir) = open_tmp();
+        seed_mem(&conn, "m1", "ns", "user");
+        seed_mem(&conn, "m2", "ns", "user");
+        seed_mem(&conn, "consumer", "ns", "user");
+        observe(&conn, "m1", "ns", "user", 0.9, 0.5, &signals(), None).unwrap();
+        observe(&conn, "m2", "ns", "user", 0.9, 0.6, &signals(), None).unwrap();
+
+        crate::observations::record_recall(
+            &conn,
+            "r1",
+            &[
+                crate::observations::Candidate {
+                    memory_id: "m1",
+                    retriever: "hybrid",
+                    rank: 1,
+                    score: 0.9,
+                },
+                crate::observations::Candidate {
+                    memory_id: "m2",
+                    retriever: "hybrid",
+                    rank: 2,
+                    score: 0.8,
+                },
+            ],
+        )
+        .unwrap();
+        // Only m1 gets cited downstream — m2 was recalled but unused.
+        crate::observations::mark_consumed(&conn, "r1", &["m1"], "consumer").unwrap();
+
+        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let b = &report.baselines[0];
+        assert_eq!(b.source, "user");
+        // 1 of 2 judged rows consumed ⇒ 0.5.
+        assert!(
+            (b.consumption_utility.expect("must have evidence") - 0.5).abs() < 1e-9,
+            "got {:?}",
+            b.consumption_utility
+        );
+
+        // The backfill is durable in the substrate, not just report-local:
+        // a fresh read of the shadow table shows the stamped outcomes.
+        let rows = crate::confidence::shadow::observations_since(&conn, Some("ns"), None)
+            .expect("read back");
+        let m1_outcome = rows
+            .iter()
+            .find(|r| r.memory_id == "m1")
+            .and_then(|r| r.recall_outcome.clone());
+        let m2_outcome = rows
+            .iter()
+            .find(|r| r.memory_id == "m2")
+            .and_then(|r| r.recall_outcome.clone());
+        assert_eq!(m1_outcome.as_deref(), Some("consumed"));
+        assert_eq!(m2_outcome.as_deref(), Some("unconsumed"));
     }
 }

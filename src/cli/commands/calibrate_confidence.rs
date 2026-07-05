@@ -112,10 +112,16 @@ pub fn run(db_path: &Path, args: &CalibrateConfidenceArgs, out: &mut CliOutput<'
 /// ```text
 /// CONFIDENCE CALIBRATION REPORT (window: 30 days, observations: 42)
 ///
-/// NAMESPACE         SOURCE       COUNT  MEDIAN  MEAN   HISTOGRAM (0.0..1.0)
-/// ai-memory-mcp     user         12     0.62    0.61   ..#.##.#.##
-/// ai-memory-mcp     claude       8      0.74    0.73   ...#####.#.
+/// NAMESPACE         SOURCE       COUNT  MEDIAN  MEAN    UTIL  HISTOGRAM (0.0..1.0)
+/// ai-memory-mcp     user         12     0.62    0.61    0.50  ..#.##.#.##
+/// ai-memory-mcp     claude       8      0.74    0.73    n/a   ...#####.#.
 /// ```
+///
+/// `UTIL` is the v0.9.0 §11.5 (#1706) shadow-mode `consumption_utility`
+/// — `n/a` when no shadow row in this group has a correlated
+/// `recall_observations` ledger entry yet. **SHADOW MODE — surfaced
+/// here for operator visibility only; `crate::storage::recall` never
+/// reads it.**
 fn render_table(report: &CalibrationReport) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -123,8 +129,8 @@ fn render_table(report: &CalibrationReport) -> String {
         report.window_days, report.total_observations
     ));
     out.push_str(&format!(
-        "{:<24}  {:<12}  {:>6}  {:>6}  {:>6}  HISTOGRAM (0.0..1.0)\n",
-        "NAMESPACE", "SOURCE", "COUNT", "MEDIAN", "MEAN"
+        "{:<24}  {:<12}  {:>6}  {:>6}  {:>6}  {:>6}  HISTOGRAM (0.0..1.0)\n",
+        "NAMESPACE", "SOURCE", "COUNT", "MEDIAN", "MEAN", "UTIL"
     ));
     if report.baselines.is_empty() {
         out.push_str("(no observations in window)\n");
@@ -136,8 +142,11 @@ fn render_table(report: &CalibrationReport) -> String {
             .iter()
             .map(|c| if *c == 0 { '.' } else { '#' })
             .collect();
+        let util = b
+            .consumption_utility
+            .map_or_else(|| "n/a".to_string(), |u| format!("{u:.2}"));
         out.push_str(&format!(
-            "{:<24}  {:<12}  {:>6}  {:>6.2}  {:>6.2}  {hist}\n",
+            "{:<24}  {:<12}  {:>6}  {:>6.2}  {:>6.2}  {util:>6}  {hist}\n",
             b.namespace, b.source, b.count, b.median, b.mean,
         ));
     }
@@ -234,11 +243,34 @@ mod tests {
                 median: 0.5,
                 mean: 0.55,
                 buckets: [0, 0, 1, 0, 1, 1, 0, 0, 0, 0],
+                consumption_utility: Some(0.75),
             }],
         };
         let s = render_table(&r);
         assert!(s.contains("ns"));
         assert!(s.contains("user"));
         assert!(s.contains("0.50"));
+        assert!(s.contains("0.75"), "UTIL column must render: {s}");
+    }
+
+    /// v0.9.0 §11.5 (#1706) — `consumption_utility: None` renders as
+    /// `n/a`, never a misleading `0.00`.
+    #[test]
+    fn render_table_shows_na_for_missing_consumption_utility() {
+        let r = CalibrationReport {
+            window_days: 7,
+            total_observations: 1,
+            baselines: vec![crate::confidence::calibrate::PerSourceBaseline {
+                namespace: "ns".to_string(),
+                source: "user".to_string(),
+                count: 1,
+                median: 0.5,
+                mean: 0.5,
+                buckets: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                consumption_utility: None,
+            }],
+        };
+        let s = render_table(&r);
+        assert!(s.contains("n/a"), "no-evidence group must show n/a: {s}");
     }
 }
