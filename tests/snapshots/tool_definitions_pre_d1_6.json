@@ -2128,6 +2128,10 @@
           "inline_skill": {
             "description": "Raw SKILL.md text (frontmatter + body).",
             "type": "string"
+          },
+          "parameters_schema": {
+            "description": "Optional JSON Schema-shaped object describing the skill's invocation parameters. Structurally validated and REJECTED (fail-closed) at register time when malformed; stored in `skills.metadata.parameters_schema`.",
+            "type": "object"
           }
         },
         "type": "object"

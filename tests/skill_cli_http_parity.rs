@@ -473,6 +473,7 @@ fn cli_skill_register_inline_smoke_v2() {
         action: SkillAction::Register(RegisterArgs {
             manifest: None,
             inline: Some(minimal_skill_md("cli-register-v2")),
+            parameters_schema: None,
             json: true,
         }),
     };

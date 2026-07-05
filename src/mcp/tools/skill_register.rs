@@ -66,6 +66,115 @@ pub(super) fn resource_digest(content: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.0 §11.5 B7-SKILL (#1865) — parameters_schema fail-closed validation
+// ---------------------------------------------------------------------------
+
+/// Structurally validate an optional `parameters_schema` value at the
+/// REGISTER boundary — FAIL CLOSED (#1865). Skill rows are admin-minted
+/// executable artefacts (#949): a malformed schema must be rejected when
+/// the skill is minted, never deferred to activation (`memory_skill_get`).
+///
+/// No external jsonschema-validator crate is a dependency of this crate,
+/// so validation is structural rather than full JSON-Schema-draft
+/// conformance: the top-level value must be a JSON object; when present,
+/// `type` must be the string `"object"`; `properties` (when present) must
+/// be an object whose every value is itself a JSON object; `required`
+/// (when present) must be an array of strings, each naming a key that
+/// actually exists in `properties`.
+///
+/// # Errors
+///
+/// Returns an [`anyhow::Error`] describing the first structural violation
+/// encountered. The callers (`handle_skill_register` /
+/// `handle_skill_promote_from_reflection`) `.map_err(|e| format!(...))`
+/// it into their `String`-error surface with a fail-closed prefix; the
+/// helper itself uses `anyhow` per the QUAL-7 "new validation helpers
+/// should return `Result<(), MemoryError>` or anyhow" discipline.
+pub(super) fn validate_parameters_schema(schema: &Value) -> anyhow::Result<()> {
+    let obj = schema
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("parameters_schema must be a JSON object"))?;
+
+    if let Some(ty) = obj.get("type") {
+        if ty.as_str() != Some("object") {
+            anyhow::bail!("parameters_schema.type must be \"object\" when present: got {ty}");
+        }
+    }
+
+    let properties = match obj.get(field_names::PROPERTIES) {
+        Some(props) => Some(props.as_object().ok_or_else(|| {
+            anyhow::anyhow!("parameters_schema.properties must be a JSON object")
+        })?),
+        None => None,
+    };
+    if let Some(props_obj) = properties {
+        for (key, val) in props_obj {
+            if !val.is_object() {
+                anyhow::bail!("parameters_schema.properties.{key} must be a JSON object schema");
+            }
+        }
+    }
+
+    if let Some(required) = obj.get("required") {
+        let req_arr = required.as_array().ok_or_else(|| {
+            anyhow::anyhow!("parameters_schema.required must be a JSON array of strings")
+        })?;
+        for r in req_arr {
+            let name = r.as_str().ok_or_else(|| {
+                anyhow::anyhow!("parameters_schema.required entries must be strings")
+            })?;
+            let known = properties.is_some_and(|p| p.contains_key(name));
+            if !known {
+                anyhow::bail!("parameters_schema.required references unknown property '{name}'");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.0 §11.5 B7-SKILL (#1865) — version-chain surfacing
+// ---------------------------------------------------------------------------
+
+/// Walk the `superseded_by` chain BACKWARD from `skill_id`, counting how
+/// many rows precede it (inclusive of itself), to derive its 1-indexed
+/// position in the (namespace, name) version chain.
+///
+/// The chain already exists at register time (each re-register sets the
+/// prior current row's `superseded_by` to the new row's id) — this is a
+/// pure read-side derivation, no new column. Works for the current
+/// (non-superseded) row and for any old, already-superseded row: the walk
+/// only asks "who did I supersede?", which is independent of whether
+/// something newer exists ahead of `skill_id`.
+///
+/// A lookup failure on any hop is treated identically to "no predecessor"
+/// (`.ok()`) — the worst case is undercounting a chain on a transient SQL
+/// hiccup, never a hard failure of the caller's read/write path.
+#[must_use]
+pub(super) fn compute_skill_version(conn: &Connection, skill_id: &str) -> i64 {
+    let mut version: i64 = 1;
+    let mut current = skill_id.to_string();
+    loop {
+        let prev: Option<String> = conn
+            .query_row(
+                "SELECT id FROM skills WHERE superseded_by = ?1",
+                params![current],
+                |row| row.get(0),
+            )
+            .ok();
+        match prev {
+            Some(p) => {
+                version += 1;
+                current = p;
+            }
+            None => break,
+        }
+    }
+    version
+}
+
+// ---------------------------------------------------------------------------
 // zstd helpers
 // ---------------------------------------------------------------------------
 
@@ -82,6 +191,9 @@ pub(super) struct RegisterResult {
     pub id: String,
     pub digest: Vec<u8>,
     pub superseded: Option<String>,
+    /// v0.9.0 §11.5 B7-SKILL (#1865) — 1-indexed position of `id` in its
+    /// (namespace, name) version chain (see [`compute_skill_version`]).
+    pub version: i64,
 }
 
 /// Core registration logic shared by the folder and inline paths.
@@ -233,10 +345,14 @@ pub(super) fn register_core(
     };
     let _ = append_signed_event(conn, &event); // best-effort; don't fail registration on audit err
 
+    // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain position.
+    let version = compute_skill_version(conn, &new_id);
+
     Ok(RegisterResult {
         id: new_id,
         digest,
         superseded,
+        version,
     })
 }
 
@@ -284,6 +400,32 @@ pub fn handle_skill_register(
     // -----------------------------------------------------------------------
     let manifest = skill_md::parse(&skill_md_text)?;
 
+    // v0.9.0 §11.5 B7-SKILL (#1865) — accept + VALIDATE `parameters_schema`
+    // at REGISTER time. FAIL CLOSED here (before any DB write below): skill
+    // rows are admin-minted executable artefacts (#949), so a malformed
+    // schema must be rejected at mint time, not deferred to activation
+    // (`memory_skill_get`).
+    let parameters_schema: Option<&Value> = params
+        .get(field_names::PARAMETERS_SCHEMA)
+        .filter(|v| !v.is_null());
+    if let Some(schema) = parameters_schema {
+        validate_parameters_schema(schema)
+            .map_err(|e| format!("parameters_schema rejected at register (fail-closed): {e}"))?;
+    }
+
+    // Mirror `parameters_schema` into the metadata JSON blob (same
+    // pattern L2-7's `composes_with_reflections` uses) so it rides the
+    // EXISTING `skills.metadata` column — no schema migration. Only
+    // inserted when the frontmatter's own metadata parsed to an object
+    // (always true for `skill_md::parse` output) and the caller supplied
+    // a schema.
+    let mut metadata = manifest.metadata.clone();
+    if let Some(schema) = parameters_schema {
+        if let Value::Object(ref mut map) = metadata {
+            map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
+        }
+    }
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
     // audit. Skill registration mints an executable capability bundle
     // in the substrate; emit the forensic-chain row BEFORE the storage
@@ -320,7 +462,7 @@ pub fn handle_skill_register(
         manifest.license.as_deref(),
         manifest.compatibility.as_deref(),
         &manifest.allowed_tools,
-        &manifest.metadata,
+        &metadata,
         body_bytes,
         res_digests,
         &resource_files,
@@ -335,6 +477,10 @@ pub fn handle_skill_register(
         "name": manifest.name,
         "digest": digest_hex,
         "signed": active_keypair.is_some(),
+        // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
+        // position; the chain itself already existed (supersede-on-
+        // register), this just exposes it on the wire.
+        "version": result.version,
     });
     if let Some(prev) = result.superseded {
         response[field_names::SUPERSEDED_ID] = json!(prev);
@@ -427,6 +573,13 @@ pub struct SkillRegisterRequest {
     /// Raw SKILL.md text (frontmatter + body).
     #[serde(default)]
     pub inline_skill: Option<String>,
+
+    /// v0.9.0 §11.5 B7-SKILL (#1865) — optional JSON Schema-shaped
+    /// object describing the skill's invocation parameters. Structurally
+    /// validated and REJECTED (fail-closed) at register time when
+    /// malformed; stored in `skills.metadata.parameters_schema`.
+    #[serde(default)]
+    pub parameters_schema: Option<serde_json::Value>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_register`.
@@ -802,5 +955,181 @@ mod tests {
     fn hex_encode_empty_and_bytes() {
         assert_eq!(hex::encode(&[]), "");
         assert_eq!(hex::encode(&[0x00, 0xff, 0xab]), "00ffab");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9.0 §11.5 B7-SKILL (#1865) — parameters_schema fail-closed
+    // validation at register.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_parameters_schema_accepts_well_formed() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+            },
+            "required": ["path"],
+        });
+        validate_parameters_schema(&schema).expect("well-formed schema must validate");
+    }
+
+    #[test]
+    fn validate_parameters_schema_accepts_empty_object() {
+        validate_parameters_schema(&json!({})).expect("empty object is valid");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_non_object_top_level() {
+        let err = validate_parameters_schema(&json!("not-an-object"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a JSON object"), "{err}");
+        let err = validate_parameters_schema(&json!(["a", "b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_non_object_type() {
+        let err = validate_parameters_schema(&json!({"type": "array"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("type must be"), "{err}");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_non_object_properties() {
+        let err = validate_parameters_schema(&json!({"properties": "nope"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("properties must be a JSON object"), "{err}");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_non_object_property_entry() {
+        let err = validate_parameters_schema(&json!({"properties": {"path": "not-a-schema"}}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("properties.path"), "{err}");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_non_array_required() {
+        let err = validate_parameters_schema(&json!({"required": "path"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("required must be a JSON array"), "{err}");
+    }
+
+    #[test]
+    fn validate_parameters_schema_rejects_required_referencing_unknown_property() {
+        let schema = json!({
+            "properties": {"path": {"type": "string"}},
+            "required": ["path", "ghost"],
+        });
+        let err = validate_parameters_schema(&schema).unwrap_err().to_string();
+        assert!(err.contains("unknown property 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn handle_skill_register_rejects_malformed_parameters_schema() {
+        let (conn, _dir) = open_db();
+        let inline = minimal_skill_md("bad-schema-skill");
+        let err = handle_skill_register(
+            &conn,
+            &json!({
+                "inline_skill": inline,
+                "parameters_schema": "not-an-object",
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("fail-closed") && err.contains("must be a JSON object"),
+            "must fail closed at register: {err}"
+        );
+        // No row must have been minted — fail-closed means BEFORE the
+        // storage write, not a rollback of a partial one.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "malformed parameters_schema must not mint a row");
+    }
+
+    #[test]
+    fn handle_skill_register_accepts_and_stores_parameters_schema() {
+        let (conn, _dir) = open_db();
+        let inline = minimal_skill_md("good-schema-skill");
+        let schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        });
+        let v = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": inline, "parameters_schema": schema.clone()}),
+            None,
+        )
+        .unwrap();
+        let id = v["id"].as_str().unwrap();
+        let metadata_json: String = conn
+            .query_row("SELECT metadata FROM skills WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["parameters_schema"], schema);
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9.0 §11.5 B7-SKILL (#1865) — version-chain surfacing.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn compute_skill_version_is_one_for_fresh_row() {
+        let (conn, _dir) = open_db();
+        let v = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": minimal_skill_md("fresh-version")}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v["version"], json!(1));
+    }
+
+    #[test]
+    fn compute_skill_version_increments_on_supersede_chain() {
+        let (conn, _dir) = open_db();
+        let v1 = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": minimal_skill_md("chain-version")}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v1["version"], json!(1));
+        let v2 = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": minimal_skill_md("chain-version")}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v2["version"], json!(2));
+        let v3 = handle_skill_register(
+            &conn,
+            &json!({"inline_skill": minimal_skill_md("chain-version")}),
+            None,
+        )
+        .unwrap();
+        assert_eq!(v3["version"], json!(3));
+
+        // An OLD (already-superseded) row's own version is its position
+        // in the chain at the time it was current, not the chain's
+        // current length.
+        let id1 = v1["id"].as_str().unwrap();
+        assert_eq!(compute_skill_version(&conn, id1), 1);
+        let id2 = v2["id"].as_str().unwrap();
+        assert_eq!(compute_skill_version(&conn, id2), 2);
     }
 }
