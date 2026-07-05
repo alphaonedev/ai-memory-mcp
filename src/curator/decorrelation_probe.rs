@@ -261,6 +261,72 @@ pub fn evaluate_write_quorum(
     }
 }
 
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — the write-gate action for a
+/// reflection write, given the [`QuorumOutcome`] and the resolved
+/// [`crate::config::ReflectDecorrelationMode`]. Shared by BOTH backend
+/// chokepoints so the semantics never drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteGateAction {
+    /// Write proceeds silently (mode `off`, or the quorum is met).
+    Proceed,
+    /// Write proceeds, but an advisory WARN is emitted (carries the
+    /// human-readable detail incl. the CLAIMED-not-ATTESTED caveat).
+    Advise(String),
+    /// `enforce` mode + evidence-backed attested monoculture — the write
+    /// is REFUSED and a signed refusal row is emitted.
+    Refuse {
+        /// Distinct attested families present (`< quorum_n`).
+        distinct_attested_families: usize,
+        /// Total attested rows considered.
+        attested_rows: usize,
+    },
+}
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — PURE mapping from
+/// `(mode, outcome)` to the write-gate action. The ONLY outcome an
+/// `enforce` mode refuses on is [`QuorumOutcome::AttestedMonoculture`]
+/// (attested evidence of monoculture); a CLAIMED-only / below-floor
+/// corpus ([`QuorumOutcome::InsufficientAttested`]) is advised, never
+/// refused (anti-theater). `total_reflections` is the full corpus size
+/// (attested + claimed) reported in the advisory payload for honest
+/// coverage.
+#[must_use]
+pub fn decorrelation_write_action(
+    mode: crate::config::ReflectDecorrelationMode,
+    outcome: &QuorumOutcome,
+    quorum_n: usize,
+    total_reflections: usize,
+) -> WriteGateAction {
+    use crate::config::ReflectDecorrelationMode as Mode;
+    if matches!(mode, Mode::Off) {
+        return WriteGateAction::Proceed;
+    }
+    match *outcome {
+        QuorumOutcome::MeetsQuorum { .. } => WriteGateAction::Proceed,
+        QuorumOutcome::InsufficientAttested { attested_rows } => WriteGateAction::Advise(format!(
+            "reflection decorrelation: only {attested_rows} ATTESTED of {total_reflections} \
+             corpus reflections (quorum_n={quorum_n}); insufficient attested evidence — \
+             {CLAIMED_NOT_ATTESTED_CAVEAT}"
+        )),
+        QuorumOutcome::AttestedMonoculture {
+            distinct_attested_families,
+            attested_rows,
+        } => match mode {
+            Mode::Enforce => WriteGateAction::Refuse {
+                distinct_attested_families,
+                attested_rows,
+            },
+            // Advisory (and the unreachable Off arm): warn, proceed.
+            _ => WriteGateAction::Advise(format!(
+                "reflection decorrelation: attested monoculture — {distinct_attested_families} \
+                 distinct attested families across {attested_rows} attested rows \
+                 (of {total_reflections} corpus, quorum_n={quorum_n}); would REFUSE under \
+                 enforce mode — {CLAIMED_NOT_ATTESTED_CAVEAT}"
+            )),
+        },
+    }
+}
+
 /// One namespace's advisory finding — emitted only when the corpus is BOTH big
 /// enough ([`MIN_REFLECTIONS_FLOOR`]) AND dominated past the threshold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

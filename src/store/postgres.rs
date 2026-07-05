@@ -9098,6 +9098,18 @@ impl PostgresStore {
             });
         }
 
+        // ─── 5.6 Write-time attested-family decorrelation gate (§25.3 S2) ─
+        // Postgres twin of `db::run_decorrelation_write_gate`. Compiled
+        // default OFF (byte-identical when the mode is unset/`off`).
+        self.decorrelation_write_gate_pg(
+            &target_namespace,
+            &input.metadata,
+            &input.agent_id,
+            &input.title,
+            &input.source_ids,
+        )
+        .await?;
+
         // ─── 6. Atomic insert + N links inside a single tx ──────────
         let now = Utc::now().to_rfc3339();
         let mut metadata = match input.metadata.clone() {
@@ -9397,6 +9409,168 @@ impl PostgresStore {
                 target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                 agent_id, attempted, cap, namespace,
                 "failed to append reflection_depth_exceeded audit row: {e}"
+            );
+        }
+    }
+
+    /// v0.9.0 §25.3 S2 (D3-021, #1767) — postgres twin of
+    /// `db::run_decorrelation_write_gate`. Compiled default OFF
+    /// (byte-identical when the mode is unset/`off`). Corpus =
+    /// reflection-kind memories in `target_namespace` read by a DIRECT
+    /// namespace-scoped SQL query (never recall); attested families use
+    /// the shared S1 candidate + a postgres `model_attestations` row
+    /// existence check, so the forgery gate (stamp without a backing row
+    /// → CLAIMED) holds identically to sqlite.
+    async fn decorrelation_write_gate_pg(
+        &self,
+        target_namespace: &str,
+        incoming_metadata: &serde_json::Value,
+        agent_id: &str,
+        proposed_title: &str,
+        source_ids: &[String],
+    ) -> Result<(), crate::db::ReflectError> {
+        use crate::curator::decorrelation_probe::{
+            WriteGateAction, decorrelation_write_action, evaluate_write_quorum,
+        };
+
+        let mode = crate::config::reflect_decorrelation_mode();
+        if !mode.is_active() {
+            return Ok(());
+        }
+        let quorum_n = crate::config::reflect_decorrelation_quorum_n();
+
+        // Direct namespace-scoped corpus read (NOT recall).
+        let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT metadata FROM memories \
+             WHERE namespace = $1 AND memory_kind = 'reflection'",
+        )
+        .bind(target_namespace)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            crate::db::ReflectError::Database(to_store_err("decorrelation corpus", e).to_string())
+        })?;
+
+        let mut corpus_attested: Vec<String> = Vec::new();
+        let total_reflections = rows.len();
+        for (meta,) in &rows {
+            if let Some(fam) = crate::storage::model_attest::attested_family_candidate(meta) {
+                if self.pg_model_family_row_exists(&fam).await? {
+                    corpus_attested.push(fam);
+                }
+            }
+        }
+
+        let incoming =
+            match crate::storage::model_attest::attested_family_candidate(incoming_metadata) {
+                Some(fam) if self.pg_model_family_row_exists(&fam).await? => Some(fam),
+                _ => None,
+            };
+
+        let outcome = evaluate_write_quorum(&corpus_attested, incoming.as_deref(), quorum_n);
+        match decorrelation_write_action(mode, &outcome, quorum_n, total_reflections) {
+            WriteGateAction::Proceed => Ok(()),
+            WriteGateAction::Advise(detail) => {
+                tracing::warn!(target: "reflection.decorrelation.advisory", namespace = %target_namespace, "{detail}");
+                Ok(())
+            }
+            WriteGateAction::Refuse {
+                distinct_attested_families,
+                attested_rows,
+            } => {
+                self.emit_reflection_decorrelation_refused_audit(
+                    agent_id,
+                    target_namespace,
+                    distinct_attested_families,
+                    attested_rows,
+                    quorum_n,
+                    proposed_title,
+                    source_ids,
+                )
+                .await;
+                Err(crate::db::ReflectError::DecorrelationRefused {
+                    distinct_attested_families,
+                    attested_rows,
+                    quorum_n,
+                    namespace: target_namespace.to_string(),
+                })
+            }
+        }
+    }
+
+    /// `true` when at least one `model_attestations` row exists for
+    /// `model_family` on this postgres backend.
+    async fn pg_model_family_row_exists(
+        &self,
+        model_family: &str,
+    ) -> Result<bool, crate::db::ReflectError> {
+        let found: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM model_attestations WHERE model_family = $1 LIMIT 1")
+                .bind(model_family)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    crate::db::ReflectError::Database(
+                        to_store_err("model_attestations probe", e).to_string(),
+                    )
+                })?;
+        Ok(found.is_some())
+    }
+
+    /// v0.9.0 §25.3 S2 (D3-021, #1767) — append a signed
+    /// `reflection.decorrelation_refused` row to `signed_events`
+    /// (postgres twin of `db::emit_reflection_decorrelation_refused_audit`,
+    /// sharing the same canonical-CBOR encoder). Best-effort.
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_reflection_decorrelation_refused_audit(
+        &self,
+        agent_id: &str,
+        namespace: &str,
+        distinct_attested_families: usize,
+        attested_rows: usize,
+        quorum_n: usize,
+        proposed_title: &str,
+        source_ids: &[String],
+    ) {
+        let created_at_dt = Utc::now();
+        let created_at = created_at_dt.to_rfc3339();
+        let cbor = match crate::db::canonical_cbor_reflection_decorrelation_refused(
+            agent_id,
+            namespace,
+            distinct_attested_families as u64,
+            attested_rows as u64,
+            quorum_n as u64,
+            source_ids,
+            proposed_title,
+            &created_at,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                    agent_id, namespace,
+                    "failed to encode canonical CBOR for reflection_decorrelation_refused audit: {e}"
+                );
+                return;
+            }
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let payload_hash = crate::signed_events::payload_hash(&cbor);
+        let insert_row = PgSignedEventInsert {
+            id: &id,
+            agent_id,
+            event_type: crate::signed_events::event_types::REFLECTION_DECORRELATION_REFUSED,
+            payload_hash: &payload_hash,
+            signature: None,
+            attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+            timestamp: created_at_dt,
+            cause_hash: None,
+        };
+        if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                agent_id, namespace,
+                "failed to append reflection_decorrelation_refused audit row: {e}"
             );
         }
     }

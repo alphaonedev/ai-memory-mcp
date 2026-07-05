@@ -53,6 +53,20 @@ pub enum ReflectError {
     /// path — hook vetoes are caller-policy refusals that carry their
     /// own provenance via the hook's own decision record (if any).
     HookVeto { reason: String, code: i32 },
+    /// v0.9.0 §25.3 S2 (D3-021, #1767) — an `enforce`-mode reflection
+    /// write refused because the target namespace corpus + incoming write
+    /// span fewer than the required N DISTINCT ATTESTED model families
+    /// (an evidence-backed attested monoculture). Refusal fires ONLY on
+    /// attested evidence (`attested_rows >= MIN_REFLECTIONS_FLOOR AND
+    /// distinct < quorum_n`); a CLAIMED-only corpus stays advisory. A
+    /// signed `reflection.decorrelation_refused` audit row is emitted
+    /// before this propagates.
+    DecorrelationRefused {
+        distinct_attested_families: usize,
+        attested_rows: usize,
+        quorum_n: usize,
+        namespace: String,
+    },
     /// Database error during the atomic write. Carries the underlying
     /// rusqlite / anyhow string.
     Database(String),
@@ -77,6 +91,17 @@ impl std::fmt::Display for ReflectError {
                     "pre_reflect hook vetoed reflection (code={code}): {reason}"
                 )
             }
+            Self::DecorrelationRefused {
+                distinct_attested_families,
+                attested_rows,
+                quorum_n,
+                namespace,
+            } => write!(
+                f,
+                "reflection refused: attested model-family decorrelation quorum not met \
+                 ({distinct_attested_families} distinct attested families across \
+                 {attested_rows} attested rows < required {quorum_n}, namespace='{namespace}')"
+            ),
         }
     }
 }
@@ -458,6 +483,22 @@ pub fn reflect_with_hooks(
         });
     }
 
+    // ─── 5.6 Write-time attested-family decorrelation gate (§25.3 S2) ─
+    //
+    // Compiled default OFF (G5b inert-until-enabled): when
+    // AI_MEMORY_REFLECT_DECORRELATION_MODE is unset/`off` this is an
+    // early return and the write is byte-identical. `advisory` warns;
+    // `enforce` refuses ONLY on attested evidence (signed
+    // `reflection.decorrelation_refused` row + DecorrelationRefused).
+    run_decorrelation_write_gate(
+        conn,
+        &target_namespace,
+        &input.metadata,
+        &input.agent_id,
+        &input.title,
+        &input.source_ids,
+    )?;
+
     // ─── 6. Atomic insert + N links inside a single transaction ─────
     // Build the system-generated reflection_metadata block. The caller-
     // supplied object wins on key collisions — if `reflection_metadata`
@@ -779,6 +820,221 @@ pub(crate) fn emit_reflection_depth_exceeded_audit(
             target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
             agent_id, attempted, cap, namespace,
             "failed to append reflection_depth_exceeded audit row: {e}"
+        );
+    }
+}
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — `tracing` target for decorrelation
+/// advisories (shared with the curator visibility probe).
+const DECORRELATION_ADVISORY_TARGET: &str = "reflection.decorrelation.advisory";
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — the write-time attested-model-family
+/// decorrelation gate, run at the sqlite reflect chokepoint BETWEEN
+/// validation/cap and the atomic insert.
+///
+/// Posture (compiled default OFF — G5b inert-until-enabled):
+/// - `off` (default): early return; the write is byte-identical.
+/// - `advisory`: WARN (`reflection.decorrelation.advisory`) on an
+///   attested monoculture / insufficient attested evidence, then proceed.
+/// - `enforce`: REFUSE **only on attested evidence** (attested rows
+///   `>= MIN_REFLECTIONS_FLOOR` AND distinct attested families
+///   `< quorum_n`) with a signed `reflection.decorrelation_refused` row;
+///   a CLAIMED-only monoculture is advised, never refused (anti-theater).
+///
+/// The corpus is the reflection-kind memories in `target_namespace`, read
+/// by a DIRECT namespace-scoped SQL query (never `recall`/`recall_hybrid`);
+/// attested families are resolved via the S1 attested-read predicate
+/// ([`crate::storage::model_attest::attested_family_of`]), so CLAIMED
+/// rows contribute nothing to the distinct-family count.
+fn run_decorrelation_write_gate(
+    conn: &Connection,
+    target_namespace: &str,
+    incoming_metadata: &serde_json::Value,
+    agent_id: &str,
+    proposed_title: &str,
+    source_ids: &[String],
+) -> std::result::Result<(), ReflectError> {
+    use crate::curator::decorrelation_probe::{
+        WriteGateAction, decorrelation_write_action, evaluate_write_quorum,
+    };
+
+    let mode = crate::config::reflect_decorrelation_mode();
+    if !mode.is_active() {
+        return Ok(()); // off → byte-identical (inertness pin).
+    }
+    let quorum_n = crate::config::reflect_decorrelation_quorum_n();
+
+    // Direct namespace-scoped corpus read (NOT recall).
+    let mut corpus_attested: Vec<String> = Vec::new();
+    let mut total_reflections: usize = 0;
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT metadata FROM memories \
+                 WHERE namespace = ?1 AND memory_kind = 'reflection'",
+            )
+            .map_err(|e| ReflectError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([target_namespace], |row| row.get::<_, String>(0))
+            .map_err(|e| ReflectError::Database(e.to_string()))?;
+        for r in rows {
+            let raw = r.map_err(|e| ReflectError::Database(e.to_string()))?;
+            total_reflections += 1;
+            let meta: serde_json::Value =
+                serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+            if let Some(fam) = crate::storage::model_attest::attested_family_of(conn, &meta)
+                .map_err(|e| ReflectError::Database(e.to_string()))?
+            {
+                corpus_attested.push(fam);
+            }
+        }
+    }
+
+    let incoming = crate::storage::model_attest::attested_family_of(conn, incoming_metadata)
+        .map_err(|e| ReflectError::Database(e.to_string()))?;
+    let outcome = evaluate_write_quorum(&corpus_attested, incoming.as_deref(), quorum_n);
+
+    match decorrelation_write_action(mode, &outcome, quorum_n, total_reflections) {
+        WriteGateAction::Proceed => Ok(()),
+        WriteGateAction::Advise(detail) => {
+            tracing::warn!(target: DECORRELATION_ADVISORY_TARGET, namespace = %target_namespace, "{detail}");
+            Ok(())
+        }
+        WriteGateAction::Refuse {
+            distinct_attested_families,
+            attested_rows,
+        } => {
+            emit_reflection_decorrelation_refused_audit(
+                conn,
+                agent_id,
+                target_namespace,
+                distinct_attested_families,
+                attested_rows,
+                quorum_n,
+                proposed_title,
+                source_ids,
+            );
+            Err(ReflectError::DecorrelationRefused {
+                distinct_attested_families,
+                attested_rows,
+                quorum_n,
+                namespace: target_namespace.to_string(),
+            })
+        }
+    }
+}
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — canonical-CBOR encoding of the
+/// `reflection.decorrelation_refused` audit payload. Same deterministic
+/// `BTreeMap`-keyed discipline as
+/// [`canonical_cbor_reflection_depth_exceeded`], so an auditor can
+/// re-derive `payload_hash` from the structured fields. No content body
+/// (title + source ids are the provenance hook).
+///
+/// # Errors
+/// Returns the CBOR encoder error (unreachable for the fixed shape).
+pub fn canonical_cbor_reflection_decorrelation_refused(
+    agent_id: &str,
+    namespace: &str,
+    distinct_attested_families: u64,
+    attested_rows: u64,
+    quorum_n: u64,
+    source_ids: &[String],
+    proposed_title: &str,
+    created_at: &str,
+) -> anyhow::Result<Vec<u8>> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
+    map.insert("agent_id", ciborium::Value::Text(agent_id.to_string()));
+    map.insert(
+        "attested_rows",
+        ciborium::Value::Integer(attested_rows.into()),
+    );
+    map.insert(
+        field_names::CREATED_AT,
+        ciborium::Value::Text(created_at.to_string()),
+    );
+    map.insert(
+        "distinct_attested_families",
+        ciborium::Value::Integer(distinct_attested_families.into()),
+    );
+    map.insert("namespace", ciborium::Value::Text(namespace.to_string()));
+    map.insert(
+        "proposed_title",
+        ciborium::Value::Text(proposed_title.to_string()),
+    );
+    map.insert("quorum_n", ciborium::Value::Integer(quorum_n.into()));
+    map.insert(
+        field_names::SOURCE_IDS,
+        ciborium::Value::Array(
+            source_ids
+                .iter()
+                .map(|s| ciborium::Value::Text(s.clone()))
+                .collect(),
+        ),
+    );
+    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
+        .into_iter()
+        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
+        .collect();
+    let value = ciborium::Value::Map(entries);
+    let mut out: Vec<u8> = Vec::with_capacity(256);
+    ciborium::ser::into_writer(&value, &mut out)
+        .context("CBOR encode reflection_decorrelation_refused audit payload")?;
+    Ok(out)
+}
+
+/// v0.9.0 §25.3 S2 (D3-021, #1767) — append a signed
+/// `reflection.decorrelation_refused` row to `signed_events`. Best-effort
+/// (mirrors [`emit_reflection_depth_exceeded_audit`]): audit-write
+/// failure is logged but does NOT crater the refusal path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_reflection_decorrelation_refused_audit(
+    conn: &Connection,
+    agent_id: &str,
+    namespace: &str,
+    distinct_attested_families: usize,
+    attested_rows: usize,
+    quorum_n: usize,
+    proposed_title: &str,
+    source_ids: &[String],
+) {
+    let created_at = Utc::now().to_rfc3339();
+    let cbor = match canonical_cbor_reflection_decorrelation_refused(
+        agent_id,
+        namespace,
+        distinct_attested_families as u64,
+        attested_rows as u64,
+        quorum_n as u64,
+        source_ids,
+        proposed_title,
+        &created_at,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                agent_id, namespace,
+                "failed to encode canonical CBOR for reflection_decorrelation_refused audit: {e}"
+            );
+            return;
+        }
+    };
+    let event = crate::signed_events::SignedEvent {
+        id: uuid::Uuid::new_v4().to_string(),
+        agent_id: agent_id.to_string(),
+        event_type: crate::signed_events::event_types::REFLECTION_DECORRELATION_REFUSED.to_string(),
+        payload_hash: crate::signed_events::payload_hash(&cbor),
+        signature: None,
+        attest_level: crate::models::AttestLevel::Unsigned.as_str().to_string(),
+        timestamp: created_at,
+        ..crate::signed_events::SignedEvent::default()
+    };
+    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+        tracing::warn!(
+            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+            agent_id, namespace,
+            "failed to append reflection_decorrelation_refused audit row: {e}"
         );
     }
 }

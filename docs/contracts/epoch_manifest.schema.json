@@ -13,7 +13,8 @@
     "panel",
     "utility_weights",
     "created_at",
-    "content_hash"
+    "content_hash",
+    "signature"
   ],
   "properties": {
     "epoch_seq": {
@@ -78,7 +79,12 @@
     "content_hash": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
-      "description": "Lowercase-hex SHA-256 over the canonical JSON bytes of this manifest (excluding the signature envelope). The triple anchor shares this hash."
+      "description": "Lowercase-hex SHA-256 over the canonical (key-sorted) JSON bytes of the manifest BODY (all fields except content_hash and signature). The triple anchor shares this hash."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{128}$",
+      "description": "Lowercase-hex 64-byte operator Ed25519 signature over the canonical CBOR of the signable view {epoch_seq, prior_epoch_id, policy_seq, policy_digest_hex, content_sha256, created_at}. Verified by the consumer via the on-disk operator public key."
     }
   }
 }

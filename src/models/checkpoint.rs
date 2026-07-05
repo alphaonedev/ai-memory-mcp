@@ -190,6 +190,7 @@ mod tests {
             ConditionType::AuditHeadWitness,
             ConditionType::GovernanceVerdict,
             ConditionType::GovernanceEnforcement,
+            ConditionType::EpochAdvance,
         ] {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }

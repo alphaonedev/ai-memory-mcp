@@ -255,6 +255,19 @@ pub mod event_types {
     /// that hash. Monotonicity is the append-only event count.
     pub const GOVERNANCE_POLICY_ADVANCED: &str = "governance.policy_version_advanced";
 
+    /// v0.9.0 §25.3 S2 (D3-021, #1767) — `signed_events.event_type` for a
+    /// write-time DECORRELATION REFUSAL: an `enforce`-mode reflection
+    /// write refused because the target namespace corpus + incoming write
+    /// span fewer than the required N DISTINCT ATTESTED model families
+    /// (evidence-backed attested monoculture). `payload_hash` = SHA-256
+    /// over the canonical-CBOR of the structured refusal fields
+    /// (namespace, distinct_attested_families, attested_rows, quorum_n,
+    /// source ids, title); `attest_level = "unsigned"` (substrate-emitted,
+    /// like `reflection.depth_exceeded`). CLAIMED-only monocultures are
+    /// NEVER refused (they stay advisory), so this row only ever attests a
+    /// refusal grounded in attested evidence.
+    pub const REFLECTION_DECORRELATION_REFUSED: &str = "reflection.decorrelation_refused";
+
     /// v0.9.0 G13 (#1828) — witness row for an identity-lineage GENESIS
     /// record (epoch 0, self-signed by `K0`). `payload_hash` =
     /// SHA-256 over the `LINEAGE_DOMAIN`-tagged canonical bytes the

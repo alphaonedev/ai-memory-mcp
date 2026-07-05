@@ -222,26 +222,41 @@ pub fn attested_family_of(
     conn: &Connection,
     metadata: &serde_json::Value,
 ) -> Result<Option<String>> {
-    let attest = metadata
-        .get(crate::identity::META_KEY_MODEL_FAMILY_ATTEST)
-        .and_then(serde_json::Value::as_str);
-    let family = metadata
-        .get(crate::identity::META_KEY_MODEL_FAMILY)
-        .and_then(serde_json::Value::as_str);
-    let (Some(attest), Some(family)) = (attest, family) else {
+    let Some(family) = attested_family_candidate(metadata) else {
         return Ok(None);
     };
-    if attest != crate::identity::ATTEST_MODEL_LOADER_OBSERVED {
-        return Ok(None);
-    }
-    if family.is_empty() {
-        return Ok(None);
-    }
-    if family_row_exists(conn, family)? {
-        Ok(Some(family.to_string()))
+    if family_row_exists(conn, &family)? {
+        Ok(Some(family))
     } else {
         // Forged / unbacked stamp → CLAIMED.
         Ok(None)
+    }
+}
+
+/// v0.9.0 §25.3 S1/S2 — the PURE (a)-condition of the attested-read
+/// predicate: return the stamped family IFF `metadata` carries
+/// `model_family_attest = "loader_observed"` and a non-empty
+/// `model_family`. Callers still MUST check that a backing
+/// `model_attestations` row exists (condition c) — [`attested_family_of`]
+/// does both for sqlite; the postgres reflect chokepoint reuses this
+/// candidate + its own `model_attestations` existence query so the
+/// forgery gate (stamp without a backing row → CLAIMED) holds identically
+/// on both backends.
+#[must_use]
+pub fn attested_family_candidate(metadata: &serde_json::Value) -> Option<String> {
+    let attest = metadata
+        .get(crate::identity::META_KEY_MODEL_FAMILY_ATTEST)
+        .and_then(serde_json::Value::as_str)?;
+    if attest != crate::identity::ATTEST_MODEL_LOADER_OBSERVED {
+        return None;
+    }
+    let family = metadata
+        .get(crate::identity::META_KEY_MODEL_FAMILY)
+        .and_then(serde_json::Value::as_str)?;
+    if family.is_empty() {
+        None
+    } else {
+        Some(family.to_string())
     }
 }
 

@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### §25.3 P0 spine (S3/S4/S1/S2/S5; 2×5-wave vote `b0c1e157-3419-4d48-aebc-857283a97dfd`)
+
+- **S3 (F-40) — signed rule enable/disable.** `rules_store::set_enabled_signed`
+  flips `enabled`, re-signs the post-state canonical bytes, appends an
+  operator-signed `governance.rule_{enabled,disabled}` audit row, and
+  advances the policy version — all in one transaction, closing the CLI's
+  two-statement atomicity gap.
+- **S4 (F-41) — `policy_version`.** Monotonic, signed, append-only policy
+  surface (whole-ruleset SHA-256 digest over enabled rules; seq = count of
+  `governance.policy_version_advanced` events, emitted in the same tx as
+  every signed rule mutation). Verdict/enforcement checkpoint wire binds
+  `policy_seq`/`policy_digest_hex` (`ROLE_RESOLUTION_VERSION` 1→2, old
+  checkpoints verify unchanged). Boot digest reconciliation is ADVISORY in
+  v0.9 (doctor + warn); refusal is v1.0.
+- **S1 (D3-012, [#1870](https://github.com/alphaonedev/ai-memory-mcp/issues/1870)) — `model_attestations` substrate, schema v78.**
+  Claimable: **"attests model family (loader-attested, ~40% hard cap)"** —
+  loader attestation is a process-lifetime trusted-substrate self-report,
+  NOT per-write cryptographic provenance; only substrate-invoked generation
+  is attestable (~40% ceiling, ROADMAP.md:1229). `model-attest list|enroll`
+  CLI; forgery-pinned attested-read predicate; `memory_update` fail-safe
+  downgrade of a caller-forged stamp.
+- **S2 (D3-021, [#1767](https://github.com/alphaonedev/ai-memory-mcp/issues/1767)) — write-time attested-family decorrelation, ENFORCE-CAPABLE + wired.**
+  `evaluate_write_quorum` counts DISTINCT ATTESTED families only (CLAIMED
+  rows never laundered as diverse, nor weaponized into a refusal). Wired at
+  BOTH reflect chokepoints (sqlite + postgres) between validation and
+  insert: `off` (compiled default) = byte-identical; `advisory` = WARN +
+  CLAIMED-not-ATTESTED caveat; `enforce` = REFUSE only on attested evidence
+  (`attested_rows ≥ floor AND distinct < N`) with a signed
+  `reflection.decorrelation_refused` row (`ReflectError::DecorrelationRefused`).
+  Test-pinned on both backends (the EPIC exit-criterion-8 kill-test).
+  **"decorrelation enforced" STAYS BANNED** — the enforce-as-DEFAULT flip is
+  v1.0; this ships the enforce-CAPABLE path, default `off`.
+- **S5 (RQ-10, [#1878](https://github.com/alphaonedev/ai-memory-mcp/issues/1878)) — verify-only epoch-freeze consumer.**
+  `ai-memory epoch-apply <manifest.json>`: parse → content-hash integrity →
+  operator signature over canonical CBOR → strict monotonic `epoch_seq` →
+  policy binding vs the live `current_policy_version()` (sqlite governance,
+  the sole rules store on every backend) → ONE-tx triple anchor (resolved
+  `EpochAdvance` checkpoint + `epoch.manifest_applied` audit row, sharing one
+  SHA-256). Stale-policy / wrong-key / tampered / non-monotonic manifests are
+  refused with zero rows (test-pinned, incl. a pg-backed-node non-vacuity
+  test). Git-tracked contract at `docs/contracts/`. The L3-boundary perma-ban
+  gate (`scripts/check-l3-boundary.sh`) is CI-wired with a dual self-test.
+  With the consumer now wired + git-tracked, **"epoch closure shipped" /
+  "RQ-01 shipped" becomes claimable** — but the manifest structurally cannot
+  assert diversity (no such field; `additionalProperties:false`), so it never
+  launders unattested diversity.
+
 ### Behavior change — recall is PURE by default (P0-1, [#1869](https://github.com/alphaonedev/ai-memory-mcp/issues/1869); 2×5-wave vote `38d5af91-835d-4053-86eb-60d7cf1391e2`)
 
 - **Pure recall (scoped claim):** recall mutates **zero rows in
