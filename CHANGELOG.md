@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+**§2-property contribution (release-level declaration, per §17):** v0.9.0
+strengthens **§2.1 (persistent, endpoint-resident index)** via the
+vector-search minimal opt-in slice (`VectorSearchIndex` seam, the G2/G4
+capacity/dimension guards, and the §5.2 namespace-starvation fix — all
+operating on the endpoint-resident HNSW index) and the B7-SKILL
+executable-artefact minting; **§2.4 (improvable across model
+generations)** via the `recall_observations` shadow-feedback sweep
+(#1706) and the `parameters_schema`/`version` skill-memory surface;
+and **§2.5 (index/governance events land in the signed, append-only
+chain)** via the §25.3 P0 spine (signed rule enable/disable, signed
+`policy_version` advances, signed `model_attestations`, signed
+`reflection.decorrelation_refused`, and the signed one-tx epoch-apply
+triple anchor). Not every hardening item below maps onto one of these
+three named properties (e.g. the P0-1 recall-purity behavior change and
+the P0-3 attestation secure-default flip are write-path/security-posture
+changes, not index-property changes) — those are stated on their own
+terms rather than force-fit onto §2.1/§2.4/§2.5.
+
 ### §11.5 B7-SKILL — skill memories first-class: `parameters_schema` at register, `invocation_record`, version surface ([#1865](https://github.com/alphaonedev/ai-memory-mcp/issues/1865))
 
 Strengthens **§2.1 (executable artefacts are admin-minted, #949)** and
@@ -132,9 +150,12 @@ ranking wire, without touching ranking itself.
   (`src/models/memory.rs`; values `neural`/`lexical`/`degraded_lexical`/`none`),
   so no duplicate `meta.reranker_mode` field was added. The global
   reranker default-on flip stays DEFERRED to v1.0 per vote `0b232b00` /
-  B7-RR-AMEND-1. This commit ships G7-step2 (pool sizing) + covering tests
-  only; `resolve_reranker` and per-tier `cross_encoder` defaults are
-  untouched.
+  B7-RR-AMEND-1. This commit ships G7-step2 (pool sizing) only;
+  `resolve_reranker` and per-tier `cross_encoder` defaults are untouched.
+- Tested (all CI-run): `src/reranker.rs::tests::pool_size_from_env_override_wins_and_clamps`,
+  `::pool_size_from_invalid_env_falls_through_to_detected` (sizing/clamp
+  logic); `tests/cov_ga2_misc.rs` (pool construction + shared-`Arc<BertModel>`
+  concurrency coverage).
 
 ### bench-gap — Bench p95 gate now exercises the handler-layer rerank stage ([#1871](https://github.com/alphaonedev/ai-memory-mcp/issues/1871))
 
@@ -181,7 +202,9 @@ ranking wire, without touching ranking itself.
   CLAIMED-not-ATTESTED caveat; `enforce` = REFUSE only on attested evidence
   (`attested_rows ≥ floor AND distinct < N`) with a signed
   `reflection.decorrelation_refused` row (`ReflectError::DecorrelationRefused`).
-  Test-pinned on both backends (the EPIC exit-criterion-8 kill-test).
+  Tested (all CI-run): `tests/decorrelation_enforce_s2.rs` (sqlite) and
+  `tests/decorrelation_enforce_s2_pg.rs` (postgres) — the EPIC
+  exit-criterion-8 kill-test, both backends.
   **"decorrelation enforced" STAYS BANNED** — the enforce-as-DEFAULT flip is
   v1.0; this ships the enforce-CAPABLE path, default `off`.
 - **S5 (RQ-10, [#1878](https://github.com/alphaonedev/ai-memory-mcp/issues/1878)) — verify-only epoch-freeze consumer.**
@@ -191,8 +214,10 @@ ranking wire, without touching ranking itself.
   the sole rules store on every backend) → ONE-tx triple anchor (resolved
   `EpochAdvance` checkpoint + `epoch.manifest_applied` audit row, sharing one
   SHA-256). Stale-policy / wrong-key / tampered / non-monotonic manifests are
-  refused with zero rows (test-pinned, incl. a pg-backed-node non-vacuity
-  test). Git-tracked contract at `docs/contracts/`. The L3-boundary perma-ban
+  refused with zero rows. Tested (all CI-run): `tests/epoch_apply_s5.rs`
+  (sqlite), `tests/epoch_apply_s5_pg.rs` (postgres, incl. a pg-backed-node
+  non-vacuity test), `tests/epoch_contract_conformance.rs` (git-tracked
+  contract conformance at `docs/contracts/`). The L3-boundary perma-ban
   gate (`scripts/check-l3-boundary.sh`) is CI-wired with a dual self-test.
   With the consumer now wired + git-tracked, **"epoch closure shipped" /
   "RQ-01 shipped" becomes claimable** — but the manifest structurally cannot
@@ -336,7 +361,9 @@ No schema migration; no new dependencies.
   cutoff that let a large foreign corpus crowd a small namespace's
   rows out of semantic recall entirely. Hierarchical namespaces admit
   ancestor rows (the Task 1.12 contract). `None`/flag-off is
-  byte-identical legacy (regression + parity tests pin both).
+  byte-identical legacy. Tested (CI-run): `tests/recall_ns_allowlist_1005.rs`
+  (flag-on in-namespace recall + ancestor admission + flag-off
+  byte-identical-legacy regression, both pinned in the same suite).
 - **G4 strict embedding-dimension guard (opt-in,
   `AI_MEMORY_REQUIRE_DIM_MATCH`):** the HNSW `cosine_distance`
   zip-truncation residual now (under the flag) collapses a
@@ -389,6 +416,151 @@ No schema migration; no new dependencies.
   federation imports bypass — traversal cycle-detection is the
   backstop), surfaced via the existing `LINK_CYCLE_ERR_PREFIX` 409
   envelope on both backends.
+
+### §11.5 B7-FC — function/tool-calling protocol for `/api/chat` + curator wiring ([#1866](https://github.com/alphaonedev/ai-memory-mcp/issues/1866))
+
+Strengthens **§2.4 (improvable across model generations)** — a tool-capable
+model can now be driven with schema-constrained calls instead of
+JSON-in-text parsing, with no regression for models that ignore tools.
+
+- **`OllamaClient::generate_with_tools` (+ async)** (`src/llm.rs`): new
+  `ToolDef`/`ToolCall`/`ChatOutcome` types; when `tools` is non-empty the
+  `/api/chat` (Ollama) / `/chat/completions` (OpenAI-shim) body carries a
+  JSON-Schema `tools` array and the reply is parsed for a structured
+  `tool_calls` array (Ollama object args, OpenAI-shim string args
+  re-parsed on ingest; malformed entries skipped). A model that ignores
+  tools degrades gracefully to `ChatOutcome::Text` — byte-identical to
+  `generate_async` when `tools` is empty. Circuit-breaker, the governance
+  `NetworkRequest` gate, and wire shape are unchanged.
+- **Curator wiring** (`src/atomisation/curator.rs`): `LlmGenerate` gains a
+  defaulted `generate_with_tools` (default = text fallback via
+  `generate`, so every existing implementor is unchanged).
+  `Curator::decompose` now offers an `emit_atoms` tool matching the
+  `CuratorResponse` schema; a tool-capable backend returns a
+  schema-constrained call (no `extract_first_json_object` heuristics on
+  the happy path), and tool-unsupporting backends fall back to the
+  historical text-parse path unchanged.
+- Tested (all CI-run, `src/llm.rs::tests` + `src/atomisation/curator.rs::tests`):
+  `tool_def_to_wire_uses_openai_function_shape`,
+  `parse_tool_calls_object_and_string_arguments`,
+  `generate_with_tools_async_dispatches_structured_call`,
+  `generate_with_tools_async_falls_back_to_text_when_model_ignores_tools`,
+  `generate_with_tools_async_malformed_tool_calls_degrades_to_text`,
+  `generate_with_tools_async_openai_string_arguments`,
+  `generate_with_tools_async_empty_tools_is_plain_text`,
+  `generate_with_tools_async_breaker_open_short_circuits`,
+  `emit_atoms_tool_schema_is_well_formed`, `parse_tool_atoms_happy_and_error_arms`,
+  `curator_dispatches_emit_atoms_tool_call`,
+  `curator_retries_when_tool_args_malformed_then_succeeds`,
+  `curator_falls_back_to_text_when_tools_unsupported`.
+
+### G6 — append-only spine: every mutation site routed to signed revision leaves ([#1823](https://github.com/alphaonedev/ai-memory-mcp/issues/1823))
+
+Strengthens **§2.5 (index/lifecycle events land in the signed, append-only
+chain)**. Additive and flag-gated (`config::append_only_enabled()`,
+default OFF — byte-identical legacy until enabled).
+
+- **Every production memory-mutation primitive on both backends** now
+  appends ONE identity-only signed leaf to `memory_revisions` IN-TX when
+  the flag is on: COW SUPERSEDE (in-place content UPDATE, same id) on
+  `update_with_expected_version`/`bind_agent_pubkey`/`revoke_agent_pubkey`/
+  `overwrite_full_row_by_id` and their postgres twins; capture-then-compact
+  TOMBSTONE/FORGET/EXPIRE/EVICT/ARCHIVE/CONSOLIDATE leaves emitted BEFORE
+  the corresponding delete on `delete`/`apply_remote_deletion`/
+  `purge_and_tombstone_forget`/`forget`/`gc`/`size_gc`/`archive_memory`/
+  `consolidate`. Leaves are identity-only (`memory_id`/`kind`/
+  `prior_version`/`namespace`/`agent_id`/`ts`/`sig`) — **never content.**
+  The postgres `apply_remote_deletion` fix additionally closes a
+  pool-direct hard-delete data-loss gap (now atomic tx + audited leaf).
+- Tested (all CI-run): `tests/append_only_spine_guard_g6.rs` (static
+  every-mutation-site-is-routed guard, enforced with an empty worklist);
+  `tests/append_only_spine_flagon_g6.rs` (flag-ON behavior: exact leaf per
+  primitive, Ed25519 signature verification, same-id-supersede +
+  federation-convergence non-perturbation, flag-OFF zero-rows
+  re-confirmation).
+- **"append-only" / "no silent delete" remain BANNED** for a global claim
+  — this ships the flag-gated capability; the global default-on flip is
+  out of scope here (see §1.5 discipline in the EPIC doc).
+
+### G9 — three-key Recorder/Judge/Stopper signing-layer separation ([#1826](https://github.com/alphaonedev/ai-memory-mcp/issues/1826))
+
+Strengthens **§2.5 (governance verdicts/enforcement land in the signed
+chain)**. Additive and opt-in — byte-identical legacy when unconfigured.
+
+- **Three governance-role signing keys** (Recorder/Judge/Stopper),
+  reusing the existing witness-custody + pin-first-then-verify
+  discipline. Every governance verdict is Recorder-signed (daemon-key
+  fallback); every enrolled Judge signs a `GovernanceVerdict` checkpoint
+  on every verdict; an enrolled Stopper signs a `GovernanceEnforcement`
+  checkpoint on every deny (advisory `stopperSig`, produced independent of
+  the deny decision itself). `verify_chain` / `verify_audit_trail`
+  (postgres twin) both gain per-row Recorder signature verification plus
+  a shared `RoleSeparationCheck` (pin-first judge/stopper pubkeys +
+  pairwise distinctness), fail-closed under the require flag.
+- Tested (all CI-run): `tests/role_separation_1826.rs` — legacy
+  byte-equality, recorder/judge/stopper signature pins, cross-role
+  forgery (all four legs), require-flag fail-closed, domain separation,
+  live-gated postgres parity.
+- **Honest scope:** single-process key custody (no HSM/M-of-N, no
+  cross-host key split) — the capability manifest explicitly disclaims
+  BFT/HSM/M-of-N/`governance.halt` and intra-process key co-location.
+  Global "three-key" / trust-boundary claims stay DEFERRED to v1.0 (§B4
+  per-stream deferral).
+
+### G10.1 — macaroon capability tokens wired end-to-end ([#1827](https://github.com/alphaonedev/ai-memory-mcp/issues/1827))
+
+Strengthens **§2.5 (capability grants/rejects land in the signed audit
+trail)**. Byte-identical legacy until `[capabilities].enabled` (default
+`false`).
+
+- **The stateless macaroon capability-token layer is now reachable on
+  every governed surface** (MCP/HTTP/CLI edges), on top of the pre-shipped
+  pure core: `[capabilities]` config block with a CLOSED-allowlist loader
+  (misconfigured issuers are SKIPPED, never fall through to
+  `db::agent_pubkey`); `CallerContext.capability` threaded through
+  `db::enforce_governance`, the SAL trait, and the postgres inline gate as
+  a signature parameter (compiler-enforced — no caller can be missed); one
+  wiring hook (`governance::capability::apply_at_gate`) runs inside both
+  backend gates on the final coarse decision, Enforce-arm only: a granted
+  Pending flips to Allow (no stray approval row), a reject returns the
+  unchanged base refusal plus a capability-reject forensic row, grants
+  land capability-grant rows naming issuer/root_id/op_level.
+  Agent-caveat identity is pinned to the gate's own `agent_id` argument,
+  closing an impersonation seam by construction.
+- Tested (all CI-run): `tests/g10_capability_tokens.rs`,
+  `tests/capabilities_v2.rs`, `tests/capabilities_v3.rs`,
+  `tests/capabilities_v3_l3_5.rs`,
+  `tests/capabilities_v3_provenance_layer.rs`.
+
+### G13 (bare) — signed identity-lineage key-succession chain, rotation-survival core ([#1828](https://github.com/alphaonedev/ai-memory-mcp/issues/1828); schema v76)
+
+Strengthens **§2.5 (identity succession lands in a signed, verifiable
+chain)**. Opt-in and additive — no lineage enrolled = byte-identical
+legacy resolution through the flat `metadata.agent_pubkey`.
+
+- **An agent_id can now name a SEQUENCE of keys** `K0 → K1 → … → Kn`
+  linked by predecessor-signed succession records; a verifier walks
+  genesis → head and trusts `Kn` via an unbroken Ed25519 chain rooted at
+  `K0`. New `src/identity/lineage.rs` (`LineageRecord`, `LineageError`,
+  `verify_succession`/`verify_lineage`, `LineageCheck` verdict — mirrors
+  `RoleSeparationCheck` for K3 cross-backend parity); `sign.rs` gains a
+  domain-tagged `SignableSuccession` (carries `recovery_pubkey` for v1.0
+  forward-compat) + `sign_succession`; `keypair::rotate_with_succession`
+  signs+persists the handoff with `K_old` before archive/save destroys
+  it (legacy `rotate()` untouched); dedicated `agent_lineage` table
+  (composite PK `(agent_id, epoch)`) on both backends; CLI
+  `identity enroll-lineage` / `succeed` / `register-recovery-key`;
+  `verify-audit-trail` surfaces the `LineageCheck` verdict on both
+  backends.
+- Tested (all CI-run): `tests/identity_lineage_succession.rs`.
+- **Honest scope (per ROADMAP §26.5 — see EPIC §B5):** this ships
+  **rotation-survival continuity only** — a *voluntary* predecessor
+  signing its successor. It does **not** solve "key-loss = death": if the
+  sole active key is lost there is nothing left to sign a successor.
+  True loss-recovery needs M-of-N threshold/social recovery (G17/#1831),
+  which is **v1.0**. Do **not** claim "key-loss recovery" for v0.9 — this
+  is why `recovery_pubkey` exists on the wire type now but v0.9 does not
+  implement a recovery-VERIFY path against it.
 
 ## [0.8.1] — 2026-06-29 — `hardened-patch` — defect closure + security review ([#1821](https://github.com/alphaonedev/ai-memory-mcp/issues/1821))
 
