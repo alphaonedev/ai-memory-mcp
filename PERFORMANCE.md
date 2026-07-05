@@ -204,6 +204,34 @@ trade latency for capability without re-compiling:
 A namespace that sets all three knobs falls back to the keyword-tier
 write budget (< 50 ms p95).
 
+### Reranker worker-pool memory footprint (#1867 B7-RR-2 / G7-step2)
+
+The neural cross-encoder batcher (`src/reranker.rs::BatchedReranker`) runs
+a pool of worker threads sized to the physical CPU count
+(`resolve_reranker_pool_size()`: `AI_MEMORY_RERANK_POOL_SIZE` when set,
+else `std::thread::available_parallelism()`, clamped to
+`1..=RERANK_POOL_MAX` = 20). Pre-#1867 a single worker served every
+autonomous-tier recall, so overlapping recalls serialised behind one
+handle; the pool lets sibling workers run BERT forward passes
+concurrently (each releases the shared job receiver **before** the
+forward), removing that head-of-line serialisation.
+
+**Memory footprint is flat in pool size.** Every worker shares the *same*
+`Arc<BertModel>` (the #1084 no-mutex `forward(&self)` is inference-only
+and concurrency-safe), so the ~80 MB ms-marco-MiniLM-L-6-v2 weights are
+allocated **once**, not per worker. Growing the pool adds only per-thread
+stack + a `JoinHandle` (kilobytes each), not another model copy. This is
+the deliberate choice over an `Arc<BertModel>`-per-worker pool, whose RAM
+would scale with core count and blow the tier memory budgets on
+many-core hosts — the reason the pool is also hard-bounded at
+`RERANK_POOL_MAX` regardless of core count. On a CPU-only host the
+candle matmul inside a single forward already parallelises across cores,
+so the pool's win is concurrency across *overlapping* recalls (tail
+latency under sustained autonomous-tier load), not single-forward
+throughput; operators on memory- or thread-constrained endpoints can pin
+`AI_MEMORY_RERANK_POOL_SIZE=1` to restore the pre-#1867 single-worker
+footprint.
+
 ### v0.7.0 attack plan — measured contributors
 
 The **worst single contributor** measured on `scripts/batman-bench.sh`

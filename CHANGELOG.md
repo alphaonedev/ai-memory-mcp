@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### §11.5 B7-RR-2 — reranker BertModel worker pool sized to physical CPUs (G7-step2, [#1867](https://github.com/alphaonedev/ai-memory-mcp/issues/1867))
+
+- **`BatchedReranker` now runs a worker POOL** sized to the physical CPU
+  count instead of a single worker. `resolve_reranker_pool_size()` resolves
+  `AI_MEMORY_RERANK_POOL_SIZE` (positive int) > `available_parallelism()`,
+  clamped to `1..=RERANK_POOL_MAX` (20). Every worker shares the ONE
+  `Arc<BertModel>` (the #1084 no-mutex `forward(&self)` is concurrency-safe),
+  so concurrent autonomous-tier recalls no longer serialise on a single
+  handle **and** model RAM stays flat in pool size — no per-worker weight
+  copy (footprint documented in PERFORMANCE.md). Each worker releases the
+  shared job receiver before its forward pass, so sibling forwards run
+  concurrently. Shutdown moved from a single one-shot channel to a shared
+  `stop` flag so `Drop` terminates every worker within the 100 ms poll
+  cadence. The #1597 candidate-pool cap and the auto-select direct path for
+  lexical/degraded-lexical encoders are unchanged.
+- **Scope note (honest):** the §11.5 "envelope-level degraded signal" was
+  found ALREADY shipped since v0.7.0 as `meta.reranker_used`
+  (`src/models/memory.rs`; values `neural`/`lexical`/`degraded_lexical`/`none`),
+  so no duplicate `meta.reranker_mode` field was added. The global
+  reranker default-on flip stays DEFERRED to v1.0 per vote `0b232b00` /
+  B7-RR-AMEND-1. This commit ships G7-step2 (pool sizing) + covering tests
+  only; `resolve_reranker` and per-tier `cross_encoder` defaults are
+  untouched.
+
 ### §25.3 P0 spine (S3/S4/S1/S2/S5; 2×5-wave vote `b0c1e157-3419-4d48-aebc-857283a97dfd`)
 
 - **S3 (F-40) — signed rule enable/disable.** `rules_store::set_enabled_signed`

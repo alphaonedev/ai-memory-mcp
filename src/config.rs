@@ -4330,6 +4330,15 @@ pub const ENV_RERANK_MAX_SEQ: &str = "AI_MEMORY_RERANK_MAX_SEQ";
 /// fall through to the next layer.
 pub const ENV_RERANK_SCORE_FLOOR: &str = "AI_MEMORY_RERANK_SCORE_FLOOR";
 
+/// #1867 B7-RR-2 (G7-step2) — env override for the neural cross-encoder
+/// worker-pool size (the number of batcher threads that run BERT forward
+/// passes over the shared `Arc<BertModel>`). Highest-precedence layer of
+/// the pool-size ladder (env > detected available parallelism); the
+/// resolved value is clamped to `1..=crate::reranker::RERANK_POOL_MAX`.
+/// Zero / unparseable values fall through to the detected default. See
+/// [`crate::reranker::resolve_reranker_pool_size`].
+pub const ENV_RERANK_POOL_SIZE: &str = "AI_MEMORY_RERANK_POOL_SIZE";
+
 /// v0.8.0 #1749 — env override for `[curator.compaction].enabled`. Truthy
 /// (`1`/`true`) or falsy (`0`/`false`) wins over config; anything else falls
 /// through to the config field then the compiled default `false`.
