@@ -165,9 +165,13 @@ pub fn reset_shadow_config_for_tests() {
 /// SQL aggregation without joining back to `memories`. Added in
 /// schema v40 (sqlite) / v39 (postgres) under Cluster G (PERF-12).
 ///
-/// `recall_outcome` is `Some("recalled")` / `Some("skipped")` /
-/// `None`. The recall ranker stamps the value once it knows whether
-/// the candidate landed in the top-K or was dropped.
+/// `recall_outcome` is normally passed `None` here — no live caller
+/// stamps a value at observe-time today. It is the pre-provisioned slot
+/// [`backfill_recall_outcomes`] fills in offline: `Some("consumed")` /
+/// `Some("unconsumed")` once a correlated `recall_observations` ledger
+/// row exists, `None` otherwise (v0.9.0 §11.5, #1706). A caller MAY
+/// still pass an explicit value (tests do, to seed fixtures); the
+/// backfill only ever touches rows that are still `NULL`.
 ///
 /// # Errors
 ///
@@ -265,6 +269,72 @@ pub fn gc_observations(conn: &Connection, retention_days: i64) -> Result<usize> 
     let n = conn.execute(
         "DELETE FROM confidence_shadow_observations WHERE observed_at < ?1",
         params![cutoff],
+    )?;
+    Ok(n)
+}
+
+/// v0.9.0 §11.5 (#1706) — offline sweep step: backfill `recall_outcome`
+/// on `confidence_shadow_observations` rows by joining the
+/// `recall_observations` consumption ledger (schema v47, #886; dual-
+/// backend authenticated ledger per #1705) on `memory_id`.
+///
+/// SHADOW MODE ONLY. This function is read-then-write against
+/// `confidence_shadow_observations` alone; it never touches `memories`
+/// or `memories_fts`, so it cannot change [`crate::storage::recall`]'s
+/// output — the two tables are disjoint from the recall query's FROM
+/// clause. Called from [`crate::confidence::calibrate::calibrate_from_shadow`]
+/// so the existing offline sweep cadence (CLI `ai-memory calibrate
+/// confidence --from-shadow` / MCP `memory_calibrate_confidence`) is the
+/// only cadence this rides; there is no new hot-path code.
+///
+/// For every shadow row still `recall_outcome IS NULL`:
+/// - set to `"consumed"` when at least one `recall_observations` row for
+///   that `memory_id` has `consumed = 1`;
+/// - set to `"unconsumed"` when a ledger row exists for that `memory_id`
+///   but none is consumed;
+/// - left `NULL` when no ledger row matches at all (no correlated
+///   recall to judge the shadow sample against).
+///
+/// Returns the number of shadow rows backfilled (i.e. rows that had a
+/// matching ledger entry and got a non-NULL `recall_outcome` written).
+///
+/// # Skip-with-WARN
+///
+/// When the `recall_observations` table is absent (a DB that hasn't
+/// run the #886 migration — e.g. a bare test fixture, or a backend
+/// state that predates the ledger), this logs a WARN and returns
+/// `Ok(0)` without error. The offline sweep MUST NOT fail the
+/// calibration report just because the consumption ledger isn't there
+/// yet (item 4 of #1706's design).
+///
+/// # Errors
+///
+/// Returns the underlying `rusqlite::Error` on SQL failure once the
+/// ledger table is confirmed present.
+pub fn backfill_recall_outcomes(conn: &Connection) -> Result<usize> {
+    if !crate::observations::table_exists(conn) {
+        tracing::warn!(
+            target: "confidence.shadow",
+            "recall_observations ledger absent, skipping consumption utility backfill"
+        );
+        return Ok(0);
+    }
+    let n = conn.execute(
+        "UPDATE confidence_shadow_observations
+            SET recall_outcome = CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM recall_observations ro
+                         WHERE ro.memory_id = confidence_shadow_observations.memory_id
+                           AND ro.consumed = 1
+                    ) THEN 'consumed'
+                    ELSE 'unconsumed'
+                END
+          WHERE recall_outcome IS NULL
+            AND EXISTS (
+                SELECT 1 FROM recall_observations ro
+                 WHERE ro.memory_id = confidence_shadow_observations.memory_id
+            )",
+        [],
     )?;
     Ok(n)
 }
@@ -464,6 +534,152 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 10);
+    }
+
+    /// #1706 — a shadow row whose `memory_id` has a `consumed = 1`
+    /// ledger row backfills to `"consumed"`.
+    #[test]
+    fn backfill_recall_outcomes_marks_consumed_row() {
+        let (conn, _dir) = open_tmp();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
+             VALUES ('m1', 'mid', 'ns', 't', 'c', '2026-05-15T00:00:00Z', '2026-05-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
+             VALUES ('consumer', 'mid', 'ns', 't2', 'c', '2026-05-15T00:00:00Z', '2026-05-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        observe(
+            &conn,
+            "m1",
+            "ns",
+            "user",
+            0.9,
+            0.6,
+            &signals_fixture(),
+            None,
+        )
+        .unwrap();
+
+        crate::observations::record_recall(
+            &conn,
+            "r1",
+            &[crate::observations::Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            }],
+        )
+        .unwrap();
+        crate::observations::mark_consumed(&conn, "r1", &["m1"], "consumer").unwrap();
+
+        let n = backfill_recall_outcomes(&conn).expect("backfill");
+        assert_eq!(n, 1);
+        let rows = observations_since(&conn, Some("ns"), None).expect("read back");
+        assert_eq!(rows[0].recall_outcome.as_deref(), Some("consumed"));
+    }
+
+    /// #1706 — a shadow row whose `memory_id` has a ledger row that is
+    /// NOT consumed backfills to `"unconsumed"`.
+    #[test]
+    fn backfill_recall_outcomes_marks_unconsumed_row() {
+        let (conn, _dir) = open_tmp();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
+             VALUES ('m1', 'mid', 'ns', 't', 'c', '2026-05-15T00:00:00Z', '2026-05-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        observe(
+            &conn,
+            "m1",
+            "ns",
+            "user",
+            0.9,
+            0.6,
+            &signals_fixture(),
+            None,
+        )
+        .unwrap();
+        crate::observations::record_recall(
+            &conn,
+            "r1",
+            &[crate::observations::Candidate {
+                memory_id: "m1",
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            }],
+        )
+        .unwrap();
+        // No mark_consumed call — the candidate was recalled but never cited.
+
+        let n = backfill_recall_outcomes(&conn).expect("backfill");
+        assert_eq!(n, 1);
+        let rows = observations_since(&conn, Some("ns"), None).expect("read back");
+        assert_eq!(rows[0].recall_outcome.as_deref(), Some("unconsumed"));
+    }
+
+    /// #1706 — a shadow row whose `memory_id` has NO ledger row at all
+    /// stays `NULL` (nothing to correlate against).
+    #[test]
+    fn backfill_recall_outcomes_leaves_unmatched_row_null() {
+        let (conn, _dir) = open_tmp();
+        conn.execute(
+            "INSERT INTO memories (id, tier, namespace, title, content, created_at, updated_at)
+             VALUES ('m1', 'mid', 'ns', 't', 'c', '2026-05-15T00:00:00Z', '2026-05-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        observe(
+            &conn,
+            "m1",
+            "ns",
+            "user",
+            0.9,
+            0.6,
+            &signals_fixture(),
+            None,
+        )
+        .unwrap();
+
+        let n = backfill_recall_outcomes(&conn).expect("backfill");
+        assert_eq!(n, 0, "no ledger row to correlate against");
+        let rows = observations_since(&conn, Some("ns"), None).expect("read back");
+        assert_eq!(rows[0].recall_outcome, None);
+    }
+
+    /// #1706 item 4 — when the `recall_observations` table is absent
+    /// (e.g. a bare `Connection` fixture that skipped
+    /// `crate::storage::open`), the backfill logs a WARN and returns
+    /// `Ok(0)` without erroring.
+    #[test]
+    fn backfill_recall_outcomes_skips_with_warn_when_ledger_absent() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("bare.db");
+        let conn = Connection::open(&path).expect("open bare conn");
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY);
+             CREATE TABLE confidence_shadow_observations (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 memory_id TEXT NOT NULL,
+                 namespace TEXT NOT NULL,
+                 caller_confidence REAL NOT NULL,
+                 derived_confidence REAL NOT NULL,
+                 signals TEXT NOT NULL,
+                 recall_outcome TEXT,
+                 observed_at TEXT NOT NULL
+             );",
+        )
+        .expect("bare schema (no recall_observations table)");
+
+        let n = backfill_recall_outcomes(&conn).expect("skip, not error");
+        assert_eq!(n, 0, "no rows touched when the ledger is absent");
     }
 
     #[test]

@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### §11.5 — close the `recall_observations` feedback loop, SHADOW mode ([#1706](https://github.com/alphaonedev/ai-memory-mcp/issues/1706))
+
+Strengthens **§2.4 (improvable across model generations)** — recall now
+generates the evidence needed to justify (or kill) a future usage-aware
+ranking wire, without touching ranking itself.
+
+- **`recall_outcome` backfill.** `confidence_shadow_observations.recall_outcome`
+  (schema v39, always-`NULL` in practice — no live caller has ever stamped
+  it) is now populated by a new offline sweep step,
+  `confidence::shadow::backfill_recall_outcomes`: for every shadow row
+  still `NULL`, it joins the `recall_observations` consumption ledger
+  (schema v47, #886; dual-backend + authenticated per #1705) on
+  `memory_id` and writes `consumed` / `unconsumed`; rows with no
+  correlated ledger entry stay `NULL`. No new schema — the column was
+  already provisioned.
+- **`consumption_utility` metric.** `PerSourceBaseline` (part of
+  `CalibrationReport`) carries a new `consumption_utility: Option<f64>` —
+  `COUNT(consumed) / COUNT(judged)` per `(namespace, source)` group.
+  **Logged only** (CLI table `UTIL` column, JSON envelope, and a
+  `tracing::info!` line) — `crate::storage::recall`'s score formula is
+  **completely untouched**; nothing reads this metric back into ranking.
+  `None` (never a misleading `0.0`) when no row in the group has ledger
+  evidence yet.
+- **Cadence.** Rides the existing `calibrate_from_shadow` offline sweep
+  (`ai-memory calibrate confidence --from-shadow` /
+  `memory_calibrate_confidence`, gated `AI_MEMORY_CONFIDENCE_SHADOW=1`
+  for the write side) — zero new hot-path code, recall p95 and the
+  sqlite single-writer mutex untouched.
+- **Skip-with-WARN.** When the `recall_observations` table is absent
+  (pre-#886 schema, or a bare fixture), the sweep logs `"recall_observations
+  ledger absent, skipping consumption utility backfill"` and returns
+  cleanly instead of erroring.
+- **The key honesty guarantee.** A new regression test
+  (`recall_output_byte_identical_around_1706_shadow_sweep`, mirroring the
+  reranker's `ReflectionBoostConfig::disabled()` byte-equality pin) proves
+  `recall()`'s Memory payload + ranking order are byte-identical before
+  and after the sweep runs — the sweep writes only into
+  `confidence_shadow_observations`, a table `recall()`'s query never
+  references.
+- **Honest scope note on #1705 gating.** #1705 (ledger backend-parity +
+  integrity hardening) is already closed, so the sqlite-backed sweep runs
+  against the authenticated dual-backend ledger today. The confidence-
+  shadow/calibration subsystem itself (`confidence_shadow_observations`,
+  `calibrate_from_shadow`) remains sqlite-only — no postgres variant
+  exists for it independent of this issue — so the skip-with-WARN path
+  protects the reachable "ledger table absent from this sqlite DB" case
+  (pre-#886 schema, bare fixtures) rather than a live postgres connection.
+  Separately, `confidence::shadow::observe` has no live caller on the
+  recall/store hot path today, so `confidence_shadow_observations` stays
+  empty in a stock deployment until that wiring lands — out of scope
+  here; the sweep and metric are correct against whatever shadow rows
+  exist.
+- **Out of scope (unchanged, per the issue's hard cuts):** no live
+  ranking change, no bandit/online-reweight/trajectory selection, no
+  exploration pool, no per-recall LLM-judge, no schema bump. Item 5
+  (rank-delta shadow telemetry) was **not** shipped in this pass — kept
+  out to bound scope; #1707 (the live-wire decision) stays conditional on
+  this shadow data showing real divergence.
+
 ### §11.5 B7-RR-2 — reranker BertModel worker pool sized to physical CPUs (G7-step2, [#1867](https://github.com/alphaonedev/ai-memory-mcp/issues/1867))
 
 - **`BatchedReranker` now runs a worker POOL** sized to the physical CPU

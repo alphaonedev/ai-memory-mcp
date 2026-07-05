@@ -32,13 +32,20 @@
 //!    updater is invoked.
 //! 7. Schema v39 (sqlite) / v38 (postgres) lands idempotently.
 //! 8. Form 5 fields round-trip through the forensic bundle envelope.
+//! 9. v0.9.0 §11.5 (#1706) — the offline sweep backfills `recall_outcome`
+//!    from the `recall_observations` ledger, `CalibrationReport` carries
+//!    a logged-only per-source `consumption_utility`, the sweep skips
+//!    gracefully (no error) when the ledger table is absent, and
+//!    `recall()` output is byte-identical before/after the sweep runs
+//!    (the key honesty guarantee — SHADOW mode, zero ranking change).
 
 use ai_memory::confidence::calibrate::calibrate_from_shadow;
 use ai_memory::confidence::decay::decayed;
-use ai_memory::confidence::shadow::{observations_since, observe};
+use ai_memory::confidence::shadow::{backfill_recall_outcomes, observations_since, observe};
 use ai_memory::confidence::{DEFAULT_HALF_LIFE_DAYS, DeriveContext, derive};
 use ai_memory::db;
 use ai_memory::models::{ConfidenceSignals, ConfidenceSource, Memory, MemoryKind, Tier};
+use ai_memory::observations::{self, Candidate};
 use ai_memory::storage;
 
 use chrono::Utc;
@@ -847,5 +854,271 @@ fn shadow_observe_uses_cached_config() {
     for _ in 0..100 {
         let p = std::ptr::from_ref(shadow_config());
         assert_eq!(p, p1, "every shadow_config call must return cache");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. v0.9.0 §11.5 (#1706) — close the recall_observations feedback loop,
+//    SHADOW mode. recall_outcome backfill, consumption_utility, and the
+//    recall() byte-identical regression pin (the key honesty guarantee).
+// ---------------------------------------------------------------------------
+
+/// #1706 acceptance criterion — after an offline sweep, `recall_outcome`
+/// is populated (`consumed`/`unconsumed`) for shadow rows with a
+/// matching `recall_observations` ledger entry; `NULL` otherwise.
+#[test]
+fn sweep_backfills_recall_outcome_from_ledger_1706() {
+    let (_tmp, conn) = fresh_db();
+    let consumed_mem = fixture_memory("ns-1706", "consumed-candidate");
+    let unconsumed_mem = fixture_memory("ns-1706", "unconsumed-candidate");
+    let unmatched_mem = fixture_memory("ns-1706", "no-ledger-entry");
+    let consumer = fixture_memory("ns-1706", "consumer");
+    db::insert(&conn, &consumed_mem).expect("insert consumed");
+    db::insert(&conn, &unconsumed_mem).expect("insert unconsumed");
+    db::insert(&conn, &unmatched_mem).expect("insert unmatched");
+    db::insert(&conn, &consumer).expect("insert consumer");
+
+    let s = ConfidenceSignals::default();
+    observe(
+        &conn,
+        &consumed_mem.id,
+        "ns-1706",
+        "user",
+        0.9,
+        0.5,
+        &s,
+        None,
+    )
+    .expect("observe c");
+    observe(
+        &conn,
+        &unconsumed_mem.id,
+        "ns-1706",
+        "user",
+        0.9,
+        0.5,
+        &s,
+        None,
+    )
+    .expect("observe u");
+    observe(
+        &conn,
+        &unmatched_mem.id,
+        "ns-1706",
+        "user",
+        0.9,
+        0.5,
+        &s,
+        None,
+    )
+    .expect("observe n");
+
+    observations::record_recall(
+        &conn,
+        "r-1706",
+        &[
+            Candidate {
+                memory_id: &consumed_mem.id,
+                retriever: "hybrid",
+                rank: 1,
+                score: 0.9,
+            },
+            Candidate {
+                memory_id: &unconsumed_mem.id,
+                retriever: "hybrid",
+                rank: 2,
+                score: 0.8,
+            },
+        ],
+    )
+    .expect("record_recall");
+    observations::mark_consumed(&conn, "r-1706", &[consumed_mem.id.as_str()], &consumer.id)
+        .expect("mark_consumed");
+
+    let n = backfill_recall_outcomes(&conn).expect("backfill");
+    assert_eq!(n, 2, "two shadow rows had a matching ledger entry");
+
+    let rows = observations_since(&conn, Some("ns-1706"), None).expect("read shadow rows");
+    let outcome_for = |id: &str| {
+        rows.iter()
+            .find(|r| r.memory_id == id)
+            .and_then(|r| r.recall_outcome.clone())
+    };
+    assert_eq!(outcome_for(&consumed_mem.id).as_deref(), Some("consumed"));
+    assert_eq!(
+        outcome_for(&unconsumed_mem.id).as_deref(),
+        Some("unconsumed")
+    );
+    assert_eq!(
+        outcome_for(&unmatched_mem.id),
+        None,
+        "no ledger entry correlates ⇒ stays NULL"
+    );
+}
+
+/// #1706 item 4 — on a DB where the `recall_observations` ledger is
+/// absent, the sweep skips the consumption-utility backfill with a WARN
+/// and does not error. Exercised through the public
+/// `calibrate_from_shadow` entry point (not just the inner
+/// `backfill_recall_outcomes` unit test in `src/confidence/shadow.rs`),
+/// so this pins the behaviour a real CLI/MCP caller observes.
+#[test]
+fn calibrate_from_shadow_skips_gracefully_when_ledger_table_absent_1706() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("no-ledger.db");
+    let conn = rusqlite::Connection::open(&path).expect("open bare conn");
+    conn.execute_batch(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY);
+         CREATE TABLE confidence_shadow_observations (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             memory_id TEXT NOT NULL,
+             namespace TEXT NOT NULL,
+             source TEXT NOT NULL,
+             caller_confidence REAL NOT NULL,
+             derived_confidence REAL NOT NULL,
+             signals TEXT NOT NULL,
+             recall_outcome TEXT,
+             observed_at TEXT NOT NULL
+         );",
+    )
+    .expect(
+        "bare schema (v40 `source` column present), no recall_observations table (pre-#886 shape)",
+    );
+    conn.execute(
+        "INSERT INTO confidence_shadow_observations
+            (memory_id, namespace, source, caller_confidence, derived_confidence,
+             signals, recall_outcome, observed_at)
+         VALUES ('m1', 'ns', 'user', 0.9, 0.5, '{}', NULL, ?1)",
+        rusqlite::params![Utc::now().to_rfc3339()],
+    )
+    .expect("seed shadow row directly (no `source` column on this bare schema)");
+
+    let report = calibrate_from_shadow(&conn, 30, Utc::now())
+        .expect("sweep must not error when the ledger table is absent");
+    assert_eq!(report.total_observations, 1);
+    assert_eq!(
+        report.baselines[0].consumption_utility, None,
+        "no ledger ⇒ no evidence ⇒ None, not an error and not 0.0"
+    );
+}
+
+/// #1706 — the key honesty guarantee: `recall()` output is
+/// BYTE-IDENTICAL before/after the #1706 offline sweep runs. Mirrors
+/// the reranker byte-equality pins (`src/reranker.rs`'s
+/// `ReflectionBoostConfig::disabled()` pin at the bare `rerank`/
+/// `rerank_with_reflection_boost` pair): this proves the shadow/
+/// calibration sweep — which writes ONLY into
+/// `confidence_shadow_observations` — cannot change what `recall()`
+/// returns, since `recall()`'s SQL (`src/storage/mod.rs`) never
+/// references that table.
+///
+/// The comparison pins the serialized `Memory` payload + rank order,
+/// not the raw blended `f64` score: `recall()`'s score formula includes
+/// a live `julianday('now')` recency term (pre-existing, independent of
+/// #1706) that is not bit-stable across two real-wall-clock SQL
+/// evaluations microseconds apart — pinning on that value would make
+/// the test flaky for a reason that has nothing to do with this
+/// feature. Ordering + Memory content is the honest, deterministic
+/// thing to pin; the score is additionally checked to stay within
+/// float noise as a supplementary (non-bit-exact) sanity check.
+#[test]
+fn recall_output_byte_identical_around_1706_shadow_sweep() {
+    let (_tmp, conn) = fresh_db();
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let mut m = fixture_memory("ns-byte-pin", &format!("findme widget report {i}"));
+        m.content = "findme widget status report body".to_string();
+        db::insert(&conn, &m).expect("insert");
+        ids.push(m.id.clone());
+    }
+    let consumer = fixture_memory("ns-byte-pin", "consumer");
+    db::insert(&conn, &consumer).expect("insert consumer");
+
+    let s = ConfidenceSignals::default();
+    for id in &ids {
+        observe(&conn, id, "ns-byte-pin", "user", 0.9, 0.5, &s, None).expect("observe");
+    }
+    let candidates: Vec<Candidate<'_>> = ids
+        .iter()
+        .map(|id| Candidate {
+            memory_id: id,
+            retriever: "hybrid",
+            rank: 1,
+            score: 0.9,
+        })
+        .collect();
+    observations::record_recall(&conn, "r-byte-pin", &candidates).expect("record_recall");
+    observations::mark_consumed(&conn, "r-byte-pin", &[ids[0].as_str()], &consumer.id)
+        .expect("mark_consumed");
+
+    let do_recall = || -> Vec<(Memory, f64)> {
+        storage::recall(
+            &conn,
+            "findme",
+            Some("ns-byte-pin"),
+            10,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .expect("recall")
+        .0
+    };
+
+    let before = do_recall();
+    assert!(
+        !before.is_empty(),
+        "fixture must actually recall something for this pin to be meaningful"
+    );
+    let before_ids: Vec<String> = before.iter().map(|(m, _)| m.id.clone()).collect();
+    let before_json: Vec<String> = before
+        .iter()
+        .map(|(m, _)| serde_json::to_string(m).expect("serialize"))
+        .collect();
+
+    // The #1706 offline sweep under test: backfill recall_outcome +
+    // compute consumption_utility. Writes ONLY into
+    // confidence_shadow_observations — never `memories` / `memories_fts`.
+    let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+    assert!(
+        report
+            .baselines
+            .iter()
+            .any(|b| b.consumption_utility.is_some()),
+        "sweep must have produced real evidence for this pin to be meaningful, got {:?}",
+        report.baselines
+    );
+
+    let after = do_recall();
+    let after_ids: Vec<String> = after.iter().map(|(m, _)| m.id.clone()).collect();
+    let after_json: Vec<String> = after
+        .iter()
+        .map(|(m, _)| serde_json::to_string(m).expect("serialize"))
+        .collect();
+
+    assert_eq!(
+        before_ids, after_ids,
+        "recall() ranking order must be byte-identical around the #1706 sweep"
+    );
+    assert_eq!(
+        before_json, after_json,
+        "recall() Memory payload must be byte-identical around the #1706 sweep"
+    );
+
+    // Supplementary (non-bit-exact) sanity check: the ephemeral blended
+    // score carries a live recency term (pre-existing wall-clock
+    // jitter, unrelated to #1706) but must not have MEANINGFULLY moved.
+    for ((_, score_before), (_, score_after)) in before.iter().zip(after.iter()) {
+        assert!(
+            (score_before - score_after).abs() < 1e-6,
+            "score drift must be wall-clock noise only, not a #1706 side effect: {score_before} vs {score_after}"
+        );
     }
 }

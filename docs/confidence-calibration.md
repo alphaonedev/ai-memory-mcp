@@ -97,8 +97,53 @@ Each observation row carries:
 * `memory_id`, `namespace`, `observed_at` (the join key + window)
 * `caller_confidence`, `derived_confidence` (the side-by-side comparison)
 * `signals` (the JSON envelope that produced `derived_confidence`)
-* `recall_outcome` (`recalled` | `skipped` | NULL) so the calibration
-  sweep can distinguish helpful vs. discarded candidates
+* `recall_outcome` (`consumed` | `unconsumed` | NULL) — the
+  pre-provisioned slot for the v0.9.0 §11.5 (#1706) recall-usage
+  feedback loop, described below. NULL until the offline sweep
+  backfills it.
+
+## Recall-usage feedback loop (v0.9.0 §11.5, #1706 — SHADOW MODE)
+
+Closes the loop between "what did recall rank" and "what did the
+caller actually use", **without changing recall ranking**. Every
+`calibrate_from_shadow` sweep run
+(`ai-memory calibrate confidence --from-shadow` /
+`memory_calibrate_confidence`) now does two things before it computes
+baselines:
+
+1. **Backfill `recall_outcome`.** For every shadow row still `NULL`,
+   `crate::confidence::shadow::backfill_recall_outcomes` joins the
+   `recall_observations` consumption ledger (schema v47, #886;
+   dual-backend + authenticated per #1705) on `memory_id`: `consumed`
+   when a ledger row for that memory has `consumed = 1`, `unconsumed`
+   when a ledger row exists but none is consumed, left `NULL` when no
+   ledger row correlates at all. If the `recall_observations` table is
+   absent (pre-#886 schema, or a bare fixture) this logs a WARN —
+   `"recall_observations ledger absent, skipping consumption utility
+   backfill"` — and returns cleanly; the sweep never fails just because
+   the ledger isn't there.
+2. **Emit `consumption_utility`.** Each `PerSourceBaseline` now carries
+   `consumption_utility: Option<f64>` —
+   `COUNT(recall_outcome = 'consumed') / COUNT(recall_outcome IS NOT
+   NULL)` for that `(namespace, source)` group. `None` (never a
+   misleading `0.0`) when no row in the group has ledger evidence yet.
+
+**This is logged only.** `consumption_utility` is surfaced in the
+`CalibrationReport` JSON, the `UTIL` column of the ASCII table, and a
+`tracing::info!` line per group — `crate::storage::recall` never reads
+it and its score formula is untouched. The metric exists to give the
+future live-wire decision (issue #1707, conditional) real evidence
+before any ranking change is considered.
+
+Today the confidence-shadow write path (`shadow::observe`) has no live
+caller — `AI_MEMORY_CONFIDENCE_SHADOW=1` provisions the table and the
+sweep/backfill/GC machinery, but nothing on the recall or store hot
+path calls `observe` yet, so `confidence_shadow_observations` stays
+empty in a stock deployment until that separate wiring lands. The
+sweep and metric described here are correct against whatever shadow
+rows exist (proven by fixture-driven tests) and degrade to `None` /
+empty reports otherwise — they do not depend on that wiring landing
+first.
 
 ## Decay function
 
@@ -152,7 +197,7 @@ operator authorises it.
   `auto_confidence_enabled`.
 * `src/confidence/decay.rs` — `decayed`, `decay_enabled`.
 * `src/confidence/shadow.rs` — `observe`, `observations_since`,
-  `should_sample`.
+  `should_sample`, `backfill_recall_outcomes` (#1706).
 * `src/confidence/calibrate.rs` — `calibrate_from_shadow`,
   `CalibrationReport`, `PerSourceBaseline`.
 * `migrations/sqlite/0033_v07_form5_confidence_calibration.sql` —
