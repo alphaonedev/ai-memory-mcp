@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] — v0.9.0
 
+### §11.5 B7-SKILL — skill memories first-class: `parameters_schema` at register, `invocation_record`, version surface ([#1865](https://github.com/alphaonedev/ai-memory-mcp/issues/1865))
+
+Strengthens **§2.1 (executable artefacts are admin-minted, #949)** and
+**§2.5 (attested — honest audit trail)**. No schema migration on either
+backend: every field rides an EXISTING structure.
+
+- **`parameters_schema` accepted + validated at REGISTER (fail-closed).**
+  `memory_skill_register` / `ai-memory skill register --parameters-schema
+  <PATH>` / `POST /api/v1/skill/register` now accept the same
+  `parameters_schema` JSON-Schema-shaped object the promote path already
+  did. Structural validation (`skill_register::validate_parameters_schema`)
+  runs BEFORE any DB write — a malformed schema is rejected at MINT time,
+  never deferred to activation (`memory_skill_get`), because skill rows
+  are admin-minted executable artefacts (#949). The same gate was added
+  to the promote path (previously a non-object schema was silently
+  dropped instead of rejected). Stored in the existing
+  `skills.metadata` JSON column under `parameters_schema` — the same
+  column L2-7's `composes_with_reflections` mirror already uses; no new
+  column, no migration.
+- **`invocation_record` capture.** `memory_skill_get` (documented as
+  returning a skill's "activation payload") now appends a best-effort,
+  unsigned `signed_events` row (new `event_types::SKILL_INVOKED =
+  "skill.invoked"`) on every activation fetch and surfaces
+  `{event_id, recorded_at}` under the response's `invocation_record`
+  key. Rides the EXISTING append-only `signed_events` table (no new
+  `skill_invocations` table) — the same audit-log primitive
+  `skill_register` already uses for its own `skill.registered` event.
+- **Version surfacing.** The version-chain already existed at register
+  (re-registering the same `(namespace, name)` supersedes the prior row
+  via `superseded_by`); `skill_register::compute_skill_version` is a
+  pure read-side walk of that EXISTING chain, now surfaced as `version`
+  on `memory_skill_register`, `memory_skill_promote_from_reflection`,
+  and `memory_skill_get` responses (1-indexed; works for the current row
+  and for any old, already-superseded row).
+- **Both backends.** The `skills` table (and `skill_resources`) has no
+  Postgres schema at all — Agent Skills (v0.7.0 L1-5) has always been a
+  sqlite-only substrate (no `MemoryStore`/SAL trait methods, no
+  `postgres_schema.sql` entry). `signed_events` (which `invocation_record`
+  rides) DOES exist on both backends with matching columns, so no
+  postgres-twin drift is introduced.
+
+Snapshots re-blessed for the new `memory_skill_register.parameters_schema`
+property: `tests/snapshots/tool_definitions_pre_d1_6.json` (hand-patched —
+property-membership only, no bless mechanism on that specific test) and
+`tests/snapshots/tools_list_full.json` (`AI_MEMORY_BLESS_SNAPSHOTS=1`).
+
 ### §11.5 — close the `recall_observations` feedback loop, SHADOW mode ([#1706](https://github.com/alphaonedev/ai-memory-mcp/issues/1706))
 
 Strengthens **§2.4 (improvable across model generations)** — recall now

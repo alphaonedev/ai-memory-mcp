@@ -191,6 +191,15 @@ pub mod event_types {
     /// (`src/mcp/tools/skill_register.rs::226`).
     pub const SKILL_REGISTERED: &str = "skill.registered";
 
+    /// v0.9.0 §11.5 B7-SKILL (#1865) — `signed_events.event_type` for a
+    /// skill-invocation capture, emitted by `memory_skill_get`
+    /// (`src/mcp/tools/skill_get.rs`) every time an agent fetches a
+    /// skill's activation payload. Best-effort / unsigned (no
+    /// `active_keypair` is threaded through the read path); the row
+    /// still gives an append-only, tamper-evident-chained record of
+    /// which agent activated which skill id and when.
+    pub const SKILL_INVOKED: &str = "skill.invoked";
+
     /// `signed_events.event_type` for the L4 `memory_capture_turn`
     /// MCP tool emission per RFC-0001 (`src/mcp/tools/capture_turn.rs::472`).
     pub const MEMORY_CAPTURE_TURN: &str = "memory_capture_turn";

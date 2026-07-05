@@ -93,6 +93,14 @@ pub struct RegisterArgs {
     #[arg(long, value_name = "TEXT", conflicts_with = "manifest")]
     pub inline: Option<String>,
 
+    /// v0.9.0 §11.5 B7-SKILL (#1865) — optional path to a JSON file
+    /// containing the skill's invocation-parameters JSON schema.
+    /// Mirrors the MCP `parameters_schema` parameter: structurally
+    /// validated and REJECTED (fail-closed) at register time when
+    /// malformed. Same flag shape as `skill promote --parameters-schema`.
+    #[arg(long, value_name = "PATH")]
+    pub parameters_schema: Option<PathBuf>,
+
     /// Emit a structured JSON envelope instead of a human summary line.
     #[arg(long, default_value_t = false)]
     pub json: bool,
@@ -278,6 +286,18 @@ fn run_register(
     if let Some(ref inl) = args.inline {
         params["inline_skill"] = json!(inl);
     }
+    // v0.9.0 §11.5 B7-SKILL (#1865) — mirrors `run_promote`'s file-read
+    // shape below. The substrate does the actual structural fail-closed
+    // validation; a read/parse error here is a plain CLI-boundary error
+    // (bad path / non-JSON file), distinct from a malformed-schema
+    // rejection (which surfaces from `handle_skill_register` itself).
+    if let Some(ref p) = args.parameters_schema {
+        let raw = std::fs::read_to_string(p)
+            .map_err(|e| anyhow::anyhow!("read parameters_schema {}: {e}", p.display()))?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse parameters_schema {}: {e}", p.display()))?;
+        params[field_names::PARAMETERS_SCHEMA] = v;
+    }
 
     match crate::mcp::handle_skill_register(conn, &params, active_keypair) {
         Ok(v) => {
@@ -289,9 +309,10 @@ fn run_register(
                 let name = v["name"].as_str().unwrap_or("");
                 let digest = v["digest"].as_str().unwrap_or("");
                 let signed = v["signed"].as_bool().unwrap_or(false);
+                let version = v["version"].as_i64().unwrap_or(1);
                 writeln!(
                     out.stdout,
-                    "registered skill {ns}/{name} id={id} digest={} signed={signed}",
+                    "registered skill {ns}/{name} id={id} digest={} signed={signed} version={version}",
                     &digest[..digest.len().min(16)],
                 )?;
                 if let Some(prev) = v.get(field_names::SUPERSEDED_ID).and_then(Value::as_str) {
@@ -512,6 +533,7 @@ mod tests {
             action: SkillAction::Register(RegisterArgs {
                 manifest: None,
                 inline: Some(minimal_skill_md("cli-register")),
+                parameters_schema: None,
                 json: true,
             }),
         };
@@ -682,6 +704,7 @@ mod tests {
             action: SkillAction::Register(RegisterArgs {
                 manifest: None,
                 inline: Some(minimal_skill_md("cli-register-human")),
+                parameters_schema: None,
                 json: false,
             }),
         };
@@ -807,6 +830,7 @@ mod tests {
             action: SkillAction::Register(RegisterArgs {
                 manifest: None,
                 inline: None,
+                parameters_schema: None,
                 json: true,
             }),
         };
@@ -904,6 +928,7 @@ mod tests {
             action: SkillAction::Register(RegisterArgs {
                 manifest: Some(folder.join("SKILL.md")),
                 inline: None,
+                parameters_schema: None,
                 json: true,
             }),
         };

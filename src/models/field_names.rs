@@ -188,6 +188,10 @@ pub const GOVERNANCE: &str = "governance";
 pub const IMPORTED_FROM_AGENT_ID: &str = "imported_from_agent_id";
 /// `include_invalidated` — wire/row field name.
 pub const INCLUDE_INVALIDATED: &str = "include_invalidated";
+/// v0.9.0 §11.5 B7-SKILL (#1865) — `invocation_record` wire field name.
+/// Carries the `{event_id, recorded_at}` envelope of the `signed_events`
+/// row appended by `memory_skill_get`'s activation-invocation capture.
+pub const INVOCATION_RECORD: &str = "invocation_record";
 /// `is_duplicate` — wire/row field name.
 pub const IS_DUPLICATE: &str = "is_duplicate";
 /// `is_reflection` — wire/row field name.

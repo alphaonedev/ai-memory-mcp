@@ -2786,7 +2786,8 @@
               "string",
               "null"
             ]
-          }
+          },
+          "parameters_schema": {}
         },
         "type": "object"
       },

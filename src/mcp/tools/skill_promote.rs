@@ -65,7 +65,9 @@ use serde_json::{Value, json};
 use crate::identity::keypair::AgentKeypair;
 use crate::models::{MemoryKind, MemoryLinkRelation};
 
-use super::skill_register::{RegisterResult, register_core, resource_digest};
+use super::skill_register::{
+    RegisterResult, register_core, resource_digest, validate_parameters_schema,
+};
 
 /// Compiled default for `governance.skill_promotion_min_depth` when the
 /// namespace governance blob does not override it. A reflection at
@@ -85,6 +87,8 @@ struct PromoteOutcome {
     reflection_depth: i32,
     sources_attached: usize,
     superseded: Option<String>,
+    /// v0.9.0 §11.5 B7-SKILL (#1865) — 1-indexed version-chain position.
+    version: i64,
 }
 
 /// MCP handler for `memory_skill_promote_from_reflection`.
@@ -118,13 +122,27 @@ pub fn handle_skill_promote_from_reflection(
         .as_str()
         .filter(|s| !s.is_empty())
         .ok_or("memory_skill_promote_from_reflection requires 'skill_description'")?;
+    // v0.9.0 §11.5 B7-SKILL (#1865) — widened from `!v.is_null() &&
+    // v.is_object()` to `!v.is_null()` so a non-object value reaches
+    // `validate_parameters_schema` below and is REJECTED (fail-closed)
+    // rather than silently dropped as if the caller had omitted it.
     let parameters_schema: Option<&Value> = params
         .get(field_names::PARAMETERS_SCHEMA)
-        .filter(|v| !v.is_null() && v.is_object());
+        .filter(|v| !v.is_null());
 
     // Validate skill name against agentskills.io §3.1 BEFORE any DB work
     // so the caller sees the parse error at the boundary.
     crate::parsing::skill_md::validate_skill_name(skill_name)?;
+
+    // v0.9.0 §11.5 B7-SKILL (#1865) — FAIL CLOSED on a malformed
+    // parameters_schema here too, same structural gate `skill_register`
+    // enforces, so a promoted skill can't slip an invalid schema past
+    // the register-time contract by going through the reflection-promote
+    // path instead.
+    if let Some(schema) = parameters_schema {
+        validate_parameters_schema(schema)
+            .map_err(|e| format!("parameters_schema rejected at promote (fail-closed): {e}"))?;
+    }
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/state-change
     // audit. Skill promotion mints a new signed capability bundle from
@@ -266,10 +284,20 @@ pub fn handle_skill_promote_from_reflection(
     }
 
     // ─── 5. Metadata: provenance edge to the source reflection ─────────
-    let metadata = json!({
+    let mut metadata = json!({
         "derived_from_reflection_id": reflection_id,
         "original_reflection_depth": reflection.reflection_depth,
     });
+    // v0.9.0 §11.5 B7-SKILL (#1865) — mirror `parameters_schema` into the
+    // same `skills.metadata` column `skill_register` uses, so a promoted
+    // skill's schema is queryable the same way regardless of which path
+    // minted the row. Additive-only: does not change the signing digest
+    // (which covers frontmatter + body + resource digests, not metadata).
+    if let Some(schema) = parameters_schema {
+        if let Value::Object(ref mut map) = metadata {
+            map.insert(field_names::PARAMETERS_SCHEMA.to_string(), schema.clone());
+        }
+    }
 
     // ─── 6. Compute per-resource digests for the signing surface ───────
     let res_digests: Vec<Vec<u8>> = resources
@@ -292,6 +320,7 @@ pub fn handle_skill_promote_from_reflection(
         id: skill_id,
         digest,
         superseded,
+        version,
     } = register_core(
         conn,
         &reflection.namespace,
@@ -318,6 +347,7 @@ pub fn handle_skill_promote_from_reflection(
         reflection_depth: reflection.reflection_depth,
         sources_attached,
         superseded,
+        version,
     };
 
     let mut response = json!({
@@ -330,6 +360,9 @@ pub fn handle_skill_promote_from_reflection(
         "original_reflection_depth": outcome.reflection_depth,
         "sources_attached": outcome.sources_attached,
         "signed": active_keypair.is_some(),
+        // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain
+        // position (chain already existed via supersede-on-register).
+        "version": outcome.version,
     });
     if let Some(prev) = outcome.superseded {
         response[field_names::SUPERSEDED_ID] = json!(prev);
@@ -546,5 +579,59 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("skill_description"), "{err}");
+    }
+
+    // -----------------------------------------------------------------
+    // v0.9.0 §11.5 B7-SKILL (#1865) — parameters_schema fail-closed at
+    // promote (same structural gate as skill_register).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rejects_malformed_parameters_schema_fail_closed() {
+        let (conn, _dir) = open_db();
+        let obs_id = insert_observation(&conn, "source", "ns");
+        let refl_id = make_reflection(&conn, &[obs_id], "ns");
+        let params = sjson!({
+            "reflection_id": refl_id,
+            "skill_name": "bad-schema",
+            "skill_description": "desc",
+            "parameters_schema": "not-an-object",
+        });
+        let err = handle_skill_promote_from_reflection(&conn, &params, None).unwrap_err();
+        assert!(
+            err.contains("fail-closed") && err.contains("must be a JSON object"),
+            "{err}"
+        );
+        // No skill row must have been minted.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn stores_parameters_schema_in_metadata_and_surfaces_version() {
+        let (conn, _dir) = open_db();
+        let obs_id = insert_observation(&conn, "source", "ns");
+        let refl_id = make_reflection(&conn, &[obs_id], "ns");
+        let schema = sjson!({"type": "object", "properties": {"x": {"type": "string"}}});
+        let params = sjson!({
+            "reflection_id": refl_id,
+            "skill_name": "good-schema",
+            "skill_description": "desc",
+            "parameters_schema": schema.clone(),
+        });
+        let v = handle_skill_promote_from_reflection(&conn, &params, None).unwrap();
+        assert_eq!(v["version"], sjson!(1));
+        let skill_id = v["skill_id"].as_str().unwrap();
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata FROM skills WHERE id = ?1",
+                [skill_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
+        assert_eq!(metadata["parameters_schema"], schema);
     }
 }
