@@ -13,7 +13,8 @@
 //!   from `cross-encoder/ms-marco-MiniLM-L-6-v2` (~80 MB, ONNX-free).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{Sender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -290,6 +291,65 @@ fn split_rerank_pool(
 /// (the head the caller actually reads) while bounding the worst-case
 /// forward-pass cost at ~40% of the pre-fix pool.
 pub const RERANK_POOL_MAX: usize = 20;
+
+/// #1867 B7-RR-2 (G7-step2) — resolve the neural cross-encoder batcher
+/// worker-pool size.
+///
+/// Ladder (highest precedence first):
+/// 1. `AI_MEMORY_RERANK_POOL_SIZE` ([`crate::config::ENV_RERANK_POOL_SIZE`])
+///    when it parses to a positive integer.
+/// 2. the detected available parallelism
+///    ([`std::thread::available_parallelism`]).
+///
+/// The resolved value is clamped to `1..=RERANK_POOL_MAX`: at least one
+/// worker always exists, and the pool never exceeds the per-call
+/// candidate cap (`RERANK_POOL_MAX` — more workers than the maximum
+/// number of candidates cross-encoded per call would idle, and the
+/// bound also caps the thread footprint on many-core hosts, per the
+/// B7-RR-2 "bounded pool" acceptance).
+///
+/// Because every worker shares the single `Arc<BertModel>` (the #1084
+/// no-mutex `forward(&self)` is concurrency-safe), pool size scales
+/// concurrency WITHOUT multiplying model RAM — see PERFORMANCE.md.
+///
+/// `available_parallelism` reports the parallelism available to the
+/// process (which honours cgroup/affinity limits), used here as the
+/// portable stand-in for the physical CPU count without pulling in a
+/// `num_cpus`-style dependency; operators who want an exact physical
+/// count on a hyperthreaded host set the env override.
+#[must_use]
+pub fn resolve_reranker_pool_size() -> usize {
+    let detected = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .ok();
+    reranker_pool_size_from(
+        std::env::var(crate::config::ENV_RERANK_POOL_SIZE)
+            .ok()
+            .as_deref(),
+        detected,
+    )
+}
+
+/// #1867 B7-RR-2 — pure resolver behind [`resolve_reranker_pool_size`],
+/// split out so the ladder + clamp are unit-testable without touching
+/// process env or the host core count. `env_override` is the raw
+/// `AI_MEMORY_RERANK_POOL_SIZE` value (if set); `detected` is the
+/// available parallelism (`None` when the platform query failed).
+fn reranker_pool_size_from(env_override: Option<&str>, detected: Option<usize>) -> usize {
+    // A positive, parseable env override wins; zero / negative /
+    // unparseable falls through to the detected default (mirrors the
+    // fall-through posture of the other `AI_MEMORY_RERANK_*` knobs).
+    if let Some(raw) = env_override {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n >= 1 {
+                return n.clamp(1, RERANK_POOL_MAX);
+            }
+        }
+    }
+    // `available_parallelism` failure (rare) falls back to a single
+    // worker — the pre-#1867 behaviour — never zero.
+    detected.unwrap_or(1).clamp(1, RERANK_POOL_MAX)
+}
 
 const CROSS_ENCODER_MODEL_ID: &str = "cross-encoder/ms-marco-MiniLM-L-6-v2";
 /// Bare configured-model spelling for the default reranker — shared with
@@ -1286,17 +1346,27 @@ struct RerankJob {
 /// pays one `recv_timeout(0)` round-trip — no artificial waiting.
 pub struct BatchedReranker {
     sender: Option<Sender<RerankJob>>,
-    /// H2 (v0.7.0 round-2) — explicit one-shot shutdown signal. The
-    /// worker thread selects on BOTH the work channel and this
-    /// shutdown channel; receiving on the shutdown channel makes the
-    /// worker exit its loop deterministically, even if a holder of
-    /// `sender` happens to outlive `Drop` (e.g. the test harness
-    /// stashed a `Sender` clone). `Drop` triggers this BEFORE dropping
-    /// `sender`, so a worker that is currently blocked in
-    /// `rx.recv()` wakes up via the shutdown channel without waiting
-    /// for the work-channel disconnect.
-    shutdown: Option<std::sync::mpsc::Sender<()>>,
-    worker: Option<JoinHandle<()>>,
+    /// H2 (v0.7.0 round-2) + #1867 B7-RR-2 — shared shutdown flag. Every
+    /// worker in the pool observes this at the top of its loop and on
+    /// each `recv_timeout` wake, so it exits deterministically even when
+    /// a holder of `sender` outlives `Drop` (e.g. a test harness stashed
+    /// a `Sender` clone). `Drop` sets this BEFORE dropping `sender`, so a
+    /// worker blocked in `rx.recv_timeout(..)` wakes on either the flag
+    /// poll (≤ `SHUTDOWN_POLL`) or the work-channel disconnect, whichever
+    /// fires first. Replaces the pre-#1867 single one-shot shutdown
+    /// channel, which could not broadcast to N workers.
+    stop: Arc<AtomicBool>,
+    /// #1867 B7-RR-2 (G7-step2) — the neural cross-encoder batcher
+    /// worker pool, sized to the physical CPU count (bounded by
+    /// [`RERANK_POOL_MAX`]) via [`resolve_reranker_pool_size`]. Every
+    /// worker pulls jobs from a shared receiver and runs BERT forward
+    /// passes over the ONE shared `Arc<BertModel>` (no per-worker model
+    /// copy — the #1084 no-mutex `forward(&self)` is concurrency-safe),
+    /// so concurrent rerank calls no longer serialise on a single
+    /// handle. Pre-#1867 this was a single worker regardless of core
+    /// count. Empty only in the degenerate "no worker could spawn" case,
+    /// which the `rerank_coalesced_unfloored` fallback handles.
+    workers: Vec<JoinHandle<()>>,
     /// Direct handle to the underlying encoder, used for the single-query
     /// short-circuit and for callers that explicitly want non-batched
     /// behavior (tests, benchmarks).
@@ -1322,12 +1392,12 @@ pub struct BatchedReranker {
     /// [`Self::rerank`] (incremented on entry, decremented on exit).
     /// Drives the auto-select between the direct encoder call and the
     /// coalescing worker; see [`use_batched_rerank_path`].
-    inflight: std::sync::atomic::AtomicUsize,
+    inflight: AtomicUsize,
     /// #1579 B10 — observability counter: how many jobs this wrapper
     /// has submitted to the coalescing worker over its lifetime. The
     /// auto-select regression tests pin "lexical / lone-caller traffic
     /// never reaches the worker" on this counter.
-    worker_submissions: std::sync::atomic::AtomicUsize,
+    worker_submissions: AtomicUsize,
 }
 
 /// v0.7.0 #1319 — post-blend score floor applied by [`BatchedReranker`].
@@ -1513,88 +1583,60 @@ impl BatchedReranker {
     ) -> Self {
         let encoder = Arc::new(encoder);
         let (tx, rx) = std::sync::mpsc::channel::<RerankJob>();
-        // H2 (v0.7.0 round-2) — one-shot shutdown channel. The std
-        // mpsc channel is used as a "oneshot": we never send more
-        // than one value, and the worker exits on the first
-        // `try_recv()` success OR on disconnect (Drop of the holder
-        // closes the sender side, which also surfaces as a recv
-        // outcome the worker can branch on).
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
-        let worker_encoder = Arc::clone(&encoder);
-        let worker_boost = reflection_boost;
+        // #1867 B7-RR-2 — the receiver is shared across the whole worker
+        // pool behind a Mutex (std `Receiver` is `!Sync`). A worker holds
+        // the lock only while accepting + coalescing a batch; it releases
+        // BEFORE the forward pass, so sibling workers run their forwards
+        // concurrently and overlapping rerank calls no longer serialise
+        // on a single handle.
+        let shared_rx = Arc::new(Mutex::new(rx));
+        // #1867 B7-RR-2 — shared shutdown flag (replaces the pre-#1867
+        // one-shot channel, which could signal only one worker).
+        let stop = Arc::new(AtomicBool::new(false));
         let max_wait = Duration::from_millis(max_wait_ms);
 
-        let worker = thread::Builder::new()
-            .name("ai-memory-reranker-batcher".into())
-            .spawn(move || {
-                // H2 polling cadence: when waiting for the first job
-                // of a batch, fall back to `recv_timeout` so the worker
-                // wakes up periodically to check the shutdown signal.
-                // 100ms keeps the test in `test_drop_terminates_worker`
-                // comfortably inside its 500ms budget while staying
-                // well below the 5ms intra-batch coalescing window
-                // (no cost to the hot path).
-                const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
-                'outer: loop {
-                    // Block until the first job arrives OR the
-                    // shutdown signal fires OR the sender drops.
-                    let first = loop {
-                        // Cheap non-blocking shutdown check first so a
-                        // signal that arrived between iterations is
-                        // observed even if the work channel had a job
-                        // queued before the signal landed.
-                        match shutdown_rx.try_recv() {
-                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                break 'outer;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                        }
-                        match rx.recv_timeout(SHUTDOWN_POLL) {
-                            Ok(job) => break job,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                break 'outer;
-                            }
-                        }
-                    };
-
-                    let mut batch: Vec<RerankJob> = Vec::with_capacity(max_batch);
-                    batch.push(first);
-
-                    // Coalesce additional jobs that arrive within the
-                    // window, up to the batch cap.
-                    let deadline = Instant::now() + max_wait;
-                    while batch.len() < max_batch {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            break;
-                        }
-                        match rx.recv_timeout(deadline - now) {
-                            Ok(j) => batch.push(j),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                // Drain the current batch then exit.
-                                process_batch(&worker_encoder, batch, &worker_boost);
-                                break 'outer;
-                            }
-                        }
-                    }
-
-                    process_batch(&worker_encoder, batch, &worker_boost);
-                }
-            })
-            .expect("failed to spawn rerank batcher worker");
+        let pool_size = resolve_reranker_pool_size();
+        let mut workers = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let worker_encoder = Arc::clone(&encoder);
+            let worker_rx = Arc::clone(&shared_rx);
+            let worker_stop = Arc::clone(&stop);
+            let worker_boost = reflection_boost;
+            let handle = thread::Builder::new()
+                .name("ai-memory-reranker-batcher".into())
+                .spawn(move || {
+                    run_reranker_worker(
+                        &worker_rx,
+                        &worker_encoder,
+                        &worker_boost,
+                        &worker_stop,
+                        max_batch,
+                        max_wait,
+                    );
+                })
+                .expect("failed to spawn rerank batcher worker");
+            workers.push(handle);
+        }
 
         Self {
             sender: Some(tx),
-            shutdown: Some(shutdown_tx),
-            worker: Some(worker),
+            stop,
+            workers,
             encoder,
             reflection_boost,
             score_floor,
-            inflight: std::sync::atomic::AtomicUsize::new(0),
-            worker_submissions: std::sync::atomic::AtomicUsize::new(0),
+            inflight: AtomicUsize::new(0),
+            worker_submissions: AtomicUsize::new(0),
         }
+    }
+
+    /// #1867 B7-RR-2 (G7-step2) — number of live batcher workers in the
+    /// pool (sized to the physical CPU count, bounded by
+    /// [`RERANK_POOL_MAX`]). Exposed for the sizing test and operator
+    /// diagnostics.
+    #[must_use]
+    pub fn pool_size(&self) -> usize {
+        self.workers.len()
     }
 
     /// Submit a single rerank request. Blocks until the result is
@@ -1648,10 +1690,9 @@ impl BatchedReranker {
     /// pin in `g9_batched_reranker_serial_calls_match_rerank`) call
     /// this directly.
     fn rerank_unfloored(&self, query: &str, candidates: Vec<(Memory, f64)>) -> Vec<(Memory, f64)> {
-        use std::sync::atomic::Ordering;
         // #1579 B10 — RAII in-flight guard so a panicking encoder call
         // can't leak the counter and wedge the auto-select high.
-        struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        struct InflightGuard<'a>(&'a AtomicUsize);
         impl Drop for InflightGuard<'_> {
             fn drop(&mut self) {
                 self.0.fetch_sub(1, Ordering::Relaxed);
@@ -1703,8 +1744,7 @@ impl BatchedReranker {
                 &self.reflection_boost,
             );
         }
-        self.worker_submissions
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.worker_submissions.fetch_add(1, Ordering::Relaxed);
         reply_rx.recv().unwrap_or_else(|_| {
             self.encoder
                 .rerank_with_reflection_boost(query, Vec::new(), &self.reflection_boost)
@@ -1717,8 +1757,7 @@ impl BatchedReranker {
     /// diagnostics.
     #[must_use]
     pub fn worker_submissions(&self) -> usize {
-        self.worker_submissions
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.worker_submissions.load(Ordering::Relaxed)
     }
 
     /// v0.7.0 #1319 — accessor for the configured score floor, used by
@@ -1762,28 +1801,104 @@ impl BatchedReranker {
 
 impl Drop for BatchedReranker {
     fn drop(&mut self) {
-        // H2 (v0.7.0 round-2): two-step termination.
+        // H2 (v0.7.0 round-2) + #1867 B7-RR-2: two-step termination for
+        // the whole worker pool.
         //
-        //   1. Fire the explicit shutdown signal FIRST so the worker
+        //   1. Raise the shared `stop` flag FIRST so every worker
         //      observes it even when another holder of `Sender`
         //      (e.g. a test that cloned the work channel) would
         //      otherwise keep the work channel alive.
-        //   2. Then drop the work-channel sender — a worker that was
-        //      blocked in `rx.recv_timeout(...)` wakes up either via
-        //      the shutdown poll OR the disconnect, whichever
-        //      happens first.
+        //   2. Then drop the work-channel sender — a worker blocked in
+        //      `rx.recv_timeout(...)` wakes via either the flag poll
+        //      (≤ SHUTDOWN_POLL) or the disconnect, whichever fires
+        //      first; the disconnect then cascades instantly across the
+        //      remaining workers as each acquires the shared receiver.
         //
-        // Joining the worker after BOTH signals fire bounds shutdown
+        // Joining every worker after BOTH signals fire bounds shutdown
         // by the SHUTDOWN_POLL cadence (100ms) in the absolute worst
         // case, well inside the 500ms budget exercised by
-        // `test_drop_terminates_worker`.
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        // `h2_drop_terminates_worker_within_500ms`.
+        self.stop.store(true, Ordering::Release);
         self.sender.take();
-        if let Some(handle) = self.worker.take() {
+        for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+/// #1867 B7-RR-2 (G7-step2) — one batcher worker's run loop, shared by
+/// every thread in the pool.
+///
+/// Each iteration: (1) re-checks the shared `stop` flag; (2) acquires
+/// the shared receiver, blocks for the first job (waking every
+/// `SHUTDOWN_POLL` to re-check `stop`), and coalesces additional queued
+/// jobs into a batch up to `max_batch`/`max_wait`; (3) RELEASES the
+/// receiver lock and runs the (expensive) forward pass via
+/// [`process_batch`]. Releasing before the forward is what lets sibling
+/// workers run their own forwards over the shared `Arc<BertModel>`
+/// concurrently — the B7-RR-2 "do not serialise on a single handle"
+/// acceptance.
+fn run_reranker_worker(
+    shared_rx: &Mutex<Receiver<RerankJob>>,
+    encoder: &CrossEncoder,
+    boost_config: &ReflectionBoostConfig,
+    stop: &AtomicBool,
+    max_batch: usize,
+    max_wait: Duration,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Poll cadence for the shutdown flag while idle-waiting for the
+    // first job of a batch. 100ms keeps `h2_drop_terminates_worker_*`
+    // comfortably inside its 500ms budget while staying well below the
+    // 5ms intra-batch coalescing window (no cost to the hot path).
+    const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        // Accept + coalesce a batch while holding the shared-receiver
+        // lock, then release it (end of this block) BEFORE the forward.
+        let batch: Vec<RerankJob> = {
+            let Ok(rx) = shared_rx.lock() else {
+                // Poisoned receiver mutex (a sibling worker panicked
+                // mid-accept). Nothing left to serve safely — exit.
+                return;
+            };
+            // Block for the first job, waking periodically to observe
+            // `stop` and the work-channel disconnect.
+            let first = loop {
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                match rx.recv_timeout(SHUTDOWN_POLL) {
+                    Ok(job) => break job,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            };
+
+            let mut batch = Vec::with_capacity(max_batch);
+            batch.push(first);
+            // Coalesce additional jobs that arrive within the window,
+            // up to the batch cap. A disconnect here still processes the
+            // jobs already gathered (below) before the next iteration
+            // observes the disconnect and exits.
+            let deadline = Instant::now() + max_wait;
+            while batch.len() < max_batch {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                match rx.recv_timeout(deadline - now) {
+                    Ok(j) => batch.push(j),
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            batch
+        };
+
+        process_batch(encoder, batch, boost_config);
     }
 }
 
@@ -2931,7 +3046,10 @@ pub mod test_support {
 #[cfg(test)]
 mod mock_tests {
     use super::test_support::*;
-    use super::{BatchedReranker, CrossEncoder};
+    use super::{
+        BatchedReranker, CrossEncoder, Ordering, RERANK_POOL_MAX, reranker_pool_size_from,
+        resolve_reranker_pool_size,
+    };
     use crate::models::{Memory, Tier};
     use std::time::Duration;
 
@@ -3055,40 +3173,43 @@ mod mock_tests {
     }
 
     // -----------------------------------------------------------------
-    // H2 (v0.7.0 round-2) — worker-thread shutdown discipline.
+    // H2 (v0.7.0 round-2) + #1867 B7-RR-2 — worker-pool shutdown
+    // discipline.
     //
-    // Contract: spawning a `BatchedReranker` and dropping it
-    // immediately must terminate the worker thread within a bounded
-    // wall-clock window. Without an explicit shutdown channel, a
-    // worker that was blocked in `rx.recv()` would only exit on
-    // sender disconnect; the explicit signal closes the worst-case
-    // (e.g. a stashed `Sender` clone) and bounds the shutdown
-    // latency by the worker's SHUTDOWN_POLL cadence.
+    // Contract: spawning a `BatchedReranker` and dropping it immediately
+    // must terminate EVERY worker in the pool within a bounded
+    // wall-clock window. The shared `stop` flag + work-channel
+    // disconnect close the worst-case (e.g. a stashed `Sender` clone)
+    // and bound the shutdown latency by the worker's SHUTDOWN_POLL
+    // cadence, regardless of pool size.
     // -----------------------------------------------------------------
     #[test]
     fn h2_drop_terminates_worker_within_500ms() {
         use std::time::Instant;
         let reranker = BatchedReranker::new(CrossEncoder::new());
-        // Capture the JoinHandle by exfiltrating it BEFORE drop so we
-        // can observe thread termination from the outside. We
-        // re-implement the Drop body inline for the assertion: fire
-        // shutdown, drop sender, join with a wall-clock budget.
+        // Exfiltrate the worker handles + the shutdown primitives BEFORE
+        // drop so we can observe pool termination from the outside. We
+        // re-implement the Drop body inline for the assertion: raise the
+        // stop flag, drop the sender, join every worker within a
+        // wall-clock budget.
         let mut r = reranker;
-        let shutdown = r.shutdown.take().expect("shutdown sender present");
-        let worker = r.worker.take().expect("worker handle present");
+        let pool_size = r.pool_size();
+        assert!(pool_size >= 1, "pool must have at least one worker");
+        let stop = std::sync::Arc::clone(&r.stop);
+        let workers: Vec<_> = r.workers.drain(..).collect();
         // Drop the work-channel sender first to mimic the same
-        // disconnect semantics the production Drop sequence
-        // produces.
+        // disconnect semantics the production Drop sequence produces.
         r.sender.take();
         let start = Instant::now();
-        let _ = shutdown.send(());
-        // Spawn the join on a side thread so we can apply a hard
-        // wall-clock budget. `JoinHandle::join` does not take a
-        // timeout, so the side-thread + park-with-deadline form is
-        // the idiomatic Rust pattern.
+        stop.store(true, Ordering::Release);
+        // Spawn the joins on a side thread so we can apply a hard
+        // wall-clock budget. `JoinHandle::join` does not take a timeout,
+        // so the side-thread + deadline form is the idiomatic pattern.
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
-            let _ = worker.join();
+            for w in workers {
+                let _ = w.join();
+            }
             let _ = done_tx.send(());
         });
         let observed = done_rx
@@ -3096,9 +3217,121 @@ mod mock_tests {
             .map(|()| Instant::now().duration_since(start));
         assert!(
             observed.is_ok(),
-            "BatchedReranker worker did not terminate within 500ms after \
-             explicit shutdown — observed: {observed:?}"
+            "BatchedReranker pool ({pool_size} workers) did not terminate \
+             within 500ms after shutdown — observed: {observed:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #1867 B7-RR-2 (G7-step2) — pool-sizing resolver.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pool_size_from_env_override_wins_and_clamps() {
+        // A positive override is honoured verbatim (within the cap).
+        assert_eq!(reranker_pool_size_from(Some("3"), Some(16)), 3);
+        assert_eq!(reranker_pool_size_from(Some("  7 "), Some(1)), 7);
+        // Above the cap → clamped to RERANK_POOL_MAX.
+        assert_eq!(
+            reranker_pool_size_from(Some("9999"), Some(2)),
+            RERANK_POOL_MAX
+        );
+        // Exactly the cap survives.
+        assert_eq!(
+            reranker_pool_size_from(Some(&RERANK_POOL_MAX.to_string()), Some(2)),
+            RERANK_POOL_MAX
+        );
+    }
+
+    #[test]
+    fn pool_size_from_invalid_env_falls_through_to_detected() {
+        // Zero / negative / unparseable all fall through to `detected`.
+        assert_eq!(reranker_pool_size_from(Some("0"), Some(4)), 4);
+        assert_eq!(reranker_pool_size_from(Some("-2"), Some(4)), 4);
+        assert_eq!(reranker_pool_size_from(Some("abc"), Some(4)), 4);
+        assert_eq!(reranker_pool_size_from(Some(""), Some(4)), 4);
+        // Detected is itself clamped into 1..=cap.
+        assert_eq!(reranker_pool_size_from(None, Some(9999)), RERANK_POOL_MAX);
+    }
+
+    #[test]
+    fn pool_size_defaults_to_one_when_detection_fails() {
+        // No override + failed platform query → single worker (the
+        // pre-#1867 behaviour), never zero.
+        assert_eq!(reranker_pool_size_from(None, None), 1);
+        assert_eq!(reranker_pool_size_from(Some("bad"), None), 1);
+    }
+
+    #[test]
+    fn resolve_pool_size_is_within_bounds() {
+        // The live resolver (reads env + host cores) always lands in
+        // 1..=RERANK_POOL_MAX.
+        let n = resolve_reranker_pool_size();
+        assert!(
+            (1..=RERANK_POOL_MAX).contains(&n),
+            "resolved pool size {n} out of bounds"
+        );
+    }
+
+    #[test]
+    fn constructed_reranker_spawns_a_bounded_pool() {
+        // The constructor spawns `resolve_reranker_pool_size()` workers,
+        // and reranking still returns correct, descending-sorted output
+        // regardless of pool size.
+        let r = BatchedReranker::new(CrossEncoder::new());
+        let n = r.pool_size();
+        assert_eq!(n, resolve_reranker_pool_size());
+        assert!((1..=RERANK_POOL_MAX).contains(&n));
+
+        let cands: Vec<(Memory, f64)> = (0..6)
+            .map(|i| {
+                (
+                    make_memory(&format!("p{i}"), &format!("alpha gamma body {i}")),
+                    f64::from(i) * 0.1,
+                )
+            })
+            .collect();
+        let out = r.rerank("alpha gamma", cands);
+        assert_eq!(out.len(), 6, "no candidate dropped");
+        for w in out.windows(2) {
+            assert!(w[0].1 >= w[1].1, "results must sort descending");
+        }
+    }
+
+    #[test]
+    fn pool_concurrent_rerank_all_succeed_and_terminate() {
+        use std::sync::Arc;
+        // Overlapping rerank calls across many threads exercise the
+        // multi-worker accept/coalesce/forward path; every call must
+        // return correct output and the pool must drain + terminate on
+        // drop without hanging.
+        let batched = Arc::new(BatchedReranker::new(CrossEncoder::new()));
+        assert!(batched.pool_size() >= 1);
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let b = Arc::clone(&batched);
+            handles.push(std::thread::spawn(move || {
+                let cands: Vec<(Memory, f64)> = (0..5)
+                    .map(|j| {
+                        (
+                            make_memory(
+                                &format!("pool-{i}-{j}"),
+                                &format!("body {j} alpha gamma rust"),
+                            ),
+                            0.5,
+                        )
+                    })
+                    .collect();
+                let out = b.rerank_coalesced(&format!("alpha {i}"), cands);
+                assert_eq!(out.len(), 5);
+                for w in out.windows(2) {
+                    assert!(w[0].1 >= w[1].1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("rerank worker thread panicked");
+        }
     }
 }
 
