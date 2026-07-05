@@ -80,6 +80,22 @@ pub(crate) fn map_reflect_error_to_wire_string(err: db::ReflectError) -> String 
             // hook wire-in lands without churning this arm.
             format!("REFLECTION_HOOK_VETO (code={code}): {reason}")
         }
+        db::ReflectError::DecorrelationRefused {
+            distinct_attested_families,
+            attested_rows,
+            quorum_n,
+            namespace,
+        } => {
+            // v0.9.0 §25.3 S2 (D3-021, #1767) — enforce-mode refusal on an
+            // evidence-backed attested monoculture. Stable string shape
+            // keyed off `REFLECTION_DECORRELATION_REFUSED` (matches the
+            // signed audit event slug) with the structured counts visible.
+            format!(
+                "REFLECTION_DECORRELATION_REFUSED: attested model-family decorrelation quorum not \
+                 met ({distinct_attested_families} distinct attested families across \
+                 {attested_rows} attested rows < required {quorum_n}, namespace='{namespace}')"
+            )
+        }
         db::ReflectError::Database(m) => m,
     }
 }

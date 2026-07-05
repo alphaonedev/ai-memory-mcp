@@ -58,6 +58,7 @@ use crate::cli::boot::BootArgs;
 use crate::cli::consolidate::{AutoConsolidateArgs, ConsolidateArgs};
 use crate::cli::crud::{DeleteArgs, GetArgs, ListArgs};
 use crate::cli::curator::CuratorArgs;
+use crate::cli::epoch_apply::EpochApplyArgs;
 use crate::cli::forget::ForgetArgs;
 use crate::cli::identity::IdentityArgs;
 use crate::cli::install::InstallArgs;
@@ -301,6 +302,12 @@ pub enum Command {
     /// attestations (`model_attestations` substrate). `enroll` requires
     /// the operator key; `list` is unprivileged.
     ModelAttest(ModelAttestArgs),
+    /// v0.9.0 §25.3 S5 (RQ-10, #1878) — verify-only epoch-freeze
+    /// consumer: `ai-memory epoch-apply <manifest.json>` verifies an
+    /// operator-signed epoch manifest and writes the triple anchor
+    /// (resolved EpochAdvance checkpoint + epoch.manifest_applied audit
+    /// row). Requires the operator key.
+    EpochApply(EpochApplyArgs),
     /// List / approve / reject governance-pending actions (Task 1.9)
     Pending(PendingArgs),
     /// v0.6.0.0: snapshot the `SQLite` database to a timestamped backup
@@ -1437,6 +1444,15 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             cli::model_attest::run(&db_path, a, j, &mut out)
+        }
+        Command::EpochApply(a) => {
+            // v0.9.0 §25.3 S5 (RQ-10, #1878) — verify-only epoch consumer.
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            cli::epoch_apply::run(&db_path, a, j, &mut out)
         }
         Command::Pending(a) => {
             let stdout = std::io::stdout();

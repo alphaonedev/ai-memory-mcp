@@ -674,7 +674,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // and the folded-guarded ledger pruner (~151 LOC at 25_651).
     // Growth is justified: the fold/migration pair is the P0-1 core,
     // zero speculative surface. 25_750 = 25_651 + 99 headroom.
-    ("src/store/postgres.rs", 25_750),
+    // 2026-07-04 (#1767 §25.3 S2) — bumped 25_750 → 25_960 for the
+    // postgres decorrelation write-gate twin (corpus query + attested
+    // predicate + signed refusal audit emit).
+    ("src/store/postgres.rs", 25_960),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

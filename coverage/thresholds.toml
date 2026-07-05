@@ -116,6 +116,7 @@ min_line_coverage = 90.0
 "cli/consolidate.rs"       = 90    # tier B, measured 98.33
 "cli/crud.rs"              = 90    # tier B, measured 97.25
 "cli/curator.rs"           = 90    # tier B, post-C-1 measured 96.08
+"cli/epoch_apply.rs"       = 97    # tier B, NEW MODULE (2026-07-05, #1878 §25.3 S5 epoch-apply consumer): measured 97.58
 "cli/doctor.rs"            = 90    # tier B, measured 92.92 post-#1146 LLM Reachability section + #1148 profile recalibration (was 96.45/95)
 "cli/forget.rs"            = 90    # tier B, measured 99.55
 "cli/gc.rs"                = 90    # tier B, measured 98.86
