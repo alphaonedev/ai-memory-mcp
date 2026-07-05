@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only; `resolve_reranker` and per-tier `cross_encoder` defaults are
   untouched.
 
+### bench-gap — Bench p95 gate now exercises the handler-layer rerank stage ([#1871](https://github.com/alphaonedev/ai-memory-mcp/issues/1871))
+
+- **New `ai-memory bench` operation: `memory_recall` (rerank stage, depth=1).**
+  `run_recall_hot` timed `db::recall` directly, but the cross-encoder rerank
+  stage lives ABOVE `db::recall` in the MCP/HTTP handler, so the Bench CI
+  p95 rule could never fire on a reranker change. The new op reproduces the
+  handler's recall→rerank sequence in-process — the SAME `db::recall` call
+  followed by the SAME `BatchedReranker::rerank` pass the handler runs — so
+  the rerank STAGE COST is now inside the timed path and gated. A lexical
+  cross-encoder stands in for the neural model (per #1871 the target is the
+  stage cost being visible, not model quality — no HF-Hub download on the
+  CI hot path). Budget: 60 ms default / 100 ms at `--scale 10000` (recall
+  budget + rerank-stage headroom); the existing 7 operations are unchanged
+  and unaffected (the new op runs after them). This is precondition (ii) of
+  B7-RR-AMEND-1 for the future v1.0 reranker default-on flip.
+
 ### §25.3 P0 spine (S3/S4/S1/S2/S5; 2×5-wave vote `b0c1e157-3419-4d48-aebc-857283a97dfd`)
 
 - **S3 (F-40) — signed rule enable/disable.** `rules_store::set_enabled_signed`

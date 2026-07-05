@@ -11,6 +11,10 @@
 //! Coverage in this build:
 //! - Embedding-free CRUD: `memory_store` (no embedding), `memory_search`
 //!   (FTS5), `memory_recall` (hot, depth=1).
+//! - Handler-layer rerank stage: `memory_recall` (rerank stage) — keyword
+//!   recall + the cross-encoder rerank pass the MCP/HTTP handler runs
+//!   above `db::recall`, so the p95 gate can fire on reranker changes
+//!   (#1871; a lexical cross-encoder stands in for the neural model).
 //! - Knowledge-graph traversal:
 //!     - `memory_kg_query` (depth=1) and `memory_kg_timeline` against a
 //!       fan-out fixture (50 sources × 4 outbound links each, every
@@ -37,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use crate::db;
 use crate::models::{Memory, Tier};
+use crate::reranker::{BatchedReranker, CrossEncoder};
 
 /// CI guard tolerance — measured p95 may exceed budget by this factor
 /// before the run is marked `Fail`. Mirrors `PERFORMANCE.md`.
@@ -113,6 +118,12 @@ pub struct ScaleBudgets {
     pub search_fts_ms: f64,
     /// `memory_recall` (hot, keyword) p95 budget, ms.
     pub recall_hot_ms: f64,
+    /// #1871 — `memory_recall` through the handler-layer rerank stage
+    /// (keyword recall + cross-encoder rerank) p95 budget, ms. Carries
+    /// headroom over [`Self::recall_hot_ms`] for the added rerank stage
+    /// so the corpus-scale gate stays green while the STAGE COST becomes
+    /// visible to the Bench p95 rule.
+    pub recall_rerank_hot_ms: f64,
 }
 
 /// #1579 B8 — the per-scale budget table (SSOT; `PERFORMANCE.md`
@@ -129,6 +140,11 @@ pub const SCALE_BUDGETS: &[ScaleBudgets] = &[ScaleBudgets {
     store_no_embedding_ms: 120.0,
     search_fts_ms: 60.0,
     recall_hot_ms: 80.0,
+    // #1871 — recall_hot (80) + rerank-stage headroom (20). The rerank
+    // stage operates on the fixed top-K candidate cap so it is scale-
+    // invariant; the recall portion carries the same corpus sensitivity
+    // as `recall_hot_ms`, hence the +20 over that row.
+    recall_rerank_hot_ms: 100.0,
 }];
 
 /// #1579 B8 — resolve the budget row for a requested scale: the first
@@ -164,6 +180,15 @@ pub enum Operation {
     SearchFts,
     /// `memory_recall` hot path, depth=1 (no hierarchy expansion).
     RecallHot,
+    /// #1871 — `memory_recall` through the handler-layer rerank stage:
+    /// keyword recall followed by the SAME `BatchedReranker::rerank`
+    /// cross-encoder pass the MCP/HTTP recall handler runs above
+    /// `db::recall`. Closes the bench-gap where the p95 rule could never
+    /// fire on a reranker change because the rerank stage lived above the
+    /// `db::recall` the bench timed. A lexical cross-encoder stands in
+    /// for the neural model (the target is the STAGE COST being visible,
+    /// not model quality — no HF-Hub download on the CI hot path).
+    RecallRerankHot,
     /// `memory_kg_query` recursive-CTE traversal at depth=1 (the
     /// shallowest path through the depth ≤ 3 budget bucket).
     KgQueryDepth1,
@@ -187,6 +212,7 @@ impl Operation {
             Self::StoreNoEmbedding => "memory_store (no embedding)",
             Self::SearchFts => "memory_search (FTS5)",
             Self::RecallHot => "memory_recall (hot, depth=1)",
+            Self::RecallRerankHot => "memory_recall (rerank stage, depth=1)",
             Self::KgQueryDepth1 => "memory_kg_query (depth=1)",
             Self::KgQueryDepth3 => "memory_kg_query (depth=3)",
             Self::KgQueryDepth5 => "memory_kg_query (depth=5)",
@@ -212,6 +238,8 @@ impl Operation {
             Self::StoreNoEmbedding => 20.0,
             Self::SearchFts => 100.0,
             Self::RecallHot => 50.0,
+            // #1871 — recall_hot (50) + rerank-stage headroom (10).
+            Self::RecallRerankHot => 60.0,
             Self::KgQueryDepth1 => 100.0,
             Self::KgQueryDepth3 => 100.0,
             Self::KgQueryDepth5 => 250.0,
@@ -247,6 +275,7 @@ impl Operation {
             Self::StoreNoEmbedding => budgets.store_no_embedding_ms,
             Self::SearchFts => budgets.search_fts_ms,
             Self::RecallHot => budgets.recall_hot_ms,
+            Self::RecallRerankHot => budgets.recall_rerank_hot_ms,
             Self::KgQueryDepth1 | Self::KgQueryDepth3 | Self::KgQueryDepth5 | Self::KgTimeline => {
                 self.target_p95_ms()
             }
@@ -330,6 +359,7 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
     let store = run_store_no_embedding(conn, config)?;
     let search = run_search_fts(conn, config)?;
     let recall = run_recall_hot(conn, config)?;
+    let recall_rerank = run_recall_rerank_hot(conn, config)?;
     let kg_sources = seed_kg_fixture(conn, &config.namespace)?;
     let kg_query = run_kg_query_depth1(conn, config, &kg_sources)?;
     let kg_chain_sources = seed_kg_chain_fixture(conn, &config.namespace)?;
@@ -342,6 +372,7 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
         store,
         search,
         recall,
+        recall_rerank,
         kg_query,
         kg_query_d3,
         kg_query_d5,
@@ -447,6 +478,78 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
     }
     Ok(percentile_summary(
         Operation::RecallHot,
+        &samples,
+        config.scale,
+    ))
+}
+
+/// #1871 — recall THROUGH the handler-layer rerank stage.
+///
+/// The MCP/HTTP recall handler (`src/mcp/tools/recall.rs`) runs the
+/// cross-encoder rerank stage ABOVE `db::recall`, so [`run_recall_hot`]
+/// (which calls `db::recall` directly) can never let the Bench p95 rule
+/// fire on a reranker change. This runner reproduces the handler's
+/// recall→rerank sequence in-process: the SAME `db::recall` call
+/// [`run_recall_hot`] times, followed by the SAME
+/// [`BatchedReranker::rerank`] the handler invokes on the recalled
+/// `(Memory, score)` candidates. A lexical [`CrossEncoder`] stands in for
+/// the neural model — per #1871 the target is the rerank STAGE COST being
+/// visible to the gate, not model quality, so no ~80 MB HF-Hub download
+/// lands on the CI hot path. The reranker is built once and reused across
+/// iterations, mirroring the daemon's process-lifetime handle.
+fn run_recall_rerank_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
+    seed_corpus(conn, &config.namespace, "recall-rerank", 200)?;
+    // The handler holds a `BatchedReranker` from the runtime context; a
+    // lexical encoder auto-selects the direct rerank path (no worker
+    // round-trip) — the same code the autonomous tier runs when its
+    // neural model is unavailable / degraded.
+    let reranker = BatchedReranker::new(CrossEncoder::new());
+    let warmup_query = "topic 0 category 0";
+    for _ in 0..config.warmup {
+        let (results, _) = db::recall(
+            conn,
+            warmup_query,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None, // #1720 — bench has no identity; trust-all
+        )?;
+        let _ = reranker.rerank(warmup_query, results);
+    }
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..config.iterations {
+        let query = format!("topic {} category {}", i % 50, i % 10);
+        let start = Instant::now();
+        // Timed path = recall + the handler-layer rerank STAGE.
+        let (results, _) = db::recall(
+            conn,
+            &query,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None, // #1720 — bench has no identity; trust-all
+        )?;
+        let _ = reranker.rerank(&query, results);
+        samples.push(start.elapsed());
+    }
+    Ok(percentile_summary(
+        Operation::RecallRerankHot,
         &samples,
         config.scale,
     ))
@@ -939,23 +1042,43 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_all_seven_results() {
+    fn run_returns_all_eight_results() {
         let conn = fresh_conn();
         let results = run(&conn, &small_config()).unwrap();
-        assert_eq!(results.len(), 7);
+        assert_eq!(results.len(), 8);
         assert_eq!(results[0].operation, Operation::StoreNoEmbedding);
         assert_eq!(results[1].operation, Operation::SearchFts);
         assert_eq!(results[2].operation, Operation::RecallHot);
-        assert_eq!(results[3].operation, Operation::KgQueryDepth1);
-        assert_eq!(results[4].operation, Operation::KgQueryDepth3);
-        assert_eq!(results[5].operation, Operation::KgQueryDepth5);
-        assert_eq!(results[6].operation, Operation::KgTimeline);
+        // #1871 — the handler-layer rerank stage sits right after recall.
+        assert_eq!(results[3].operation, Operation::RecallRerankHot);
+        assert_eq!(results[4].operation, Operation::KgQueryDepth1);
+        assert_eq!(results[5].operation, Operation::KgQueryDepth3);
+        assert_eq!(results[6].operation, Operation::KgQueryDepth5);
+        assert_eq!(results[7].operation, Operation::KgTimeline);
         for r in &results {
             assert_eq!(r.samples, 30);
             assert!(r.measured_p50_ms <= r.measured_p95_ms);
             assert!(r.measured_p95_ms <= r.measured_p99_ms);
             assert!(r.target_p95_ms > 0.0);
         }
+    }
+
+    /// #1871 — the rerank-stage bench op actually runs the cross-encoder
+    /// rerank pass on top of recall (STAGE is in the timed path) and
+    /// reports a well-formed, in-budget result on the default workload.
+    #[test]
+    fn recall_rerank_stage_op_runs_and_is_reported() {
+        let conn = fresh_conn();
+        let results = run(&conn, &small_config()).unwrap();
+        let rr = results
+            .iter()
+            .find(|r| r.operation == Operation::RecallRerankHot)
+            .expect("rerank-stage op must be reported");
+        assert_eq!(rr.label, "memory_recall (rerank stage, depth=1)");
+        assert!(rr.measured_p95_ms >= 0.0);
+        assert!(rr.samples > 0);
+        // Default-workload budget is the recall budget + rerank headroom.
+        assert!((rr.target_p95_ms - 60.0).abs() < 1e-9);
     }
 
     #[test]
@@ -999,6 +1122,7 @@ mod tests {
         assert!(table.contains("memory_store (no embedding)"));
         assert!(table.contains("memory_search (FTS5)"));
         assert!(table.contains("memory_recall (hot, depth=1)"));
+        assert!(table.contains("memory_recall (rerank stage, depth=1)"));
         assert!(table.contains("memory_kg_query (depth=1)"));
         assert!(table.contains("memory_kg_query (depth=3)"));
         assert!(table.contains("memory_kg_query (depth=5)"));
@@ -1012,6 +1136,7 @@ mod tests {
         assert!((Operation::StoreNoEmbedding.target_p95_ms() - 20.0).abs() < 1e-9);
         assert!((Operation::SearchFts.target_p95_ms() - 100.0).abs() < 1e-9);
         assert!((Operation::RecallHot.target_p95_ms() - 50.0).abs() < 1e-9);
+        assert!((Operation::RecallRerankHot.target_p95_ms() - 60.0).abs() < 1e-9);
         assert!((Operation::KgQueryDepth1.target_p95_ms() - 100.0).abs() < 1e-9);
         assert!((Operation::KgQueryDepth3.target_p95_ms() - 100.0).abs() < 1e-9);
         assert!((Operation::KgQueryDepth5.target_p95_ms() - 250.0).abs() < 1e-9);
@@ -1062,6 +1187,9 @@ mod tests {
         );
         assert!((Operation::SearchFts.target_p95_ms_at_scale(at_gate_scale) - 60.0).abs() < 1e-9);
         assert!((Operation::RecallHot.target_p95_ms_at_scale(at_gate_scale) - 80.0).abs() < 1e-9);
+        assert!(
+            (Operation::RecallRerankHot.target_p95_ms_at_scale(at_gate_scale) - 100.0).abs() < 1e-9
+        );
         // KG fixtures are scale-independent → canonical budgets hold.
         for op in [
             Operation::KgQueryDepth1,
@@ -1076,6 +1204,7 @@ mod tests {
         }
         // `None` (default workload) keeps the legacy budgets.
         assert!((Operation::RecallHot.target_p95_ms_at_scale(None) - 50.0).abs() < 1e-9);
+        assert!((Operation::RecallRerankHot.target_p95_ms_at_scale(None) - 60.0).abs() < 1e-9);
     }
 
     /// #1579 B8 — bucket resolution: a request at or below a pinned
@@ -1105,7 +1234,7 @@ mod tests {
             scale: Some(300),
         };
         let results = run(&conn, &config).unwrap();
-        assert_eq!(results.len(), 7);
+        assert_eq!(results.len(), 8);
         let seeded: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
@@ -1125,9 +1254,16 @@ mod tests {
         assert!((search.target_p95_ms - 60.0).abs() < 1e-9);
         let recall = &results[2];
         assert!((recall.target_p95_ms - 80.0).abs() < 1e-9);
-        // KG rows keep canonical budgets.
-        assert!((results[3].target_p95_ms - 100.0).abs() < 1e-9);
-        assert!((results[5].target_p95_ms - 250.0).abs() < 1e-9);
+        // #1871 — the rerank-stage op carries the scale-aware recall+rerank
+        // budget (recall_hot 80 + rerank headroom 20).
+        let recall_rerank = &results[3];
+        assert_eq!(recall_rerank.operation, Operation::RecallRerankHot);
+        assert!((recall_rerank.target_p95_ms - 100.0).abs() < 1e-9);
+        // KG rows keep canonical budgets (now shifted to indices 4..7).
+        assert_eq!(results[4].operation, Operation::KgQueryDepth1);
+        assert!((results[4].target_p95_ms - 100.0).abs() < 1e-9);
+        assert_eq!(results[6].operation, Operation::KgQueryDepth5);
+        assert!((results[6].target_p95_ms - 250.0).abs() < 1e-9);
     }
 
     #[test]
