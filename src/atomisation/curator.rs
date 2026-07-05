@@ -299,6 +299,50 @@ pub fn backoff_for_attempt(attempt: u32) -> Duration {
     Duration::from_millis(SCHEDULE_MS[idx])
 }
 
+/// #1866 (§11.5 B7-FC-2) — name of the constrained tool the curator
+/// offers so a tool-capable model returns atoms as a structured call
+/// rather than free-form JSON-in-text.
+const EMIT_ATOMS_TOOL_NAME: &str = "emit_atoms";
+
+/// #1866 (§11.5 B7-FC-2) — the `emit_atoms` tool definition. Its
+/// JSON-Schema mirrors [`CuratorResponse`] (`{"atoms":[{"text":…}]}`) so
+/// a conforming tool call deserialises straight into the same type the
+/// text path parses, keeping the two paths semantically identical.
+fn emit_atoms_tool() -> crate::llm::ToolDef {
+    crate::llm::ToolDef::new(
+        EMIT_ATOMS_TOOL_NAME,
+        "Emit the decomposed atomic propositions for the input memory as a list of {text} objects.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "atoms": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } },
+                        "required": ["text"]
+                    }
+                }
+            },
+            "required": ["atoms"]
+        }),
+    )
+}
+
+/// #1866 (§11.5 B7-FC-2) — extract a [`CuratorResponse`] from the model's
+/// structured `emit_atoms` tool call.
+///
+/// Returns `Err(diagnostic)` when no matching call is present or its
+/// arguments don't match the atoms schema, so the caller retries / falls
+/// back exactly like the text path (`parse_response`).
+fn parse_tool_atoms(calls: &[crate::llm::ToolCall]) -> Result<CuratorResponse, String> {
+    let call = calls
+        .iter()
+        .find(|c| c.name == EMIT_ATOMS_TOOL_NAME)
+        .ok_or_else(|| format!("no '{EMIT_ATOMS_TOOL_NAME}' tool call in response"))?;
+    serde_json::from_value::<CuratorResponse>(call.arguments.clone()).map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // LlmCurator — production impl backed by `crate::llm::OllamaClient`
 // ---------------------------------------------------------------------------
@@ -324,11 +368,42 @@ pub trait LlmGenerate {
     /// (no trimming, no fence-stripping — `parse_response` handles
     /// that).
     fn generate(&self, prompt: &str, system: Option<&str>) -> Result<String, CuratorError>;
+
+    /// #1866 (§11.5 B7-FC-2) — tool-calling generate. The default impl
+    /// signals "no tool support" by delegating to [`Self::generate`] and
+    /// wrapping the prose in [`crate::llm::ChatOutcome::Text`], so every
+    /// existing implementor keeps working unchanged and the curator's
+    /// text-parse path stays byte-identical. Backends that support
+    /// tool-calling override this to issue a real structured request.
+    ///
+    /// # Errors
+    /// Propagates the underlying [`Self::generate`] error verbatim (LLM
+    /// unavailable, transport / non-2xx / malformed response).
+    fn generate_with_tools(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[crate::llm::ToolDef],
+    ) -> Result<crate::llm::ChatOutcome, CuratorError> {
+        let _ = tools;
+        self.generate(prompt, system)
+            .map(crate::llm::ChatOutcome::Text)
+    }
 }
 
 impl LlmGenerate for crate::llm::OllamaClient {
     fn generate(&self, prompt: &str, system: Option<&str>) -> Result<String, CuratorError> {
         Self::generate(self, prompt, system)
+            .map_err(|e| CuratorError::LlmUnavailable(e.to_string()))
+    }
+
+    fn generate_with_tools(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[crate::llm::ToolDef],
+    ) -> Result<crate::llm::ChatOutcome, CuratorError> {
+        Self::generate_with_tools(self, prompt, system, tools)
             .map_err(|e| CuratorError::LlmUnavailable(e.to_string()))
     }
 }
@@ -341,6 +416,16 @@ impl LlmGenerate for crate::llm::OllamaClient {
 impl LlmGenerate for std::sync::Arc<crate::llm::OllamaClient> {
     fn generate(&self, prompt: &str, system: Option<&str>) -> Result<String, CuratorError> {
         crate::llm::OllamaClient::generate(self.as_ref(), prompt, system)
+            .map_err(|e| CuratorError::LlmUnavailable(e.to_string()))
+    }
+
+    fn generate_with_tools(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[crate::llm::ToolDef],
+    ) -> Result<crate::llm::ChatOutcome, CuratorError> {
+        crate::llm::OllamaClient::generate_with_tools(self.as_ref(), prompt, system, tools)
             .map_err(|e| CuratorError::LlmUnavailable(e.to_string()))
     }
 }
@@ -377,10 +462,21 @@ impl<L: LlmGenerate + Send + Sync> Curator for LlmCurator<L> {
         max_retries: u32,
     ) -> Result<Vec<Atom>, CuratorError> {
         let system = render_system_prompt(max_atom_tokens);
+        // #1866 (§11.5 B7-FC-2) — offer the `emit_atoms` tool so a
+        // tool-capable model returns a schema-constrained structured
+        // call. Tool-unsupporting backends (and the default `LlmGenerate`
+        // impl) degrade to `ChatOutcome::Text` → the historical
+        // `parse_response` path, which stays byte-identical.
+        let tools = [emit_atoms_tool()];
         let mut last_err = String::from("no attempts made");
         for attempt in 0..=max_retries {
-            let resp = self.llm.generate(body, Some(&system))?;
-            match parse_response(&resp) {
+            let parse_result = match self.llm.generate_with_tools(body, Some(&system), &tools)? {
+                // Happy path: structured tool call, no fence-strip / first-object heuristics.
+                crate::llm::ChatOutcome::ToolCalls(calls) => parse_tool_atoms(&calls),
+                // Fallback: prose — the historical JSON-in-text path, byte-identical.
+                crate::llm::ChatOutcome::Text(resp) => parse_response(&resp),
+            };
+            match parse_result {
                 Ok(parsed) => {
                     let (kept, _dropped) = enforce_token_budget(parsed.atoms, max_atom_tokens);
                     return Ok(kept);
@@ -639,5 +735,167 @@ mod tests {
         let parsed: CuratorResponse = serde_json::from_str(&extracted).unwrap();
         assert_eq!(parsed.atoms.len(), 1);
         assert_eq!(parsed.atoms[0].text, "contains } brace");
+    }
+
+    // =======================================================================
+    // #1866 (§11.5 B7-FC-2) — tool-calling curator wiring
+    // =======================================================================
+
+    /// Mock that scripts a sequence of [`crate::llm::ChatOutcome`]s on the
+    /// tool-calling path. Counts tool-path vs text-path invocations so the
+    /// tests can prove the happy path never falls back to the
+    /// `parse_response` fence/first-object heuristics.
+    struct ToolMockLlm {
+        outcomes: Mutex<Vec<Result<crate::llm::ChatOutcome, CuratorError>>>,
+        tool_calls: Mutex<usize>,
+        text_calls: Mutex<usize>,
+    }
+
+    impl ToolMockLlm {
+        fn new(outcomes: Vec<Result<crate::llm::ChatOutcome, CuratorError>>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes),
+                tool_calls: Mutex::new(0),
+                text_calls: Mutex::new(0),
+            }
+        }
+        fn tool_call_count(&self) -> usize {
+            *self.tool_calls.lock().unwrap()
+        }
+        fn text_call_count(&self) -> usize {
+            *self.text_calls.lock().unwrap()
+        }
+    }
+
+    impl LlmGenerate for Arc<ToolMockLlm> {
+        fn generate(&self, _prompt: &str, _system: Option<&str>) -> Result<String, CuratorError> {
+            *self.text_calls.lock().unwrap() += 1;
+            Err(CuratorError::LlmUnavailable(
+                "text path not scripted".into(),
+            ))
+        }
+        fn generate_with_tools(
+            &self,
+            _prompt: &str,
+            _system: Option<&str>,
+            tools: &[crate::llm::ToolDef],
+        ) -> Result<crate::llm::ChatOutcome, CuratorError> {
+            assert!(
+                tools.iter().any(|t| t.name == EMIT_ATOMS_TOOL_NAME),
+                "curator must offer the emit_atoms tool"
+            );
+            *self.tool_calls.lock().unwrap() += 1;
+            let mut os = self.outcomes.lock().unwrap();
+            if os.is_empty() {
+                return Err(CuratorError::LlmUnavailable("no outcomes left".into()));
+            }
+            os.remove(0)
+        }
+    }
+
+    #[test]
+    fn emit_atoms_tool_schema_is_well_formed() {
+        let t = emit_atoms_tool();
+        assert_eq!(t.name, EMIT_ATOMS_TOOL_NAME);
+        assert_eq!(t.parameters["required"][0], "atoms");
+        assert_eq!(t.parameters["properties"]["atoms"]["type"], "array");
+    }
+
+    #[test]
+    fn parse_tool_atoms_happy_and_error_arms() {
+        let good = vec![crate::llm::ToolCall {
+            name: EMIT_ATOMS_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"atoms":[{"text":"x"}]}),
+        }];
+        assert_eq!(parse_tool_atoms(&good).unwrap().atoms.len(), 1);
+        // Wrong tool name → error (no matching call).
+        let wrong = vec![crate::llm::ToolCall {
+            name: "other".to_string(),
+            arguments: serde_json::json!({}),
+        }];
+        assert!(parse_tool_atoms(&wrong).is_err());
+        // Right tool, wrong args shape → error.
+        let bad = vec![crate::llm::ToolCall {
+            name: EMIT_ATOMS_TOOL_NAME.to_string(),
+            arguments: serde_json::json!({"wrong":1}),
+        }];
+        assert!(parse_tool_atoms(&bad).is_err());
+    }
+
+    #[test]
+    fn curator_dispatches_emit_atoms_tool_call() {
+        // A tool-capable model returns a structured emit_atoms call; the
+        // curator dispatches it WITHOUT touching the text heuristics.
+        let mock = Arc::new(ToolMockLlm::new(vec![Ok(
+            crate::llm::ChatOutcome::ToolCalls(vec![crate::llm::ToolCall {
+                name: EMIT_ATOMS_TOOL_NAME.to_string(),
+                arguments: serde_json::json!({"atoms":[{"text":"alpha"},{"text":"beta"}]}),
+            }]),
+        )]));
+        let curator = LlmCurator::with_sleep(mock.clone(), |_| {});
+        let atoms = curator.decompose("input", 200, 3).unwrap();
+        assert_eq!(
+            atoms.iter().map(|a| a.text.as_str()).collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(mock.tool_call_count(), 1);
+        assert_eq!(
+            mock.text_call_count(),
+            0,
+            "happy tool path must not fall back to parse_response heuristics"
+        );
+    }
+
+    #[test]
+    fn curator_retries_when_tool_args_malformed_then_succeeds() {
+        let mock = Arc::new(ToolMockLlm::new(vec![
+            Ok(crate::llm::ChatOutcome::ToolCalls(vec![
+                crate::llm::ToolCall {
+                    name: EMIT_ATOMS_TOOL_NAME.to_string(),
+                    arguments: serde_json::json!({"wrong":"shape"}),
+                },
+            ])),
+            Ok(crate::llm::ChatOutcome::ToolCalls(vec![
+                crate::llm::ToolCall {
+                    name: EMIT_ATOMS_TOOL_NAME.to_string(),
+                    arguments: serde_json::json!({"atoms":[{"text":"ok"}]}),
+                },
+            ])),
+        ]));
+        let curator = LlmCurator::with_sleep(mock.clone(), |_| {});
+        let atoms = curator.decompose("input", 200, 3).unwrap();
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(mock.tool_call_count(), 2);
+    }
+
+    #[test]
+    fn curator_falls_back_to_text_when_tools_unsupported() {
+        // GRACEFUL DEGRADATION: backend reports no tool support → returns
+        // ChatOutcome::Text → the historical parse_response path handles it.
+        let mock = Arc::new(ToolMockLlm::new(vec![Ok(crate::llm::ChatOutcome::Text(
+            r#"{"atoms":[{"text":"gamma"}]}"#.to_string(),
+        ))]));
+        let curator = LlmCurator::with_sleep(mock, |_| {});
+        let atoms = curator.decompose("input", 200, 3).unwrap();
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0].text, "gamma");
+    }
+
+    #[test]
+    fn text_path_byte_identical_regression_pin() {
+        // #1866 no-regression pin: with a text-only backend (the default
+        // LlmGenerate impl, exercised via MockLlm) the curator's output
+        // must equal the historical parse_response + enforce_token_budget
+        // path exactly — proving the JSON-in-text consumer is unchanged.
+        let body = "Here you go:\n{\"atoms\":[{\"text\":\"one\"},{\"text\":\"two\"}]}\nDone.";
+        let mock = Arc::new(MockLlm::new(vec![Ok(body.to_string())]));
+        let curator = LlmCurator::with_sleep(mock.clone(), |_| {});
+        let got = curator.decompose("input", 200, 3).unwrap();
+        // Reference: the exact historical parse+budget path, run directly.
+        let parsed = parse_response(body).unwrap();
+        let (expected, _dropped) = enforce_token_budget(parsed.atoms, 200);
+        assert_eq!(got, expected);
+        // Default impl routes through generate() once (text path).
+        assert_eq!(mock.call_count(), 1);
     }
 }

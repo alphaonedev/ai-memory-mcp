@@ -32,6 +32,21 @@
 //!   selection is vendor-specific (e.g. `grok-4` for xAI,
 //!   `deepseek-chat` for DeepSeek, `qwen-max` for Qwen).
 //! - Legacy `OLLAMA_BASE_URL` is still honored when backend=ollama.
+//!
+//! # Function / tool calling (#1866, §11.5 B7-FC)
+//!
+//! [`OllamaClient::generate_with_tools`] (and the async twin) extend the
+//! `/api/chat` (Ollama) / `/chat/completions` (OpenAI-compatible) body
+//! with a JSON-Schema `tools` array and parse a structured assistant
+//! `tool_calls` reply into [`ChatOutcome::ToolCalls`]. The addition is
+//! purely additive: an empty `tools` slice, or a backend/model that
+//! ignores tools and replies with prose, yields [`ChatOutcome::Text`] —
+//! the graceful-degradation path that preserves today's JSON-in-text
+//! behaviour for `classify_kind` / `auto_tag` / the curator `decompose`
+//! pass. Both providers use the OpenAI tool-definition wire shape
+//! (`{"type":"function","function":{name,description,parameters}}`);
+//! Ollama returns `function.arguments` as an object, OpenAI-compatible
+//! backends as a JSON string that is re-parsed on ingest.
 
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -357,6 +372,121 @@ impl Drop for LlmProvider {
     }
 }
 
+/// #1866 (§11.5 B7-FC-1) — a function/tool definition offered to the LLM
+/// on a tool-calling request.
+///
+/// `parameters` is a JSON-Schema object describing the tool's arguments;
+/// the model is asked to answer with a structured call conforming to it.
+/// Both the Ollama and OpenAI-compatible wire shapes wrap this in
+/// `{"type":"function","function":{…}}` (see [`ToolDef::to_wire`]).
+//
+// rust-skills api-common-traits / M-PUBLIC-DEBUG: derive the standard
+// trait set. `Value` is not `Eq` (floats), so `PartialEq` only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDef {
+    /// Tool/function name the model addresses in its `tool_calls`.
+    pub name: String,
+    /// One-line natural-language description of what the tool does.
+    pub description: String,
+    /// JSON-Schema object describing the tool's parameters.
+    pub parameters: Value,
+}
+
+impl ToolDef {
+    /// Construct a tool definition from its parts.
+    ///
+    /// rust-skills `api-impl-into`: accept `impl Into<String>` so callers
+    /// can pass `&str` or owned `String` without an explicit conversion.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+
+    /// Render the provider-agnostic tool-definition wire element:
+    /// `{"type":"function","function":{name,description,parameters}}`.
+    /// Ollama adopted the OpenAI tool schema, so a single shape serves
+    /// both providers.
+    fn to_wire(&self) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        })
+    }
+}
+
+/// #1866 (§11.5 B7-FC-1) — a structured tool/function call the model
+/// requested in its response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCall {
+    /// Name of the tool the model chose to call.
+    pub name: String,
+    /// Arguments object the model supplied. Already JSON-decoded — the
+    /// OpenAI-compatible string form is re-parsed to a [`Value`] on
+    /// ingest so callers see one uniform shape.
+    pub arguments: Value,
+}
+
+/// #1866 (§11.5 B7-FC-1) — outcome of a tool-enabled chat turn.
+///
+/// [`Self::ToolCalls`] when the model emitted one or more structured
+/// calls; [`Self::Text`] when it replied with prose — the
+/// graceful-degradation path for backends/models that ignore `tools`.
+///
+/// rust-skills `api-must-use`: dropping the outcome silently would lose
+/// the model's answer, so the type is `#[must_use]`.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum ChatOutcome {
+    /// Free-form assistant text (no structured tool call).
+    Text(String),
+    /// One or more structured tool calls, in the order the model emitted
+    /// them.
+    ToolCalls(Vec<ToolCall>),
+}
+
+/// #1866 — parse an assistant `message` object's `tool_calls` array into
+/// typed [`ToolCall`]s.
+///
+/// Returns `None` when the message carries no non-empty, well-formed
+/// `tool_calls` array (the model ignored the tools), which signals the
+/// caller to fall back to the prose/text path. Tolerates both the Ollama
+/// shape (`function.arguments` is a JSON object) and the
+/// OpenAI-compatible shape (`function.arguments` is a JSON string that is
+/// re-parsed). Individual malformed entries (missing `function`/`name`)
+/// are skipped rather than failing the whole batch.
+fn parse_tool_calls(message: &Value) -> Option<Vec<ToolCall>> {
+    let arr = message.get("tool_calls")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for call in arr {
+        let Some(func) = call.get("function") else {
+            continue;
+        };
+        let Some(name) = func.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let arguments = match func.get("arguments") {
+            // OpenAI-compatible: arguments is a JSON string — re-parse.
+            Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+            // Ollama: arguments is already a JSON object.
+            Some(v) => v.clone(),
+            None => Value::Null,
+        };
+        out.push(ToolCall {
+            name: name.to_string(),
+            arguments,
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 const GENERATE_TIMEOUT: Duration = Duration::from_secs(30);
 const PULL_TIMEOUT: Duration = Duration::from_secs(120);
 /// v0.7.0 F6 — explicit TCP connect timeout. Prevents the daemon's MCP
@@ -372,6 +502,24 @@ const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 /// v0.7.0 F6 — failures within the same cooldown window required to trip
 /// the breaker. Single transient failure does not flip the switch.
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+/// #1866 — `anyhow` context prefix for a failed outbound chat send.
+/// Named so the three chat wire paths (`generate_async`,
+/// `generate_with_model_override_async`, `generate_with_tools_async`)
+/// share one source of truth (no scattered literal).
+const ERR_SEND_CHAT: &str = "Failed to send chat request";
+/// #1866 — `anyhow` context prefix for a chat response that is not
+/// valid JSON. Shared across the three chat wire paths.
+const ERR_PARSE_CHAT: &str = "Failed to parse chat response";
+
+/// #1866 — Ollama chat endpoint path suffix, appended to `base_url`.
+/// Named so the three chat wire paths share one source of truth (a
+/// `format!` string must be a literal, so the sites concatenate this
+/// const rather than interpolating it).
+const OLLAMA_CHAT_PATH: &str = "/api/chat";
+/// #1866 — OpenAI-compatible chat endpoint path suffix, appended to
+/// `base_url`. Shared across the three chat wire paths.
+const OPENAI_CHAT_PATH: &str = "/chat/completions";
 
 /// #1603 — max texts per batched OpenAI-compatible `/embeddings`
 /// request ([`OllamaClient::embed_texts_async`]). 100 matches the A4
@@ -1280,7 +1428,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    format!("{}/api/chat", self.base_url),
+                    self.base_url.clone() + OLLAMA_CHAT_PATH,
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -1296,7 +1444,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    format!("{}/chat/completions", self.base_url),
+                    self.base_url.clone() + OPENAI_CHAT_PATH,
                     json!({
                         "model": self.model,
                         "messages": messages,
@@ -1320,7 +1468,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send chat request"));
+                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1337,7 +1485,7 @@ impl OllamaClient {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse chat response"));
+                return Err(e.context(ERR_PARSE_CHAT));
             }
         };
 
@@ -1359,6 +1507,168 @@ impl OllamaClient {
 
         self.note_success();
         Ok(response_text)
+    }
+
+    /// #1866 (§11.5 B7-FC-1) — tool/function-calling variant of
+    /// [`Self::generate`]. Synchronous wrapper over
+    /// [`Self::generate_with_tools_async`].
+    ///
+    /// # Errors
+    /// Same as [`Self::generate_with_tools_async`].
+    pub fn generate_with_tools(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[ToolDef],
+    ) -> Result<ChatOutcome> {
+        block_on_local(|| self.generate_with_tools_async(prompt, system, tools))
+    }
+
+    /// #1866 (§11.5 B7-FC-1) — tool/function-calling variant of
+    /// [`Self::generate_async`].
+    ///
+    /// When `tools` is non-empty the request carries a JSON-Schema
+    /// `tools` array; the response is parsed for a structured assistant
+    /// `tool_calls` array. Returns [`ChatOutcome::ToolCalls`] when the
+    /// model emitted a structured call, or [`ChatOutcome::Text`] when it
+    /// replied with prose — the graceful-degradation path for local
+    /// models / Ollama versions that ignore `tools`. Passing an empty
+    /// `tools` slice is equivalent to [`Self::generate_async`] wrapped in
+    /// [`ChatOutcome::Text`].
+    ///
+    /// The circuit-breaker, governance `NetworkRequest` gate, and wire
+    /// shape are identical to [`Self::generate_async`]; the only additive
+    /// surface is the outbound `tools` array and the inbound `tool_calls`
+    /// parse. This method never mutates the plain-text path, so the three
+    /// existing JSON-in-text consumers (`classify_kind`, `auto_tag`, the
+    /// curator `decompose` pass) are unaffected when tools are not in
+    /// play.
+    ///
+    /// # Errors
+    /// Same as [`Self::generate_async`]: circuit-breaker open, governance
+    /// refusal, transport failure, non-2xx status, malformed body, or a
+    /// missing content field when the model emitted neither `tool_calls`
+    /// nor `message.content`.
+    #[allow(clippy::too_many_lines)]
+    pub async fn generate_with_tools_async(
+        &self,
+        prompt: &str,
+        system: Option<&str>,
+        tools: &[ToolDef],
+    ) -> Result<ChatOutcome> {
+        if self.breaker_is_open() {
+            return Err(anyhow!(
+                "Failed to send chat request: circuit breaker open \
+                 (last failure within {}s); LLM at {} is not responding",
+                CIRCUIT_BREAKER_COOLDOWN.as_secs(),
+                self.base_url,
+            ));
+        }
+        self.check_outbound()?;
+
+        let (url, payload, bearer): (String, Value, Option<&str>) = match &self.provider {
+            LlmProvider::Ollama => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                let mut body = json!({
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": false,
+                });
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
+                }
+                (self.base_url.clone() + OLLAMA_CHAT_PATH, body, None)
+            }
+            LlmProvider::OpenAiCompatible { api_key } => {
+                let mut messages = Vec::new();
+                if let Some(sys) = system {
+                    messages.push(json!({"role": "system", "content": sys}));
+                }
+                messages.push(json!({"role": "user", "content": prompt}));
+                let mut body = json!({
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": false,
+                });
+                if !tools.is_empty() {
+                    body["tools"] = Value::Array(tools.iter().map(ToolDef::to_wire).collect());
+                }
+                (
+                    self.base_url.clone() + OPENAI_CHAT_PATH,
+                    body,
+                    Some(api_key.as_str()),
+                )
+            }
+        };
+
+        let mut req = self
+            .client
+            .post(&url)
+            .timeout(GENERATE_TIMEOUT)
+            .json(&payload);
+        if let Some(key) = bearer {
+            req = req.bearer_auth(key);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                self.note_failure();
+                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            if status.is_server_error() {
+                self.note_failure();
+            }
+            let text = read_capped_text(resp).await;
+            return Err(anyhow!("Chat generate failed ({status}): {text}"));
+        }
+
+        let body: Value = match read_capped_json(resp).await {
+            Ok(b) => b,
+            Err(e) => {
+                self.note_failure();
+                return Err(e.context(ERR_PARSE_CHAT));
+            }
+        };
+
+        let message = match &self.provider {
+            LlmProvider::Ollama => &body["message"],
+            LlmProvider::OpenAiCompatible { .. } => &body["choices"][0]["message"],
+        };
+
+        // Structured tool call present → dispatch it. Absent (the model
+        // ignored the tools) → fall back to the prose text path.
+        if let Some(calls) = parse_tool_calls(message) {
+            self.note_success();
+            return Ok(ChatOutcome::ToolCalls(calls));
+        }
+
+        let response_text = match &self.provider {
+            LlmProvider::Ollama => message["content"]
+                .as_str()
+                .ok_or_else(|| anyhow!("Missing 'message.content' field in chat output"))?
+                .to_string(),
+            LlmProvider::OpenAiCompatible { .. } => message["content"]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Missing 'choices[0].message.content' field in OpenAI-compatible \
+                         chat response; got: {body}"
+                    )
+                })?
+                .to_string(),
+        };
+
+        self.note_success();
+        Ok(ChatOutcome::Text(response_text))
     }
 
     /// Uses the LLM to expand a search query into additional search terms.
@@ -1530,7 +1840,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    format!("{}/api/chat", self.base_url),
+                    self.base_url.clone() + OLLAMA_CHAT_PATH,
                     json!({"model": model, "messages": messages, "stream": false}),
                     None,
                 )
@@ -1542,7 +1852,7 @@ impl OllamaClient {
                 }
                 messages.push(json!({"role": "user", "content": prompt}));
                 (
-                    format!("{}/chat/completions", self.base_url),
+                    self.base_url.clone() + OPENAI_CHAT_PATH,
                     json!({"model": model, "messages": messages, "stream": false}),
                     Some(api_key.as_str()),
                 )
@@ -1561,7 +1871,7 @@ impl OllamaClient {
             Ok(r) => r,
             Err(e) => {
                 self.note_failure();
-                return Err(anyhow::Error::new(e).context("Failed to send chat request"));
+                return Err(anyhow::Error::new(e).context(ERR_SEND_CHAT));
             }
         };
 
@@ -1578,7 +1888,7 @@ impl OllamaClient {
             Ok(b) => b,
             Err(e) => {
                 self.note_failure();
-                return Err(e.context("Failed to parse chat response"));
+                return Err(e.context(ERR_PARSE_CHAT));
             }
         };
 
@@ -2405,6 +2715,33 @@ pub mod test_support {
             } else {
                 Ok("Mock response for: ".to_string() + &prompt[..prompt.len().min(50)])
             }
+        }
+
+        /// #1866 (§11.5 B7-FC-1) — mock tool-calling generate. Scripts a
+        /// deterministic [`ChatOutcome`] so curator/handler wiring can be
+        /// exercised without a live Ollama:
+        ///
+        /// - failure modes propagate exactly like [`Self::generate`];
+        /// - when `tools` is non-empty AND the prompt names a supplied
+        ///   tool, returns a [`ChatOutcome::ToolCalls`] echoing that tool
+        ///   with `{}` arguments (callers script richer args by prompt);
+        /// - otherwise degrades to [`ChatOutcome::Text`] via
+        ///   [`Self::generate`] — the no-tool-support fallback path.
+        pub fn generate_with_tools(
+            &self,
+            prompt: &str,
+            system: Option<&str>,
+            tools: &[ToolDef],
+        ) -> Result<ChatOutcome> {
+            if let Some(tool) = tools.iter().find(|t| prompt.contains(&t.name)) {
+                if self.should_fail().is_none() {
+                    return Ok(ChatOutcome::ToolCalls(vec![ToolCall {
+                        name: tool.name.clone(),
+                        arguments: json!({}),
+                    }]));
+                }
+            }
+            self.generate(prompt, system).map(ChatOutcome::Text)
         }
 
         /// Mock `expand_query` — returns error or synthetic expansion.
@@ -4595,6 +4932,209 @@ mod perf9_async_tests {
             err.to_string()
                 .contains("Missing 'choices[0].message.content'")
         );
+    }
+
+    // ============ #1866 (§11.5 B7-FC-1) generate_with_tools ============
+
+    /// A demo tool def used across the tool-calling tests.
+    fn weather_tool() -> super::ToolDef {
+        super::ToolDef::new(
+            "get_weather",
+            "Look up the weather for a city.",
+            json!({
+                "type": "object",
+                "properties": { "city": {"type": "string"} },
+                "required": ["city"]
+            }),
+        )
+    }
+
+    #[test]
+    fn tool_def_to_wire_uses_openai_function_shape() {
+        let wire = weather_tool().to_wire();
+        assert_eq!(wire["type"], "function");
+        assert_eq!(wire["function"]["name"], "get_weather");
+        assert_eq!(
+            wire["function"]["parameters"]["properties"]["city"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_object_and_string_arguments() {
+        // Ollama shape — arguments is an object.
+        let ollama = json!({
+            "tool_calls": [{"function": {"name": "t", "arguments": {"a": 1}}}]
+        });
+        let calls = super::parse_tool_calls(&ollama).expect("object args parse");
+        assert_eq!(calls[0].name, "t");
+        assert_eq!(calls[0].arguments, json!({"a": 1}));
+
+        // OpenAI-compatible shape — arguments is a JSON string.
+        let openai = json!({
+            "tool_calls": [{"function": {"name": "t", "arguments": "{\"a\":2}"}}]
+        });
+        let calls = super::parse_tool_calls(&openai).expect("string args parse");
+        assert_eq!(calls[0].arguments, json!({"a": 2}));
+
+        // No tool_calls at all → None (fall back to text).
+        assert!(super::parse_tool_calls(&json!({"content": "hi"})).is_none());
+        // Empty tool_calls array → None.
+        assert!(super::parse_tool_calls(&json!({"tool_calls": []})).is_none());
+        // Malformed-only entries (no name) → None.
+        assert!(super::parse_tool_calls(&json!({"tool_calls": [{"function": {}}]})).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_dispatches_structured_call() {
+        // A tool-capable model returns a structured tool_calls array.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {"name": "get_weather", "arguments": {"city": "London"}}
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model").unwrap();
+        let outcome = client
+            .generate_with_tools_async("weather?", None, &[weather_tool()])
+            .await
+            .unwrap();
+        match outcome {
+            super::ChatOutcome::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "get_weather");
+                assert_eq!(calls[0].arguments, json!({"city": "London"}));
+            }
+            super::ChatOutcome::Text(t) => panic!("expected ToolCalls, got Text({t:?})"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_falls_back_to_text_when_model_ignores_tools() {
+        // GRACEFUL DEGRADATION: a model that ignores `tools` replies with
+        // prose only — we must return ChatOutcome::Text, never hard-fail.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "{\"atoms\":[{\"text\":\"a\"}]}"}
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model").unwrap();
+        let outcome = client
+            .generate_with_tools_async("decompose this", None, &[weather_tool()])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::ChatOutcome::Text("{\"atoms\":[{\"text\":\"a\"}]}".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_malformed_tool_calls_degrades_to_text() {
+        // tool_calls present but every entry is malformed (no name) AND a
+        // content field is present → degrade to the text path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {
+                    "role": "assistant",
+                    "content": "fallback text",
+                    "tool_calls": [{"function": {}}]
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model").unwrap();
+        let outcome = client
+            .generate_with_tools_async("q", None, &[weather_tool()])
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            super::ChatOutcome::Text("fallback text".to_string())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_openai_string_arguments() {
+        // OpenAI-compatible backend returns arguments as a JSON string.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]
+                }}]
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new_openai_compatible(&server.uri(), "test-model", "fake-key").unwrap();
+        let outcome = client
+            .generate_with_tools_async("weather?", None, &[weather_tool()])
+            .await
+            .unwrap();
+        match outcome {
+            super::ChatOutcome::ToolCalls(calls) => {
+                assert_eq!(calls[0].arguments, json!({"city": "Paris"}));
+            }
+            super::ChatOutcome::Text(t) => panic!("expected ToolCalls, got Text({t:?})"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_empty_tools_is_plain_text() {
+        // With no tools supplied the body carries no `tools` array and the
+        // reply is returned as ChatOutcome::Text — parity with generate().
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .and(body_partial_json(json!({"stream": false})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "message": {"role": "assistant", "content": "plain reply"}
+            })))
+            .mount(&server)
+            .await;
+        let client =
+            OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model").unwrap();
+        let outcome = client
+            .generate_with_tools_async("hi", None, &[])
+            .await
+            .unwrap();
+        assert_eq!(outcome, super::ChatOutcome::Text("plain reply".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generate_with_tools_async_breaker_open_short_circuits() {
+        // Circuit-breaker semantics preserved: an open breaker fast-fails.
+        let client = OllamaClient::new_for_testing("test-model");
+        for _ in 0..super::CIRCUIT_BREAKER_THRESHOLD {
+            client.note_failure();
+        }
+        let err = client
+            .generate_with_tools_async("hi", None, &[weather_tool()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("circuit breaker open"));
     }
 
     // ============ embed_text_async ============
