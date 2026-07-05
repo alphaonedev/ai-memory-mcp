@@ -1052,7 +1052,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `OllamaClient::classify_kind` + `CLASSIFY_KIND_SYSTEM` prompt +
     // `classify_kind_prompt` / `parse_classified_kind` helpers + 4 parser-pin
     // tests (file grew to 5_456); 5_500 = 44 headroom.
-    ("src/llm.rs", 5_500),
+    // 2026-07-05 (v0.9.0 §11.5 B7-FC-1 #1866) — bumped 5_500 → 6_060: the
+    // function/tool-calling protocol — `ToolDef` / `ToolCall` / `ChatOutcome`
+    // types + `parse_tool_calls` + `generate_with_tools`(`_async`) wire methods
+    // + `ERR_SEND_CHAT`/`ERR_PARSE_CHAT`/`OLLAMA_CHAT_PATH`/`OPENAI_CHAT_PATH`
+    // consts (de-scattered literals) + the `MockOllamaClient` scripted tool
+    // method + 8 wiremock/unit tool-calling tests (file grew to 6_012);
+    // 6_060 = 48 headroom. Refactor-split into `src/llm/{…}.rs` remains the
+    // tracked post-ship ARCH cleanup.
+    ("src/llm.rs", 6_060),
 ];
 
 #[test]
