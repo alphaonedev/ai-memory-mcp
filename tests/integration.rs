@@ -7965,7 +7965,8 @@ fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
     // subcommand (Pillar 3 / Stream E). Verifies that:
     //   1. The binary exits 0 (no operation exceeded its p95 budget).
     //   2. --json output is parseable and well-shaped.
-    //   3. All 7 hot-path operations are reported.
+    //   3. All 8 hot-path operations are reported (incl. the #1871
+    //      handler-layer rerank-stage recall op).
     //   4. Each result carries the fields documented in PERFORMANCE.md.
     //
     // The bench subcommand seeds a disposable :memory: SQLite DB
@@ -7996,8 +7997,8 @@ fn test_cli_bench_emits_json_with_seven_results_and_passes_budget() {
         .expect("results must be a JSON array");
     assert_eq!(
         results.len(),
-        7,
-        "bench should report exactly 7 operations on release/v0.6.3, got {}",
+        8,
+        "bench should report exactly 8 operations (7 legacy + #1871 rerank stage), got {}",
         results.len()
     );
 

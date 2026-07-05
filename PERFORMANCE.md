@@ -28,6 +28,7 @@ are advisory targets.
 |---|---|---|---|
 | `memory_session_start` hook | < 100 ms | < 200 ms | *[advisory]* Claude Code hook critical path |
 | `memory_recall` (hot, depth=1) | < 50 ms | < 150 ms | Felt during agent reasoning |
+| `memory_recall` (rerank stage, depth=1) | < 60 ms | < 180 ms | #1871 — keyword recall + the handler-layer cross-encoder rerank pass (lexical stand-in in the bench). Recall budget + rerank-stage headroom; makes the rerank STAGE COST visible to the Bench p95 gate. |
 | `memory_recall` (cold, full hybrid) | < 200 ms | < 500 ms | *[advisory]* First-query path |
 | `memory_recall` (budget, `budget_tokens=4096`) | < 90 ms | < 200 ms | *[advisory]* v0.6.3.1 R1 — autonomous tier budget. Adds cl100k_base BPE tokenization on the survivors only; budget-unset path is unchanged (skips BPE, falls back to a byte heuristic for the `tokens_used` tally). The first call in a process pays a one-shot ~200 ms BPE table parse, amortized away from the steady-state p95. |
 | `memory_store` (no embedding) | < 20 ms | < 50 ms | Pure write |
@@ -114,7 +115,7 @@ budget on a 100k-row corpus** while the default bench stayed green).
 
 `ai-memory bench --scale <rows>` closes that blind spot: it seeds a
 scratch corpus of `<rows>` rows into the disposable in-memory DB
-before running the same 7 operations, and gates the verdict against
+before running the same 8 operations, and gates the verdict against
 the per-scale budget table below instead of the default budgets.
 Omitting `--scale` keeps the default workload and default budgets
 byte-for-byte.
@@ -126,7 +127,8 @@ byte-for-byte.
 | 10,000 | `memory_store` (no embedding) | < 120 ms | keyword-tier write incl. FTS5 trigger sync at scale |
 | 10,000 | `memory_search` (FTS5) | < 60 ms | |
 | 10,000 | `memory_recall` (hot, keyword) | < 80 ms | |
-| 10,000 | `memory_list` | < 10 ms | *[advisory]* — no bench row yet (the 7-op workload does not cover list); pinned per the #1579 remediation plan |
+| 10,000 | `memory_recall` (rerank stage) | < 100 ms | #1871 — recall-hot budget (80) + rerank-stage headroom (20). The rerank pass operates on the fixed top-K candidate cap (scale-invariant); the recall portion carries the same corpus sensitivity as the hot-keyword row. |
+| 10,000 | `memory_list` | < 10 ms | *[advisory]* — no bench row yet (the bench workload does not cover list); pinned per the #1579 remediation plan |
 | 10,000 | `memory_kg_query` / `memory_kg_timeline` | unchanged | KG fixtures are fixed-size (50×4 fan-out, 50×5 chains) — corpus scale does not change traversal cost, so the canonical budgets above apply |
 
 SSOT: `src/bench.rs::SCALE_BUDGETS` (pinned by the
@@ -304,7 +306,7 @@ reference hardware, not absolute floors for every machine.
 | Component | State | Where |
 |---|---|---|
 | Published budgets | ✅ landed | this file |
-| `ai-memory bench` subcommand | ✅ landed | `src/bench.rs` — covers `memory_store` (no embedding), `memory_search` (FTS5), `memory_recall` (hot, depth=1), `memory_kg_query` (depth=1, depth=3, depth=5), `memory_kg_timeline` |
+| `ai-memory bench` subcommand | ✅ landed | `src/bench.rs` — covers `memory_store` (no embedding), `memory_search` (FTS5), `memory_recall` (hot, depth=1), `memory_recall` (rerank stage, depth=1) (#1871), `memory_kg_query` (depth=1, depth=3, depth=5), `memory_kg_timeline` |
 | Per-tool MCP `tracing` spans | ✅ landed | `src/mcp.rs` `handle_request` — `mcp_tool_call` span carries `tool` + `rpc_id`; `elapsed_ms` emitted at exit |
 | KG operations in `bench` | ✅ landed | `src/bench.rs` — fan-out fixture (50 × 4 outbound, every link `valid_from`-stamped) drives `kg_query` depth=1 + `kg_timeline`; chain fixture (50 chains × 5 hops) drives `kg_query` depth=3 + depth=5 |
 | Embedding-bound operations in `bench` | 🚧 Stream E follow-up | needs an embedder fixture decision (opt-in flag vs cfg(test) fake vs pre-cached model) — see iter-0017 handoff |
@@ -331,6 +333,7 @@ Operation                       Target (p95)   Measured (p95)   p50      p99    
 memory_store (no embedding)     <   20 ms           0.4 ms         0.3      0.5    PASS
 memory_search (FTS5)            <  100 ms           0.5 ms         0.5      0.5    PASS
 memory_recall (hot, depth=1)    <   50 ms           4.8 ms         4.2      5.3    PASS
+memory_recall (rerank stage, depth=1) < 60 ms        5.1 ms         4.5      5.7    PASS
 memory_kg_query (depth=1)       <  100 ms           0.5 ms         0.5      0.5    PASS
 memory_kg_query (depth=3)       <  100 ms           0.6 ms         0.6      0.6    PASS
 memory_kg_query (depth=5)       <  250 ms           0.7 ms         0.6      1.0    PASS
