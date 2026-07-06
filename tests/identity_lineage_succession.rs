@@ -32,11 +32,42 @@
 
 #![allow(clippy::too_many_lines, clippy::doc_markdown, clippy::similar_names)]
 
+mod common;
+
 use ai_memory::db;
 use ai_memory::identity::keypair::{self, AgentKeypair};
 use ai_memory::identity::lineage::{LineageError, LineageRecord};
 use ai_memory::identity::sign::sign_succession;
+use common::EnvVarGuard;
 use rusqlite::{Connection, params};
+
+// ---------------------------------------------------------------------------
+// v0.9.0 pre-GA (#1853) flake fix — `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` is a
+// PROCESS-GLOBAL env var read by `verify_audit_trail`
+// (`identity::lineage::require_identity_lineage_enabled`, consulted at
+// src/signed_events.rs:1710). `require_identity_lineage_fail_closes_when_missing`
+// below sets it truthy to pin the Missing-verdict fail-closed behaviour, while
+// `successor_verifies_via_chain_and_fails_closed_when_broken_but_synced` and
+// `audit_trail_lineage_verdicts` also call `verify_audit_trail` and assert the
+// DEFAULT (unset) verdicts (Forged / Unknown / NotDetected respectively).
+// Cargo's default multi-threaded harness runs all `#[test]` fns in this
+// binary concurrently, so the mutator's set/remove window could transiently
+// flip a sibling's verdict to `Missing` — this raced as a full-suite-only
+// flake (green in isolation / `--test-threads=1`); the assertions themselves
+// were always correct.
+//
+// Fix: reuse the crate's ALREADY-ESTABLISHED `tests/common::EnvVarGuard`
+// (issue #821; process-wide `ENV_LOCK`, RAII restore-on-drop, same
+// discipline the #1853 HMAC fix at afebc9df and the #1874 AGENT_ID
+// env-guard at e078c89b both cite/extend) instead of inventing a new
+// module-local lock. The mutator wraps its `set_var` in
+// `EnvVarGuard::set(...)`; the two readers that depend on the DEFAULT
+// (unset) value wrap themselves in `EnvVarGuard::remove(...)` — both
+// acquire the SAME process-wide `ENV_LOCK` for the whole test body, so the
+// three tests can never interleave on this global, and a mid-body panic in
+// any of them still restores prior env state on unwind (RAII, not manual
+// set/remove).
+// ---------------------------------------------------------------------------
 
 /// Fresh migrated sqlite DB (temp file — `db::open` runs the ladder).
 fn fresh_db() -> (tempfile::TempDir, Connection) {
@@ -174,6 +205,13 @@ fn genesis_self_signs_and_verifies() {
 
 #[test]
 fn successor_verifies_via_chain_and_fails_closed_when_broken_but_synced() {
+    // v0.9.0 pre-GA (#1853) flake fix — this test asserts the Forged verdict
+    // that `verify_audit_trail` computes with `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`
+    // UNSET (default). Force-unset + hold `ENV_LOCK` for the whole body so
+    // `require_identity_lineage_fail_closes_when_missing`'s transient `"1"`
+    // can never race this assertion (see the module doc-comment above).
+    let _lineage_env =
+        EnvVarGuard::remove(ai_memory::identity::lineage::REQUIRE_IDENTITY_LINEAGE_ENV);
     let (_dir, conn) = fresh_db();
     let (_k0, _k1, k2) = enroll_three_key_chain(&conn, "c2-agent");
 
@@ -659,6 +697,12 @@ fn crash_mid_append_leaves_no_half_migrated_identity() {
 
 #[test]
 fn audit_trail_lineage_verdicts() {
+    // v0.9.0 pre-GA (#1853) flake fix — see the module doc-comment: this
+    // test asserts the Unknown/NotDetected verdicts `verify_audit_trail`
+    // computes with `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` UNSET (default).
+    // Force-unset + hold `ENV_LOCK` for the whole body.
+    let _lineage_env =
+        EnvVarGuard::remove(ai_memory::identity::lineage::REQUIRE_IDENTITY_LINEAGE_ENV);
     let (_dir, conn) = fresh_db();
     // No lineage anywhere → Unknown, clean (byte-identical legacy).
     let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit");
@@ -680,14 +724,19 @@ fn audit_trail_lineage_verdicts() {
 
 #[test]
 fn require_identity_lineage_fail_closes_when_missing() {
-    // Env-mutating test: this is the ONLY test in this binary touching
-    // the require flag, and it restores the var before returning.
+    // v0.9.0 pre-GA (#1853) flake fix — see the module doc-comment: this is
+    // the only test in this binary that MUTATES the require flag. Using
+    // `EnvVarGuard::set` (rather than raw `set_var`/`remove_var`) acquires
+    // the process-wide `ENV_LOCK` for the whole body (serialising against
+    // the two reader tests above, which hold the same lock) AND restores
+    // the prior value via `Drop` even if the `.expect`/assert below panics
+    // — no manual `remove_var` needed.
+    let _lineage_env = EnvVarGuard::set(
+        ai_memory::identity::lineage::REQUIRE_IDENTITY_LINEAGE_ENV,
+        "1".to_string(),
+    );
     let (_dir, conn) = fresh_db();
-    // SAFETY: single-threaded with respect to this env var (see above).
-    unsafe { std::env::set_var("AI_MEMORY_REQUIRE_IDENTITY_LINEAGE", "1") };
     let report = ai_memory::signed_events::verify_audit_trail(&conn, None).expect("audit");
-    // SAFETY: as above.
-    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_IDENTITY_LINEAGE") };
     assert_eq!(
         report.lineage,
         ai_memory::identity::lineage::LineageCheck::Missing

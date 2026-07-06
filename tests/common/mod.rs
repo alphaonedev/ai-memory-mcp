@@ -645,6 +645,30 @@ mod hmac_fixture_tests {
 /// broken will still fail well inside the CI job's 6 h budget.
 pub const DAEMON_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
+// ---------------------------------------------------------------------------
+// v0.9.0 pre-GA (#1853) — same #1194 anti-pattern, second occurrence.
+//
+// `tests/federation_postgres_fanout.rs`'s per-peer `wait_for_counter` polling
+// loop used a fixed `Duration::from_secs(5)` budget to observe a mock peer's
+// `sync_push` counter bump. The fanout it's waiting on is genuinely
+// ASYNCHRONOUS (post-quorum "straggler" broadcasts detach from the request
+// that already returned 201/CREATED — see that file's `#1480` doc-comment),
+// so its completion time is load-sensitive exactly like the #1194
+// postgres-container cold start: fine warm / on an idle box, and prone to
+// exceed 5 s under full-suite CI load (many parallel postgres-feature test
+// binaries competing for the shared runner's CPU + the postgres connection
+// pool) — "fails under load, passes in isolation" is the textbook symptom of
+// a too-tight timeout, not a logic bug.
+//
+// Fix: the SAME generous-bounded-wait shape as [`DAEMON_READY_TIMEOUT`]
+// above, sized down from its 5-minute daemon-cold-start budget since
+// observing an in-process mock HTTP POST is a much lighter operation than a
+// postgres-container + AGE-extension cold start, but still ~12x the
+// pre-existing 5 s budget so CI-load variance doesn't surface as a false
+// fanout-never-happened assertion. A genuinely broken fanout still fails
+// fast enough to not meaningfully dent the CI job's time budget.
+pub const FANOUT_OBSERVED_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
 /// Probe the in-process HTTP daemon's `/api/v1/health` endpoint until
 /// it returns 200 OK or the overall `timeout` elapses.
 ///

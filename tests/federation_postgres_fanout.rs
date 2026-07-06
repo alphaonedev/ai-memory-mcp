@@ -56,7 +56,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 
 mod common;
-use common::{DAEMON_READY_TIMEOUT, free_port, postgres_url, wait_for_http_ready};
+use common::{
+    DAEMON_READY_TIMEOUT, FANOUT_OBSERVED_TIMEOUT, free_port, postgres_url, wait_for_http_ready,
+};
 
 #[derive(Clone)]
 struct MockPeer {
@@ -302,7 +304,7 @@ async fn notify_fanout_postgres_reaches_w_of_n_peers() {
     // All three peers must observe at least one sync_push POST for
     // the notify-generated inbox memory. Post-quorum detach fanout
     // means stragglers complete too.
-    let timeout = Duration::from_secs(5);
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
     let p1_ok = wait_for_counter(&peer1.count, 1, timeout).await;
     let p2_ok = wait_for_counter(&peer2.count, 1, timeout).await;
     let p3_ok = wait_for_counter(&peer3.count, 1, timeout).await;
@@ -398,7 +400,7 @@ async fn subscribe_postgres_replays_history() {
     assert!(resp_body["id"].is_string(), "subscribe must return id");
 
     // Every peer must observe the subscription memory via sync_push.
-    let timeout = Duration::from_secs(5);
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
     let p1_ok = wait_for_counter(&peer1.count, 1, timeout).await;
     let p2_ok = wait_for_counter(&peer2.count, 1, timeout).await;
     let p3_ok = wait_for_counter(&peer3.count, 1, timeout).await;
@@ -521,7 +523,7 @@ async fn cross_namespace_dispatch_on_postgres() {
         .expect("subscribe post");
     assert_eq!(sub_resp.status(), reqwest::StatusCode::CREATED);
 
-    let timeout = Duration::from_secs(5);
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
     assert!(
         wait_for_counter(&peer1.count, 1, timeout).await
             && wait_for_counter(&peer2.count, 1, timeout).await
@@ -701,7 +703,7 @@ async fn create_postgres_pipelines_broadcast_with_local_write() {
     // (c) the pipelined broadcast still fanned out to every peer. Post-
     // quorum straggler detach (the W=2 of N=4 policy) means peer-3
     // completes too even though quorum was met at peer-1+peer-2.
-    let timeout = Duration::from_secs(5);
+    let timeout = FANOUT_OBSERVED_TIMEOUT;
     let p1_ok = wait_for_counter(&peer1.count, 1, timeout).await;
     let p2_ok = wait_for_counter(&peer2.count, 1, timeout).await;
     let p3_ok = wait_for_counter(&peer3.count, 1, timeout).await;

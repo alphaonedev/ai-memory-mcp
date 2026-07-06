@@ -206,6 +206,28 @@ cargo bench --bench recall
 
 `AI_MEMORY_NO_CONFIG=1` prevents loading user config which may trigger embedder/LLM initialization during tests.
 
+### Local coverage (matching CI's `coverage.yml`)
+
+```bash
+scripts/coverage.sh
+```
+
+Runs `cargo llvm-cov --features sal,sal-postgres --lib --tests --workspace
+-- --test-threads=1` (byte-for-byte the same invocation as the "Generate
+coverage JSON" step in `.github/workflows/coverage.yml`) followed by
+`coverage/check-thresholds.sh`. The trailing `-- --test-threads=1` is
+**required, not optional** (v0.8.0 #1709 SHIP-HARDEN): the `sal-postgres`
+suite shares one `ai_memory_test` database with no per-test schema
+isolation, so running it under llvm-cov WITHOUT serialising threads lets
+two postgres-backed tests race on shared table/index locks and produces a
+spurious local-only failure that never reproduces in CI (which already
+serialises). Before `scripts/coverage.sh` existed this was a recurring
+trap for anyone running `cargo llvm-cov` locally by hand and omitting the
+flag. Point `AI_MEMORY_TEST_POSTGRES_URL` at a live PG16 instance (+ `age`
++ `vector` extensions) to exercise the postgres backend instead of having
+those tests self-skip; pass `--no-threshold-check` to generate
+`coverage/current.json` only.
+
 ## Dogfooding release branches
 
 Every `release/v0.6.x.y` branch should be dogfooded by the maintainer for at least 24h before tag-cut so any migration / capability / wire-format regression surfaces in real use, not just CI. The script that does this on this node:
