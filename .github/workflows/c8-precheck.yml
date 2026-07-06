@@ -133,3 +133,24 @@ jobs:
         # in a tmpdir + invokes the gate against AI_MEMORY_DOCS_GATE_ROOT
         # = tmpdir; the gate must catch the drift.
         run: bash scripts/check-docs-vs-ssot.sh --self-test
+
+  cloud-init-ascii-gate:
+    # v0.9.0 (issue #1880): a stray non-ASCII byte (U+2014 em-dash) in a
+    # DO cloud-init template made cloud-init reject the config
+    # ("unacceptable character #x0080") and boot a BARE droplet with none
+    # of the postgres/AGE/pgvector substrate — a SILENT provisioning
+    # failure only visible on SSH triage. This gate keeps the cloud-init
+    # templates pure ASCII so `terraform apply` renders a cloud-config
+    # cloud-init will parse.
+    name: Cloud-init ASCII gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run cloud-init ASCII gate
+        run: bash scripts/check-cloud-init-ascii.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test stages a template carrying the exact #1880 em-dash
+        # byte in a tmpdir + a clean control; the gate must reject the
+        # former and pass the latter.
+        run: bash scripts/check-cloud-init-ascii.sh --self-test

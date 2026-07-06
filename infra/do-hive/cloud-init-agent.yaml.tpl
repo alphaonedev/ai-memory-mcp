@@ -1,5 +1,5 @@
 #cloud-config
-# Track E1 — IronClaw agent droplet bootstrap. Templated by main.tf.
+# Track E1 -- IronClaw agent droplet bootstrap. Templated by main.tf.
 # Each agent registers itself with the shared ai-memory substrate at
 # ${memory_private_ip}:9077 using its per-droplet `agent_id`.
 package_update: true
@@ -36,7 +36,7 @@ runcmd:
   - tar -xzf /tmp/ironclaw.tar.gz -C /opt/ironclaw/bin
   - chmod 0755 /opt/ironclaw/bin/ironclaw
   - systemctl daemon-reload
-  # Service is NOT enabled by default — operator runs `ironclaw-agent start`
+  # Service is NOT enabled by default -- operator runs `ironclaw-agent start`
   # via the post-spawn playbook so XAI_API_KEY can be injected at start time
   # rather than embedded in the unit file (the cloud-init pass would leak it
   # to disk in the systemd unit).
