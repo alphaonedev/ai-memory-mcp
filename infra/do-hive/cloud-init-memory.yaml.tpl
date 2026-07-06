@@ -1,10 +1,10 @@
 #cloud-config
-# Track E1 — ai-memory + PostgreSQL 16 + pgvector + Apache AGE bootstrap on the
+# Track E1 -- ai-memory + PostgreSQL 16 + pgvector + Apache AGE bootstrap on the
 # DO substrate droplet. Templated by `infra/do-hive/main.tf`. Operator-triggered.
 #
 # #1842 fix (v0.8.1): the prior template installed postgresql-16 but never
-# installed pgvector and never built Apache AGE (AGE is source-only — not an
-# apt package — and `CREATE EXTENSION age` failed). It also used the invalid
+# installed pgvector and never built Apache AGE (AGE is source-only -- not an
+# apt package -- and `CREATE EXTENSION age` failed). It also used the invalid
 # `--bind` flag. This template installs pgvector (apt), builds AGE from source
 # against pg16, preloads AGE, creates the db + both extensions, and runs serve
 # with the correct `--host/--port` flags + a postgres `--store-url`.
