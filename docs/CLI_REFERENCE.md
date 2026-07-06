@@ -835,7 +835,12 @@ Walks the `signed_events` cross-row hash chain end-to-end. Supports
 ### `schema-init` — postgres + AGE bootstrap (`--features sal`)
 
 Idempotent schema bootstrap for a fresh SAL store by URL
-(`--store-url <URL>`; flags: `--json`, `--embedding-dim`, default 384).
+(`--store-url <URL>`; flags: `--json`, `--embedding-dim`). When
+`--embedding-dim` is omitted it resolves from the SAME config-driven
+source the daemon uses to pick its embedder (the effective tier's
+embedder dim; 384 for the keyword / no-embedder case) — so `schema-init`
+then `serve` never disagree on the column dim by default and no
+boot-time `ALTER` fires (#1882).
 Enumerates the resulting catalog (tables, views, functions, indices,
 extensions, schema_version); on Postgres with Apache AGE installed it
 also bootstraps the `memory_graph` projection — without AGE the

@@ -783,13 +783,13 @@ async fn schema_init_run_postgres_enumerates_live_catalog() {
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
         store_url: url.clone(),
         json: true,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
     // Drives run → init_and_enumerate_postgres → connect_with_dim →
     // migrate_embedding_dim → enumerate_postgres (+ bootstrap_memory_graph
     // when AGE is present) → current_embedding_dim.
-    ai_memory::cli::schema_init::run(&args, &mut out)
+    ai_memory::cli::schema_init::run(&args, None, &mut out)
         .await
         .expect("schema-init against live postgres");
 
@@ -830,10 +830,10 @@ async fn schema_init_run_postgres_human_render() {
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
         store_url: url,
         json: false,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
-    ai_memory::cli::schema_init::run(&args, &mut out)
+    ai_memory::cli::schema_init::run(&args, None, &mut out)
         .await
         .expect("schema-init human render against live postgres");
 

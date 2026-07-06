@@ -760,7 +760,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
             let args = ai_memory::cli::schema_init::SchemaInitArgs {
                 store_url: url,
                 json: true,
-                embedding_dim: dim,
+                embedding_dim: Some(dim),
                 // This test deliberately drives the destructive in-place
                 // dim-conversion arm (384→768→384) on a shared scratch DB
                 // that other suites populate with embedding-bearing rows.
@@ -769,7 +769,7 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
                 // (and the embedding NULLing it documents) is the intent.
                 force_reembed: true,
             };
-            ai_memory::cli::schema_init::run(&args, &mut out)
+            ai_memory::cli::schema_init::run(&args, None, &mut out)
                 .await
                 .expect("schema-init run");
             let raw = String::from_utf8(stdout).expect("utf-8 stdout");
@@ -828,10 +828,10 @@ async fn schema_init_postgres_reports_age_projection_field() {
     let args = ai_memory::cli::schema_init::SchemaInitArgs {
         store_url: url,
         json: true,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
-    ai_memory::cli::schema_init::run(&args, &mut out)
+    ai_memory::cli::schema_init::run(&args, None, &mut out)
         .await
         .expect("schema-init run for age probe");
     let raw = String::from_utf8(stdout).expect("utf-8 stdout");

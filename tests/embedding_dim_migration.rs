@@ -131,6 +131,34 @@ async fn current_dim(pool: &PgPool) -> Option<i32> {
     .flatten()
 }
 
+/// \#1882 helper — run `schema-init --json` with the given config-resolved
+/// default and NO explicit `--embedding-dim` (the common deploy-pipeline
+/// invocation), returning the parsed report. Exercises the real public
+/// [`ai_memory::cli::schema_init::run`] entry-point so the default-dim
+/// resolution under test is the production one.
+async fn run_schema_init_default(url: &str, config_default_dim: Option<u32>) -> serde_json::Value {
+    use ai_memory::cli::CliOutput;
+    use ai_memory::cli::schema_init::{SchemaInitArgs, run as schema_init_run};
+
+    let args = SchemaInitArgs {
+        store_url: url.to_string(),
+        json: true,
+        // Operator omits the flag → dim resolves from `config_default_dim`.
+        embedding_dim: None,
+        force_reembed: false,
+    };
+    let mut so = Vec::<u8>::new();
+    let mut se = Vec::<u8>::new();
+    {
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        schema_init_run(&args, config_default_dim, &mut out)
+            .await
+            .expect("schema-init run");
+    }
+    let raw = String::from_utf8(so).expect("utf-8 schema-init json");
+    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parseable JSON, got {raw}: {e}"))
+}
+
 /// Core regression: bootstrap at 384, then re-open with the
 /// auto-migrate entry point at 768 — the column flips in-place.
 #[tokio::test]
@@ -430,6 +458,148 @@ async fn list_survives_embedding_dim_alter_without_cached_plan_503_1881() {
         "issue #1881: {cached_plan_503s}/40 `list` reads on the post-ALTER pool returned \
          `cached plan must not change result type` — the pool's cached plans were not \
          evicted after the embedding-dim auto-migrate"
+    );
+}
+
+/// Issue #1882 — CROSS-PROCESS closeout of the #1881 cached-plan 503.
+///
+/// The #1881 minimal harden ([`PostgresStore::discard_pool_cached_plans`])
+/// evicted the MIGRATING process's own pool, but a SEPARATELY-running
+/// serving daemon's pool was unreachable — so a `schema-init` re-flipping
+/// the column in one process still invalidated a serving daemon's cached
+/// plans in another. #1882 removes the boot-time ALTER at its SOURCE:
+/// `schema-init` and `serve` now resolve the embedding dim from the SAME
+/// config-driven source, so a fresh DEFAULT deploy (any tier) never
+/// disagrees on the dim and no boot-time
+/// `ALTER TABLE ... embedding TYPE vector(N)` fires — hence the
+/// cross-process cached-plan invalidation is impossible.
+///
+/// This is the production-faithful cross-process reproduction:
+///  - **Process A** = `schema-init` with NO `--embedding-dim` (the common
+///    deploy-pipeline invocation). Post-#1882 it provisions the column at
+///    the daemon-resolved default (768 for a smart/autonomous deploy);
+///    pre-#1882 it hardcoded 384 — the first assertion pins this and FAILS
+///    against pre-fix behaviour.
+///  - **Process B** = a separate serving pool booting via the #877
+///    auto-migrate entry point at the SAME daemon default, then warming
+///    `list` (caching the `SELECT *` plan that binds vector(768)).
+///  - **Process A redeploy** = `schema-init` runs again (idempotent deploy
+///    step). Post-#1882 it reports `embedding_dim_migrated == false` (NO
+///    ALTER), so process B's cached plans are untouched.
+///
+/// Pre-#1882 the redeploy would flip 768→384 under process B's warmed pool
+/// and a subset of its reads would return `cached plan must not change
+/// result type`. Post-#1882 all 40 reads succeed and no ALTER ever fires.
+#[tokio::test]
+async fn default_deploy_no_boot_alter_cross_process_1882() {
+    use ai_memory::store::{CallerContext, Filter, MemoryStore};
+
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _public_lock = PublicSchemaLock::acquire()
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    // The daemon's resolved embedder dim for a fresh DEFAULT smart/autonomous
+    // deploy: `NomicEmbedV15` = 768. This is exactly what
+    // `resolve_configured_embedding_dim` returns for that tier (pinned by
+    // the daemon_runtime unit tests) and what the SchemaInit dispatch hands
+    // to `schema-init` as `config_default_dim` when `--embedding-dim` is
+    // omitted.
+    let daemon_default_dim: u32 = 768;
+
+    // ---- Process A: schema-init WITHOUT --embedding-dim ----
+    // Post-#1882 this lands vector(768) from the config-resolved default.
+    // Pre-#1882 it would land vector(384) (hardcoded) → this assert FAILS.
+    let report_a = run_schema_init_default(&url, Some(daemon_default_dim)).await;
+    assert_eq!(
+        report_a["embedding_dim"].as_i64(),
+        Some(768),
+        "#1882: schema-init with no --embedding-dim must provision the \
+         daemon-resolved default dim (768), not the legacy hardcoded 384: {report_a}"
+    );
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "column must be vector(768) after the default-deploy schema-init"
+    );
+
+    // ---- Process B: a SEPARATE serving daemon pool ----
+    // Boots via the #877 auto-migrate entry point at the SAME daemon
+    // default. Because process A already provisioned 768, this is a no-op:
+    // NO boot-time ALTER.
+    let serve = PostgresStore::connect_with_dim_and_timeout_auto_migrate(
+        &url,
+        daemon_default_dim,
+        30,
+        PoolConfig::default(),
+    )
+    .await
+    .expect("serving pool boots at the daemon default dim");
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "serve boot at a matching dim must NOT fire an ALTER"
+    );
+
+    // Warm the serving pool so `SELECT *` (result type includes
+    // vector(768)) is cached across its connections — the plan the #1881
+    // 503 came from invalidating.
+    let ctx = CallerContext::for_agent("issue-1882-test");
+    let filter = Filter {
+        namespace: Some("issue-1882".to_string()),
+        limit: 50,
+        ..Default::default()
+    };
+    for _ in 0..10 {
+        serve
+            .list(&ctx, &filter)
+            .await
+            .expect("warm-up list on the serving pool must succeed");
+    }
+
+    // ---- Process A redeploy: schema-init runs AGAIN ----
+    // The cross-process trigger the #1881 minimal harden could not reach.
+    // Post-#1882 both processes resolve 768, so the re-run is a pure no-op:
+    // `embedding_dim_migrated == false` — NO ALTER — so process B's cached
+    // plans cannot be invalidated.
+    let report_a2 = run_schema_init_default(&url, Some(daemon_default_dim)).await;
+    assert_eq!(
+        report_a2["embedding_dim_migrated"], false,
+        "#1882: a default redeploy must fire NO embedding-dim ALTER: {report_a2}"
+    );
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "redeploy must leave the column at vector(768)"
+    );
+
+    // ---- The cross-process assertion ----
+    // Every `list` on process B's warmed pool must still succeed: no ALTER
+    // happened anywhere, so no cached plan was invalidated across processes.
+    let mut cached_plan_503s = 0;
+    for _ in 0..40 {
+        match serve.list(&ctx, &filter).await {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("cached plan must not change result type"),
+                    "unexpected non-#1882 list failure on the serving pool: {msg}"
+                );
+                cached_plan_503s += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cached_plan_503s, 0,
+        "issue #1882: {cached_plan_503s}/40 serving-pool `list` reads hit the cross-process \
+         `cached plan must not change result type` 503 — a boot-time embedding-dim ALTER \
+         fired on a default deploy that #1882 was meant to eliminate"
     );
 }
 

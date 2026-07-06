@@ -83,6 +83,15 @@ use crate::migrate;
 #[cfg(feature = "sal-postgres")]
 const TRACE_TARGET: &str = "schema_init";
 
+/// \#1882 — fallback embedding column dim for `schema-init` when neither
+/// `--embedding-dim` nor the config-resolved daemon dim yields a value
+/// (the keyword / no-embedder deploy). Mirrors
+/// `crate::store::postgres::DEFAULT_EMBEDDING_DIM` — the daemon's own
+/// `connect_with_dim` keyword fallback — kept as a plain const so this
+/// CLI compiles without the `sal-postgres` feature, and so `schema-init`
+/// and `serve` land the SAME column dim on a keyword default deploy.
+const DEFAULT_SCHEMA_INIT_EMBEDDING_DIM: u32 = 384;
+
 // ---------------------------------------------------------------------------
 // CLI arg surface
 // ---------------------------------------------------------------------------
@@ -102,12 +111,21 @@ pub struct SchemaInitArgs {
     pub json: bool,
     /// Embedding column dimension. Must match the dim of the embedder
     /// the daemon will use (`mini_lm_l6_v2` = 384, `nomic_embed_v15` =
-    /// 768). Default: 384 (matches the v0.7.0 baseline schema and the
-    /// semantic-tier preset).
+    /// 768).
+    ///
+    /// \#1882 — when omitted, the dim is resolved from the SAME
+    /// config-driven source the daemon uses to pick its embedder
+    /// (`resolve_configured_embedding_dim` against the effective tier),
+    /// falling back to `DEFAULT_EMBEDDING_DIM` (384) for the keyword /
+    /// no-embedder case. This makes a fresh default deploy (`schema-init`
+    /// then `serve`, any tier) provision exactly the dim the daemon will
+    /// produce — so no boot-time column ALTER fires and the cross-process
+    /// cached-plan invalidation of #1881/#1882 cannot occur. Pass an
+    /// explicit value only to override the config-resolved default.
     ///
     /// For Postgres targets, a fresh schema is initialised with
     /// `vector(<dim>)` columns directly, and an existing schema whose
-    /// `memories.embedding` column dim differs from `--embedding-dim`
+    /// `memories.embedding` column dim differs from the resolved dim
     /// is converted in place via the v29 helper: HNSW indexes are
     /// dropped + recreated, existing embedding values are NULLed
     /// (cross-dim reprojection isn't well-defined), and the column
@@ -115,8 +133,8 @@ pub struct SchemaInitArgs {
     ///
     /// For SQLite targets the flag is a no-op (SQLite stores
     /// embeddings as opaque BLOBs without a column-level dim).
-    #[arg(long, default_value_t = 384)]
-    pub embedding_dim: u32,
+    #[arg(long, value_name = "DIM")]
+    pub embedding_dim: Option<u32>,
     /// Force a destructive embedding-dim conversion (#1781). Required
     /// to proceed when `--embedding-dim` differs from the live
     /// `memories.embedding` column dim AND the corpus already holds
@@ -203,7 +221,23 @@ pub struct SchemaInitReport {
 /// - Connection / schema-bootstrap failures bubble up from the
 ///   underlying adapter with their original error chain so operators
 ///   can diagnose missing extensions, bad credentials, etc.
-pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
+pub async fn run(
+    args: &SchemaInitArgs,
+    config_default_dim: Option<u32>,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    // #1882 — effective embedding-dim precedence:
+    //   1. explicit `--embedding-dim` flag (operator override),
+    //   2. the daemon's config-resolved dim (`config_default_dim`, the
+    //      SAME source `serve` uses — so a default deploy agrees by
+    //      construction and no boot-time ALTER fires),
+    //   3. `DEFAULT_EMBEDDING_DIM` (384) for the keyword / no-embedder
+    //      case, matching the daemon's `connect_with_dim` keyword arm.
+    let effective_dim: u32 = args
+        .embedding_dim
+        .or(config_default_dim)
+        .unwrap_or(DEFAULT_SCHEMA_INIT_EMBEDDING_DIM);
+
     // Enumerate per-backend. We dispatch on URL scheme rather than
     // on the SAL Capabilities bits because the enumeration queries
     // are inherently backend-specific (sqlite_master vs pg_catalog).
@@ -228,13 +262,12 @@ pub async fn run(args: &SchemaInitArgs, out: &mut CliOutput<'_>) -> Result<()> {
         let mut r = enumerate_sqlite(&args.store_url)?;
         // SQLite has no column-level vector dim — echo the flag
         // value as a metadata hint for downstream tools.
-        r.embedding_dim = Some(i32::try_from(args.embedding_dim).unwrap_or(384));
+        r.embedding_dim = Some(i32::try_from(effective_dim).unwrap_or(384));
         r
     } else if is_postgres_url(&args.store_url) {
         #[cfg(feature = "sal-postgres")]
         {
-            init_and_enumerate_postgres(&args.store_url, args.embedding_dim, args.force_reembed)
-                .await?
+            init_and_enumerate_postgres(&args.store_url, effective_dim, args.force_reembed).await?
         }
         #[cfg(not(feature = "sal-postgres"))]
         {
@@ -720,10 +753,12 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: true,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        run(&args, &mut out).await.expect("schema-init sqlite");
+        run(&args, None, &mut out)
+            .await
+            .expect("schema-init sqlite");
 
         let raw = String::from_utf8(stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
@@ -779,10 +814,12 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: true,
-            embedding_dim: 768,
+            embedding_dim: Some(768),
             force_reembed: false,
         };
-        run(&args, &mut out).await.expect("schema-init sqlite 768");
+        run(&args, None, &mut out)
+            .await
+            .expect("schema-init sqlite 768");
 
         let raw = String::from_utf8(stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
@@ -804,10 +841,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url,
             json: false,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        run(&args, &mut out)
+        run(&args, None, &mut out)
             .await
             .expect("schema-init sqlite human");
         let rendered = String::from_utf8(stdout).unwrap();
@@ -827,10 +864,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: "mysql://user:secret@host/db".to_string(),
             json: false,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        let err = run(&args, &mut out).await.expect_err("must reject");
+        let err = run(&args, None, &mut out).await.expect_err("must reject");
         let msg = err.to_string();
         assert!(msg.contains("unrecognised store URL"), "got: {msg}");
         // #1579 A3 — credential must be redacted in the error.
@@ -871,10 +908,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: true,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        run(&args, &mut out).await.expect("schema-init 384");
+        run(&args, None, &mut out).await.expect("schema-init 384");
         let raw = String::from_utf8(stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
         assert_eq!(v["embedding_dim"].as_i64(), Some(384), "initial dim: {v}");
@@ -886,10 +923,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: true,
-            embedding_dim: 768,
+            embedding_dim: Some(768),
             force_reembed: false,
         };
-        run(&args, &mut out).await.expect("schema-init 768");
+        run(&args, None, &mut out).await.expect("schema-init 768");
         let raw = String::from_utf8(stdout).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
         assert_eq!(
@@ -909,10 +946,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url,
             json: true,
-            embedding_dim: 768,
+            embedding_dim: Some(768),
             force_reembed: false,
         };
-        run(&args, &mut out)
+        run(&args, None, &mut out)
             .await
             .expect("schema-init 768 idempotent");
         let raw = String::from_utf8(stdout).unwrap();
@@ -937,10 +974,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: url.clone(),
             json: false,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        run(&args, &mut out)
+        run(&args, None, &mut out)
             .await
             .expect("schema-init sqlite human");
 
@@ -969,10 +1006,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: "nosql://nope".to_string(),
             json: false,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        let err = run(&args, &mut out).await.expect_err("should reject");
+        let err = run(&args, None, &mut out).await.expect_err("should reject");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("unrecognised store URL"),
@@ -1004,10 +1041,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: "postgres://nobody:nope@127.0.0.1:1/no_db".to_string(),
             json: true,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        let err = run(&args, &mut out)
+        let err = run(&args, None, &mut out)
             .await
             .expect_err("should fail to connect");
         let msg = format!("{err:#}");
@@ -1029,10 +1066,10 @@ mod tests {
         let args = SchemaInitArgs {
             store_url: "postgresql://nobody:nope@127.0.0.1:1/x".to_string(),
             json: false,
-            embedding_dim: 384,
+            embedding_dim: Some(384),
             force_reembed: false,
         };
-        assert!(run(&args, &mut out).await.is_err());
+        assert!(run(&args, None, &mut out).await.is_err());
     }
 
     #[tokio::test]
