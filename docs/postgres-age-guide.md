@@ -204,11 +204,15 @@ What it does (see `src/cli/schema_init.rs`):
    NOT fatal; the JSON report just carries
    `age_projection_created: false` and KG queries use the
    recursive-CTE fallback.
-3. Applies the `--embedding-dim` contract (default 384): a fresh
-   schema is initialised with `vector(<dim>)` columns; an existing
-   schema whose dim differs is converted in place (HNSW indexes
-   dropped + recreated, existing embedding values NULLed — re-embed
-   afterwards; `embedding_dim_migrated: true` in the JSON report).
+3. Applies the `--embedding-dim` contract: when the flag is omitted
+   the dim resolves from the SAME config-driven source the daemon uses
+   for its embedder (the effective tier's embedder dim; 384 for the
+   keyword / no-embedder case), so a default deploy provisions exactly
+   what `serve` will produce (#1882). A fresh schema is initialised with
+   `vector(<dim>)` columns; an existing schema whose dim differs is
+   converted in place (HNSW indexes dropped + recreated, existing
+   embedding values NULLed — re-embed afterwards; `embedding_dim_migrated:
+   true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
    `schema_version: 71`) or the `--json` report.

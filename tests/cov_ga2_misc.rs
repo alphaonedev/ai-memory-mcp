@@ -492,10 +492,12 @@ async fn schema_init_sqlite_enumerates_and_reports() {
     let args = SchemaInitArgs {
         store_url: url.clone(),
         json: true,
-        embedding_dim: 768,
+        embedding_dim: Some(768),
         force_reembed: false,
     };
-    run(&args, &mut out).await.expect("schema-init sqlite run");
+    run(&args, None, &mut out)
+        .await
+        .expect("schema-init sqlite run");
 
     let raw = String::from_utf8(stdout).expect("utf8");
     let v: serde_json::Value = serde_json::from_str(&raw).expect("parseable JSON");
@@ -537,10 +539,10 @@ async fn schema_init_sqlite_human_render() {
     let args = SchemaInitArgs {
         store_url: url,
         json: false,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
-    run(&args, &mut out)
+    run(&args, None, &mut out)
         .await
         .expect("schema-init sqlite human");
 
@@ -569,10 +571,10 @@ async fn schema_init_unrecognised_scheme_bails() {
     let args = SchemaInitArgs {
         store_url: "nosql://nope".to_string(),
         json: false,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
-    let err = run(&args, &mut out).await.expect_err("must reject");
+    let err = run(&args, None, &mut out).await.expect_err("must reject");
     assert!(
         format!("{err:#}").contains("unrecognised store URL"),
         "expected unrecognised-scheme error: {err:#}"
@@ -608,10 +610,10 @@ async fn schema_init_postgres_enumerates_live_catalog() {
     let args = SchemaInitArgs {
         store_url: url.clone(),
         json: true,
-        embedding_dim: 384,
+        embedding_dim: Some(384),
         force_reembed: false,
     };
-    run(&args, &mut out)
+    run(&args, None, &mut out)
         .await
         .expect("schema-init postgres run");
 

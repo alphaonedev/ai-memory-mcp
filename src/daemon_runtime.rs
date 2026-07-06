@@ -1541,7 +1541,18 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            cli::schema_init::run(&a, &mut out).await
+            // #1882 — resolve the default embedding dim from the SAME
+            // config-driven source `serve` uses (`resolve_configured_embedding_dim`
+            // against the effective tier). When the operator omits
+            // `--embedding-dim`, `schema-init` provisions exactly the dim
+            // the daemon will produce, so a fresh default deploy triggers
+            // no boot-time column ALTER (and thus no cross-process
+            // cached-plan invalidation). `None` = keyword / no embedder →
+            // `run` falls back to `DEFAULT_EMBEDDING_DIM`, matching the
+            // daemon's `connect_with_dim` (non-auto-migrate) keyword arm.
+            let tier_config = app_config.effective_tier(None).config();
+            let config_default_dim = resolve_configured_embedding_dim(app_config, &tier_config);
+            cli::schema_init::run(&a, config_default_dim, &mut out).await
         }
         Command::Doctor(a) => {
             // P7 / R7. The doctor is read-only; it never sets
@@ -3233,46 +3244,66 @@ pub struct ServeBootstrap {
 /// [`StorageBackend::Postgres`]: crate::handlers::StorageBackend::Postgres
 /// [`StorageBackend::Sqlite`]: crate::handlers::StorageBackend::Sqlite
 #[cfg(feature = "sal")]
-/// v0.7.x (issue #1169) — resolve the configured embedder dim for the
-/// postgres-schema bootstrap (used by [`build_store_handle`]).
+/// Resolve the dim of the embedder that will ACTUALLY produce vectors —
+/// the single source of truth for both the postgres-schema bootstrap
+/// (via [`build_store_handle`]) and the `schema-init` CLI default
+/// (`cli::schema_init::run`), so the two never disagree on a default
+/// deploy.
 ///
-/// Resolution ladder (first arm wins):
+/// This mirrors [`build_embedder`] / [`crate::embeddings::Embedder::from_resolved`]
+/// EXACTLY, because the schema column dim must match what the live
+/// embedder writes:
 ///
-/// 1. [`crate::config::AppConfig::resolve_embeddings`] returns
-///    `ResolvedEmbeddings.embedding_dim` populated by the canonical
-///    [`crate::config::canonical_embedding_dim`] lookup table when the
-///    operator-picked model id is in [`crate::config::KNOWN_EMBEDDING_DIMS`].
-/// 2. Legacy flat-field path: parse `app_config.embedding_model` as the
-///    2-family [`crate::config::EmbeddingModel`] enum and pull its
-///    compile-time `dim()` (`nomic_embed_v15` / `mini_lm_l6_v2`).
-/// 3. Tier-preset fallback when neither resolver nor legacy parses
-///    yields a dim — the historical pre-#1169 behaviour, retained as
-///    the last-resort default.
+/// - **API backend** ([`crate::config::is_api_embed_backend`]): enablement
+///   is gated on the tier preset (`tier_config.embedding_model` Some/None,
+///   the same gate `build_embedder` applies for API backends), and the
+///   produced vector dim is `resolved.embedding_dim` (the explicit
+///   `[embeddings].dim` override or the [`crate::config::canonical_embedding_dim`]
+///   table — `from_resolved` bails without a known dim). Keyword tier → `None`.
+/// - **Ollama backend** (the only non-API backend): `from_resolved`
+///   constructs from the resolved [`crate::config::EmbeddingModel`] enum
+///   ONLY — the `resolved.model` id is not honored beyond the two
+///   compiled families — so the produced dim is exactly what
+///   [`resolve_embedder_model`] resolves (precedence: `[embeddings].model`
+///   > legacy flat `embedding_model` > tier preset). Keyword tier (no
+///   preset, no constructible model) → `None`.
 ///
-/// Returns `None` only when no embedder is configured at all
-/// (`tier_config.embedding_model.is_none()` AND no operator override) —
-/// i.e. the keyword-only tier. The postgres bootstrap then falls back
-/// to `DEFAULT_EMBEDDING_DIM` per `build_store_handle`'s
-/// `configured_embedding_dim` doc comment.
+/// Returns `None` when no embedder is active (keyword tier / embeddings
+/// disabled). The postgres bootstrap then falls back to
+/// `DEFAULT_EMBEDDING_DIM` (via `build_store_handle`'s
+/// `connect_with_dim` arm — which does NOT auto-migrate), so a keyword
+/// daemon never ALTERs the embedding column.
+///
+/// # \#1882 — root-cause fix
+///
+/// The pre-fix ladder took `resolved.embedding_dim` as its first arm.
+/// That field defaults to `DEFAULT_EMBED_MODEL` (nomic → 768) inside
+/// [`crate::config::AppConfig::resolve_embeddings`] REGARDLESS of tier,
+/// so a fresh semantic (MiniLM/384) or keyword (no-embedder) deploy
+/// resolved the schema to 768 — diverging both from the live embedder's
+/// dim AND from `schema-init`'s hardcoded 384 default. The #877
+/// auto-migrate then fired an `ALTER TABLE ... embedding TYPE vector(N)`
+/// on EVERY boot, and a separately-running `schema-init` re-flipping the
+/// column invalidated a serving daemon's pooled cached plans across
+/// processes → the transient `cached plan must not change result type`
+/// 503 (#1881/#1882). Deriving the dim from the active embedder here
+/// makes `schema-init` and `serve` agree by default, so no boot-time
+/// ALTER fires and the cross-process invalidation is impossible.
 #[cfg(feature = "sal")]
 #[must_use]
-#[allow(deprecated)]
 fn resolve_configured_embedding_dim(
     app_config: &crate::config::AppConfig,
     tier_config: &crate::config::TierConfig,
 ) -> Option<u32> {
-    let preset = tier_config.embedding_model;
     let resolved = app_config.resolve_embeddings();
-    resolved
-        .embedding_dim
-        .or_else(|| {
-            app_config
-                .embedding_model
-                .as_deref()
-                .and_then(|raw| raw.parse::<crate::config::EmbeddingModel>().ok())
-                .map(|m| u32::try_from(m.dim()).unwrap_or(384))
-        })
-        .or_else(|| preset.map(|m| u32::try_from(m.dim()).unwrap_or(384)))
+    if crate::config::is_api_embed_backend(&resolved.backend) {
+        // API backend: gated by the tier preset (Some/None), dim from the
+        // resolver (explicit override or canonical lookup).
+        return tier_config.embedding_model.and(resolved.embedding_dim);
+    }
+    // Ollama backend: the produced dim is whatever `resolve_embedder_model`
+    // — the SAME precedence `build_embedder` loads — resolves to.
+    resolve_embedder_model(tier_config, app_config).map(|m| u32::try_from(m.dim()).unwrap_or(384))
 }
 
 /// v0.7.0 #1548 — resolve the curator's SAL store handle from the same
@@ -8661,12 +8692,21 @@ decision = "allow"
     // The three resolution-ladder arms (resolver, legacy enum, tier preset)
     // are each pinned independently.
 
-    /// v0.7.x (#1169) — operator picks a model that's in
-    /// [`crate::config::KNOWN_EMBEDDING_DIMS`]. The first arm of the
-    /// ladder (resolver) wins and returns the canonical dim.
+    /// \#1882 — an operator who pins a model the daemon CANNOT construct
+    /// on the ollama backend (e.g. `bge-large-en`, a 1024-dim entry in
+    /// [`crate::config::KNOWN_EMBEDDING_DIMS`]) gets the tier-preset dim,
+    /// NOT the table dim. This is the embedder-truthful contract: on the
+    /// ollama backend [`crate::embeddings::Embedder::from_resolved`] only
+    /// constructs from the 2-variant [`crate::config::EmbeddingModel`]
+    /// enum (MiniLM/Nomic) — `bge-large-en` falls through
+    /// [`resolve_embedder_model`] to the Autonomous preset (Nomic, 768),
+    /// which is what the daemon ACTUALLY loads and writes. Provisioning
+    /// the column at the table's 1024 (the pre-#1882 behaviour) would
+    /// mismatch every write. Pins that the schema dim tracks the live
+    /// embedder, not a catalog lookup the ollama path never honors.
     #[cfg(feature = "sal")]
     #[test]
-    fn resolve_configured_embedding_dim_resolver_arm_wins_for_known_model() {
+    fn resolve_configured_embedding_dim_tracks_live_embedder_not_catalog() {
         use crate::config::{AppConfig, EmbeddingsSection, FeatureTier};
 
         let cfg = AppConfig {
@@ -8681,8 +8721,9 @@ decision = "allow"
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
         assert_eq!(
             dim,
-            Some(1024),
-            "bge-large-en is in KNOWN_EMBEDDING_DIMS at 1024-dim; resolver wins"
+            Some(768),
+            "ollama can't construct bge-large-en; the live embedder is the \
+             Autonomous preset (Nomic, 768) — the schema dim must track it"
         );
     }
 
@@ -8729,10 +8770,12 @@ decision = "allow"
         assert_eq!(dim, Some(768));
     }
 
-    /// v0.7.x (#1169) — keyword tier has no embedder; resolver returns
-    /// `None` (and the postgres bootstrap then uses its hardcoded
-    /// `DEFAULT_EMBEDDING_DIM` fallback per the
-    /// `configured_embedding_dim` doc comment on `build_store_handle`).
+    /// \#1882 — keyword tier has no embedder, so the resolver returns
+    /// `None` and the daemon SKIPS the #877 auto-migrate entirely
+    /// (`build_store_handle` takes the `connect_with_dim` arm at
+    /// `DEFAULT_EMBEDDING_DIM`, not the auto-migrate arm). A keyword
+    /// daemon writes zero embeddings, so it must never ALTER the
+    /// embedding column.
     #[cfg(feature = "sal")]
     #[test]
     fn resolve_configured_embedding_dim_returns_none_for_keyword_tier() {
@@ -8741,23 +8784,14 @@ decision = "allow"
         let cfg = AppConfig::default();
         let tier_config = FeatureTier::Keyword.config();
         let dim = resolve_configured_embedding_dim(&cfg, &tier_config);
-        // Keyword tier preset has `embedding_model = None`. The
-        // resolver still returns `Some(768)` from the
-        // canonical-default model id — that's the correct behavior
-        // because the operator can ALWAYS use an embedder regardless
-        // of tier preset; the tier preset only controls reranker /
-        // synthesis primitives. The keyword-tier-disabled-embedder
-        // posture is enforced at the `build_embedder` site, NOT
-        // here. This test pins that subtlety: when the operator's
-        // config has no [embeddings] block AND no legacy flat field
-        // AND the tier preset disables embeddings, the resolver
-        // still defaults to "nomic-embed-text-v1.5" (the wire-side
-        // default at `resolve_embeddings`) — which IS in the table
-        // — so the function returns `Some(768)` even on keyword
-        // tier. The postgres-bootstrap caller treats that as the
-        // configured dim regardless; pre-loading an unused 768-dim
-        // pgvector column is operationally cheap.
-        assert_eq!(dim, Some(768));
+        // Pre-#1882 this returned `Some(768)` because the buggy first
+        // arm read `resolve_embeddings().embedding_dim`, which defaults
+        // to nomic-768 regardless of tier — so a keyword daemon ALTERed
+        // the column to 768 (never writing a single vector) and thrashed
+        // against `schema-init`'s 384 across processes. The embedder-
+        // truthful resolver returns `None`: keyword loads no embedder,
+        // so there is no dim to align and no migrate to run.
+        assert_eq!(dim, None);
     }
 
     /// v0.7.x (#1169) — operator picks a model that's NOT in
