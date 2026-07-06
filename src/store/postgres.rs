@@ -5376,6 +5376,22 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("commit v29 conversion", e))?;
 
+        // #1881 — the `ALTER TABLE ... ALTER COLUMN embedding TYPE
+        // vector(N)` above changes the RESULT TYPE of every prepared plan
+        // that selects the embedding column (notably the `list` path's
+        // `SELECT * FROM memories`). Any pooled connection that had already
+        // cached such a plan now holds a stale one: re-executing it fails at
+        // the server with `cached plan must not change result type`, which
+        // surfaced on the live DO PG16 GA round as a transient
+        // `503 postgres: list: ...` on `GET /api/v1/memories` that alternated
+        // 200/503 across pool connections until they naturally recycled.
+        // Evict every pooled connection's client+server statement cache here,
+        // right after the DDL, so no connection can serve a stale plan. This
+        // runs ONLY on the real-conversion path — the no-op (dim already
+        // matches) and refuse-without-force paths return above, before the
+        // ALTER, so the happy path pays nothing.
+        self.discard_pool_cached_plans().await;
+
         tracing::warn!(
             target: TRACE_TARGET,
             target_dim = target_i32,
@@ -5383,6 +5399,68 @@ impl PostgresStore {
         );
 
         Ok(true)
+    }
+
+    /// #1881 — evict the prepared-statement cache on every pooled connection
+    /// after an embedding-column type `ALTER`, so no connection serves a plan
+    /// whose result type (the `vector(N)` embedding column) changed underneath
+    /// it. Uses sqlx's own [`sqlx::Connection::clear_cached_statements`], which
+    /// drops the client-side handles and `DEALLOCATE`s them server-side.
+    ///
+    /// We check out EVERY open connection (via `acquire`, so a connection
+    /// still settling back into the pool after this migrate's own queries is
+    /// waited for rather than skipped — a plain `try_acquire` sweep misses it
+    /// and leaves one connection serving a stale plan, which shows up as the
+    /// classic "alternating 200/503 across pool connections" symptom). We hold
+    /// them all simultaneously while clearing, so a just-cleared connection
+    /// cannot be handed back out and re-grabbed in place of one we have not
+    /// cleared yet. Connections opened after this returns are born fresh and
+    /// prepare post-`ALTER` plans on first use. Called on the
+    /// destructive-migrate path only (see [`Self::migrate_embedding_dim`]),
+    /// which at daemon boot has no concurrent readers, so acquiring
+    /// `pool.size()` connections deterministically reaches every open one
+    /// without forcing new connections above the current open count.
+    async fn discard_pool_cached_plans(&self) {
+        use sqlx::Connection as _;
+        // `size()` counts every open connection (idle OR checked-out /
+        // settling); clamp to the pool ceiling as a belt-and-suspenders
+        // bound so we never spin trying to open beyond `max_connections`.
+        let target = self
+            .pool
+            .size()
+            .min(self.pool.options().get_max_connections());
+        let mut held = Vec::new();
+        for _ in 0..target {
+            match self.pool.acquire().await {
+                Ok(conn) => held.push(conn),
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        error = %e,
+                        "issue #1881: could not acquire a pooled connection to clear its \
+                         cached plans after the embedding-dim ALTER; some connections may \
+                         briefly return `cached plan must not change result type` until they recycle"
+                    );
+                    break;
+                }
+            }
+        }
+        // Second pass: sweep any connection that became idle while we were
+        // clearing (e.g. one that finished settling after the size() read).
+        while let Some(conn) = self.pool.try_acquire() {
+            held.push(conn);
+        }
+        for conn in &mut held {
+            if let Err(e) = conn.clear_cached_statements().await {
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    error = %e,
+                    "issue #1881: clear_cached_statements failed on a pooled connection \
+                     after the embedding-dim ALTER; that connection may briefly return \
+                     `cached plan must not change result type` until it recycles"
+                );
+            }
+        }
     }
 
     /// v0.7.0 H2 — Add `attest_level` TEXT column to `memory_links`.

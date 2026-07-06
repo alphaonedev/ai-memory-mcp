@@ -306,6 +306,133 @@ async fn http_write_path_accepts_768_after_auto_migrate() {
     );
 }
 
+/// Issue #1881 (v0.9.0 tag-gate minimal harden) — after the #877
+/// embedding-dim auto-migrate runs its in-place `ALTER TABLE ... ALTER
+/// COLUMN embedding TYPE vector(N)`, the SAME sqlx pool must keep
+/// serving `list` (and any read whose prepared plan selects the
+/// embedding column) WITHOUT the transient
+/// `cached plan must not change result type` 503 that the live DO PG16
+/// GA round surfaced.
+///
+/// Root cause: the `list` path prepares `SELECT * FROM memories ...`,
+/// whose cached result type includes the `vector(384)` embedding
+/// column. The dim ALTER (384→768) changes that result type, so any
+/// pooled connection still holding the pre-ALTER plan fails at the
+/// server on its next `list` — alternating 200/503 across pool
+/// connections until they recycle. The fix
+/// ([`PostgresStore::discard_pool_cached_plans`], invoked at the tail of
+/// `migrate_embedding_dim`) evicts every pooled connection's
+/// prepared-statement cache immediately after the DDL commits.
+///
+/// This is the production-faithful reproduction: warm the serving pool
+/// by running `list` at dim=384 (caching the `SELECT *` plan across the
+/// pool's connections), migrate the embedding column in place to 768 on
+/// that SAME pool, then hammer `list` again. PRE-FIX this asserts fails
+/// with the cached-plan 503 (empirically ~1-in-3 to persistent across
+/// the 40 iterations); POST-FIX all 40 reads return rows cleanly.
+#[tokio::test]
+async fn list_survives_embedding_dim_alter_without_cached_plan_503_1881() {
+    use ai_memory::models::Memory;
+    use ai_memory::store::{CallerContext, Filter, MemoryStore};
+    use chrono::Utc;
+
+    let Some(url) = postgres_url() else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let _public_lock = PublicSchemaLock::acquire()
+        .expect("PublicSchemaLock requires AI_MEMORY_TEST_POSTGRES_URL (already checked above)");
+
+    let inspect = inspection_pool(&url).await;
+    reset_schema(&inspect).await;
+
+    // Bootstrap at the legacy MiniLM dim (384) and seed a handful of
+    // rows WITH 384-dim embeddings so `list` returns a non-empty result
+    // set whose `SELECT *` plan genuinely binds the `vector(384)` column.
+    let store = PostgresStore::connect_with_dim(&url, 384)
+        .await
+        .expect("connect at dim=384");
+    assert_eq!(current_dim(&inspect).await, Some(384), "bootstrap at 384");
+
+    let ctx = CallerContext::for_agent("issue-1881-test");
+    for i in 0..5 {
+        let now = Utc::now().to_rfc3339();
+        let mem = Memory {
+            id: format!("issue-1881-{i}"),
+            namespace: "issue-1881".to_string(),
+            title: format!("row {i}"),
+            content: "cached-plan regression fixture".to_string(),
+            tags: vec!["issue-1881".to_string()],
+            source: "test".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: serde_json::json!({"agent_id":"issue-1881-test","scope":"shared"}),
+            ..Default::default()
+        };
+        let embedding: Vec<f32> = vec![0.1_f32; 384];
+        store
+            .store_with_embedding(&ctx, &mem, Some(&embedding))
+            .await
+            .expect("seed 384-dim row");
+    }
+
+    // Warm the serving pool: run `list` repeatedly so the `SELECT *`
+    // prepared plan (result type includes `vector(384)`) is cached across
+    // the pool's connections — exactly what a live daemon does while
+    // serving `GET /api/v1/memories` before the boot-time auto-migrate.
+    let filter = Filter {
+        namespace: Some("issue-1881".to_string()),
+        limit: 50,
+        ..Default::default()
+    };
+    for _ in 0..10 {
+        store
+            .list(&ctx, &filter)
+            .await
+            .expect("warm-up list at dim=384 must succeed");
+    }
+
+    // The #877 in-place dim migrate (384→768) on the SAME warmed pool.
+    // `force = true` mirrors the daemon auto-migrate opt-in. This is the
+    // DDL whose column-type change invalidates the cached `SELECT *`
+    // plans; the fix must evict them here.
+    let converted = store
+        .migrate_embedding_dim(768, true)
+        .await
+        .expect("in-place embedding-dim migrate to 768");
+    assert!(converted, "a real 384→768 conversion returns Ok(true)");
+    assert_eq!(
+        current_dim(&inspect).await,
+        Some(768),
+        "column must be vector(768) after the migrate"
+    );
+
+    // The regression assertion: every `list` on the post-ALTER pool must
+    // succeed. Pre-fix, a subset (the connections holding stale plans)
+    // returns `cached plan must not change result type`; post-fix, the
+    // cache eviction guarantees all reads re-plan against vector(768).
+    let mut cached_plan_503s = 0;
+    for _ in 0..40 {
+        match store.list(&ctx, &filter).await {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("cached plan must not change result type"),
+                    "unexpected non-#1881 list failure after dim migrate: {msg}"
+                );
+                cached_plan_503s += 1;
+            }
+        }
+    }
+    assert_eq!(
+        cached_plan_503s, 0,
+        "issue #1881: {cached_plan_503s}/40 `list` reads on the post-ALTER pool returned \
+         `cached plan must not change result type` — the pool's cached plans were not \
+         evicted after the embedding-dim auto-migrate"
+    );
+}
+
 /// Issue #1781 — refuse-destructive-by-default guard on
 /// `migrate_embedding_dim`. With stored embeddings present, a real
 /// dim conversion REFUSES (typed `InvalidInput`) without `force` and
