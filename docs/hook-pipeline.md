@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# Hook pipeline (Track G — 25 lifecycle events)
+# Hook pipeline (Track G — 27 lifecycle events)
 
 v0.7.0 ships a programmable extension surface that fires on every
 substrate lifecycle point. Hooks return one of `Allow`,
@@ -42,7 +42,7 @@ fail_mode = "open"       # open (default) | closed
 
 Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
 
-- **`event`** — one of the 25 events below.
+- **`event`** — one of the 27 events below.
 - **`command`** — absolute path to the helper binary.
 - **`priority`** — higher fires first; first `Deny` short-circuits the chain.
 - **`timeout_ms`** — wall-clock budget per call; capped at
@@ -65,7 +65,7 @@ Fields ([`src/hooks/config.rs:174-190`](../src/hooks/config.rs)):
   control) where silent fail-open is worse than a hard refusal.
   Defined at [`src/hooks/config.rs:111-122`](../src/hooks/config.rs).
 
-## 25-event matrix
+## 27-event matrix
 
 The 20 baseline events:
 
@@ -90,6 +90,13 @@ The 5 grand-slam additions:
 | `pre_recall_expand` | G10 | **HotPath** | query-expansion synthesise step |
 | `pre_reflect` / `post_reflect` | Recursive-learning Task 6/8 | Write | `memory_reflect` |
 | `pre_compaction` / `on_compaction_rollback` | L1-7 | Write | curator compaction pipeline |
+
+The 2 v0.8.0 Pillar-1 additions:
+
+| Event | Track | Class | Fires on |
+|---|---|---|---|
+| `pre_signal_send` | v0.8.0 #1709 | Write | before a signed coordination signal (`memory_signal_send`) is persisted |
+| `post_signal_ack` | v0.8.0 #1709 | Write (notify-only) | after a coordination signal is acknowledged (`memory_signal_ack`) |
 
 The discriminator strings (snake_case of the variant names via
 `#[serde(rename_all = "snake_case")]`) and the `HookEvent` enum live at
@@ -243,7 +250,7 @@ Pinned by [`tests/hooks_executor_test.rs`](../tests/hooks_executor_test.rs),
    hook count). The capabilities `hooks` block
    (`memory_capabilities` over MCP, e.g.
    `printf '<JSON-RPC tools/call>' | ai-memory mcp --profile full`)
-   reports `hook_events_count` (25) and `registered_count` — it does
+   reports `hook_events_count` (27) and `registered_count` — it does
    not enumerate per-event hook rows.
 
 ## Tuning guidance

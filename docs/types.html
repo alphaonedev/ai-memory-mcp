@@ -258,7 +258,7 @@ footer a{color:var(--text-muted)}
     <span class="pill">5 enums</span>
     <span class="pill">22 structs</span>
     <span class="pill">5 consts</span>
-    <span class="pill">v0.8.0 — Memory 27 fields / MemoryLink 9 relations</span>
+    <span class="pill">v0.9.0 — Memory 28 fields / MemoryLink 9 relations</span>
   </div>
 </section>
 
@@ -320,9 +320,9 @@ Tier::from_str(&amp;str) -&gt; Option&lt;Tier&gt;</div>
     </div>
 
     <div class="ty k-struct" id="memory">
-      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · grew to 27 fields at v0.8.0</span></div>
+      <div class="ty-head"><span class="ty-name">Memory</span><span class="ty-kind struct">struct</span><span class="ty-since">since v0.1 · grew to 28 fields at v0.9.0</span></div>
       <div class="ty-derive"><code>#[derive(Debug, Clone, Serialize, Deserialize)]</code></div>
-      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>27 fields at v0.8.0</strong> (26 at v0.7.0, was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs::Memory</code>, <code>FIELD_COUNT = 27</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45), and <code>lifecycle_state</code> (v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64).</div>
+      <div class="ty-desc">The stored record returned by HTTP <code>GET /memories/:id</code> and MCP <code>memory_get</code>. Persisted into the <code>memories</code> table; mirrored to FTS5 + HNSW vector index. <strong>28 fields at v0.9.0</strong> (27 at v0.8.0, 26 at v0.7.0, was 15 at v0.6.x; canonical truth in <code>src/models/memory.rs::Memory</code>, <code>FIELD_COUNT = 28</code>) — adds <code>reflection_depth</code> (Task 1/8 recursive learning), <code>memory_kind</code> (Batman Form-6 vocabulary), <code>entity_id</code> + <code>persona_version</code> (QW-2 persona artefact), <code>citations</code> + <code>source_uri</code> + <code>source_span</code> (Form-4 fact provenance), <code>confidence_source</code> + <code>confidence_signals</code> + <code>confidence_decayed_at</code> (Form-5 calibration), the <code>version</code> BIGINT (Gap-1 optimistic concurrency, schema v45), <code>lifecycle_state</code> (v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64), and <code>cid</code> (v0.9.0 G8 #1825 additive BLAKE3 content-id, schema v74).</div>
       <table class="fld"><thead><tr><th>field</th><th>type</th><th>notes</th></tr></thead><tbody>
         <tr><td class="fname">id</td><td class="ftype">String</td><td class="fnote"><span class="flag req">REQ</span>UUIDv4 primary key.</td></tr>
         <tr><td class="fname">tier</td><td class="ftype">Tier</td><td class="fnote"><span class="flag req">REQ</span>One of <code>short</code> · <code>mid</code> · <code>long</code>.</td></tr>

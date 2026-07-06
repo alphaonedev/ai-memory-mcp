@@ -115,8 +115,8 @@ the host config.
 **Schema-drift detection.** From v0.6.3.1, boot also surfaces a
 `# ai-memory boot: warn` header when the DB's `schema_version` lies
 outside the binary's supported range. The canonical
-schema is **v71** (verified via `CURRENT_SCHEMA_VERSION` in
-`src/storage/migrations.rs`); an older DB is brought up to v71
+schema is **v78** (verified via `CURRENT_SCHEMA_VERSION` in
+`src/storage/migrations.rs`); an older DB is brought up to v78
 via the in-process migration ladder applied on first daemon start. An agent or
 human running an older `ai-memory` binary against a newer DB (or
 vice versa) sees the drift directly in their session log instead of
@@ -133,8 +133,8 @@ no black-box behaviour:
 
 ```text
 # ai-memory boot: ok
-#   version:    0.8.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v71, 161 memories)
+#   version:    0.8.1
+#   db:         /home/u/.claude/ai-memory.db (schema=v78, 161 memories)
 #   tier:       autonomous (embedder=nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=xai:grok-4.3)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp (loaded 10 memories)

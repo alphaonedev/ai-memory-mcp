@@ -373,7 +373,7 @@ ai-memory schema-init --store-url postgres://aimemory:PWD@hub.dc1.internal:5432/
 ```
 
 Opening the store runs the idempotent `postgres_schema.sql` bootstrap
-plus the in-process upgrade ladder to schema v71 as a side effect. The
+plus the in-process upgrade ladder to schema v78 as a side effect. The
 `vector` (pgvector) extension is required (its absence aborts the
 bootstrap); `age` is opt-in — when installed, the verb additionally
 creates the AGE graph `memory_graph` via the idempotent
@@ -1069,7 +1069,7 @@ Concurrent writes from different agents are merged via the substrate's
 CRDT-lite vector-clock merge (`src/federation/vector_clock.rs`). The
 v0.7.0 schema also carries a `version` column on the Memory struct
 (schema v45, Gap-1 optimistic concurrency for `memory_update`; field
-26 of the 27-field struct, `CLAUDE.md §"Data Model"`).
+26 of the current 28-field struct, `CLAUDE.md §"Data Model"`).
 
 For the swarm topology:
 

@@ -968,14 +968,16 @@ router in `src/lib.rs`.
 | `POST` | `/api/v1/memory_smart_load`, `/api/v1/memory_reflect`, `/api/v1/memory_recall_observations`, `/api/v1/memory_reflection_origin`, `/api/v1/memory_dependents_of_invalidated`, `/api/v1/memory_export_reflection`, `/api/v1/memory_atomise`, `/api/v1/memory_calibrate_confidence`, `/api/v1/memory_verify`, `/api/v1/memory_replay`, `/api/v1/memory_subscription_replay`, `/api/v1/memory_subscription_dlq_list`, `/api/v1/memory_rule_list`, `/api/v1/memory_check_agent_action` | #1111 — 14 thin HTTP wrappers around the same-named MCP substrate handlers (`src/handlers/route_1111.rs`); wire envelopes are byte-equal across MCP and HTTP. |
 | `GET`  | `/api/v1/tools/list` | MCP `tools/list` mirror for harness ops — returns the live tool surface for the daemon's profile (101 at `full`, 7 at `core`) — SSOT: `Profile::full()/core().expected_tool_count()` in `src/profile.rs`. |
 
-> Total HTTP surface at v0.8.0: **78 unique URL paths** / 91 production
+> Total HTTP surface: **78 unique URL paths** / 92 production
 > route registrations on the sqlite-backed daemon (and the
 > postgres-backed daemon under `--features sal-postgres`).
 > Authoritative count:
-> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 77
-> (76 `/api/v1/*` paths + the bare `/metrics`), pinned by
+> `grep -oE '"/[^"]*"' src/handlers/routes.rs | sort -u | wc -l` = 78
+> (77 `/api/v1/*` paths + the bare `/metrics`), pinned by
 > `EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT` in `src/lib.rs`. The two
-> v0.8.0 net-new paths are the #1718 coordination write surfaces below.
+> v0.8.0 net-new paths were the #1718 coordination write surfaces below;
+> the v0.9.0 #1859 G13-mem lineage read surface (`GET
+> /api/v1/memories/{id}/lineage`) added the 78th unique path.
 
 ### v0.8.0 net-new endpoints
 
@@ -1005,7 +1007,7 @@ Highlights for HTTP-equivalent surfaces:
 | `memory_pending_list` / `memory_pending_approve` / `memory_pending_reject` | `GET /api/v1/pending`, `POST /api/v1/pending/{id}/approve`, `POST /api/v1/pending/{id}/reject` | K10. The MCP tool names changed from the v0.7-alpha drafts (`memory_approval_pending` / `memory_approval_decide`); the HTTP paths are stable. |
 | `memory_agent_register` / `memory_agent_list` | `POST /api/v1/agents`, `GET /api/v1/agents` | `meta` family. Register an NHI agent (`agent_type`, `capabilities`) in `_agents` (refreshes `last_seen_at`, preserves `registered_at`) and list every registered agent (ordered by `registered_at`). `agent_id` is CLAIMED, not attested — pair with attestation (#626 Layer-3) for a security boundary. |
 
-For the canonical full inventory (100 entries advertised at `--profile full` at v0.8.0 — 99 callable + the always-on `memory_capabilities`): `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 100 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth. The v0.8.0 net-new tools are the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
+For the canonical full inventory (101 entries advertised at `--profile full` — 100 callable + the always-on `memory_capabilities`): `grep -oE 'crate::mcp::[a-z_]+::[A-Za-z]+Tool' src/mcp/registry.rs | sort -u | wc -l` returns 101 — the `registered_tools()` iterator in `src/mcp/registry.rs` is the source of truth. The v0.8.0 net-new tools were the coordination families `memory_action_*`, `memory_lease_*`, `memory_signal_*`, `memory_checkpoint_*`, and `memory_routine_*`.
 
 ## See also
 
