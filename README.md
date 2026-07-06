@@ -15,7 +15,7 @@
 [![Test Hub](https://img.shields.io/badge/test--hub-live_results-6ee7ff?logo=githubpages)](https://alphaonedev.github.io/ai-memory-test-hub/)
 [![Discovery Gate](https://img.shields.io/badge/discovery--gate-6%2F6_PASS_%E2%80%A2_GATE_GREEN-2ea043?logo=githubpages)](https://alphaonedev.github.io/ai-memory-discovery-gate/)
 [![v0.6.4 Cert](https://img.shields.io/badge/v0.6.4_cert-CERT_GREEN-2ea043?logo=githubpages)](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md)
-[![MCP](https://img.shields.io/badge/MCP-7_default_%E2%80%A2_100_full-blueviolet)]()
+[![MCP](https://img.shields.io/badge/MCP-7_default_%E2%80%A2_101_full-blueviolet)]()
 [![NSA CSI](https://img.shields.io/badge/NSA_CSI_MCP-10%2F10_concerns_%E2%80%A2_7%2F7_recs-2ea043)](https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html)
 [![Evidence v0.6.4](https://img.shields.io/badge/claims-frozen_v0.6.4-c8a2ff)](https://alphaonedev.github.io/ai-memory-mcp/evidence.html)
 [![Evidence v0.7.0](https://img.shields.io/badge/claims-frozen_v0.7.0-7e57c2)](docs/v0.7.0/release-notes.md)
@@ -123,8 +123,8 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 
 **One binary, four operational modes** (v0.6.4). The `ai-memory` Rust binary (tokio + axum) can run any of these in isolation or simultaneously, sharing a single SQLite database:
 
-1. **stdio MCP server** -- 100 advertised entries over JSON-RPC at full profile (v0.8.0; 99 callable memory tools + the always-on `memory_capabilities` bootstrap; verified against `Profile::full().expected_tool_count()`). Default `--profile core` advertises 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. `ai-memory mcp` / `ai-memory mcp --profile full`
-2. **HTTP / mTLS daemon** -- 91 REST route registrations (78 unique URL paths) on `127.0.0.1:9077`, TLS + optional mTLS allowlist + API-key auth, background GC loop. `ai-memory serve`
+1. **stdio MCP server** -- 101 advertised entries over JSON-RPC at full profile (v0.8.0; 100 callable memory tools + the always-on `memory_capabilities` bootstrap; verified against `Profile::full().expected_tool_count()`). Default `--profile core` advertises 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. `ai-memory mcp` / `ai-memory mcp --profile full`
+2. **HTTP / mTLS daemon** -- 92 REST route registrations (78 unique URL paths) on `127.0.0.1:9077`, TLS + optional mTLS allowlist + API-key auth, background GC loop. `ai-memory serve`
 3. **Autonomous curator daemon** -- self-scheduling loop (default 1h cadence) that auto-tags, surfaces contradictions across namespace siblings, consolidates near-duplicates, and adjusts priority by access pattern. Every action goes to a rollback log; destructive ops can be gated behind a governance approval flow. `ai-memory curator --daemon`
 4. **Sync daemon** -- quorum-based peer federation across instances. W-of-N writes (default majority), vector-clock CRDT-lite merge, mTLS allowlist between peers. `ai-memory sync-daemon`
 
@@ -187,7 +187,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (91 route registrations / 78 unique URL paths on localhost at v0.7.0) and the **CLI** (85 subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`; 83 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (92 route registrations / 78 unique URL paths on localhost) and the **CLI** (89 subcommands under `--features sal` OR `--features sal-postgres`; 87 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -571,14 +571,14 @@ For HTTP-only clients, start the REST API:
 
 ```bash
 ai-memory serve
-# 91 REST route registrations (78 unique URL paths) at http://127.0.0.1:9077/api/v1/
+# 92 REST route registrations (78 unique URL paths) at http://127.0.0.1:9077/api/v1/
 ```
 
 </details>
 
 **Step 4: Done. Test it.**
 
-Restart your AI assistant. If using MCP, it now has the **7-tool default surface** advertised on session boot (the original 5 + `memory_load_family` + `memory_smart_load`; the other 92 of the 99 callable tools load on demand via `--profile` or `memory_capabilities --include-schema`). Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
+Restart your AI assistant. If using MCP, it now has the **7-tool default surface** advertised on session boot (the original 5 + `memory_load_family` + `memory_smart_load`; the other 93 of the 100 callable tools load on demand via `--profile` or `memory_capabilities --include-schema`). Ask it: "Store a memory that my favorite language is Rust." Then in a new conversation, ask: "What is my favorite language?" It will remember.
 
 ---
 
@@ -646,7 +646,7 @@ ai-memory recall "database"
 ai-memory stats
 ```
 
-**6. Use with your AI.** Restart your AI client. It now has **7 default memory tools** advertised on boot (100 advertised entries reachable via runtime expansion or `--profile full` at v0.8.0) over MCP -- it can store and recall memories natively during conversations.
+**6. Use with your AI.** Restart your AI client. It now has **7 default memory tools** advertised on boot (101 advertised entries reachable via runtime expansion or `--profile full`) over MCP -- it can store and recall memories natively during conversations.
 
 ---
 
@@ -689,14 +689,14 @@ It runs as an MCP (Model Context Protocol) tool server -- a background process t
 
 Memories that keep getting accessed automatically promote from mid to long-term. Each recall extends the TTL. Priority increases with usage. The system is self-curating.
 
-Beyond MCP, ai-memory also exposes a full HTTP REST API (91 route registrations / 78 unique URL paths on port 9077 at v0.7.0) and a complete CLI (85 subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`; 83 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) for direct interaction, scripting, and integration with any AI platform or tool.
+Beyond MCP, ai-memory also exposes a full HTTP REST API (92 route registrations / 78 unique URL paths on port 9077) and a complete CLI (89 subcommands under `--features sal` OR `--features sal-postgres`; 87 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_{DEFAULT,SAL}` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) for direct interaction, scripting, and integration with any AI platform or tool.
 
 ---
 
 ## Features
 
 ### Core
-- **MCP tool server** -- 100 tools over stdio JSON-RPC (full profile at v0.8.0), compatible with any MCP client
+- **MCP tool server** -- 101 tools over stdio JSON-RPC (full profile), compatible with any MCP client
 - **Three-tier memory** -- short (6h TTL default), mid (7d TTL default), long (permanent) -- TTLs are configurable
 - **Full-text search** -- SQLite FTS5 with ranked retrieval
 - **Hybrid recall** -- FTS5 keyword + cosine similarity with adaptive blending: the semantic weight varies 0.50 (short content) → 0.15 (long content) because embeddings lose information on long text
@@ -720,9 +720,9 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (91 route registrations 
 - **Tagging** -- comma-separated tags with filter support
 
 ### Interfaces
-- **91 HTTP routes (77 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **85 CLI subcommands at v0.7.x under `--features sal` OR `--features sal-postgres`** (83 in the default build) -- complete CLI with identical capabilities
-- **100 MCP tools** at full profile (7 default at v0.8.0; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
+- **92 HTTP routes (78 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
+- **89 CLI subcommands under `--features sal` OR `--features sal-postgres`** (87 in the default build) -- complete CLI with identical capabilities
+- **101 MCP tools** at full profile (7 default; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
 - **Distributed coordination (v0.8.0 Pillar-1 + Pillar-2)** -- action DAG (`memory_action_*`), single-holder leases (`memory_lease_*`), Ed25519-signed signals (`memory_signal_*`), attested checkpoints (`memory_checkpoint_*`), parameterised routines (`memory_routine_*`), and the Goal/Plan/Step typed-cognition lifecycle. See [`docs/coordination.md`](docs/coordination.md).
@@ -821,7 +821,7 @@ Substrate is unchanged across v0.6.3.x → v0.6.4 (the `quiet-tools` release shi
 
 ### MCP (Primary -- for MCP-compatible AI platforms)
 
-MCP is the recommended integration. Your AI gets **7 native memory tools advertised by default** at v0.8.0 (the original 5 + `memory_load_family` + `memory_smart_load`; plus the always-on `memory_capabilities` bootstrap) with zero glue code. The other 92 callable tools (100 advertised entries at v0.8.0 — verified against `Profile::full().expected_tool_count()` and pinned by `const_count_matches_full_profile` in `src/mcp/registry.rs`) remain reachable via `--profile graph|admin|power|full` or runtime expansion through `memory_capabilities --include-schema family=<name>`. Configure the MCP server in your AI platform's config:
+MCP is the recommended integration. Your AI gets **7 native memory tools advertised by default** (the original 5 + `memory_load_family` + `memory_smart_load`; plus the always-on `memory_capabilities` bootstrap) with zero glue code. The other 93 callable tools (101 advertised entries — verified against `Profile::full().expected_tool_count()` and pinned by `const_count_matches_full_profile` in `src/mcp/registry.rs`) remain reachable via `--profile graph|admin|power|full` or runtime expansion through `memory_capabilities --include-schema family=<name>`. Configure the MCP server in your AI platform's config:
 
 ```json
 {
@@ -840,7 +840,7 @@ Start the HTTP server for REST API access. Any AI, script, or automation that ca
 
 ```bash
 ai-memory serve
-# 91 REST route registrations (78 unique URL paths) at http://127.0.0.1:9077/api/v1/
+# 92 REST route registrations (78 unique URL paths) at http://127.0.0.1:9077/api/v1/
 ```
 
 ### CLI (Universal -- for scripting and direct use)
@@ -861,10 +861,10 @@ ai-memory supports 4 feature tiers, selected at startup with `ai-memory mcp --ti
 
 | Tier | Recall Method | Extra Capabilities | Approx. Overhead |
 |------|---------------|-------------------|-----------------|
-| **keyword** | FTS5 only | Baseline 100-entry surface (v0.8.0) — tier gates models/features, NOT the advertised tool surface | 0 MB |
-| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index, semantic tier (subset of 100-entry surface (v0.8.0)) | ~256 MB |
-| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 100-entry surface (v0.8.0). LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
-| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, full 100-entry surface (v0.8.0). Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
+| **keyword** | FTS5 only | Baseline 101-entry surface — tier gates models/features, NOT the advertised tool surface | 0 MB |
+| **semantic** | FTS5 + cosine similarity (hybrid) | MiniLM-L6-v2 embeddings (384-dim), HNSW index, semantic tier (subset of 101-entry surface) | ~256 MB |
+| **smart** | Hybrid + LLM query expansion | + nomic-embed-text (768-dim) + LLM-backed `memory_expand_query`, `memory_auto_tag`, `memory_detect_contradiction`, full 101-entry surface. LLM provider is operator-selected via `AI_MEMORY_LLM_BACKEND` ([#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) — local Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, or llama.cpp. | ~1 GB (local Ollama) / ~0 GB (remote API) |
+| **autonomous** | Hybrid + LLM expansion + cross-encoder reranking | + neural cross-encoder (ms-marco-MiniLM), memory reflection, full 101-entry surface. Same LLM-provider freedom as smart tier. | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder only) |
 
 ### Capability Matrix
 
@@ -893,13 +893,13 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | **Resources** | | | | |
 | RAM | 0 MB | ~256 MB | ~1 GB | ~4 GB |
 | External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
-| MCP tools exposed (at `--profile full`) [^tools] | 100 | 100 | 100 | 100 |
+| MCP tools exposed (at `--profile full`) [^tools] | 101 | 101 | 101 | 101 |
 
-[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 100 tools at `--profile full` (the default `--profile core` advertises 7 at boot regardless of tier; the other 92 load on demand). What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
+[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 101 tools at `--profile full` (the default `--profile core` advertises 7 at boot regardless of tier; the other 94 load on demand). What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
 
 **Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
-**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier (full 100-entry surface (v0.8.0) + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
+**Tiers gate features, not models — and post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0), tiers gate features, not vendors either.** The `--tier` flag controls which tools are exposed. The LLM backend + model are independently configurable via `AI_MEMORY_LLM_BACKEND` + `AI_MEMORY_LLM_MODEL` env vars (or via the canonical `[llm]` section in `~/.config/ai-memory/config.toml` — see [docs/CONFIG_SCHEMA.md](docs/CONFIG_SCHEMA.md) for the v0.7.x enterprise schema and the migration tool). For example, run autonomous tier (full 101-entry surface + reranker) against xAI Grok 4 via the OpenAI-compatible alias:
 
 ```bash
 # Quick path: env vars
@@ -954,7 +954,7 @@ The `memory_capabilities` tool reports the active tier, loaded models, and avail
 
 ## MCP Tools
 
-These 100 tools (full profile at v0.8.0; canonical count via `Profile::full().expected_tool_count()` in [`src/profile.rs`](src/profile.rs)) are available to any MCP-compatible AI when configured as an MCP server (the v0.6.4-frozen evidence page lists the 63-tool baseline; the table below documents the core subset most clients use day-to-day):
+These 101 tools (full profile; canonical count via `Profile::full().expected_tool_count()` in [`src/profile.rs`](src/profile.rs)) are available to any MCP-compatible AI when configured as an MCP server (the v0.6.4-frozen evidence page lists the 63-tool baseline; the table below documents the core subset most clients use day-to-day):
 
 | Tool | Description |
 |------|-------------|
@@ -984,7 +984,7 @@ These 100 tools (full profile at v0.8.0; canonical count via `Profile::full().ex
 
 ## HTTP API
 
-91 route registrations / 78 unique URL paths on `127.0.0.1:9077` at v0.8.0. Start with `ai-memory serve`. The table below shows the most commonly used REST endpoints; see [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for the full surface (governance, federation, subscriptions, knowledge-graph, quotas, approvals SSE).
+92 route registrations / 78 unique URL paths on `127.0.0.1:9077`. Start with `ai-memory serve`. The table below shows the most commonly used REST endpoints; see [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) for the full surface (governance, federation, subscriptions, knowledge-graph, quotas, approvals SSE).
 
 > **Security:** The HTTP server binds to 127.0.0.1 and ships with no authentication configured by default, plus permissive CORS. Set `api_key` in `config.toml` to require the `x-api-key` header on every request (the legacy `?api_key=` query-param form is deprecated at v0.7.0 — #1574), and set `AI_MEMORY_REQUIRE_API_KEY=1` to hard-refuse keyless startup (#1458). Do not expose to the network without authentication (and prefer TLS via `--tls-cert`/`--tls-key` or a reverse proxy).
 
@@ -1019,7 +1019,7 @@ These 100 tools (full profile at v0.8.0; canonical count via `Profile::full().ex
 
 ## CLI Commands
 
-85 top-level subcommands at v0.8.0 under `--features sal` OR `--features sal-postgres` (83 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
+89 top-level subcommands under `--features sal` OR `--features sal-postgres` (87 in the default build; the 2-variant gap is `Migrate` + `SchemaInit`, both gated `#[cfg(feature = "sal")]` per `src/daemon_runtime.rs::Command::{Migrate,SchemaInit}`; was 40 at v0.6.4). Run `ai-memory <command> --help` for details on any command, or `ai-memory --help` for the full list.
 
 | Command | Description |
 |---------|-------------|

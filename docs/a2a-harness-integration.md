@@ -24,17 +24,17 @@ exercising this repo's binary.
 
 - 101 MCP tools at `--profile full`; 7 at `--profile core` + always-on
   `memory_capabilities`.
-- 91 production HTTP routes (78 unique URL paths) registered.
-- Schema v71 (single logical version across sqlite + postgres; see
+- 92 production HTTP routes (78 unique URL paths) registered.
+- Schema v78 (single logical version across sqlite + postgres; see
   `src/storage/migrations.rs::CURRENT_SCHEMA_VERSION`
   and `src/store/postgres.rs::CURRENT_SCHEMA_VERSION`).
 - Per-message Ed25519 federation signing (`X-Memory-Sig` header).
 - Per-peer attestation via `x-peer-id` header on every push.
-- 26-field `Memory` model with `reflection_depth`, `memory_kind`,
+- 28-field `Memory` model with `reflection_depth`, `memory_kind`,
   `entity_id`, `persona_version`, `citations`, `source_uri`,
   `source_span`, `confidence_source`, `confidence_signals`,
-  `confidence_decayed_at`, and `version` (Gap-1 optimistic concurrency,
-  schema v45).
+  `confidence_decayed_at`, `version` (Gap-1 optimistic concurrency,
+  schema v45), `lifecycle_state` (schema v64), and `cid` (schema v74).
 
 ## v0.7.0 substrate features the harness MUST NOT depend on
 

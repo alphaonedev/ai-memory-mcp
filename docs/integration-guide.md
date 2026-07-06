@@ -25,7 +25,7 @@ the binary, ai-memory boots a per-session process, and the AI now
 has 7 to 99 memory tools at its disposal (depending on the
 `--profile` flag). For AIs that don't speak MCP, the HTTP API
 covers everything the MCP surface does, plus a few more endpoints
-(91 route registrations / 77 unique URL paths at v0.8.0).
+(92 route registrations / 78 unique URL paths).
 
 Every recipe below assumes the binary is on your `PATH`. If
 `ai-memory --version` doesn't print `0.8.0`, go back to
@@ -295,11 +295,11 @@ command: ai-memory
 args:    ["mcp"]
 # optionally:
 #   ["--db", "/path/to/ai-memory.db", "mcp", "--tier", "semantic"]
-#   ["mcp", "--profile", "full"]  # advertise all 100 tools
+#   ["mcp", "--profile", "full"]  # advertise all 101 tools
 ```
 
 That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7
-tools by default and up to 99 with `--profile full`. Per-harness
+tools by default and up to 100 with `--profile full`. Per-harness
 copy-paste recipes live in [`docs/integrations/`](integrations/):
 **aider**, **claude-agent-sdk**, **cline**, **codex-cli**, **cody**,
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,
@@ -310,7 +310,7 @@ Category-1 (hook-capable) vs. Category-2 (MCP-only) matrix.
 
 ## 7. HTTP API fallback — for clients that don't speak MCP
 
-ai-memory ships an HTTP/REST daemon with **91 route registrations / 77 unique URL paths at v0.8.0**
+ai-memory ships an HTTP/REST daemon with **92 route registrations / 78 unique URL paths**
 covering everything the MCP surface does. Use it for AI clients
 with no MCP support (most browser-based assistants), custom
 scripts, multi-host setups, and browser extensions.

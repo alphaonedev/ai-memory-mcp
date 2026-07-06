@@ -230,7 +230,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <span class="pill">local GPU embeddings</span>
       <span class="pill">nomic-embed-text · 768d</span>
       <span class="pill">W-of-N quorum · mTLS</span>
-      <span class="pill">schema v70</span>
+      <span class="pill">schema v78</span>
     </div>
   </div>
 </section>
@@ -324,7 +324,7 @@ capacity / cost / SLA planning is
         <text x="405" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
         <text x="405" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="405" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v70</text>
+        <text x="405" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v78</text>
       </g>
 
       <!-- GPU embed loopback leg (green) -->
@@ -364,7 +364,7 @@ capacity / cost / SLA planning is
         <text x="965" y="362" text-anchor="middle" class="svg-title" font-size="11" fill="#ffb86b" font-weight="700">SQLite (WAL + FTS5)</text>
         <text x="965" y="380" text-anchor="middle" class="svg-label" font-size="8.5">— or —</text>
         <text x="965" y="398" text-anchor="middle" class="svg-label" font-size="10" fill="#ffb86b">PostgreSQL + Apache AGE</text>
-        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v70</text>
+        <text x="965" y="416" text-anchor="middle" class="svg-label" font-size="9">+ pgvector · schema v78</text>
       </g>
 
       <path class="flow gpu" d="M822 252 C844 240 846 216 860 210" aria-hidden="true"/>
@@ -397,12 +397,12 @@ capacity / cost / SLA planning is
   <span class="item"><span class="dot" style="background:#ffd700"></span>Batman maximum-secure</span>
 </div>
 <div class="stats" style="margin-top:1.5rem">
-  <div class="stat"><div class="n">v70</div><div class="l">DB schema</div></div>
-  <div class="stat"><div class="n">100 / 7</div><div class="l">MCP tools (full / core)</div></div>
-  <div class="stat"><div class="n">83 / 85</div><div class="l">CLI subcommands (default / sal)</div></div>
-  <div class="stat"><div class="n">91 / 77</div><div class="l">HTTP routes / paths</div></div>
+  <div class="stat"><div class="n">v78</div><div class="l">DB schema</div></div>
+  <div class="stat"><div class="n">101 / 7</div><div class="l">MCP tools (full / core)</div></div>
+  <div class="stat"><div class="n">87 / 89</div><div class="l">CLI subcommands (default / sal)</div></div>
+  <div class="stat"><div class="n">92 / 78</div><div class="l">HTTP routes / paths</div></div>
   <div class="stat"><div class="n">9</div><div class="l">Link relations</div></div>
-  <div class="stat"><div class="n">27</div><div class="l">Memory fields</div></div>
+  <div class="stat"><div class="n">28</div><div class="l">Memory fields</div></div>
 </div>
 <p><strong>When to choose this.</strong> Your fleet nodes have GPUs (or you are
 sizing new nodes and embedding volume justifies them). You want the

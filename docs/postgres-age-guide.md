@@ -39,9 +39,9 @@ choice. Switch to postgres+AGE when one or more of these is true:
   sharing the same store. Postgres is the supported topology;
   sqlite-over-NFS is not.
 
-The two backends have **schema parity at v71** as of v0.8.1
-(`CURRENT_SCHEMA_VERSION = 71` on both ladders — the postgres upgrade
-ladder ends at `migrate_v71()`) — every feature that works on sqlite
+The two backends have **schema parity at v78**
+(`CURRENT_SCHEMA_VERSION = 78` on both ladders — the postgres upgrade
+ladder ends at `migrate_v78()`) — every feature that works on sqlite
 works on postgres.
 
 ## Prerequisites
@@ -193,7 +193,7 @@ What it does (see `src/cli/schema_init.rs`):
    `migrate` verb uses — the open itself runs `INIT_SCHEMA` (the
    bundled `src/store/postgres_schema.sql`, idempotent `CREATE TABLE
    IF NOT EXISTS` throughout) plus the in-process upgrade ladder up to
-   schema v71 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
+   schema v78 (the current `CURRENT_SCHEMA_VERSION`) as a side effect. The
    `vector` (pgvector) extension is
    **required** — `CREATE EXTENSION IF NOT EXISTS vector` failing
    aborts the bootstrap.
@@ -603,8 +603,8 @@ pass-through.
 
 After Wave-3 Continuation 3, **no standard HTTP endpoint** returns
 501 on a postgres-backed daemon. Every endpoint listed in the
-router (**91 production `.route(...)` registrations in `src/lib.rs`
-at v0.8.0 — 77 unique URL paths**, surfaced through
+router (**92 production `.route(...)` registrations in `src/lib.rs`
+— 78 unique URL paths**, surfaced through
 `/api/v1/capabilities`) dispatches through the SAL trait or is handled
 directly by the postgres adapter.
 

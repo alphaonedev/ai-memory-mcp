@@ -103,14 +103,14 @@ cargo audit</code></pre>
   <p>All three share <code>src/storage/</code> + <code>src/validate.rs</code>. There is no behavioural divergence; whatever the CLI does, the MCP tool and the HTTP endpoint do too. Post-#966 (Wave-2 Tier-C1, May 2026), DTO-bundling validation routes through the shared <code>RequestValidator</code> fluent surface so adding a new cross-field invariant is one impl method on the facade instead of three audited per-surface duplicates.</p>
 
   <h3>MCP &mdash; stdio JSON-RPC 2.0</h3>
-  <div class="if-tabs"><span class="if-tab mcp">100 entries at --profile full (99 callable), 7 default in --profile core</span></div>
+  <div class="if-tabs"><span class="if-tab mcp">101 entries at --profile full (100 callable), 7 default in --profile core</span></div>
   <pre><code>printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"demo","version":"0"}}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_store","arguments":{"title":"hello","content":"first MCP memory","tier":"mid"}}}' \
   | ai-memory mcp --profile core</code></pre>
 
   <h3>HTTP &mdash; Axum REST</h3>
-  <div class="if-tabs"><span class="if-tab http">91 route registrations (77 unique paths) at /api/v1/ (+ /metrics)</span></div>
+  <div class="if-tabs"><span class="if-tab http">92 route registrations (78 unique paths) at /api/v1/ (+ /metrics)</span></div>
   <pre><code>ai-memory serve --host 127.0.0.1 --port 9077 &amp;
 
 curl -X POST http://127.0.0.1:9077/api/v1/memories \
@@ -119,7 +119,7 @@ curl -X POST http://127.0.0.1:9077/api/v1/memories \
   -d '{"title":"hello","content":"first HTTP memory","tier":"mid"}'</code></pre>
 
   <h3>CLI &mdash; clap subcommands</h3>
-  <div class="if-tabs"><span class="if-tab cli">83 subcommands in default build (85 with --features sal or --features sal-postgres), all support --json</span></div>
+  <div class="if-tabs"><span class="if-tab cli">87 subcommands in default build (89 with --features sal or --features sal-postgres), all support --json</span></div>
   <pre><code>ai-memory store --title hello --content "first CLI memory" --tier mid
 ai-memory recall "hello"
 ai-memory stats --json | jq .</code></pre>
@@ -266,9 +266,9 @@ ai-memory serve</code></pre>
   <h2>Where to go from here.</h2>
   <div class="next">
     <a href="../DEVELOPER_GUIDE.html"><strong>Developer guide</strong><span class="desc">Full reference</span></a>
-    <a href="../USER_GUIDE.html"><strong>MCP tool reference</strong><span class="desc">100 entries at --profile full (99 callable)</span></a>
-    <a href="../API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">91 route registrations (77 unique paths)</span></a>
-    <a href="../CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">83 subcommands</span></a>
+    <a href="../USER_GUIDE.html"><strong>MCP tool reference</strong><span class="desc">101 entries at --profile full (100 callable)</span></a>
+    <a href="../API_REFERENCE.html"><strong>HTTP API</strong><span class="desc">92 route registrations (78 unique paths)</span></a>
+    <a href="../CLI_REFERENCE.html"><strong>CLI reference</strong><span class="desc">87 subcommands</span></a>
     <a href="../agent-identity.html"><strong>Agent identity</strong><span class="desc">NHI semantics</span></a>
     <a href="../hook-pipeline.html"><strong>Hook pipeline</strong><span class="desc">27 events</span></a>
     <a href="../knowledge-graph.html"><strong>Knowledge graph</strong><span class="desc">Typed links + temporal validity</span></a>

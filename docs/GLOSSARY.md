@@ -150,8 +150,8 @@ embeddings lose information on long text.
 ## MCP (Model Context Protocol)
 
 Anthropic's JSON-RPC protocol for AI-tool integration. ai-memory ships
-an MCP server via `ai-memory mcp` exposing **100 advertised entries at
-`--profile full` at v0.8.0** (99 callable "memory tools" + the always-on
+an MCP server via `ai-memory mcp` exposing **101 advertised entries at
+`--profile full`** (100 callable "memory tools" + the always-on
 `memory_capabilities` bootstrap — both numbers are intentional; see
 issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862))
 plus 2 prompts over stdio. Default `--profile core` exposes 7 tools (the
@@ -161,7 +161,7 @@ Codex, Grok, Gemini, Llama Stack. See `docs/USER_GUIDE.md`.
 
 ## Memory
 
-The core data unit. **A 27-field record at v0.8.0** (26 at v0.7.0, was 15 at v0.6.x; the 27th field is `lifecycle_state`, the v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64) —
+The core data unit. **A 28-field record at v0.9.0** (27 at v0.8.0, 26 at v0.7.0, was 15 at v0.6.x; the 27th field is `lifecycle_state`, the v0.8.0 Pillar-2 #1709 typed-cognition state machine, schema v64; the 28th field is `cid`, the v0.9.0 G8 #1825 additive BLAKE3 content-id, schema v74) —
 adds `reflection_depth` (Task 1/8 recursive-learning), `memory_kind`
 (Batman Form-6 vocabulary), `entity_id`/`persona_version` (QW-2 persona
 artefact), `citations`/`source_uri`/`source_span` (Form-4 fact
