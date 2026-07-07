@@ -1419,14 +1419,18 @@ the signature against the agent's **bound public key** (registered via
 verbatim (±300 s freshness window). A forged signature is rejected with
 `403 ATTESTATION_FAILED`.
 
-Operators who want to *require* attestation can set
-`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy): unsigned writes are then
-rejected rather than landing claimed. The default is permissive (unsigned →
-claimed) to preserve the v0.6.x posture. Two edges stay claimed-by-design at
-v0.7.0 — the federation **receive** path (mTLS + the peer allowlist is the
-trust boundary, not a per-write agent signature) and this permissive default
-posture — both tracked for v0.8 hardening under
-[#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464).
+As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), attestation is **required by default**: an unsigned
+write is **rejected** (`403 ATTESTATION_FAILED`) rather than landing claimed.
+Operators who need the pre-v0.9 permissive posture (unsigned → claimed) must
+set the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or
+`=false`); any other value falls through to the required default, so a typo
+fails closed. This is the flip promised by the v0.8.0 one-cycle deprecation
+WARN tracked under
+[#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464). One edge
+stays claimed-by-design: the federation **receive** path (mTLS + the peer
+allowlist is the trust boundary, not a per-write agent signature) — per-write
+cryptographic verification of federated memories remains tracked under
+[#1719](https://github.com/alphaonedev/ai-memory-mcp/issues/1719).
 
 ### Default exposes the hostname
 

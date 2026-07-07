@@ -710,7 +710,7 @@ If `ai-memory` is not in your PATH, use the full path to the binary in any of th
 
 ### Step 2: Verify
 
-Restart your AI client. With `--profile core` (default at v0.7.0) you should see 7 tools available (`memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. With `--profile full` you get all 101 advertised entries (100 callable memory tools + `memory_capabilities`). Other profiles: `graph` (18 tools), `admin` (21 tools), `power` (56 tools). The full advertised inventory is asserted by `Profile::full().expected_tool_count() = 101` in `src/profile.rs`; the canonical surface list lives in `docs/USER_GUIDE.md`.
+Restart your AI client. With `--profile core` (default at v0.7.0) you should see 7 tools available (`memory_store`, `memory_recall`, `memory_search`, `memory_list`, `memory_get`, `memory_load_family`, `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. With `--profile full` you get all 101 advertised entries (100 callable memory tools + `memory_capabilities`). Other profiles: `graph` (19 tools — Family::Core 7 + Family::Graph 12, the latter grew to 12 with the v0.9.0 addition of `memory_lineage`, #1859), `admin` (21 tools), `power` (56 tools). The full advertised inventory is asserted by `Profile::full().expected_tool_count() = 101` in `src/profile.rs`; the canonical surface list lives in `docs/USER_GUIDE.md`.
 
 ### Step 3: Test
 

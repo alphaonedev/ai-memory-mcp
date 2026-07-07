@@ -74,7 +74,7 @@ never downgrades.
 | `--source-uri` | string | — | Form-4 source pointer; `uri:` / `doc:` / `file:` schemes. |
 | `--source-span` | JSON | — | Form-4 byte-range pin: `{start, end}`. |
 | `--entity-id` | string | — | QW-2 persona binding; required with `--kind persona`. |
-| `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign` the write is *claimed* unless `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is set (which then rejects the unsigned write). |
+| `--sign` | bool | `false` | **#626 Layer-3** — sign the write with the resolved agent's local Ed25519 keypair so the stored row is *attested* (`attest_level = "agent_attested"`) rather than merely *claimed*. Requires a `<agent_id>.priv` under the key directory (`AI_MEMORY_KEY_DIR` or the platform default) and a matching bound public key (`ai-memory agents bind-key`). Without `--sign`, an unsigned write is **rejected by default** as of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)); it only lands *claimed* when the operator sets the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`). |
 
 ```bash
 ai-memory store --title "Q2 roadmap" \
@@ -272,7 +272,7 @@ API key comes from the `api_key` field in `config.toml`).
 | `--shutdown-grace-secs` | u64 | `30` | SIGINT grace period. |
 | `--quorum-writes` | usize | `0` | v0.7 federation: W (peer acks required). `0` = federation off. |
 | `--quorum-peers` | comma-list | — | Peer base URLs; each must expose `POST /api/v1/sync/push`. |
-| `--quorum-timeout-ms` | u64 | `2000` | Quorum-ack deadline; after it the write returns 503 `quorum_not_met`. Default assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 (the do-1461 reference deployment uses 8000 — see `docs/federation.md`, [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)). |
+| `--quorum-timeout-ms` | u64 | `2000` | Quorum-ack deadline; after it the locally-committed write returns **202 Accepted** with `quorum_met:false` in the body (`{quorum_met, acks, needed, reason, durability:"local"}`) — NOT a 503 (v0.8.1 W3 / gap G12); a durable write is never reported as a 5xx. Default assumes same-DC peers; cross-region (WAN) meshes need 5000-10000 (the do-1461 reference deployment uses 8000 — see `docs/federation.md`, [#1565](https://github.com/alphaonedev/ai-memory-mcp/issues/1565)). |
 | `--quorum-client-cert`/`--quorum-client-key` | path | — | mTLS client pair for outbound quorum fanout. |
 | `--quorum-ca-cert` | path | — | CA for verifying quorum peers. |
 | `--catchup-interval-secs` | u64 | `30` | Federation catch-up loop cadence. |

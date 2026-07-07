@@ -302,7 +302,7 @@ ranking wire, without touching ranking itself.
   win); PERFORMANCE.md p95 budgets are intentionally NOT tightened in
   this change.
 
-### Breaking / secure-default changes — store-path agent attestation now REQUIRED by default ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751); deprecation cycle from [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464))
+### Breaking / secure-default changes — store-path agent attestation now REQUIRED by default ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751); deprecation cycle from [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)); pre-event hook-enforcement gate now dual MCP+HTTP ([#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885) / [#1924](https://github.com/alphaonedev/ai-memory-mcp/issues/1924))
 
 - **`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` compiled default flipped
   `false → true`** (`src/identity/attest.rs::require_agent_attestation_enabled`,
@@ -335,6 +335,61 @@ ranking wire, without touching ranking itself.
   `src/identity/attest.rs::tests::require_flag_parse_core_v09_default_required` +
   the pre-existing strict-posture rejection suites
   (`tests/agent_attestation_integrity.rs`, `tests/agent_attestation_postgres.rs`).
+- **[#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885) / [#1924](https://github.com/alphaonedev/ai-memory-mcp/issues/1924) — mandatory-hook-presence enforcement gate now fires on BOTH the
+  MCP write path and the HTTP write path.** `#1734` (v0.8.1) installed the
+  process-global pre-event enforcement gate (`consult_pre_event_gate`,
+  `src/mcp/mod.rs`) for the MCP surface only — a required-event hook
+  configured but absent/disabled correctly fails closed there, but an HTTP
+  write (`POST /api/v1/memories` and siblings) never consulted the gate at
+  all, a silent bypass (CWE-288): a caller could skip MCP entirely and land
+  a write with zero hook coverage even when a mandatory hook was configured.
+  `#1885` re-confirmed and hardened the MCP-side gate; `#1924` wires the
+  same installed gate onto the HTTP write path
+  (`http_pre_event_gate`, `src/handlers/create.rs`), so both surfaces now
+  enforce identically. Inert unless enforce mode is configured — no
+  behavior change for deployments that don't use mandatory-hook enforcement.
+
+### Security / code-review hardening — 49 fixes across a 5-lane adversarial review ([#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885)–[#1935](https://github.com/alphaonedev/ai-memory-mcp/issues/1935))
+
+Five review lanes (crypto/daemon/federation, security/crypto, handlers/governance,
+authz/isolation, mcp) landed 49 confirmed findings, all fixed. The two
+write-path-wide items (#1751 attestation-required default, #1885/#1924 dual
+hook-enforcement gate) are called out above under "Breaking / secure-default
+changes"; the remaining highlights:
+
+- **[#1919](https://github.com/alphaonedev/ai-memory-mcp/issues/1919) — `bulk_create` is now attestation-gated per row** (CWE-288/CWE-345).
+  Mirrors the #1751 single-write requirement onto the batch path
+  (`src/handlers/memories_query.rs`) — every row in a `bulk_create` request
+  must carry a valid agent attestation; a batch cannot bypass the
+  required-attestation default just by going through the bulk endpoint.
+- **[#1920](https://github.com/alphaonedev/ai-memory-mcp/issues/1920) — federation approval authorship gate** (CWE-862). An inbound
+  federated PENDING approval (`src/handlers/federation_receive.rs`) is now
+  honored only when it is attributed to the peer's registered approver; an
+  enrolled-but-hostile peer can no longer forge an approval for an
+  unauthorized requester.
+- **[#1921](https://github.com/alphaonedev/ai-memory-mcp/issues/1921) — `team`/`unit`/`org` visibility scope hardening** (CWE-863).
+  `src/visibility.rs` now enforces the namespace-ancestor subtree
+  correctly for the `team`/`unit`/`org` scopes, closing a cross-tenant
+  over-broad-visibility gap where a shared-scope row could project beyond
+  its intended subtree.
+- **[#1923](https://github.com/alphaonedev/ai-memory-mcp/issues/1923) — `skill_register` `folder_path` import jail** (CWE-22/CWE-59).
+  `src/mcp/tools/skill_register.rs` canonicalizes and confines
+  `folder_path` under the configured root; a symlink anywhere inside the
+  imported tree is refused outright rather than followed.
+- **[#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927) — non-argv store-url credential channels** (CWE-214). New
+  `AI_MEMORY_STORE_URL` (owner-only `/proc/environ`) and
+  `AI_MEMORY_STORE_URL_FILE` (a `0600` file) let `ai-memory serve` receive
+  the store URL — including any embedded password — without putting it on
+  `--store-url` argv, which is exposed via world-readable
+  `/proc/<pid>/cmdline` and `ps auxww` to any local UID.
+  `resolve_store_url()` (`src/daemon_runtime.rs`) resolution order:
+  `AI_MEMORY_STORE_URL_FILE` → `AI_MEMORY_STORE_URL` → `--store-url`.
+- The remaining findings across the crypto/daemon/federation, security/crypto,
+  handlers/governance, and mcp clusters (#1886–#1918, #1922, #1925, #1926,
+  #1928–#1935) are defect closures with no external-facing behavior/API
+  change; see `git log` for the per-cluster commits
+  (`59508a8c`, `5ffd5748`, `d2ca4d75`, `540465b5`, `212d2e3b`, `3ae00af3`,
+  `7d136222`, `3c6a8f39`).
 
 ### Added — vector-search minimal opt-in slice ([#1005](https://github.com/alphaonedev/ai-memory-mcp/issues/1005); full substrate deferred to [#1860](https://github.com/alphaonedev/ai-memory-mcp/issues/1860))
 

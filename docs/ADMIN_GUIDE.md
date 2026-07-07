@@ -131,7 +131,7 @@ docker run -d -p 127.0.0.1:9077:9077 -v ai-memory-data:/data ai-memory
 | `--host <addr>` | `127.0.0.1` | Bind address (serve only) |
 | `--port <port>` | `9077` | Bind port (serve only) |
 | `--json` | `false` | JSON output for CLI commands |
-| `--tier <tier>` | `semantic` | Feature tier: `keyword`, `semantic`, `smart`, `autonomous` (mcp/serve only) |
+| `--tier <tier>` | `semantic` | Feature tier: `keyword`, `semantic`, `smart`, `autonomous` (`mcp` only — `serve` has no `--tier` flag, see issue #703 below) |
 
 ### Feature Tiers
 
@@ -142,7 +142,7 @@ The `--tier` flag controls which features are enabled. Each tier builds on the p
 | `keyword` | keyword subset | No | No | Minimal |
 | `semantic` (default) | semantic subset | Yes (HuggingFace) | No | ~256 MB |
 | `smart` | smart subset (LLM tools enabled) | Yes | Yes — any provider (#1067): Ollama, xAI, OpenAI, Anthropic, Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks, LMStudio, vLLM, llama.cpp | ~1 GB (local Ollama) / ~256 MB (remote endpoint) |
-| `autonomous` | full 100-entry surface (v0.8.0) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
+| `autonomous` | full 101-entry surface (v0.9.0; 100 callable memory tools + the always-on `memory_capabilities` bootstrap) | Yes | Yes — same as smart (#1067) | ~4 GB (local Ollama) / ~3 GB (remote LLM, local cross-encoder) |
 
 Set the tier when starting the MCP server or running per-invocation
 subcommands (`mcp`, `store`, `recall`, etc.):
@@ -1014,10 +1014,13 @@ surface — CLI (`ai-memory store --sign`), MCP (`memory_store`), or HTTP
 (`POST /api/v1/memories`). The daemon verifies it against the agent's bound
 public key (registered via `memory_agent_register` + bind-key) and stamps
 `metadata.attest_level = "agent_attested"`; a forged signature is rejected with
-`403 ATTESTATION_FAILED`. Set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy) to
-**require** attestation — unsigned writes are then rejected rather than landing
-claimed (default is permissive, preserving the v0.6.x posture). Agent
-registration itself landed earlier as Task 1.3.
+`403 ATTESTATION_FAILED`. As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), agent attestation is
+**REQUIRED by default** on writes — an unsigned write is now rejected
+(`403 ATTESTATION_FAILED`) rather than landing `claimed`. Set the explicit
+opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`) to restore the
+pre-v0.9 permissive posture (unsigned → `claimed`); any other value falls
+through to the required default, so a typo fails closed. Agent registration
+itself landed earlier as Task 1.3.
 
 ### Resolution precedence
 

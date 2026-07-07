@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# PostgreSQL + Apache AGE operator guide (ai-memory v0.8.0)
+# PostgreSQL + Apache AGE operator guide (ai-memory v0.9.0)
 
 > **Audience.** Operators running `ai-memory` who want PostgreSQL as the
 > live storage backend, with Apache AGE for graph queries and pgvector
@@ -51,7 +51,7 @@ works on postgres.
 | PostgreSQL | **18.4** (canonical) | The recommended Enterprise Federated substrate. SSOT: `deploy/docker-1461/provision/lib.sh` (`EXPECTED_PG_VERSION=18.4`). PG 16.x + AGE 1.6.0 remains a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.7.0** (canonical) | Targets PG 18. Use the bundled `deploy/docker-1461/Dockerfile.pg-age-vector` (`apache/age:release_PG18_1.7.0`) or build from source (see below). |
 | pgvector | **0.8.2** (canonical) | Faster HNSW. SSOT: `PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`. **Required**: the `sal-postgres` Cargo feature pulls `dep:pgvector` (Rust binding crate `pgvector = "0.4"`) which maps Rust vectors to the Postgres `vector` column type. |
-| ai-memory | v0.8.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
+| ai-memory | v0.9.0 with `--features sal-postgres` | The `sal-postgres` feature is **off by default** to keep the no-postgres build hermetic. |
 
 ### Bundled Dockerfile (Apache AGE + pgvector on PG18, #1065)
 
@@ -169,9 +169,12 @@ SQL
 Notes:
 
 - `aimemory` is the role the daemon runs as. Pick a strong password and
-  store it in your secret manager — the daemon reads it from the
-  `--store-url` URL only (the `AI_MEMORY_STORE_URL` env fallback was
-  deliberately dropped; commit `1e8ad69b`).
+  store it in your secret manager. As of v0.9.0 ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)), prefer a
+  non-argv channel over `--store-url` for the credential: `AI_MEMORY_STORE_URL`
+  (read from the owner-only process environment) or `AI_MEMORY_STORE_URL_FILE`
+  (a `0600` file holding the URL) — both were (re-)added specifically to
+  keep the password off world-readable `/proc/<pid>/cmdline` and `ps
+  auxww`. See "Daemon configuration" below for the resolution order.
 - `ag_catalog` must be on the search path so AGE's `cypher()` SQL
   function resolves without a schema prefix on every call.
 - The role only needs `USAGE` on `ag_catalog` (read of the AGE
@@ -215,7 +218,7 @@ What it does (see `src/cli/schema_init.rs`):
    true` in the JSON report).
 4. Enumerates the resulting catalog and prints the human summary
    (tables / indices / views / functions / extensions /
-   `schema_version: 71`) or the `--json` report.
+   `schema_version: 78`) or the `--json` report.
 
 Idempotent on rerun — safe to invoke from a deploy script. Exit code
 0 on success, non-zero on connection / bootstrap failure.
@@ -225,15 +228,26 @@ recursive-CTE fallback serves `kg_query`/`kg_timeline`/etc.
 
 ## Daemon configuration
 
-Pass the store URL as a CLI flag on `serve` (this is the supported
-shape in v0.7.0; env-var and config-file forms are tracked for a
-follow-on release):
+`--store-url` on `serve` is still accepted, but as of v0.9.0 ([#1927](https://github.com/alphaonedev/ai-memory-mcp/issues/1927)) two
+non-argv channels exist and are preferred, since a password on
+`--store-url` is exposed via world-readable `/proc/<pid>/cmdline` and
+`ps auxww` to any local UID. `resolve_store_url()` (`src/daemon_runtime.rs`)
+resolves the store URL in this order, first hit wins:
+
+1. `AI_MEMORY_STORE_URL_FILE` — a `0600` file whose sole contents are the store URL (the most restrictive channel).
+2. `AI_MEMORY_STORE_URL` — the owner-only process environment (`/proc/<pid>/environ` is mode `0400`, strictly better than argv).
+3. the `--store-url` CLI argument (unchanged; a userinfo password on this flag emits a warning pointing at the non-argv alternatives).
 
 ```bash
+# Preferred (v0.9.0+): non-argv channel
+export AI_MEMORY_STORE_URL='postgres://aimemory:PASSWORD@HOST:5432/aimemory'
+ai-memory serve
+
+# Still accepted, but the password is exposed via /proc/<pid>/cmdline and `ps`
 ai-memory serve --store-url postgres://aimemory:PASSWORD@HOST:5432/aimemory
 ```
 
-URL shapes accepted by `--store-url`:
+URL shapes accepted by `--store-url` (and the env/file channels above):
 
 - `postgres://user:pass@host:port/dbname`
 - `postgresql://user:pass@host:port/dbname` (alias)
@@ -633,7 +647,7 @@ endpoint availability:
   the trait. Postgres operators relying on multi-node consistency
   for these subcollections should poll peers or pin sqlite for v0.7.0.
 
-Schema parity at v71 means `ai-memory migrate` sqlite → postgres
+Schema parity at v78 means `ai-memory migrate` sqlite → postgres
 carries every row across cleanly.
 
 The recall **score breakdown** is the same 6-factor formula on both
@@ -748,7 +762,7 @@ bootstrap.
 
 If you're pointing at a v0.7-alpha postgres database (schema v15),
 run `ai-memory schema-init --store-url postgres://…` with a current
-(v0.8.1) binary — opening the store applies the upgrade ladder to v71
+(v0.9.0) binary — opening the store applies the upgrade ladder to v78
 idempotently. (See `migration-v0.7.0-postgres.md` for the full
 migration guide.)
 
@@ -787,7 +801,7 @@ parity test is the gate that prevents it.
 | | sqlite | postgres |
 |---|---|---|
 | Live daemon | ✓ (default) | ✓ (Wave 3) |
-| Schema parity | v71 | v71 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
+| Schema parity | v78 | v78 (`CURRENT_SCHEMA_VERSION` pinned in lockstep) |
 | `link()` | ✓ | ✓ (Wave 1 Stream A) |
 | `register_agent()` | ✓ | ✓ (Wave 1 Stream A) |
 | Recall 6-factor scoring (SAL `search`) | ✓ | ✓ (Wave 1 Stream A) |
