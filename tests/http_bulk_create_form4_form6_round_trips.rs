@@ -29,6 +29,13 @@ use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
 fn build_test_router() -> (axum::Router, NamedTempFile) {
+    // #1919 — this suite pins Form-4/Form-6 field round-tripping, not
+    // attestation; opt out of the v0.9 required-agent-attestation default
+    // so the unsigned bulk rows persist instead of 403 ATTESTATION_FAILED.
+    static ATTEST: std::sync::Once = std::sync::Once::new();
+    ATTEST.call_once(|| unsafe {
+        std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
+    });
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");

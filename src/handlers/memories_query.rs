@@ -243,6 +243,39 @@ pub async fn search_memories(
         Err(e) => return crate::handlers::wire_format::invalid_format_response(&e),
     };
 
+    // #1922 (CWE-639, tenant-isolation) — bind the visibility `as_agent`
+    // to the AUTHENTICATED caller. Pre-fix a caller-supplied `?as_agent=`
+    // drove the `visibility_clause` team/unit/org arms with NO parity
+    // check (unlike the recall path, which rejects a mismatch via
+    // `resolve_caller_agent_id`), so an attacker sent
+    // `?as_agent=victimorg/unit/team/x` (with their OWN or NO X-Agent-Id)
+    // and `namespace_ancestors` handed the SQL team/unit/org arms the
+    // victim's entire subtree — a cross-tenant read of every team/unit/
+    // org-scoped row. Mirror recall's parity gate HERE, before EITHER
+    // backend branch consumes `p.as_agent`: when `as_agent` is present it
+    // MUST equal the header-resolved caller id, else 403. This fails
+    // closed for anonymous callers too (a synthesized `anonymous:req-…`
+    // id never matches an attacker-chosen namespace).
+    let header_agent_id = headers
+        .get(crate::HEADER_AGENT_ID)
+        .and_then(|v| v.to_str().ok());
+    let resolved_caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
+        .unwrap_or_else(|_| crate::identity::anonymous_request_id());
+    if let Some(claimed) = p.as_agent.as_deref()
+        && claimed != resolved_caller
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "agent_id_query_header_mismatch: as_agent {claimed:?} disagrees with \
+                     authenticated caller {resolved_caller:?}"
+                ),
+            })),
+        )
+            .into_response();
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The Postgres adapter's `search` runs the same
     // text-search projection as SQLite's FTS5 path with the trait's
@@ -662,6 +695,39 @@ pub async fn bulk_create(
     let caller = crate::identity::resolve_http_agent_id(None, header_agent_id)
         .unwrap_or_else(|_| crate::identity::anonymous_request_id());
 
+    // #1919 (CWE-288 / CWE-345) — bulk_create MUST enforce the SAME
+    // required-agent-attestation gate (#1751) that single-create
+    // (`create_memory`) enforces. Pre-fix bulk bypassed it entirely: a
+    // low-privilege caller could POST /memories/bulk with a self-asserted
+    // `X-Agent-Id` and UNSIGNED bodies and land unattested rows attributed
+    // to ANY agent — the exact cross-tenant identity forgery the #1751
+    // attestation-require default was built to prevent. Fail the WHOLE
+    // batch (403 ATTESTATION_FAILED, BEFORE any persistence or fanout) when
+    // required-attestation is on and ANY row is unsigned, matching the
+    // single-create contract. Per-row signature VERIFICATION (forged /
+    // unverifiable → row rejected) is applied inside each backend loop
+    // below via `stamp_attestation_*`.
+    let require_attest = crate::identity::attest::require_agent_attestation_enabled();
+    if require_attest
+        && bodies.iter().any(|b| {
+            b.signature
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        })
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "code": crate::errors::error_codes::ATTESTATION_FAILED,
+                "error": "bulk_create requires every row to carry an agent-attestation \
+                          signature when AI_MEMORY_REQUIRE_AGENT_ATTESTATION is set",
+            })),
+        )
+            .into_response();
+    }
+
     // v0.7.0 Wave-3 Continuation — postgres-backed daemons stream each
     // row through `app.store.store(...)`. Federation fanout below stays
     // sqlite-only because the federation transport assumes the
@@ -703,6 +769,10 @@ pub async fn bulk_create(
         // before the loop rather than re-locking per row.
         let resolved_ttl = app.db.lock().await.2.clone();
         for body in bodies {
+            // #1919 — capture the per-row attestation fields before `body`
+            // is partial-moved into the `Memory` literal below.
+            let row_sig = body.signature.clone();
+            let row_created_at = body.created_at.clone();
             if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
                 // with the raw error — both are caller-influenced, and
@@ -741,7 +811,9 @@ pub async fn bulk_create(
             let citations = body.citations;
             let source_uri = body.source_uri;
             let source_span = body.source_span;
-            let mem = Memory {
+            // #1919 — mutable so the per-row attestation below can stamp
+            // `attest_level` / adopt the signed `created_at`.
+            let mut mem = Memory {
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
                 namespace: body.namespace,
@@ -780,6 +852,54 @@ pub async fn bulk_create(
                 lifecycle_state: crate::models::LifecycleState::Open,
                 cid: None,
             };
+
+            // #1919 (CWE-288) — per-row agent attestation, mirroring the
+            // single-create postgres gate (`create.rs` #626 Layer-3). Verify
+            // a presented signature against the caller's bound key and stamp
+            // `attest_level`; a forged / unverifiable signature (or, under
+            // required-attestation, an unsigned row — already batch-rejected
+            // above, kept here as a fail-closed backstop) REJECTS the row into
+            // `errors[]` so it is never persisted or fanned out.
+            if let Some(sig_b64) = row_sig.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                match crate::identity::attest::prepare_signed_store(
+                    sig_b64,
+                    row_created_at.as_deref(),
+                ) {
+                    Ok((sig_bytes, signed_created_at)) => {
+                        mem.created_at = signed_created_at.to_string();
+                        if let Err(e) = crate::identity::attest::stamp_attestation_async(
+                            app.store.as_ref(),
+                            &mut mem,
+                            &caller,
+                            Some(&sig_bytes),
+                        )
+                        .await
+                        {
+                            tracing::warn!("bulk_create(postgres): attestation failed: {e}");
+                            errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                            continue;
+                        }
+                    }
+                    Err(msg) => {
+                        errors.push(super::sanitize_bulk_row_error(&msg).to_string());
+                        continue;
+                    }
+                }
+            } else if require_attest
+                && let Err(e) = crate::identity::attest::stamp_attestation_async(
+                    app.store.as_ref(),
+                    &mut mem,
+                    &caller,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    "bulk_create(postgres): required attestation rejected unsigned: {e}"
+                );
+                errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                continue;
+            }
 
             // F-A2A1.5 (#705) — governance enforcement on the postgres
             // bulk_create path. Mirrors F-A2A1.2 delete/promote and the
@@ -901,6 +1021,10 @@ pub async fn bulk_create(
     {
         let lock = app.db.lock().await;
         for body in bodies {
+            // #1919 — capture the per-row attestation fields before `body`
+            // is partial-moved into the `Memory` literal below.
+            let row_sig = body.signature.clone();
+            let row_created_at = body.created_at.clone();
             if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
                 // with the raw error. Sanitize and log instead.
@@ -936,7 +1060,9 @@ pub async fn bulk_create(
             let citations = body.citations;
             let source_uri = body.source_uri;
             let source_span = body.source_span;
-            let mem = Memory {
+            // #1919 — mutable so the per-row attestation below can stamp
+            // `attest_level` / adopt the signed `created_at`.
+            let mut mem = Memory {
                 cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
@@ -975,6 +1101,45 @@ pub async fn bulk_create(
                 version: 1,
                 lifecycle_state: crate::models::LifecycleState::Open,
             };
+            // #1919 (CWE-288) — per-row agent attestation, mirroring the
+            // single-create sqlite gate (`create.rs` #626 Layer-3). Verify a
+            // presented signature against the caller's bound key and stamp
+            // `attest_level`; a forged / unverifiable signature (or, under
+            // required-attestation, an unsigned row — already batch-rejected
+            // above, kept here as a fail-closed backstop) REJECTS the row into
+            // `errors[]` so it is never persisted or fanned out.
+            if let Some(sig_b64) = row_sig.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                match crate::identity::attest::prepare_signed_store(
+                    sig_b64,
+                    row_created_at.as_deref(),
+                ) {
+                    Ok((sig_bytes, signed_created_at)) => {
+                        mem.created_at = signed_created_at.to_string();
+                        if let Err(e) = crate::identity::attest::stamp_attestation_sync(
+                            &lock.0,
+                            &mut mem,
+                            &caller,
+                            Some(&sig_bytes),
+                        ) {
+                            tracing::warn!("bulk_create: attestation failed: {e}");
+                            errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                            continue;
+                        }
+                    }
+                    Err(msg) => {
+                        errors.push(super::sanitize_bulk_row_error(&msg).to_string());
+                        continue;
+                    }
+                }
+            } else if require_attest
+                && let Err(e) = crate::identity::attest::stamp_attestation_sync(
+                    &lock.0, &mut mem, &caller, None,
+                )
+            {
+                tracing::warn!("bulk_create: required attestation rejected unsigned: {e}");
+                errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
+                continue;
+            }
             // #1788 (5-agent vote 4d3ea1c5) — charge the per-agent daily write
             // quota PER ROW, mirroring the single-write create handler so the
             // bulk surface is no longer a quota-bypass amplifier. A row that

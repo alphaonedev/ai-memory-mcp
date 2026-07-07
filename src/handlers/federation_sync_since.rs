@@ -73,7 +73,14 @@ pub async fn sync_since(
         )
             .into_response();
     }
-    let limit = q.limit.unwrap_or(500).min(10_000);
+    // #1932 (CWE-770) — clamp the outbound page to the SAME
+    // `app.max_page_size` (default 1000) the inbound `/sync/push` path
+    // enforces, instead of a hard-coded 10_000. Pre-fix a hostile peer
+    // could request `?limit=10000` and drive up to ~640 MB of transient
+    // Vec+JSON allocation (10k rows × 64 KiB `content`) before the
+    // response CompressionLayer runs — an asymmetric, peer-triggered
+    // memory-amplification vector. The pull page now matches the push cap.
+    let limit = q.limit.unwrap_or(500).min(app.max_page_size);
 
     // v0.7.0 #239 — per-peer namespace allowlist. Read the
     // `x-peer-id` header + the operator-configured attestation map

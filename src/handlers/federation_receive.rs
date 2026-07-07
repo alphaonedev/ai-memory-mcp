@@ -409,6 +409,46 @@ pub(super) fn apply_inbound_write_attestation(
     .map(|_| ())
 }
 
+/// #1920 (CWE-862) — authorship gate for an inbound federated PENDING
+/// action, mirroring [`resolve_inbound_attribution`] (memories) and
+/// [`signal_author_authorized`] (signals). A pending action is an
+/// authority-granting request: it is later approved + executed as a
+/// `store` / `delete` / `promote` / `reflect` side effect, so a hostile
+/// peer must NOT be able to inject one attributed to an arbitrary
+/// `requested_by` (or smuggle a forged `payload.metadata.agent_id`). The
+/// `pendings[]` loop runs BEFORE `pending_decisions[]`, so an ungated
+/// upsert + a forged approval in the SAME request is the exploit.
+///
+/// Returns `true` when the peer may relay this pending row:
+/// - Zero-config (no allowlist): faith-based — accept (byte-identical to
+///   the pre-fix posture the other lanes preserve for an unenrolled mesh).
+/// - Enrolled posture: accept only when every claimed author (the
+///   `requested_by` and, when present, the store payload's
+///   `metadata.agent_id`) either self-relays (`== sender_agent_id`) or is
+///   in the peer's [`peer_attestation::PeerScope::allowed_sender_agent_ids`].
+#[must_use]
+pub(super) fn pending_author_authorized(
+    pa: &crate::models::PendingAction,
+    sender_agent_id: &str,
+    attest_cfg: &PeerAttestationConfig,
+    peer_id: Option<&str>,
+) -> bool {
+    if !attest_cfg.has_allowlist() {
+        return true;
+    }
+    let payload_agent = pa
+        .payload
+        .get("metadata")
+        .and_then(|m| m.get(crate::META_KEY_AGENT_ID))
+        .and_then(serde_json::Value::as_str);
+    let scope = peer_id.and_then(|p| attest_cfg.scope_for(p));
+    let authorized = |claimed: &str| -> bool {
+        claimed == sender_agent_id
+            || scope.is_some_and(|s| s.allowed_sender_agent_ids.iter().any(|a| a == claimed))
+    };
+    authorized(&pa.requested_by) && payload_agent.is_none_or(authorized)
+}
+
 /// v0.7.0 S6-M2 — compute the next UTC midnight in RFC3339, used as
 /// the `X-Quota-Reset-At` header value when a federation receive is
 /// refused for hitting `memories_per_day` or `links_per_day`. Storage
@@ -1252,6 +1292,44 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #1934 (CWE-284) — confine deletions to the peer's per-peer
+        // `allowed_namespaces` scope, like the read (`/sync/since`) and
+        // write (`memories[]` via `resolve_inbound_attribution`) lanes.
+        // Pre-fix the delete loop consulted NEITHER the peer's namespace
+        // scope NOR per-row ownership, so a peer scoped to `public/*`
+        // could hard-delete rows in `secure/ops` or any other agent's
+        // namespace by guessing ids. Resolve the target row's namespace
+        // and refuse ids outside the peer's scope. A missing row stays a
+        // no-op (unchanged — the peer may have already GC'd it).
+        match db::get(&lock.0, del_id) {
+            Ok(Some(row)) => {
+                if !peer_attestation::namespace_allowed(
+                    peer_header_owned.as_deref(),
+                    &row.namespace,
+                    &attest_cfg,
+                ) {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        memory_id = %del_id,
+                        namespace = %row.namespace,
+                        peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                        "sync_push: refusing federated deletion outside the peer's namespace \
+                         scope (#1934)"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+            Ok(None) => {
+                noop += 1;
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("sync_push: delete pre-resolve failed for {del_id}: {e}");
+                skipped += 1;
+                continue;
+            }
+        }
         match db::delete(&lock.0, del_id) {
             Ok(true) => deleted += 1,
             Ok(false) => noop += 1,
@@ -1433,6 +1511,28 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
+        // #1920 (CWE-862) — gate the pending upsert behind the per-peer
+        // authorship allowlist so a hostile peer cannot inject a pending
+        // action attributed to an arbitrary `requested_by` (or a forged
+        // payload author) and then approve+execute it in the same request.
+        if !pending_author_authorized(
+            pa,
+            &body.sender_agent_id,
+            &attest_cfg,
+            peer_header_owned.as_deref(),
+        ) {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                pending_id = %pa.id,
+                requested_by = %pa.requested_by,
+                sender = %body.sender_agent_id,
+                peer_id = %peer_header_owned.as_deref().unwrap_or(""),
+                "sync_push: peer not authorized to inject a pending action attributed to \
+                 requested_by (#1920) — skipping"
+            );
+            skipped += 1;
+            continue;
+        }
         match db::upsert_pending_action(&lock.0, pa) {
             Ok(()) => {
                 pendings_applied += 1;
@@ -1470,31 +1570,73 @@ pub async fn sync_push(
             noop += 1;
             continue;
         }
-        match db::decide_pending_action(&lock.0, &dec.id, dec.approved, &dec.decider) {
-            Ok(true) => {
-                pending_decisions_applied += 1;
-                // On approve, replay the pending payload so the target
-                // write (store/delete/promote) actually lands on this
-                // peer — matches the originator's post-approve state.
-                if dec.approved {
-                    match db::execute_pending_action(&lock.0, &dec.id) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                "sync_push: execute_pending_action failed for {}: {e}",
-                                dec.id
-                            );
-                        }
+        // #1920 (CWE-862) — an APPROVAL is authority-granting (it triggers
+        // the pending action's store/delete/promote/reflect side effect),
+        // so route it through the SAME hardened governance gate the HTTP
+        // approve surface uses (`approve_with_approver_type`), NOT the raw
+        // `decide_pending_action` which trusted the attacker-supplied
+        // `decider` verbatim. `ApproveSurface::Http` fires the self-approval
+        // reject + registered-approver + approver-type-policy checks
+        // UNCONDITIONALLY — the strongest posture, correct here because the
+        // federation lane has a real adversary (a hostile-but-enrolled
+        // peer). Only a genuinely-approved action is executed; a forged
+        // approval (`decider` == requester, or an unregistered decider) is
+        // refused. A REJECT merely DENIES a pending (converges toward the
+        // originator's rejected state) and grants no authority, so it keeps
+        // the idempotent `decide_pending_action(false)` transition.
+        if dec.approved {
+            match db::approve_with_approver_type(
+                &lock.0,
+                &dec.id,
+                &dec.decider,
+                db::ApproveSurface::Http,
+            ) {
+                Ok(db::ApproveOutcome::Approved) => {
+                    pending_decisions_applied += 1;
+                    // Replay the pending payload so the target write lands
+                    // on this peer — matches the originator's post-approve
+                    // state.
+                    if let Err(e) = db::execute_pending_action(&lock.0, &dec.id) {
+                        tracing::warn!(
+                            "sync_push: execute_pending_action failed for {}: {e}",
+                            dec.id
+                        );
                     }
                 }
+                // Consensus-gated: the relayed vote was recorded but quorum
+                // is not yet met on this peer — nothing to execute.
+                Ok(db::ApproveOutcome::Pending { .. }) => pending_decisions_applied += 1,
+                // Already decided / unknown pending — converged / no-op.
+                Ok(db::ApproveOutcome::NotFound) => noop += 1,
+                Ok(db::ApproveOutcome::Rejected(reason)) => {
+                    tracing::warn!(
+                        target: ATTESTATION_TRACE_TARGET,
+                        pending_id = %dec.id,
+                        decider = %dec.decider,
+                        "sync_push: refusing forged / unauthorized federated approval (#1920): \
+                         {reason}"
+                    );
+                    skipped += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "sync_push: approve_with_approver_type failed for {}: {e}",
+                        dec.id
+                    );
+                    skipped += 1;
+                }
             }
-            Ok(false) => noop += 1, // already decided — converged state
-            Err(e) => {
-                tracing::warn!(
-                    "sync_push: decide_pending_action failed for {}: {e}",
-                    dec.id
-                );
-                skipped += 1;
+        } else {
+            match db::decide_pending_action(&lock.0, &dec.id, false, &dec.decider) {
+                Ok(true) => pending_decisions_applied += 1,
+                Ok(false) => noop += 1, // already decided — converged state
+                Err(e) => {
+                    tracing::warn!(
+                        "sync_push: decide_pending_action (reject) failed for {}: {e}",
+                        dec.id
+                    );
+                    skipped += 1;
+                }
             }
         }
     }
@@ -2075,6 +2217,91 @@ mod tests {
             resolve_inbound_attribution(&mut m5, "ai:relay", &cfg, Some("ai:relay")),
             "ai:relay"
         );
+    }
+
+    /// #1920 ADVERSARIAL — a hostile-but-enrolled peer must not be able to
+    /// inject a pending action attributed to an arbitrary `requested_by`
+    /// (the first half of the forge-governance-approval exploit: inject
+    /// pending P for `victim`, then approve it in the same request).
+    /// `pending_author_authorized` is the gate now protecting the
+    /// `pendings[]` upsert.
+    #[test]
+    fn pending_author_authorized_gates_forged_requester_1920() {
+        use crate::federation::peer_attestation::PeerScope;
+        use crate::models::PendingAction;
+        use std::collections::HashMap;
+
+        fn pending(requested_by: &str, payload_agent: Option<&str>) -> PendingAction {
+            let payload = payload_agent.map_or_else(
+                || serde_json::json!({}),
+                |a| serde_json::json!({ "metadata": { "agent_id": a } }),
+            );
+            PendingAction {
+                id: "P-1920".to_string(),
+                action_type: "store".to_string(),
+                memory_id: None,
+                namespace: "secure/ops".to_string(),
+                payload,
+                requested_by: requested_by.to_string(),
+                requested_at: "2026-07-01T00:00:00Z".to_string(),
+                status: "pending".to_string(),
+                decided_by: None,
+                decided_at: None,
+                approvals: vec![],
+            }
+        }
+
+        // Enrolled: peer "ai:relay" may author only as "bob".
+        let mut peers = HashMap::new();
+        peers.insert(
+            "ai:relay".to_string(),
+            PeerScope {
+                allowed_sender_agent_ids: vec!["bob".to_string()],
+                ..PeerScope::default()
+            },
+        );
+        let cfg = PeerAttestationConfig { peers };
+        let zero = PeerAttestationConfig::default();
+
+        // EXPLOIT (blocked): forge a pending requested_by="victim".
+        let forged = pending("victim", Some("victim"));
+        assert!(
+            !pending_author_authorized(&forged, "ai:relay", &cfg, Some("ai:relay")),
+            "#1920: enrolled peer must NOT inject a pending attributed to an unauthorized agent"
+        );
+
+        // Payload smuggling (blocked): requested_by ok but payload author forged.
+        let smuggled = pending("bob", Some("victim"));
+        assert!(
+            !pending_author_authorized(&smuggled, "ai:relay", &cfg, Some("ai:relay")),
+            "#1920: a forged payload metadata.agent_id must also be gated"
+        );
+
+        // Legit: authorized third-party author ("bob") → accepted.
+        let ok = pending("bob", Some("bob"));
+        assert!(pending_author_authorized(
+            &ok,
+            "ai:relay",
+            &cfg,
+            Some("ai:relay")
+        ));
+
+        // Legit: self-relay (requested_by == sender) → accepted.
+        let selfrelay = pending("ai:relay", None);
+        assert!(pending_author_authorized(
+            &selfrelay,
+            "ai:relay",
+            &cfg,
+            Some("ai:relay")
+        ));
+
+        // Zero-config (unenrolled mesh): faith-based — accepted (back-compat).
+        assert!(pending_author_authorized(
+            &forged,
+            "ai:relay",
+            &zero,
+            Some("ai:relay")
+        ));
     }
 
     /// v0.7.0 #1049 (Agent-5 #9) — `extract_peer_id` validates the
