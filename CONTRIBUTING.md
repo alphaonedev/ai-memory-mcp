@@ -161,11 +161,12 @@ can relax the cleanup + swap steps once you've sized the host
 appropriately (≥ 16 GB RAM + ≥ 50 GB disk recommended for the heavy
 gates).
 
-The 13 per-module coverage thresholds (`coverage/thresholds.toml`)
-were re-pinned to `floor(measured - 0.5)` post-#1146 to absorb the
-~1500 new LOC the enterprise-config campaign landed; future PRs
-ratchet UP from those new floors per the standing
-thresholds-rise-NEVER-fall discipline.
+The per-module coverage thresholds (`coverage/thresholds.toml`) —
+179 entries as of v0.9.0, up from the 13-module snapshot taken
+immediately post-#1146 — were re-pinned to `floor(measured - 0.5)`
+post-#1146 to absorb the ~1500 new LOC the enterprise-config
+campaign landed; future PRs ratchet UP from those new floors per
+the standing thresholds-rise-NEVER-fall discipline.
 
 ## Pull Request Process
 

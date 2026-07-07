@@ -92,19 +92,21 @@ layout: doc
    ### Version pinning (v0.7.0 Gap #3 / issue #804)
 
    For production deployments, pin to an exact version. The substrate
-   honours semver discipline (`0.7.x` series stays backward-compatible;
-   `0.8.0` will land schema bumps and new tools). The supported pin
+   honours semver discipline within a minor series; `0.8.0` (released
+   2026-06-25) and `0.8.1` (released 2026-06-29) already shipped their
+   schema bumps and new tools, and the current release is `0.9.0`
+   (schema v78, 101 MCP tools at `--profile full`). The supported pin
    syntax per channel:
 
    | Channel       | Pin syntax                                                          |
    |---------------|---------------------------------------------------------------------|
-   | Cargo         | `cargo install ai-memory --version =0.7.1 --locked`                 |
-   | cargo-binstall| `cargo binstall ai-memory --version 0.7.1`                          |
-   | Homebrew      | The tap publishes a single rolling `Formula/ai-memory.rb` (no versioned `@0.7.0` formula). Pin by installing the desired release, then `brew pin ai-memory` to block upgrades. |
-   | COPR          | `sudo dnf install ai-memory-0.7.1-1.fc40`                           |
-   | .deb / .rpm   | Download the `0.7.0` artifact from the GH Release; pin by filename. |
-   | AUR           | AUR helpers build the latest PKGBUILD; pin by checking out the package at the `0.7.0-1` revision and `makepkg -si`, or hold with `IgnorePkg = ai-memory` in `pacman.conf`. |
-   | Docker        | `docker pull ghcr.io/alphaonedev/ai-memory:0.7.1` (digest pin is even safer: `@sha256:…`). |
+   | Cargo         | `cargo install ai-memory --version =0.9.0 --locked`                 |
+   | cargo-binstall| `cargo binstall ai-memory --version 0.9.0`                          |
+   | Homebrew      | The tap publishes a single rolling `Formula/ai-memory.rb` (no versioned `@0.9.0` formula). Pin by installing the desired release, then `brew pin ai-memory` to block upgrades. |
+   | COPR          | `sudo dnf install ai-memory-0.9.0-1.fc40`                           |
+   | .deb / .rpm   | Download the `0.9.0` artifact from the GH Release; pin by filename. |
+   | AUR           | AUR helpers build the latest PKGBUILD; pin by checking out the package at the `0.9.0-1` revision and `makepkg -si`, or hold with `IgnorePkg = ai-memory` in `pacman.conf`. |
+   | Docker        | `docker pull ghcr.io/alphaonedev/ai-memory:0.9.0` (digest pin is even safer: `@sha256:…`). |
 
    In CI, prefer the cargo-binstall + `--version` form so the version
    appears in your build manifest and reproducibility is trivial.

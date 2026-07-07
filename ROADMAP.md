@@ -10,7 +10,7 @@
 >
 > **Trademark:** ai-memory™ — USPTO Serial No. 99761257
 > **License:** Apache 2.0 — permanent, non-revocable, non-relicenseable.
-> **Production version:** v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
+> **Production version:** v0.9.0 (schema v78, 101 MCP tools at `--profile full`), a security-hardening and code-review release. It supersedes v0.8.1 (patch release, 2026-06-29) and v0.8.0 (GA, released 2026-06-25; `distributed-coordination`). The prior v0.7.1 patch line (surface area identical to v0.7.0) is itemized in §11.3.1.
 
 ---
 

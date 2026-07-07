@@ -1,7 +1,7 @@
 ---
 layout: doc
 ---
-# ai-memory v0.8.0 — install quickstart (Path A: super simple)
+# ai-memory v0.9.0 — install quickstart (Path A: super simple)
 
 A friendly, no-jargon install guide. If you can use a terminal, you can
 get ai-memory running in under five minutes. No software engineering
@@ -45,13 +45,13 @@ Pick the row that matches your machine. If you're not sure, the
 | **macOS / Linux** — pre-built binary (recommended) | `curl -fsSL https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.sh \| sh` | Downloads the right binary for your CPU, drops it in `~/.cargo/bin` or `~/.local/bin`. No Rust toolchain needed. |
 | **macOS / Linux** — Homebrew tap | `brew install alphaonedev/tap/ai-memory` | The Homebrew tap is owned by AlphaOne. If the tap is not yet live in your region or the formula lags the latest release, fall back to the curl one-liner above or `cargo install ai-memory`. |
 | **Linux / any Unix** — cargo | `cargo install ai-memory` | Needs the Rust toolchain (`rustup`) installed first. Build takes ~2 minutes on a modern laptop. |
-| **Linux** — Docker | `docker pull ghcr.io/alphaonedev/ai-memory:0.7.1` then `docker run --rm -v ai-memory-data:/data ghcr.io/alphaonedev/ai-memory:0.7.1 --version` *(the image's entrypoint is the `ai-memory` binary — pass subcommands/flags directly)* | Zero-toolchain install. The image carries the binary and ships ready to run as a daemon. |
+| **Linux** — Docker | `docker pull ghcr.io/alphaonedev/ai-memory:0.9.0` then `docker run --rm -v ai-memory-data:/data ghcr.io/alphaonedev/ai-memory:0.9.0 --version` *(the image's entrypoint is the `ai-memory` binary — pass subcommands/flags directly)* | Zero-toolchain install. The image carries the binary and ships ready to run as a daemon. |
 | **Fedora / RHEL** — COPR | `sudo dnf copr enable alpha-one-ai/ai-memory && sudo dnf install ai-memory` | Official RPM channel. |
 | **Arch / Manjaro** — AUR | `paru -S ai-memory` *(or your AUR helper of choice)* | Community-maintained, tracking upstream. |
 | **Windows** — PowerShell (pre-built binary) | `irm https://raw.githubusercontent.com/alphaonedev/ai-memory-mcp/main/install.ps1 \| iex` | Drops `ai-memory.exe` into your `%USERPROFILE%\.local\bin` (or equivalent). |
 | **Windows** — cargo via WSL | Inside WSL: `cargo install ai-memory` | Treat WSL like Linux. |
 | **Windows** — cargo native | From a Developer PowerShell: `cargo install ai-memory` | Native Windows build; requires the MSVC toolchain and `rustup` installed first. |
-| **Mobile (iOS / Android) / IoT / edge** | See [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) | The mobile artifacts (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`) ship with every v0.7.x release and embed into your mobile app via the FFI layer. Not a stand-alone CLI install. |
+| **Mobile (iOS / Android) / IoT / edge** | See [`docs/mobile-iot-deployment.md`](mobile-iot-deployment.html) | The mobile artifacts (`ai-memory-ios.xcframework.tar.gz`, `ai-memory-android.tar.gz`) ship with every release, including v0.9.0, and embed into your mobile app via the FFI layer. Not a stand-alone CLI install. |
 
 > **Don't have `cargo`?** Install Rust first:
 > `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
@@ -71,7 +71,7 @@ ai-memory --version
 You should see something like:
 
 ```
-ai-memory 0.7.0
+ai-memory 0.9.0
 ```
 
 If you see `command not found`, your shell's `PATH` is missing the

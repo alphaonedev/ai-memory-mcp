@@ -31,7 +31,7 @@ Verify:
 
 ```bash
 ai-memory --version
-# ai-memory 0.7.0
+# ai-memory 0.9.0
 ```
 
 Full install reference including Windows, Docker, Fedora COPR, Debian
