@@ -299,7 +299,7 @@ args:    ["mcp"]
 ```
 
 That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 7
-tools by default and up to 100 with `--profile full`. Per-harness
+tools by default and up to 101 with `--profile full`. Per-harness
 copy-paste recipes live in [`docs/integrations/`](integrations/):
 **aider**, **claude-agent-sdk**, **cline**, **codex-cli**, **cody**,
 **gemini**, **goose**, **grok-and-xai**, **openclaw**, **roo-code**,
@@ -341,8 +341,8 @@ curl -X POST http://127.0.0.1:9077/api/v1/memory_check_agent_action \
 
 **Production hardening:**
 
-- Set an API key: `ai-memory serve --api-key "$(cat /etc/ai-memory/api.key)"`.
-  All callers then pass `-H "X-API-Key: <key>"`.
+- Set an API key via the `api_key` field in `config.toml` (`serve` has
+  no `--api-key` flag). All callers then pass `-H "X-API-Key: <key>"`.
 - Add TLS: `--tls-cert /etc/ai-memory/cert.pem --tls-key /etc/ai-memory/key.pem`.
 - Pin who can connect: `--mtls-allowlist /etc/ai-memory/peer-fingerprints.txt`.
 

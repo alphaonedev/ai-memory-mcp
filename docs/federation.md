@@ -51,8 +51,11 @@ any HTTP layer code runs.
 
 ### Layer 2 — X-API-Key (application)
 
-```bash
-ai-memory serve --api-key "$(cat /etc/ai-memory/api.key)"
+Set the `api_key` field in `config.toml` (`serve` has no `--api-key`
+flag):
+
+```toml
+api_key = "…"   # e.g. contents of /etc/ai-memory/api.key
 ```
 
 When set, every endpoint except `/api/v1/health` requires the

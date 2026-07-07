@@ -336,7 +336,7 @@ ranking wire, without touching ranking itself.
   the pre-existing strict-posture rejection suites
   (`tests/agent_attestation_integrity.rs`, `tests/agent_attestation_postgres.rs`).
 - **[#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885) / [#1924](https://github.com/alphaonedev/ai-memory-mcp/issues/1924) — mandatory-hook-presence enforcement gate now fires on BOTH the
-  MCP write path and the HTTP write path.** `#1734` (v0.8.1) installed the
+  MCP write path and the HTTP write path.** `#1734` (v0.8.0) installed the
   process-global pre-event enforcement gate (`consult_pre_event_gate`,
   `src/mcp/mod.rs`) for the MCP surface only — a required-event hook
   configured but absent/disabled correctly fails closed there, but an HTTP
@@ -509,6 +509,32 @@ JSON-in-text parsing, with no regression for models that ignore tools.
   `curator_retries_when_tool_args_malformed_then_succeeds`,
   `curator_falls_back_to_text_when_tools_unsupported`.
 
+### G5a/G5b — audit cause-binding + dual-chain witness anchor ([#1822](https://github.com/alphaonedev/ai-memory-mcp/issues/1822); schema v73)
+
+Strengthens **§2.5 (the signed audit trail binds *why* a write happened,
+not just *what*)**. Additive and permissive — byte-identical legacy when
+the require-flags are unset.
+
+- **Schema v73** (both ladders): additive nullable
+  `signed_events.cause_hash` — a 32-byte SHA-256 over a secret-screened,
+  identity-only pre-image of the TRIGGERING CAUSE of an audit-bearing
+  write. Folded PRESENT-ONLY into the cross-row canonical bytes (legacy
+  `NULL`-cause rows hash byte-identically) and into the per-row Ed25519
+  signing input, so tampering the cause breaks both the next row's
+  `prev_hash` link and the row's own signature. `migrations/sqlite/0057_v73_signed_events_cause.sql`
+  + postgres `migrate_v73`; `CURRENT_SCHEMA_VERSION` 72 → 73.
+- **G5b dual-chain witness anchor:** `verify_audit_trail` gains an
+  independent `audit_head_witness` checkpoint (one anchor per 64
+  `signed_events` appends + graceful shutdown) plus per-row cause-binding
+  coverage checks, both surfaced as verdicts on both backends.
+- **Two new K2 require-flags** (both default `false`/permissive — they
+  withhold judgement rather than dirty by default):
+  `AI_MEMORY_REQUIRE_WITNESS` (truthy ⇒ a missing/unpinnable/invalid
+  witness anchor is `WitnessCheck::Missing`, exit 1) and
+  `AI_MEMORY_REQUIRE_CAUSE_BINDING` (truthy ⇒ any `cause_hash IS NULL`
+  row is `CauseBinding::Detected`, exit 1). `Detected`/`Forged` tamper
+  verdicts stay dirty unconditionally regardless of the flags.
+
 ### G6 — append-only spine: every mutation site routed to signed revision leaves ([#1823](https://github.com/alphaonedev/ai-memory-mcp/issues/1823))
 
 Strengthens **§2.5 (index/lifecycle events land in the signed, append-only
@@ -537,6 +563,30 @@ default OFF — byte-identical legacy until enabled).
   — this ships the flag-gated capability; the global default-on flip is
   out of scope here (see §1.5 discipline in the EPIC doc).
 
+### G8 — additive content-addressed BLAKE3 content-id (cid) ([#1825](https://github.com/alphaonedev/ai-memory-mcp/issues/1825); schema v74)
+
+Strengthens **§2.5 (stable, content-addressed genesis identity for
+federation resolution)**. Fully additive — the UUID `id` stays the PK,
+every FK, and the federation LWW tiebreak.
+
+- **Schema v74** (both ladders): additive nullable `memories.cid`
+  (TEXT `b3:<hex>`) + `memories.cid_genesis` (BLOB/BYTEA) columns +
+  `idx_memories_cid`. `cid` is a BLAKE3 content-address minted from a
+  memory's GENESIS fields (`agent_id + namespace + screen(title) +
+  memory_kind + created_at + SHA256(screen(content))`); title/content
+  are secret-screened MODE-INDEPENDENTLY so federated nodes on different
+  `AI_MEMORY_SECRET_SCREEN_MODE` mint the SAME cid. `cid_genesis` is
+  NULLed on erasure (`RecordKind::Forget`) while `cid` is retained so the
+  stored digest can't become a confirmation-oracle.
+  `migrations/sqlite/0058_v74_memories_cid.sql` + postgres `migrate_v74`;
+  `CURRENT_SCHEMA_VERSION` 73 → 74.
+- **`AI_MEMORY_CID_ENFORCE`** (default `false` = detect-and-log): when
+  truthy, a cid/`cid_genesis` mismatch is logged at `WARN` under the
+  `cid.enforce` target. Enforcement is DETECT-AND-LOG ONLY — it never
+  refuses a write and never refuses a federated receive (that would break
+  CRDT convergence). cid is partial-corruption detection + genesis-identity
+  binding, NOT at-rest forgery-evidence.
+
 ### G9 — three-key Recorder/Judge/Stopper signing-layer separation ([#1826](https://github.com/alphaonedev/ai-memory-mcp/issues/1826))
 
 Strengthens **§2.5 (governance verdicts/enforcement land in the signed
@@ -551,7 +601,9 @@ chain)**. Additive and opt-in — byte-identical legacy when unconfigured.
   the deny decision itself). `verify_chain` / `verify_audit_trail`
   (postgres twin) both gain per-row Recorder signature verification plus
   a shared `RoleSeparationCheck` (pin-first judge/stopper pubkeys +
-  pairwise distinctness), fail-closed under the require flag.
+  pairwise distinctness), fail-closed under the require flag
+  `AI_MEMORY_REQUIRE_ROLE_SEPARATION` (default `false`/permissive; when
+  truthy a failed check hard-blocks the verdict).
 - Tested (all CI-run): `tests/role_separation_1826.rs` — legacy
   byte-equality, recorder/judge/stopper signature pins, cross-role
   forgery (all four legs), require-flag fail-closed, domain separation,
@@ -606,7 +658,10 @@ legacy resolution through the flat `metadata.agent_pubkey`.
   (composite PK `(agent_id, epoch)`) on both backends; CLI
   `identity enroll-lineage` / `succeed` / `register-recovery-key`;
   `verify-audit-trail` surfaces the `LineageCheck` verdict on both
-  backends.
+  backends. New require-flag `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`
+  (default `false`/permissive): when truthy, a broken or absent
+  succession chain fails closed rather than falling back to the flat
+  `metadata.agent_pubkey`.
 - Tested (all CI-run): `tests/identity_lineage_succession.rs`.
 - **Honest scope (per ROADMAP §26.5 — see EPIC §B5):** this ships
   **rotation-survival continuity only** — a *voluntary* predecessor

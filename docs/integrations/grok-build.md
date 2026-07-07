@@ -344,7 +344,7 @@ printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_n
 
 ```text
 ai-memory: loaded config from ~/.config/ai-memory/config.toml
-ai-memory: profile = 8 families ... expected tool count = 100
+ai-memory: profile = 8 families ... expected tool count = 101
 ai-memory MCP server started (stdio, tier=autonomous)
 ```
 

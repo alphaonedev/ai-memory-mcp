@@ -264,13 +264,13 @@ human approval.
 
 ---
 
-## 7. Self-Review (the six gates)
+## 7. Self-Review (the ten gates)
 
-Before requesting human review, run all six gates locally and paste the results into
-the PR description. The set is **four cargo gates** + **two script gates** introduced
-by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the substrate-
-canonical-discipline campaign (CLAUDE.md §"Lint gates (issue #1174 PR10)" is the
-canonical contract).
+Before requesting human review, run all ten gates locally and paste the results into
+the PR description. The set is **four cargo gates** + **six script gates** — the two
+introduced by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the
+substrate-canonical-discipline campaign, plus the four added since (CLAUDE.md §"Lint
+gates (issue #1174 PR10)" is the canonical contract).
 
 ```bash
 cargo fmt --check
@@ -279,10 +279,14 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-number HARD-BLOCK (#1200)
 scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
+scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
+scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
+scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
+scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BLOCK (#1880)
 ```
 
-All six must be clean. If clippy pedantic requires `#[allow(clippy::...)]`, justify it
-in the PR description. Both script gates are wired into
+All ten must be clean. If clippy pedantic requires `#[allow(clippy::...)]`, justify it
+in the PR description. All six script gates are wired into
 `.github/workflows/c8-precheck.yml` and will block any PR that fails them.
 
 In addition, walk the **manual security checklist** in
@@ -291,7 +295,7 @@ findings in the 10 areas (SQL injection, `validate_id()` coverage, command injec
 path traversal, `unwrap()`, error message leakage, race conditions, auth/authz, data in
 logs, CORS).
 
-For documentation-only PRs the six gates are still required (they should pass without
+For documentation-only PRs the ten gates are still required (they should pass without
 changes), but the security checklist may be skipped if no source files changed.
 
 ---
@@ -321,6 +325,10 @@ PRs target `develop`. **Never** target `main`.
 - [ ] cargo audit
 - [ ] scripts/check-vendor-literals.sh (vendor-monoculture + SECS_PER_* — #1200)
 - [ ] scripts/qc-codegraph-precheck.sh (C8 caller-context allowlist + structural drift — #923)
+- [ ] scripts/check-l3-boundary.sh (L3-boundary perma-ban — §25.3 S5 / RQ-10, #1853)
+- [ ] scripts/check-hardcoded-literals.sh (hardcoded-literal duplication ratchet — pm-v3.1)
+- [ ] scripts/check-docs-vs-ssot.sh (docs-vs-SSOT drift — operator directive 2026-05-31)
+- [ ] scripts/check-cloud-init-ascii.sh (cloud-init template ASCII-only — #1880)
 - [ ] Manual security checklist (Engineering Standards §3.2) reviewed
 - [ ] Documentation sync (test counts, tool counts) where applicable
 
@@ -439,7 +447,7 @@ Quick reference: which `ai-memory` tools and external commands you use at each p
 | 4 Branching | — | `git checkout -b <type>/<slug> origin/develop` |
 | 5 Implementation | `memory_store` (debug, decision) | `git add`, `git commit` (with Co-Authored-By trailer) |
 | 6 Memory hygiene | `memory_store`, `memory_link`, `memory_detect_contradiction`, `memory_consolidate` | — |
-| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit`, `scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh` (6 gates) |
+| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit`, `scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh` (10 gates) |
 | 8 PR submission | `memory_store` (followup) | `git push -u origin <branch>`, `gh pr create --base develop` |
 | 9 Handoff | `memory_promote`, `memory_store` (outcome), `memory_link` | `gh pr view`, `gh issue close` (only if necessary) |
 
