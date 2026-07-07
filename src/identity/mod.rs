@@ -54,9 +54,14 @@
 //!
 //! # Trust
 //!
-//! `agent_id` is a *claimed* identity, not an *attested* one. Do not use it
-//! for security decisions without pairing it with agent registration (Task
-//! 1.3) and, eventually, signed attestations.
+//! `agent_id` is a *claimed* identity, not an *attested* one. On the store
+//! path that claim is no longer trusted on its own: as of v0.9 (#1751)
+//! signed store-path attestations have shipped and are REQUIRED by default.
+//! [`crate::identity::verify::attest_write`] rejects an unsigned write (or
+//! one whose agent has no bound key) unless
+//! `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` restores the pre-v0.9 permissive
+//! posture. Pair `agent_id` with agent registration (Task 1.3) and that
+//! default-on attestation gate before relying on it for security decisions.
 
 use std::sync::OnceLock;
 

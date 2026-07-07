@@ -815,7 +815,8 @@ pub async fn api_key_auth(
     // A deeper hardening — extract peer-id from the client cert's
     // Subject CN / SAN and cross-check against X-Peer-Id — requires
     // axum to expose the peer certificate via request extensions; a
-    // focused follow-up tracks that v0.8 surface change. For v0.7.0
+    // focused follow-up still tracks that surface change — once planned
+    // for v0.8 but unlanded and still open as of v0.9.0. In the meantime
     // the #1031 signed-GET gate + the env-default-secure posture
     // close the acute exploitability surface.
     let path = req.uri().path();

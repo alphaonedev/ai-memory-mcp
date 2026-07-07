@@ -26,9 +26,11 @@
 //! rustls server connection. Closing that gap requires either a
 //! non-trivial axum-server PR or a new x509-parser dependency wired
 //! into a custom `ClientCertVerifier` that stashes per-connection
-//! state. **That work is escalated to v0.8.0** and tracked under the
+//! state. **That work was once planned for v0.8.0 but never landed; it
+//! remains unimplemented as of v0.9.0**, still tracked under the
 //! follow-up to issues #238/#239 in the PR body that landed this
-//! module.
+//! module. Until it ships, the mTLS client-cert fingerprint pin remains
+//! the sole cryptographic peer anchor.
 //!
 //! What this module DOES give v0.7.0:
 //!
