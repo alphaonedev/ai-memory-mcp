@@ -622,18 +622,36 @@ async fn refused_storage_insert_signs_signed_events_row_when_daemon_keyed_1035()
         .expect("graceful drain");
 
     // Assert the row has both a non-empty signature AND the
-    // `daemon_signed` attest_level.
+    // `daemon_signed` attest_level, then reconstruct the FULL row so we can
+    // recompute the exact bytes the daemon key signed.
     let conn = db::open(&db_path).expect("reopen db");
-    let (sig_bytes, attest_level, payload_hash_bytes): (Option<Vec<u8>>, String, Vec<u8>) = conn
+    let row: ai_memory::signed_events::SignedEvent = conn
         .query_row(
-            "SELECT signature, attest_level, payload_hash FROM signed_events \
+            "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                    timestamp, prev_hash, sequence, cause_hash FROM signed_events \
              WHERE event_type = ?1 AND agent_id = ?2",
             rusqlite::params![GOVERNANCE_REFUSAL_EVENT_TYPE, "agent:1035-signed"],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                Ok(ai_memory::signed_events::SignedEvent {
+                    id: r.get(0)?,
+                    agent_id: r.get(1)?,
+                    event_type: r.get(2)?,
+                    payload_hash: r.get(3)?,
+                    signature: r.get(4)?,
+                    attest_level: r.get(5)?,
+                    timestamp: r.get(6)?,
+                    prev_hash: r.get::<_, Option<Vec<u8>>>(7)?.unwrap_or_default(),
+                    sequence: r.get(8)?,
+                    cause_hash: r.get::<_, Option<Vec<u8>>>(9)?,
+                })
+            },
         )
         .unwrap();
 
-    let sig_bytes = sig_bytes.expect("signature must be populated when daemon key installed");
+    let sig_bytes = row
+        .signature
+        .clone()
+        .expect("signature must be populated when daemon key installed");
     assert_eq!(
         sig_bytes.len(),
         64,
@@ -641,18 +659,32 @@ async fn refused_storage_insert_signs_signed_events_row_when_daemon_keyed_1035()
         sig_bytes.len()
     );
     assert_eq!(
-        attest_level, "daemon_signed",
+        row.attest_level, "daemon_signed",
         "attest_level must be `daemon_signed` when daemon key installed"
     );
 
-    // Defense-in-depth — verify the signature actually validates
-    // against the daemon's verifying key over the stored payload_hash.
-    // This proves the sig binds to the row's content, not just that
-    // we wrote arbitrary bytes.
+    // Defense-in-depth — verify the signature validates against the daemon's
+    // verifying key. #1925 (CWE-347): the per-row daemon signature now binds the
+    // FULL identity tuple (agent_id/event_type/attest_level/timestamp/sequence/
+    // payload_hash/cause) via `daemon_row_signing_input`, NOT `payload_hash`
+    // alone, so a head-row identity edit invalidates the signature. We recompute
+    // the EXACT bytes the daemon key signed (a fresh, symmetric sign→verify
+    // round-trip using the production signing-input function) — proving the sig
+    // binds the row's whole identity, strictly stronger than the pre-#1925
+    // payload_hash-only check.
     let sig = Signature::from_slice(&sig_bytes).expect("64-byte ed25519 signature");
+    let signing_input = ai_memory::signed_events::daemon_row_signing_input(&row);
     daemon_vk
-        .verify(&payload_hash_bytes, &sig)
-        .expect("daemon verifying key must verify the stored sig over payload_hash");
+        .verify(&signing_input, &sig)
+        .expect("daemon verifying key must verify the stored sig over the #1925 identity input");
+
+    // And the AUTHORITATIVE production verifier agrees (no signature failures).
+    let report = ai_memory::signed_events::verify_chain(&conn, None).expect("verify_chain");
+    assert!(report.chain_holds(), "chain must hold: {report:?}");
+    assert!(
+        report.signature_failures.is_empty(),
+        "production verifier must accept the daemon-signed row: {report:?}"
+    );
 }
 
 #[tokio::test]
