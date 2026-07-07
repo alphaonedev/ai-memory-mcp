@@ -208,6 +208,94 @@ pub(crate) fn http_caller_ctx(
     crate::store::CallerContext::for_agent(resolved)
 }
 
+/// #1886 / #1911 — single SSOT for the create / bulk-create `expires_at`
+/// resolution so every backend (SQLite + Postgres, single + bulk) derives
+/// the row's expiry identically. Precedence mirrors the original sqlite
+/// `create_memory` body:
+///
+/// 1. an explicit caller `expires_at` (RFC3339) wins verbatim;
+/// 2. else a caller-supplied `ttl_secs` → `now + ttl_secs`;
+/// 3. else the operator-configured tier default (`ResolvedTtl::ttl_for_tier`).
+///
+/// Returns `None` (an immortal row) only when all three are absent.
+///
+/// Pre-#1886 the Postgres single-create path bound `expires_at` from the
+/// explicit field ONLY, silently dropping a validated `ttl_secs` — an
+/// ephemeral `{"ttl_secs":3600}` write landed as an immortal row on a
+/// postgres-backed daemon, a data-retention divergence versus sqlite.
+/// Pre-#1911 the Postgres bulk path honoured `ttl_secs` but omitted the
+/// tier-default fallback. Routing all four call sites through this helper
+/// makes the divergence impossible by construction.
+#[must_use]
+pub fn resolve_create_expires_at(
+    now: chrono::DateTime<chrono::Utc>,
+    explicit: Option<String>,
+    ttl_secs: Option<i64>,
+    tier_default_secs: Option<i64>,
+) -> Option<String> {
+    explicit.or_else(|| {
+        ttl_secs
+            .or(tier_default_secs)
+            .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339())
+    })
+}
+
+#[cfg(test)]
+mod resolve_create_expires_at_tests {
+    use super::resolve_create_expires_at;
+    use chrono::{Duration, TimeZone, Utc};
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn explicit_expires_at_wins_verbatim() {
+        let out = resolve_create_expires_at(
+            fixed_now(),
+            Some("2030-01-01T00:00:00+00:00".to_string()),
+            Some(3600),
+            Some(60),
+        );
+        assert_eq!(out.as_deref(), Some("2030-01-01T00:00:00+00:00"));
+    }
+
+    #[test]
+    fn ttl_secs_is_honoured_when_no_explicit_expiry_1886() {
+        // #1886 regression: a caller-supplied `ttl_secs` MUST become an
+        // expiry. Pre-fix the postgres single-create path returned `None`
+        // here (immortal row).
+        let out = resolve_create_expires_at(fixed_now(), None, Some(3600), None);
+        let expected = (fixed_now() + Duration::seconds(3600)).to_rfc3339();
+        assert_eq!(out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn ttl_secs_takes_precedence_over_tier_default() {
+        let out = resolve_create_expires_at(fixed_now(), None, Some(3600), Some(60));
+        let expected = (fixed_now() + Duration::seconds(3600)).to_rfc3339();
+        assert_eq!(out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn tier_default_applies_when_no_explicit_or_ttl_1911() {
+        // #1911 regression: with neither explicit expiry nor `ttl_secs`,
+        // the configured tier default must still expire the row. Pre-fix
+        // the postgres bulk path returned `None` (immortal row).
+        let out = resolve_create_expires_at(fixed_now(), None, None, Some(21600));
+        let expected = (fixed_now() + Duration::seconds(21600)).to_rfc3339();
+        assert_eq!(out.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn none_when_all_absent_stays_immortal() {
+        assert_eq!(
+            resolve_create_expires_at(fixed_now(), None, None, None),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod require_caller_owns_memory_tests {
     use super::*;

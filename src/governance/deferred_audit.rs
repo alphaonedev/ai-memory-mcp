@@ -589,11 +589,32 @@ impl DeferredAuditQueue {
         (queue, receiver)
     }
 
-    /// Submit a refusal event. Non-blocking. Never panics — if the
-    /// receiver is closed the metric counter is bumped and a
-    /// tracing::warn is emitted, but the caller path is unaffected.
-    /// Returns `true` when the event was queued, `false` when the
-    /// receiver was already closed.
+    /// Submit a refusal event.
+    ///
+    /// **Blocking semantics (#1912 — doc corrected to match behaviour):**
+    /// when a crash-durable journal is configured
+    /// (`new_with_journal(Some(_))`), this performs a durable `write_all`
+    /// + `sync_all` (fsync) on the CALLING thread BEFORE the channel send.
+    /// That is the #1732 PE-4 durability contract: the event must be on
+    /// stable storage before it is observable to the drainer, so a SIGKILL
+    /// after `submit` returns cannot lose it. The fsync can block for the
+    /// duration of the disk sync, and on the storage-refusal path this
+    /// runs inside the `GOVERNANCE_PRE_WRITE` hook while the substrate's
+    /// writer `Mutex<Connection>` is held, so a slow disk stalls the
+    /// shared writer for that window. It is therefore NOT non-blocking
+    /// when a journal is attached; without a journal (the `new()` / test
+    /// default) it only does the channel send and never blocks on IO.
+    /// Moving the fsync off this thread is intentionally NOT done — it
+    /// would break the durable-before-observable guarantee above.
+    ///
+    /// The delivery channel is an unbounded mpsc; the per-event fsync
+    /// self-throttles the producer, applying implicit backpressure rather
+    /// than growing without bound in practice.
+    ///
+    /// Never panics — if the receiver is closed the metric counter is
+    /// bumped and a `tracing::warn` is emitted, but the caller path is
+    /// unaffected. Returns `true` when the event was queued, `false` when
+    /// the receiver was already closed.
     pub fn submit(&self, event: DeferredAuditEvent) -> bool {
         self.metrics.submitted.fetch_add(1, Ordering::Relaxed);
         // v0.8.0 PE-4 (#1732) — durability point: journal the event
@@ -2133,6 +2154,37 @@ mod tests {
             .replay()
             .unwrap();
         assert!(after.is_empty(), "journal must be truncated post-recovery");
+    }
+
+    #[test]
+    fn submit_with_journal_is_durable_before_return_1912() {
+        // #1912 — the corrected `submit` doc states that when a journal is
+        // configured the event is durably fsync'd BEFORE `submit` returns
+        // (it is NOT the "non-blocking" fire-and-forget the old doc
+        // claimed). Lock that contract: after `submit` returns, replaying
+        // the journal from an INDEPENDENT handle must already observe the
+        // event — i.e. it hit stable storage synchronously on this thread,
+        // before the channel send, with no drainer involved.
+        let dir = fresh_tempdir();
+        let journal_path = dir.path().join("durable-submit.journal");
+        let journal = Arc::new(DeferredAuditJournal::open(&journal_path).expect("open journal"));
+        let (queue, _rx) = DeferredAuditQueue::new_with_journal(Some(journal));
+
+        let queued = queue.submit_refusal("agent:durable", &refusal_action(), &refusal_decision());
+        assert!(queued, "submit must enqueue while the receiver is alive");
+
+        // Independent handle → proves the bytes are on disk, not merely in
+        // the writer's in-process buffer.
+        let replayed = DeferredAuditJournal::open(&journal_path)
+            .expect("reopen journal")
+            .replay()
+            .expect("replay");
+        assert_eq!(
+            replayed.len(),
+            1,
+            "the refusal must be durably journaled before submit() returns"
+        );
+        assert_eq!(replayed[0].agent_id, "agent:durable");
     }
 
     #[test]
