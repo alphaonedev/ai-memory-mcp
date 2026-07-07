@@ -51,8 +51,9 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 
 ## Testing Requirements
 
-All six checks must pass before submitting a PR (four cargo gates + two
-script gates introduced by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)):
+All ten checks must pass before submitting a PR (four cargo gates + six
+script/workflow gates wired into `.github/workflows/c8-precheck.yml`,
+starting with the two introduced by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)):
 
 ```bash
 cargo fmt --check
@@ -61,10 +62,14 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-number HARD-BLOCK (#1200)
 scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
+scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
+scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
+scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
+scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BLOCK (#1880)
 ```
 
-- All six checks must pass. CI will reject PRs that fail any of them.
-  The two script gates are wired into `.github/workflows/c8-precheck.yml`
+- All ten checks must pass. CI will reject PRs that fail any of them.
+  The six script/workflow gates are wired into `.github/workflows/c8-precheck.yml`
   alongside the four cargo gates. See [CLAUDE.md §"Lint gates (issue #1174 PR10)"](CLAUDE.md)
   for the full contract + allowlist policy.
 - `AI_MEMORY_NO_CONFIG=1` prevents loading `~/.config/ai-memory/config.toml` which may trigger embedder/LLM initialization.
@@ -167,7 +172,7 @@ thresholds-rise-NEVER-fall discipline.
 1. Fork the repository (external contributors) or branch directly (collaborators).
 2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
-4. Ensure all six gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the two script gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`) — see [CLAUDE.md §"Lint gates"](CLAUDE.md).
+4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CLAUDE.md §"Lint gates"](CLAUDE.md).
 5. Push your branch and open a pull request against `develop` (not `main`).
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.
@@ -213,7 +218,7 @@ The `main` branch is protected. The following rules are enforced:
 
 - **No direct pushes to `main`.** All changes must go through a pull request.
 - **Owner approval required.** Every PR to `main` requires approval from `@alphaonedev` (CODEOWNERS). No exceptions.
-- **CI must pass.** Both `Check (ubuntu-latest)` and `Check (macos-latest)` status checks must succeed before merge.
+- **CI must pass.** The `check` job in `.github/workflows/ci.yml` runs across a 3-OS matrix — `Check (ubuntu-latest)`, `Check (macos-latest)`, and `Check (windows-latest)` — and all three must succeed before merge. The actual required-status-check set enforced on `main` is the SOURCE-OF-TRUTH manifest in [`.github/branch-protection.yml`](.github/branch-protection.yml): the three Batman Mode acceptance-gate checks, `C8 caller-context allowlist check`, and `Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)` — none of the per-OS `Check (...)` matrix legs are themselves pinned as required in that manifest.
 - **Stale reviews are dismissed.** If you push new commits after receiving approval, the approval is invalidated and must be re-granted.
 - **Force pushes and branch deletion are blocked** on `main`.
 

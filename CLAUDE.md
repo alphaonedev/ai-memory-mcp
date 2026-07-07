@@ -934,9 +934,11 @@ but new public operations live on the trait.
 
 ### Lint gates (issue #1174 PR10 — pm-v3.1 vendor-monoculture + SECS_PER_*)
 
-Three script-based lint gates run in CI alongside the four cargo gates
+Six script-based lint gates run in CI alongside the four cargo gates
 (fmt / clippy / test / audit). All are HARD-BLOCK and are wired into
-`.github/workflows/c8-precheck.yml`.
+`.github/workflows/c8-precheck.yml` as six separate jobs (`c8-precheck`,
+`vendor-literal-gate`, `l3-boundary-gate`, `hardcoded-literal-gate`,
+`docs-vs-ssot-drift`, `cloud-init-ascii-gate`).
 
 **0. Hardcoded-literal duplication ratchet (pm-v3.1)** —
 `scripts/check-hardcoded-literals.sh`. The mechanical enforcement of the
@@ -1032,6 +1034,37 @@ this section. Operator-approved review before merge.
 The heuristic mirrors `scripts/qc-codegraph-precheck.sh` so the
 two gates have the same production-vs-test boundary across the
 codebase.
+
+**3. L3-boundary perma-ban gate** (§25.3 S5 / RQ-10, #1853) —
+`scripts/check-l3-boundary.sh`. HARD-BLOCKS the case-insensitive
+pattern `rqgm|epoch_manifest|red.?queen` anywhere in `src/`
+(string literal or comment) — these are internal design-doc
+identifiers that must never leak into the shipped binary's
+symbol/string surface. The ruled PUBLIC identifiers
+(`SignableEpochManifest`, `epoch.manifest_applied`,
+`EpochAdvance`, `EPOCH_APPLIED`, `epoch_seq`, `prior_epoch_id`)
+are gate-clean by construction. `--self-test` plants a violation
+in a tmpdir and confirms the gate rejects it.
+
+**4. Docs vs SSOT drift gate** (v0.7.0 operator directive
+2026-05-31) — `scripts/check-docs-vs-ssot.sh`. Markdown has no
+native variables, so this gate is the minimal-infra answer:
+parses the canonical Rust SSOT consts (`CURRENT_SCHEMA_VERSION`,
+`EXPECTED_PRODUCTION_ROUTES_COUNT`, `EXPECTED_CLI_SUBCOMMANDS_*`,
+`Profile::full().expected_tool_count()`, `Memory::FIELD_COUNT`,
+etc.), walks the operator-facing `.md` files for known
+narrative-count patterns, and HARD-BLOCKS when any cited value
+drifts from the canonical. `--self-test` stages a contrived
+stale-claim doc in a tmpdir and confirms the gate catches it.
+
+**5. Cloud-init ASCII gate** (#1880) — `scripts/check-cloud-init-ascii.sh`.
+A stray non-ASCII byte (a U+2014 em-dash) in a DigitalOcean
+cloud-init template made cloud-init silently discard the config
+and boot a BARE droplet with none of the postgres/AGE/pgvector
+substrate — a silent provisioning failure only visible on SSH
+triage. HARD-BLOCKS any non-ASCII byte in `infra/do-hive/*.tpl`.
+`--self-test` plants the exact #1880 em-dash byte in a tmpdir
+template and confirms the gate rejects it.
 
 ## Prime directive (operator-set, 2026-05-17)
 

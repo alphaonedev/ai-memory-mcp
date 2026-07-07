@@ -311,11 +311,13 @@ timestamp that was signed.
   signed `created_at` verbatim**.
 - A `signature` whose `created_at` is outside a **±300 s** freshness
   window is rejected.
-- An unsigned write lands `metadata.attest_level = "claimed"` under the
-  default permissive posture. When the operator sets
-  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (truthy), an unsigned write is
-  **rejected** instead. This flag governs only the unsigned-write
-  disposition; a presented signature is always verified regardless.
+- As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)), an unsigned write is **rejected** by default
+  (`403 ATTESTATION_FAILED`) rather than landing `metadata.attest_level =
+  "claimed"`. Only with the explicit opt-out
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`) does an unsigned
+  write land `claimed`; any other value falls through to the required
+  default. This flag governs only the unsigned-write disposition; a
+  presented signature is always verified regardless.
 
 This wire is identical across the three store surfaces (MCP
 `memory_store`, this HTTP endpoint, and the CLI `--sign` path).

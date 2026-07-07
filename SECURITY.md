@@ -6,6 +6,7 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 
 | Version    | Supported |
 |------------|-----------|
+| v0.9.x     | ✅ Active  |
 | v0.8.x     | ✅ Active  |
 | v0.7.x     | ✅ Active  |
 | v0.6.4     | ✅ Active (LTS through v1.0 ship) |
@@ -13,6 +14,19 @@ ai-memory is a substrate for persistent AI/agent memory. Customers and AgenticMe
 | v0.6.3 and earlier | ❌ End of life |
 
 When v1.0 ships (Q2 2027), only the two most recent minor versions receive security fixes.
+
+## v0.9.0 secure-default changes (BREAKING) — operator action may be required
+
+v0.9.0 ships a 49-fix security/code-review hardening pass ([#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885)–[#1935](https://github.com/alphaonedev/ai-memory-mcp/issues/1935)); the two write-path-wide defaults below have already flipped in this release. Operators upgrading from v0.8.x must review these:
+
+| Change | New default | Migration |
+|--------|-------------|-----------|
+| **#1751** Store-path agent attestation | **now REQUIRED by default** (was permissive) — an unsigned MCP `memory_store` / HTTP `POST /api/v1/memories` / CLI `store` is **rejected** (`403 ATTESTATION_FAILED`) instead of landing `attest_level="claimed"` | sign writes (`ai-memory store --sign` with a keypair bound via `ai-memory agents bind-key`), or set the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to restore the pre-v0.9 permissive posture |
+| **#1885** / **#1924** Mandatory-hook-presence enforcement gate | now consulted on BOTH the MCP write path and the HTTP write path (was MCP-only, closing a silent-bypass gap where an HTTP write never saw a configured mandatory hook) | inert unless `AI_MEMORY_HOOKS_ENFORCE_MODE=enforce` is configured; no operator action needed otherwise |
+| **#1919** `bulk_create` | now attestation-gated per row, mirroring the #1751 single-write requirement | ensure every row in a `bulk_create` batch carries a valid attestation, or use the `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out |
+| **#1920** Federation approval authorship | an inbound federated PENDING approval must be attributed to the peer's registered approver | no operator action unless you were relying on unauthenticated cross-peer approvals (not a supported posture) |
+| **#1921** `team`/`unit`/`org` visibility scope | scope hierarchy now enforced correctly (was over-broad across the subtree) | review namespace ACLs if you depended on the pre-#1921 broader visibility |
+| **#1923** `skill_register` `folder_path` import | canonicalized + confined under the configured root; symlinks inside the imported tree are refused | ensure skill-import trees do not rely on symlinks pointing outside the root |
 
 ## v0.8.0 secure-default changes (BREAKING) — operator action may be required
 
@@ -29,7 +43,7 @@ v0.8.0 flips several defaults to fail-closed/secure postures. Operators upgradin
 | **#1718** Federated action-state transitions require an inner per-transition signature | `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG=1` (fail-closed) | set `=0` for heterogeneous-rollout windows |
 
 **Known posture notes (by design — not vulnerabilities):**
-- **Store-path agent attestation is permissive by default** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → unsigned writes land `attest_level="claimed"`). A deprecation WARN ships now; the default flips to fail-closed in v0.9 (#1751). Multi-agent operators should set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` early. `metadata.agent_id` is a *claimed* identity — do not use it for authorization decisions without attestation.
+- **Store-path agent attestation is REQUIRED by default as of v0.9.0** (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset → an unsigned write is **rejected**, `403 ATTESTATION_FAILED`, rather than landing `attest_level="claimed"`). See the "v0.9.0 secure-default changes" table above (#1751). Operators who need the pre-v0.9 permissive posture must set the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`. `metadata.agent_id` is a *claimed* identity even under attestation — do not use it for authorization decisions without checking `attest_level`.
 - **At-rest content encryption (#228)** is wired on both backends but **off by default** (verbatim plaintext); enable with `AI_MEMORY_ENCRYPT_AT_REST=1` (or `[storage] encrypt_at_rest = true`). It is an application-layer ChaCha20-Poly1305 / X25519 / HKDF per-memory content envelope, independent of the SQLCipher build — so it works on plain SQLite *and* Postgres (the two are orthogonal and compose). Fail-closed on write when enabled without an `agent_id` to key to, and on read when the keying material is missing.
 - **The curator daemon reads across all tenants** (`bypass_visibility`, admin-class) to perform background maintenance (reflect/consolidate/decay). Treat curator credentials as root-equivalent; it is C8-allowlist-gated in CI but is a privileged in-process actor.
 - **Namespace governance is allow-on-silence (#1569)**: a namespace with no configured standard defaults to `write/promote: Any`. `enforce` permissions mode does nothing until you install rules / namespace standards. Configure explicit standards for production / multi-tenant namespaces.
@@ -129,4 +143,4 @@ Per [`ROADMAP.md`](ROADMAP.md) §15: ai-memory is Apache 2.0 forever. Security f
 
 ---
 
-Last updated: 2026-06-24 (v0.8.0 secure-default changes + at-rest encryption crypto entry).
+Last updated: 2026-07-07 (v0.9.0 secure-default changes — store-path attestation required by default #1751, dual MCP+HTTP hook-enforcement gate #1885/#1924, plus the #1885-#1935 code-review hardening pass).
