@@ -1,0 +1,9 @@
+# Never commit generated key material / certs / ephemeral test artifacts.
+out/
+*.key
+*.crt
+*.csr
+*.srl
+pg.*.err
+*.db*
+*.journal
