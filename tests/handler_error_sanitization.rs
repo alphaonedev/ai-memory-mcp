@@ -70,6 +70,13 @@ const FORBIDDEN_LEAK_SUBSTRINGS: &[&str] = &[
 /// Build an in-memory router with the same wiring `build_router` uses
 /// in `serve()` so the test exercises the production handler chain.
 fn build_router() -> axum::Router {
+    // #1919 — this suite pins error-SANITIZATION, not attestation; opt out
+    // of the v0.9 required-agent-attestation default so the unsigned bulk /
+    // import rows reach the sanitiser instead of a 403 ATTESTATION_FAILED.
+    static ATTEST: std::sync::Once = std::sync::Once::new();
+    ATTEST.call_once(|| unsafe {
+        std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0");
+    });
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let path = std::path::PathBuf::from(":memory:");
     let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((

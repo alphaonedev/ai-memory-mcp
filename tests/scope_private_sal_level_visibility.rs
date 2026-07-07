@@ -371,10 +371,19 @@ fn is_visible_to_caller_predicate_truth_table() {
     // collective ⇒ visible to everyone
     assert!(is_visible_to_caller(&collective, "bob"));
     assert!(is_visible_to_caller(&collective, "alice"));
-    // team ⇒ visible to everyone (only `private` is dropped at SAL —
-    // namespace-shape scopes are handled by the storage-layer
-    // visibility_clause; SAL drops only `private`)
-    assert!(is_visible_to_caller(&team, "bob"));
+    // #1921 (CWE-863) — team/unit/org are SUBTREE-restricted, NOT world-
+    // readable. Pre-fix `is_visible_to_caller` returned true for a team row
+    // to ANY caller (the leak); post-fix a caller inside the row's
+    // namespace subtree still sees it, but a cross-subtree caller (bob, no
+    // shared namespace ancestor) is denied.
+    assert!(
+        is_visible_to_caller(&team, &format!("{NS}/agent-x")),
+        "#1921: a caller inside the team subtree still sees the team row"
+    );
+    assert!(
+        !is_visible_to_caller(&team, "bob"),
+        "#1921: a cross-subtree caller must NOT see a team-scoped row (was the CWE-863 leak)"
+    );
     // missing scope ⇒ treated as private (NHI contract default)
     assert!(is_visible_to_caller(&no_scope, "alice"));
     assert!(!is_visible_to_caller(&no_scope, "bob"));
