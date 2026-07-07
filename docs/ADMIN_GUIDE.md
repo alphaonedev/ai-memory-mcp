@@ -1001,10 +1001,13 @@ context and the threat model are tracked on issue [#148](https://github.com/alph
 
 ### Trust model
 
-**By default `metadata.agent_id` is a *claimed* identity, not an *attested* one.** Any
-caller able to invoke the CLI / MCP / HTTP API can set any well-formed
-`agent_id` on an *unsigned* write. Use such an id for provenance, audit, and
-filter scoping — **never as an authorization gate on its own.**
+**`metadata.agent_id` is a *self-asserted* identity string — treat it as a claim,
+not proof, even on an *attested* write.** Any caller able to invoke the CLI / MCP /
+HTTP API can set any well-formed `agent_id`; what a signature attests is the
+`attest_level`, not that the id itself is trustworthy for authorization. Use such
+an id for provenance, audit, and filter scoping — **never as an authorization gate
+on its own.** (Whether an *unsigned* write is accepted at all is governed by the
+store-path attestation gate below — **required by default since v0.9.0**.)
 
 **Store-path attestation (#626 Layer-3, v0.7.0).** A caller holding the agent's
 keypair can upgrade a write from claimed to attested by presenting a detached

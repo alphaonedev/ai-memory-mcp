@@ -452,7 +452,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 
     <div class="feature future">
       <div class="feature-head"><span class="feature-name">Ed25519 attested identity</span><span class="feature-tag live">SHIPPED · v0.7.0 (#626 Layer-3)</span></div>
-      <div class="feature-desc">Agents hold Ed25519 keypairs. A caller can attach a detached signature over the canonical <code>SignableWrite</code> envelope on every store surface; the daemon verifies it against the agent's bound public key and stamps <code>attest_level = "agent_attested"</code> (forged → 403). Links carry per-link signatures + <code>attest_level</code> + <code>signed_at</code>. Unsigned writes stay permitted (landing <code>claimed</code>) unless <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1</code>.</div>
+      <div class="feature-desc">Agents hold Ed25519 keypairs. A caller can attach a detached signature over the canonical <code>SignableWrite</code> envelope on every store surface; the daemon verifies it against the agent's bound public key and stamps <code>attest_level = "agent_attested"</code> (forged → 403). Links carry per-link signatures + <code>attest_level</code> + <code>signed_at</code>. As of v0.9.0 (#1751) store-path attestation is required by default: an unsigned direct CLI/MCP/HTTP write is rejected (<code>403 ATTESTATION_FAILED</code>) rather than landing <code>claimed</code>, unless the operator sets the explicit opt-out <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>.</div>
     </div>
 
     <div class="feature future">

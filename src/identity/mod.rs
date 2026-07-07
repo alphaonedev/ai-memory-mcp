@@ -99,7 +99,9 @@ pub mod replay;
 // Ties SignableWrite (C1) + bound-key lookup (C3) + the attest_write gate
 // (C4) into stamp_attestation_{sync,async}, which the write surfaces call
 // to resolve metadata.attest_level (claimed / agent_attested) before
-// persisting. Permissive-default; fail-closed on a presented-but-bad sig.
+// persisting. Required-by-default since v0.9 (#1751): an unsigned/unbound
+// direct write is REJECTED unless AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0;
+// a presented-but-bad sig is always fail-closed regardless of the flag.
 pub mod attest;
 // #1558 — reserved caller-identity sentinel SSOT. Every internal /
 // system principal string (privileged carve-outs, resolve-failure

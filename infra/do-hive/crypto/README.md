@@ -42,6 +42,9 @@ the compiled default `semantic` → MiniLM-384, and no stray `db`/`embeddings` l
 **Leg 1 — API mTLS** (`ServeArgs`: `--tls-cert` src/daemon_runtime.rs:757,
 `--tls-key` :760, `--mtls-allowlist` :771; wired at :5150/:5158/:5163):
 ```bash
+# AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 is redundant since v0.9.0 (#1751):
+# store-path attestation is REQUIRED by default (=0 opts out). Set explicitly here
+# only to pin the posture; the launch is byte-identical to omitting it.
 AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1 \
 ai-memory serve --host 0.0.0.0 --port 9077 --store-url "$PG_URL" \
   --tls-cert out/server.crt --tls-key out/server.key \

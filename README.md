@@ -150,7 +150,7 @@ v0.7.0 closes the `attested-cortex` epic (69/69 across 11 tracks A–K), folds i
 
 **One binary, four operational modes** (v0.6.4). The `ai-memory` Rust binary (tokio + axum) can run any of these in isolation or simultaneously, sharing a single SQLite database:
 
-1. **stdio MCP server** -- 101 advertised entries over JSON-RPC at full profile (v0.8.0; 100 callable memory tools + the always-on `memory_capabilities` bootstrap; verified against `Profile::full().expected_tool_count()`). Default `--profile core` advertises 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. `ai-memory mcp` / `ai-memory mcp --profile full`
+1. **stdio MCP server** -- 101 advertised entries over JSON-RPC at full profile (v0.9.0; 100 callable memory tools + the always-on `memory_capabilities` bootstrap; verified against `Profile::full().expected_tool_count()`). Default `--profile core` advertises 7 (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on `memory_capabilities` bootstrap. `ai-memory mcp` / `ai-memory mcp --profile full`
 2. **HTTP / mTLS daemon** -- 92 REST route registrations (78 unique URL paths) on `127.0.0.1:9077`, TLS + optional mTLS allowlist + API-key auth, background GC loop. `ai-memory serve`
 3. **Autonomous curator daemon** -- self-scheduling loop (default 1h cadence) that auto-tags, surfaces contradictions across namespace siblings, consolidates near-duplicates, and adjusts priority by access pattern. Every action goes to a rollback log; destructive ops can be gated behind a governance approval flow. `ai-memory curator --daemon`
 4. **Sync daemon** -- quorum-based peer federation across instances. W-of-N writes (default majority), vector-clock CRDT-lite merge, mTLS allowlist between peers. `ai-memory sync-daemon`
@@ -180,7 +180,7 @@ a1b2|Project DB is PostgreSQL 16|long|infra|8|0.91|database,postgres|ai:claude-c
 c3d4|API rate limit is 100 rps|long|infra|7|0.87|api,limits|ai:claude-desktop@laptop:pid-5219
 ```
 
-By default `agent_id` is *claimed*, not *attested* — don't make security decisions on an unsigned write's id alone. **v0.7.0** wires cryptographic Ed25519 attestation on two surfaces: (1) **store-path attestation (#626 Layer-3)** — present a detached signature over the canonical `SignableWrite` envelope on the CLI (`store --sign`), MCP (`memory_store`), or HTTP (`POST /api/v1/memories`) path and the daemon verifies it against the agent's bound public key, stamping `metadata.attest_level = "agent_attested"` (operators can require it with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`); and (2) **link attestation (`attested-cortex`)** — the previously-reserved `memory_links.signature` field with `memory_verify(link_id)` for inbound verification and an append-only `signed_events` audit chain. See the [agent identity page](https://alphaonedev.github.io/ai-memory-mcp/agent-identity.html) and the [`attested-cortex` RFC](docs/v0.7/rfc-attested-cortex.md) for the full provenance contract.
+On an *unsigned* write `agent_id` is a *claimed* identity — don't make security decisions on it alone. As of **v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751))** store-path agent attestation is **required by default**: an unsigned direct CLI/MCP/HTTP write is **rejected** (`403 ATTESTATION_FAILED`) rather than landing `attest_level = "claimed"`, unless the operator sets the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`. Cryptographic Ed25519 attestation is wired on two surfaces: (1) **store-path attestation (#626 Layer-3)** — present a detached signature over the canonical `SignableWrite` envelope on the CLI (`store --sign`), MCP (`memory_store`), or HTTP (`POST /api/v1/memories`) path and the daemon verifies it against the agent's bound public key, stamping `metadata.attest_level = "agent_attested"` (a *presented-but-forged* signature is always rejected regardless of the flag); and (2) **link attestation (`attested-cortex`)** — the previously-reserved `memory_links.signature` field with `memory_verify(link_id)` for inbound verification and an append-only `signed_events` audit chain. See the [agent identity page](https://alphaonedev.github.io/ai-memory-mcp/agent-identity.html) and the [`attested-cortex` RFC](docs/v0.7/rfc-attested-cortex.md) for the full provenance contract.
 
 ## Retroactive conversation import — `ai-memory mine`
 
@@ -700,7 +700,7 @@ with AiMemoryClient(base_url="http://127.0.0.1:9077", api_key="...") as client:
     require_profile(client, "graph")  # raises ProfileNotLoaded on miss
 ```
 
-Both SDKs are versioned with the server (`0.6.4` matches `ai-memory 0.6.4`). v0.6.4+ daemons enforce the profile contract; pre-v0.6.4 daemons fall back to a permissive warn-and-continue so SDK upgrades don't break old servers. Source lives in [`sdk/typescript/`](sdk/typescript/) and [`sdk/python/`](sdk/python/).
+Both SDKs are versioned with the server (`0.9.0` matches `ai-memory 0.9.0`). v0.6.4+ daemons enforce the profile contract; pre-v0.6.4 daemons fall back to a permissive warn-and-continue so SDK upgrades don't break old servers. Source lives in [`sdk/typescript/`](sdk/typescript/) and [`sdk/python/`](sdk/python/).
 
 ---
 
@@ -922,7 +922,7 @@ Every capability mapped to its minimum tier. Each tier includes all capabilities
 | External dependencies | None | None | LLM backend (Ollama / xAI / OpenAI / Anthropic / Gemini / DeepSeek / Kimi / Qwen / Mistral / Groq / Together / Cerebras / OpenRouter / Fireworks / LMStudio / vLLM / llama.cpp — #1067) | LLM backend (same choices as smart) |
 | MCP tools exposed (at `--profile full`) [^tools] | 101 | 101 | 101 | 101 |
 
-[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 101 tools at `--profile full` (the default `--profile core` advertises 7 at boot regardless of tier; the other 94 load on demand). What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
+[^tools]: MCP tool surface is orthogonal to recall tier — every tier sees the same 101 tools at `--profile full` (the default `--profile core` advertises 8 at boot regardless of tier — the 7 Core-family tools plus the always-on `memory_capabilities` bootstrap; the other 93 load on demand). What tier gates is models (embedder, cross-encoder, LLM) and feature behaviour (cosine similarity, LLM expansion, reranking), not the advertised tool count. Pinned by `Profile::full().expected_tool_count()` + `const_count_matches_full_profile` in `src/mcp/registry.rs`.
 
 **Semantic tier** (default) bundles the Candle ML framework and downloads the all-MiniLM-L6-v2 model on first run (~90 MB). **Smart** and **autonomous** tiers require an LLM backend — post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067) (v0.7.0) that can be local ([Ollama](https://ollama.com), LMStudio, vLLM, llama.cpp server) or any OpenAI-compatible remote endpoint (xAI, OpenAI, Anthropic via OpenAI shim, Google Gemini, DeepSeek, Kimi, Qwen, Mistral, Groq, Together, Cerebras, OpenRouter, Fireworks). Selection is by `AI_MEMORY_LLM_BACKEND` env var; per-vendor API keys via `XAI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `DEEPSEEK_API_KEY` / `MOONSHOT_API_KEY` / `DASHSCOPE_API_KEY` / etc. or the canonical `AI_MEMORY_LLM_API_KEY`.
 
@@ -1231,7 +1231,8 @@ ai-memory includes hardening across all input paths:
 
 | Guide | Audience |
 |-------|----------|
-| [Release notes v0.8.0](docs/v0.8.0/release-notes.md) | **Current release (`distributed-coordination`)** — coordination substrate, typed cognition, federation hardening, enforcing governance, schema v58→v70 |
+| [Changelog v0.9.0](CHANGELOG.md) | **Current release (`secure-default hardening`)** — store-path agent attestation required by default (#1751), dual MCP+HTTP hook-enforcement gate (#1885/#1924), schema v78 |
+| [Release notes v0.8.0](docs/v0.8.0/release-notes.md) | Prior release (`distributed-coordination`) — coordination substrate, typed cognition, federation hardening, enforcing governance, schema v58→v70 |
 | [Coordination tool reference](docs/coordination.md) | The v0.8.0 action / lease / signal / checkpoint / routine primitives (`memory_action_*` / `_lease_*` / `_signal_*` / `_checkpoint_*` / `_routine_*`) |
 | [Migration Guide v0.7](docs/MIGRATION_v0.7.md) | Upgrading from v0.6.x (covers attested-cortex, hooks, transcripts, AGE, permissions, G1 inheritance fix) |
 | [What's new in v0.7](docs/whats-new-v07.html) | Visual walk-through of the `attested-cortex` substrates |

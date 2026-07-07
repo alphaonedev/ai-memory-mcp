@@ -234,17 +234,18 @@ The verbose path goes through `tool_definitions()` directly **without**
 stripping, returning the un-trimmed schemars schema with every
 `description` and the full `docs` field.
 
-## Counts at v0.7.0
+## Counts at v0.9.0
 
-- 74 per-tool `McpTool` impls (73 under `src/mcp/tools/*.rs` +
+- 101 per-tool `McpTool` impls (100 under `src/mcp/tools/*.rs` +
   `StoreTool` under `src/mcp/tools/store/mod.rs`).
-- 74 entries in `registered_tools()`
-  (`Profile::full().expected_tool_count() == 74 ==
-  crate::mcp::registry::tool_names::ALL.len()`). 73 of these are
-  callable memory tools; the 74th is the always-on
+- 101 entries in `registered_tools()`
+  (`Profile::full().expected_tool_count() == 101 ==
+  crate::mcp::registry::tool_names::ALL.len()`). 100 of these are
+  callable memory tools; the 101st is the always-on
   `memory_capabilities` bootstrap — see issue #862 for the canonical
-  73-callable / 74-advertised disambiguation.
+  100-callable / 101-advertised disambiguation.
 - 4-line iteration over `registered_tools()` is the entire body of
   `tool_definitions()` post-D1.6.
-- 7 always-on tools at the v0.7.0 default profile; additional tools
-  load via `memory_load_family` / `memory_smart_load`.
+- 7 always-on tools at the v0.9.0 default `--profile core` (plus the
+  always-on `memory_capabilities` bootstrap = 8 advertised at boot);
+  additional tools load via `memory_load_family` / `memory_smart_load`.
