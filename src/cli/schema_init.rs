@@ -155,10 +155,20 @@ pub struct SchemaInitArgs {
 /// order are the wire contract: every field stays `serde`-stable.
 #[derive(Debug, Clone, Serialize)]
 pub struct SchemaInitReport {
-    /// The original `--store-url` value, echoed back verbatim. Useful
-    /// when the operator pipes JSON output into downstream tooling.
-    /// Note: passwords inside Postgres URLs are NOT redacted here —
-    /// the URL was already in the operator's terminal scrollback.
+    /// The `--store-url` value, with any Postgres userinfo password
+    /// masked via [`crate::logging::redact_url_password`]. Useful when
+    /// the operator pipes JSON output into downstream tooling.
+    ///
+    /// #1893 — this field used to echo `--store-url` verbatim on the
+    /// rationale that "the URL was already in the operator's terminal
+    /// scrollback." That holds for a human typing the command, but not
+    /// for the `--json` success payload, which is exactly the shape
+    /// operators pipe into CI logs, log aggregators, tickets, and
+    /// monitoring systems — a materially different and longer-lived
+    /// exposure channel than transient scrollback. Every *error* path
+    /// in this module already redacts (`#1579 A3`); the success path
+    /// now matches so a Postgres credential never leaks from either
+    /// path.
     pub url: String,
     /// Backend tag: `"sqlite"` or `"postgres"`.
     pub kind: String,
@@ -309,6 +319,16 @@ fn is_postgres_url(url: &str) -> bool {
     crate::migrate::is_postgres_url(url)
 }
 
+/// #1893 — mask any credential in `url` before it lands in
+/// [`SchemaInitReport::url`], so `--json` and human success output
+/// never echo a raw Postgres password. Centralised here so both
+/// `enumerate_sqlite` and `enumerate_postgres` apply the exact same
+/// masking, and so the masking is unit-testable without a live DB
+/// connection (the enumeration functions themselves require one).
+fn masked_report_url(url: &str) -> String {
+    crate::logging::redact_url_password(url)
+}
+
 /// Strip the `sqlite://` prefix and the optional third slash so the
 /// remainder is a filesystem path that `rusqlite::Connection::open`
 /// understands. Mirrors `migrate::open_store`.
@@ -343,7 +363,12 @@ fn enumerate_sqlite(url: &str) -> Result<SchemaInitReport> {
     let schema_version = read_schema_version_sqlite(&conn).unwrap_or(0);
 
     Ok(SchemaInitReport {
-        url: url.to_string(),
+        // #1893 — mask any credential before it ever lands in the
+        // report (and therefore in `--json` / human success output).
+        // SQLite URLs carry no credential today, but routing through
+        // the redactor unconditionally means a future scheme change
+        // can't reintroduce the leak here either.
+        url: masked_report_url(url),
         kind: "sqlite".to_string(),
         tables,
         views,
@@ -587,7 +612,10 @@ async fn enumerate_postgres(url: &str) -> Result<SchemaInitReport> {
     drop(pool);
 
     Ok(SchemaInitReport {
-        url: url.to_string(),
+        // #1893 — mask the Postgres userinfo password so the `--json`
+        // and human success output never echo the raw credential (the
+        // error paths in this module already redact via `#1579 A3`).
+        url: masked_report_url(url),
         kind: "postgres".to_string(),
         tables,
         views,
@@ -738,6 +766,43 @@ mod tests {
     fn sqlite_path_strips_prefix_and_third_slash() {
         assert_eq!(sqlite_path_from_url("sqlite:///tmp/foo.db"), "/tmp/foo.db");
         assert_eq!(sqlite_path_from_url("sqlite://./rel.db"), "./rel.db");
+    }
+
+    #[test]
+    fn masked_report_url_redacts_postgres_password() {
+        // #1893 — before the fix, `SchemaInitReport::url` echoed
+        // `--store-url` verbatim, so a `--json` success payload (or the
+        // human "schema initialized at ..." line) leaked the raw
+        // Postgres password into CI logs / log aggregators / tickets.
+        let url = "postgres://svc_acct:hunter2@db.internal:5432/prod";
+        let masked = masked_report_url(url);
+        assert!(
+            !masked.contains("hunter2"),
+            "password leaked into report url: {masked}"
+        );
+        assert!(
+            masked.contains("svc_acct"),
+            "username should still identify the credential: {masked}"
+        );
+        assert!(
+            masked.contains("db.internal:5432/prod"),
+            "host/db should still surface for diagnostics: {masked}"
+        );
+    }
+
+    #[test]
+    fn masked_report_url_leaves_credential_free_urls_unchanged() {
+        // SQLite URLs (and a bare Postgres URL with no userinfo) carry
+        // no credential, so masking must be a no-op — the report still
+        // echoes the operator's `--store-url` for diagnostics.
+        assert_eq!(
+            masked_report_url("sqlite:///tmp/foo.db"),
+            "sqlite:///tmp/foo.db"
+        );
+        assert_eq!(
+            masked_report_url("postgres://db.internal:5432/prod"),
+            "postgres://db.internal:5432/prod"
+        );
     }
 
     #[tokio::test]

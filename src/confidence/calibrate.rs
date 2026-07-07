@@ -40,12 +40,18 @@
 //!    ORDER BY derived_confidence ASC
 //!    ```
 //!    The compound `(namespace, source, observed_at)` index added in
-//!    schema v40 keeps the WHERE-predicate scan tight; the ORDER BY
-//!    DESCfile by sort merge stays in scratch space (no full-table
-//!    Vec materialisation). Median is picked at row index
-//!    `count / 2` (lower median for even counts, identical to the
-//!    pre-Cluster-G `(a+b)/2` semantics within the test tolerance);
-//!    buckets fold into 10 stack-allocated counters via a single pass.
+//!    schema v40 keeps the WHERE-predicate scan tight. Pass 1 already
+//!    knows each group's `count`, so Pass 2 walks the ASC cursor once
+//!    per group tracking only a running row index plus the (at most
+//!    two) captured central value(s) at `mid = count / 2` — no
+//!    per-group `Vec<f64>` materialisation at all, matching the
+//!    module's streaming contract exactly rather than merely moving
+//!    the allocation from all-observations to one-group (#1905). The
+//!    median is the mean of the two central values for an even count
+//!    (`(values[mid-1] + values[mid]) / 2`) and the single central
+//!    value for an odd count, matching pre-Cluster-G semantics (#1915);
+//!    buckets fold into 10 stack-allocated counters via the same
+//!    single pass.
 //!
 //! The denormalised `source` column (also schema v40) eliminates the
 //! join with `memories` entirely — orphan observation rows whose
@@ -187,24 +193,39 @@ pub fn calibrate_from_shadow(
             continue;
         }
         let count = count_i64 as u64;
-        let mut values: Vec<f64> = Vec::with_capacity(count as usize);
         let mut rows =
             median_stmt.query(params![since.as_str(), namespace.as_str(), source.as_str()])?;
         let mut buckets = [0_u64; 10];
+        // #1905 — the median needs only the value(s) at the central
+        // index/indices; `count` is already known from Pass 1, so we
+        // track a running row index over the ASC cursor and capture
+        // just those scalars instead of materialising the whole group
+        // into a `Vec<f64>`. This keeps Pass 2 O(1) memory per group
+        // (independent of group size) rather than reintroducing the
+        // exact unbounded-Vec allocation the streaming redesign was
+        // written to eliminate.
+        let mid = (count as usize) / 2;
+        let even_count = count % 2 == 0;
+        let mut lower_mid_value: Option<f64> = None;
+        let mut mid_value: Option<f64> = None;
+        let mut row_idx: usize = 0;
         while let Some(row) = rows.next()? {
             let v: f64 = row.get(0)?;
-            let idx = ((v.clamp(0.0, 1.0) * 10.0) as usize).min(9);
-            buckets[idx] += 1;
-            values.push(v);
+            let bucket_idx = ((v.clamp(0.0, 1.0) * 10.0) as usize).min(9);
+            buckets[bucket_idx] += 1;
+            if row_idx == mid {
+                mid_value = Some(v);
+            } else if even_count && row_idx + 1 == mid {
+                lower_mid_value = Some(v);
+            }
+            row_idx += 1;
         }
-        // Values arrived ORDER BY ASC — pick the median by index.
-        let median = if values.is_empty() {
-            0.0
-        } else if values.len() % 2 == 0 {
-            let mid = values.len() / 2;
-            (values[mid - 1] + values[mid]) / 2.0
-        } else {
-            values[values.len() / 2]
+        // Rows arrived ORDER BY ASC — the captured scalar(s) at `mid`
+        // (and `mid - 1` for an even count) are the median inputs.
+        let median = match (even_count, lower_mid_value, mid_value) {
+            (true, Some(lower), Some(upper)) => (lower + upper) / 2.0,
+            (false, _, Some(single)) => single,
+            _ => 0.0,
         };
 
         // v0.9.0 §11.5 (#1706) — consumption_utility = consumed / judged,
@@ -308,6 +329,76 @@ mod tests {
             .find(|b| b.source == "claude")
             .expect("claude baseline");
         assert!((claude.median - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn calibrate_median_correct_for_larger_even_and_odd_groups() {
+        // #1905 — regression test for the O(1)-memory running-index
+        // median that replaced the removed per-group `Vec<f64>`. Uses
+        // groups large enough that an off-by-one in the running index
+        // (`row_idx == mid` / `row_idx + 1 == mid`) would misalign the
+        // captured central value(s) and silently corrupt the median.
+        let (conn, _dir) = open_tmp();
+        seed_mem(&conn, "m-odd", "ns-big", "odd-src");
+        seed_mem(&conn, "m-even", "ns-big", "even-src");
+
+        // Odd group: 101 values, 0.00..=1.00 step 0.01. True median
+        // (middle of 101 sorted values, index 50) is 0.50.
+        for i in 0..101 {
+            let v = f64::from(i) / 100.0;
+            observe(
+                &conn,
+                "m-odd",
+                "ns-big",
+                "odd-src",
+                0.9,
+                v,
+                &signals(),
+                None,
+            )
+            .unwrap();
+        }
+        // Even group: 100 values, 0.00..=0.99 step 0.01. True median is
+        // the mean of index 49 (0.49) and index 50 (0.50) -> 0.495.
+        for i in 0..100 {
+            let v = f64::from(i) / 100.0;
+            observe(
+                &conn,
+                "m-even",
+                "ns-big",
+                "even-src",
+                0.9,
+                v,
+                &signals(),
+                None,
+            )
+            .unwrap();
+        }
+
+        let report = calibrate_from_shadow(&conn, 30, Utc::now()).expect("calibrate");
+        let odd = report
+            .baselines
+            .iter()
+            .find(|b| b.source == "odd-src")
+            .expect("odd baseline");
+        assert_eq!(odd.count, 101);
+        assert!(
+            (odd.median - 0.50).abs() < 1e-9,
+            "odd-group median got {}",
+            odd.median
+        );
+
+        let even = report
+            .baselines
+            .iter()
+            .find(|b| b.source == "even-src")
+            .expect("even baseline");
+        assert_eq!(even.count, 100);
+        assert!(
+            (even.median - 0.495).abs() < 1e-9,
+            "even-group median got {}",
+            even.median
+        );
     }
 
     #[test]
