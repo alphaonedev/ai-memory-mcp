@@ -125,17 +125,28 @@ pub fn apply_decay_touch(conn: &Connection, id: &str) -> rusqlite::Result<bool> 
     // n15 — read `namespace` too so the per-namespace half-life override
     // (boot-seeded from `[curator.confidence_decay_half_life_days]`) can
     // be resolved per row instead of always using the compiled default.
-    let row: Option<(f64, String, Option<String>, String)> = conn
-        .query_row(
-            "SELECT confidence, created_at, confidence_decayed_at, namespace
-             FROM memories WHERE id = ?1",
-            params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .ok();
-    let Some((current_confidence, created_at, decayed_at, namespace)) = row else {
-        return Ok(false);
+    // #1906 — `.ok()` used to collapse EVERY `rusqlite::Error` into
+    // `None`, indistinguishable from the legitimate "no such id"
+    // outcome. That swallowed real faults (a missing/renamed column
+    // after a partial migration, a locked DB, corruption) silently:
+    // `touch_after_recall` treats `Ok(false)` as "nothing to do", so a
+    // persistent read fault made confidence-decay look enabled while
+    // doing nothing, with zero telemetry. Only `QueryReturnedNoRows`
+    // (the genuine "no such id" case) maps to `Ok(false)`; every other
+    // error now propagates via `?`, matching this function's own write
+    // path (`conn.execute` below) and its documented `Result<bool>`
+    // contract.
+    let row: (f64, String, Option<String>, String) = match conn.query_row(
+        "SELECT confidence, created_at, confidence_decayed_at, namespace
+         FROM memories WHERE id = ?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ) {
+        Ok(row) => row,
+        Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(false),
+        Err(e) => return Err(e),
     };
+    let (current_confidence, created_at, decayed_at, namespace) = row;
 
     let now = Utc::now();
     let anchor_str = decayed_at.unwrap_or(created_at);
@@ -238,6 +249,38 @@ mod tests {
         let b = decayed(1.0, 10.0, 30.0);
         let c = decayed(1.0, 30.0, 30.0);
         assert!(a > b && b > c, "should decay monotonically: {a} {b} {c}");
+    }
+
+    #[test]
+    fn apply_decay_touch_missing_id_returns_ok_false() {
+        // The legitimate "no such id" contract must still hold after
+        // #1906 narrowed the swallowed-error case to
+        // `QueryReturnedNoRows` specifically.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.db");
+        let _ = crate::storage::open(&path).expect("open storage");
+        let conn = Connection::open(&path).expect("open conn");
+        let found = apply_decay_touch(&conn, "does-not-exist").expect("must not error");
+        assert!(!found, "unknown id must yield Ok(false), not an error");
+    }
+
+    #[test]
+    fn apply_decay_touch_propagates_real_sql_errors_instead_of_swallowing_them() {
+        // #1906 — before the fix, `.ok()` collapsed EVERY
+        // `rusqlite::Error` (not just "no rows") into `None`, which
+        // `let ... else` then turned into the same `Ok(false)` as a
+        // legitimate "no such id". A real fault — here, the `memories`
+        // table not existing at all (e.g. a partial/failed migration)
+        // — must propagate as `Err`, not silently report "nothing to
+        // decay".
+        let conn = Connection::open_in_memory().expect("open in-memory conn");
+        let err = apply_decay_touch(&conn, "any-id")
+            .expect_err("a missing table is a real SQL fault, not a benign not-found");
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("no such table"),
+            "expected a real rusqlite error surfaced to the caller, got: {msg}"
+        );
     }
 
     #[test]

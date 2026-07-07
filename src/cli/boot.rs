@@ -680,17 +680,35 @@ pub fn run(
     Ok(())
 }
 
-/// Sentinel substituted for `memory.title` when `[boot] redact_titles =
-/// true`. Identical to the `redact_content` placeholder pattern used by
-/// the audit subsystem (PR-5). v0.6.3.1 (PR-9h / issue #487 PR #497 req
-/// #73).
+/// Sentinel substituted for `memory.title` (and, since #1892, `content`
+/// / `tags` / `metadata` — see [`REDACTED_CONTENT`]) when `[boot]
+/// redact_titles = true`. Identical to the `redact_content` placeholder
+/// pattern used by the audit subsystem (PR-5). v0.6.3.1 (PR-9h / issue
+/// #487 PR #497 req #73).
 const REDACTED_TITLE: &str = "<redacted>";
 
-/// Apply title redaction to a slice of memories, returning a freshly
-/// owned `Vec` with each `title` replaced by [`REDACTED_TITLE`] when
-/// the operator opted in via `[boot] redact_titles = true`. The
-/// no-redact path returns a clone — the cost is one Vec allocation per
-/// boot, which is dwarfed by the SQL list call.
+/// Sentinel for `memory.content` under the same `[boot] redact_titles =
+/// true` kill-switch. References [`REDACTED_TITLE`] rather than a fresh
+/// string literal so both fields render the identical redaction marker
+/// without duplicating the literal. #1892 — `content` is the actual
+/// subject-revealing payload; redacting only `title` left it shipping
+/// verbatim in `--format json` / `--format toon` output.
+const REDACTED_CONTENT: &str = REDACTED_TITLE;
+
+/// Apply the `[boot] redact_titles = true` privacy kill-switch to a
+/// slice of memories, returning a freshly owned `Vec` with `title`,
+/// `content`, `tags`, and `metadata` scrubbed when the operator opted
+/// in. #1892 — the guarantee MUST be format-independent: `emit_text`
+/// only ever prints non-subject fields (tier/id_short/namespace/
+/// priority/age), but `emit_json_with_status` / `emit_toon` serialize
+/// the whole (cloned) `Memory` via `serde_json::json!`, so every
+/// subject-revealing field has to be scrubbed here — redacting only
+/// `title` left `content` (and `tags`/`metadata`, which can equally
+/// carry the subject) shipping unredacted whenever an operator/agent
+/// requested JSON or TOON output despite explicitly opting into
+/// redaction for compliance reasons. The no-redact path returns a
+/// clone — the cost is one Vec allocation per boot, which is dwarfed
+/// by the SQL list call.
 fn render_memories_for_emit(mems: &[models::Memory], redact_titles: bool) -> Vec<models::Memory> {
     if !redact_titles {
         return mems.to_vec();
@@ -699,6 +717,9 @@ fn render_memories_for_emit(mems: &[models::Memory], redact_titles: bool) -> Vec
         .map(|m| {
             let mut redacted = m.clone();
             redacted.title = REDACTED_TITLE.to_string();
+            redacted.content = REDACTED_CONTENT.to_string();
+            redacted.tags = Vec::new();
+            redacted.metadata = serde_json::json!({});
             redacted
         })
         .collect()
@@ -1873,6 +1894,88 @@ mod tests {
         let memories = parsed["memories"].as_array().expect("memories array");
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0]["title"].as_str().unwrap(), REDACTED_TITLE);
+    }
+
+    #[test]
+    fn boot_redact_titles_json_output_redacts_content_tags_and_metadata() {
+        // #1892 — `[boot] redact_titles = true` must be format-
+        // independent: the JSON body serializes the whole `Memory`
+        // (not just the fields `emit_text` prints), so `content`,
+        // `tags`, and `metadata` must be scrubbed exactly like `title`.
+        // Before the fix, `render_memories_for_emit` only overwrote
+        // `title`, so `content` (the actual subject payload) shipped
+        // verbatim in `--format json`.
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(
+            &env.db_path,
+            "ns-rc",
+            "private-title",
+            "super-secret-memory-subject-content",
+        );
+        let db_path = env.db_path.clone();
+        let cfg = config_with_boot(Some(true), Some(true));
+        let mut args = default_args();
+        args.namespace = Some("ns-rc".to_string());
+        args.format = "json".to_string();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+        let memories = parsed["memories"].as_array().expect("memories array");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["title"].as_str().unwrap(), REDACTED_TITLE);
+        assert_eq!(memories[0]["content"].as_str().unwrap(), REDACTED_CONTENT);
+        assert!(
+            memories[0]["tags"].as_array().unwrap().is_empty(),
+            "tags should be scrubbed: {stdout}"
+        );
+        assert_eq!(
+            memories[0]["metadata"],
+            serde_json::json!({}),
+            "metadata should be scrubbed: {stdout}"
+        );
+        // The raw subject payload must not leak anywhere in stdout.
+        assert!(
+            !stdout.contains("super-secret-memory-subject-content"),
+            "content leaked despite redact_titles=true: {stdout}"
+        );
+    }
+
+    #[test]
+    fn boot_redact_titles_toon_output_redacts_content() {
+        // Same guarantee via the TOON path (emit_toon), which also
+        // serializes the whole cloned `Memory`.
+        let _g = test_lock();
+        unsafe {
+            std::env::remove_var("AI_MEMORY_BOOT_ENABLED");
+        }
+        let mut env = TestEnv::fresh();
+        seed_memory(
+            &env.db_path,
+            "ns-rt-toon",
+            "toon-private-title",
+            "toon-secret-subject-payload",
+        );
+        let db_path = env.db_path.clone();
+        let cfg = config_with_boot(Some(true), Some(true));
+        let mut args = default_args();
+        args.namespace = Some("ns-rt-toon".to_string());
+        args.format = "toon".to_string();
+        let mut out = env.output();
+        run(&db_path, &args, &cfg, &mut out).unwrap();
+        let stdout = std::str::from_utf8(&env.stdout).unwrap();
+        assert!(
+            !stdout.contains("toon-secret-subject-payload"),
+            "content leaked in toon output despite redact_titles=true: {stdout}"
+        );
+        assert!(
+            !stdout.contains("toon-private-title"),
+            "title leaked in toon output despite redact_titles=true: {stdout}"
+        );
     }
 
     #[test]

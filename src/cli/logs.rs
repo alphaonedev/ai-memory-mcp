@@ -349,6 +349,41 @@ fn read_lines_after_offset(path: &Path, offset: u64) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Convert a file's mtime into a `DateTime<Utc>`, degrading to `None`
+/// for anything that can't round-trip cleanly instead of panicking.
+///
+/// #1916 — `run_archive` and `run_purge` both walk a directory of
+/// operator/filesystem-influenced files and treat a bad/missing mtime
+/// as "skip this one file", not "abort the whole command" — every
+/// step up to (and including) this one is deliberately fallible-safe.
+/// The previous inline chain called `.unwrap()` on `timestamp_opt`,
+/// which returns `LocalResult::None` (panicking on `.unwrap()`) for a
+/// timestamp outside chrono's representable range, and cast
+/// `d.as_secs(): u64` to `i64` with `as`, which silently wraps to a
+/// negative number for a `u64` beyond `i64::MAX`. A single log/archive
+/// file with a corrupted, absurd, or maliciously-set mtime (e.g. via
+/// `touch -d`) turned best-effort retention/pruning into a hard
+/// process panic. `i64::try_from` + `LocalResult::single()` fold both
+/// failure modes into the same graceful `None` every earlier step
+/// already produces on its own failure.
+fn mtime_to_datetime(t: std::time::SystemTime) -> Option<DateTime<Utc>> {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    seconds_since_epoch_to_datetime(secs)
+}
+
+/// Pure `u64` seconds-since-epoch → `DateTime<Utc>` conversion, split
+/// out of [`mtime_to_datetime`] so its two defensive branches — a
+/// seconds count that doesn't fit in `i64` (`i64::try_from`) and a
+/// seconds count that fits `i64` but still falls outside chrono's
+/// representable date range (`LocalResult::single()`) — are each
+/// unit-testable with a plain `u64` literal, without needing an actual
+/// `SystemTime` value (whose own overflow checks make a `u64::MAX`-ish
+/// duration impossible to construct in the first place).
+fn seconds_since_epoch_to_datetime(secs: u64) -> Option<DateTime<Utc>> {
+    let secs = i64::try_from(secs).ok()?;
+    Utc.timestamp_opt(secs, 0).single()
+}
+
 fn run_archive(dir: &Path, cfg: &LoggingConfig, out: &mut CliOutput<'_>) -> Result<()> {
     let retention_days = i64::from(cfg.retention_days.unwrap_or(90));
     let cutoff = Utc::now() - chrono::Duration::days(retention_days);
@@ -360,8 +395,7 @@ fn run_archive(dir: &Path, cfg: &LoggingConfig, out: &mut CliOutput<'_>) -> Resu
         let mtime = fs::metadata(&f)
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| Utc.timestamp_opt(d.as_secs() as i64, 0).unwrap());
+            .and_then(mtime_to_datetime);
         let Some(mtime) = mtime else {
             continue;
         };
@@ -427,8 +461,7 @@ fn run_purge(
         let mtime = fs::metadata(&p)
             .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| Utc.timestamp_opt(d.as_secs() as i64, 0).unwrap());
+            .and_then(mtime_to_datetime);
         if let Some(mt) = mtime
             && mt < cutoff
         {
@@ -543,6 +576,41 @@ mod tests {
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("first"), "got: {s}");
         assert!(s.contains("second"), "expected appended line: {s}");
+    }
+
+    #[test]
+    fn mtime_to_datetime_converts_a_normal_mtime() {
+        let t = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let dt = mtime_to_datetime(t).expect("normal mtime must convert");
+        assert_eq!(dt.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn mtime_to_datetime_returns_none_instead_of_panicking_on_out_of_range_seconds() {
+        // #1916 — before the fix this path called
+        // `Utc.timestamp_opt(...).unwrap()`, which panics for a mtime
+        // whose seconds-since-epoch falls outside chrono's
+        // representable date range. A corrupted or maliciously-set
+        // mtime (e.g. via `touch -d`) must be skipped like every other
+        // failure mode in the chain, not crash the whole
+        // `logs archive` / `logs prune` command.
+        let far_future = std::time::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2);
+        assert_eq!(mtime_to_datetime(far_future), None);
+    }
+
+    #[test]
+    fn seconds_since_epoch_to_datetime_returns_none_when_seconds_exceed_i64_range() {
+        // #1916 — the old code did `d.as_secs() as i64`, an `as` cast
+        // that silently wraps to a negative number for a `u64` beyond
+        // `i64::MAX` instead of failing safely. `i64::try_from` turns
+        // that overflow into a clean `None` instead of a wrapped,
+        // bogus (and possibly panicking) timestamp. Exercised as a
+        // plain `u64` here because a real `SystemTime` can't represent
+        // a duration this large in the first place (constructing one
+        // panics on overflow before this code would ever run) — this
+        // is exactly the kind of extreme value a corrupted/malicious
+        // mtime source (not the `SystemTime` API) could still hand us.
+        assert_eq!(seconds_since_epoch_to_datetime(u64::MAX), None);
     }
 
     #[test]
