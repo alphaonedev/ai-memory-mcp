@@ -901,7 +901,11 @@ async fn dispatch_recover_previous_session(
             #[cfg(not(feature = "sal"))]
             let c = {
                 tracing::warn!(
-                    store_url = %url,
+                    // #1926 (CWE-532) — redact the userinfo password before it
+                    // reaches the durable log sink. This was the ONE store_url
+                    // tracing site the #1579 A3 pass missed; every sibling site
+                    // routes through `redact_url_password`.
+                    store_url = %crate::logging::redact_url_password(url),
                     "recover-previous-session --store-url requires the 'sal' build feature; using local sqlite db path"
                 );
                 let stdout = std::io::stdout();
@@ -2272,6 +2276,122 @@ pub fn passphrase_from_file(path: &Path) -> Result<String> {
     Ok(passphrase)
 }
 
+/// #1927 (CWE-214) — env var carrying the store/Postgres connection URL out
+/// of band, so the DB credential need NOT be forced onto the world-readable
+/// `/proc/<pid>/cmdline`. `/proc/<pid>/environ` is owner-only (mode 0400),
+/// strictly better than argv (mode 0444).
+pub const STORE_URL_ENV: &str = "AI_MEMORY_STORE_URL";
+
+/// #1927 (CWE-214) — env var naming a `0600` file whose sole contents are the
+/// store URL: the most restrictive channel (never in argv, never in the
+/// process environment block, never in shell history).
+pub const STORE_URL_FILE_ENV: &str = "AI_MEMORY_STORE_URL_FILE";
+
+/// #1927 — read a store URL from a file, enforcing owner-only (`0600`)
+/// permissions exactly as [`passphrase_from_file`] does for the SQLCipher
+/// passphrase. The file holds a bare credential, so a group/world-readable
+/// mode is refused fail-closed (opt out with
+/// `AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1`).
+pub fn store_url_from_file(path: &Path) -> Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path).with_context(|| {
+            format!(
+                "stat store-url file {} for permission check (#1927)",
+                path.display()
+            )
+        })?;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            let fail_open = std::env::var("AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if fail_open {
+                tracing::warn!(
+                    path = %path.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "store_url_from_file: file is group/world-readable; \
+                     AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1 — accepting (UNSAFE)."
+                );
+            } else {
+                anyhow::bail!(
+                    "store-url file {} has lax permissions (mode {:o}, group/world bits set); \
+                     tighten with `chmod 0600 {}` OR set \
+                     AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS=1 to opt out (#1927)",
+                    path.display(),
+                    mode & 0o777,
+                    path.display(),
+                );
+            }
+        }
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading store-url file {}", path.display()))?;
+    let url = raw.trim().to_string();
+    if url.is_empty() {
+        anyhow::bail!("store-url file {} is empty", path.display());
+    }
+    Ok(url)
+}
+
+/// #1927 (CWE-214) — resolve the store URL from a NON-argv channel when
+/// available, so the DB password need never appear on `--store-url` (which
+/// lands in world-readable `/proc/<pid>/cmdline`, `ps auxww`, shell history
+/// and systemd unit files, readable by any co-tenant local UID).
+///
+/// Resolution order (first hit wins):
+///   1. [`STORE_URL_FILE_ENV`] — read the URL from a `0600` file.
+///   2. [`STORE_URL_ENV`] — read the URL from the owner-only environment.
+///   3. the `--store-url` CLI argument (unchanged). When it carries a userinfo
+///      password a warning points at the /proc/cmdline exposure and the
+///      non-argv alternatives.
+///
+/// Returns `Ok(None)` when no channel supplies a URL (the caller then falls
+/// back to the local sqlite `--db` path).
+pub fn resolve_store_url(cli_arg: Option<&str>) -> Result<Option<String>> {
+    if let Ok(path) = std::env::var(STORE_URL_FILE_ENV) {
+        if !path.trim().is_empty() {
+            return Ok(Some(store_url_from_file(Path::new(path.trim()))?));
+        }
+    }
+    if let Ok(url) = std::env::var(STORE_URL_ENV) {
+        let trimmed = url.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+    if let Some(url) = cli_arg {
+        if url_has_userinfo_password(url) {
+            tracing::warn!(
+                "--store-url carries a password in argv, which is exposed via world-readable \
+                 /proc/<pid>/cmdline and `ps auxww` to any local UID (#1927). Prefer \
+                 AI_MEMORY_STORE_URL (owner-only /proc/environ) or AI_MEMORY_STORE_URL_FILE \
+                 (a 0600 file)."
+            );
+        }
+        return Ok(Some(url.to_string()));
+    }
+    Ok(None)
+}
+
+/// #1927 — true when a `scheme://user:pass@host/...` URL carries a non-empty
+/// userinfo password component (`user:pass@`). Best-effort structural check
+/// (no full URL parse) used only to decide whether to warn about argv exposure.
+fn url_has_userinfo_password(url: &str) -> bool {
+    let Some(after_scheme) = url.split_once("://").map(|(_, r)| r) else {
+        return false;
+    };
+    // userinfo is everything before the first '@' of the authority.
+    let Some(at) = after_scheme.find('@') else {
+        return false;
+    };
+    let userinfo = &after_scheme[..at];
+    // A password is present iff there is a ':' in the userinfo with something
+    // after it.
+    matches!(userinfo.split_once(':'), Some((_, pass)) if !pass.is_empty())
+}
+
 /// Apply the configured `anonymize_default` to the runtime env: when the
 /// config asks for anonymization but the user hasn't already set
 /// `AI_MEMORY_ANONYMIZE`, set it to `"1"`. Idempotent — repeated calls are
@@ -3396,6 +3516,13 @@ async fn build_store_handle(
     Arc<dyn crate::store::MemoryStore>,
 )> {
     use crate::handlers::StorageBackend;
+
+    // #1927 (CWE-214) — prefer a non-argv credential channel
+    // (AI_MEMORY_STORE_URL_FILE / AI_MEMORY_STORE_URL) over the world-readable
+    // `--store-url` argv when one is supplied. Shadows the borrowed param with
+    // the resolved owned URL so every downstream arm is unchanged.
+    let resolved_store_url = resolve_store_url(store_url)?;
+    let store_url = resolved_store_url.as_deref();
 
     match store_url {
         Some(url) => {
@@ -5171,6 +5298,45 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         app_config.resolve_required_events().len()
     );
 
+    // #1924 (CWE-288) — INSTALL the process pre-event enforcement gate on the
+    // HTTP daemon, mirroring `run_mcp_server`'s MCP install. Pre-#1924 ONLY the
+    // MCP stdio path installed + consulted the gate; the HTTP write handlers
+    // (POST /api/v1/memories, delete/promote/link/consolidate/reflect) are a
+    // SEPARATE implementation that never routed through `handle_store`, so
+    // `[hooks].enforce_mode = enforce` + a `required_events` entry printed the
+    // banner above and `doctor --hooks` said "WILL DENY" while every
+    // HTTP-routed write silently committed with NO hook running — the exact
+    // silent bypass #1885 closed for MCP, still open for HTTP. Installing here
+    // makes `crate::handlers::create::http_pre_event_gate` (consulted at the top
+    // of each HTTP write handler) actually DENY. Installed ONLY when enforce is
+    // active AND a required event is declared → default (off) deployments never
+    // install it (byte-identical to pre-#1924). Idempotent OnceLock: harmless if
+    // an MCP server on the same process already installed it.
+    {
+        use crate::hooks::{HookEnforceMode, config::HookConfig};
+        let mode = app_config.resolve_hooks_enforce_mode();
+        let required = app_config.resolve_required_events();
+        if mode != HookEnforceMode::Off && !required.is_empty() {
+            let all_hooks = HookConfig::default_path()
+                .filter(|p| p.exists())
+                .and_then(|p| HookConfig::load_from_file(&p).ok())
+                .unwrap_or_default();
+            // `install_pre_event_enforce_gate_for_tests` is the ONLY public
+            // installer for the process-global `PRE_EVENT_ENFORCE_GATE`
+            // (`set_pre_event_enforce_gate` and the gate itself are private to
+            // `src/mcp/mod.rs`). It builds the executor registry from `all_hooks`
+            // and installs the gate exactly as `run_mcp_server` does — the
+            // `_for_tests` suffix names how it was first introduced, not a
+            // test-only guard (it carries no `#[cfg(test)]`). Reused here so the
+            // HTTP daemon shares the identical install path without editing the
+            // MCP module.
+            crate::mcp::install_pre_event_enforce_gate_for_tests(all_hooks, mode, required);
+            tracing::info!(
+                "#1924 — HTTP pre-event enforcement gate installed on the network write surface"
+            );
+        }
+    }
+
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
 
@@ -5904,6 +6070,84 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// #1927 (CWE-214) — ADVERSARIAL: a co-tenant reading `/proc/<pid>/cmdline`
+    /// recovers the DB password ONLY because it must ride on `--store-url`.
+    /// Proof the exploit is closed: a non-argv channel now resolves the URL, so
+    /// the operator can keep the credential OUT of argv entirely. Fail-before
+    /// (no channel) vs pass-after (env/file channel).
+    #[test]
+    fn issue_1927_non_argv_store_url_channel_exists() {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // Clean slate.
+        // SAFETY: env mutation is serialized by ENV_GUARD; these keys are read
+        // only by `resolve_store_url`, which no other test drives concurrently.
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
+
+        // FAIL-BEFORE analogue: with no env channel and no arg, nothing resolves
+        // (operator would be forced to put the secret on argv to get a URL).
+        assert_eq!(resolve_store_url(None).unwrap(), None);
+
+        // PASS-AFTER: the owner-only environment supplies the URL — never argv.
+        let secret = "postgres://u:hunter2@db.internal/mem";
+        // SAFETY: see above.
+        unsafe {
+            std::env::set_var(STORE_URL_ENV, secret);
+        }
+        assert_eq!(resolve_store_url(None).unwrap().as_deref(), Some(secret));
+        // SAFETY: see above.
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+        }
+    }
+
+    /// #1927 — a `0600` store-url file is accepted; a group/world-readable one
+    /// is refused fail-closed (the credential must not sit in a lax-perm file).
+    #[cfg(unix)]
+    #[test]
+    fn issue_1927_store_url_file_enforces_owner_only_perms() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dsn");
+        {
+            let mut f = std::fs::File::create(&path).expect("create");
+            writeln!(f, "postgres://u:hunter2@db.internal/mem").expect("write");
+        }
+
+        // Lax perms (0644) — refused.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        assert!(
+            store_url_from_file(&path).is_err(),
+            "group/world-readable store-url file must be refused (#1927)"
+        );
+
+        // Owner-only (0600) — accepted, trimmed.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod 600");
+        assert_eq!(
+            store_url_from_file(&path).unwrap(),
+            "postgres://u:hunter2@db.internal/mem"
+        );
+    }
+
+    /// #1927 — the argv-exposure warning fires only when a userinfo password is
+    /// actually present (so a passwordless DSN does not nag the operator).
+    #[test]
+    fn issue_1927_userinfo_password_detection() {
+        assert!(url_has_userinfo_password(
+            "postgres://user:hunter2@db.internal/mem"
+        ));
+        assert!(!url_has_userinfo_password(
+            "postgres://user@db.internal/mem"
+        ));
+        assert!(!url_has_userinfo_password("postgres://db.internal/mem"));
+        assert!(!url_has_userinfo_password("sqlite:///var/lib/mem.db"));
+    }
 
     /// #1579 A3 (SECURITY) — regression pin: the Postgres SAL boot
     /// path must log the REDACTED store URL. Pre-fix,

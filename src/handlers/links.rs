@@ -276,6 +276,13 @@ pub async fn create_link(
     headers: axum::http::HeaderMap,
     Json(raw): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // #1924 (CWE-288) — consult the PRE-LINK enforcement gate before the link
+    // write (HTTP parity with the MCP gate). INERT for default deployments.
+    if let Some(resp) =
+        crate::handlers::create::http_pre_event_gate(crate::hooks::HookEvent::PreLink, raw.clone())
+    {
+        return resp;
+    }
     // v0.7.0 G-PHASE-E-1 (#706) — reject unknown fields with a
     // structured 400 instead of silently defaulting `relation` to
     // `related_to`. The canonical shape is `{source_id|from,

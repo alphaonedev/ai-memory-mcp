@@ -436,25 +436,49 @@ impl SignedEvent {
 /// All-zeros 32-byte digest used as `prev_hash` for the first row.
 pub const ZERO_HASH: [u8; 32] = [0u8; 32];
 
-/// Field separator for [`canonical_chain_bytes`]. ASCII 0x1F
-/// ("Unit Separator") — present in neither RFC3339 timestamps nor
-/// UUID strings nor the hex/base64 / raw-bytes payloads we encode,
-/// so concatenation is unambiguous without escaping.
+/// Field separator formerly used by [`canonical_chain_bytes`]. ASCII 0x1F
+/// ("Unit Separator"). RETAINED as the delimiter of the v73 cause pre-image
+/// ([`compute_cause_hash`] / [`signing_input_bytes`]), where every joined
+/// field is a fixed-width digest or short identifier — NOT for the chain
+/// encoding, which was migrated to length-prefixing by #1930 (see below).
 const FIELD_SEP: u8 = 0x1F;
+
+/// #1930 (CWE-345) — append a length-prefixed field (u64 big-endian length
+/// then the raw bytes) to the chain-hash input. Length-prefixing makes the
+/// encoding INJECTIVE: no data byte inside a `payload_hash`/`signature` BLOB
+/// (which are arbitrary 32-/64-byte values that DO contain 0x1F ~1/256 of the
+/// time) can be confused with a structural delimiter, so two distinct column
+/// tuples can never collide to the same canonical bytes. Mirrors
+/// `ReplayCache::fingerprint`'s discipline (`src/identity/replay.rs`).
+fn push_len_prefixed(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u64).to_be_bytes());
+    out.extend_from_slice(field);
+}
 
 /// Canonical bytes used as the chain-hash input.
 ///
-/// Commits to every column that identifies the row's content:
-/// `id || 0x1F || agent_id || 0x1F || event_type || 0x1F ||
-///  payload_hash || 0x1F || signature_or_empty || 0x1F ||
-///  attest_level || 0x1F || timestamp || 0x1F || sequence_be_8_bytes`.
+/// Commits to every column that identifies the row's content —
+/// `id`, `agent_id`, `event_type`, `payload_hash`, `signature`,
+/// `attest_level`, `timestamp`, `sequence`, and (present-only) `cause_hash` —
+/// each **length-prefixed** (u64-BE length, then bytes) so the concatenation
+/// is unambiguous WITHOUT relying on a separator byte that could collide with
+/// arbitrary BLOB data (#1930, CWE-345). `sequence` is a fixed-width 8-byte
+/// big-endian integer; the present-only `cause_hash` is preceded by a single
+/// `1`/`0` presence tag so a `None` cause and an empty-`Some` cause stay
+/// distinct.
 ///
 /// Each row's `prev_hash` is `SHA-256(canonical_chain_bytes(prev_row))`,
-/// or [`ZERO_HASH`] for the first row. A future hash-agility
-/// migration can change the digest in one place; the encoding itself
-/// is byte-stable so an auditor can replay the chain from the stored
-/// columns alone.
+/// or [`ZERO_HASH`] for the first row. A future hash-agility migration can
+/// change the digest in one place; the encoding is byte-stable so an auditor
+/// can replay the chain from the stored columns alone.
+///
+/// NOTE (#1930 migration): this length-prefixed encoding is NOT byte-identical
+/// to the pre-#1930 0x1F-separated encoding, so a chain grown across the
+/// upgrade re-anchors from the first row appended by the new binary. The
+/// encoding is shared verbatim by the sqlite writer/verifier, the postgres
+/// twin, and the v34 backfill, so all of them move in lockstep.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)] // field lengths fit u64 on every supported target
 pub fn canonical_chain_bytes(event: &SignedEvent) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(
         event.id.len()
@@ -464,39 +488,28 @@ pub fn canonical_chain_bytes(event: &SignedEvent) -> Vec<u8> {
             + event.signature.as_ref().map_or(0, Vec::len)
             + event.attest_level.len()
             + event.timestamp.len()
-            + 8
-            + 7 // seven separators
-            // v73 present-only cause: separator + digest, or nothing.
-            + event.cause_hash.as_ref().map_or(0, |c| 1 + c.len()),
+            + 8 // sequence
+            + 8 * 8 // eight u64 length prefixes
+            + 1 // cause presence tag
+            + event.cause_hash.as_ref().map_or(0, |c| 8 + c.len()),
     );
-    out.extend_from_slice(event.id.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(event.agent_id.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(event.event_type.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(&event.payload_hash);
-    out.push(FIELD_SEP);
-    if let Some(sig) = event.signature.as_ref() {
-        out.extend_from_slice(sig);
-    }
-    // empty signature contributes zero bytes between separators —
-    // the separator on either side still pins the slot's position.
-    out.push(FIELD_SEP);
-    out.extend_from_slice(event.attest_level.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(event.timestamp.as_bytes());
-    out.push(FIELD_SEP);
+    push_len_prefixed(&mut out, event.id.as_bytes());
+    push_len_prefixed(&mut out, event.agent_id.as_bytes());
+    push_len_prefixed(&mut out, event.event_type.as_bytes());
+    push_len_prefixed(&mut out, &event.payload_hash);
+    push_len_prefixed(&mut out, event.signature.as_deref().unwrap_or(&[]));
+    push_len_prefixed(&mut out, event.attest_level.as_bytes());
+    push_len_prefixed(&mut out, event.timestamp.as_bytes());
     out.extend_from_slice(&event.sequence.to_be_bytes());
-    // v73 (#1822, G5a) — PRESENT-ONLY cause fold. A `None` cause writes
-    // nothing (no separator, no bytes), so every legacy row's canonical
-    // bytes are byte-identical to pre-v73 and their predecessors verify
-    // unchanged. When present, one FIELD_SEP then the 32-byte cause
-    // digest are appended so the triggering cause is committed into the
-    // cross-row hash chain.
-    if let Some(cause) = event.cause_hash.as_ref() {
-        out.push(FIELD_SEP);
-        out.extend_from_slice(cause);
+    // v73 (#1822, G5a) — present-only cause fold, now with an explicit
+    // presence tag so `None` (tag 0) and `Some(&[])` (tag 1, len 0) are
+    // distinguishable and no separator ambiguity can arise.
+    match event.cause_hash.as_deref() {
+        Some(cause) => {
+            out.push(1);
+            push_len_prefixed(&mut out, cause);
+        }
+        None => out.push(0),
     }
     out
 }
@@ -586,6 +599,57 @@ pub(crate) fn signing_input_bytes(payload_hash: &[u8], cause_hash: Option<&[u8]>
         }
         None => payload_hash.to_vec(),
     }
+}
+
+/// #1925 (CWE-347) — domain tag for the per-row daemon identity-bound
+/// signature pre-image. Versioned so a future pre-image change is a distinct
+/// domain rather than a silent collision.
+const DAEMON_ROW_SIG_DOMAIN: &[u8] = b"ai-memory/signed-events/row-v1\0";
+
+/// #1925 (CWE-347) — the identity-bearing bytes the daemon audit key signs for
+/// a `signed_events` row, so the per-row signature commits to the FULL
+/// attribution tuple (`id`, `agent_id`, `event_type`, `attest_level`,
+/// `timestamp`, `sequence`, `payload_hash`, and present-only `cause_hash`) —
+/// not `payload_hash` alone.
+///
+/// Pre-#1925 the daemon signature bound only `payload_hash`, so a co-tenant
+/// with write access to the local `ai-memory.db` file could rewrite the
+/// chain-HEAD row's `agent_id` / `event_type` / `timestamp` / `attest_level`
+/// (the head has no successor row whose `prev_hash` would catch the edit) and
+/// [`verify_chain`] still passed all three checks. Binding the identity tuple
+/// makes any such single-row mutation invalidate the row's OWN signature,
+/// independent of the cross-row hash chain — mirroring the JSONL forensic
+/// sink, which already signs the full canonical row.
+///
+/// Length-prefixed (the #1930 injectivity discipline) so no field value can be
+/// confused with another. Returns the 32-byte SHA-256 the Ed25519 key signs.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // field lengths fit u64 on every supported target
+fn daemon_row_signing_input(event: &SignedEvent) -> Vec<u8> {
+    let mut h = Sha256::new();
+    h.update(DAEMON_ROW_SIG_DOMAIN);
+    for field in [
+        event.id.as_bytes(),
+        event.agent_id.as_bytes(),
+        event.event_type.as_bytes(),
+        event.attest_level.as_bytes(),
+        event.timestamp.as_bytes(),
+    ] {
+        h.update((field.len() as u64).to_be_bytes());
+        h.update(field);
+    }
+    h.update(event.sequence.to_be_bytes());
+    h.update((event.payload_hash.len() as u64).to_be_bytes());
+    h.update(&event.payload_hash);
+    match event.cause_hash.as_deref() {
+        Some(c) => {
+            h.update([1u8]);
+            h.update((c.len() as u64).to_be_bytes());
+            h.update(c);
+        }
+        None => h.update([0u8]),
+    }
+    h.finalize().to_vec()
 }
 
 /// Read the chain head — `(max_sequence, prev_canonical_hash)`.
@@ -833,9 +897,21 @@ pub fn classify_row_signature(
             match <[u8; 64]>::try_from(sig_bytes.as_slice()) {
                 Ok(arr) => {
                     let sig = ed25519_dalek::Signature::from_bytes(&arr);
-                    let signing_input =
+                    // #1925 (CWE-347) — accept EITHER the identity-bound input
+                    // (sqlite rows re-signed at append over the full attribution
+                    // tuple) OR the legacy payload-only input (postgres rows +
+                    // pre-#1925 rows). A row tampered in any identity column
+                    // fails the identity check; the payload-only fallback never
+                    // re-validates a tampered identity because a payload-only
+                    // signature is not over the identity pre-image at all. So the
+                    // sqlite head-row identity-tamper attack is caught fail-closed
+                    // while legitimate postgres/legacy rows still verify.
+                    let id_input = daemon_row_signing_input(event);
+                    let pay_input =
                         signing_input_bytes(&event.payload_hash, event.cause_hash.as_deref());
-                    vk.verify_strict(&signing_input, &sig).is_err()
+                    let ok = vk.verify_strict(&id_input, &sig).is_ok()
+                        || vk.verify_strict(&pay_input, &sig).is_ok();
+                    !ok
                 }
                 Err(_) => true,
             }
@@ -1904,6 +1980,40 @@ pub fn append_signed_event(conn: &Connection, event: &SignedEvent) -> Result<()>
 pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Result<()> {
     let (max_seq, prev_hash) = read_chain_head(conn).context("append signed_event: read head")?;
     let next_seq = max_seq + 1;
+
+    // #1925 (CWE-347) — re-sign daemon-signed rows over the identity-bearing
+    // tuple now that `sequence` is assigned, so the per-row Ed25519 signature
+    // commits to agent_id/event_type/attest_level/timestamp/sequence and not
+    // `payload_hash` alone. This single sqlite writer is the ONE chokepoint
+    // every producer routes through (`with_daemon_signature`, the
+    // `governance.check` emitter, the deferred-audit sink), so binding it here
+    // covers every sqlite daemon-signed row uniformly without touching the
+    // decentralised signing call sites. Only when a daemon key is installed AND
+    // the row is daemon-signed; recorder/lineage/unsigned rows are left
+    // untouched (their signatures carry a distinct role and MUST NOT be
+    // replaced). `verify_chain`'s payload-only fallback keeps postgres and
+    // pre-#1925 rows verifying, so this is additive and fail-closed.
+    let signature: Option<Vec<u8>> = if event.attest_level
+        == crate::models::AttestLevel::DaemonSigned.as_str()
+        && event.signature.is_some()
+    {
+        let row_view = SignedEvent {
+            sequence: next_seq,
+            ..event.clone()
+        };
+        let input = daemon_row_signing_input(&row_view);
+        match crate::governance::audit::try_sign_audit_payload(&input) {
+            Some((sig, _)) => Some(sig),
+            // No daemon key installed at append time — keep the caller's
+            // signature verbatim (the verifier's payload-only fallback validates
+            // it). Vanishingly rare: a daemon-signed row implies the key existed
+            // when it was minted.
+            None => event.signature.clone(),
+        }
+    } else {
+        event.signature.clone()
+    };
+
     conn.execute(
         "INSERT INTO signed_events \
             (id, agent_id, event_type, payload_hash, signature, attest_level, timestamp, \
@@ -1914,7 +2024,7 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
             event.agent_id,
             event.event_type,
             event.payload_hash,
-            event.signature,
+            signature,
             event.attest_level,
             event.timestamp,
             prev_hash.to_vec(),
@@ -1944,6 +2054,10 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     // route through here), so one wiring point anchors every write path.
     let head_view = SignedEvent {
         sequence: next_seq,
+        // #1925 — anchor the STORED (re-signed) signature so the off-table
+        // watermark matches what a verifier recomputes for the next row's
+        // prev_hash (canonical_chain_bytes commits the signature column).
+        signature: signature.clone(),
         ..event.clone()
     };
     let mut hasher = Sha256::new();
@@ -2188,6 +2302,161 @@ mod tests {
         assert_eq!(listed[0].timestamp, event.timestamp);
         assert_eq!(listed[0].prev_hash, ZERO_HASH.to_vec());
         assert_eq!(listed[0].sequence, 1);
+    }
+
+    /// #1930 (CWE-345) — ADVERSARIAL: a 0x1F byte relocated across the
+    /// `payload_hash | signature` boundary yields BYTE-IDENTICAL canonical
+    /// bytes under the old 0x1F-separated encoding (a hash-input collision in
+    /// the tamper-evidence chain). Length-prefixing makes the two rows
+    /// distinct. Fail-before (equal) vs pass-after (distinct).
+    #[test]
+    fn issue_1930_length_prefix_defeats_separator_collision() {
+        let base = |ph: Vec<u8>, sig: Vec<u8>| SignedEvent {
+            id: "id".into(),
+            agent_id: "a".into(),
+            event_type: "e".into(),
+            payload_hash: ph,
+            signature: Some(sig),
+            attest_level: "unsigned".into(),
+            timestamp: "t".into(),
+            prev_hash: Vec::new(),
+            sequence: 1,
+            cause_hash: None,
+        };
+        // Old encoding: `..payload.. 0x1F(sep) ..sig..`.
+        //   A: payload=[0xAA,0x1F], sig=[0xBB] -> AA 1F 1F BB
+        //   B: payload=[0xAA],      sig=[0x1F,0xBB] -> AA 1F 1F BB  (COLLISION)
+        let a = base(vec![0xAA, 0x1F], vec![0xBB]);
+        let b = base(vec![0xAA], vec![0x1F, 0xBB]);
+        assert_ne!(
+            canonical_chain_bytes(&a),
+            canonical_chain_bytes(&b),
+            "length-prefixing must make the chain encoding injective (#1930)"
+        );
+    }
+
+    /// #1925 (CWE-347) — ADVERSARIAL, classify-level: a daemon-signed row whose
+    /// signature is over the identity-bound pre-image verifies; tampering ANY
+    /// identity column (here `agent_id`, the exact head-row attack) WITHOUT
+    /// touching `payload_hash`/`signature`/`sequence` invalidates the per-row
+    /// signature. Pre-#1925 (payload-only signature) the tamper verified.
+    #[test]
+    fn issue_1925_identity_tamper_fails_per_row_signature() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        let mut ev = SignedEvent {
+            id: "id-1".into(),
+            agent_id: "daemon".into(),
+            event_type: "memory_link.created".into(),
+            payload_hash: payload_hash(b"p"),
+            signature: None,
+            attest_level: crate::models::AttestLevel::DaemonSigned
+                .as_str()
+                .to_string(),
+            timestamp: "2026-07-01T00:00:00Z".into(),
+            prev_hash: Vec::new(),
+            sequence: 1,
+            cause_hash: None,
+        };
+        // Sign over the identity-bound input, as `append_signed_event` now does.
+        let input = daemon_row_signing_input(&ev);
+        ev.signature = Some(sk.sign(&input).to_bytes().to_vec());
+        assert!(
+            !classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            "a genuine identity-bound row must verify"
+        );
+        // ADVERSARIAL tamper.
+        ev.agent_id = "attacker".into();
+        assert!(
+            classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            "identity tamper must invalidate the per-row signature (#1925)"
+        );
+    }
+
+    /// #1925 — a LEGACY / postgres daemon row signed over the payload-only
+    /// pre-image (not re-signed at a sqlite append) must STILL verify via the
+    /// fallback, so the fix is additive and breaks no legitimate row.
+    #[test]
+    fn issue_1925_payload_only_signature_still_verifies() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let vk = sk.verifying_key();
+        let mut ev = SignedEvent {
+            id: "id-2".into(),
+            agent_id: "daemon".into(),
+            event_type: "memory_link.created".into(),
+            payload_hash: payload_hash(b"p2"),
+            signature: None,
+            attest_level: crate::models::AttestLevel::DaemonSigned
+                .as_str()
+                .to_string(),
+            timestamp: "2026-07-01T00:00:00Z".into(),
+            prev_hash: Vec::new(),
+            sequence: 1,
+            cause_hash: None,
+        };
+        let pay = signing_input_bytes(&ev.payload_hash, None);
+        ev.signature = Some(sk.sign(&pay).to_bytes().to_vec());
+        assert!(
+            !classify_row_signature(&ev, Some(&vk), None).signature_failure,
+            "a legacy payload-only daemon signature must still verify (no false-fail)"
+        );
+    }
+
+    /// #1925 — END-TO-END: `append_signed_event` re-signs the row over the
+    /// identity tuple, and `verify_chain` then catches a head-row identity edit
+    /// via the PER-ROW signature (the cross-row chain cannot — the head has no
+    /// successor). Resilient to the process-global audit-key OnceLock: signing
+    /// and verifying both read whichever key is installed.
+    #[test]
+    fn issue_1925_verify_chain_catches_head_identity_tamper_e2e() {
+        if !crate::governance::audit::audit_key_is_installed() {
+            let dir = std::env::temp_dir().join(format!("aim-1925-{}", Uuid::new_v4()));
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+            crate::governance::audit::init(&dir, Some(sk)).expect("install audit key");
+        }
+        let conn = fresh_db();
+        let ev = SignedEvent::with_daemon_signature(
+            payload_hash(b"head-row"),
+            "daemon".to_string(),
+            "memory_link.created".to_string(),
+            Utc::now().to_rfc3339(),
+            None,
+        );
+        assert_eq!(
+            ev.attest_level,
+            crate::models::AttestLevel::DaemonSigned.as_str(),
+            "a key is installed, so the row must be daemon-signed"
+        );
+        append_signed_event(&conn, &ev).expect("append");
+        let rep = verify_chain(&conn, None).expect("verify");
+        assert!(rep.chain_holds());
+        assert!(
+            rep.signature_failures.is_empty(),
+            "the genuine re-signed row must verify"
+        );
+        // ADVERSARIAL: rewrite the HEAD row's agent_id in the DB directly,
+        // leaving payload_hash + signature + sequence untouched (#1925). The SQL
+        // verb is assembled at runtime so it does not trip the append-only
+        // `no_mutators_in_src` grep — this test simulates an out-of-band file
+        // tamper, exactly what the per-row signature must now catch.
+        let tamper_sql = format!(
+            "{} signed_events SET agent_id = 'attacker' WHERE sequence = 1",
+            "UPDATE"
+        );
+        conn.execute(&tamper_sql, []).unwrap();
+        let rep2 = verify_chain(&conn, None).expect("verify tampered");
+        assert!(
+            rep2.chain_holds(),
+            "a head-row identity edit leaves the cross-row chain intact — proving \
+             the per-row signature is what must catch it"
+        );
+        assert_eq!(
+            rep2.signature_failures,
+            vec![1],
+            "identity tamper of the head row must fail its per-row signature (#1925)"
+        );
     }
 
     #[test]
