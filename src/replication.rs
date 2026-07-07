@@ -87,7 +87,10 @@ impl QuorumPolicy {
     ///
     /// Returns `QuorumError::InvalidPolicy` if `n == 0`.
     pub fn majority(n: usize) -> Result<Self, QuorumError> {
-        let w = n.div_ceil(2).max(1);
+        // Strict-majority threshold: floor(N/2)+1 = ceil((N+1)/2).
+        // Guarantees 2W > N for both parities (the split-brain-safe
+        // invariant); `n.div_ceil(2)` only holds it for odd N.
+        let w = (n / 2) + 1;
         Self::new(n, w, Duration::from_secs(2), Duration::from_secs(30))
     }
 }
@@ -304,6 +307,24 @@ mod tests {
         assert_eq!(QuorumPolicy::majority(3).unwrap().w, 2);
         assert_eq!(QuorumPolicy::majority(5).unwrap().w, 3);
         assert_eq!(QuorumPolicy::majority(7).unwrap().w, 4);
+    }
+
+    /// #1888 — even N must yield a STRICT majority (2W > N), not W = N/2.
+    /// The old `n.div_ceil(2)` gave W=2 for N=4 and W=3 for N=6, letting two
+    /// disjoint N/2 partitions both reach quorum (split-brain).
+    #[test]
+    fn majority_even_n_is_strict_majority() {
+        for n in [2usize, 4, 6, 8, 100] {
+            let w = QuorumPolicy::majority(n).unwrap().w;
+            assert_eq!(w, n / 2 + 1, "even N={n} must be floor(N/2)+1");
+            assert!(
+                2 * w > n,
+                "strict-majority invariant 2W>N violated for N={n}"
+            );
+        }
+        // Explicit ADR-intended values from the issue.
+        assert_eq!(QuorumPolicy::majority(4).unwrap().w, 3);
+        assert_eq!(QuorumPolicy::majority(6).unwrap().w, 4);
     }
 
     #[test]

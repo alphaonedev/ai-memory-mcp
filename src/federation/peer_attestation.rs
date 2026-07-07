@@ -302,8 +302,15 @@ pub fn namespace_allowed_test_glob(pattern: &str, target: &str) -> bool {
 
 #[must_use]
 fn glob_match(pattern: &str, target: &str) -> bool {
-    if pattern == "**" || pattern == "*" {
+    // `**` is the only match-all token. A bare `*` matches exactly ONE
+    // top-level segment (#1902) — matching it against any target would
+    // silently widen a `["*"]` allowlist to the entire namespace tree,
+    // defeating the #239 per-peer scope control.
+    if pattern == "**" {
         return true;
+    }
+    if pattern == "*" {
+        return !target.contains('/');
     }
     if let Some(prefix) = pattern.strip_suffix("/**") {
         // `prefix/**` matches `prefix` itself OR anything starting with `prefix/`.
@@ -452,8 +459,14 @@ mod tests {
 
     #[test]
     fn glob_wildcard_all() {
-        assert!(glob_match("*", "anything"));
+        // `**` is the only match-all token.
+        assert!(glob_match("**", "anything"));
         assert!(glob_match("**", "anything/even/nested"));
+        // A bare `*` matches exactly ONE top-level segment, NOT nested paths
+        // (#1902 — a `["*"]` allowlist must not silently grant the whole tree).
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("*", "anything/nested"));
+        assert!(!glob_match("*", "a/b/c"));
     }
 
     #[test]

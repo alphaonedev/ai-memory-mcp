@@ -51,8 +51,8 @@ pub mod pre_store;
 // G1's `use crate::hooks::HookEvent` (and the
 // `crate::hooks::config::HookEvent` compatibility alias) resolving.
 pub use chain::{
-    AskUserPrompt, ChainResult, HookChain, fire_on_index_eviction, spawn_eviction_observer,
-    spawn_post_event_observer,
+    AskUserPrompt, ChainResult, HookChain, dispatch_pre_event_enforced, fire_on_index_eviction,
+    spawn_eviction_observer, spawn_post_event_observer,
 };
 pub use config::{FailMode, HookConfig, HookMode, HooksConfigError};
 pub use events::{EvictionEvent, HookEvent};

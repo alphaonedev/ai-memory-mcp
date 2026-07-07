@@ -1309,6 +1309,16 @@ pub fn compute_witness_verdict(
     }
     // Signature self-consistency over the canonical resolution.
     if !crate::checkpoints::verify(cp) {
+        // #1890 — if a pin MATCHED above (enrolled_pubkey present and equal)
+        // but the signature is invalid, an attacker forged a newer anchor
+        // under the *public* enrolled pubkey to shadow the real witness. Fail
+        // CLOSED (Forged), mirroring `pin_and_verify_role_checkpoint`. Only
+        // withhold when NO out-of-band pin was available to anchor the pubkey.
+        if enrolled_pubkey.is_some() {
+            return WitnessCheck::Forged {
+                detail: "witness checkpoint signature failed verification".to_string(),
+            };
+        }
         return withhold();
     }
     // No out-of-band pin available → cannot cryptographically anchor the
@@ -2653,5 +2663,60 @@ mod tests {
         .unwrap();
         let res = list_signed_events(&conn, Some("alice"), 10, 0);
         assert!(res.is_err(), "row decode must fail when event_type is NULL");
+    }
+
+    /// #1890 — a witness anchor whose `resolver_pubkey` MATCHES the enrolled
+    /// out-of-band pin but whose signature is INVALID must be `Forged` (fail
+    /// closed), not silently withheld as `Unknown` (which `is_clean` treats as
+    /// clean). An attacker who can tail-truncate can also insert a newer bogus
+    /// anchor under the *public* enrolled pubkey to shadow the real witness.
+    #[test]
+    fn witness_pin_match_but_bad_sig_is_forged_not_unknown() {
+        use crate::governance::audit::{WitnessDualHead, build_signed_witness_checkpoint};
+        let kp = crate::identity::keypair::generate("witness-node").expect("gen keypair");
+        let enrolled = kp.public;
+        let dual = WitnessDualHead {
+            signed_head_sequence: 5,
+            signed_head_hash: "aa".to_string(),
+            revisions_head_sequence: 3,
+            revisions_head_hash: "bb".to_string(),
+        };
+        let mut cp =
+            build_signed_witness_checkpoint(&dual, 1_900_000_000, &kp).expect("build witness cp");
+
+        // Positive control: valid, pinned witness whose heads match the DB →
+        // NotDetected (no truncation).
+        assert!(matches!(
+            compute_witness_verdict(Some(&cp), Some(&enrolled), 5, 3, false),
+            WitnessCheck::NotDetected
+        ));
+
+        // Corrupt the signature but keep resolver_pubkey == the enrolled pin.
+        cp.signature[0] ^= 0xFF;
+        assert!(
+            !crate::checkpoints::verify(&cp),
+            "corrupted signature must fail verification"
+        );
+
+        // Fix: pin matched + invalid sig → Forged (NOT withheld Unknown).
+        assert!(
+            matches!(
+                compute_witness_verdict(Some(&cp), Some(&enrolled), 5, 3, false),
+                WitnessCheck::Forged { .. }
+            ),
+            "pin-valid but sig-invalid anchor must be Forged"
+        );
+        // Fail-closed under require-witness mode too.
+        assert!(matches!(
+            compute_witness_verdict(Some(&cp), Some(&enrolled), 5, 3, true),
+            WitnessCheck::Forged { .. }
+        ));
+
+        // Control: NO out-of-band pin available (enrolled None) + bad sig →
+        // withhold (cannot cryptographically anchor the pubkey).
+        assert!(matches!(
+            compute_witness_verdict(Some(&cp), None, 5, 3, false),
+            WitnessCheck::Unknown
+        ));
     }
 }

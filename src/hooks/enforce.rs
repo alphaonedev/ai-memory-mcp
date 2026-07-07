@@ -179,6 +179,32 @@ pub fn effective_fail_mode(
     }
 }
 
+/// PE-1 dispatch composition (#1885) — build the effective, priority-unsorted
+/// hook list for `event`, threading [`effective_fail_mode`] through every
+/// entry. This is the piece the dispatch gate feeds into the chain so that a
+/// required-event hook configured `fail_open` is forced to fail **closed**
+/// under `enforce` (otherwise a fail-open hook that errored would let the chain
+/// Allow, defeating enforcement). Filters to ENABLED hooks matching `event`
+/// (mirroring [`super::chain::HookChain::for_event`]) then overrides each
+/// entry's `fail_mode` with its effective value.
+#[must_use]
+pub fn effective_hooks_for_event(
+    all_hooks: &[HookConfig],
+    event: HookEvent,
+    mode: HookEnforceMode,
+    required: &[HookEvent],
+) -> Vec<HookConfig> {
+    all_hooks
+        .iter()
+        .filter(|h| h.enabled && h.event == event)
+        .map(|h| {
+            let mut c = h.clone();
+            c.fail_mode = effective_fail_mode(h, mode, required);
+            c
+        })
+        .collect()
+}
+
 /// PE-1 discoverability (#1734) — produce operator-facing pre-flight lines for
 /// the boot banner + `ai-memory doctor`, one per declared required event,
 /// flagging any that has no enabled hook (and, under `enforce`, that it WILL
@@ -378,6 +404,32 @@ mod tests {
         // Advisory → the missing one is WARN+allow, not WILL DENY.
         let adv = preflight_report(&hooks, HookEnforceMode::Advisory, &req);
         assert!(adv[1].contains("WARN+allow") && !adv[1].contains("WILL DENY"));
+    }
+
+    #[test]
+    fn effective_hooks_for_event_threads_fail_mode_and_filters() {
+        let req = [HookEvent::PreStore];
+        let hooks = [
+            cfg(HookEvent::PreStore, true, FailMode::Open), // required + fail-open
+            cfg(HookEvent::PreStore, false, FailMode::Open), // disabled → filtered out
+            cfg(HookEvent::PreDelete, true, FailMode::Open), // other event → filtered out
+        ];
+        let effective =
+            effective_hooks_for_event(&hooks, HookEvent::PreStore, HookEnforceMode::Enforce, &req);
+        assert_eq!(
+            effective.len(),
+            1,
+            "only the enabled PreStore hook survives"
+        );
+        assert_eq!(
+            effective[0].fail_mode,
+            FailMode::Closed,
+            "a required fail-open hook is forced Closed under enforce (#1885 threading)"
+        );
+        // Outside enforce the configured mode is preserved verbatim.
+        let advisory =
+            effective_hooks_for_event(&hooks, HookEvent::PreStore, HookEnforceMode::Advisory, &req);
+        assert_eq!(advisory[0].fail_mode, FailMode::Open);
     }
 
     #[test]

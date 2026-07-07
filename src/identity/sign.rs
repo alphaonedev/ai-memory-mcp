@@ -25,11 +25,15 @@
 //!
 //! CBOR is the RustCrypto / IETF default for signed payloads (COSE
 //! lives on top of CBOR). RFC 8949 §4.2.1 defines a *deterministic*
-//! encoding: map keys sort lexicographically, integers use the smallest
-//! length, no indefinite-length items, no semantic tags we don't need.
-//! That gives us byte-stable input to Ed25519 without writing a custom
-//! binary format and without depending on `serde_json`'s key-ordering
-//! quirks (which are not part of its public contract).
+//! encoding: map keys sort by the **bytewise order of their encoded
+//! form** (for text-string keys: length-first, then bytewise — NOT plain
+//! string-lexicographic order), integers use the smallest length, no
+//! indefinite-length items, no semantic tags we don't need. That gives
+//! us byte-stable input to Ed25519 without writing a custom binary
+//! format and without depending on `serde_json`'s key-ordering quirks
+//! (which are not part of its public contract). The link/persona/write
+//! encoders route their keys through [`canonical_cbor_map`], which
+//! enforces exactly this canonical ordering (#1897).
 //!
 //! # Out of scope here
 //!
@@ -80,10 +84,11 @@ pub struct SignableLink<'a> {
 /// `SignableLink` twice (or on a different host) produces identical
 /// bytes — the precondition Ed25519 needs.
 ///
-/// Field order matters at the *byte* level even though `ciborium`
-/// canonicalises map keys for us — we still pass a deterministic
-/// `Vec<(&str, ...)>` shape to keep this function's intent reviewable
-/// without leaning on a non-obvious property of the encoder.
+/// Keys are emitted in true RFC-8949 canonical order via
+/// [`canonical_cbor_map`] (length-first, then bytewise over the encoded
+/// keys) so the bytes match what any conformant CBOR verifier re-derives —
+/// for the link keys that order is `dst_id, src_id, relation, valid_from,
+/// observed_by, valid_until` (#1897).
 ///
 /// # Errors
 ///
@@ -92,29 +97,14 @@ pub struct SignableLink<'a> {
 /// `Result` so callers don't have to choose between panicking and
 /// silently signing a truncated payload.
 pub fn canonical_cbor(link: &SignableLink<'_>) -> Result<Vec<u8>> {
-    // We model the payload as a plain `BTreeMap<&str, ciborium::Value>`
-    // so map-key ordering is enforced at construction time — the encoder
-    // walks the BTreeMap in iteration order, which matches lexicographic
-    // sort. ciborium's `into_writer` emits canonical (smallest-int,
-    // definite-length) representations by default.
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
-    map.insert("src_id", ciborium::Value::Text(link.src_id.to_string()));
-    map.insert("dst_id", ciborium::Value::Text(link.dst_id.to_string()));
-    map.insert("relation", ciborium::Value::Text(link.relation.to_string()));
-    map.insert(field_names::OBSERVED_BY, text_or_null(link.observed_by));
-    map.insert(field_names::VALID_FROM, text_or_null(link.valid_from));
-    map.insert(field_names::VALID_UNTIL, text_or_null(link.valid_until));
-
-    // Convert the BTreeMap to a `ciborium::Value::Map` whose entries are
-    // already in lexicographic key order. ciborium will preserve that
-    // order on the wire — the documented default for `into_writer`.
-    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
-        .into_iter()
-        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
-        .collect();
-    let value = ciborium::Value::Map(entries);
-
+    let value = canonical_cbor_map(vec![
+        ("src_id", ciborium::Value::Text(link.src_id.to_string())),
+        ("dst_id", ciborium::Value::Text(link.dst_id.to_string())),
+        ("relation", ciborium::Value::Text(link.relation.to_string())),
+        (field_names::OBSERVED_BY, text_or_null(link.observed_by)),
+        (field_names::VALID_FROM, text_or_null(link.valid_from)),
+        (field_names::VALID_UNTIL, text_or_null(link.valid_until)),
+    ]);
     let mut out: Vec<u8> = Vec::with_capacity(128);
     ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableLink")?;
     Ok(out)
@@ -153,6 +143,31 @@ fn text_or_null(opt: Option<&str>) -> ciborium::Value {
         Some(s) => ciborium::Value::Text(s.to_string()),
         None => ciborium::Value::Null,
     }
+}
+
+/// Assemble a CBOR map whose entries obey RFC 8949 §4.2.1 Core Deterministic
+/// Encoding: keys ordered by the **bytewise order of their encoded form**
+/// (for the text-string keys used here, that is length-first, then bytewise) —
+/// NOT the string-lexicographic order a `BTreeMap<&str>` yields, which diverges
+/// for keys of unequal length (#1897 — e.g. `observed_by` sorts BEFORE
+/// `relation` lexicographically but AFTER it in canonical order, since
+/// `relation` is shorter). ciborium preserves the entry order we supply, so
+/// pre-sorting here is what makes the encoding genuinely RFC-canonical and
+/// interoperable with any conformant CBOR verifier — the cross-implementation
+/// guarantee this module documents.
+fn canonical_cbor_map(pairs: Vec<(&str, ciborium::Value)>) -> ciborium::Value {
+    let mut keyed: Vec<(Vec<u8>, ciborium::Value, ciborium::Value)> = pairs
+        .into_iter()
+        .map(|(k, v)| {
+            let key = ciborium::Value::Text(k.to_string());
+            let mut enc = Vec::with_capacity(k.len() + 1);
+            ciborium::ser::into_writer(&key, &mut enc)
+                .expect("encoding a CBOR text-string key is infallible");
+            (enc, key, v)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    ciborium::Value::Map(keyed.into_iter().map(|(_, k, v)| (k, v)).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -219,40 +234,33 @@ pub struct SignablePersona<'a> {
 /// `Result` so callers don't have to choose between panicking and
 /// silently signing a truncated payload.
 pub fn canonical_cbor_persona(p: &SignablePersona<'_>) -> Result<Vec<u8>> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
-    map.insert(
-        "persona_id",
-        ciborium::Value::Text(p.persona_id.to_string()),
-    );
-    map.insert("entity_id", ciborium::Value::Text(p.entity_id.to_string()));
-    map.insert("namespace", ciborium::Value::Text(p.namespace.to_string()));
-    map.insert(
-        "version",
-        ciborium::Value::Integer(ciborium::value::Integer::from(p.version)),
-    );
-    map.insert(
-        field_names::GENERATED_AT,
-        ciborium::Value::Text(p.generated_at.to_string()),
-    );
     let sources_val = ciborium::Value::Array(
         p.sources
             .iter()
             .map(|s| ciborium::Value::Text(s.clone()))
             .collect(),
     );
-    map.insert("sources", sources_val);
-    map.insert(
-        "body_md_sha256",
-        ciborium::Value::Bytes(p.body_md_sha256.to_vec()),
-    );
-
-    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
-        .into_iter()
-        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
-        .collect();
-    let value = ciborium::Value::Map(entries);
-
+    let value = canonical_cbor_map(vec![
+        (
+            "persona_id",
+            ciborium::Value::Text(p.persona_id.to_string()),
+        ),
+        ("entity_id", ciborium::Value::Text(p.entity_id.to_string())),
+        ("namespace", ciborium::Value::Text(p.namespace.to_string())),
+        (
+            "version",
+            ciborium::Value::Integer(ciborium::value::Integer::from(p.version)),
+        ),
+        (
+            field_names::GENERATED_AT,
+            ciborium::Value::Text(p.generated_at.to_string()),
+        ),
+        ("sources", sources_val),
+        (
+            "body_md_sha256",
+            ciborium::Value::Bytes(p.body_md_sha256.to_vec()),
+        ),
+    ]);
     let mut out: Vec<u8> = Vec::with_capacity(256);
     ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignablePersona")?;
     Ok(out)
@@ -356,27 +364,20 @@ pub struct SignableWrite<'a> {
 /// `Result` so callers don't have to choose between panicking and
 /// silently signing a truncated payload.
 pub fn canonical_cbor_write(w: &SignableWrite<'_>) -> Result<Vec<u8>> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<&str, ciborium::Value> = BTreeMap::new();
-    map.insert("agent_id", ciborium::Value::Text(w.agent_id.to_string()));
-    map.insert("namespace", ciborium::Value::Text(w.namespace.to_string()));
-    map.insert("title", ciborium::Value::Text(w.title.to_string()));
-    map.insert("kind", ciborium::Value::Text(w.kind.to_string()));
-    map.insert(
-        field_names::CREATED_AT,
-        ciborium::Value::Text(w.created_at.to_string()),
-    );
-    map.insert(
-        field_names::CONTENT_SHA256,
-        ciborium::Value::Bytes(w.content_sha256.to_vec()),
-    );
-
-    let entries: Vec<(ciborium::Value, ciborium::Value)> = map
-        .into_iter()
-        .map(|(k, v)| (ciborium::Value::Text(k.to_string()), v))
-        .collect();
-    let value = ciborium::Value::Map(entries);
-
+    let value = canonical_cbor_map(vec![
+        ("agent_id", ciborium::Value::Text(w.agent_id.to_string())),
+        ("namespace", ciborium::Value::Text(w.namespace.to_string())),
+        ("title", ciborium::Value::Text(w.title.to_string())),
+        ("kind", ciborium::Value::Text(w.kind.to_string())),
+        (
+            field_names::CREATED_AT,
+            ciborium::Value::Text(w.created_at.to_string()),
+        ),
+        (
+            field_names::CONTENT_SHA256,
+            ciborium::Value::Bytes(w.content_sha256.to_vec()),
+        ),
+    ]);
     let mut out: Vec<u8> = Vec::with_capacity(256);
     ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableWrite")?;
     Ok(out)
@@ -1276,6 +1277,51 @@ mod tests {
         let a = canonical_cbor(&base).expect("encode base");
         let b = canonical_cbor(&altered).expect("encode altered");
         assert_ne!(a, b, "different relation must produce different bytes");
+    }
+
+    /// #1897 — the encoder must emit keys in TRUE RFC 8949 §4.2.1 canonical
+    /// order (length-first, then bytewise over the ENCODED keys), NOT the
+    /// `BTreeMap<&str>` string-lexicographic order. For the link key set the
+    /// canonical order is `dst_id, src_id, relation, valid_from, observed_by,
+    /// valid_until`. The old BTreeMap order wrongly placed `observed_by`
+    /// before `relation` (lexicographic `o` < `r`), so any conformant CBOR
+    /// verifier would re-derive different bytes and reject the signature.
+    #[test]
+    fn canonical_cbor_uses_rfc8949_key_order() {
+        let bytes = canonical_cbor(&link_fixture()).expect("encode");
+
+        // Exact header + first key: a 6-entry map (0xA6) whose first key is
+        // the 6-byte text string "dst_id" (0x66 'd' 's' 't' '_' 'i' 'd').
+        assert_eq!(
+            &bytes[0..8],
+            &[0xA6, 0x66, b'd', b's', b't', b'_', b'i', b'd'],
+            "canonical map must open with 6 entries and the key dst_id"
+        );
+
+        let pos = |needle: &str| {
+            bytes
+                .windows(needle.len())
+                .position(|w| w == needle.as_bytes())
+                .unwrap_or_else(|| panic!("key {needle} not found in encoding"))
+        };
+        let order = [
+            "dst_id",
+            "src_id",
+            "relation",
+            "valid_from",
+            "observed_by",
+            "valid_until",
+        ];
+        let positions: Vec<usize> = order.iter().map(|k| pos(k)).collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "keys must be in RFC-8949 canonical order {order:?}; got byte positions {positions:?}"
+        );
+        // The exact inversion the old BTreeMap ordering got wrong:
+        assert!(
+            pos("relation") < pos("observed_by"),
+            "shorter key 'relation' must precede longer 'observed_by'"
+        );
     }
 
     #[test]

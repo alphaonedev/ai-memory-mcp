@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// Current credential format version. Bumped only on a breaking change
 /// to the claim set or encoding; verifiers refuse versions they do not
@@ -404,8 +404,12 @@ impl SignedCredential {
             ));
         }
         let sig = Signature::from_bytes(&self.signature);
+        // `verify_strict` (not permissive `verify`) so an identity credential
+        // binds to exactly one canonical key: it rejects signature
+        // malleability, non-canonical scalars, and small-order/torsion issuer
+        // keys — matching src/identity/verify.rs (#1900).
         issuer_pub
-            .verify(&self.claims_bytes, &sig)
+            .verify_strict(&self.claims_bytes, &sig)
             .map_err(|_| CredentialError::BadSignature)?;
         self.check_validity(now_unix)
     }
@@ -573,6 +577,34 @@ mod tests {
         let signed = sample(now).sign(&ca).expect("sign");
         assert_eq!(
             signed.verify_against(&attacker.verifying_key(), now),
+            Err(CredentialError::BadSignature)
+        );
+    }
+
+    /// #1900 — `verify_against` must use `verify_strict`, rejecting a
+    /// non-canonical (malleable) `S` scalar (`S + L`). A permissive `verify`
+    /// would let a second, distinct signature encoding pass for the same key,
+    /// breaking the one-credential-one-key uniqueness guarantee.
+    #[test]
+    fn non_canonical_signature_scalar_rejected() {
+        // Ed25519 group order L, little-endian.
+        const L: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let ca = ca_key(9);
+        let now = 1_900_000_000;
+        let mut signed = sample(now).sign(&ca).expect("sign");
+        // Add L to the S half (bytes 32..64), little-endian, with carry.
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(signed.signature[32 + i]) + u16::from(L[i]) + carry;
+            signed.signature[32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(
+            signed.verify_against(&ca.verifying_key(), now),
             Err(CredentialError::BadSignature)
         );
     }
