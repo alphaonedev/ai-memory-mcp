@@ -27,6 +27,15 @@ if [[ -z "${DIGITALOCEAN_TOKEN:-}" ]]; then
   exit 2
 fi
 
+# `terraform destroy` requires every declared variable to be bound, even
+# though destroy operates purely from the state file. `ssh_pubkey_fingerprint`
+# (main.tf) has no default and is consumed ONLY at create time (droplet
+# ssh_keys) — destroy never uses its value. Default it here so a bare
+# `teardown.sh` can NEVER refuse for a missing var and strand a paid droplet
+# running; that money-safety guarantee is the entire point of teardown. A real
+# operator env value, if exported, still wins.
+export TF_VAR_ssh_pubkey_fingerprint="${TF_VAR_ssh_pubkey_fingerprint:-destroy-noop}"
+
 mkdir -p "${SCRATCH_ROOT}/${NOW}"
 terraform init -input=false >/dev/null
 terraform output -json > "${SCRATCH_ROOT}/${NOW}/pre-destroy.json" || true
