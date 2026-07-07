@@ -44,6 +44,54 @@ fn log_catchup_sync_state_observe_failed(peer_id: &str, e: impl std::fmt::Displa
     tracing::warn!("catchup: sync_state_observe failed for {peer_id}: {e}");
 }
 
+/// #1928 (CWE-770) — hard ceiling on a federation catchup/sync response body.
+/// reqwest's `.json()` buffers the ENTIRE body into RAM before parsing with no
+/// length bound, so a hostile-but-enrolled peer answering `/sync/since` with a
+/// multi-gigabyte body could drive the daemon to OOM (the federation client
+/// sets only a wall-clock timeout, NOT a byte bound). We cap here exactly as
+/// the LLM client does at `src/llm.rs`: a `Content-Length` pre-check rejects an
+/// honest oversize body before a byte is read, and a streaming accumulator
+/// aborts a lying peer mid-transfer.
+const MAX_SYNC_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+/// #1928 — buffer a federation catchup response, aborting as soon as the
+/// accumulated body would exceed [`MAX_SYNC_RESPONSE_BYTES`], then parse JSON.
+/// Replaces the unbounded `resp.json().await` at every `/sync/since` pull.
+async fn read_capped_sync_json(resp: reqwest::Response) -> anyhow::Result<serde_json::Value> {
+    read_capped_sync_json_inner(resp, MAX_SYNC_RESPONSE_BYTES).await
+}
+
+/// Cap-parameterised core of [`read_capped_sync_json`], split out so a unit
+/// test can exercise the rejection against a tiny `cap` without streaming a
+/// real 64 MiB body.
+async fn read_capped_sync_json_inner(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> anyhow::Result<serde_json::Value> {
+    use anyhow::anyhow;
+    if let Some(len) = resp.content_length() {
+        if len > cap as u64 {
+            return Err(anyhow!(
+                "federation sync response too large: Content-Length {len} exceeds cap of {cap} bytes"
+            ));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow!("reading federation sync response chunk: {e}"))?
+    {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(anyhow!(
+                "federation sync response exceeded cap of {cap} bytes while streaming"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| anyhow!("parsing federation sync response: {e}"))
+}
+
 /// #1687 — advance the per-peer catchup watermark for a row that just applied
 /// successfully, but never while `halted` (set once any earlier row in the
 /// batch failed to apply). Guarantees `sync_state` is never moved past an
@@ -221,7 +269,7 @@ pub(super) async fn catchup_once_with_store(
             }
         };
 
-        let body: serde_json::Value = match resp.json().await {
+        let body: serde_json::Value = match read_capped_sync_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 log_catchup_unparseable_body(&peer.id, e);
@@ -399,7 +447,7 @@ async fn catchup_once_legacy(config: &FederationConfig, db: &crate::handlers::Db
             }
         };
 
-        let body: serde_json::Value = match resp.json().await {
+        let body: serde_json::Value = match read_capped_sync_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 log_catchup_unparseable_body(&peer.id, e);
@@ -515,7 +563,7 @@ pub async fn catchup_once_for_tests(config: &FederationConfig) {
             }
         };
 
-        let body: serde_json::Value = match resp.json().await {
+        let body: serde_json::Value = match read_capped_sync_json(resp).await {
             Ok(v) => v,
             Err(e) => {
                 log_catchup_unparseable_body(&peer.id, e);
@@ -597,5 +645,71 @@ mod issue_1687_tests {
             Some("t1"),
             "watermark must stop at the last pre-failure success"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_1928_tests {
+    //! #1928 (CWE-770) — ADVERSARIAL: a hostile-but-enrolled federation peer
+    //! answers a `/sync/since` pull with a body far larger than any legitimate
+    //! delta, driving the daemon toward OOM. The catchup path used the
+    //! unbounded `resp.json().await`; the cap now rejects it.
+    use super::{MAX_SYNC_RESPONSE_BYTES, read_capped_sync_json_inner};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Spawn a one-shot TCP "peer" that returns `body` under a crafted
+    /// `Content-Length: content_length_hdr` and returns its address.
+    async fn hostile_peer(content_length_hdr: u64, body: &'static [u8]) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut scratch = [0u8; 2048];
+                let _ = sock.read(&mut scratch).await; // drain request line/headers
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length_hdr}\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.flush().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn oversize_sync_body_rejected_before_buffering() {
+        // Advertise 100 MiB — the exact multi-gigabyte-class OOM vector.
+        let advertised = 100 * 1024 * 1024u64;
+        let addr = hostile_peer(advertised, b"{").await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/sync/since"))
+            .send()
+            .await
+            .expect("connect to hostile peer");
+        // Cap far below the advertised length → rejected on the Content-Length
+        // pre-check, before a single body byte is buffered.
+        let out = read_capped_sync_json_inner(resp, 4096).await;
+        assert!(
+            out.is_err(),
+            "oversize federation sync body (Content-Length {advertised}) must be rejected (#1928)"
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_small_sync_body_still_parses() {
+        let body = br#"{"memories":[]}"#;
+        let addr = hostile_peer(body.len() as u64, body).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/sync/since"))
+            .send()
+            .await
+            .expect("connect to peer");
+        let out = read_capped_sync_json_inner(resp, MAX_SYNC_RESPONSE_BYTES)
+            .await
+            .expect("a legitimate under-cap body parses");
+        assert!(out.get("memories").is_some());
     }
 }

@@ -624,6 +624,16 @@ pub async fn delete_memory(
             .into_response();
     }
 
+    // #1924 (CWE-288) — consult the PRE-DELETE enforcement gate before the
+    // destructive write, so `enforce_mode = enforce` + required `pre_delete`
+    // with no hook DENIES (503) on the HTTP surface as it does on MCP.
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PreDelete,
+        json!({ "id": id }),
+    ) {
+        return resp;
+    }
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // action audit. Memory delete is the canonical destructive operation;
     // the forensic-chain entry MUST land before the storage write so the
@@ -1002,6 +1012,14 @@ pub async fn promote_memory(
             Json(json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+    // #1924 (CWE-288) — consult the PRE-PROMOTE enforcement gate before the
+    // tier-promotion write (HTTP parity with the MCP gate).
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PrePromote,
+        json!({ "id": id }),
+    ) {
+        return resp;
     }
     // #1623 — optional JSON body `{"target_tier": "mid"|"long"}`,
     // closing the MCP/HTTP parity gap (#831 added the param on MCP;

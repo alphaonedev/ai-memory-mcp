@@ -150,6 +150,14 @@ pub async fn handle_reflect_http(
     _headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
+    // reflection write (HTTP parity with the MCP gate). INERT by default.
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PreReflect,
+        body.clone(),
+    ) {
+        return resp;
+    }
     // Postgres SAL path (#1549): route the recursive-learning reflect
     // through `MemoryStore::reflect` (the inherent native-sqlx port —
     // governance cap, depth-exceeded signed_events audit, atomic memory

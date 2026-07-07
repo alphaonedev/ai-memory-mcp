@@ -32,32 +32,25 @@ use ai_memory::signed_events::{
     verify_chain,
 };
 
-/// ASCII Unit Separator — the field separator the canonical encoding
-/// uses. Mirrored here (not imported — it is a private module const) so
-/// the test independently reconstructs the pre-G5a byte layout.
-const FIELD_SEP: u8 = 0x1F;
-
-/// Independently reconstruct the PRE-G5a canonical bytes (no cause
-/// field) so test (a) can assert byte-identity rather than trusting the
-/// production function to police itself.
-fn pre_g5a_canonical_bytes(ev: &SignedEvent) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(ev.id.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(ev.agent_id.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(ev.event_type.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(&ev.payload_hash);
-    out.push(FIELD_SEP);
-    if let Some(sig) = ev.signature.as_ref() {
-        out.extend_from_slice(sig);
+/// #1930 (CWE-345) — independently reconstruct the length-prefixed BASE
+/// canonical bytes (every field through `sequence`, WITHOUT the trailing
+/// present-only cause fold) so the tests assert the cause-fold layout against a
+/// hand-built reference rather than trusting the production function to police
+/// itself. Post-#1930 every field is `u64-BE length || bytes` (no 0x1F
+/// separators), so a data byte can never be confused with a delimiter.
+fn base_canonical_bytes_no_cause(ev: &SignedEvent) -> Vec<u8> {
+    fn push_lp(out: &mut Vec<u8>, f: &[u8]) {
+        out.extend_from_slice(&u64::try_from(f.len()).unwrap().to_be_bytes());
+        out.extend_from_slice(f);
     }
-    out.push(FIELD_SEP);
-    out.extend_from_slice(ev.attest_level.as_bytes());
-    out.push(FIELD_SEP);
-    out.extend_from_slice(ev.timestamp.as_bytes());
-    out.push(FIELD_SEP);
+    let mut out: Vec<u8> = Vec::new();
+    push_lp(&mut out, ev.id.as_bytes());
+    push_lp(&mut out, ev.agent_id.as_bytes());
+    push_lp(&mut out, ev.event_type.as_bytes());
+    push_lp(&mut out, &ev.payload_hash);
+    push_lp(&mut out, ev.signature.as_deref().unwrap_or(&[]));
+    push_lp(&mut out, ev.attest_level.as_bytes());
+    push_lp(&mut out, ev.timestamp.as_bytes());
     out.extend_from_slice(&ev.sequence.to_be_bytes());
     out
 }
@@ -118,25 +111,30 @@ fn legacy_all_none_chain_verifies_clean_and_canonical_bytes_unchanged() {
         ..unsigned_row("bob", "memory.stored", b"probe")
     };
     assert!(ev.cause_hash.is_none(), "probe row has no cause");
+    // #1930/#1822 — a None cause = length-prefixed base bytes + a single 0
+    // presence tag (present-only fold contributes just the tag).
+    let mut none_expected = base_canonical_bytes_no_cause(&ev);
+    none_expected.push(0);
     assert_eq!(
         canonical_chain_bytes(&ev),
-        pre_g5a_canonical_bytes(&ev),
-        "None cause must produce byte-identical pre-G5a canonical bytes",
+        none_expected,
+        "None cause = length-prefixed base bytes + 0 presence tag",
     );
 
-    // And a Some-cause event = the same bytes + SEP + the cause digest.
+    // And a Some-cause event = base + presence-tag 1 + u64 length + the digest.
     let cause = compute_cause_hash("bob", "memory.stored", "id-1", "some|args");
     let with_cause = SignedEvent {
         cause_hash: Some(cause.clone()),
         ..ev.clone()
     };
-    let mut expected = pre_g5a_canonical_bytes(&ev);
-    expected.push(FIELD_SEP);
+    let mut expected = base_canonical_bytes_no_cause(&ev);
+    expected.push(1);
+    expected.extend_from_slice(&u64::try_from(cause.len()).unwrap().to_be_bytes());
     expected.extend_from_slice(&cause);
     assert_eq!(
         canonical_chain_bytes(&with_cause),
         expected,
-        "present cause must append exactly one separator + the digest",
+        "present cause must append presence-tag 1 + u64 length + the digest",
     );
 }
 
@@ -379,13 +377,14 @@ mod postgres_parity {
             sequence: read_seq,
             cause_hash: read_cause,
         };
-        let mut expected = pre_g5a_canonical_bytes(&ev);
-        expected.push(FIELD_SEP);
+        let mut expected = base_canonical_bytes_no_cause(&ev);
+        expected.push(1);
+        expected.extend_from_slice(&u64::try_from(cause.len()).unwrap().to_be_bytes());
         expected.extend_from_slice(&cause);
         assert_eq!(
             canonical_chain_bytes(&ev),
             expected,
-            "pg-stored cause folds identically to the sqlite encoding",
+            "pg-stored cause folds identically to the sqlite length-prefixed encoding",
         );
 
         // Cleanup (append-only table; test rows are pruned via direct SQL,

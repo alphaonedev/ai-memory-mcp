@@ -260,6 +260,14 @@ pub async fn consolidate_memories(
     headers: HeaderMap,
     Json(body): Json<ConsolidateBody>,
 ) -> impl IntoResponse {
+    // #1924 (CWE-288) — consult the PRE-CONSOLIDATE enforcement gate before the
+    // consolidation write (HTTP parity with the MCP gate).
+    if let Some(resp) = crate::handlers::create::http_pre_event_gate(
+        crate::hooks::HookEvent::PreConsolidate,
+        serde_json::json!({ "ids": body.ids }),
+    ) {
+        return resp;
+    }
     // v0.7.0 L7 — materialize the summary up front so the downstream
     // validation + storage paths see a concrete `&str`. When the caller
     // supplied one, use it verbatim; when absent, ask the LLM (matching

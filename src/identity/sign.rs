@@ -96,8 +96,38 @@ pub struct SignableLink<'a> {
 /// unreachable for the fixed-shape input above, but surfaced as a
 /// `Result` so callers don't have to choose between panicking and
 /// silently signing a truncated payload.
+/// #1931 (CWE-347) — per-context domain-separation tags. Each signing surface
+/// commits a UNIQUE, versioned tag into its canonical CBOR map so a signature
+/// minted in one context (a link attestation) cannot be reinterpreted as
+/// another (a write / persona attestation) even if two payload shapes ever
+/// converge. Explicit context separation, replacing reliance on the incidental
+/// structural difference between the CBOR shapes. Versioned so a future shape
+/// change is a distinct domain rather than a silent collision.
+mod domain_tags {
+    /// `memory_link` attestation (link `attest_level`).
+    pub const LINK: &str = "ai-memory/link/v1";
+    /// Signed-write attestation (write `attest_level`).
+    pub const WRITE: &str = "ai-memory/write/v1";
+    /// Persona-provenance attestation.
+    pub const PERSONA: &str = "ai-memory/persona/v1";
+}
+
+/// #1931 — the map key carrying the [`domain_tags`] value. Distinct from every
+/// payload field name (note: NOT `dst_id`); adding it never reorders the
+/// existing keys because the verifier re-derives through the same encoder.
+const DOMAIN_SEP_KEY: &str = "_dst";
+
+/// #1931 — build the `(key, value)` pair that stamps a context's
+/// domain-separation tag into a [`canonical_cbor_map`]. The verifier re-derives
+/// bytes through the SAME encoder, so the tag is enforced on both sides with no
+/// separate verifier edit.
+fn domain_separation_pair(tag: &'static str) -> (&'static str, ciborium::Value) {
+    (DOMAIN_SEP_KEY, ciborium::Value::Text(tag.to_string()))
+}
+
 pub fn canonical_cbor(link: &SignableLink<'_>) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        domain_separation_pair(domain_tags::LINK),
         ("src_id", ciborium::Value::Text(link.src_id.to_string())),
         ("dst_id", ciborium::Value::Text(link.dst_id.to_string())),
         ("relation", ciborium::Value::Text(link.relation.to_string())),
@@ -241,6 +271,7 @@ pub fn canonical_cbor_persona(p: &SignablePersona<'_>) -> Result<Vec<u8>> {
             .collect(),
     );
     let value = canonical_cbor_map(vec![
+        domain_separation_pair(domain_tags::PERSONA),
         (
             "persona_id",
             ciborium::Value::Text(p.persona_id.to_string()),
@@ -365,6 +396,7 @@ pub struct SignableWrite<'a> {
 /// silently signing a truncated payload.
 pub fn canonical_cbor_write(w: &SignableWrite<'_>) -> Result<Vec<u8>> {
     let value = canonical_cbor_map(vec![
+        domain_separation_pair(domain_tags::WRITE),
         ("agent_id", ciborium::Value::Text(w.agent_id.to_string())),
         ("namespace", ciborium::Value::Text(w.namespace.to_string())),
         ("title", ciborium::Value::Text(w.title.to_string())),
@@ -1141,6 +1173,46 @@ mod tests {
         }
     }
 
+    /// #1931 (CWE-347) — ADVERSARIAL: each signing context now commits a UNIQUE
+    /// versioned domain tag, so a signature minted for one purpose cannot be
+    /// reinterpreted as another even if two payload shapes ever coincided.
+    /// Pre-#1931 the canonical bytes carried NO context marker — safety rested
+    /// only on incidental structural difference. Positive round-trip proves the
+    /// change is additive (the verifier re-derives through the same encoder).
+    #[test]
+    fn issue_1931_domain_separation_tags_committed() {
+        fn contains(hay: &[u8], needle: &[u8]) -> bool {
+            !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+        }
+        let body = [0u8; 32];
+        let link_bytes = canonical_cbor(&link_fixture()).expect("encode link");
+        let write_bytes = canonical_cbor_write(&write_fixture(&body)).expect("encode write");
+
+        assert!(
+            contains(&link_bytes, domain_tags::LINK.as_bytes()),
+            "link signing bytes must commit the link domain tag (#1931)"
+        );
+        assert!(
+            !contains(&link_bytes, domain_tags::WRITE.as_bytes()),
+            "link bytes must NOT carry the write tag"
+        );
+        assert!(
+            contains(&write_bytes, domain_tags::WRITE.as_bytes()),
+            "write signing bytes must commit the write domain tag (#1931)"
+        );
+        // The two contexts never share signing bytes.
+        assert_ne!(link_bytes, write_bytes);
+
+        // Positive: a genuine link signature still verifies end-to-end.
+        let kp = keypair::generate("alice").expect("generate");
+        let sig_bytes = sign(&kp, &link_fixture()).expect("sign");
+        let payload = canonical_cbor(&link_fixture()).expect("re-encode");
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().expect("64-byte sig");
+        kp.public
+            .verify(&payload, &ed25519_dalek::Signature::from_bytes(&sig_arr))
+            .expect("genuine link signature must still verify (#1931 additive)");
+    }
+
     #[test]
     fn canonical_cbor_is_deterministic() {
         // RFC 8949 §4.2.1 — encoding the same logical input three times
@@ -1253,12 +1325,14 @@ mod tests {
     fn canonical_cbor_uses_rfc8949_key_order() {
         let bytes = canonical_cbor(&link_fixture()).expect("encode");
 
-        // Exact header + first key: a 6-entry map (0xA6) whose first key is
-        // the 6-byte text string "dst_id" (0x66 'd' 's' 't' '_' 'i' 'd').
+        // Exact header + first key: since #1931 the map carries a 7th entry —
+        // the domain-separation tag under key "_dst" (a 4-byte text string,
+        // 0x64 '_' 'd' 's' 't') — which sorts FIRST under length-first canonical
+        // ordering (4 < 6). So the map opens 0xA7 then "_dst".
         assert_eq!(
-            &bytes[0..8],
-            &[0xA6, 0x66, b'd', b's', b't', b'_', b'i', b'd'],
-            "canonical map must open with 6 entries and the key dst_id"
+            &bytes[0..6],
+            &[0xA7, 0x64, b'_', b'd', b's', b't'],
+            "canonical map must open with 7 entries and the #1931 domain tag key _dst"
         );
 
         let pos = |needle: &str| {
@@ -1268,6 +1342,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("key {needle} not found in encoding"))
         };
         let order = [
+            "_dst",
             "dst_id",
             "src_id",
             "relation",

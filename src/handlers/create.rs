@@ -35,6 +35,42 @@ use super::maybe_auto_tag;
 use super::store_err_to_response;
 use super::{AppState, JsonOrBadRequest};
 
+/// #1924 (CWE-288) — consult the process pre-event enforcement gate on the HTTP
+/// write surface, mirroring the MCP `consult_pre_event_gate` install/consult
+/// pattern. The HTTP write handlers are a SEPARATE implementation from the MCP
+/// `handle_*` functions, so the #1885 gate — installed for HTTP by
+/// `daemon_runtime::serve` — was never consulted on this surface: an operator
+/// running `[hooks].enforce_mode = enforce` with a `required_events` entry saw
+/// the boot banner / `doctor --hooks` "WILL DENY" while every HTTP-routed write
+/// committed with NO required hook running. This is that missing consult.
+///
+/// Returns `Some(503 response)` when the gate DENIES (enforce-mode + the event
+/// is required + NO enabled hook is configured for it, or a present required
+/// hook fails closed); `None` to proceed. INERT (`None`) when no gate is
+/// installed — the default enforce-off deployment — so callers consult
+/// unconditionally at ~zero cost beyond one `OnceLock` load.
+///
+/// Shared by every HTTP write handler (`create`, `delete`, `promote`, `link`,
+/// `consolidate`, `reflect`) so the enforcement surface is uniform. The
+/// underlying consult drives the async hook chain via `block_on_local`, which
+/// uses `block_in_place` on the daemon's multi-thread runtime — safe to call
+/// from an async handler.
+pub(crate) fn http_pre_event_gate(
+    event: crate::hooks::HookEvent,
+    payload: serde_json::Value,
+) -> Option<axum::response::Response> {
+    match crate::mcp::consult_pre_event_gate(event, payload) {
+        Ok(()) => None,
+        Err(reason) => Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": reason })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 // #866 — `create_memory` stage-helpers.
 //
 // The original `create_memory` carried ~790 LOC across the agent_id
@@ -1091,6 +1127,25 @@ pub async fn create_memory(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+
+    // #1924 (CWE-288) — consult the PRE-STORE enforcement gate BEFORE any write
+    // (and before the postgres branch), so `[hooks].enforce_mode = enforce` +
+    // `required_events = ["pre_store"]` with no enabled hook DENIES the HTTP
+    // write (503) exactly as it does on the MCP path. INERT for default
+    // (enforce-off) deployments.
+    if let Some(resp) = http_pre_event_gate(
+        crate::hooks::HookEvent::PreStore,
+        json!({
+            "agent_id": agent_id,
+            "namespace": body.namespace,
+            "title": body.title,
+            "content": body.content,
+            "tags": body.tags,
+        }),
+    ) {
+        return resp;
+    }
+
     // v0.9.0 G10.1 (#1827) — edge-parse the optional
     // `X-AI-Memory-Capability` header ONCE; inert unless
     // `[capabilities].enabled`. Threaded to whichever backend gate runs
