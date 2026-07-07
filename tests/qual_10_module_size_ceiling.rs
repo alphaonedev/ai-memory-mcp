@@ -347,7 +347,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-01 (#1859 G13-mem) — bumped 15_300 → 15_400: the
     // memory_lineage module mount + dispatch wrapper + TOOL_DISPATCH_TABLE
     // entry grew the file to 15_303; 15_400 = 97 headroom.
-    ("src/mcp/mod.rs", 15_400),
+    // 2026-07-07 (#1885) — bumped 15_400 → 15_530: the pre-event
+    // mandatory-hook-presence enforcement gate (PreEventEnforceGate + install +
+    // consult_pre_event_gate + test installer) + consult wiring in the
+    // eligible pre-event dispatchers landed the file at 15_482; +48 headroom.
+    ("src/mcp/mod.rs", 15_530),
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -677,7 +681,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-04 (#1767 §25.3 S2) — bumped 25_750 → 25_960 for the
     // postgres decorrelation write-gate twin (corpus query + attested
     // predicate + signed refusal audit emit).
-    ("src/store/postgres.rs", 25_960),
+    // 2026-07-07 (#1895) — bumped 25_960 → 26_000: the char-boundary-safe
+    // `payload_preview` truncation guard landed the file at 25_966; +34 headroom.
+    ("src/store/postgres.rs", 26_000),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -952,7 +958,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // stands (7 LOC headroom).
     // 2026-07-04 (#1870 §25.3 S1) — bumped 9_500 → 9_560 for the
     // `ModelAttest` CLI subcommand variant + its dispatch arm.
-    ("src/daemon_runtime.rs", 9_560),
+    // 2026-07-07 (#1889 / #1903) — bumped 9_560 → 9_650: the synchronous
+    // pre-runtime `apply_startup_env` shim (hoisting env mutation out of the
+    // tokio runtime) + the api_key normalization comments landed the file at
+    // 9_610; +40 headroom.
+    ("src/daemon_runtime.rs", 9_650),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
