@@ -2,7 +2,7 @@
   Copyright 2026 AlphaOne LLC
   SPDX-License-Identifier: Apache-2.0
   Grand Slam Secure Enterprise Federated Reference Architecture (do-1461) —
-  the 3-region Batman-mode AI Agent Hive. v0.8.0 GA deliverable.
+  the 3-region Batman-mode AI Agent Hive. v0.9.0 GA deliverable.
   Result cells are filled from the live 0->60 run (verified across two independent runs).
 -->
 <!DOCTYPE html>
@@ -11,7 +11,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Grand Slam Reference Architecture — 3-region Batman-mode AI Agent Hive</title>
-<meta name="description" content="ai-memory v0.8.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
+<meta name="description" content="ai-memory v0.9.0 Secure Enterprise Federated Reference Architecture (do-1461): a 3-region (nyc3 / fra1 / sgp1) Batman-active AI Agent Hive. 15 nodes (9 peers + 3 regional PG + 3 NHI agents), 9 federated peers in one W=2-synchronous-quorum mesh with eventual cross-region convergence, three distinct encryption legs (API mTLS, federation/quorum mTLS, daemon→Postgres verify-full TLS), each proven with a positive and a negative test. PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.2.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/reference-architecture/">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;
@@ -219,7 +219,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       <div class="stat"><div class="n">9</div><div class="l">Federated peers</div></div>
       <div class="stat"><div class="n">W=2</div><div class="l">Sync quorum + eventual convergence</div></div>
       <div class="stat"><div class="n">3</div><div class="l">Encryption legs</div></div>
-      <div class="stat"><div class="n">v57</div><div class="l">Schema (lockstep)</div></div>
+      <div class="stat"><div class="n">v78</div><div class="l">Schema (lockstep)</div></div>
     </div>
   </div>
 </section>
@@ -620,7 +620,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <tr><td class="id">c</td><td>Poor approval workflows</td><td>pending-actions surface present; HMAC-mandatory approval dispatch (unsigned refused)</td><td class="res">PASS — pending-actions surface present; HMAC-mandatory approval dispatch (unsigned refused)</td></tr>
         <tr><td class="id">d</td><td>Token / session security</td><td>leg-1 mTLS + x-api-key enforced; leg-2 Ed25519 sig + nonce anti-replay (replay → 401)</td><td class="res">PASS — leg-1 mTLS + x-api-key enforced; leg-2 Ed25519 sig + nonce anti-replay (replay → 401)</td></tr>
         <tr><td class="id">e</td><td>Misconfigurations / poor implementation</td><td>fail-CLOSED secure defaults asserted live (sig / nonce / enrollment / permissions / governance)</td><td class="res">PASS — fail-CLOSED secure defaults asserted live (sig / nonce / enrollment / permissions / governance)</td></tr>
-        <tr><td class="id">f</td><td>Inconsistent behaviors</td><td>schema v70 lockstep across all peers; optimistic-concurrency version conflict → 409</td><td class="res">PASS — schema v70 lockstep across all peers; optimistic-concurrency version conflict → 409</td></tr>
+        <tr><td class="id">f</td><td>Inconsistent behaviors</td><td>schema v78 lockstep across all peers; optimistic-concurrency version conflict → 409</td><td class="res">PASS — schema v78 lockstep across all peers; optimistic-concurrency version conflict → 409</td></tr>
         <tr><td class="id">g</td><td>Poor / missing audit logs</td><td>per-peer V-4 <code>verify-signed-events-chain</code> exits 0; recall-observation ledger present</td><td class="res">PASS — per-peer V-4 verify-signed-events-chain (MCP/L4) exits 0; recall-observation ledger present</td></tr>
         <tr><td class="id">h</td><td>Denial of service / fatigue</td><td>per-agent K8 quota surface; 2 MB body cap; federation DLQ bounded</td><td class="res">PASS — per-agent K8 quota surface; 2 MB body cap; federation DLQ bounded</td></tr>
         <tr><td class="id">i</td><td>Tool parameter injection</td><td>RequestValidator rejects malformed parameters at the wire boundary</td><td class="res">PASS — RequestValidator rejects malformed parameters at the MCP wire boundary</td></tr>
@@ -634,10 +634,10 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <table class="matrix">
       <thead><tr><th>#</th><th>NSA recommendation</th><th>Observable live-hive test</th><th>Result</th></tr></thead>
       <tbody>
-        <tr><td class="id">a</td><td>Choose supported MCP projects</td><td>live <code>/api/v1/health</code> reports pinned version 0.8.0 + schema 70 on every node</td><td class="res">PASS — /api/v1/health reports pinned version 0.8.0 + schema 70 on every node</td></tr>
+        <tr><td class="id">a</td><td>Choose supported MCP projects</td><td>live <code>/api/v1/health</code> reports pinned version 0.9.0 + schema 78 on every node</td><td class="res">PASS — /api/v1/health reports pinned version 0.9.0 + schema 78 on every node</td></tr>
         <tr><td class="id">b</td><td>Design for boundaries</td><td>namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td><td class="res">PASS — namespace isolation + per-region VPC substrate boundary + fail-CLOSED defaults verified live</td></tr>
         <tr><td class="id">c</td><td>Validate parameters</td><td>malformed / out-of-range write rejected with typed validation error</td><td class="res">PASS — malformed / out-of-range write rejected with typed RequestValidator error</td></tr>
-        <tr><td class="id">d</td><td>Constrain &amp; sandbox tool execution</td><td>Form-7 governance gate live (R001–R004 enabled); permissions=enforce</td><td class="res">PASS — governance gate live (permissions=enforce, attestation required, fail-closed) on every MCP write path</td></tr>
+        <tr><td class="id">d</td><td>Constrain &amp; sandbox tool execution</td><td>Form-7 governance gate live (R001–R004 enabled); permissions=enforce</td><td class="res">PASS — governance gate live (permissions=enforce, attestation required, fail-closed) on both the MCP and HTTP write paths</td></tr>
         <tr><td class="id">e</td><td>Sign &amp; verify MCP messages</td><td>leg-2 Ed25519 sig required (missing → 401); V-4 chain verifies; serverInfo signed</td><td class="res">PASS — leg-2 Ed25519 sig required (missing → 401); V-4 MCP/L4 chain verifies; serverInfo signed at initialize</td></tr>
         <tr><td class="id">f</td><td>Filter &amp; monitor output pipelines</td><td><code>Accept-Provenance: verbose</code> envelope returns citations / ConfidenceTier / MemoryKind</td><td class="res">PASS — Accept-Provenance: verbose envelope returns citations / ConfidenceTier / MemoryKind</td></tr>
         <tr><td class="id">g</td><td>Instrument for logging &amp; detection</td><td>bare <code>/metrics</code> Prometheus surface reachable; federation-convergence probe observable</td><td class="res">PASS — bare /metrics Prometheus surface reachable; federation-convergence probe observable</td></tr>
@@ -696,7 +696,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
   <div class="container">
     <span class="eyebrow">Reproducibility</span>
     <h2 class="sans">Stand the whole hive up from one directory.</h2>
-    <p class="lede">Everything a reviewer needs to reproduce both the environment and the results lives in <code>deploy/do-1461/</code> and ships inside <code>release/v0.8.0</code>. Terraform stands the infrastructure up (3 regions, one VPC per region, tag-based firewall); a push-based toolkit brings every node to a verified Batman-active state; a harness proves it.</p>
+    <p class="lede">Everything a reviewer needs to reproduce both the environment and the results lives in <code>deploy/do-1461/</code> and ships inside <code>release/v0.9.0</code>. Terraform stands the infrastructure up (3 regions, one VPC per region, tag-based firewall); a push-based toolkit brings every node to a verified Batman-active state; a harness proves it.</p>
 
     <div class="snip"><span class="cm"># one directory, one deterministic 0→60 flow</span>
 make seed up provision validate test   <span class="cm"># build, prove, full-spectrum test</span>
@@ -716,13 +716,13 @@ make down                              <span class="cm"># tear it all down</span
       <div class="card">
         <div class="lbl">Pinned stack</div>
         <h3 style="font-family:var(--font-mono)">single-source constants</h3>
-        <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v70</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
+        <p>PostgreSQL <code>18.4-1.pgdg24.04+1</code> · Apache AGE <code>1.7.0</code> · pgvector <code>0.8.2</code> · schema <code>v78</code> · golden binary <code>sha256</code>-asserted · <code>nomic-embed-text</code> 768-dim CPU embedder. Installed natively — no Docker anywhere on the fleet.</p>
       </div>
     </div>
 
     <div class="warn-box">
       <strong>What "reproducible" means here</strong>
-      Pinned artifacts (golden binary <code>sha256</code> / version <code>0.8.0</code> / schema <code>v70</code> / pinned pgdg <code>.deb</code>s / pinned Ollama release) are single-source named constants in <code>provision/lib.sh</code>, overridable by env for forks. The seed corpus is pinned by <code>sha256</code> in <code>CORPUS_MANIFEST.json</code>; every tunable knob is a named constant, not a magic literal. The campaign CA + per-node keys are generated once and reused on re-runs for stable trust. <code>make validate</code> exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report under <code>.local-runs/do-1461/reports/</code>; the committed baseline artifact set is the attested Atlas Corpus baseline under <code>deploy/do-1461/atlas/results/</code>. Reference: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md">deploy/do-1461/README.md</a>.
+      Pinned artifacts (golden binary <code>sha256</code> / version <code>0.9.0</code> / schema <code>v78</code> / pinned pgdg <code>.deb</code>s / pinned Ollama release) are single-source named constants in <code>provision/lib.sh</code>, overridable by env for forks. The seed corpus is pinned by <code>sha256</code> in <code>CORPUS_MANIFEST.json</code>; every tunable knob is a named constant, not a magic literal. The campaign CA + per-node keys are generated once and reused on re-runs for stable trust. <code>make validate</code> exercises the live fleet over the real TLS+mTLS path and emits a JSON + tabular report under <code>.local-runs/do-1461/reports/</code>; the committed baseline artifact set is the attested Atlas Corpus baseline under <code>deploy/do-1461/atlas/results/</code>. Reference: <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/deploy/do-1461/README.md">deploy/do-1461/README.md</a>.
     </div>
 
     <div class="warn-box">
@@ -810,7 +810,7 @@ make down                              <span class="cm"># tear it all down</span
     <a href="../whats-new-v08.html">v0.8.0</a>
   </div>
   <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
-  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.8.0 GA deliverable.</div>
+  <div class="legal">Secure Enterprise Federated Reference Architecture (do-1461) — a 3-region Batman-mode AI Agent Hive. A v0.9.0 GA deliverable.</div>
   <div class="legal" style="margin-top:.55rem; font-size:.72rem; opacity:.85; max-width:64rem; margin-left:auto; margin-right:auto">
     <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="../compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
   </div>
