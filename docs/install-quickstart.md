@@ -278,7 +278,7 @@ client's config and restores the pre-install backup if one exists.
 | curl one-liner | `rm ~/.local/bin/ai-memory` (or wherever `which ai-memory` reports) |
 | Homebrew | `brew uninstall alphaonedev/tap/ai-memory && brew untap alphaonedev/tap` |
 | cargo | `cargo uninstall ai-memory` |
-| Docker | `docker rmi ghcr.io/alphaonedev/ai-memory:0.7.1` |
+| Docker | `docker rmi ghcr.io/alphaonedev/ai-memory:0.9.0` |
 | DNF (COPR) | `sudo dnf remove ai-memory && sudo dnf copr disable alpha-one-ai/ai-memory` |
 | AUR | `paru -R ai-memory` (or your AUR helper's remove command) |
 | Windows installer | `Remove-Item $env:USERPROFILE\.local\bin\ai-memory.exe` |

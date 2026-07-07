@@ -50,7 +50,7 @@ layout: doc
    **Ubuntu/Debian (.deb manual install):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo dpkg -i ai-memory_0.7.0_amd64.deb   # or arm64
+   sudo dpkg -i ai-memory_0.9.0_amd64.deb   # or arm64
    ```
 
    **Fedora/RHEL (COPR — recommended):**
@@ -62,7 +62,7 @@ layout: doc
    **Fedora/RHEL (.rpm manual install):**
    ```bash
    # Download from https://github.com/alphaonedev/ai-memory-mcp/releases/latest
-   sudo rpm -i ai-memory-0.7.0-1.x86_64.rpm    # or aarch64
+   sudo rpm -i ai-memory-0.9.0-1.x86_64.rpm    # or aarch64
    ```
 
    **Arch Linux (AUR — v0.7.0 Gap #3 / issue #804):**
@@ -858,12 +858,13 @@ ai-memory doctor
 ```
 
 The migrator is **idempotent** — running against an already-v2
-file is a no-op INFO log. Legacy v0.6.x flat fields continue to
-work in v0.7.x with a single-line deprecation WARN at load time;
-they will be removed in v0.8.0.
+file is a no-op INFO log. Legacy v0.6.x flat fields (`ollama_url`, `embed_url`, etc.) remain
+present and still work as of v0.9.0 with a single-line deprecation
+WARN at load time; the removal originally slated for v0.8.0 has not
+yet happened.
 
 The DB schema migration is **automatic** — the daemon walks v20 →
-v55 on first open of an existing v0.6.4 DB (writing an automatic
+v78 on first open of an existing v0.6.4 DB (writing an automatic
 `<db>.pre-migration-v<from>-to-v<to>-<token>.bak` snapshot first).
 No operator action required.
 

@@ -92,12 +92,16 @@ Every PR must pass these gates before merge:
 | `cargo audit` | 0 vulnerabilities (warnings acceptable if transitive) |
 | `scripts/check-vendor-literals.sh` | Zero violations — vendor-monoculture + `SECS_PER_*` magic-number HARD-BLOCK ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) |
 | `scripts/qc-codegraph-precheck.sh` | Zero violations — C8 caller-context allowlist + structural-drift HARD-BLOCK ([#923](https://github.com/alphaonedev/ai-memory-mcp/issues/923)) |
+| `scripts/check-l3-boundary.sh` | Zero violations — L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, [#1853](https://github.com/alphaonedev/ai-memory-mcp/issues/1853)) |
+| `scripts/check-hardcoded-literals.sh` | Zero violations — hardcoded-literal duplication ratchet (pm-v3.1) |
+| `scripts/check-docs-vs-ssot.sh` | Zero violations — docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31) |
+| `scripts/check-cloud-init-ascii.sh` | Zero violations — cloud-init template ASCII-only HARD-BLOCK ([#1880](https://github.com/alphaonedev/ai-memory-mcp/issues/1880)) |
 | Functional test | All categories pass (maintainer performs during review) |
 | Security review | 0 ship-blocking findings (maintainer performs during review) |
 | Documentation sync | Test counts and tool counts updated in all docs |
 | CLA | Signed (see [CLA.md](../CLA.md)) |
 
-Contributors are responsible for the first six gates (four cargo + two
+Contributors are responsible for the first ten gates (four cargo + six
 script gates wired into `.github/workflows/c8-precheck.yml` — see
 [CLAUDE.md §"Lint gates (issue #1174 PR10)"](../CLAUDE.md)). Maintainers perform the
 functional test, security review, and documentation sync verification during PR review.
@@ -118,10 +122,10 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 
 ### 2.2 Full Pre-PR Verification
 
-Contributors must run all six before submitting (four cargo gates plus
-the two script gates introduced by
+Contributors must run all ten before submitting (four cargo gates plus
+the six script gates — the two introduced by
 [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the
-substrate-canonical-discipline campaign):
+substrate-canonical-discipline campaign, and the four added since):
 
 ```bash
 cargo fmt --check
@@ -130,6 +134,10 @@ AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* HARD-BLOCK (#1200)
 scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural drift (#923)
+scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
+scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
+scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
+scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BLOCK (#1880)
 ```
 
 ### 2.3 Full Spectrum Functional Test

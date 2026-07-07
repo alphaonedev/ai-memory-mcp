@@ -5,7 +5,7 @@ layout: doc
 
 Threat model, trust boundaries, and hardening options for operators.
 
-For responsible disclosure: **security@alphaone.dev**. Please encrypt
+For responsible disclosure: **security@alpha-one.mobi**. Please encrypt
 against the maintainer key listed in `SECURITY.md.sig` (if present)
 or via the fingerprint on our releases page.
 
@@ -98,16 +98,11 @@ Out of scope (non-goals):
 
 ### API key (HTTP)
 
-Set at daemon startup:
-
-```bash
-ai-memory serve --api-key "$(pwgen -s 48 1)"
-```
-
-Or via config file:
+Set via the `api_key` field in `config.toml` (`serve` has no
+`--api-key` flag):
 
 ```toml
-api_key = "long-random-string"
+api_key = "long-random-string"   # e.g. pwgen -s 48 1
 ```
 
 Every HTTP endpoint except `/api/v1/health` enforces the key (when
@@ -321,10 +316,10 @@ For compliance-grade audit, also:
 If you find a security vulnerability, please:
 
 1. **Do not** open a public issue.
-2. Email **security@alphaone.dev** with details. Encrypt to the key
+2. Email **security@alpha-one.mobi** with details. Encrypt to the key
    listed on our releases page if the impact is severe.
-3. We aim to acknowledge within 72 hours and ship a fix within 14
-   days for critical issues. We'll credit reporters who wish to be
-   credited.
+3. We aim to acknowledge receipt within 48 hours and ship a fix within
+   7 days for CRITICAL issues (per the severity rubric). We'll credit
+   reporters who wish to be credited.
 
 Our bug bounty program is documented at <https://alphaonedev.github.io/ai-memory-mcp/security>.

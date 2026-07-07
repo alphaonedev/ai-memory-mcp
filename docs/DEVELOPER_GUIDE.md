@@ -246,7 +246,7 @@ Hybrid recall algorithm. Blends the FTS5 keyword score and the embedding cosine 
 
 ### `src/identity/`
 
-Non-Human Identity (NHI) resolution for `agent_id` (split from the former `src/identity.rs` into per-domain modules: `mod.rs`, `attest.rs`, `sign.rs`, `verify.rs`, `replay.rs`, plus the #1558 additions `sentinels.rs` — reserved caller identities / `RESERVED_AGENT_IDS` — and `keypair.rs` — `DAEMON_KEYPAIR_LABEL` + daemon signing-keypair load). Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>` (MCP), `host:<hostname>` (CLI) — both durable, pid-free since #1720 — and `anonymous:req-<uuid8>` (HTTP per-request fallback). By default `agent_id` is a *claimed* identity, not attested; a write that presents a valid Ed25519 `signature` is upgraded to `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`).
+Non-Human Identity (NHI) resolution for `agent_id` (split from the former `src/identity.rs` into per-domain modules: `mod.rs`, `attest.rs`, `sign.rs`, `verify.rs`, `replay.rs`, plus the #1558 additions `sentinels.rs` — reserved caller identities / `RESERVED_AGENT_IDS` — and `keypair.rs` — `DAEMON_KEYPAIR_LABEL` + daemon signing-keypair load). Centralises the precedence chain across CLI, MCP, and HTTP entry points so `metadata.agent_id` is uniformly populated. Public API: `resolve_agent_id()` (CLI/MCP), `resolve_http_agent_id()` (HTTP body + `X-Agent-Id` header), `preserve_agent_id()` (round-trip), `process_discriminator()` (stable per-process identifier). Default-id formats: `ai:<client>@<hostname>` (MCP), `host:<hostname>` (CLI) — both durable, pid-free since #1720 — and `anonymous:req-<uuid8>` (HTTP per-request fallback). As of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)) store-path agent attestation is **required by default**: an unsigned direct CLI/MCP/HTTP write is **rejected** (`403 ATTESTATION_FAILED`), not stored as `claimed`. A write that presents a valid Ed25519 `signature` is stamped `agent_attested` (#626 Layer-3 — see `identity::attest::stamp_attestation`). The pre-#1751 permissive `claimed` posture only applies when the operator sets the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
 
 ### `src/curator/`
 
@@ -1140,6 +1140,11 @@ Plus the script-based HARD-BLOCK gates wired into
   (narrative counts in the docs must match the canonical Rust consts:
   schema version, tool counts, route/path counts, CLI subcommand
   counts, Memory field count, link-relation count, …).
+- **L3-boundary perma-ban** -- `scripts/check-l3-boundary.sh`
+  (§25.3 S5 / RQ-10, #1853 — no reintroduction of the banned
+  Layer-3 boundary crossings).
+- **Cloud-init ASCII gate** -- `scripts/check-cloud-init-ascii.sh`
+  (#1880 — cloud-init templates must remain ASCII-only).
 
 Each script gate also runs a `--self-test` step proving it is
 load-bearing. Coverage floors are enforced per-module from
