@@ -182,6 +182,28 @@ pub fn handle_kg_query(conn: &rusqlite::Connection, params: &Value) -> Result<Va
     )
     .map_err(|e| e.to_string())?;
 
+    // #1935 (CWE-863) — visibility filter, mirroring the HTTP twin at
+    // `src/handlers/kg.rs`. `db::kg_query` returns each reachable node's
+    // title + namespace with NO per-caller gate; because links can be forged
+    // to targets the caller cannot see (#1929), an attacker-rooted walk could
+    // otherwise disclose the titles/namespaces/graph-structure of linked
+    // PRIVATE memories. Keyed on the ENFORCED-read caller (env-only) so it
+    // fires ONLY when `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); the
+    // single-operator trust-all default returns the full topology
+    // byte-unchanged. Nodes the caller cannot see (or that can't be fetched)
+    // are DROPPED — fail closed.
+    let nodes: Vec<_> = if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+        nodes
+            .into_iter()
+            .filter(|n| match db::get(conn, &n.target_id) {
+                Ok(Some(mem)) => crate::visibility::is_visible_to_caller(&mem, &caller),
+                _ => false,
+            })
+            .collect()
+    } else {
+        nodes
+    };
+
     let memories_json: Vec<Value> = nodes
         .iter()
         .map(|n| {
@@ -228,5 +250,86 @@ mod d1_4_985_tests {
     fn memory_kg_query_tool_metadata_985() {
         assert_eq!(KgQueryTool::name(), "memory_kg_query");
         assert_eq!(KgQueryTool::family(), "graph");
+    }
+}
+
+#[cfg(test)]
+mod visibility_1935_tests {
+    //! #1935 (CWE-863) — MCP `handle_kg_query` must apply the same
+    //! visibility filter as its HTTP twin so a forged-link walk cannot
+    //! disclose the title/namespace of a memory the caller cannot see.
+    use super::*;
+    use serde_json::json;
+
+    fn open_db() -> rusqlite::Connection {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("t.db");
+        let c = crate::db::open(&path).expect("db::open");
+        std::mem::forget(dir);
+        c
+    }
+
+    fn insert_mem(
+        c: &rusqlite::Connection,
+        title: &str,
+        ns: &str,
+        meta: serde_json::Value,
+    ) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let m = crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: ns.to_string(),
+            title: title.to_string(),
+            content: format!("body {title}"),
+            created_at: now.clone(),
+            updated_at: now,
+            metadata: meta,
+            ..Default::default()
+        };
+        crate::db::insert(c, &m).expect("insert")
+    }
+
+    /// A KG walk rooted at the attacker's OWN memory that links to a
+    /// VICTIM-owned PRIVATE memory must NOT disclose the victim node.
+    /// Fail-before/pass-after: pre-fix every reachable node was returned
+    /// with no per-caller gate.
+    #[test]
+    fn kg_walk_hides_invisible_target_1935() {
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let c = open_db();
+        let src = insert_mem(
+            &c,
+            "attacker-root",
+            "attacker-ns",
+            json!({"agent_id": "ai:attacker"}),
+        );
+        let victim = insert_mem(
+            &c,
+            "victim-secret",
+            "victim-ns",
+            json!({"agent_id": "ai:victim", "scope": "private"}),
+        );
+        crate::db::create_link(&c, &src, &victim, "related_to").expect("link");
+
+        // Attacker caller → the victim's private node is filtered out.
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:attacker") };
+        let out = handle_kg_query(&c, &json!({"source_id": src, "max_depth": 2})).expect("query");
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        let mems = out["memories"].as_array().expect("memories array");
+        let leaked = mems.iter().any(|m| {
+            m["title"].as_str() == Some("victim-secret")
+                || m[field_names::TARGET_NAMESPACE].as_str() == Some("victim-ns")
+                || m["target_id"].as_str() == Some(victim.as_str())
+        });
+        assert!(!leaked, "victim private node must not be disclosed: {out}");
+
+        // Control: env UNSET (single-operator trust-all default) → the full
+        // topology is still returned (behaviour byte-unchanged).
+        let out2 = handle_kg_query(&c, &json!({"source_id": src, "max_depth": 2})).expect("query2");
+        assert!(
+            out2["count"].as_u64().unwrap_or(0) >= 1,
+            "default path must return the full topology: {out2}"
+        );
     }
 }

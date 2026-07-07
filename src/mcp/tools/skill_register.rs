@@ -22,7 +22,7 @@
 //! attestation chain.
 
 use crate::models::field_names;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -395,21 +395,37 @@ pub fn handle_skill_register(
     // -----------------------------------------------------------------------
     let (skill_md_text, resource_files): (String, Vec<(String, String, Vec<u8>)>) =
         if let Some(folder_str) = params["folder_path"].as_str() {
-            let folder = Path::new(folder_str);
-            if !folder.is_dir() {
-                return Err(format!(
-                    "folder_path '{folder_str}' is not a directory or does not exist"
-                ));
-            }
-            let md_path = folder.join("SKILL.md");
+            // #1923 (HIGH, CWE-22/CWE-59) — `folder_path` is fully caller-
+            // controlled and this handler is in the unprivileged `Other`
+            // capability family, so an unauthenticated MCP client could
+            // previously point it at ANY directory the daemon UID can read
+            // and, via a planted `resources/loot -> /home/svc/.../key`
+            // symlink (followed by `std::fs::read`), exfiltrate arbitrary
+            // host secrets. JAIL the read: canonicalize the folder (resolves
+            // symlinks + normalises `..`), confine it under an operator-
+            // configured import root when set, and refuse to FOLLOW any
+            // symlinked entry — reading SKILL.md and resources ONLY from
+            // within the canonical root. Fail closed on every ambiguity.
+            let import_root_env = std::env::var(SKILLS_IMPORT_ROOT_ENV).ok();
+            let root = resolve_import_root(folder_str, import_root_env.as_deref())?;
+
+            let md_path = root.join("SKILL.md");
+            // SKILL.md must be a regular file inside the root — never a
+            // symlink pointing back out of the jail.
+            reject_symlink_escape(&md_path, &root)?;
             let text = std::fs::read_to_string(&md_path)
                 .map_err(|e| format!("cannot read SKILL.md in '{folder_str}': {e}"))?;
 
             // Collect resource files from a 'resources/' sub-directory.
             let mut res: Vec<(String, String, Vec<u8>)> = Vec::new();
-            let res_dir = folder.join("resources");
-            if res_dir.is_dir() {
-                collect_resources(&res_dir, &res_dir, &mut res)?;
+            let res_dir = root.join("resources");
+            if res_dir.exists() {
+                // `resources` itself must not be a symlink escaping the root.
+                reject_symlink_escape(&res_dir, &root)?;
+                if res_dir.is_dir() {
+                    let mut budget = ImportBudget::new();
+                    collect_resources(&res_dir, &res_dir, &mut res, &mut budget)?;
+                }
             }
             (text, res)
         } else if let Some(inline) = params["inline_skill"].as_str() {
@@ -514,6 +530,108 @@ pub fn handle_skill_register(
 }
 
 // ---------------------------------------------------------------------------
+// #1923 — folder_path import jail
+// ---------------------------------------------------------------------------
+
+/// Env naming the operator-configured skills-import jail root. When set, a
+/// `folder_path` register MUST canonically resolve to a path INSIDE this
+/// root or the read is refused (fail-closed). Unset → the canonical folder
+/// is its own root (self-jail), which preserves the legitimate "register
+/// any local skill folder" workflow while the symlink-escape guard still
+/// prevents reads outside the imported tree.
+pub const SKILLS_IMPORT_ROOT_ENV: &str = "AI_MEMORY_SKILLS_IMPORT_ROOT";
+
+/// #1923 — hard ceilings on a single `folder_path` import so a hostile tree
+/// cannot exhaust memory / inodes even from inside the jail.
+const MAX_IMPORT_FILES: usize = 4_096;
+const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// #1923 — running file/byte tally for one import, enforcing the ceilings.
+struct ImportBudget {
+    files: usize,
+    bytes: u64,
+}
+
+impl ImportBudget {
+    fn new() -> Self {
+        Self { files: 0, bytes: 0 }
+    }
+
+    fn charge(&mut self, n: u64) -> Result<(), String> {
+        self.files += 1;
+        if self.files > MAX_IMPORT_FILES {
+            return Err(format!(
+                "skill import exceeds the max resource file count ({MAX_IMPORT_FILES})"
+            ));
+        }
+        self.bytes = self.bytes.saturating_add(n);
+        if self.bytes > MAX_IMPORT_BYTES {
+            return Err(format!(
+                "skill import exceeds the max resource byte budget ({MAX_IMPORT_BYTES})"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// #1923 — canonicalize `folder_str` and confine it under `configured_root`
+/// when the operator set one. Returns the canonical jail root. Fails closed
+/// when the folder cannot be resolved, is not a directory, or escapes the
+/// configured root. Split from the env read so it is deterministically
+/// unit-testable without mutating process env.
+fn resolve_import_root(folder_str: &str, configured_root: Option<&str>) -> Result<PathBuf, String> {
+    // `canonicalize` resolves every symlink component AND normalises `..`,
+    // so a traversal / symlinked `folder_path` collapses to its true target
+    // before any containment check below.
+    let canonical = std::fs::canonicalize(Path::new(folder_str))
+        .map_err(|_| format!("folder_path '{folder_str}' is not a directory or does not exist"))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "folder_path '{folder_str}' is not a directory or does not exist"
+        ));
+    }
+    if let Some(root_str) = configured_root {
+        let root = std::fs::canonicalize(Path::new(root_str)).map_err(|_| {
+            format!("{SKILLS_IMPORT_ROOT_ENV} '{root_str}' is not a directory or does not exist")
+        })?;
+        if !canonical.starts_with(&root) {
+            return Err(format!(
+                "folder_path '{folder_str}' resolves outside the configured skills-import root \
+                 (path-escape refused)"
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+/// #1923 — refuse a symlinked path outright (do NOT follow it) and assert
+/// its fully-resolved location stays under `root`. `symlink_metadata` does
+/// not follow the final component, so a planted symlink is detected here
+/// instead of being silently dereferenced by a later `std::fs::read`. A
+/// non-existent path is treated as "nothing to guard" so the caller's own
+/// read surfaces the real (e.g. missing-SKILL.md) error.
+fn reject_symlink_escape(path: &Path, root: &Path) -> Result<(), String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "refusing symlinked skill path '{}': symlinks are not followed (path-escape defence)",
+            path.display()
+        ));
+    }
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve skill path '{}': {e}", path.display()))?;
+    if !resolved.starts_with(root) {
+        return Err(format!(
+            "refusing skill path '{}': resolved path escapes the import root",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Recursive resource directory walker
 // ---------------------------------------------------------------------------
 
@@ -521,14 +639,28 @@ fn collect_resources(
     base: &Path,
     dir: &Path,
     out: &mut Vec<(String, String, Vec<u8>)>,
+    budget: &mut ImportBudget,
 ) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("read_dir '{}': {e}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("dir entry error: {e}"))?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_resources(base, &path, out)?;
+        // #1923 — inspect the entry WITHOUT following it. A symlink (to a
+        // dir OR a file) is refused so a planted
+        // `resources/loot -> /etc/shadow` cannot be read; walking only
+        // real directories keeps the traversal inside `base`.
+        let md = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("stat resource '{}': {e}", path.display()))?;
+        if md.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlinked resource '{}': symlinks are not followed \
+                 (path-escape defence)",
+                path.display()
+            ));
+        }
+        if md.is_dir() {
+            collect_resources(base, &path, out, budget)?;
         } else {
             // Always emit forward-slash-joined relative paths regardless of
             // host OS. `to_string_lossy()` on Windows produces backslashes
@@ -543,8 +675,20 @@ fn collect_resources(
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
+            // Defense-in-depth: the fully-resolved regular file MUST remain
+            // under the import root (catches any escape the symlink check
+            // above could miss on an exotic filesystem).
+            let resolved = std::fs::canonicalize(&path)
+                .map_err(|e| format!("cannot resolve resource '{}': {e}", path.display()))?;
+            if !resolved.starts_with(base) {
+                return Err(format!(
+                    "refusing resource '{}': resolved path escapes the import root",
+                    path.display()
+                ));
+            }
             let content = std::fs::read(&path)
                 .map_err(|e| format!("read resource '{}': {e}", path.display()))?;
+            budget.charge(content.len() as u64)?;
             // Determine kind from sub-directory name or file extension.
             let kind = infer_kind(&rel);
             out.push((rel, kind, content));
@@ -897,6 +1041,109 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    // ---- #1923: folder_path import jail (adversarial) --------------------
+
+    /// #1923 — a `resources/loot` symlink pointing OUTSIDE the imported
+    /// folder (at a host secret) MUST be refused, and its bytes must never
+    /// reach `skill_resources`. Fail-before/pass-after: pre-fix
+    /// `collect_resources` followed the symlink via `std::fs::read` and
+    /// exfiltrated the target into `content_blob`.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_resource_escaping_folder() {
+        let (conn, dir) = open_db();
+        // A "secret" file well outside the skill folder (stands in for an
+        // ed25519 signing key / SQLCipher passphrase / another tenant DB).
+        let secret = dir.path().join("secret.key");
+        std::fs::write(&secret, b"TOP-SECRET-ED25519-PRIVATE-KEY-MATERIAL").unwrap();
+
+        let folder = dir.path().join("evil-skill");
+        write_skill_md(&folder, &minimal_skill_md("evil"));
+        let res = folder.join("resources");
+        std::fs::create_dir_all(&res).unwrap();
+        // resources/loot -> the out-of-tree secret.
+        std::os::unix::fs::symlink(&secret, res.join("loot")).unwrap();
+
+        let err = handle_skill_register(
+            &conn,
+            &json!({"folder_path": folder.to_str().unwrap()}),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("path-escape") || err.contains("escapes"),
+            "expected symlink-escape refusal, got: {err}"
+        );
+        // BLOCKED: no resource row was created, so the secret never leaked.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skill_resources", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no resource row must be created on refusal");
+    }
+
+    /// #1923 — the `resources` directory itself being a symlink out of the
+    /// imported folder is refused before any child is read.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_resources_dir() {
+        let (conn, dir) = open_db();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("run.sh"), b"echo pwned\n").unwrap();
+
+        let folder = dir.path().join("evil2");
+        write_skill_md(&folder, &minimal_skill_md("evil2"));
+        // resources -> ../outside  (a symlinked directory escaping the tree)
+        std::os::unix::fs::symlink(&outside, folder.join("resources")).unwrap();
+
+        let err = handle_skill_register(
+            &conn,
+            &json!({"folder_path": folder.to_str().unwrap()}),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("symlink") || err.contains("escapes") || err.contains("path-escape"),
+            "expected refusal, got: {err}"
+        );
+    }
+
+    /// #1923 — with an operator-configured import root, a folder that
+    /// resolves OUTSIDE it (sibling / `..` traversal escape / nonexistent)
+    /// is refused while one inside it is accepted. Exercised at the pure
+    /// `resolve_import_root` layer for determinism (no process-env churn).
+    #[test]
+    fn import_root_confines_folder_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("jail");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("ok");
+        std::fs::create_dir_all(&inside).unwrap();
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let root_s = root.to_str().unwrap();
+        // Inside the jail → accepted.
+        assert!(resolve_import_root(inside.to_str().unwrap(), Some(root_s)).is_ok());
+        // A sibling directory outside the jail → refused.
+        let err = resolve_import_root(outside.to_str().unwrap(), Some(root_s)).unwrap_err();
+        assert!(
+            err.contains("outside the configured skills-import root"),
+            "got: {err}"
+        );
+        // `..` traversal that lands outside the jail → refused.
+        let escape = format!("{root_s}/ok/../../elsewhere");
+        let err2 = resolve_import_root(&escape, Some(root_s)).unwrap_err();
+        assert!(
+            err2.contains("outside the configured skills-import root")
+                || err2.contains("is not a directory"),
+            "got: {err2}"
+        );
+        // Nonexistent folder → fail closed.
+        let err3 = resolve_import_root("/no/such/folder/xyzzy-1923", Some(root_s)).unwrap_err();
+        assert!(err3.contains("is not a directory"), "got: {err3}");
+    }
+
     // ---- skill md parse failure ------------------------------------------
 
     #[test]
@@ -934,14 +1181,17 @@ mod tests {
     #[test]
     fn collect_resources_walks_nested_dirs() {
         let dir = tempfile::tempdir().unwrap();
-        let base = dir.path().to_path_buf();
+        // #1923 — the walker asserts every resolved regular file stays under
+        // `base`, so `base` must be the canonical form (matching the handler,
+        // which derives it from the canonicalized import root).
+        let base = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(base.join("a")).unwrap();
         std::fs::create_dir_all(base.join("b").join("c")).unwrap();
         std::fs::write(base.join("a").join("f1.txt"), b"f1").unwrap();
         std::fs::write(base.join("b").join("c").join("f2.txt"), b"f2").unwrap();
 
         let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
-        collect_resources(&base, &base, &mut out).unwrap();
+        collect_resources(&base, &base, &mut out, &mut ImportBudget::new()).unwrap();
         assert_eq!(out.len(), 2);
         // Resource paths MUST be forward-slash-joined on every platform —
         // they are the wire-format key used by `memory_skill_resource`
@@ -970,7 +1220,13 @@ mod tests {
     fn collect_resources_rejects_nonexistent() {
         let mut out: Vec<(String, String, Vec<u8>)> = Vec::new();
         let nonexistent = std::path::PathBuf::from("/does/not/exist/at/all");
-        let err = collect_resources(&nonexistent, &nonexistent, &mut out).unwrap_err();
+        let err = collect_resources(
+            &nonexistent,
+            &nonexistent,
+            &mut out,
+            &mut ImportBudget::new(),
+        )
+        .unwrap_err();
         assert!(err.contains("read_dir"));
     }
 

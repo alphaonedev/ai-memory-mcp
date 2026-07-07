@@ -95,7 +95,8 @@ pub fn handle_skill_export(
     // -----------------------------------------------------------------------
     // Decompress body
     // -----------------------------------------------------------------------
-    let body_bytes = zstd::decode_all(body_blob.as_slice())
+    // #1933 — bounded decode (anti-decompression-bomb ceiling).
+    let body_bytes = crate::mcp::skill_zstd::decode_all_bounded(body_blob.as_slice())
         .map_err(|e| crate::errors::msg::zstd_decompress_body(e))?;
     let body = String::from_utf8_lossy(&body_bytes);
 
@@ -219,7 +220,7 @@ pub fn handle_skill_export(
                      absolute or parent-directory components are not allowed"
                 ));
             }
-            let content = zstd::decode_all(blob.as_slice())
+            let content = crate::mcp::skill_zstd::decode_all_bounded(blob.as_slice())
                 .map_err(|e| format!("decompress resource '{res_path}': {e}"))?;
             let res_file = resources_root.join(&res_path);
             // Defense-in-depth: the lexical join MUST remain inside the
