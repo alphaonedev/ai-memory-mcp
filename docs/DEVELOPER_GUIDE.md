@@ -420,7 +420,7 @@ The `config.rs` module defines 4 feature tiers that gate functionality:
 | `smart` | Yes | Yes | Adds LLM-backed expansion / auto-tag / contradiction detection |
 | `autonomous` | Yes | Yes | Adds cross-encoder reranking + autonomous behaviors |
 
-The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 100 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
+The tier gates **capabilities** (embedder / LLM / reranker), not the advertised tool count — the tool surface is selected separately by `--profile` (7 entries at `core`, 101 at `full`). Tier is set at startup via `ai-memory mcp --tier <tier>` and cannot be changed at runtime. Post-#1067 the LLM is provider-agnostic (`AI_MEMORY_LLM_BACKEND`), not Ollama-only. The `memory_capabilities` tool reports the active tier and which features are available, allowing AI clients to adapt their behavior.
 
 > **Note:** Configuration is loaded once at process startup. Changes to `config.toml` require restarting the ai-memory process (MCP server, HTTP daemon, or CLI) to take effect.
 

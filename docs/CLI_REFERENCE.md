@@ -44,6 +44,8 @@ supplements `--help` with examples and context.
 | `AI_MEMORY_EMBED_BASE_URL` | #1598 — embedding endpoint base URL. Required for `openai-compatible`; vendor default applies for named aliases. |
 | `AI_MEMORY_EMBED_MODEL` | #1598 — embedding model id (e.g. `google/gemini-embedding-2`). Dim resolves from `KNOWN_EMBEDDING_DIMS`; set `[embeddings].dim` for models outside the table. |
 | `AI_MEMORY_EMBED_API_KEY` | #1598 — **secret.** Bearer key for API embedding backends; highest-precedence layer over the per-vendor alias env, `[embeddings].api_key_env`, and `[embeddings].api_key_file` (0400 enforced). |
+| `AI_MEMORY_STORE_URL` | #1927 — **secret.** Non-argv channel for the `serve --store-url` connection URL (e.g. `postgres://user:pass@host/db`), read from the owner-only environment instead of argv so a userinfo password is not exposed via `/proc/<pid>/cmdline` or `ps auxww`. |
+| `AI_MEMORY_STORE_URL_FILE` | #1927 — **secret.** Path to a `0600`-enforced file holding the `--store-url` connection URL; takes precedence over `AI_MEMORY_STORE_URL`, which in turn takes precedence over the CLI arg. |
 | `RUST_LOG` | Tracing filter, e.g. `RUST_LOG=ai_memory=debug`. (Standard Rust ecosystem env, not product-specific.) |
 
 Resolution precedence for any setting: **CLI flag > `AI_MEMORY_*` env
@@ -277,7 +279,7 @@ API key comes from the `api_key` field in `config.toml`).
 | `--quorum-ca-cert` | path | — | CA for verifying quorum peers. |
 | `--catchup-interval-secs` | u64 | `30` | Federation catch-up loop cadence. |
 | `--federation-identity` | string | — | Identity this node presents to peers (also `AI_MEMORY_FED_IDENTITY`). |
-| `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). |
+| `--store-url` | URL | — | SAL backend selector (`postgres://…` under `--features sal-postgres`). **Mutually exclusive with `--db`** — passing both is rejected at startup with a clear error. A userinfo password should be supplied via `AI_MEMORY_STORE_URL` (owner-only environment) or `AI_MEMORY_STORE_URL_FILE` (a `0600` file) rather than on argv, which is exposed via `/proc/<pid>/cmdline` and `ps auxww` to any local UID (#1927). |
 
 ```bash
 ai-memory serve --host 0.0.0.0 --port 9077 \
