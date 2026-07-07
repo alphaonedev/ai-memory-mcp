@@ -623,9 +623,14 @@ const DAEMON_ROW_SIG_DOMAIN: &[u8] = b"ai-memory/signed-events/row-v1\0";
 ///
 /// Length-prefixed (the #1930 injectivity discipline) so no field value can be
 /// confused with another. Returns the 32-byte SHA-256 the Ed25519 key signs.
+///
+/// Public so an external auditor (or a forensic tool) can recompute the exact
+/// bytes the daemon key signed for a `signed_events` row and re-verify it — the
+/// same input [`append_signed_event`] signs and [`classify_row_signature`]
+/// verifies (sign/verify symmetry).
 #[must_use]
 #[allow(clippy::cast_possible_truncation)] // field lengths fit u64 on every supported target
-fn daemon_row_signing_input(event: &SignedEvent) -> Vec<u8> {
+pub fn daemon_row_signing_input(event: &SignedEvent) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(DAEMON_ROW_SIG_DOMAIN);
     for field in [
