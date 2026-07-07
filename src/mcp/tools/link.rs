@@ -90,6 +90,15 @@ const REFLECTS_ON: &str = "reflects_on";
 /// walker — see `crate::notification::invalidation`.
 const SUPERSEDES: &str = "supersedes";
 
+/// #1929 — refusal when the caller does not OWN a state-changing link
+/// target (e.g. `supersedes`, which mutates the target's lineage / fires
+/// cross-namespace invalidation writes).
+const TARGET_NOT_OWNED_FOR_MUTATION: &str =
+    "caller does not own the link target for a state-changing relation";
+
+/// #1929 — refusal when the caller cannot even SEE the link target.
+const TARGET_NOT_VISIBLE: &str = "caller cannot see the link target";
+
 pub(super) fn handle_link(
     conn: &rusqlite::Connection,
     db_path: &Path,
@@ -245,17 +254,39 @@ pub(super) fn handle_link(
         || crate::quotas::GLOBAL_NAMESPACE.to_string(),
         |mem| mem.namespace.clone(),
     );
-    // #1786 — owner gate: refuse forging a link ROOTED at a source memory owned
-    // by a DIFFERENT agent (the MCP link path bypasses the HTTP source-owner
-    // gate, leaving a graph-forge primitive). Keyed on the ENFORCED-read caller
-    // (`resolve_read_visibility_caller`, env-only) so it fires ONLY when
-    // `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); single-operator
-    // trust-all default byte-unchanged.
-    if let Some(src) = link_owner.as_ref()
-        && let Some(caller) = crate::identity::resolve_read_visibility_caller()
-        && !crate::visibility::caller_owns_for_mutation(src, &caller, false)
-    {
-        return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+    // #1786 + #1929 — owner/visibility gates, keyed on the ENFORCED-read
+    // caller (`resolve_read_visibility_caller`, env-only) so they fire ONLY
+    // when `AI_MEMORY_AGENT_ID` is set (multi-tenant opt-in); the single-
+    // operator trust-all default is byte-unchanged.
+    if let Some(caller) = crate::identity::resolve_read_visibility_caller() {
+        // #1786 — SOURCE gate: refuse forging a link ROOTED at a source
+        // memory owned by a DIFFERENT agent (the MCP link path bypasses the
+        // HTTP source-owner gate, leaving a graph-forge primitive).
+        if let Some(src) = link_owner.as_ref()
+            && !crate::visibility::caller_owns_for_mutation(src, &caller, false)
+        {
+            return Err(crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.into());
+        }
+        // #1929 (CWE-862) — TARGET gate. The #1786 gate checked ownership on
+        // the SOURCE only; `target_id` was never authorized. A caller who
+        // owns a reflection could point a `supersedes` edge at a VICTIM's
+        // reflection (any cross-namespace target), driving
+        // `propagate_reflection_invalidation` to write invalidation notices
+        // into the victim's `_invalidations` namespace and pollute their
+        // lineage — a cross-tenant integrity/DoS write the victim never
+        // authorized. Gate the TARGET too: for a STATE-CHANGING relation
+        // (`supersedes`) the caller must OWN the target; for any other
+        // relation it must at least be able to SEE it. A missing target is
+        // left to `db::create_link_signed`'s FK error (more actionable).
+        if let Some(tgt) = db::get(conn, target_id).ok().flatten() {
+            if relation == SUPERSEDES {
+                if !crate::visibility::caller_owns_for_mutation(&tgt, &caller, false) {
+                    return Err(TARGET_NOT_OWNED_FOR_MUTATION.into());
+                }
+            } else if !crate::visibility::is_visible_to_caller(&tgt, &caller) {
+                return Err(TARGET_NOT_VISIBLE.into());
+            }
+        }
     }
     // H12 (#628 blocker): combine the link quota check + counter
     // increment in a single atomic transaction. The check + record
@@ -956,6 +987,67 @@ mod tests {
         assert_eq!(out["relation"].as_str(), Some(SUPERSEDES));
         // invalidation_notified is always an array on this path.
         assert!(out["invalidation_notified"].is_array());
+    }
+
+    /// #1929 (CWE-862) adversarial — an attacker who owns the SOURCE
+    /// reflection cannot forge a `supersedes` edge onto a VICTIM-owned
+    /// reflection they neither own nor can see. Fail-before/pass-after:
+    /// pre-fix only the SOURCE owner was checked, so this drove
+    /// `propagate_reflection_invalidation` into the victim's `_invalidations`
+    /// namespace. Post-fix the TARGET owner gate refuses it and no
+    /// cross-tenant write lands.
+    #[test]
+    fn cross_owner_supersede_target_refused_1929() {
+        // Crate-wide env lock — excludes all other AI_MEMORY_AGENT_ID
+        // readers/mutators for this test's window.
+        let _envg = crate::identity::agent_id_env_test_lock();
+        let conn = fresh_conn();
+
+        let mut attacker_src = make_reflection("attacker-src", "attacker-ns");
+        attacker_src.metadata = json!({"agent_id": "ai:attacker"});
+        let mut victim_tgt = make_reflection("victim-tgt", "victim-ns");
+        victim_tgt.metadata = json!({"agent_id": "ai:victim"});
+        let src_id = db::insert(&conn, &attacker_src).unwrap();
+        let tgt_id = db::insert(&conn, &victim_tgt).unwrap();
+        let db_path = db_path();
+
+        unsafe { std::env::set_var("AI_MEMORY_AGENT_ID", "ai:attacker") };
+        let err = handle_link(
+            &conn,
+            &db_path,
+            &json!({
+                "source_id": src_id,
+                "target_id": tgt_id,
+                "relation": SUPERSEDES,
+                "agent_id": "ai:attacker",
+            }),
+            None,
+        )
+        .expect_err("cross-owner supersede onto a victim target must be refused");
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
+
+        assert!(
+            err.contains("does not own the link target"),
+            "expected the TARGET owner-gate refusal, got: {err}"
+        );
+        // BLOCKED: no supersedes edge was created …
+        let links: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                [&src_id, &tgt_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(links, 0, "no link row must be created on refusal");
+        // … and no invalidation notice was written into the victim's tree.
+        let inval: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace LIKE '%_invalidations%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(inval, 0, "no cross-tenant invalidation write may occur");
     }
 
     // Supersedes between an observation and a reflection skips the

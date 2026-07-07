@@ -538,6 +538,7 @@ mod update;
 #[path = "tools/verify.rs"]
 mod verify;
 // v0.7.0 L1-5 — Agent Skills ingestion substrate (Pillar 1.5).
+// #1933 — shared bounded zstd decoder for every skill blob decode.
 #[path = "tools/skill_export.rs"]
 mod skill_export;
 #[path = "tools/skill_get.rs"]
@@ -548,6 +549,8 @@ mod skill_list;
 mod skill_register;
 #[path = "tools/skill_resource.rs"]
 mod skill_resource;
+#[path = "tools/skill_zstd.rs"]
+mod skill_zstd;
 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop:
 // reflections become skills become reusable knowledge.
 #[path = "tools/skill_promote.rs"]

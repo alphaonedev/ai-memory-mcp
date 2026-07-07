@@ -52,8 +52,10 @@ pub fn handle_skill_resource(conn: &Connection, params: &Value) -> Result<Value,
         format!("resource '{resource_path}' has no inline content (reference-only)")
     })?;
 
-    // Decompress.
-    let content_bytes = zstd::decode_all(content_blob.as_slice())
+    // Decompress. #1933 — bounded streaming decode so a hostile
+    // `skill_resources.content_blob` that decodes to gigabytes cannot OOM
+    // the daemon (same anti-bomb ceiling as the transcript path).
+    let content_bytes = crate::mcp::skill_zstd::decode_all_bounded(content_blob.as_slice())
         .map_err(|e| format!("zstd decompress resource: {e}"))?;
 
     // Verify digest.
