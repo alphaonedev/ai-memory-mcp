@@ -8018,7 +8018,14 @@ impl PostgresStore {
                     if s.len() <= 200 {
                         s.to_string()
                     } else {
-                        format!("{}…<{}b truncated>", &s[..200], s.len() - 200)
+                        // #1895 — truncate on a CHAR boundary, never a raw
+                        // byte index: `&s[..200]` panics with "byte index 200
+                        // is not a char boundary" when offset 200 falls inside
+                        // a multi-byte UTF-8 sequence. This helper runs on the
+                        // JSON-parse-FAILURE path over `raw.0` (arbitrary /
+                        // adversarial AGE bytes), so ASCII cannot be assumed.
+                        let end = s.char_indices().nth(200).map_or(s.len(), |(i, _)| i);
+                        format!("{}…<{}b truncated>", &s[..end], s.len() - end)
                     }
                 };
                 let arr: serde_json::Value = serde_json::from_str(&json_payload).map_err(|e| {

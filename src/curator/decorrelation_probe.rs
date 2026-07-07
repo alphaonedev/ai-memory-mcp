@@ -399,6 +399,16 @@ pub struct DecorrelationProbeReport {
     /// Additive + backward-compatible via `#[serde(default)]`.
     #[serde(default)]
     pub namespaces_capped: usize,
+    /// #1904 — number of namespaces whose per-namespace `list` read FAILED and
+    /// were skipped from the sweep (schema drift, permission, transient backend
+    /// outage). Previously the error was silently swallowed (`Err(_) =>
+    /// continue`) with no telemetry and no report field, so a persistently
+    /// unreadable namespace vanished from this monoculture-visibility audit as
+    /// a false all-clear while `namespaces_scanned` still counted it. Each such
+    /// skip now also emits a `hooks`-free WARN on [`TRACE_TARGET`]. Additive +
+    /// backward-compatible via `#[serde(default)]`.
+    #[serde(default)]
+    pub namespaces_errored: usize,
 }
 
 #[cfg(feature = "sal")]
@@ -436,9 +446,11 @@ const PROBE_SCAN_LIMIT: usize = crate::storage::LIST_MAX_LIMIT;
 ///
 /// # Errors
 ///
-/// Propagates a fatal store error (`list_namespaces`); per-namespace `list`
-/// failures are collected into the report's advisories path as skipped, not
-/// fatal — a single bad namespace never aborts the sweep.
+/// Propagates a fatal store error (`list_namespaces`). A per-namespace `list`
+/// failure is NOT fatal — it is recorded in
+/// [`DecorrelationProbeReport::namespaces_errored`] and emitted as a WARN on
+/// [`TRACE_TARGET`] (naming the namespace + error), then the sweep continues so
+/// a single bad namespace never aborts the whole probe (#1904).
 #[cfg(feature = "sal")]
 pub async fn run_decorrelation_probe(
     store: &dyn MemoryStore,
@@ -495,8 +507,19 @@ pub async fn run_decorrelation_probe(
         };
         let memories = match store.list(&ctx, &filter).await {
             Ok(v) => v,
-            // A single namespace's read failure must not abort the whole sweep.
-            Err(_) => continue,
+            // #1904 — a single namespace's read failure must not abort the whole
+            // sweep, but it must NOT vanish silently either: record it + WARN so
+            // an unreadable namespace is a signalled skip, not a false all-clear.
+            Err(e) => {
+                report.namespaces_errored += 1;
+                tracing::warn!(
+                    target: TRACE_TARGET,
+                    namespace = %ns,
+                    error = %e,
+                    "decorrelation probe: namespace read failed, skipped"
+                );
+                continue;
+            }
         };
         // Honest truncation marker, keyed on the PRE-Reflection-filter row count
         // (the raw window the store returned). Both backends now scan the

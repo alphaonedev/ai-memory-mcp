@@ -11429,6 +11429,47 @@ pub fn get_embedding(conn: &Connection, id: &str) -> Result<Option<Vec<f32>>> {
     }
 }
 
+/// #1910 — batched sibling of [`get_embedding`], mirroring [`get_many`]:
+/// resolve the stored embedding vector for every id in `ids` with a single
+/// `... WHERE id IN (?,?,…)` SELECT (chunked at 500) instead of one round-trip
+/// per id. The #1692 checked-cosine recompute in the semantic recall phase used
+/// to call `get_embedding` per surviving HNSW hit INSIDE the DB-lock hot path,
+/// re-introducing the N+1 pattern the #981 `get_many` batching had killed; this
+/// restores the single-round-trip-per-recall property.
+///
+/// Rows with a NULL / empty embedding, or a blob that fails to decode, are
+/// simply absent from the map (never an error): the caller falls back to the
+/// HNSW distance-derived cosine for a missing id, matching the pre-batch
+/// per-hit `get_embedding` error/None arm.
+pub fn get_embeddings_many(conn: &Connection, ids: &[String]) -> Result<HashMap<String, Vec<f32>>> {
+    let mut out: HashMap<String, Vec<f32>> = HashMap::with_capacity(ids.len());
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    const CHUNK: usize = 500;
+    for chunk in ids.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id, embedding FROM memories WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+        })?;
+        for r in rows {
+            let (id, bytes) = r?;
+            if let Some(bytes) = bytes
+                && !bytes.is_empty()
+                && let Ok(floats) = crate::embeddings::decode_embedding_blob(&bytes)
+            {
+                out.insert(id, floats);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Get all memory IDs that are missing embeddings.
 ///
 /// #1579 B6 (F5.6): unbounded — materialises every `(id, title,
@@ -12168,7 +12209,9 @@ fn fts_keyword_phase(
     until: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(Memory, f64, Option<Vec<u8>>)>> {
-    let fts_limit = (limit * 3).max(30);
+    // #1909 — same unclamped public `limit`; guard the multiply against
+    // overflow (panic in overflow-checks builds, silent wrap in release).
+    let fts_limit = limit.saturating_mul(3).max(30);
     let fts_sql = format!(
         "SELECT m.id, m.tier, m.namespace, m.title, m.content, m.tags, m.priority,
                 m.confidence, m.source, m.access_count, m.created_at, m.updated_at,
@@ -12373,7 +12416,12 @@ fn semantic_phase(
         let hits: &[crate::hnsw::VectorHit] = if let Some(pre) = precomputed_hnsw_hits {
             pre
         } else {
-            let ann_limit = (limit * 5).max(50);
+            // #1909 — `limit` reaches here unclamped from the public
+            // `db::recall_hybrid` / `MemoryStore::recall_hybrid` boundary, so
+            // guard the multiply exactly as the sibling site at mod.rs:~12926
+            // (`limit.saturating_mul(5).max(50)`): unchecked `limit * 5`
+            // panics under overflow-checks and silently wraps in release.
+            let ann_limit = limit.saturating_mul(5).max(50);
             // v0.9 #1005 (§5.2) — opt-in namespace allowlist. When
             // AI_MEMORY_VECTOR_NAMESPACE_ALLOWLIST is truthy AND this
             // recall is namespace-filtered, the ANN walk consumes the
@@ -12418,6 +12466,12 @@ fn semantic_phase(
             }
         }
         let fetched = get_many(conn, &needed_ids)?;
+        // #1910 — batch the #1692 checked-cosine recompute's embedding reads
+        // into ONE `SELECT id, embedding ... IN (…)` (mirrors the `get_many`
+        // above) instead of a per-hit `get_embedding` round-trip inside this
+        // DB-lock loop, preserving the #981 single-round-trip-per-recall
+        // property for warm-index recalls.
+        let stored_embeddings = get_embeddings_many(conn, &needed_ids)?;
         for (id, cosine) in hit_meta {
             let Some(mem) = fetched.get(&id) else {
                 continue;
@@ -12432,10 +12486,10 @@ fn semantic_phase(
             // dimension mismatch instead of trusting `hit.distance`. For a
             // same-dim hit the checked cosine equals `1.0 - hit.distance`
             // (both reduce to the dot product), so valid hits are unchanged.
-            let cosine = match get_embedding(conn, &id) {
-                Ok(Some(stored)) => match crate::embeddings::Embedder::cosine_similarity_checked(
+            let cosine = match stored_embeddings.get(&id) {
+                Some(stored) => match crate::embeddings::Embedder::cosine_similarity_checked(
                     query_embedding,
-                    &stored,
+                    stored,
                 ) {
                     crate::embeddings::CosineComparison::Comparable(c) => f64::from(c),
                     crate::embeddings::CosineComparison::DimensionMismatch { .. } => {
@@ -12443,9 +12497,10 @@ fn semantic_phase(
                         continue;
                     }
                 },
-                // Legacy row with no stored embedding (or a fetch error): fall
-                // back to the HNSW distance-derived cosine rather than dropping.
-                _ => cosine,
+                // Legacy row with no stored embedding (or an undecodable blob):
+                // fall back to the HNSW distance-derived cosine rather than
+                // dropping — same arm the per-hit `get_embedding` None/Err took.
+                None => cosine,
             };
             if let Some(ns) = namespace {
                 if prep.hierarchy_active {

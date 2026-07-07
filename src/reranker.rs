@@ -1597,12 +1597,13 @@ impl BatchedReranker {
 
         let pool_size = resolve_reranker_pool_size();
         let mut workers = Vec::with_capacity(pool_size);
+        let mut spawn_failed = false;
         for _ in 0..pool_size {
             let worker_encoder = Arc::clone(&encoder);
             let worker_rx = Arc::clone(&shared_rx);
             let worker_stop = Arc::clone(&stop);
             let worker_boost = reflection_boost;
-            let handle = thread::Builder::new()
+            match thread::Builder::new()
                 .name("ai-memory-reranker-batcher".into())
                 .spawn(move || {
                     run_reranker_worker(
@@ -1613,9 +1614,50 @@ impl BatchedReranker {
                         max_batch,
                         max_wait,
                     );
-                })
-                .expect("failed to spawn rerank batcher worker");
-            workers.push(handle);
+                }) {
+                Ok(handle) => workers.push(handle),
+                Err(e) => {
+                    // #1908 — a thread-spawn failure at daemon startup (rlimit /
+                    // OOM) previously `.expect()`-panicked and took the whole
+                    // process down, an inconsistent resilience posture next to
+                    // the sibling neural-model-load failure at the same call
+                    // site (which degrades to a lexical fallback, no panic).
+                    // Degrade the SAME way: fall back to a pool-less
+                    // "direct-only" mode (`sender: None` routes every `rerank`
+                    // through `rerank_direct_unfloored` on the caller's thread —
+                    // no coalescing pool, no round-trip), rather than aborting.
+                    tracing::warn!(
+                        target: "reranker",
+                        error = %e,
+                        "failed to spawn rerank batcher worker — falling back to \
+                         direct-only mode (no coalescing pool); rerank still \
+                         functions, without cross-request batching"
+                    );
+                    spawn_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if spawn_failed {
+            // Tear down any workers that DID spawn, then return the degraded
+            // direct-only reranker (empty pool, no sender). `rerank_coalesced_
+            // unfloored` sees `sender: None` and dispatches directly.
+            stop.store(true, Ordering::Release);
+            drop(tx);
+            for handle in workers.drain(..) {
+                let _ = handle.join();
+            }
+            return Self {
+                sender: None,
+                stop,
+                workers,
+                encoder,
+                reflection_boost,
+                score_floor,
+                inflight: AtomicUsize::new(0),
+                worker_submissions: AtomicUsize::new(0),
+            };
         }
 
         Self {

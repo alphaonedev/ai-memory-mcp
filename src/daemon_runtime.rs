@@ -929,21 +929,16 @@ async fn dispatch_recover_previous_session(
 /// Top-level CLI dispatch. Called from `main()` after `Cli::parse()`.
 ///
 /// Handles:
-/// - `--db-passphrase-file` → exports `AI_MEMORY_DB_PASSPHRASE`.
 /// - `is_write_command` → conditional post-run WAL checkpoint.
 /// - The match arm for every `Command` variant.
+///
+/// #1889: the `--db-passphrase-file` → `AI_MEMORY_DB_PASSPHRASE` export and the
+/// `anonymize_default` seeding NO LONGER happen here (this body runs on the
+/// multi-threaded tokio runtime, where `std::env::set_var` is a data race).
+/// They now run synchronously in [`apply_startup_env`], called from the binary
+/// entry point BEFORE the runtime is built.
 #[allow(clippy::too_many_lines)]
 pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
-    // v0.6.0.0: read the SQLCipher passphrase from a file and export it as
-    // AI_MEMORY_DB_PASSPHRASE for the duration of the process. File path
-    // comes from the --db-passphrase-file flag (global). No-op on standard
-    // SQLite builds (the env var is ignored unless the binary was built
-    // with --features sqlcipher).
-    if let Some(path) = &cli.db_passphrase_file {
-        let passphrase = passphrase_from_file(path)?;
-        // SAFETY: single-threaded startup before any worker threads spawn.
-        unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
-    }
     let db_path = app_config.effective_db(&cli.db);
     // Seed the process-wide per-agent quota defaults from the resolved
     // `[limits]` config (env `AI_MEMORY_MAX_*` > `[limits]` > compiled
@@ -2291,9 +2286,49 @@ pub fn apply_anonymize_default(app_config: &AppConfig) {
     if app_config.effective_anonymize_default()
         && std::env::var(crate::identity::ENV_ANONYMIZE).is_err()
     {
-        // SAFETY: single-threaded startup before any worker threads spawn.
+        // SAFETY: #1889 — reached only from `apply_startup_env`, which the
+        // binary entry point calls on the single main thread BEFORE the tokio
+        // runtime (and its worker threads) are built. No other thread exists
+        // that could concurrently `getenv`, so this env mutation is race-free
+        // (the real invariant; the prior "before any worker threads spawn" was
+        // false when this ran inside `#[tokio::main]`).
         unsafe { std::env::set_var(crate::identity::ENV_ANONYMIZE, "1") };
     }
+}
+
+/// #1889 — apply ALL process-environment mutation that daemon startup requires,
+/// synchronously, on the single main thread BEFORE the tokio runtime (and its
+/// worker threads) exist.
+///
+/// `std::env::set_var` mutating the process environment while another thread may
+/// call `getenv` is a data race — undefined behaviour in glibc, and `unsafe` in
+/// edition 2024. A multi-threaded `#[tokio::main]` runtime spawns its worker
+/// threads BEFORE the async `main` body runs, so performing this seeding inside
+/// [`run`] / any async context violated the stated "single-threaded startup"
+/// SAFETY invariant. Hoisting it into this synchronous pre-runtime shim makes
+/// that invariant actually hold.
+///
+/// Covers: (1) the `--db-passphrase-file` → `AI_MEMORY_DB_PASSPHRASE` export
+/// (no-op on standard SQLite builds; honoured only under `--features
+/// sqlcipher`), and (2) the `anonymize_default` → `AI_MEMORY_ANONYMIZE` seeding.
+///
+/// # Errors
+///
+/// Propagates a passphrase-file read / permission / empty-content error from
+/// [`passphrase_from_file`].
+pub fn apply_startup_env(cli: &Cli, app_config: &AppConfig) -> Result<()> {
+    // v0.6.0.0: read the SQLCipher passphrase from a file and export it as
+    // AI_MEMORY_DB_PASSPHRASE for the duration of the process.
+    if let Some(path) = &cli.db_passphrase_file {
+        let passphrase = passphrase_from_file(path)?;
+        // SAFETY: #1889 — synchronous pre-runtime region (before
+        // `Runtime::block_on`), so no other thread can concurrently read the
+        // environment. This is the invariant the prior in-`run` call site
+        // (under `#[tokio::main]`) falsely claimed.
+        unsafe { std::env::set_var("AI_MEMORY_DB_PASSPHRASE", passphrase) };
+    }
+    apply_anonymize_default(app_config);
+    Ok(())
 }
 
 /// #976 (2026-05-20) — resolve the admin-allowlist with env-var
@@ -4031,8 +4066,20 @@ pub async fn bootstrap_serve(
     // address with no API key configured is the safe default;
     // operators who *intentionally* run a public daemon must set
     // `[api] api_key` (or `--api-key` on the CLI) explicitly.
+    // #1903 — normalize the configured api_key so an EMPTY / whitespace-only
+    // value (e.g. an unset templated/env-substituted `api_key = ""`) is treated
+    // as UNCONFIGURED, not as a present-but-trivially-guessable secret. Without
+    // this, `api_key = ""` made `is_some()` true: the bind guard returned Ok
+    // (silent public 0.0.0.0 bind, no keyless-bind refusal) while the auth
+    // middleware then "required" a match against the empty string, which any
+    // caller supplies (`x-api-key:` / `?api_key=`). The retained value is the
+    // ORIGINAL string when it carries any non-whitespace content (secrets are
+    // compared verbatim); only empty/blank collapses to `None`. Constructed
+    // once here and fed to BOTH the bind guard and `ApiKeyState` below.
+    let normalized_api_key: Option<String> =
+        app_config.api_key.clone().filter(|k| !k.trim().is_empty());
     match api_key_bind_guard(
-        app_config.api_key.is_some(),
+        normalized_api_key.is_some(),
         args.host.as_str(),
         require_api_key_strict(),
     ) {
@@ -5002,7 +5049,10 @@ pub async fn bootstrap_serve(
     let mtls_enforced =
         args.tls_cert.is_some() && args.tls_key.is_some() && args.mtls_allowlist.is_some();
     let api_key_state = ApiKeyState {
-        key: app_config.api_key.clone(),
+        // #1903 — reuse the normalized key: an empty/whitespace-only `api_key`
+        // is rejected as unconfigured (loopback-only auth-off posture) rather
+        // than installed as a known-empty, attacker-suppliable shared secret.
+        key: normalized_api_key,
         mtls_enforced,
     };
     if api_key_state.key.is_some() {
@@ -7885,11 +7935,13 @@ mod tests {
 
     // ----- run() with passphrase file (covers lines 372-374) ------------
 
-    #[tokio::test]
-    async fn test_run_with_db_passphrase_file_exports_env() {
-        // Covers the `--db-passphrase-file` branch in run() (lines
-        // 371-375) which calls passphrase_from_file then sets
-        // AI_MEMORY_DB_PASSPHRASE in the environment.
+    #[test]
+    fn test_apply_startup_env_with_db_passphrase_file_exports_env() {
+        // #1889 — the `--db-passphrase-file` → AI_MEMORY_DB_PASSPHRASE export
+        // moved OUT of the async `run()` (unsound env mutation under the
+        // multi-threaded tokio runtime) into the synchronous pre-runtime shim
+        // `apply_startup_env`. This covers that canonical export site: given the
+        // flag, it reads the passphrase file and sets the env var.
         let _g = env_var_lock();
         // SAFETY: serialized via env_var_lock.
         unsafe { std::env::remove_var("AI_MEMORY_DB_PASSPHRASE") };
@@ -7914,7 +7966,7 @@ mod tests {
             "stats",
         ])
         .unwrap();
-        run(cli, &cfg).await.unwrap();
+        apply_startup_env(&cli, &cfg).unwrap();
         // Env var is now set.
         assert_eq!(
             std::env::var("AI_MEMORY_DB_PASSPHRASE").unwrap(),

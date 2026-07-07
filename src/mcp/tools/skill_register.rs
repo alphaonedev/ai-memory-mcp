@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::identity::keypair::AgentKeypair;
 use crate::parsing::skill_md;
-use crate::signed_events::{SignedEvent, append_signed_event, payload_hash};
+use crate::signed_events::{SignedEvent, append_signed_event_no_tx, payload_hash};
 
 // ---------------------------------------------------------------------------
 // Digest computation
@@ -258,6 +258,22 @@ pub(super) fn register_core(
 
     let new_id = Uuid::new_v4().to_string();
 
+    // #1887 — the SELECT-current-row → INSERT skills → INSERT skill_resources →
+    // UPDATE prev.superseded_by sequence together maintains the single-non-
+    // superseded-row invariant, so it MUST run as ONE atomic transaction
+    // (project SSOT: BEGIN IMMEDIATE, as capture_turn / store::synthesis use).
+    // On a bare autocommit connection, a partial failure could leave a skills
+    // row whose signed digest covers resource_digests never fully persisted,
+    // or leave the prior version un-superseded (TWO rows satisfying
+    // `superseded_by IS NULL`); and the read-modify-write SELECT→INSERT→UPDATE
+    // was a TOCTOU under concurrent same-(namespace,name) registrations (also
+    // reachable via HTTP /api/v1/skill/register). BEGIN IMMEDIATE takes the
+    // write lock up front, serialising concurrent registrations; RAII drop of
+    // `tx` rolls back ALL writes on any early `?` return below.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("skill register BEGIN IMMEDIATE: {e}"))?;
+    let conn: &Connection = &tx;
+
     // Find the current (non-superseded) row for this (namespace, name).
     let prev_id: Option<String> = conn
         .query_row(
@@ -343,10 +359,19 @@ pub(super) fn register_core(
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..SignedEvent::default()
     };
-    let _ = append_signed_event(conn, &event); // best-effort; don't fail registration on audit err
+    // #1887 — we are already inside a BEGIN IMMEDIATE tx, so use the
+    // `_no_tx` variant: the public `append_signed_event` opens its OWN
+    // IMMEDIATE tx, which SQLite rejects as a nested transaction. Still
+    // best-effort — an audit-append error does not fail (or roll back) the
+    // registration; the audit row is simply skipped.
+    let _ = append_signed_event_no_tx(conn, &event);
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain position.
     let version = compute_skill_version(conn, &new_id);
+
+    // Commit the atomic register (skills + resources + supersede) as one unit.
+    tx.commit()
+        .map_err(|e| format!("skill register COMMIT: {e}"))?;
 
     Ok(RegisterResult {
         id: new_id,
