@@ -962,7 +962,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // pre-runtime `apply_startup_env` shim (hoisting env mutation out of the
     // tokio runtime) + the api_key normalization comments landed the file at
     // 9_610; +40 headroom.
-    ("src/daemon_runtime.rs", 9_650),
+    // 2026-07-07 (#1927 / #1926 / #1924) — bumped 9_650 → 9_950: the non-argv
+    // store-url credential channel (`store_url_from_file` + `resolve_store_url`
+    // + `url_has_userinfo_password` + their #1927 adversarial tests), the #1926
+    // log-redaction fix, and the #1924 HTTP pre-event enforcement-gate install
+    // in `serve` landed the file at 9_854; +96 headroom.
+    ("src/daemon_runtime.rs", 9_950),
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
