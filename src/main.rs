@@ -32,7 +32,7 @@ use ai_memory::tls;
 // can call `std::process::exit(78)` on a bad hmac secret, which would
 // abort the test harness. Its individual steps are covered indirectly:
 //   - `config::AppConfig::load` / `write_default_if_missing` — config tests
-//   - `daemon_runtime::apply_anonymize_default` — daemon_runtime tests
+//   - `daemon_runtime::apply_startup_env` / `apply_anonymize_default` — daemon_runtime tests
 //   - `config::set_active_permissions_mode` / `set_active_hooks_hmac_secret`
 //     / `set_allow_loopback_webhooks` — config tests
 //   - `subscriptions::validate_hmac_secret_hex` — subscriptions tests
@@ -43,12 +43,28 @@ use ai_memory::tls;
 //   - `daemon_runtime::run` — the serve_*/cli_*/cov_* integration suite
 // The `std::process::exit(78)` arm (invalid hmac secret) is documented
 // as uncoverable: exercising it would terminate the test process.
-#[tokio::main]
-async fn main() -> Result<()> {
+// #1889 — the entry point is a SYNCHRONOUS `fn main()`, not `#[tokio::main]`.
+// `#[tokio::main]` expands to a `fn main()` that builds a multi-threaded runtime
+// (spawning worker threads) and only THEN runs the async body — so any
+// `std::env::set_var` in that body races with those workers (glibc UB; `unsafe`
+// in edition 2024). Doing config-load + `Cli::parse` + ALL process-environment
+// seeding (`apply_startup_env`) here, on the single main thread BEFORE
+// `Runtime::block_on`, makes the "no other thread touches the environment"
+// invariant actually true. The async daemon body then runs under a manually
+// built runtime that mirrors the previous `#[tokio::main]` default
+// (multi-thread + all drivers enabled).
+fn main() -> Result<()> {
     color::init();
     let app_config = config::AppConfig::load();
     config::AppConfig::write_default_if_missing();
-    daemon_runtime::apply_anonymize_default(&app_config);
+
+    // Parse argv up front so `apply_startup_env` can read `--db-passphrase-file`.
+    let cli = Cli::parse();
+
+    // #1889 — ALL env mutation (passphrase-file export + anonymize seeding)
+    // happens HERE, synchronously, before any thread (tracing appender worker,
+    // tokio runtime workers) exists. See `daemon_runtime::apply_startup_env`.
+    daemon_runtime::apply_startup_env(&cli, &app_config)?;
 
     // v0.7.0 K3 — pin the process-wide governance gate posture before
     // any subcommand has a chance to call `db::enforce_governance`.
@@ -111,8 +127,14 @@ async fn main() -> Result<()> {
     // and swallowed so a missing key never blocks daemon startup.
     init_forensic_audit(&app_config);
 
-    let cli = Cli::parse();
-    daemon_runtime::run(cli, &app_config).await
+    // #1889 — build the async runtime AFTER all env seeding is done, then hand
+    // off to the daemon body. Mirrors the `#[tokio::main]` default (multi-thread
+    // scheduler, all drivers enabled). `_log_guard` stays in scope across the
+    // whole `block_on` so the non-blocking tracing writer flushes on exit.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(daemon_runtime::run(cli, &app_config))
 }
 
 /// v0.7.0 #697 — best-effort init for the forensic governance log.

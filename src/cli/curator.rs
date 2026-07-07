@@ -2012,6 +2012,8 @@ mod tests {
                 scan_capped: false,
             }],
             namespaces_capped: 0,
+            // #1904 — additive report field (per-namespace read-failure count).
+            namespaces_errored: 0,
         }
     }
 

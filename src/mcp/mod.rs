@@ -1515,6 +1515,125 @@ fn dispatch_memory_signal_send(ctx: &ToolDispatchCtx<'_>) -> Result<Value, Strin
     }
 }
 
+// ---------------------------------------------------------------------------
+// #1885 (critical) — MCP PRE-event mandatory-hook-presence ENFORCEMENT gate.
+//
+// `hooks/enforce.rs` shipped the pure helpers and cluster A added
+// `chain::dispatch_pre_event_enforced` (presence-gate → short-circuit Deny →
+// fire with `effective_fail_mode` threaded), but NO production call site
+// consulted it: `[hooks].enforce_mode = enforce` + `required_events =
+// ["pre_store"]` gave a boot-banner / `doctor --hooks` "WILL DENY" warning while
+// every `memory_store` still resolved an EMPTY chain whose `fire` returned Allow
+// — a silent bypass of the very control the module exists to provide.
+//
+// This gate is that missing dispatch layer for the MCP write surface. It mirrors
+// the #1752 PreSignalSend install/consult pattern: `run_mcp_server` resolves the
+// enforce mode + required events from config and installs the gate (ONLY when
+// enforce is active AND a required event is declared — default off = never
+// installed = inert), and every eligible pre-event handler consults it BEFORE
+// the op commits, returning the 503 Deny on short-circuit. The async chain fires
+// synchronously via `block_on_local` (the sync stdio dispatch cannot `.await`).
+// ---------------------------------------------------------------------------
+
+/// #1885 — the process-global pre-event enforcement gate: the full loaded hook
+/// set + resolved `[hooks].enforce_mode` / `required_events`, plus an
+/// `ExecutorRegistry` (behind a `Mutex`; the sync stdio loop is single-threaded
+/// so it is uncontended) for firing any hook that IS present. `None` until
+/// [`run_mcp_server`] installs it.
+struct PreEventEnforceGate {
+    all_hooks: Vec<crate::hooks::config::HookConfig>,
+    mode: crate::hooks::HookEnforceMode,
+    required: Vec<crate::hooks::HookEvent>,
+    registry: std::sync::Mutex<crate::hooks::ExecutorRegistry>,
+}
+
+static PRE_EVENT_ENFORCE_GATE: std::sync::OnceLock<PreEventEnforceGate> =
+    std::sync::OnceLock::new();
+
+/// #1885 — install the process pre-event enforcement gate (first-writer-wins).
+/// Called once by [`run_mcp_server`] when enforce is active with declared
+/// required events.
+fn set_pre_event_enforce_gate(
+    all_hooks: Vec<crate::hooks::config::HookConfig>,
+    mode: crate::hooks::HookEnforceMode,
+    required: Vec<crate::hooks::HookEvent>,
+    registry: crate::hooks::ExecutorRegistry,
+) {
+    let _ = PRE_EVENT_ENFORCE_GATE.set(PreEventEnforceGate {
+        all_hooks,
+        mode,
+        required,
+        registry: std::sync::Mutex::new(registry),
+    });
+}
+
+/// #1885 — consult the installed pre-event enforcement gate for `event` BEFORE
+/// the MCP operation commits, via `dispatch_pre_event_enforced`.
+///
+/// Returns `Err(reason)` — a stringified 503 Deny that refuses the operation —
+/// when `mode == enforce`, `event` is in `required`, and NO enabled hook is
+/// configured for it (the silent-bypass gap #1885 closes), or when a present
+/// required hook fails closed. `Ok(())` means proceed. INERT (`Ok`) when no gate
+/// is installed (the default enforce-off deployment), so callers consult
+/// unconditionally at zero added cost beyond one `OnceLock` load.
+pub(crate) fn consult_pre_event_gate(
+    event: crate::hooks::HookEvent,
+    payload: Value,
+) -> Result<(), String> {
+    let Some(gate) = PRE_EVENT_ENFORCE_GATE.get() else {
+        return Ok(());
+    };
+    let cr = crate::llm::block_on_local(move || async move {
+        let mut reg = gate
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::hooks::dispatch_pre_event_enforced(
+            event,
+            payload,
+            &gate.all_hooks,
+            gate.mode,
+            &gate.required,
+            &mut reg,
+        )
+        .await
+    });
+    use crate::hooks::chain::ChainResult;
+    match cr {
+        // Allow / ModifiedAllow (the memory-shaped delta has no MCP-store
+        // rewrite mapping over stdio; the #1752 signal path warns similarly) →
+        // proceed.
+        ChainResult::Allow | ChainResult::ModifiedAllow(_) => Ok(()),
+        // The enforcement refusal (or a fail-closed required hook error). The
+        // `reason` already names the event + mode (see
+        // `enforce_required_event_presence`).
+        ChainResult::Deny { reason, code } => Err(format!(
+            "refused by hooks.enforce gate (code {code}): {reason}"
+        )),
+        // No operator-prompt channel on the sync stdio path → fail closed.
+        ChainResult::AskUser { .. } => Err("pending operator decision: hooks.enforce \
+             pre-event hook returned AskUser, which has no prompt channel on the MCP \
+             stdio path → refused (fail-closed)"
+            .to_string()),
+    }
+}
+
+/// #1885 — test-only installer for the pre-event enforcement gate. Builds the
+/// executor registry from `all_hooks` and installs the gate so an integration
+/// test can drive an ACTUAL `memory_store` (via `handle_store_for_tests`) under
+/// `enforce_mode = enforce` + a required event with no configured hook and
+/// observe the real Deny — not just the in-hooks unit helpers. Not part of the
+/// supported public API.
+#[doc(hidden)]
+pub fn install_pre_event_enforce_gate_for_tests(
+    all_hooks: Vec<crate::hooks::config::HookConfig>,
+    mode: crate::hooks::HookEnforceMode,
+    required: Vec<crate::hooks::HookEvent>,
+) {
+    let registry = crate::hooks::ExecutorRegistry::from_hooks(&all_hooks);
+    set_pre_event_enforce_gate(all_hooks, mode, required, registry);
+}
+
 /// v0.8.0 Pillar 1 (#1709) — dispatch for `memory_signal_read`.
 fn dispatch_memory_signal_read(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_signal_read(ctx.conn, ctx.arguments)
@@ -1664,6 +1783,8 @@ fn dispatch_memory_lineage(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1885 — pre-event enforcement gate (inert unless enforce active).
+    consult_pre_event_gate(crate::hooks::HookEvent::PreDelete, ctx.arguments.clone())?;
     handle_delete(
         ctx.conn,
         ctx.db_path,
@@ -1674,6 +1795,8 @@ fn dispatch_memory_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_promote(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1885 — pre-event enforcement gate (inert unless enforce active).
+    consult_pre_event_gate(crate::hooks::HookEvent::PrePromote, ctx.arguments.clone())?;
     handle_promote(ctx.conn, ctx.db_path, ctx.arguments, ctx.mcp_client)
 }
 
@@ -1714,6 +1837,8 @@ fn dispatch_memory_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_link(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1885 — pre-event enforcement gate (inert unless enforce active).
+    consult_pre_event_gate(crate::hooks::HookEvent::PreLink, ctx.arguments.clone())?;
     handle_link(ctx.conn, ctx.db_path, ctx.arguments, ctx.active_keypair)
 }
 
@@ -1737,6 +1862,11 @@ fn dispatch_memory_replay(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
 }
 
 fn dispatch_memory_consolidate(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1885 — pre-event enforcement gate (inert unless enforce active).
+    consult_pre_event_gate(
+        crate::hooks::HookEvent::PreConsolidate,
+        ctx.arguments.clone(),
+    )?;
     handle_consolidate(
         ctx.conn,
         ctx.db_path,
@@ -1767,6 +1897,8 @@ fn dispatch_memory_ingest_multistep(ctx: &ToolDispatchCtx<'_>) -> Result<Value, 
 }
 
 fn dispatch_memory_reflect(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    // #1885 — pre-event enforcement gate (inert unless enforce active).
+    consult_pre_event_gate(crate::hooks::HookEvent::PreReflect, ctx.arguments.clone())?;
     handle_reflect(
         ctx.conn,
         ctx.db_path,
@@ -3335,6 +3467,35 @@ pub fn run_mcp_server(
                 "ai-memory: #1752 — MCP PreSignalSend enforcement gate installed \
                  ({n} pre_signal_send hook(s))"
             );
+        }
+    }
+
+    // #1885 (critical) — MCP PRE-event mandatory-hook-presence ENFORCEMENT gate.
+    // Wire `dispatch_pre_event_enforced` into the real pre-event MCP handlers
+    // (memory_store → PreStore, plus delete / promote / link / consolidate /
+    // reflect) so `[hooks].enforce_mode = enforce` + a `required_events` entry
+    // with NO enabled hook actually DENIES the operation, closing the silent
+    // bypass where every write resolved an empty chain that Allowed while the
+    // boot banner / doctor only warned "WILL DENY". Installed ONLY when enforce
+    // is active AND at least one required event is declared → default (off)
+    // deployments are byte-identical to pre-#1885 (gate never installed).
+    {
+        use crate::hooks::{HookEnforceMode, config::HookConfig};
+        let mode = app_config.resolve_hooks_enforce_mode();
+        let required = app_config.resolve_required_events();
+        if mode != HookEnforceMode::Off && !required.is_empty() {
+            let all_hooks = HookConfig::default_path()
+                .filter(|p| p.exists())
+                .and_then(|p| HookConfig::load_from_file(&p).ok())
+                .unwrap_or_default();
+            let registry = crate::hooks::ExecutorRegistry::from_hooks(&all_hooks);
+            eprintln!(
+                "ai-memory: #1885 — MCP pre-event enforcement gate installed \
+                 (enforce_mode={}, {} required event(s))",
+                mode.as_str(),
+                required.len()
+            );
+            set_pre_event_enforce_gate(all_hooks, mode, required, registry);
         }
     }
 

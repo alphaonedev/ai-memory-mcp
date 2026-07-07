@@ -296,6 +296,18 @@ pub(crate) fn handle_store(
     // legacy supersede path through `update_with_archive_on_supersede`.
     active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<Value, String> {
+    // #1885 (critical) — mandatory-hook-presence enforcement gate, consulted
+    // BEFORE the store commits (and before any federation forward). Under
+    // `[hooks].enforce_mode = enforce` with `pre_store` in `required_events` and
+    // NO enabled pre_store hook, this returns the 503 Deny and the write never
+    // lands — closing the silent bypass where an empty hook chain's `fire`
+    // always Allowed. INERT (returns `Ok`) in the default enforce-off
+    // deployment (the gate is not installed), so this is a zero-cost
+    // `OnceLock` load on the hot store path. Payload = the raw store arguments,
+    // fired only when a pre_store hook IS present (the deny path short-circuits
+    // before firing).
+    crate::mcp::consult_pre_event_gate(crate::hooks::HookEvent::PreStore, params.clone())?;
+
     // v0.7.0 (issue #318) — when operators have configured a federation
     // forward URL, every MCP write routes through the local HTTP daemon
     // so its `broadcast_store_quorum` fanout runs. Direct-SQLite path
