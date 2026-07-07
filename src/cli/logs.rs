@@ -586,16 +586,24 @@ mod tests {
     }
 
     #[test]
-    fn mtime_to_datetime_returns_none_instead_of_panicking_on_out_of_range_seconds() {
+    fn seconds_since_epoch_to_datetime_returns_none_for_out_of_chrono_range_value() {
         // #1916 — before the fix this path called
         // `Utc.timestamp_opt(...).unwrap()`, which panics for a mtime
         // whose seconds-since-epoch falls outside chrono's
-        // representable date range. A corrupted or maliciously-set
-        // mtime (e.g. via `touch -d`) must be skipped like every other
-        // failure mode in the chain, not crash the whole
-        // `logs archive` / `logs prune` command.
-        let far_future = std::time::UNIX_EPOCH + Duration::from_secs(u64::MAX / 2);
-        assert_eq!(mtime_to_datetime(far_future), None);
+        // representable date range (chrono tops out around the
+        // year 262143, i.e. roughly 8.2e12 seconds since epoch). A
+        // corrupted or maliciously-set mtime (e.g. via `touch -d`)
+        // must be skipped like every other failure mode in the chain,
+        // not crash the whole `logs archive` / `logs prune` command.
+        //
+        // Exercised as a plain `u64` (well within `i64`'s range, so
+        // this is purely the chrono-range branch) rather than via a
+        // real `SystemTime`: `SystemTime`'s own representable range is
+        // platform-dependent and, on Windows (backed by a 100ns-tick
+        // `FILETIME`), is *smaller* than chrono's — so a duration this
+        // large can panic constructing the `SystemTime` itself well
+        // before `mtime_to_datetime` ever runs, on that platform only.
+        assert_eq!(seconds_since_epoch_to_datetime(9_000_000_000_000_000), None);
     }
 
     #[test]
