@@ -111,7 +111,20 @@ pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_S
 /// unconditionally regardless of this knob (see [`authorize_remote_transition`]).
 #[must_use]
 pub fn require_transition_sig_enabled() -> bool {
-    std::env::var(REQUIRE_TRANSITION_SIG_ENV)
+    env_flag_default_on(REQUIRE_TRANSITION_SIG_ENV)
+}
+
+/// Shared grammar for federation security knobs that default **ON**
+/// (fail-closed): the flag is disabled only by an explicit falsy token
+/// (`0`/`false`/`no`/`off`, case- and whitespace-trimmed); every other value
+/// — including the empty string or an unknown word — keeps it enabled.
+///
+/// Centralising this parsing (#1914) stops sibling knobs from diverging, e.g.
+/// `require_sig()` historically disabled only on the literal `"0"`, so
+/// `AI_MEMORY_FED_REQUIRE_SIG=false` silently stayed ON — an operator footgun.
+#[must_use]
+pub fn env_flag_default_on(name: &str) -> bool {
+    std::env::var(name)
         .ok()
         .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
 }

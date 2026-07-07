@@ -21,7 +21,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 /// HTTP header carrying the per-message Ed25519 signature. Lowercase
 /// per HTTP/2 wire convention; axum's `HeaderMap` lookups are
@@ -137,7 +137,7 @@ pub fn verify_header(
     sig_arr.copy_from_slice(&bytes);
     let sig = Signature::from_bytes(&sig_arr);
     pubkey
-        .verify(body, &sig)
+        .verify_strict(body, &sig)
         .map_err(|_| VerifyError::BadSignature)
 }
 
@@ -173,26 +173,20 @@ pub fn verify_header_with_nonce(
     input.push(NONCE_DOMAIN_SEP);
     input.extend_from_slice(nonce.as_bytes());
     pubkey
-        .verify(&input, &sig)
+        .verify_strict(&input, &sig)
         .map_err(|_| VerifyError::BadSignature)
 }
 
 /// Whether the receiver enforces signature verification.
 #[must_use]
 pub fn require_sig() -> bool {
-    match std::env::var(REQUIRE_SIG_ENV) {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    }
+    crate::federation::receive_auth::env_flag_default_on(REQUIRE_SIG_ENV)
 }
 
 /// v0.7.0 #922 — whether the receiver enforces per-message nonce freshness.
 #[must_use]
 pub fn require_nonce() -> bool {
-    match std::env::var(REQUIRE_NONCE_ENV) {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    }
+    crate::federation::receive_auth::env_flag_default_on(REQUIRE_NONCE_ENV)
 }
 
 #[cfg(test)]
@@ -303,5 +297,53 @@ mod tests {
             std::env::remove_var(REQUIRE_SIG_ENV);
         }
         assert!(!result);
+    }
+
+    /// #1914 — `require_sig()` must share the falsy grammar of the sibling
+    /// transition/signal knobs: `false`/`no`/`off` (case-trimmed) disable it,
+    /// while unknown / empty values stay fail-closed (ON).
+    #[test]
+    fn require_sig_honours_full_falsy_set() {
+        let _g = require_sig_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for falsy in ["0", "false", "no", "off", " off "] {
+            unsafe { std::env::set_var(REQUIRE_SIG_ENV, falsy) };
+            assert!(!require_sig(), "{falsy:?} should disable require_sig");
+        }
+        for truthy in ["1", "true", "yes", "", "banana"] {
+            unsafe { std::env::set_var(REQUIRE_SIG_ENV, truthy) };
+            assert!(require_sig(), "{truthy:?} should keep require_sig ON");
+        }
+        unsafe { std::env::remove_var(REQUIRE_SIG_ENV) };
+    }
+
+    /// #1901 — a non-canonical (malleable) `S` scalar in the signature must be
+    /// rejected. `verify_strict` enforces `S < L`; `S + L` is the classic
+    /// non-canonical encoding that must NOT verify.
+    #[test]
+    fn non_canonical_signature_scalar_rejected() {
+        // Ed25519 group order L, little-endian.
+        const L: [u8; 32] = [
+            0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9,
+            0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x10,
+        ];
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        let body = b"malleability-guard";
+        let header = sign_body_header(&key, body);
+        let b64 = header.strip_prefix(ED25519_PREFIX).unwrap();
+        let mut sig = B64.decode(b64.as_bytes()).unwrap();
+        // Add L to the S half (bytes 32..64), little-endian, with carry.
+        let mut carry = 0u16;
+        for i in 0..32 {
+            let sum = u16::from(sig[32 + i]) + u16::from(L[i]) + carry;
+            sig[32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        let mutated = format!("{ED25519_PREFIX}{}", B64.encode(&sig));
+        let err = verify_header(Some(&mutated), body, &pubkey).unwrap_err();
+        assert!(matches!(err, VerifyError::BadSignature));
     }
 }

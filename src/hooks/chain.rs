@@ -499,6 +499,70 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// PE-1 (#1885) — mandatory-presence dispatch gate for pre-* events
+// ---------------------------------------------------------------------------
+//
+// The enforce module (`hooks/enforce.rs`) shipped the pure helpers
+// `enforce_required_event_presence` + `effective_fail_mode` but nothing ever
+// composed them into a real dispatch path, so `[hooks].enforce_mode = enforce`
+// + `required_events = ["pre_store"]` gave operators a boot-banner / doctor
+// warning ("WILL DENY") while every `memory_store` still resolved an EMPTY
+// `HookChain` whose `fire` returns `Allow` — a silent bypass of the very
+// control the module exists to provide (#1885).
+//
+// This gate is that missing dispatch layer. A pre-event MCP operation
+// (`memory_store`, `memory_delete`, …) calls `dispatch_pre_event_enforced`
+// with the loaded hook set + the resolved enforce mode / required-events; the
+// gate runs the mandatory-presence check FIRST (an empty chain's `fire` cannot
+// carry it — that is why the check lives here, around `fire`, exactly as the
+// enforce module header mandates) and short-circuits to the returned `Deny`.
+// When the operation IS allowed to proceed, the chain is fired with
+// `effective_fail_mode` already threaded through every hook (via
+// `effective_hooks_for_event`), so a required-event hook configured fail-open
+// is forced Closed under `enforce` and its error/timeout denies rather than
+// silently allowing.
+
+/// PE-1 (#1885) — dispatch one PRE-event through the mandatory-presence
+/// enforcement gate before firing its hook chain.
+///
+/// Returns:
+/// * `ChainResult::Deny { code: 503 }` when `mode == enforce`, `event` is in
+///   `required`, and NO enabled hook is configured for it (the silent-bypass
+///   gap this closes).
+/// * otherwise the normal chain outcome — with `effective_fail_mode` threaded
+///   so a required, fail-open hook is forced Closed under `enforce`.
+///
+/// `all_hooks` is the full loaded hook set (unfiltered); `mode` / `required`
+/// are the resolved `[hooks].enforce_mode` / `required_events`. Callers on the
+/// pre-event MCP paths pass `app_config.resolve_hooks_enforce_mode()` /
+/// `resolve_required_events()`.
+pub async fn dispatch_pre_event_enforced(
+    event: HookEvent,
+    payload: Value,
+    all_hooks: &[HookConfig],
+    mode: super::enforce::HookEnforceMode,
+    required: &[HookEvent],
+    registry: &mut ExecutorRegistry,
+) -> ChainResult {
+    debug_assert!(
+        is_pre_event(event),
+        "dispatch_pre_event_enforced is PRE-only; {event:?} is not a pre-event"
+    );
+    // 1) Mandatory-presence gate — evaluated AROUND `fire` (an empty chain's
+    //    `fire` returns Allow, so the check cannot live inside it).
+    if let Some(deny) =
+        super::enforce::enforce_required_event_presence(all_hooks, event, mode, required)
+    {
+        return deny;
+    }
+    // 2) Fire the chain with `effective_fail_mode` threaded through every hook
+    //    (required fail-open hooks forced Closed under enforce).
+    let effective = super::enforce::effective_hooks_for_event(all_hooks, event, mode, required);
+    let chain = HookChain::new(effective);
+    chain.fire(event, payload, registry).await
+}
+
+// ---------------------------------------------------------------------------
 // G8 / R3-S1 — on_index_eviction fire helper + observer-channel sink
 // ---------------------------------------------------------------------------
 //
@@ -1602,5 +1666,127 @@ mod tests {
             ran.load(Ordering::SeqCst),
             "Allow on pre-event must let subscription dispatch run"
         );
+    }
+
+    // ---- PE-1 (#1885) mandatory-presence dispatch gate ---------------------
+
+    use crate::hooks::enforce::HookEnforceMode;
+
+    /// The core #1885 acceptance: under `enforce` with `pre_store` declared
+    /// required but NO hook configured, the dispatch gate a `memory_store`
+    /// would route through must DENY (503) — not silently Allow the write via
+    /// an empty chain. This is the end-to-end contract the pure helpers could
+    /// not assert in isolation.
+    #[tokio::test]
+    async fn dispatch_gate_denies_store_when_required_hook_absent() {
+        let mut reg = ExecutorRegistry::new();
+        // Operator declared pre_store REQUIRED under enforce but configured no
+        // hook (misconfig / crash-loop auto-disable / etc.).
+        let all_hooks: Vec<HookConfig> = vec![];
+        let required = [HookEvent::PreStore];
+        let store_payload = json!({"title": "secret", "namespace": "default", "content": "x"});
+
+        let result = dispatch_pre_event_enforced(
+            HookEvent::PreStore,
+            store_payload,
+            &all_hooks,
+            HookEnforceMode::Enforce,
+            &required,
+            &mut reg,
+        )
+        .await;
+
+        match result {
+            ChainResult::Deny { code, reason } => {
+                assert_eq!(code, 503, "enforce presence-gap denies with 503");
+                assert!(
+                    reason.contains("pre_store"),
+                    "deny reason names the required event: {reason}"
+                );
+            }
+            other => {
+                panic!("enforce + required pre_store + no hook must DENY a store, got {other:?}")
+            }
+        }
+    }
+
+    /// A present-but-DISABLED required hook does not satisfy presence — the
+    /// gate still denies (a crash-loop-disabled governance hook must not open
+    /// the write path).
+    #[tokio::test]
+    async fn dispatch_gate_denies_when_required_hook_disabled() {
+        let mut reg = ExecutorRegistry::new();
+        let mut disabled = make_cfg(0, FailMode::Closed, "/bin/governance");
+        disabled.event = HookEvent::PreStore;
+        disabled.enabled = false;
+        let all_hooks = vec![disabled];
+        let required = [HookEvent::PreStore];
+
+        let result = dispatch_pre_event_enforced(
+            HookEvent::PreStore,
+            json!({}),
+            &all_hooks,
+            HookEnforceMode::Enforce,
+            &required,
+            &mut reg,
+        )
+        .await;
+        assert!(
+            matches!(result, ChainResult::Deny { code: 503, .. }),
+            "a disabled required hook must not satisfy presence: {result:?}"
+        );
+    }
+
+    /// Default `off` mode is byte-identical to pre-#1734: even with a required
+    /// event + no hook, the gate Allows (empty chain → Allow).
+    #[tokio::test]
+    async fn dispatch_gate_off_mode_allows_missing_hook() {
+        let mut reg = ExecutorRegistry::new();
+        let required = [HookEvent::PreStore];
+        let result = dispatch_pre_event_enforced(
+            HookEvent::PreStore,
+            json!({}),
+            &[],
+            HookEnforceMode::Off,
+            &required,
+            &mut reg,
+        )
+        .await;
+        assert_eq!(result, ChainResult::Allow, "off → no enforcement");
+    }
+
+    /// `advisory` warns but Allows (the safe-rollout soak rung) — the gate
+    /// returns Allow from the empty chain after the presence WARN.
+    #[tokio::test]
+    async fn dispatch_gate_advisory_allows_missing_hook() {
+        let mut reg = ExecutorRegistry::new();
+        let required = [HookEvent::PreStore];
+        let result = dispatch_pre_event_enforced(
+            HookEvent::PreStore,
+            json!({}),
+            &[],
+            HookEnforceMode::Advisory,
+            &required,
+            &mut reg,
+        )
+        .await;
+        assert_eq!(result, ChainResult::Allow, "advisory → allow (soak rung)");
+    }
+
+    /// An event NOT declared required is never gated even under enforce.
+    #[tokio::test]
+    async fn dispatch_gate_non_required_event_allows() {
+        let mut reg = ExecutorRegistry::new();
+        let required = [HookEvent::PreDelete]; // pre_store NOT required
+        let result = dispatch_pre_event_enforced(
+            HookEvent::PreStore,
+            json!({}),
+            &[],
+            HookEnforceMode::Enforce,
+            &required,
+            &mut reg,
+        )
+        .await;
+        assert_eq!(result, ChainResult::Allow);
     }
 }

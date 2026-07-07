@@ -911,14 +911,12 @@ impl DaemonExecutor {
                 let mut guard = self.conn.lock().await;
                 if let Some(conn) = guard.as_ref() {
                     let tail = conn.stderr_tail().await;
-                    if !tail.is_empty() {
-                        tracing::warn!(
-                            command = %self.config.command.display(),
-                            timeout_ms = self.config.timeout_ms,
-                            stderr_tail = %tail,
-                            "hooks: daemon child stderr at timeout"
-                        );
-                    }
+                    // #1894 — route through the same redacting helper as every
+                    // other failure path. The timeout branch is the MOST likely
+                    // to fire on a hung/hostile hook, so raw stderr here must be
+                    // redacted too (env-var-shaped values + secret-keyword lines
+                    // stripped) rather than logged verbatim.
+                    warn_stderr_tail(&self.config.command, "timeout", &tail);
                 }
                 *guard = None;
                 Err(ExecutorError::Timeout {
@@ -1271,6 +1269,24 @@ mod tests {
         let red = redact_stderr_tail(raw);
         assert!(!red.contains("Bearer eyJ.fake.jwt"));
         assert!(!red.contains("session=abc"));
+    }
+
+    // #1894 — the timeout path now routes its stderr snapshot through
+    // `warn_stderr_tail`/`redact_stderr_tail` like every other failure
+    // branch. Guard the exact secret shapes from the issue's failure
+    // scenario (a hung hook dumping AWS creds + a PEM private-key block
+    // to stderr) so a regression to raw logging would fail this test.
+    #[test]
+    fn redact_stderr_covers_timeout_scenario_secrets() {
+        let raw = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n-----BEGIN PRIVATE KEY-----\nhandler timed out waiting on upstream\n";
+        let red = redact_stderr_tail(raw);
+        // The AWS credential value is stripped (env-var-shaped line).
+        assert!(!red.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+        assert!(red.contains("AWS_SECRET_ACCESS_KEY=<redacted>"));
+        // The PEM header line matches the "begin private" secret-keyword filter.
+        assert!(!red.contains("BEGIN PRIVATE KEY"));
+        // Non-secret diagnostic context still survives for the operator.
+        assert!(red.contains("handler timed out waiting on upstream"));
     }
 
     #[test]

@@ -1224,8 +1224,16 @@ pub fn verify(bundle_path: &Path) -> Result<VerificationReport> {
     }
 
     // 4) Roll the per-section failures into the top-level ok flag.
+    //
+    // #1907 — a file present in the tar but ABSENT from the (signed) manifest
+    // is an injected file: `canonical_signed_bytes` enumerates the exact
+    // manifest file set, so a signed bundle must reject any unlisted entry
+    // (an injected `edges/*.json` with `signature_hex=null` even passes
+    // `verify_edge_envelope`, so it never lands in `chain_edges_failed`).
+    // Treat any extra file as a hard integrity failure regardless of type.
     report.ok = report.tampered_files.is_empty()
         && report.missing_files.is_empty()
+        && report.extra_files.is_empty()
         && report.chain_edges_failed.is_empty()
         && !matches!(report.signature_status, SignatureStatus::Failed);
 
@@ -1328,12 +1336,22 @@ fn bytes_to_hex(b: &[u8]) -> String {
 }
 
 fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
+    // #1891 — reject non-ASCII / non-hex up front so we never index a `&str`
+    // by byte range across a multi-byte UTF-8 char boundary (which panics).
+    // `signature_hex` is attacker-controlled (edges/*.json inside an untrusted
+    // bundle), so this must fail closed, not abort the verifier.
+    if !s.is_ascii() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("hex string contains non-hex characters");
+    }
     if s.len() % 2 != 0 {
         bail!("hex string has odd length");
     }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    for i in (0..s.len()).step_by(2) {
-        let pair = &s[i..i + 2];
+    // Operate on bytes in chunks of 2 — slicing can never cross a char
+    // boundary because every byte is guaranteed ASCII above.
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        let pair = std::str::from_utf8(chunk).expect("ascii hex digits");
         let byte =
             u8::from_str_radix(pair, 16).with_context(|| format!("invalid hex pair '{pair}'"))?;
         out.push(byte);
@@ -1851,8 +1869,24 @@ mod tests {
 
     #[test]
     fn hex_to_bytes_rejects_invalid_pair() {
+        // #1891 — non-hex ASCII is now rejected by the up-front hex-digit guard
+        // (before any pair slicing), so the error names the non-hex content.
         let err = hex_to_bytes("zz").unwrap_err();
-        assert!(format!("{err:#}").contains("invalid hex pair"));
+        assert!(format!("{err:#}").contains("non-hex characters"));
+    }
+
+    /// #1891 — non-ASCII / multi-byte input must be rejected as an error, NOT
+    /// panic via `&s[i..i+2]` slicing across a UTF-8 char boundary. The input
+    /// comes from attacker-controlled `edges/*.json` `signature_hex`.
+    #[test]
+    fn hex_to_bytes_rejects_non_ascii_without_panic() {
+        // "a\u{e9}a" is 4 bytes; a byte-range slice [0..2] would cut the 'é'.
+        for evil in ["a\u{e9}a", "\u{e9}\u{e9}", "g\u{1f4a9}", "  "] {
+            assert!(
+                hex_to_bytes(evil).is_err(),
+                "non-hex input {evil:?} must error, not panic"
+            );
+        }
     }
 
     #[test]
@@ -2201,6 +2235,12 @@ mod tests {
                 .contains(&"memories/intruder.json".to_string()),
             "extra file must be reported: {:?}",
             report.extra_files
+        );
+        // #1907 — an injected file absent from the signed manifest must flip
+        // the top-level verdict to NOT-ok, not just be recorded.
+        assert!(
+            !report.ok,
+            "injected extra file must fail the bundle verdict: {report:#?}"
         );
     }
 
