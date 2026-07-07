@@ -162,7 +162,14 @@ const QUAL_6_CEILING: usize = 114;
 // `Err` propagates via `?` straight into the `Result<Value, String>`
 // `handle_store` / dispatch handlers it gates). Signature parity; no new
 // error contract. Net: +1.
-const QUAL_7_CEILING: usize = 35;
+// 2026-07-07 (#1923 security review) — raised 35 → 37 for the two folder_path
+// import-jail helpers added to `src/mcp/tools/skill_register.rs`:
+// `reject_symlink_escape` and `ImportBudget::charge`. Both return
+// `Result<(), String>` for signature parity with the surrounding
+// `handle_skill_register` / `collect_resources` String-error surface they feed
+// via `?` (the enclosing handler is `Result<Value, String>`). No new error
+// contract — the same String shape the skill-register path already uses. Net: +2.
+const QUAL_7_CEILING: usize = 37;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
