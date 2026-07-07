@@ -156,7 +156,13 @@ const QUAL_6_CEILING: usize = 114;
 /// `deny_message` convention it was extracted from (the per-namespace gate the
 /// namespace-less bulk-forget branch now reuses). Signature parity with the
 /// pre-existing single-namespace gate; no new error contract. Net: +1.
-const QUAL_7_CEILING: usize = 34;
+// 2026-07-07 (#1885) — raised 34 → 35 for the MCP pre-event enforcement gate
+// helper `consult_pre_event_gate` in `src/mcp/mod.rs`, which returns
+// `Result<(), String>` to match the surrounding MCP dispatch convention (its
+// `Err` propagates via `?` straight into the `Result<Value, String>`
+// `handle_store` / dispatch handlers it gates). Signature parity; no new
+// error contract. Net: +1.
+const QUAL_7_CEILING: usize = 35;
 
 #[test]
 fn qual_6_result_value_string_count_below_ceiling() {
