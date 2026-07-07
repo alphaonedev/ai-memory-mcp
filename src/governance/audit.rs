@@ -43,7 +43,9 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::{DateTime, Datelike, Utc};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+// #1899 — `Verifier` (the non-strict verify trait) dropped: the forensic
+// chain walker below now verifies with the inherent `verify_strict`.
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -503,7 +505,27 @@ fn list_forensic_files(dir: &Path) -> Result<Vec<PathBuf>> {
             continue;
         };
         if name_str.starts_with(FORENSIC_FILE_PREFIX) && name_str.ends_with(FORENSIC_FILE_SUFFIX) {
-            out.push(entry.path());
+            // #1913 — admit only files whose stem is a real YYYY-MM-DD
+            // date. Pre-#1913 any `forensic-*.jsonl` matched (e.g. a stray
+            // `forensic-README.jsonl` / `forensic-.jsonl` dropped by a
+            // backup tool), and `verify_since`'s `file_date(path)?` then
+            // propagated the parse error and aborted the ENTIRE chain walk
+            // instead of verifying the legitimate daily files. Filtering at
+            // the single listing point keeps every consumer robust
+            // (verify_since seeding + verification loops, read_chain_tail).
+            let stem_is_date = name_str
+                .strip_prefix(FORENSIC_FILE_PREFIX)
+                .and_then(|s| s.strip_suffix(FORENSIC_FILE_SUFFIX))
+                .is_some_and(|stem| parse_iso_date(stem).is_ok());
+            if stem_is_date {
+                out.push(entry.path());
+            } else {
+                tracing::warn!(
+                    target: AUDIT_TRACE_TARGET,
+                    "forensic: skipping file with non-date stem in {}: {name_str}",
+                    dir.display()
+                );
+            }
         }
     }
     out.sort();
@@ -674,7 +696,12 @@ pub fn verify_since(
                 let mut sig_arr = [0u8; 64];
                 sig_arr.copy_from_slice(&sig_bytes);
                 let sig = Signature::from_bytes(&sig_arr);
-                if let Err(e) = pk.verify(&canonical, &sig) {
+                // #1899 — verify_strict so the forensic-chain walker rejects
+                // the same non-canonical / malleable Ed25519 signatures the
+                // forensic-bundle verifier (bundle.rs verify_strict) and
+                // identity::verify already reject. Keeps "one verifying key
+                // validates both chains uniformly" true.
+                if let Err(e) = pk.verify_strict(&canonical, &sig) {
                     return Ok(VerifyReport {
                         total_lines: total,
                         unsigned_lines: unsigned,
@@ -1958,6 +1985,81 @@ mod tests {
             failure.kind,
             VerifyFailureKind::Signature | VerifyFailureKind::ChainBreak
         ));
+    }
+
+    #[test]
+    fn corrupted_signature_rejected_by_verify_strict_1899() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        fresh_init(tmp.path(), Some(key));
+        record_decision(
+            "ai:s",
+            "refuse",
+            "bash",
+            "R001",
+            serde_json::json!({"r":"no"}),
+        );
+        shutdown();
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let path = tmp.path().join(format!("forensic-{date}.jsonl"));
+        let body = std::fs::read_to_string(&path).unwrap();
+        // #1899 — corrupt ONLY the base64 signature (flip its first data
+        // char), leaving the payload — and therefore `self_hash`, which
+        // clears `sig` before hashing — untouched, so the prev_hash chain
+        // stays intact and the failure surfaces as a Signature verdict from
+        // the `verify_strict` call rather than a ChainBreak.
+        let mut rewritten = String::new();
+        for line in body.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut row: ForensicDecision = serde_json::from_str(line).unwrap();
+            if !row.sig.is_empty() {
+                let first = &row.sig[..1];
+                let repl = if first == "A" { "B" } else { "A" };
+                row.sig = format!("{repl}{}", &row.sig[1..]);
+            }
+            rewritten.push_str(&serde_json::to_string(&row).unwrap());
+            rewritten.push('\n');
+        }
+        std::fs::write(&path, rewritten).unwrap();
+        let report = verify_since(tmp.path(), &date, Some(&pubkey)).expect("verify runs");
+        let failure = report
+            .first_failure
+            .expect("a non-verifying signature must be flagged");
+        assert_eq!(failure.kind, VerifyFailureKind::Signature);
+    }
+
+    #[test]
+    fn stray_non_date_file_does_not_abort_verify_1913() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let key = fresh_key();
+        let pubkey = key.verifying_key();
+        fresh_init(tmp.path(), Some(key));
+        record_decision("ai:j", "allow", "bash", "R001", serde_json::json!({}));
+        shutdown();
+        // #1913 — a backup tool drops a file with the `forensic-` prefix +
+        // `.jsonl` suffix but a NON-date stem. Pre-#1913 `list_forensic_files`
+        // admitted it and `verify_since`'s `file_date(path)?` propagated the
+        // parse error, aborting the ENTIRE chain walk with Err. Post-fix the
+        // stray file is filtered out and the legit signed row still verifies.
+        std::fs::write(
+            tmp.path().join("forensic-README.jsonl"),
+            b"not a forensic row\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("forensic-.jsonl"), b"").unwrap();
+        let since = Utc::now().format("%Y-%m-%d").to_string();
+        let report = verify_since(tmp.path(), &since, Some(&pubkey))
+            .expect("stray non-date file must be skipped, not abort verification");
+        assert!(report.first_failure.is_none(), "{:?}", report.first_failure);
+        assert!(
+            report.total_lines >= 1,
+            "the legitimate signed row must still be verified"
+        );
     }
 
     #[test]

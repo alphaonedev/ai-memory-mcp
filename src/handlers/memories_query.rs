@@ -19,7 +19,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -692,6 +692,16 @@ pub async fn bulk_create(
         // accumulate per row exactly as before; only the persistence of
         // the surviving rows is batched.
         let mut allowed: Vec<Memory> = Vec::new();
+        // #1911 — mirror the sqlite bulk_create tier-default TTL fallback
+        // on the postgres branch too. Pre-#1911 this loop resolved
+        // `expires_at` from `body.expires_at`/`body.ttl_secs` only,
+        // omitting the `.or(ResolvedTtl::ttl_for_tier)` fallback the
+        // sqlite loop applies below — so a tiered row with a configured
+        // default TTL but no explicit expiry landed immortal on postgres
+        // yet expired on sqlite. `ResolvedTtl` lives in the `app.db`
+        // mutex tuple (populated on both backends); snapshot it ONCE
+        // before the loop rather than re-locking per row.
+        let resolved_ttl = app.db.lock().await.2.clone();
         for body in bodies {
             if let Err(e) = validate::RequestValidator::validate_create(&body) {
                 // Issue #851: do not echo the caller's title back paired
@@ -702,10 +712,12 @@ pub async fn bulk_create(
                 errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
                 continue;
             }
-            let expires_at = body.expires_at.clone().or_else(|| {
-                body.ttl_secs
-                    .map(|s| (now + Duration::seconds(s)).to_rfc3339())
-            });
+            let expires_at = crate::handlers::parity::resolve_create_expires_at(
+                now,
+                body.expires_at.clone(),
+                body.ttl_secs,
+                resolved_ttl.ttl_for_tier(&body.tier),
+            );
             // #910 — stamp metadata.agent_id from the resolved caller
             // so the SAL visibility filter recognises the row as
             // owned by the writer on later get/list/recall.
@@ -896,11 +908,13 @@ pub async fn bulk_create(
                 errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
                 continue;
             }
-            let expires_at = body.expires_at.or_else(|| {
-                body.ttl_secs
-                    .or(lock.2.ttl_for_tier(&body.tier))
-                    .map(|s| (now + Duration::seconds(s)).to_rfc3339())
-            });
+            // #1911 — shared SSOT with the postgres bulk branch above.
+            let expires_at = crate::handlers::parity::resolve_create_expires_at(
+                now,
+                body.expires_at.clone(),
+                body.ttl_secs,
+                lock.2.ttl_for_tier(&body.tier),
+            );
             // #910 — stamp metadata.agent_id from the resolved caller
             // (sqlite branch mirror of the postgres branch above).
             let mut metadata_stamped = body.metadata;

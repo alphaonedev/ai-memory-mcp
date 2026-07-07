@@ -871,7 +871,7 @@ pub fn verify_rule_signature(
     rule: &Rule,
     operator_pubkey: &ed25519_dalek::VerifyingKey,
 ) -> Result<(), ed25519_dalek::SignatureError> {
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Signature;
 
     let Some(sig_bytes) = rule.signature.as_ref() else {
         return Err(ed25519_dalek::SignatureError::new());
@@ -889,7 +889,16 @@ pub fn verify_rule_signature(
     // must NOT crash the daemon.
     let canonical =
         canonical_bytes_for_signing(rule).map_err(|_| ed25519_dalek::SignatureError::new())?;
-    operator_pubkey.verify(&canonical, &signature)
+    // #1898 — verify_strict (not the malleable `Verifier::verify`) so this
+    // load-time rule-signature gate rejects non-canonical / small-order
+    // Ed25519 signatures exactly like every other verifier in the
+    // substrate (identity::verify, governance::capability, forensic
+    // bundle). Using the non-strict path here made the single most
+    // security-critical governance verifier the odd one out and weakened
+    // non-repudiation (two distinct-but-valid signatures over the same
+    // canonical bytes). `verify_strict` is an inherent method on
+    // `VerifyingKey`, so the `Verifier` trait import is no longer needed.
+    operator_pubkey.verify_strict(&canonical, &signature)
 }
 
 fn row_to_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<Rule> {
@@ -1347,6 +1356,30 @@ mod tests {
         let sig = signing.sign(&canonical);
         rule.signature = Some(sig.to_bytes().to_vec());
         assert!(verify_rule_signature(&rule, &verifying).is_ok());
+    }
+
+    #[test]
+    fn verify_rule_signature_rejects_corrupted_signature_1898() {
+        use ed25519_dalek::Signer;
+        let mut rule = make_rule("R1", "bash", false);
+        let mut csprng = rand_core::OsRng;
+        let signing = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let verifying = signing.verifying_key();
+        let canonical = canonical_bytes_for_signing(&rule).unwrap();
+        let sig = signing.sign(&canonical);
+        let mut sig_bytes = sig.to_bytes().to_vec();
+        // #1898 — corrupt the SIGNATURE itself (not the payload): flip a
+        // bit in the S-scalar half. The strict gate (`verify_strict`) must
+        // reject a signature that does not canonically verify over the
+        // row's canonical bytes, matching every other Ed25519 verifier in
+        // the substrate. Length stays 64 so this exercises the verify path,
+        // not the length guard.
+        sig_bytes[40] ^= 0x01;
+        rule.signature = Some(sig_bytes);
+        assert!(
+            verify_rule_signature(&rule, &verifying).is_err(),
+            "a corrupted signature must not verify under the strict gate"
+        );
     }
 
     #[test]

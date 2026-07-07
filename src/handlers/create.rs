@@ -17,7 +17,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -707,6 +707,26 @@ async fn create_memory_postgres(
             final_tags.push(t.clone());
         }
     }
+    // #1886 — mirror the sqlite `create_memory` TTL resolution so the
+    // postgres backend honours a caller-supplied `ttl_secs` (and the
+    // operator-configured tier default) identically. Pre-#1886 this
+    // branch bound `expires_at: body.expires_at.clone()` ONLY, so a
+    // validated `{"ttl_secs":3600}` was accepted then silently dropped
+    // (`ttl_secs` is not a `Memory` field, so the SAL store could never
+    // recover it) — the ephemeral row landed immortal on postgres, a
+    // data-retention divergence versus sqlite. `ResolvedTtl` lives in
+    // the `app.db` mutex tuple (populated on BOTH backends); read
+    // `ttl_for_tier` in a tight scope with no `await` held so the shared
+    // writer lock is never pinned across the network work below.
+    let expires_at = {
+        let tier_default = app.db.lock().await.2.ttl_for_tier(&body.tier);
+        crate::handlers::parity::resolve_create_expires_at(
+            now,
+            body.expires_at.clone(),
+            body.ttl_secs,
+            tier_default,
+        )
+    };
     let mut mem = Memory {
         id: Uuid::new_v4().to_string(),
         tier: body.tier.clone(),
@@ -723,7 +743,7 @@ async fn create_memory_postgres(
         created_at: now.to_rfc3339(),
         updated_at: now.to_rfc3339(),
         last_accessed_at: None,
-        expires_at: body.expires_at.clone(),
+        expires_at,
         metadata,
         reflection_depth: 0,
         // #1385 — honour caller-supplied `kind` instead of the prior
@@ -1147,11 +1167,14 @@ pub async fn create_memory(
     let state = app.db.clone();
     let now = Utc::now();
     let lock = state.lock().await;
-    let expires_at = body.expires_at.clone().or_else(|| {
-        body.ttl_secs
-            .or(lock.2.ttl_for_tier(&body.tier))
-            .map(|s| (now + Duration::seconds(s)).to_rfc3339())
-    });
+    // #1886 — shared SSOT with the postgres branch (and both bulk
+    // branches) so every backend resolves the expiry identically.
+    let expires_at = crate::handlers::parity::resolve_create_expires_at(
+        now,
+        body.expires_at.clone(),
+        body.ttl_secs,
+        lock.2.ttl_for_tier(&body.tier),
+    );
 
     // Stage 2 — on_conflict resolution against the live connection.
     let resolved_title = match resolve_create_conflict_title(&lock.0, &body, on_conflict_mode) {

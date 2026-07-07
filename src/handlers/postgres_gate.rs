@@ -829,8 +829,23 @@ pub fn sanitize_store_err_message(raw: &str) -> String {
             continue;
         }
 
-        out.push(bytes[i] as char);
-        i += 1;
+        // #1896 — push the WHOLE UTF-8 scalar, not `bytes[i] as char`.
+        // A `u8 as char` cast reinterprets every byte >= 0x80 (each
+        // lead/continuation byte of a multibyte sequence) as the Latin-1
+        // scalar U+0080..U+00FF and re-encodes it as different UTF-8,
+        // mangling non-ASCII text (mojibake) — and Conflict /
+        // PermissionDenied / InvalidInput / LinkRefused messages routed
+        // here can interpolate user-controlled memory titles / namespaces
+        // that legitimately contain non-ASCII. `i` is always on a char
+        // boundary at this point (the URL / path sentinels above only ever
+        // match and advance across single-byte ASCII), so decode the
+        // scalar at `i` and advance by its encoded length.
+        let ch = raw[i..]
+            .chars()
+            .next()
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -901,6 +916,41 @@ mod store_err_sanitize_tests {
         let leak = "postgres://u:p@h/db is unreachable";
         let clean = sanitize_store_err_message(leak);
         assert!(clean.starts_with(REDACTED_URL_SENTINEL));
+    }
+
+    // #1896 — regression: the pass-through branch must preserve
+    // multibyte UTF-8 VERBATIM. Pre-fix `out.push(bytes[i] as char)`
+    // reinterpreted each byte >= 0x80 as a Latin-1 scalar and re-encoded
+    // it, mangling every non-ASCII character (mojibake). A clean message
+    // with no URL/path leak must round-trip byte-identically.
+    #[test]
+    fn sanitize_preserves_non_ascii_verbatim() {
+        // Accented Latin, CJK, and an emoji — all multibyte in UTF-8.
+        let raw = "conflict on title 'café \u{6771}\u{4EAC} \u{1F4DD}' in namespace café";
+        let out = sanitize_store_err_message(raw);
+        assert_eq!(
+            out, raw,
+            "non-ASCII content must survive the sanitizer unchanged (no mojibake)"
+        );
+    }
+
+    // #1896 — non-ASCII interleaved with a real leak: the URL is still
+    // redacted, and the non-ASCII pass-through runs on either side stay
+    // intact (no corruption of the user-controlled title text).
+    #[test]
+    fn sanitize_redacts_url_but_keeps_surrounding_non_ascii() {
+        let leak = "title 'café' failed: postgres://u:p@h/db then résumé \u{4EAC}";
+        let clean = sanitize_store_err_message(leak);
+        assert!(!clean.contains("postgres://"), "url leaked: {clean}");
+        assert!(
+            clean.contains(REDACTED_URL_SENTINEL),
+            "no sentinel: {clean}"
+        );
+        assert!(clean.contains("café"), "leading non-ascii mangled: {clean}");
+        assert!(
+            clean.contains("résumé \u{4EAC}"),
+            "trailing non-ascii mangled: {clean}"
+        );
     }
 }
 
