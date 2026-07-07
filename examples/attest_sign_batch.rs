@@ -5,8 +5,9 @@
 //! store-path agent-attestation gate (#626 Layer-3), built for the Atlas
 //! Corpus scale ingest (#1535).
 //!
-//! The maximum-secure fleet runs with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`,
-//! so an UNSIGNED `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED`.
+//! Since v0.9.0 (#1751) store-path attestation is REQUIRED by default, so an
+//! UNSIGNED `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED` unless
+//! the operator opts out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
 //! [`attest_sign`](attest_sign.rs) signs ONE write per process invocation — too
 //! slow for the 7912-record corpus (one cargo-spawned signer per record would
 //! dominate wall-clock). This tool reads the WHOLE corpus JSONL + the agent's

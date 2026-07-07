@@ -73,8 +73,9 @@ Corpus-scale endpoints require an **admin** caller: `GET /stats`,
 public key: body `{"pubkey_b64": "<base64 32-byte key>"}`, response
 `{"bound": true, "agent_id": "..."}`; the pubkey is validated as a real
 curve point and the agent must already be registered. Gives attesting
-clients under `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` a first-party
-enrollment surface instead of an out-of-band DB write).
+clients a first-party enrollment surface instead of an out-of-band DB
+write — store-path attestation is required by default since v0.9.0
+(#1751; opt out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`)).
 The admin allowlist is `[admin] agent_ids = [...]` in `config.toml`
 (plus `AI_MEMORY_ADMIN_AGENT_IDS`); when empty (the default) these
 endpoints return **403** to every caller. Per

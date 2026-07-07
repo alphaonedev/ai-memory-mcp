@@ -4,8 +4,9 @@
 //! `attest_sign` — repo-linked Ed25519 signer for the store-path agent
 //! attestation gate (#626 Layer-3).
 //!
-//! The maximum-secure fleet runs with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`,
-//! so an UNSIGNED `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED`.
+//! Since v0.9.0 (#1751) store-path attestation is REQUIRED by default, so an
+//! UNSIGNED `POST /api/v1/memories` is refused `403 ATTESTATION_FAILED` unless
+//! the operator opts out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
 //! A positive functional write must present a detached Ed25519 `signature`
 //! (standard base64) plus the `created_at` (RFC3339) it signed, so the daemon
 //! re-derives the exact [`SignableWrite`] envelope and verifies it against the
