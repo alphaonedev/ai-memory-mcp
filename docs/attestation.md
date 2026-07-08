@@ -137,12 +137,14 @@ ai-memory agents register --agent-id my-agent --agent-type ai:claude-opus-4.8
 
 ### Step 3 — Bind the public key
 
-Paste the `pub_b64` from step 1:
+Paste the `pub_b64` from step 1 — use the `--pubkey=<key>` form (with the `=`):
 
 ```bash
 ai-memory agents bind-key --agent-id my-agent \
-  --pubkey cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
+  --pubkey=cuOFCoGj1UCDK9H52vsoRJKbKlcktsyMVaAaHg52_3U
 ```
+
+> **Tip — keys starting with `-`.** Public keys are URL-safe base64, so they can begin with `-` (e.g. `-nLCEF…`). Always use the `--pubkey=<key>` form (with the `=`); `--pubkey -nLCEF…` makes the shell read `-n` as a flag and errors.
 
 Now the daemon can verify signatures from `my-agent`. Re-binding
 overwrites in place (that's how you rotate — see below).
