@@ -10,6 +10,19 @@ layout: doc
 > `ai-memory store` (CLI) is **rejected** with **`403 ATTESTATION_FAILED`**
 > instead of quietly landing as `attest_level="claimed"`.
 
+> ### ⚠️ Solo user on Claude Code / Cursor / any non-signing MCP client? Read this first.
+> Those clients call `memory_store` **without a signature**, and there is **no
+> server-side auto-signing** for memory writes (unlike signals/checkpoints, memory
+> writes are never self-signed by the daemon). So under the v0.9.0 default, your MCP
+> writes are rejected with `403 ATTESTATION_FAILED` — this hits **every** local
+> single-user setup the first time the MCP server restarts on v0.9.0.
+>
+> **If you run a single-operator local setup, the fix is one line** — set
+> `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` on the MCP server ([how ↓](#mcp-configuration-crystal-clear)).
+> Required-mode attestation is designed for **multi-agent / shared / federated**
+> deployments (where the client signs) or **signed CLI writes** — not the solo
+> Claude Code path.
+
 You have exactly **two** ways to move forward. Pick one:
 
 | | When to use | One-liner |

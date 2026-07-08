@@ -6,6 +6,29 @@ layout: doc
 **Category 1 (hook-capable). 100% reliable.** This is the load-bearing
 remediation for issue [#487](https://github.com/alphaonedev/ai-memory-mcp/issues/487).
 
+> ### ⚠️ v0.9.0 — attestation is required by default; Claude Code's MCP client doesn't sign
+> As of **v0.9.0**, ai-memory **rejects unsigned writes** with `403 ATTESTATION_FAILED`.
+> Claude Code's MCP client sends `memory_store` **without a signature**, and ai-memory
+> does **not** self-sign memory writes server-side — so on a v0.9.0 MCP server your
+> Claude Code memory captures would fail.
+>
+> **For a normal single-operator Claude Code setup, opt out** — add this to the
+> ai-memory MCP server's `env` block in `~/.claude.json`:
+>
+> ```jsonc
+> "mcpServers": {
+>   "ai-memory": {
+>     "command": "ai-memory",
+>     "args": ["mcp", "--profile", "full"],
+>     "env": { "AI_MEMORY_REQUIRE_AGENT_ATTESTATION": "0" }
+>   }
+> }
+> ```
+>
+> Keep attestation **required** only for multi-agent / shared / federated deployments
+> (where the client signs) — attested writes are still available on the CLI
+> (`ai-memory store --sign`). Full guide: **[Attestation setup](../attestation.html)**.
+
 ## Quick install
 
 ```text
