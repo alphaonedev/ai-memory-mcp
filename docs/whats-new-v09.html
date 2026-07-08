@@ -77,6 +77,12 @@ ul.checked li::before{content:"✓";position:absolute;left:0;color:var(--good);f
 .audience h3{margin-bottom:1rem;font-size:1.1rem}
 .audience .pitch{color:var(--text-muted);font-size:.95rem;line-height:1.55;margin-bottom:1rem}
 .audience .pitch strong{color:#fff}
+.audience .b{color:var(--text-muted);font-size:.92rem;line-height:1.5;margin-bottom:.65rem}
+.audience .b:last-child{margin-bottom:0}
+.audience .b strong{color:#fff}
+.audience .b .k{font-family:var(--font-mono);font-size:.63rem;letter-spacing:.09em;text-transform:uppercase;color:var(--p1);display:block;margin-bottom:.15rem}
+.audience.cxo .b .k{color:var(--p3)}
+.audience.dev .b .k{color:var(--p2)}
 .audience .cta{color:#fff;font-family:var(--font-mono);font-size:.8rem;border-bottom:1px dashed var(--text-muted);padding-bottom:1px}
 .cta-row{display:flex;gap:1rem;flex-wrap:wrap;justify-content:center;margin-top:2rem}
 .cta-row a{padding:.7rem 1.25rem;border-radius:10px;font-weight:600;font-size:.92rem;border:1px solid var(--p1);color:var(--p1)}
@@ -210,41 +216,36 @@ footer a:hover{color:var(--accent)}
 <!-- ============ THREE AUDIENCES ============ -->
 <section style="background:var(--bg-raised)">
   <div class="container">
-    <span class="eyebrow">Three audiences, one release</span>
-    <h2>What v0.9.0 means for you</h2>
-    <p class="lede">Same release, three framings &mdash; pick yours.</p>
+    <span class="eyebrow">Executive brief</span>
+    <h2>What v0.9.0 means &mdash; for three audiences</h2>
+    <p class="lede">The same release in three framings &mdash; <strong>what it means, why it matters, the value, and what it is now</strong>.</p>
 
     <div class="audience-row">
       <div class="audience user">
-        <span class="who">👤 If you USE AI</span>
-        <h3>Your assistant's memory now proves who wrote each entry &mdash; by default.</h3>
-        <p class="pitch">
-          Nothing to relearn. Install once and your AI keeps a durable, private, <strong>self-hosted</strong> memory that survives restarts &mdash; and now, by default, every entry it writes is <strong>cryptographically attributable to a signed identity</strong> instead of a name anyone could type. If you sign your writes (a one-time keypair bind), an unsigned or spoofed write is rejected outright. Your data stays on your machine; nothing is sent to a cloud you don't control.
-        </p>
-        <pre>brew upgrade ai-memory
-ai-memory doctor</pre>
-        <p style="font-size:.85rem">A drop-in upgrade from v0.8.x &mdash; the live DB auto-migrates on first open. See the upgrade callouts below if you write unsigned memories.</p>
-      </div>
-
-      <div class="audience dev">
-        <span class="who">🛠️ If you BUILD with AI</span>
-        <h3>Attestation-required, enforced hooks, signed governance roles, capability tokens &mdash; in the substrate.</h3>
-        <ul class="checked">
-          <li><strong>Attestation required by default:</strong> an unsigned direct store is <code>403 ATTESTATION_FAILED</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1751">#1751</a>). Sign with <code>ai-memory store --sign</code> against a keypair bound by <code>ai-memory agents bind-key</code>, or opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>. <strong>Full step-by-step (CLI / HTTP / MCP, every OS): <a href="attestation.html">Attestation setup guide &rarr;</a></strong></li>
-          <li><strong>Mandatory-hook enforcement, now live:</strong> the <code>enforce</code> gate is wired onto both the MCP write path (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1885">#1885</a>) and the HTTP write path (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1924">#1924</a>) &mdash; a missing required pre-write hook now fails closed instead of silently no-op'ing.</li>
-          <li><strong>49 review fixes:</strong> per-row <code>bulk_create</code> attestation gating (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1919">#1919</a>), federated PENDING approvals through the registered-approver gate (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1920">#1920</a>), tightened team/unit/org visibility scope (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1921">#1921</a>), a <code>skill_register</code> <code>folder_path</code> symlink jail (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1923">#1923</a>), and a non-argv credential channel <code>AI_MEMORY_STORE_URL</code>/<code>AI_MEMORY_STORE_URL_FILE</code> keeping the postgres password off <code>/proc/&lt;pid&gt;/cmdline</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1927">#1927</a>).</li>
-          <li><strong>Governance signing hardening:</strong> three-key Recorder/Judge/Stopper signing-layer separation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1826">#1826</a>), macaroon capability tokens wired end-to-end (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1827">#1827</a>), and a signed identity-lineage key-succession chain that survives rotation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1828">#1828</a>, schema v76).</li>
-          <li><strong>Additive surfaces:</strong> first-class skill memories (<code>parameters_schema</code> + <code>invocation_record</code>, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1865">#1865</a>), a recall shadow-feedback loop (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1706">#1706</a>), a memory-derivation lineage-DAG (<code>memory_lineage</code> MCP tool + <code>GET /api/v1/memories/{id}/lineage</code> + <code>ai-memory lineage</code>, <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1859">#1859</a>), and an opt-in vector-search slice with capacity/dimension guards (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1005">#1005</a>).</li>
-          <li><strong>Surface:</strong> schema <strong>v78</strong> &middot; <strong>101</strong> MCP tools at <code>--profile full</code> (100 callable + the always-on <code>memory_capabilities</code>) / 7 core &middot; <strong>92</strong> HTTP route registrations (78 unique paths) &middot; <strong>89</strong> CLI subcommands (87 default) &middot; <strong>9</strong> typed link relations &middot; 28-field <code>Memory</code>. SQLite <strong>and</strong> PostgreSQL+AGE, identical API.</li>
-        </ul>
+        <span class="who">👤 1 &middot; Non-technical end users</span>
+        <h3>Your AI's memory now proves who wrote each entry.</h3>
+        <p class="b"><span class="k">What it means</span> Install once and your assistant keeps a durable, <strong>private, self-hosted</strong> memory that survives restarts &mdash; and now, by default, every entry it saves is tied to a <strong>signed identity</strong>, not a name anyone could type.</p>
+        <p class="b"><span class="k">Why it matters</span> A saved fact or decision can be trusted because it is provably authored &mdash; a spoofed or unsigned entry is rejected outright.</p>
+        <p class="b"><span class="k">The value</span> Peace of mind with zero new habits: nothing to relearn, and your data never leaves a machine you control.</p>
+        <p class="b"><span class="k">What it is now</span> A durable, private, cryptographically-attributed memory for your AI that runs entirely on your own device.</p>
       </div>
 
       <div class="audience cxo">
-        <span class="who">🏢 If you DECIDE AI infrastructure</span>
-        <h3>Attribution you can enforce, not just claim. The release that makes the audit trail defensible.</h3>
-        <p class="pitch">
-          v0.9.0 is the hardening release that closes the gap between "the substrate <em>can</em> prove who wrote a memory" and "the substrate <em>requires</em> it." <strong>Attested, not asserted:</strong> unsigned writes are rejected by default &mdash; the difference between an audit trail an auditor trusts and one full of unverifiable name-strings. <strong>Enforcement that actually enforces:</strong> the governance hook gate is now wired live on both write paths, and governance verdicts can be signed by physically-separated Recorder/Judge/Stopper keys so no single compromised process can forge a favorable record. <strong>Reviewed adversarially:</strong> 49 findings from a five-lane external-style code + security review, each fixed and tested. <strong>No lock-in:</strong> self-hosted, single binary or container, SQLite or your existing PostgreSQL, provider-agnostic.
-        </p>
+        <span class="who">🏢 2 &middot; C-level decision makers</span>
+        <h3>Attribution you can enforce, not just claim.</h3>
+        <p class="b"><span class="k">What it means</span> The substrate no longer merely <em>can</em> prove who wrote a memory &mdash; it <strong>requires</strong> it. Unsigned writes are rejected by default.</p>
+        <p class="b"><span class="k">Why it matters</span> The difference between an audit trail an auditor trusts and one full of unverifiable name-strings &mdash; and governance verdicts can be signed by physically-separated Recorder/Judge/Stopper keys, so no single compromised process forges a favorable record.</p>
+        <p class="b"><span class="k">The value</span> Defensible provenance, reduced insider / compromise risk, <strong>no lock-in</strong> (self-hosted, single binary or container, SQLite or your existing PostgreSQL, provider-agnostic), and a hardened posture: 49 findings from a five-lane adversarial security review, each fixed and tested.</p>
+        <p class="b"><span class="k">What it is now</span> An enforceable, attested memory &amp; coordination substrate for AI-agent fleets &mdash; the release that makes the audit trail hold up.</p>
+      </div>
+
+      <div class="audience dev">
+        <span class="who">🛠️ 3 &middot; SME software engineers &amp; architects</span>
+        <h3>The guarantees now bind &mdash; enforced at every write path.</h3>
+        <p class="b"><span class="k">What it means</span> Attestation-required-by-default on <strong>MCP / HTTP / CLI</strong> writes (verified against each agent's bound Ed25519 key); mandatory-hook enforcement actually wired (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1885">#1885</a> / <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1924">#1924</a>); three-key governance signing (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1826">#1826</a>), macaroon capability tokens (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1827">#1827</a>), signed identity-lineage succession (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1828">#1828</a>).</p>
+        <p class="b"><span class="k">Why it matters</span> It closes real bypass gaps: the v0.8.0 <code>enforce</code> gate was a silent no-op and unsigned writes landed <code>claimed</code>. v0.9.0 fails closed &mdash; <code>403 ATTESTATION_FAILED</code> on unsigned / forged writes.</p>
+        <p class="b"><span class="k">The value</span> A substrate you can architect real trust boundaries on: separable signing roles, per-write content attestation, fail-closed hooks, plus an opt-in vector-search slice and a memory-derivation lineage-DAG (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1005">#1005</a> / <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1859">#1859</a>).</p>
+        <p class="b"><span class="k">What it is now</span> Schema <strong>v78</strong> &middot; 101 MCP tools (7 core) &middot; 92 HTTP routes (78 paths) &middot; 89 CLI (87 default) &middot; 28-field <code>Memory</code> &middot; SQLite + PostgreSQL/AGE, one API. <a href="attestation.html"><strong>Set up attestation &rarr;</strong></a></p>
       </div>
     </div>
   </div>
