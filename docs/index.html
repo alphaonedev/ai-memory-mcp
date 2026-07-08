@@ -249,6 +249,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <a href="lifecycle.html">Lifecycle</a>
           <a href="performance.html">Performance</a>
           <a href="agent-identity.html">Agent Identity (NHI)</a>
+          <a href="attestation.html">Attestation setup</a>
           <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         </div>
       </div>
@@ -332,6 +333,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <a href="lifecycle.html">Lifecycle</a>
         <a href="performance.html">Performance</a>
         <a href="agent-identity.html">Agent Identity (NHI)</a>
+        <a href="attestation.html">Attestation setup</a>
         <a href="zero-touch-trust.html">Zero-Touch Trust</a>
         <div class="mnav-group">Architectures</div>
         <a href="architectures.html">Overview</a>
@@ -375,7 +377,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     <span class="badge">v0.9.0 &middot; security-hardening &middot; Apache-2.0</span>
     <h1>Memory for AI agents that runs on <span class="accent">your hardware</span> &mdash; and proves what they did.</h1>
     <p class="subtitle">
-      ai-memory is the <strong>endpoint-resident, model-neutral</strong> memory layer for AI agents &mdash; local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong>, from servers to mobile to fully <strong>air-gapped</strong>, with no cloud dependency and no phone-home. Every state-changing operation lands in an <strong>append-only, tamper-evident audit chain</strong> &mdash; enable attestation and each write is Ed25519-signed at the source &mdash; so you can reconstruct what any agent knew, and when. Neutral by construction: any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama, local models) reads and writes the same store. It doesn't just retrieve &mdash; it <strong>governs</strong>: typed, deterministic refusals at the endpoint, so the substrate can be stopped and audited without corrupting the record.
+      ai-memory is the <strong>endpoint-resident, model-neutral</strong> memory layer for AI agents &mdash; local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong>, from servers to mobile to fully <strong>air-gapped</strong>, with no cloud dependency and no phone-home. Every state-changing operation lands in an <strong>append-only, tamper-evident audit chain</strong> &mdash; enable <a href="attestation.html">attestation</a> and each write is Ed25519-signed at the source &mdash; so you can reconstruct what any agent knew, and when. Neutral by construction: any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama, local models) reads and writes the same store. It doesn't just retrieve &mdash; it <strong>governs</strong>: typed, deterministic refusals at the endpoint, so the substrate can be stopped and audited without corrupting the record.
     </p>
     <div class="meta">
       <span>Local-first &middot; air-gappable</span>
@@ -610,6 +612,9 @@ cd ai-memory-mcp &amp;&amp; cargo build --release</code></pre>
       <a class="cta primary" href="install-quickstart.html">Quickstart for non-technical users &rarr;</a>
       &nbsp;
       <a class="cta ghost" href="QUICKSTART.html">3-minute engineer quickstart</a>
+    </div>
+    <div style="margin-top:1rem;padding:.9rem 1.1rem;border:1px solid var(--p2,#ffb86b);border-left:4px solid var(--p2,#ffb86b);border-radius:8px;background:rgba(255,184,107,.06);font-size:.92rem">
+      <strong>⚠️ Required after install:</strong> v0.9.0 requires agent attestation by default &mdash; set it up (or opt out) before your first write, or it returns <code>403 ATTESTATION_FAILED</code>. <a href="attestation.html"><strong>Attestation setup guide &rarr;</strong></a>
     </div>
 
     <div style="margin-top:3rem; padding-top:1.5rem; border-top:1px solid var(--border)">
