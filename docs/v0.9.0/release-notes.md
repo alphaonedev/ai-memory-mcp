@@ -106,7 +106,9 @@ on a v0.8.0 one-cycle deprecation.
   `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`. Scope is the direct-write path
   ONLY — the federation receive boundary attests via the peer-authorship
   allowlist (`resolve_inbound_attribution`, #1464), not this flag, and
-  curator / autonomy self-writes are exempt.
+  curator / autonomy self-writes are exempt. **Setup — step-by-step key
+  generation, register / bind, and signing on CLI / HTTP / MCP across
+  Linux / macOS / Windows / iOS / Android: [Attestation setup guide](../attestation.html).**
 - **Mandatory-hook enforcement wired LIVE on both write paths ([#1885](https://github.com/alphaonedev/ai-memory-mcp/issues/1885), [#1924](https://github.com/alphaonedev/ai-memory-mcp/issues/1924)).**
   At v0.8.0 the `AI_MEMORY_HOOKS_ENFORCE_MODE` (env-table row #83)
   `enforce` gate shipped **non-functional**: the enforce module carried
