@@ -292,7 +292,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
           <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/benchmarks/longmemeval/results.md">LongMemEval variants</a>
         </div>
       </div>
-      <a href="whats-new-v08.html" style="color:var(--p3)">v0.8.0</a>
+      <a href="whats-new-v09.html" style="color:var(--p3)">v0.9.0</a>
       <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
     </div>
     <details class="mnav">
@@ -307,7 +307,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
         <a href="#integrate">Integrate</a>
         <a href="#audiences">Audiences</a>
         <a href="#architectures">Architectures</a>
-        <a href="whats-new-v08.html">v0.8.0</a>
+        <a href="whats-new-v09.html">v0.9.0</a>
         <a href="at-a-glance.html">Atlas</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
@@ -372,7 +372,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
 <!-- ============ HERO ============ -->
 <header class="hero">
   <div class="container">
-    <span class="badge">v0.8.0 &middot; distributed-coordination &middot; Apache-2.0</span>
+    <span class="badge">v0.9.0 &middot; security-hardening &middot; Apache-2.0</span>
     <h1>Memory for AI agents that runs on <span class="accent">your hardware</span> &mdash; and proves what they did.</h1>
     <p class="subtitle">
       ai-memory is the <strong>endpoint-resident, model-neutral</strong> memory layer for AI agents &mdash; local-first Rust&nbsp;+&nbsp;SQLite on <strong>your own hardware</strong>, from servers to mobile to fully <strong>air-gapped</strong>, with no cloud dependency and no phone-home. Every state-changing operation lands in an <strong>append-only, tamper-evident audit chain</strong> &mdash; enable attestation and each write is Ed25519-signed at the source &mdash; so you can reconstruct what any agent knew, and when. Neutral by construction: any <strong>MCP</strong> client (Claude, GPT, Grok, Gemini, Llama, local models) reads and writes the same store. It doesn't just retrieve &mdash; it <strong>governs</strong>: typed, deterministic refusals at the endpoint, so the substrate can be stopped and audited without corrupting the record.
@@ -390,7 +390,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
     </div>
     <div class="cta-row">
       <a class="cta primary" href="#install">Install in 60 seconds</a>
-      <a class="cta violet" href="whats-new-v08.html">What's new in v0.8.0</a>
+      <a class="cta violet" href="whats-new-v09.html">What's new in v0.9.0</a>
       <a class="cta ghost" href="#why">Why ai-memory?</a>
     </div>
     <pre style="display:inline-block;text-align:left;margin-top:1.75rem;font-size:.82rem;padding:.7rem 1.1rem"><code>brew install alphaonedev/tap/ai-memory   <span style="color:#666"># or: cargo install ai-memory</span></code></pre>
@@ -555,7 +555,7 @@ footer .legal{margin-top:.5rem;font-size:.78rem;color:var(--text-dim)}
       </div>
     </div>
 
-    <p style="margin-top:2rem"><a href="whats-new-v08.html">See what's new in v0.8.0 &rarr;</a> &middot; <a href="coordination.html">Distributed coordination &rarr;</a> &middot; <a href="at-a-glance.html">Atlas: everything on one page &rarr;</a> &middot; <a href="v0.7.0/heterogeneous-ai-nhi-assessment/">Heterogeneous AI NHI assessment &rarr;</a></p>
+    <p style="margin-top:2rem"><a href="whats-new-v09.html">See what's new in v0.9.0 &rarr;</a> &middot; <a href="coordination.html">Distributed coordination &rarr;</a> &middot; <a href="at-a-glance.html">Atlas: everything on one page &rarr;</a> &middot; <a href="v0.7.0/heterogeneous-ai-nhi-assessment/">Heterogeneous AI NHI assessment &rarr;</a></p>
   </div>
 </section>
 
@@ -589,7 +589,7 @@ sudo dnf install ai-memory</code></pre>
         <div class="platform">Container &middot; Plan C</div>
         <div class="name">Docker</div>
         <pre><code>docker run --rm -it \
-  ghcr.io/alphaonedev/ai-memory:0.8.0</code></pre>
+  ghcr.io/alphaonedev/ai-memory:0.9.0</code></pre>
       </div>
       <div class="install-card">
         <div class="platform">iOS &middot; Android</div>
@@ -668,15 +668,15 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
   </div>
 </section>
 
-<!-- ============ MIGRATION → v0.8.0 ============ -->
+<!-- ============ MIGRATION → v0.9.0 ============ -->
 <section id="migrate">
   <div class="container-narrow">
-    <span class="eyebrow">Migrating to v0.8.0</span>
-    <h2>Already running v0.6.4 or v0.7.x? The upgrade is one boot.</h2>
+    <span class="eyebrow">Migrating to v0.9.0</span>
+    <h2>Already running v0.6.4, v0.7.x, or v0.8.x? The upgrade is one boot.</h2>
     <p class="lede">
-      v0.8.0 migrates your existing database in place. The sqlite schema steps up to
-      <strong>v70</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.7.x DB steps
-      <strong>v57&nbsp;&rarr;&nbsp;v70</strong>; a v0.6.4 DB walks the full ladder).
+      v0.9.0 migrates your existing database in place. The sqlite schema steps up to
+      <strong>v78</strong> on the first <code>ai-memory serve</code> after the upgrade (a v0.8.x DB steps
+      <strong>v70&nbsp;&rarr;&nbsp;v78</strong>; a v0.7.x DB steps v57&nbsp;&rarr;&nbsp;v78; a v0.6.4 DB walks the full ladder).
       It is <strong>non-destructive</strong> &mdash; every existing memory carries forward unchanged, archive&nbsp;&rarr;&nbsp;restore is lossless, and new
       columns default to safe values for legacy rows. Typical downtime is
       <strong>30&nbsp;seconds to 2&nbsp;minutes</strong> on a laptop-sized database.
@@ -689,7 +689,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
       </div>
       <div class="feat cyan">
         <span class="tag">Step 2 &middot; Upgrade</span>
-        <h3>Install v0.8.0 &amp; boot once</h3>
+        <h3>Install v0.9.0 &amp; boot once</h3>
         <p>Install the new binary, then run <code>ai-memory serve</code>. The schema ladder migrates automatically and you are back online when it finishes.</p>
       </div>
       <div class="feat cyan">
@@ -975,7 +975,7 @@ api_key_env = "XAI_API_KEY"            # env-var name (inline keys rejected at p
     <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">Changelog</a>
     <a href="SECURITY.html">Security</a>
     <a href="credits.html">Credits</a>
-    <a href="whats-new-v08.html">v0.8.0</a>
+    <a href="whats-new-v09.html">v0.9.0</a>
   </div>
   <div>ai-memory&trade; &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
   <div class="legal">Built for AI Non-Human Identity agents that need to remember &mdash; from a phone to a planet.</div>

@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Governance — Allow / Deny / Pending</title>
-<meta name="description" content="ai-memory v0.8.0 governance reference. Allow / Deny / Pending decision tree, GovernanceLevel × GovernedAction matrix, ApproverType (Human / Agent / Consensus), pending-action lifecycle.">
+<meta name="description" content="ai-memory v0.9.0 governance reference. Allow / Deny / Pending decision tree, GovernanceLevel × GovernedAction matrix, ApproverType (Human / Agent / Consensus), pending-action lifecycle.">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/governance.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -130,7 +130,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Governance</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -211,7 +211,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v08.html">v0.8.0</a>
+        <a href="whats-new-v09.html">v0.9.0</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -280,7 +280,7 @@ footer a{color:var(--text-muted)}
     <span class="pill">3 governed actions</span>
     <span class="pill">4 levels</span>
     <span class="pill">3 approver types</span>
-    <span class="pill" style="border-color:var(--p1);color:var(--p1)">v0.8.0</span>
+    <span class="pill" style="border-color:var(--p1);color:var(--p1)">v0.9.0</span>
   </div>
 </section>
 
@@ -405,7 +405,7 @@ footer a{color:var(--text-muted)}
       <div class="card">
         <div class="lbl">presence enforcement · #1734</div>
         <h3>Mandatory hook presence</h3>
-        <p><code>AI_MEMORY_HOOKS_ENFORCE_MODE</code> = <code>off</code> / <code>advisory</code> / <code>enforce</code>. Paired with <code>[hooks].required_events</code>, <code>enforce</code> returns <code>Deny{503}</code> when a required pre-* event has no enabled hook — closing the silent no-enforcement gap where an absent governance hook simply Allowed. Default <code>off</code> + empty required-events is a deliberate no-op self-DOS guard.</p>
+        <p><code>AI_MEMORY_HOOKS_ENFORCE_MODE</code> = <code>off</code> / <code>advisory</code> / <code>enforce</code>. Paired with <code>[hooks].required_events</code>, <code>enforce</code> returns <code>Deny{503}</code> when a required pre-* event has no enabled hook — closing the silent no-enforcement gap where an absent governance hook simply Allowed. Default <code>off</code> + empty required-events is a deliberate no-op self-DOS guard. <strong>The mandatory-hook enforcement path (MCP + HTTP) is wired live as of v0.9.0 (#1885 / #1924)</strong> — the v0.8.0 gate landed the config surface but did not yet enforce end-to-end.</p>
       </div>
       <div class="card pending">
         <div class="lbl">§22 PE-5 · schema v66</div>
@@ -720,7 +720,7 @@ footer a{color:var(--text-muted)}
 </section>
 
 <footer>
-  <p>ai-memory v0.8.0 · Apache 2.0 · governance lives in <code>src/governance/</code> + <code>src/models/</code> · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.9.0 · Apache 2.0 · governance lives in <code>src/governance/</code> + <code>src/models/</code> · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="types.html">Types</a> · <a href="schema.html">Schema</a> · <a href="validators.html">Validators</a></p>
 </footer>
 
