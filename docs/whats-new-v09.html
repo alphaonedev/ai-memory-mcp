@@ -139,6 +139,7 @@ footer a:hover{color:var(--accent)}
     </div>
     <div class="cta-row">
       <a class="solid" href="v0.9.0/release-notes.html">📓 Release notes</a>
+      <a class="amber" href="attestation.html">🔑 Attestation setup</a>
       <a class="green" href="governance.html">🛡️ Governance L1&ndash;L6</a>
       <a class="amber" href="federation.html">🔐 Federation hardening</a>
       <a class="violet" href="at-a-glance.html">🗺️ Atlas: one page</a>
@@ -168,7 +169,7 @@ footer a:hover{color:var(--accent)}
         <tr>
           <td><strong>Attestation required</strong></td>
           <td>An unsigned direct store (MCP <code>memory_store</code> / HTTP <code>POST /api/v1/memories</code> / CLI <code>store</code>) is rejected with <code>403 ATTESTATION_FAILED</code> instead of landing <code>attest_level="claimed"</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1751">#1751</a>)</td>
-          <td><strong>Secure by default</strong> &mdash; fail-closed. Opt-out: <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code></td>
+          <td><strong>Secure by default</strong> &mdash; fail-closed. Opt-out: <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>. <a href="attestation.html">Setup guide &rarr;</a></td>
           <td><span class="status ok">✅ shipped</span></td>
         </tr>
         <tr>
@@ -229,7 +230,7 @@ ai-memory doctor</pre>
         <span class="who">🛠️ If you BUILD with AI</span>
         <h3>Attestation-required, enforced hooks, signed governance roles, capability tokens &mdash; in the substrate.</h3>
         <ul class="checked">
-          <li><strong>Attestation required by default:</strong> an unsigned direct store is <code>403 ATTESTATION_FAILED</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1751">#1751</a>). Sign with <code>ai-memory store --sign</code> against a keypair bound by <code>ai-memory agents bind-key</code>, or opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>.</li>
+          <li><strong>Attestation required by default:</strong> an unsigned direct store is <code>403 ATTESTATION_FAILED</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1751">#1751</a>). Sign with <code>ai-memory store --sign</code> against a keypair bound by <code>ai-memory agents bind-key</code>, or opt out with <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code>. <strong>Full step-by-step (CLI / HTTP / MCP, every OS): <a href="attestation.html">Attestation setup guide &rarr;</a></strong></li>
           <li><strong>Mandatory-hook enforcement, now live:</strong> the <code>enforce</code> gate is wired onto both the MCP write path (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1885">#1885</a>) and the HTTP write path (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1924">#1924</a>) &mdash; a missing required pre-write hook now fails closed instead of silently no-op'ing.</li>
           <li><strong>49 review fixes:</strong> per-row <code>bulk_create</code> attestation gating (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1919">#1919</a>), federated PENDING approvals through the registered-approver gate (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1920">#1920</a>), tightened team/unit/org visibility scope (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1921">#1921</a>), a <code>skill_register</code> <code>folder_path</code> symlink jail (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1923">#1923</a>), and a non-argv credential channel <code>AI_MEMORY_STORE_URL</code>/<code>AI_MEMORY_STORE_URL_FILE</code> keeping the postgres password off <code>/proc/&lt;pid&gt;/cmdline</code> (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1927">#1927</a>).</li>
           <li><strong>Governance signing hardening:</strong> three-key Recorder/Judge/Stopper signing-layer separation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1826">#1826</a>), macaroon capability tokens wired end-to-end (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1827">#1827</a>), and a signed identity-lineage key-succession chain that survives rotation (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1828">#1828</a>, schema v76).</li>
