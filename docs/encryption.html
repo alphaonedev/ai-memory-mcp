@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Encryption — at-rest, in-transit, integrity</title>
-<meta name="description" content="ai-memory v0.8.0 cryptographic surface. SQLCipher at-rest (PRAGMA key) plus opt-in #228 per-memory content envelope (ChaCha20-Poly1305 / X25519 / HKDF) on both backends, mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, Ed25519 attested identity (shipped v0.7.0) + per-write content attestation (#1464, v0.8.0).">
+<meta name="description" content="ai-memory v0.9.0 cryptographic surface. SQLCipher at-rest (PRAGMA key) plus opt-in #228 per-memory content envelope (ChaCha20-Poly1305 / X25519 / HKDF) on both backends, mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, signed git tags + SBOM, Ed25519 attested identity (shipped v0.7.0) + per-write content attestation (#1464, v0.8.0).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/encryption.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -110,7 +110,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Encryption</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -191,7 +191,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v08.html">v0.8.0</a>
+        <a href="whats-new-v09.html">v0.9.0</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -481,7 +481,7 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
 </section>
 
 <footer>
-  <p>ai-memory v0.8.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/encryption/</code> (#228 ChaCha20-Poly1305/X25519/HKDF content envelope) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
+  <p>ai-memory v0.9.0 · Apache 2.0 · crypto modules: <code>src/storage/connection.rs</code> (SQLCipher) · <code>src/encryption/</code> (#228 ChaCha20-Poly1305/X25519/HKDF content envelope) · <code>src/federation/</code> (rustls) · <code>src/subscriptions.rs</code> (HMAC-SHA256) · <code>src/identity/</code> (Ed25519) · <a href="https://github.com/alphaonedev/ai-memory-mcp">repo</a></p>
   <p style="margin-top:.5rem"><a href="./">← Back to ai-memory</a> · <a href="at-a-glance.html">Atlas</a> · <a href="release-pipeline.html">Release pipeline</a> · <a href="memory-rules.html">Memory rules</a></p>
 </footer>
 

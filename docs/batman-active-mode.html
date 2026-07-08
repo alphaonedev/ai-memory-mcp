@@ -10,7 +10,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Batman Mode — Activating full-spectrum write-time investment</title>
-<meta name="description" content="ai-memory v0.8.0 operator how-to: take a fresh install from Batman-capable to Batman-active. Operator key, signed seed rules, curator daemon, namespace policies, and per-OS persistence (launchd / systemd / Task Scheduler).">
+<meta name="description" content="ai-memory v0.9.0 operator how-to: take a fresh install from Batman-capable to Batman-active. Operator key, signed seed rules, curator daemon, namespace policies, and per-OS persistence (launchd / systemd / Task Scheduler).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/batman-active-mode.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--warn:#ffd700;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -107,7 +107,7 @@ footer a{color:var(--text-muted)}
     <a class="home-link" href="./">ai-memory <span style="opacity:.5">▸ Batman Mode</span></a>
     <div class="right">
       <a href="at-a-glance.html" style="color:#6ee7ff">Atlas</a>
-      <a href="whats-new-v08.html" style="color:#ffb86b">v0.8.0</a>
+      <a href="whats-new-v09.html" style="color:#ffb86b">v0.9.0</a>
       <div class="menu">
         <button class="menu-btn">Audiences<span class="caret">▾</span></button>
         <div class="menu-pane">
@@ -188,7 +188,7 @@ footer a{color:var(--text-muted)}
       <div class="mnav-pane">
         <a href="./">Home</a>
         <a href="at-a-glance.html">Atlas</a>
-        <a href="whats-new-v08.html">v0.8.0</a>
+        <a href="whats-new-v09.html">v0.9.0</a>
         <div class="mnav-group">Audiences</div>
         <a href="for-everyone.html">For Everyone</a>
         <a href="audience/decision-maker.html">Decision Maker</a>
@@ -251,7 +251,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Going Batman-active.</h1>
-  <p class="tagline">v0.8.0 ships <strong style="color:var(--good)">6 of 6</strong> of Batman's write-time-investment forms <strong style="color:var(--good)">+ the 7th</strong> (substrate-authority at write). All <code>IMPLEMENTED</code>. None active by default. This page is the operator-facing recipe to take a fresh install from <strong style="color:var(--warn)">Batman-capable</strong> to <strong style="color:var(--good)">Batman-active</strong> — and make it survive reboot.</p>
+  <p class="tagline">v0.9.0 ships <strong style="color:var(--good)">6 of 6</strong> of Batman's write-time-investment forms <strong style="color:var(--good)">+ the 7th</strong> (substrate-authority at write). All <code>IMPLEMENTED</code>. None active by default. This page is the operator-facing recipe to take a fresh install from <strong style="color:var(--warn)">Batman-capable</strong> to <strong style="color:var(--good)">Batman-active</strong> — and make it survive reboot.</p>
   <div class="pills">
     <span class="pill">7-step recipe</span>
     <span class="pill">launchd / systemd / Task Scheduler</span>
@@ -264,7 +264,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">The thesis</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Pay at write time, read for free.</h2>
-    <p class="lede"><strong>Batman</strong> is the published 6-form write-time-investment framework. Memory quality is set at WRITE time, not retrieval time. No amount of rerank fixes a substrate that ingested duplicates, un-atomized blobs, untyped facts, no provenance, no confidence, and no governance. ai-memory v0.8.0 implements all 6 + adds a 7th (substrate-authority over agent-EXTERNAL actions). On a default install the cognitive forms in the write path are on the moment you launch with <code>--tier autonomous</code>; the governance + namespace-policy forms are opt-in and need this recipe.</p>
+    <p class="lede"><strong>Batman</strong> is the published 6-form write-time-investment framework. Memory quality is set at WRITE time, not retrieval time. No amount of rerank fixes a substrate that ingested duplicates, un-atomized blobs, untyped facts, no provenance, no confidence, and no governance. ai-memory v0.9.0 implements all 6 + adds a 7th (substrate-authority over agent-EXTERNAL actions). On a default install the cognitive forms in the write path are on the moment you launch with <code>--tier autonomous</code>; the governance + namespace-policy forms are opt-in and need this recipe.</p>
 
     <table class="matrix">
       <thead>
@@ -318,7 +318,7 @@ footer a{color:var(--text-muted)}
       </tbody>
     </table>
 
-    <p style="margin-top:1.5rem;font-size:.85rem">Form 7 at v0.7.0 wires substrate-internal write paths (any caller of <code>memory_store</code> / <code>memory_link</code> / <code>memory_delete</code> / <code>memory_archive</code> / <code>memory_consolidate</code> / <code>memory_replay</code>). Agent-EXTERNAL Layer-4 (Bash / FilesystemWrite outside substrate / NetworkRequest / ProcessSpawn) is <code>callable_now=false</code> until the v0.8.0 harness-boundary wiring lands (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/697">#697</a>). Operators can already enforce the same rules at the harness boundary themselves via a <code>PreToolUse</code> hook that shells out to <code>ai-memory rules check</code>.</p>
+    <p style="margin-top:1.5rem;font-size:.85rem">Form 7 at v0.7.0 wires substrate-internal write paths (any caller of <code>memory_store</code> / <code>memory_link</code> / <code>memory_delete</code> / <code>memory_archive</code> / <code>memory_consolidate</code> / <code>memory_replay</code>). Agent-EXTERNAL Layer-4 (Bash / FilesystemWrite outside substrate / NetworkRequest / ProcessSpawn) is <code>callable_now=false</code>; the agent-EXTERNAL Layer-4 harness-boundary wiring (<a href="https://github.com/alphaonedev/ai-memory-mcp/issues/697">#697</a>) remains a tracked follow-up. Operators can already enforce the same rules at the harness boundary themselves via a <code>PreToolUse</code> hook that shells out to <code>ai-memory rules check</code>.</p>
   </div>
 </section>
 
@@ -326,7 +326,7 @@ footer a{color:var(--text-muted)}
   <div class="container">
     <span class="eyebrow">Default state</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Capable, not active.</h2>
-    <p class="lede">A fresh v0.8.0 install with <code>--tier autonomous --profile full</code> running gives you Forms 1–4 the moment the MCP server boots. Everything else is dormant by design. The recipe below activates Forms 5, 6, 7 and makes the activation survive reboot.</p>
+    <p class="lede">A fresh v0.9.0 install with <code>--tier autonomous --profile full</code> running gives you Forms 1–4 the moment the MCP server boots. Everything else is dormant by design. The recipe below activates Forms 5, 6, 7 and makes the activation survive reboot.</p>
     <div class="cards">
       <div class="card always">
         <div class="lbl">already on</div>
