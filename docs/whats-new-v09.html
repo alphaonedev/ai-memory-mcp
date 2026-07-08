@@ -492,7 +492,7 @@ ai-memory doctor</pre>
   <div class="container">
     <span class="eyebrow">Install shortcuts</span>
     <h2>Install the current release (v0.9.0)</h2>
-    <p class="lede">v0.9.0 (<code>security-hardening</code>) is the current release. The install channels below publish v0.9.0.</p>
+    <p class="lede">v0.9.0 (<code>security-hardening</code>) is the current release. The core channels publish <code>0.9.0</code>; the SDK packages ship the 0.9.0 line under fresh versions (the 0.9.0 SDK slots were reserved by a withdrawn build) &mdash; PyPI <code>0.9.0.post1</code>, npm <code>0.9.1</code>.</p>
 
     <div class="grid-3">
       <div class="card">
@@ -520,14 +520,18 @@ sudo dnf install ai-memory</pre>
       <div class="card">
         <span class="tag">TypeScript SDK</span>
         <h3>npm</h3>
-        <pre>npm install @alphaone/ai-memory</pre>
+        <pre>npm install @alphaone/ai-memory@0.9.1</pre>
       </div>
       <div class="card">
         <span class="tag">Python SDK</span>
         <h3>PyPI</h3>
-        <pre>pip install ai-memory-mcp
+        <pre>pip install ai-memory-mcp==0.9.0.post1
 # import name remains ai_memory</pre>
       </div>
+    </div>
+
+    <div style="margin-top:1.5rem;padding:1.1rem 1.25rem;border:1px solid var(--p2);border-left:4px solid var(--p2);border-radius:8px;background:rgba(255,184,107,.06)">
+      <strong>⚠️ Required next step &mdash; set up attestation.</strong> v0.9.0 requires <strong>agent attestation by default</strong>, so an unsigned first write returns <code>403 ATTESTATION_FAILED</code>. Before your first write, either bind a key and sign, or set the <code>AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0</code> opt-out. The guide walks it through step-by-step for <strong>CLI / HTTP / MCP</strong> on <strong>Linux / macOS / Windows / iOS / Android</strong>: <a href="attestation.html"><strong>Attestation setup guide &rarr;</strong></a>
     </div>
   </div>
 </section>
