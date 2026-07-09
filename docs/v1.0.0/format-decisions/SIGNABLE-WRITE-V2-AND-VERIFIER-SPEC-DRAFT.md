@@ -146,6 +146,13 @@ A conforming sub-10kLOC dependency-free offline verifier, given only the artifac
 
 **Out of the frozen-verifier scope (deferred / ESTIMABLE):** capability caveat algebra (the capability layer stays additive), the epoch-aware write-path revocation enforcement, hardware custody attestation, whole-host rollback resistance, and vote-independence (permanently ESTIMABLE — the verifier sees signed bytes, never the generating process).
 
+### 7.1 Read-path consumer-binding — DEFERRED post-v1.0 (ruling #1950 · `973f3056` · unanimous)
+
+Write-path attestation (§2) + the shipped `recall_observations` ledger is the **frozen read-path boundary** for v1.0; **zero read-path bytes freeze now.** A future recall-attestation is a clean additive artifact (its own `"ai-memory/recall-attestation/v1"` domain tag; ephemeral/derived; consumes the already-frozen `cid` + SubkeyCert + content_digest), so retrofit is provably not a freeze break.
+- ⚠️ **v1.0 read-path assurance is TELEMETRY strength, not proof.** `recall_observations` is unsigned, local-only, best-effort (7d TTL) — a compromised node can forge/omit its own rows. **Never claim consumer-binding/proof at v1.0.** ESTIMABLE.
+- **Frozen design guardrails for the future envelope** (recorded now, no bytes): it SHALL anchor to `cid` (per-record, tamper-evident), never `recall_id` (per-event, stays unsigned telemetry); it SHOULD fold into the `signed_events` witness spine (present-only, v73 `cause_hash` precedent) to be drop-evident.
+- **Honest ceiling:** the substrate can attest *what it returned*, never *what the caller did with it* (outside the substrate — same boundary as the record-stop actuator and vote-independence).
+
 ---
 
 ## 8. Migration summary
