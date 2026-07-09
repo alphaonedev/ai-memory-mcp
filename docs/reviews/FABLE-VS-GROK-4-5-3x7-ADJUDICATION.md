@@ -1,0 +1,75 @@
+# Fable vs Grok 4.5 — 3×7 Cross-Family Adjudication of the Perfect-Endpoint Assessments
+
+> **Document classification:** Adjudication record + binding corrections list. Completes the cross-family check both same-day assessments required of themselves.
+>
+> **Date:** 2026-07-09. **Run:** `wf_a100ebc9-daa` (3 waves × 7 agents; 20/21 completed — `converge:plan` lost to a server error, leaving a 6/7 convergence quorum; ~5.3M tokens across both attempts). **Subjects:** (A) Fable document set — `PERFECT-ENDPOINT-MEMORY-SPEC-3x7-FABLE.md` + `PERFECT-ENDPOINT-MEMORY-V1.0.0-ASSESSMENT-FABLE.md` (21+7-agent Anthropic-family councils); (B) Grok 4.5 document set — `docs/v1.0.0/UPDATED-ROADMAP-GROK-4-5-ASSESSMENT-PERFECT-ENDPOINT-AI-MEMORY.md` (49-agent xAI-family council, commit `713dd85b`). **Ground truth:** v0.9.0 code at `main`, the GitHub tracker, ROADMAP.md — neither document was treated as authoritative; every disputed claim was resolved against primary evidence.
+>
+> **Provenance chain:** [#1939]. Adjudicating agents are Anthropic-family — this record therefore corrects **both** documents against code, but final constitutional weight still routes through the [#1171] panel.
+
+---
+
+## 1. Verdict
+
+**Final dimension tally: FABLE 24 · GROK 12 · TIE 6 · BOTH_WRONG 7.**
+
+The two councils **agree on the facts almost everywhere once rubrics are translated**: nothing fully held (0/27 SHIPPED ≡ 0/7 perfect), the identical honest-credit list (pure recall, #1751 flip, G30 tombstones, secret screen, authority-lane fail-closed, vendor-agnosticism), and the identical core gap list (decorrelation off-by-default, append_only off, fed write-sig off, capture L3, UUID/cid dual-truth, crypto monoculture, recovery-verify absent). The disagreements are **rubric and prescription, not shipped-state facts** — which is itself the strongest cross-family corroboration of the shared verdict: *substrate-ready, constitution-incomplete, and v1.0.0-as-planned closes neither document's gap set.*
+
+**Where Fable wins** (selected): actuator specificity (R45 names the full stop mechanism; Grok narrows §2.3 to write-refusal and funds no actuator in any epic), falsifiable acceptance criteria on all 27 requirements (Grok's nearest executable surface is claim-discipline conditions), evidence anchoring (every spot-checked Fable code anchor verified; Grok's two-decimal scores cite wave documents, not code, with no recomputable procedure), epistemic lattice (tier monotonicity, quarantine, transitive invalidation, as-of bitemporal — absent from Grok), performance/durability as spec obligations (R23/R7 have no Grok counterpart), governance actuators (human-key veto, weight-ingestion gate, zero-config mint), and the P0 freeze-critical lane structure with T4-vote wiring.
+
+**Where Grok wins** (selected): the **UUID→cid record-identity-authority ADR** (a freeze-killer Fable's P0 lane omitted despite meeting its own freeze-critical criterion), **capture completeness** ("pure recall of an empty corpus" — Fable's converged 27 contain no capture requirement despite #1388 being the substrate's founding failure), **corpus lifecycle** (bounded growth + typed forget; Fable had zero boundedness requirement), headline **distance granularity** (per-property ordinal scores communicate what a flat PARTIAL bucket cannot), the **defaults-vs-machinery scoring scope**, the **authority-lane ≠ data-lane** axis (Fable's federation section would mis-grade a deliberately-shipped, 5-agent-voted asymmetry as inconsistency), death-condition breadth (D1–D12), and the undated-tag **slip rule** as public schedule posture.
+
+**BOTH_WRONG (shared blind spots, all now ticketed as corrections):** the inference-plane egress channel (at semantic/smart tiers with an API backend, memory content POSTs to a third-party vendor on every store/recall — neither spec's egress or sovereignty claims covered it); supply-chain/build integrity (537-crate lock, no cargo-vet/SBOM lane, and ROADMAP:995's reproducible-build gate is prose-only); recall-completeness omission (index-tamper silently censors recall without touching signed bytes); audit-remediation-loop modeling; operator bandwidth + metered-vendor dependency as unmodeled schedule constraints; sanctioned-restore (operator DR **is** snapshot-restore — A1 needs a signed restore ceremony or the first disk failure teaches operators to disable the check); and treating multi-agent council methodology itself as reliable (both documents cite their own councils as evidence).
+
+## 2. Sustained errors in the Grok document (14, evidence-final)
+
+1. **Portability Spec 0.93 "real format"** — the spec is a Draft pinned at v0.6.3.1, **61 schema versions behind** the assessed substrate, defining none of the four v0.9.0 record classes. Material overscore.
+2. **durability-503 as live work** (§4.6 + R18) — the fix shipped at v0.8.1 W3 (`d1b7fdd3`, 202-Accepted with quorum state). Only stale ROADMAP §26.3 prose remains (Sprint-0 W1 docs item).
+3. **#1809 cited as a live v1.0 federation-crypto epic** — closed in the v0.8.0 security cycle as a LOW docs-drift finding.
+4. **Claim-level bitemporal listed as post-v1.0 DEFER** — #1834 is OPEN at milestone v1.0 (P2) since 2026-06-28; silently re-homing a milestoned item.
+5. **#1852 internal inconsistency** — §2.7 declares mesh tombstone propagation v1.x while E8/P3.2/C9 put it in v1.0 lanes.
+6. **E7 dependency omission** — FED-RQ-02/03 shown depending only on E5/G3; the real blocking predecessor is FED-RQ-01 ([#1936]), per ROADMAP §25.2's own transport language.
+7. **§2.3 "unscoped kill-switch" purge demand** — ROADMAP §2.3's Precision paragraph (2026-06-14, per #1698) already binds exactly the record-stop scope Grok demands.
+8. **"49/49 structural slots filled"** — the same section records the W6-A1 federation-mesh peer slot ABSENT.
+9. **Grandeur self-violation** — bans the register while titling itself "Survive-to-Infinity Moonshot" and closing with the banned formula.
+10. **G29 unqualified unlock** — the house register permits only the qualified best-effort-screening form; absolute forms never unlock.
+11. **No stop actuator funded anywhere in E0–E12** while claiming §2.3 coverage via PE-1 hook-presence.
+12. **C6 relaxes §11.6's "two languages besides Rust" to ≥1** without a ruling — internally contradicting its own must-start-gravity finding.
+13. **Day-0 checklist duplicates existing structure** — a v1.0 milestone with ~30 open issues pre-existed; #1938 already gates feature work; "create milestone/branch/file parents" executed as written would fork the tracker.
+14. **algorithm_id DAG incoherence** — declared "never block tag" in the cutline while P4.1 makes it a v1.0 schema commitment and D2/D7 make Ed25519-forever a death condition; by Grok's own logic the seed is tag-blocking.
+15. *(self-scoring)* **"Grand confidence 0.84 (chair merge, red-team penalty −0.02)"** — a blended composite of heterogeneous wave confidences published as a headline in a self-declared procurement SSOT, by the document that bans non-measurement composites (G7). Fable's 0/20/7 was adjudicated NOT a banned composite (a recomputable verdict distribution, nothing averaged).
+
+## 3. Binding corrections to the Fable documents (applied as amendments)
+
+Highest-support clusters (6/6 voters unless noted); full per-entry evidence in the run journal:
+
+1. **Fund the committed §2.6 decorrelation spine as named lane items** (1 CRITICAL): production reflect family-stamps + stamp-density probe → D3-021 advisory-soak→enforce-as-default → D3-031 consolidation gate → D3-060 ship-gate, plus the "defaults stop lying" items (RECALL_TOUCH_SYNC removal path, fed write/signal-sig WARN→flip). A v1.0 tag from lanes that leave ROADMAP §24's own committed line unfunded contradicts the document's premise.
+2. **"Perfect endpoint memory system" becomes a PERMA-ban as public claim/brand** — Fable's ban-until-27-green unlock is unsatisfiable by its own ATTESTABLE/ESTIMABLE discipline (fuzz-based "zero bypass" acceptances are ESTIMABLE forever). Retained only as the internal spec-target denominator. All schedule figures labeled ESTIMABLE with throughput parameters; public posture adopts the slip rule ("tag when the gate spine is green; slip the date, never cut gates").
+3. **Add capture-completeness** as a converged-class requirement (panel-routed; L3 watcher build sequenced behind the Sprint-0 W4 keep/cut ruling + operator notify-dependency approval).
+4. **Add corpus-lifecycle law** (bounded growth under named pressure policy + typed forget; "infinite corpus by default" banned) — spec/scoring only; default flips of compaction/size-GC are T3 crossroads, not adjudication outputs.
+5. **Add the UUID→cid identity-authority ADR to the P0 freeze lane** (ADR by T4 vote pre-freeze; cutover migration stays out of v1.0 unless the ADR rules otherwise).
+6. **Read-path provenance/consumer binding (M1)**: rule the envelope scope pre-freeze or record it post-v1.0 explicitly — write-path attestation does not bind the consumer that retrieves-injects-acts.
+7. **Scorecard honesty riders** (5/6): state SHIPPED-is-empty-**by-construction**; annotate every PARTIAL as *default-off* vs *incomplete* (append_only/fed-sig/capabilities are one-flip-plus-soak; R3/R24 are real engineering); add near/mid/far distance markers.
+8. **Tracker-fact fixes in A2**: #1834 is OPEN **at** milestone v1.0 (P2) — restate and recommend promotion into the P0 lane (columns pre-freeze, Claim algebra deferred); #1862 is the refusal-slice only with NO milestone — told/intervention kinds need a new issue; the R69 catch-up tombstone feed needs a **new** issue (#1852 is the un-forget revocation primitive, wrong home); R40 row must acknowledge the shipped partial mitigations (#1787/#1796 no-self-approve + registered-approver) while keeping the no-signature finding P1.
+9. **A1 rollback-evidence scoping**: since v0.8.1 #1850, `verify_audit_trail` detects DB-file-only rollback against the forensic-JSONL watermark when the sink is live; the honest residuals keeping A1 in P0 are open-time silence, whole-host snapshot restore, and unsigned-daemon suffix rewrite. Add the **sanctioned-restore ceremony** (operator-key-signed restore event distinguishing DR from attack).
+10. **R45 renamed "substrate record-stop actuator"** (full mechanism unchanged); the claims-register entry splits — scoped record-stop unlocks at R45; unscoped world-action "kill-switch"/"stops an ASI" is perma-banned.
+11. **One-cycle deprecation-WARN discipline** (#1751 pattern, measured 13-day soak) binds every fail-open→fail-closed flip; **v0.10.0 promoted from capacity-fallback to PLANNED WARN-carrier release** (env #94/#96 emit no WARN today — a cold bulk flip inside the freeze release is the self-DOS class the repo's own precedent forbids).
+12. **PE-1/namespace hardening ships as production TEMPLATES + a named `asi-hard` procurement profile**, never compiled default flips (empty `required_events` under enforce is a documented no-op; non-empty enforce can 503 fresh installs).
+13. **New BOTH_WRONG lane items**: inference-plane egress (R68 default-deny classes + gate decisions extended to embed/LLM calls; R72 cache tags record where vectors were computed; offline-embedder rider on any sovereign-egress claim); supply-chain/build-integrity pre-freeze item (cargo-vet-class dependency review, SBOM, implement-or-strike ROADMAP:995's reproducible-build gate); recall-completeness index-coverage reconciliation; audit RFP/SOW prep into Sprint 0 (engagement operator-$-gated; execution stays post-P0/P1); dark-age Rosetta rider on R24 (bind to #1835); unlock-bookkeeping rows reconciling §26.5/§26.6 to the current partial-earned register; grandeur purge in A2 §6 and — Sprint-0 W1 note — in ROADMAP §24/§25 itself.
+14. **Schedule model discloses** operator bandwidth (every P0 item is a 5-agent-vote crossroads; the human is plausibly the critical path) and the metered-frontier-vendor dependency of the AI-NHI labor itself.
+
+**Killed corrections** (wave-2/3): adding durability-503 work (already fixed, see Grok error #2); Grok's Day-0 milestone/branch/parent-issue creation (duplicates #1938 + existing v1.0 milestone — E-items file *during* Sprint 0 into the existing milestone); trading the trichotomy for 0-100 decimals; dropping weeks-level dev estimates (they stay, internal + ESTIMABLE-labeled).
+
+## 4. Final adopted-from-Grok / kept-Fable merge (the v1.0.0 program deltas)
+
+**Adopted (some MODIFIED):** V10-G0 "defaults stop lying" as named tag-blocking items · §7.3 ban-unlock matrix into Sprint-0 W1 as the docs-pass work order · one-cycle WARN discipline + planned v0.10.0 · UUID/cid ADR (P0) · undated-tag public slip rule · record-stop vocabulary · PARTIAL(default-off/incomplete) split + honest-credit rider · authority≠data-lane spec axis (panel-routed) · capture-completeness (panel-routed) · corpus-lifecycle (spec-only) · PE-1 templates + `asi-hard` profile · seed-vs-implement per T4 vote · two-tier freeze vocabulary (planning-binding → ship-law after the #1171-class panel) · Day-0 audit SOW prep · M1/M2/M4/M8 threat tickets · D1–D12 register extended with D13 (supply-chain) + D14 (inference-plane capture) · C1–C12 tag-DoD format amended (C1 gains the record-stop actuator; C6 restored to ≥2 non-Rust consumers).
+
+**Kept against Grok pressure:** Sprint 0 (#1938) as the hard gate (no parallel milestone/branch) · the P0 freeze-critical format lane + T4-vote wiring · the [#1936]→R22→FED-RQ-02/03 ordering gate (which Grok's own DAG misses) · the seven-MISSING register (every disputed entry re-verified in code) · R45's full actuator (renamed) · R7/R23 durability + verified-path budgets · A1 open-time head-check (+ restore ceremony) · R40/R56/R9 governance machinery · R24 frozen verifier (now also the supply-chain hedge) · R59/R11/R22/R65 federation mechanisms · the trichotomy + code-anchored falsifiable verdicts as the evidence standard · the ~251-session capacity model (ESTIMABLE-labeled) · weeks-not-quarters dev realism paired with the adopted public slip rule · "recorded rulings, never silence" for all residue · audit-the-final-surface-once serialization.
+
+## 5. Disposition
+
+The corrections in §3 are applied to the two Fable documents as a dated, binding amendments section (superseding conflicting inline text); the Grok errors in §2 are input to the Sprint-0 W1 docs pass and to Grok-document errata the operator may request; the §4 merge defines the v1.0.0 program that the final ROADMAP.md revision should encode. Constitutional items (spec axes, property amendments, freeze escalation to ship-law) remain gated on the [#1171] heterogeneous panel — this adjudication was performed by Anthropic-family agents and, per its own discipline, corrects facts but cannot confer family-decorrelated authority on itself.
+
+[#1171]: https://github.com/alphaonedev/ai-memory-mcp/issues/1171
+[#1936]: https://github.com/alphaonedev/ai-memory-mcp/issues/1936
+[#1938]: https://github.com/alphaonedev/ai-memory-mcp/issues/1938
+[#1939]: https://github.com/alphaonedev/ai-memory-mcp/issues/1939
