@@ -809,6 +809,8 @@ The `token-budget` workflow is a **required status check**. It enforces three cl
 
 Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500 questions, 6 categories). Pure FTS5 keyword tier achieves 97.0% R@5 in 2.2 seconds. LLM query expansion (smart tier) pushes to 97.8% R@5. All inference runs locally — zero cloud API calls, zero cost.
 
+> **Benchmark-model caveat (2026-07-09):** the smart-tier (LLM-expansion) numbers were measured with **Gemma 3 4B** as the expansion model; the production default has since moved to Gemma 4. A Gemma-4 re-run + republish is tracked as a v1.0 Gate-0 honesty item (#1975). The **keyword-tier 97.0% R@5 is LLM-independent** and unaffected.
+
 | Tier | R@5 | Speed | Dependencies |
 |------|-----|-------|-------------|
 | **keyword** | 97.0% | 232 q/s | None |

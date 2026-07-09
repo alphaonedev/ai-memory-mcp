@@ -694,7 +694,11 @@ Per RFC #651. Implements the trait; keeps Ollama as default forever; adds vLLM a
 
 **Strengthens §2.5 (attested) and is the foundation for closing the §5 family-attestation gap.** Without per-model attestation, structural bias-displacement enforcement cannot exist. This is the on-ramp to the §5 mechanism the v1.x panel will adjudicate.
 
-##### §11.4.E Distilled hot-path model — **IN IF FROM DECORRELATED FAMILY**
+##### §11.4.E Distilled hot-path model — **CUT from v1.0 (2026-07-09, Sprint-0 W4 ruling, memory 8c5e9f2a)**
+
+> Anchor #654 is CLOSED (strategy/IP, parked). Bundling 300-700M weights ADDS attestation/supply-chain audit surface hostile to a freeze whose §2.5 job is minimizing what must be audited; the §2.6 benefit is conditional on an unproven decorrelated-family lineage. Operator may reopen #654 at discretion — this is a strategy call, not an AI defer. Original scope preserved below.
+
+##### §11.4.E (original, parked) — IN IF FROM DECORRELATED FAMILY
 
 Investment A from #654. Train a small model (300M-700M) on Gemma 4 teacher outputs for four bounded structured-output tasks (`auto_tag`, `detect_contradiction`, `expand_query`, `summarize_memories`). Ship distilled weights with the binary; <2GB; CPU-only with mlx/wgpu acceleration when available.
 
@@ -818,7 +822,7 @@ Commercial deployment surfaces in generic terms. Brand-specific commitments live
 
 ### 11.5 v0.9 — Skill Memories + Function Calling + Default-On Reranker — as planned pre-v0.9.0
 
-> **Status (2026-07-09 reconciliation — the actual v0.9.0, released 2026-07-08, was the security-hardening release; see §25.3 for its P0 spine).** Most of this section's scope nevertheless shipped INSIDE v0.9.0: **skill memories first-class** (#1865 — `parameters_schema` at register, `invocation_record`, version), **function calling in `llm.rs`** (#1866 — `generate_with_tools` + `ChatOutcome::ToolCalls`), **recall-usage shadow sweep** (#1706 — `consumption_utility` in `confidence/calibrate.rs`), and **G7-step2 reranker pool + G8 fail-loud `mode:degraded`** (#1867). NOT shipped: the **global reranker default-on flip** (explicitly REFUSED by the #1867 vote — deferred to v1.0), **streaming tool responses** (open [#1868](https://github.com/alphaonedev/ai-memory-mcp/issues/1868)), the **#1707 conditional live recall-utility wire** (v1.0, gated on shadow divergence), and the **§23 vector index substrate** (→ #1860, v1.0). R8 TOON v2: recover-or-cut ruling owed at Sprint-0 W4 (#1938).
+> **Status (2026-07-09 reconciliation — the actual v0.9.0, released 2026-07-08, was the security-hardening release; see §25.3 for its P0 spine).** Most of this section's scope nevertheless shipped INSIDE v0.9.0: **skill memories first-class** (#1865 — `parameters_schema` at register, `invocation_record`, version), **function calling in `llm.rs`** (#1866 — `generate_with_tools` + `ChatOutcome::ToolCalls`), **recall-usage shadow sweep** (#1706 — `consumption_utility` in `confidence/calibrate.rs`), and **G7-step2 reranker pool + G8 fail-loud `mode:degraded`** (#1867). NOT shipped: the **global reranker default-on flip** (explicitly REFUSED by the #1867 vote — deferred to v1.0), **streaming tool responses** (open [#1868](https://github.com/alphaonedev/ai-memory-mcp/issues/1868)), the **#1707 conditional live recall-utility wire** (v1.0, gated on shadow divergence), and the **§23 vector index substrate** (→ #1860, v1.0). R8 TOON v2: **formally CUT** at Sprint-0 W4 (2026-07-09, memory 8c5e9f2a — no §2 property, TOON v1 ships).
 
 **Strengthens §2.4 (improvable across model generations) + §2.6 (bias-displaced via default-on reranker) + §2.1 (endpoint-resident via vector index substrate).**
 
@@ -841,7 +845,7 @@ Full policy: [`docs/telemetry.md`](docs/telemetry.md).
 - G8 — fail-loud reranker fallback.
 
 **Recoveries (optional):**
-- **R8 — TOON v2 schema inference** (target 85%+ token reduction). Recover or formally cut.
+- **R8 — TOON v2 schema inference** (target 85%+ token reduction). **FORMALLY CUT (2026-07-09, Sprint-0 W4 ruling, memory 8c5e9f2a):** pure token-reduction perf, strengthens no §2 property, TOON v1 already ships. Not reopened.
 
 ### 11.6 v1.0 — Federation Maturity + Portability + Audit — Q2 2027
 
@@ -897,7 +901,7 @@ All prior-roadmap commitments either shipped, are scheduled, are cut, or are tra
 | Plugin SDK Python + TypeScript | 6 | ❌ stays cut — MCP is the SDK |
 | Memory portability spec | 6 | ✅ shipped v0.6.3.1 |
 | Security audit | 6 | 🔜 v1.0 |
-| TOON v2 schema inference (R8) | 6 | 🔜 v0.9 (optional) |
+| TOON v2 schema inference (R8) | 6 | ❌ CUT 2026-07-09 (Sprint-0 W4; no §2 property) |
 
 ---
 
