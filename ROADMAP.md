@@ -994,7 +994,7 @@ Plus per-release:
 - A2A-gate cell certification (ironclaw-mtls minimum; full 6-cell matrix for major versions).
 - All 5 distribution channels publish smoke-tested (`memory_capabilities` returns valid response).
 - Mobile cross-compile gate (iOS + Android) on every PR; runtime emulator subset on `release/**`.
-- Reproducible build verification.
+- Build-provenance discipline: GPG-signed tags + `cargo audit` (RustSec) every release + a CycloneDX SBOM (v1.0, #1973); the R24 dependency-free offline verifier is the corpus-integrity anchor. (Bit-for-bit reproducible builds are NOT claimed — a same-runner rebuild cannot detect a compromised runner; SLSA-style signed build-provenance attestation is tracked for v1.x. Prior 'reproducible build verification' prose was a counterfactual gate, corrected 2026-07-09 per #1951.)
 - GPG-signed git tag.
 - Public-surface landing pages (ship-gate, A2A-gate) auto-update from result JSON.
 - **NEW: §2 property contribution declared per release.** Each release's CHANGELOG.md must name which of the seven properties (§2.1–§2.7) the release strengthens, with code anchors. If a release strengthens none, the release proposal must be re-evaluated against the §3 scope test before merge.

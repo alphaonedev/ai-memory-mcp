@@ -284,7 +284,7 @@ footer a{color:var(--text-muted)}
       <div class="stat"><div class="n">3</div><div class="l">Operating systems</div></div>
       <div class="stat"><div class="n">~10</div><div class="l">min wallclock</div></div>
       <div class="stat"><div class="n">100%</div><div class="l">Signed (Cosign + GPG)</div></div>
-      <div class="stat"><div class="n">SBOM</div><div class="l">Published per release</div></div>
+      <div class="stat"><div class="n">SBOM</div><div class="l">CycloneDX, v1.0</div></div>
     </div>
   </div>
 </section>
@@ -548,12 +548,12 @@ cargo install ai-memory --features sqlcipher</pre>
         <p style="font-size:.9rem"><code>git tag -s v*</code> only. Unsigned tags are never published. <strong>Procurement can verify the chain from tag to binary.</strong></p>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--gold)">
-        <h3 style="margin-bottom:.5rem">SBOM per release</h3>
-        <p style="font-size:.9rem">Cargo.toml + Cargo.lock are the complete dependency manifest. <code>cargo audit</code> runs in CI on every release.</p>
+        <h3 style="margin-bottom:.5rem">SBOM per release (v1.0)</h3>
+        <p style="font-size:.9rem"><code>cargo audit</code> (RustSec) runs in CI on every release today. A CycloneDX SBOM generated from Cargo.lock ships with each release artifact in v1.0 (#1973). SHA-256 is present for registry crates.</p>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--gold)">
-        <h3 style="margin-bottom:.5rem">Reproducible builds</h3>
-        <p style="font-size:.9rem">Pinned Rust toolchain. <code>--locked</code> on every cargo invocation. <strong>Same source produces the same binary.</strong></p>
+        <h3 style="margin-bottom:.5rem">Build provenance (v1.x)</h3>
+        <p style="font-size:.9rem">Pinned Rust toolchain + <code>--locked</code> on every cargo invocation. Bit-for-bit reproducible builds are <strong>not</strong> claimed — a same-runner rebuild cannot detect a compromised runner. SLSA-style signed build-provenance attestation is tracked for v1.x; today the trust anchor is the GPG-signed tag + the R24 dependency-free verifier.</p>
       </div>
       <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;border-top:3px solid var(--gold)">
         <h3 style="margin-bottom:.5rem">SHA256 release manifests</h3>
