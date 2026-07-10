@@ -1096,11 +1096,11 @@ The `benchmarks/longmemeval/` directory evaluates recall accuracy against the [L
 | Harness | Strategy | R@5 | Speed |
 |---------|----------|-----|-------|
 | `harness_99.py --no-expand` | Parallel FTS5, 10 cores | **97.0%** | 232 q/s (2.2s) |
-| `harness_99.py` | LLM expansion + parallel FTS5 | **97.8%** | 142 q/s (3.5s) |
+| `harness_99.py` | LLM expansion + parallel FTS5 | **97.2%** (Gemma 4, API venue; historical `gemma3:4b` 97.8%) | 142 q/s (3.5s) |
 | `harness_fast.py` | Single-process native SQLite | 96.2% | 57 q/s (8.8s) |
 | `harness.py` | CLI subprocess per operation | 96.2% | 1.2 q/s (414s) |
 
-Best result: **97.8% R@5 (489/500), 99.0% R@10, 99.8% R@20** -- 499/500 at R@20.
+Published expansion anchor (per the [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975) ruling, 2026-07-10): **97.2% R@5, 99.6% R@10, 99.8% R@20** — measured 2026-05-31 with OpenRouter `google/gemma-4-26b-a4b-it` (500 questions, 0 expansion failures). The historical `gemma3:4b` best (97.8% R@5, 489/500) is retained in `benchmarks/longmemeval/results.md` as the compiled-default-model row, no longer the headline. The keyword-tier 97.0% is LLM-independent.
 
 ```bash
 # Quick run (keyword, ~2s)

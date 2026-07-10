@@ -12,6 +12,13 @@ Evaluates ai-memory's recall engine against the [LongMemEval](https://github.com
 
 ### LLM-expanded + parallel FTS5 -- 3.5s recall, 142 q/s
 
+> **Historical row (gemma3:4b).** These are the `gemma3:4b`-expansion
+> numbers, retired as the published headline by the
+> [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)
+> ruling (2026-07-10). The current-generation published anchor is the
+> OpenRouter Gemma-4 run: **97.2% R@5 / 99.6% R@10 / 99.8% R@20**
+> (see [results.md](./results.md), row 5).
+
 | Category | R@1 | R@5 | R@10 | R@20 |
 |---|---|---|---|---|
 | **Overall** | **86.8%** | **97.8%** | **99.0%** | **99.8%** |
@@ -31,7 +38,7 @@ Four harnesses are provided, each building on the last:
 | `harness.py` | CLI subprocess per operation | ~57 q/s | baseline |
 | `harness_fast.py` | Native Python+SQLite, zero subprocesses | 232 q/s (parallel) | 97.0% |
 | `harness_blazing.py` | Multi-strategy FTS5 with enhanced titles | -- | ~96% |
-| `harness_99.py` | LLM query expansion + parallel FTS5 | 142 q/s | 97.8% |
+| `harness_99.py` | LLM query expansion + parallel FTS5 | 142 q/s | 97.2% (Gemma 4 anchor; `gemma3:4b` historical 97.8%) |
 
 ### harness.py -- Original CLI harness
 
@@ -98,7 +105,7 @@ python harness_fast.py --dataset-path /tmp/LongMemEval --variant S --parallel
 # Blazing multi-strategy FTS5
 python harness_blazing.py --dataset-path /tmp/LongMemEval --variant S
 
-# LLM-expanded queries (reproduces 97.8% R@5 result)
+# LLM-expanded queries (historical gemma3:4b 97.8% row; current anchor is results.md row 5 per #1975)
 python harness_99.py --dataset-path /tmp/LongMemEval --variant S
 ```
 

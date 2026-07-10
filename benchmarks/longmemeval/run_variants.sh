@@ -84,7 +84,7 @@ run_keyword_baseline() {
     local pass="$1"
     local db="/tmp/lme-bench-keyword.db"
     : > "$RESULTS_DIR/raw-keyword-${pass}.csv"
-    # Reproduces the published 97.8% R@5 row (LLM-expanded + parallel FTS5).
+    # Reproduces the historical gemma3:4b 97.8% R@5 row (LLM-expanded + parallel FTS5); current published anchor is results.md row 5 (#1975).
     REQUIRE_OLLAMA=1 python3 "$HARNESS_DIR/harness_99.py" \
         --dataset-path "$DATASET_PATH" \
         --variant "$DATASET_VARIANT" \
