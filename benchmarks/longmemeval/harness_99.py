@@ -90,18 +90,33 @@ Question: {question}
 Keywords:"""
 
 
+# #1983: expansion failures must be VISIBLE. A silently-empty expansion is
+# indistinguishable from a real one downstream, so a run where every request
+# fails degrades to the keyword baseline while reporting itself as an
+# LLM-expansion run. Every failure is now returned with its cause and the
+# run aborts when the success rate is below EXPAND_SUCCESS_FLOOR.
+EXPAND_TIMEOUT_SECS = float(os.environ.get("EXPAND_TIMEOUT_SECS", "30"))
+EXPAND_NUM_PREDICT = int(os.environ.get("EXPAND_NUM_PREDICT", "80"))
+EXPAND_SUCCESS_FLOOR = float(os.environ.get("EXPAND_SUCCESS_FLOOR", "0.9"))
+
+
 def expand_one(args):
     idx, question, url, model = args
     try:
         resp = requests.post(
             f"{url}/api/generate",
+            # "think": False — thinking-default models (e.g. gemma4 on
+            # Ollama >= 0.20) otherwise burn the whole num_predict budget
+            # inside the invisible thinking segment and return "" (#1983).
             json={"model": model, "prompt": EXPAND_PROMPT.format(question=question),
-                  "stream": False, "options": {"temperature": 0.3, "num_predict": 80}},
-            timeout=30)
+                  "stream": False, "think": False,
+                  "options": {"temperature": 0.3, "num_predict": EXPAND_NUM_PREDICT}},
+            timeout=EXPAND_TIMEOUT_SECS)
         resp.raise_for_status()
-        return idx, resp.json().get("response", "").strip().replace("\n", " ")
-    except Exception:
-        return idx, ""
+        text = resp.json().get("response", "").strip().replace("\n", " ")
+        return idx, text, None if text else "empty-response"
+    except Exception as exc:  # noqa: BLE001 — cause is surfaced, not swallowed
+        return idx, "", type(exc).__name__
 
 
 # ---------------------------------------------------------------------------
@@ -245,17 +260,32 @@ def main():
     if not args.no_expand:
         print(f"\n--- Phase 1: LLM expansion ({LLM_MODEL}, {args.llm_workers} threads) ---")
         t0 = time.time()
+        fail_causes = defaultdict(int)
         work = [(i, dataset[i]["question"], OLLAMA_URL, LLM_MODEL) for i in range(total)]
         with ThreadPoolExecutor(max_workers=args.llm_workers) as pool:
             futures = {pool.submit(expand_one, w): w[0] for w in work}
             done = 0
             for f in as_completed(futures):
-                idx, exp = f.result()
+                idx, exp, cause = f.result()
                 expansions[idx] = exp
+                if cause:
+                    fail_causes[cause] += 1
                 done += 1
                 if done % 100 == 0:
                     print(f"  [{done}/{total}] expanded ({done/(time.time()-t0):.1f} q/s)")
+        ok = sum(1 for e in expansions if e)
         print(f"  Expansion: {time.time()-t0:.1f}s ({total/(time.time()-t0):.1f} q/s)")
+        # #1983: publish the success rate; abort below the floor so a failed
+        # expansion phase can never silently publish keyword-baseline numbers
+        # under an LLM-expansion label.
+        print(f"  Expansion success: {ok}/{total} ({ok/total*100:.1f}%)"
+              + (f" — failures by cause: {dict(fail_causes)}" if fail_causes else ""))
+        if ok / total < EXPAND_SUCCESS_FLOOR:
+            sys.exit(
+                f"ABORT (#1983): expansion success {ok}/{total} is below the "
+                f"{EXPAND_SUCCESS_FLOOR:.0%} floor — results would be the keyword "
+                f"baseline mislabeled as LLM-expansion. Causes: {dict(fail_causes)}. "
+                f"Fix the endpoint/model (or run --no-expand for an honest keyword run).")
 
     # Phase 2: Parallel FTS5 recall (CPU parallelism)
     print(f"\n--- Phase 2: FTS5 recall ({args.workers} processes) ---")
