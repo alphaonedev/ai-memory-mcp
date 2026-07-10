@@ -11,9 +11,12 @@ layout: doc
 > The artifacts produced today (`ai-memory-ios.xcframework.tar.gz`,
 > `ai-memory-android.tar.gz`) are LINKABLE — embed them in an Xcode
 > or Android Studio project and link against the bundled rlib /
-> staticlib / cdylib — but the public FFI surface is a stub header
-> (`cbindgen.toml`) until Layer 2 declares it. Native CLI use over
-> Termux (Android) or a sidecar Mac (iOS) is supported TODAY.
+> staticlib / cdylib — but the public FFI surface is a single symbol
+> (`ai_memory_version()`, ARCH-10; the `cbindgen.toml` header is scoped
+> to exactly that per [#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976))
+> until the broader v1.x surface lands ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977)).
+> Native CLI use over Termux (Android) or a sidecar Mac (iOS) is
+> supported TODAY.
 
 This document is the operator guide for running ai-memory off a
 laptop / server — on a phone in your pocket, on a Raspberry Pi in a
@@ -194,11 +197,15 @@ user-installable CLI; iOS apps run in a sandbox; there is no
 
 ### What does not work today
 
-- **No public C-FFI surface yet.** The `cbindgen.toml` generates a
-  stub header — there are no `#[no_mangle] extern "C"` items in
-  `src/lib.rs` at v0.7.0. So while the staticlib bundles
-  correctly, you cannot meaningfully call into it from Swift
-  until v0.7.x ships the items (issue #1068 Layer 2). The
+- **A single-symbol C-FFI surface.** `src/lib.rs` exports exactly one
+  `#[no_mangle] extern "C"` item — `ai_memory_version()` (ARCH-10,
+  pinned by `tests/ffi_version_arch_10.rs`) — and the `cbindgen.toml`
+  header is scoped to exactly that symbol
+  ([#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976)).
+  So while the staticlib bundles correctly, you cannot meaningfully
+  call the memory API from Swift until the broader v1.x surface lands
+  ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977),
+  supersedes the issue #1068 Layer-2 framing). The
   build-pipeline-without-callable-surface scaffold is intentional;
   it pins the artifact + signing + xcframework layout before any
   API churn.
