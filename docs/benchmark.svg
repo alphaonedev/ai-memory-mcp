@@ -26,20 +26,20 @@
 
   <!-- R@5 -->
   <g class="stat1">
-    <text x="100" y="105" text-anchor="middle" class="num-green">97.8%</text>
-    <text x="100" y="128" text-anchor="middle" class="lbl">R@5 (489/500)</text>
+    <text x="100" y="105" text-anchor="middle" class="num-green">97.0%</text>
+    <text x="100" y="128" text-anchor="middle" class="lbl">R@5 (485/500)</text>
   </g>
 
   <!-- R@10 -->
   <g class="stat2">
-    <text x="260" y="105" text-anchor="middle" class="num-green">99.0%</text>
-    <text x="260" y="128" text-anchor="middle" class="lbl">R@10 (495/500)</text>
+    <text x="260" y="105" text-anchor="middle" class="num-green">98.2%</text>
+    <text x="260" y="128" text-anchor="middle" class="lbl">R@10 (491/500)</text>
   </g>
 
   <!-- R@20 -->
   <g class="stat3">
-    <text x="420" y="105" text-anchor="middle" class="num-green">99.8%</text>
-    <text x="420" y="128" text-anchor="middle" class="lbl">R@20 (499/500)</text>
+    <text x="420" y="105" text-anchor="middle" class="num-green">99.4%</text>
+    <text x="420" y="128" text-anchor="middle" class="lbl">R@20 (497/500)</text>
   </g>
 
   <!-- Speed -->
@@ -54,5 +54,5 @@
     <text x="720" y="128" text-anchor="middle" class="lbl">Cloud API costs</text>
   </g>
 
-  <text x="410" y="170" text-anchor="middle" class="footer">SQLite FTS5 BM25 + local LLM query-expansion (Ollama gemma3:4b) — zero cloud API costs — local-only inference</text>
+  <text x="410" y="170" text-anchor="middle" class="footer">SQLite FTS5 BM25 keyword tier — LLM-independent, local-only, zero cloud API costs · smart-tier anchor 97.2% R@5 (Gemma 4, API venue, #1975)</text>
 </svg>

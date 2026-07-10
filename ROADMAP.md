@@ -321,14 +321,15 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 
 | Metric | Result |
 |---|---|
-| Recall@5 | **97.8%** (489/500) |
-| Recall@10 | 99.0% (495/500) |
-| Recall@20 | 99.8% (499/500) |
+| Recall@5 (keyword, LLM-independent) | **97.0%** (485/500) |
+| Recall@5 (LLM-expanded, current-gen anchor) | **97.2%** (Gemma 4, API venue) |
+| Recall@10 / Recall@20 (keyword) | 98.2% (491/500) / 99.4% (497/500) |
+| Recall@10 / Recall@20 (LLM-expanded anchor) | 99.6% / 99.8% |
 | Throughput (keyword) | 232 q/s |
 | Throughput (LLM-expanded) | 142 q/s |
-| Cloud cost | $0 |
+| Cloud cost (keyword tier) | $0 |
 
-ICLR 2025 benchmark, pure SQLite FTS5+BM25, zero cloud. Reranker-on / reranker-off / curator-on variants disclosed at v0.6.3.1. Gemma 4 refresh planned at §11.4.A.
+ICLR 2025 benchmark, pure SQLite FTS5+BM25. Keyword tier is fully local / zero cloud. Reranker-on / reranker-off / curator-on variants disclosed at v0.6.3.1. §11.4.A Gemma-4 refresh DISCHARGED by the #1975 ruling (2×5 vote wf_8ac90aca, 2026-07-10): historical gemma3:4b 97.8% headline retired; the measured OpenRouter Gemma-4 leg (2026-05-31) promoted as the expansion anchor; no local-Ollama Gemma-4 number exists (CPU-only reference host, #1983); local GPU re-run reopenable post-v1.0.
 
 ### 9.6 Performance budgets (Apple M2, 16 GB, SQLite reference)
 
@@ -670,7 +671,7 @@ pillar builds on it.
 
 ##### §11.4.A LongMemEval Gemma 4 refresh — pre-distribution honesty (+1 session, urgent)
 
-Current published numbers ran with gemma3:4b; production v0.7.0 deploys Gemma 4. Re-run with `CURATOR_MODEL=gemma4:e4b`, publish updated R@5/R@10/R@20. **Strengthens §2.5 (attested — honesty of published claims).**
+Current published numbers ran with gemma3:4b; production deploys Gemma 4. **DISCHARGED 2026-07-10 by the #1975 ruling (2×5 vote wf_8ac90aca)**: the prescribed local `gemma4:e4b` re-run is infeasible on the CPU-only reference host (~1 tok/s; the attempt also surfaced harness defect #1983, now fixed) — the 97.8% gemma3:4b headline is formally retired and the measured OpenRouter Gemma-4 leg (97.2% R@5, 2026-05-31) is promoted as the published expansion anchor, venue labeled. Local GPU re-run reopenable post-v1.0. **Strengthens §2.5 (attested — honesty of published claims).**
 
 ##### §11.4.B Claude Code plugin marketplace install (+1 session)
 

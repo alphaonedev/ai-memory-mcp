@@ -768,7 +768,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (92 route registrations 
 
 ### Quality
 - **~10,000 tests across the full surface** -- roughly 6,712 `#[test]`/`#[tokio::test]` attributes under `src/` (5,759 `#[test]` + 953 `#[tokio::test]`) plus roughly 3,362 under `tests/` (2,138 `#[test]` + 1,224 `#[tokio::test]`), grown from the v0.6.4-era ~2,400-test baseline (1,960 lib + 211 integration + 16 mcp_integration + 4 webhook_http_parity + 16 recipe_contract + ~150 across other binary targets). Line coverage held above the **≥92% project bar**; net-new v0.6.4 modules at 100% (`sizes.rs`), 99.50% (`profile.rs`), 97.58% (`cli/audit.rs`), 97.05% (`cli/doctor.rs`), 92.56% (`handlers.rs`), 92.26% (`cli/install.rs`). v0.6.3.x baselines (1,809 / 93.08% and 1,886 / 93.84%) remain frozen on the [evidence page](https://alphaonedev.github.io/ai-memory-mcp/evidence.html); v0.6.4 metrics in the release notes and on the [test-hub campaign](https://github.com/alphaonedev/ai-memory-test-hub/blob/main/campaigns/v0.6.4.md). Empirical NHI discovery acceptance proven separately by the [Discovery Gate](https://alphaonedev.github.io/ai-memory-discovery-gate/) (T1–T4 matrix vs. live xAI Grok 4.3, 6/6 PASS, **GATE GREEN**).
-- **LongMemEval benchmark** -- **97.8% R@5** (489/500), **99.0% R@10**, **99.8% R@20** on ICLR 2025 LongMemEval-S dataset. 499/500 at R@20. Pure FTS5 keyword achieves 97.0% R@5 in 2.2 seconds (232 q/s). LLM query expansion pushes to 97.8% R@5. Zero cloud API costs. See [benchmark details](benchmarks/longmemeval/).
+- **LongMemEval benchmark** -- **97.0% R@5** pure FTS5 keyword (LLM-independent, 2.2 seconds, 232 q/s, zero API costs) on the ICLR 2025 LongMemEval-S dataset; LLM query expansion with the current-generation Gemma 4 model measures **97.2% R@5 / 99.6% R@10 / 99.8% R@20** (cloud-API venue; the historical `gemma3:4b` 97.8% figure is retired as headline per [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975)). See [benchmark details](benchmarks/longmemeval/).
 - **MCP Prompts** -- `recall-first` and `memory-workflow` prompts teach AI clients to use memory proactively
 - **TOON-default** -- recall/list/search responses use TOON compact by default (79% smaller than JSON)
 - **Criterion benchmarks** -- insert, recall, search at 1K scale
@@ -807,15 +807,15 @@ The `token-budget` workflow is a **required status check**. It enforces three cl
   <img src="docs/benchmark.svg" alt="LongMemEval benchmark results" width="820">
 </p>
 
-Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500 questions, 6 categories). Pure FTS5 keyword tier achieves 97.0% R@5 in 2.2 seconds. LLM query expansion (smart tier) pushes to 97.8% R@5. All inference runs locally — zero cloud API calls, zero cost.
+Evaluated on the [ICLR 2025 LongMemEval-S](benchmarks/longmemeval/) dataset (500 questions, 6 categories). Pure FTS5 keyword tier achieves 97.0% R@5 in 2.2 seconds — LLM-independent, fully local, zero cloud API calls, zero cost. LLM query expansion (smart tier) measures 97.2% R@5 with the current-generation Gemma 4 model (cloud-API venue).
 
-> **Benchmark-model caveat (2026-07-09):** the smart-tier (LLM-expansion) numbers were measured with **Gemma 3 4B** as the expansion model; the production default has since moved to Gemma 4. A Gemma-4 re-run + republish is tracked as a v1.0 Gate-0 honesty item (#1975). The **keyword-tier 97.0% R@5 is LLM-independent** and unaffected.
+> **Benchmark-model note (updated 2026-07-10, [#1975](https://github.com/alphaonedev/ai-memory-mcp/issues/1975) ruling):** the historical 97.8% R@5 smart-tier figure was measured with **Gemma 3 4B** (still the *compiled* default expansion model) and is retired as the headline. The published current-generation anchor is the measured **OpenRouter Gemma 4** run: **97.2% R@5 / 99.6% R@10 / 99.8% R@20** (2026-05-31, 500 questions, 0 expansion failures). No local-Ollama Gemma-4 number exists — the reference benchmark host is CPU-only, where a valid full-protocol local run is infeasible (see [#1983](https://github.com/alphaonedev/ai-memory-mcp/issues/1983)); a local GPU re-run stays open post-v1.0. The **keyword-tier 97.0% R@5 is LLM-independent** and unaffected.
 
 | Tier | R@5 | Speed | Dependencies |
 |------|-----|-------|-------------|
 | **keyword** | 97.0% | 232 q/s | None |
 | **semantic** | 97.4% | 45 q/s | Embedding model (~100MB) |
-| **smart** | 97.8% | 12 q/s | Any LLM backend (e.g. local Ollama + Gemma 3 4B; or xAI Grok 4.3, OpenAI gpt-5, Anthropic Claude Opus 4.7, Gemini, DeepSeek, etc. post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) |
+| **smart** | 97.2% (Gemma 4, API venue; historical `gemma3:4b` 97.8%) | 12 q/s | Any LLM backend (e.g. local Ollama + Gemma; or xAI Grok 4.3, OpenAI gpt-5, Anthropic Claude Opus 4.7, Gemini, DeepSeek, etc. post-[#1067](https://github.com/alphaonedev/ai-memory-mcp/issues/1067)) |
 
 ### Performance Budgets (v0.6.4)
 

@@ -93,9 +93,18 @@ LongMemEval is the ICLR 2025 long-term-memory benchmark by Wu et al.
 We benchmark **variant S** (cleaned). Acquire:
 
 ```bash
-git clone https://github.com/xiaowu0162/LongMemEval /tmp/LongMemEval
-cd /tmp/LongMemEval && git checkout 1c4f7a3
+git clone https://github.com/xiaowu0162/LongMemEval LongMemEval
+cd LongMemEval/data
+wget https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
 ```
+
+> **Pin correction (2026-07-10, #1975):** the previously-pinned upstream
+> commit `1c4f7a3` no longer exists — the upstream repo's history was
+> rewritten and the data moved to HuggingFace
+> (`xiaowu0162/longmemeval-cleaned`; upstream further cleaned the history
+> sessions in 2025/09). The `longmemeval_s_cleaned.json` file above (500
+> questions) is the current acquisition path; runs from 2026-05-31 onward
+> used this cleaned revision.
 
 ---
 
@@ -104,7 +113,8 @@ cd /tmp/LongMemEval && git checkout 1c4f7a3
 | Surface | Seed |
 |---|---|
 | Python harness sampling | `42` (fixed in harness scripts) |
-| Ollama `seed` parameter | `42` (passed via API; deterministic with `temperature=0`) |
+| Ollama `seed` parameter (`harness.py`, binary-faithful) | `42` (passed via API; deterministic with `temperature=0`) |
+| `harness_99.py` expansion (shadow) | **no seed; `temperature=0.3`** — corrected 2026-07-10 (#1975): the shadow harness never passed seed/temp-0; empirically its passes are repeatable (identical R@K counts across 8 passes observed 2026-07-10) |
 | ai-memory recall | None — recall is deterministic for a given DB and query |
 
 ---

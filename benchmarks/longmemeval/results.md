@@ -49,14 +49,26 @@ the installed v0.7.0 binary (schema v53).
 
 | # | Variant | Recall path | LLM expand backend | R@1 | R@5 | R@10 | R@20 |
 |--:|---|---|---|---:|---:|---:|---:|
-| 4 | keyword + expansion (published anchor) | shadow FTS5 | Ollama `gemma3:4b` | 86.8% | **97.8%** | 99.0% | 99.8% |
-| 5 | keyword + expansion (OpenRouter reproduction) | shadow FTS5 | OpenRouter `google/gemma-4-26b-a4b-it` | 86.0% | **97.2%** | 99.6% | 99.8% |
+| 4 | keyword + expansion (compiled-default model, historical headline) | shadow FTS5 | Ollama `gemma3:4b` | 86.8% | 97.8% | 99.0% | 99.8% |
+| 5 | keyword + expansion (**current-generation anchor**) | shadow FTS5 | OpenRouter `google/gemma-4-26b-a4b-it` | 86.0% | **97.2%** | 99.6% | 99.8% |
 
 Row 5 was run 2026-05-31 (500 questions, 0 expansion failures, 57,501
-OpenRouter tokens, 138.8s expansion + 1.7s recall). It reproduces the
-published anchor **within 0.6pp R@5** using a cloud LLM backend in place
-of local Ollama — confirming the expansion methodology is LLM-portable and
-the 97.8% headline holds with an entirely Ollama-free configuration.
+OpenRouter tokens, 138.8s expansion + 1.7s recall).
+
+> **Anchor change (2026-07-10, #1975 ruling — 2×5 vote `wf_8ac90aca`).**
+> The 97.8% row-4 figure is **retired as the headline**: it was measured
+> with `gemma3:4b`, which remains the *compiled* default expansion model
+> (`src/config.rs::backend_default_model`) but is no longer what
+> Gemma-4-era production deployments run. Row 5 — the measured
+> current-generation Gemma-4 number — is promoted to the published
+> expansion anchor, venue honestly labeled (cloud API). **No
+> local-Ollama Gemma-4 number exists**: the reference host is CPU-only,
+> where a valid full-protocol run is infeasible (~1 tok/s; see #1983 for
+> the harness-defect post-mortem that a first re-run attempt surfaced —
+> thinking-default models silently returned empty expansions, which the
+> harness now detects and refuses to publish). A local GPU re-run stays
+> reopenable post-v1.0. The keyword-tier numbers are LLM-independent and
+> unaffected.
 
 ---
 
