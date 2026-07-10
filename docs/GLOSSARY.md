@@ -37,7 +37,12 @@ claimed. Two surfaces at v0.7.0: (1) **store-path attestation**
 (#626 Layer-3) — a write presenting a valid detached Ed25519
 `signature` over the `SignableWrite` envelope lands
 `metadata.attest_level = "agent_attested"` instead of `"claimed"`;
-as of v0.9.0 ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)) an unsigned write is **rejected by default**; the explicit opt-out `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` restores the pre-v0.9 permissive (`claimed`) posture.
+an unsigned write is **rejected by default on the HTTP direct-write
+surface** ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751),
+surface-scoped by [#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985)),
+but **permissive by default** on the MCP `memory_store` and CLI `store`
+operator-as-actor surfaces (unsigned → `claimed`); `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
+forces strict on every surface and `=0` permissive on every surface.
 (2) **link/event attestation** — every `memory_links` row and signed
 event carries an `attest_level` from the five-variant enum
 (`src/models/link.rs::AttestLevel`): `unsigned`, `self_signed`,
