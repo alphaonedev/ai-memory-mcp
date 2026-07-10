@@ -13,11 +13,28 @@
 # byte-identical between CI runs unless someone changed an
 # `extern "C"` item.
 #
-# Until the C-callable FFI surface lands (v0.7.x #1068 Layer 2
-# follow-up or #1069 wrapper SDK), this config produces a stub
-# header containing only the language preamble. That's the expected
-# v0.7.0 state — the BUILD pipeline is the v0.7.0 Layer 2
-# deliverable; the actual `#[no_mangle] extern "C"` items follow.
+# v1.0 Gate-0 honesty fix (issue #1976). The real C-callable FFI
+# surface is DEFERRED to v1.x (tracked by issue #1977); the ONLY
+# symbol this crate ships today is `ai_memory_version()`
+# (`src/lib.rs`, ARCH-10 / FX-C4-batch2), pinned by
+# `tests/ffi_version_arch_10.rs`. Without `item_types = ["functions"]`
+# below, cbindgen's default item-type filter is NOT scoped to
+# `extern "C"` functions — it walks every `pub const` / `pub static`
+# at the crate root (SECS_PER_HOUR, HTTP_BODY_LIMIT_BYTES, and
+# ~150 more internal tuning constants never intended for C
+# consumption) plus every `#[repr(C)]`-ineligible `pub enum` it can
+# find (`EditSource`, `MemoryLinkRelation`, `RecordKind`), emitting
+# them as ~1600 lines of `#define` macros and unusable opaque
+# `typedef struct` forward-declarations with no defined fields. That
+# is NOT a shipped C ABI surface — it is Rust-internal plumbing that
+# cbindgen happens to be able to see, and advertising it in a header
+# consumers link against materially overstates what this crate
+# guarantees at the C boundary. `item_types = ["functions"]` scopes
+# generation to `extern "C"` functions only, so the header advertises
+# EXACTLY the one symbol that ships. When the real v1.x FFI surface
+# lands (#1977) and deliberately exposes additional constants/types,
+# widen `item_types` (or add explicit `[export.include]` entries)
+# alongside that work — not before.
 
 language = "C"
 header = """
@@ -27,6 +44,15 @@ header = """
  *
  * SPDX-License-Identifier: Apache-2.0
  * Copyright 2026 AlphaOne LLC
+ *
+ * C-ABI SURFACE CAVEAT (issue #1976, pre-v1.0 Gate-0 honesty pass):
+ * the real extern-C FFI surface is DEFERRED to v1.x (tracked by
+ * issue #1977). As of this build, the ONLY symbol this header
+ * declares — and the ONLY symbol this crate ships across the ABI —
+ * is `ai_memory_version()`, pinned by
+ * tests/ffi_version_arch_10.rs. Treat every declaration below as
+ * the complete shipped surface; there is no broader C API to
+ * discover by inspecting the crate's other public Rust items.
  */"""
 include_guard = "AI_MEMORY_H"
 cpp_compat = true
@@ -38,6 +64,13 @@ pragma_once = true
 # every public Rust type that happens to be `#[repr(C)]`-able.
 [export]
 prefix = "ai_memory_"
+# #1976 Gate-0 honesty fix: restrict generation to extern "C"
+# functions. Without this, cbindgen's default (empty item_types =
+# "generate everything visible") pulls in every pub const/static and
+# pub enum at the crate root regardless of extern "C" — see the
+# header-block comment above for what that used to produce. See
+# https://github.com/mozilla/cbindgen/blob/master/docs.md#itemtypes
+item_types = ["functions"]
 
 [parse]
 parse_deps = false
