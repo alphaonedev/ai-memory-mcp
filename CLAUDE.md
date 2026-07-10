@@ -366,7 +366,7 @@ The lib target (`crate-type = ["rlib", "staticlib", "cdylib"]`) cross-compiles f
 
 Selection rationale + CI cost rationale: `tests/mobile/README.md`. The `mobile-runtime` workflow is cost-capped (~$10/month at v0.7.0 release cadence vs. the $50-150 ceiling the spec set) by gating Android to `release/**` push + manual dispatch only.
 
-The C-callable FFI surface itself (`#[no_mangle] extern "C"` items in `src/lib.rs`) lands in a v0.7.x follow-up; v0.7.0 ships the BUILD pipeline + artifact layout but no FFI items, so `cbindgen.toml` generates a stub header until the surface is declared.
+The C-callable FFI surface is a single shipped symbol — `ai_memory_version()` in `src/lib.rs` (ARCH-10, pinned by `tests/ffi_version_arch_10.rs`); `cbindgen.toml` is scoped to exactly that symbol (`item_types = ["functions"]`, #1976). The broader C-ABI surface (memory API callable from C/Swift/Kotlin) is deferred to v1.x (#1977).
 
 ### Database
 

@@ -1218,7 +1218,7 @@ A production hive needs more than what v0.7.0 ships. The gaps:
 | Hierarchical persona reconciliation | Not in v0.7.0 | `persona_generate` per-peer; operator-driven reconcile |
 | Cross-tier governance-rule replication on wire | Partial (intra-cluster `build_namespace_chain` works; cross-tier is operator-replicated) | Manual replication across tiers |
 | Automatic edge-tier discovery | Not in v0.7.0 | Operator maintains per-tier peer list |
-| Mobile FFI surface (`#[no_mangle] extern "C"` items) | BUILD pipeline + artifact only at v0.7.0 | Tracked for v0.7.x follow-up; `cbindgen.toml` stub-only until then |
+| Mobile FFI surface (`#[no_mangle] extern "C"` items) | One shipped symbol — `ai_memory_version()` (ARCH-10; header scoped to it per [#1976](https://github.com/alphaonedev/ai-memory-mcp/issues/1976)) | Broader C-ABI surface deferred to v1.x ([#1977](https://github.com/alphaonedev/ai-memory-mcp/issues/1977)) |
 
 ### 9.4 Recommended hive pilot — 3 clusters, strict trust gates
 
