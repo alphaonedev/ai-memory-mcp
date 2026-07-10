@@ -224,9 +224,17 @@ impl std::fmt::Display for AttestError {
                 "write signature did not verify against the agent's bound public key — \
                  payload or signature bytes do not match what the agent signed",
             ),
+            // #1984 — name the concrete remediation paths so a refused user
+            // can self-serve. HTTP direct-writes require attestation by
+            // default (#1985); MCP and CLI do not.
             Self::AttestationRequired => f.write_str(
                 "agent attestation is required but this write is unsigned or the agent \
-                 has no bound public key",
+                 has no bound public key. To resolve: sign the write \
+                 (`ai-memory store --sign`, with a keypair bound via \
+                 `ai-memory agents bind-key`), or set \
+                 `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` to restore the permissive \
+                 posture. HTTP direct-writes (POST /api/v1/memories) require \
+                 attestation by default; MCP and CLI writes do not",
             ),
             Self::BadBoundKey => f.write_str(
                 "the agent's bound public key is malformed and cannot be used to verify",

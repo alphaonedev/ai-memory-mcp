@@ -299,7 +299,7 @@ async fn http_require_attestation_rejects_unsigned_403() {
 /// #626 Layer-3 — the synchronous MCP `handle_store` gate, distinct from the
 /// async HTTP handler exercised above. With `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
 /// set and no `signature` in the params, the require-branch
-/// (`src/mcp/tools/store/mod.rs` `else if require_agent_attestation_enabled()`)
+/// (`src/mcp/tools/store/mod.rs` `else if require_agent_attestation_for(Mcp)`)
 /// calls `stamp_attestation_sync(.., None)`, which rejects the unsigned write.
 /// The HTTP test cannot reach this branch — it drives `post_memory`, not the
 /// in-process `handle_store` entry point — so this pins the MCP path directly.
@@ -388,22 +388,22 @@ fn cli_require_attestation_rejects_unsigned_store() {
     );
 }
 
-/// #1751 (v0.9) — the COMPILED DEFAULT is now the strict posture: with
-/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` entirely ABSENT from the child
-/// env (`env_clear()`, no explicit set), an unsigned CLI store must be
-/// rejected. This is the flip promised by the v0.8.0 one-cycle
-/// deprecation WARN (#1464 vote); a regression that silently reverted
-/// the compiled default to permissive surfaces here, independent of the
-/// parse-ladder pins in `tests/config_precedence.rs`.
+/// #1985 (v1.0) — the CLI surface is operator-as-actor, so the COMPILED
+/// DEFAULT (with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` entirely ABSENT from
+/// the child env) is PERMISSIVE: an unsigned `ai-memory store` SUCCEEDS and
+/// lands as a bare `claimed`-level write (no `attest_level` stamp — the
+/// same no-stamp path as the explicit `=0` opt-out). This corrects the
+/// v0.9.0 #1751 require-everywhere default (the #1981 break). A regression
+/// that reinstated require-by-default on the CLI surface surfaces here,
+/// independent of the parse-ladder pins in `tests/config_precedence.rs`.
 #[test]
-fn cli_default_requires_attestation_rejects_unsigned_store_1751() {
+fn cli_default_permissive_lands_unsigned_store_claimed_1985() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("cli-attest-default.db");
     let mut cmd = assert_cmd::Command::cargo_bin("ai-memory").expect("cargo_bin");
-    let assert = cmd
-        .env_clear()
+    cmd.env_clear()
         .env("AI_MEMORY_NO_CONFIG", "1")
-        .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1751")
+        .env("AI_MEMORY_AGENT_ID", "ai:attest-cli-1985")
         .args([
             "--db",
             db.to_str().expect("utf8 path"),
@@ -411,18 +411,194 @@ fn cli_default_requires_attestation_rejects_unsigned_store_1751() {
             "--title",
             "cli-unsigned-default",
             "--content",
-            "Body of the unsigned CLI write under the v0.9 default, real prose.",
+            "Body of the unsigned CLI write under the v1.0 surface-scoped default, prose.",
             "--namespace",
             "attest-cli-default",
         ])
         .assert()
-        .failure();
-    let out = assert.get_output();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("attestation"),
-        "the v0.9 compiled default must reject an unsigned store; got stderr: {stderr}"
+        .success();
+    // The row landed and is claimed (no stamp), not rejected.
+    let conn = ai_memory::db::open(&db).expect("db::open");
+    let (count, level): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(json_extract(metadata, '$.attest_level')) \
+             FROM memories WHERE namespace = 'attest-cli-default'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("count query");
+    assert_eq!(
+        count, 1,
+        "the CLI permissive default must persist the unsigned write"
     );
+    assert_eq!(
+        level.as_deref(),
+        None,
+        "an unsigned CLI write under the permissive default takes the no-stamp claimed path"
+    );
+}
+
+/// #1985 (v1.0) — the MCP surface is operator-as-actor: with
+/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` ABSENT (the compiled default), an
+/// unsigned `memory_store` is ACCEPTED and lands as a bare `claimed`-level
+/// write (no `attest_level` stamp), byte-identical to the `=0` opt-out
+/// path. Guards on [`ENV_LOCK`] and defensively clears the var so a sibling
+/// env-mutating test cannot flip the gate closed mid-run.
+#[test]
+#[allow(clippy::await_holding_lock)] // sync test; lock only serialises env access
+fn mcp_default_permissive_lands_unsigned_store_claimed_1985() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK. The
+    // surface-scoped default lives in the ABSENCE of the var.
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+    let ttl = ResolvedTtl::default();
+    let namespace = "attest-mcp-default";
+    let params = json!({
+        "title": "mcp-unsigned-default",
+        "content": "Body of the unsigned MCP write under the v1.0 permissive default, prose.",
+        "namespace": namespace,
+        "tier": "mid",
+        "agent_id": "ai:alice",
+    });
+
+    let result = ai_memory::mcp::tools::handle_store_for_tests(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+    );
+
+    assert!(
+        result.is_ok(),
+        "the MCP permissive default must accept an unsigned write; got {result:?}"
+    );
+    let (count, level): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT COUNT(*), MAX(json_extract(metadata, '$.attest_level')) \
+             FROM memories WHERE namespace = ?1",
+            rusqlite::params![namespace],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("count query");
+    assert_eq!(
+        count, 1,
+        "unsigned MCP write must persist under the default"
+    );
+    assert_eq!(
+        level.as_deref(),
+        None,
+        "an unsigned MCP write under the permissive default takes the no-stamp claimed path"
+    );
+}
+
+/// #1985 (v1.0) — the HTTP direct-write surface stays fail-CLOSED under the
+/// compiled default: with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` ABSENT, an
+/// unsigned `POST /api/v1/memories` is still `403 ATTESTATION_FAILED`. This
+/// is the surface that DID keep the v0.9.0 strict posture; the MCP/CLI
+/// relaxation must not leak to the network surface.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // intentional: serialise the env access across the request
+async fn http_default_unsigned_store_rejected_403_1985() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK. Assert the
+    // compiled default by explicitly clearing the var.
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+
+    let (router, _f, _db_path) = build_test_router();
+    let (status, resp) = post_memory(
+        &router,
+        "ai:alice",
+        json!({
+            "title": "http-unsigned-default",
+            "content": "Body of the unsigned HTTP write under the v1.0 default, real prose.",
+            "namespace": "attest-it",
+            "tier": "mid",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the HTTP-direct compiled default must reject an unsigned write; got {resp}"
+    );
+    assert_eq!(
+        resp["code"].as_str(),
+        Some("ATTESTATION_FAILED"),
+        "403 envelope must carry the ATTESTATION_FAILED code; got {resp}"
+    );
+}
+
+/// #1985 (v1.0) — a presented-but-FORGED signature is rejected on the MCP
+/// surface EVEN THOUGH that surface's compiled default is permissive. The
+/// permissive default only governs the *absence* of a signature; a bad
+/// signature is never silently downgraded to a claim (the load-bearing
+/// `attest_write` invariant). Guards on [`ENV_LOCK`] and clears the var.
+#[test]
+#[allow(clippy::await_holding_lock)] // sync test; lock only serialises env access
+fn mcp_forged_signature_rejected_under_permissive_default_1985() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: edition-2024 env mutation; serialised by ENV_LOCK.
+    unsafe { std::env::remove_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION") };
+
+    let f = NamedTempFile::new().expect("tempfile");
+    let db_path = f.path().to_path_buf();
+    let conn = ai_memory::db::open(&db_path).expect("db::open");
+
+    let bound = ai_memory::identity::keypair::generate("ai:alice").expect("kp1");
+    let attacker = ai_memory::identity::keypair::generate("ai:alice").expect("kp2");
+    provision_agent(&db_path, "ai:alice", &bound.public_base64());
+
+    let title = "mcp-forged";
+    let content = "Body of the forged MCP write, long enough to read as real prose.";
+    let namespace = "attest-mcp-forged";
+    let created_at = chrono::Utc::now().to_rfc3339();
+    // Sign with the attacker key — does NOT match the bound key.
+    let sig_b64 = sign_envelope(
+        &attacker,
+        "ai:alice",
+        namespace,
+        title,
+        content,
+        &created_at,
+    );
+
+    let ttl = ResolvedTtl::default();
+    let params = json!({
+        "title": title,
+        "content": content,
+        "namespace": namespace,
+        "tier": "mid",
+        "agent_id": "ai:alice",
+        "signature": sig_b64,
+        "created_at": created_at,
+    });
+
+    let err = ai_memory::mcp::tools::handle_store_for_tests(
+        &conn, &db_path, &params, None, None, None, &ttl, false, None, None,
+    )
+    .expect_err("a forged signature must be rejected even on the permissive MCP surface");
+    assert!(
+        err.contains("attestation"),
+        "rejection must name the attestation gate; got: {err}"
+    );
+
+    // Defence-in-depth: the forged write must not have landed.
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+            rusqlite::params![namespace],
+            |r| r.get(0),
+        )
+        .expect("count query");
+    assert_eq!(count, 0, "rejected forged write must not persist a row");
 }
 
 /// #1751 (v0.9) — the explicit `=0` opt-out is honoured: same unsigned

@@ -825,8 +825,8 @@ mod store_handle {
         );
     }
 
-    // NOTE: the `else if require_agent_attestation_enabled()` unsigned-write
-    // rejection arm (store/mod.rs lines 356-358) is deliberately NOT driven
+    // NOTE: the `else if require_agent_attestation_for(WriteSurface::Mcp)`
+    // unsigned-write rejection arm (store/mod.rs) is deliberately NOT driven
     // here. It requires flipping the process-global
     // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` env var, which races every other
     // store-write test in this binary (cargo runs `#[tokio::test]`s in this

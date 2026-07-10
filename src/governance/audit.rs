@@ -1100,11 +1100,10 @@ pub const REQUIRE_CAUSE_BINDING_ENV: &str = "AI_MEMORY_REQUIRE_CAUSE_BINDING";
 /// independent of [`LAST_WATERMARKED_SEQ`].
 static LAST_WITNESSED_SEQ: AtomicI64 = AtomicI64::new(0);
 
-/// Truthy-env helper for the K2 require-mode knobs. Keeps the pre-v0.9
-/// opt-in shape (default `false`) that
-/// [`crate::identity::attest::require_agent_attestation_enabled`] had
-/// before its #1751 store-path default flip — these audit knobs stay
-/// permissive/withhold by default.
+/// Truthy-env helper for the K2 require-mode knobs. Keeps the plain
+/// opt-in shape (default `false`), distinct from the surface-scoped
+/// [`crate::identity::attest::require_agent_attestation_for`] resolver
+/// (#1985) — these audit knobs stay permissive/withhold by default.
 fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {

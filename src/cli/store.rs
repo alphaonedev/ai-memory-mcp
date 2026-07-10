@@ -86,10 +86,10 @@ pub struct StoreArgs {
     /// rather than merely *claimed*. Requires a `<agent_id>.priv` under
     /// the key directory (`AI_MEMORY_KEY_DIR` or the platform default);
     /// the bound public key must match (see `ai-memory agents bind-key`).
-    /// When unset, the unsigned write is REJECTED under the v0.9
-    /// required-attestation default (#1751) unless the operator set the
-    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out, in which case it
-    /// lands *claimed*.
+    /// When unset, the CLI surface is permissive by default (#1985
+    /// operator-as-actor `WriteSurface::Cli`), so the unsigned write lands
+    /// *claimed*; it is only REJECTED if the operator forces global-strict
+    /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
     #[arg(long)]
     pub sign: bool,
     /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
@@ -269,11 +269,10 @@ pub fn run(
     // #626 Layer-3 (Task 1.3 / C5) — agent attestation gate. When
     // `--sign` is set, load the agent's local keypair and sign the
     // attestable surface; the gate then stamps `metadata.attest_level =
-    // "agent_attested"`. The gate is also invoked (with no signature)
-    // when attestation is required — the v0.9 default (#1751) — so an
-    // unsigned write is rejected. Only under the explicit
-    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out does the unsigned
-    // path stay byte-equal to the pre-Layer-3 behavior (no stamp).
+    // "agent_attested"`. #1985 — the CLI surface default is PERMISSIVE, so
+    // an unsigned write takes the no-stamp `claimed` path; the gate is only
+    // additionally invoked (with no signature) when the operator forces
+    // strict via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
     let signature: Option<Vec<u8>> = if args.sign {
         let dir = identity::keypair::default_key_dir()?;
         let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
@@ -283,8 +282,21 @@ pub fn run(
     } else {
         None
     };
-    if args.sign || identity::attest::require_agent_attestation_enabled() {
-        identity::attest::stamp_attestation_sync(&conn, &mut mem, &agent_id, signature.as_deref())?;
+    // #1985 — CLI is the operator-as-actor surface (WriteSurface::Cli): its
+    // compiled default is PERMISSIVE, so an unsigned `ai-memory store` lands
+    // `claimed` unless the operator forces strict with
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`. `--sign` still upgrades to
+    // `agent_attested`; a forged signature is rejected regardless.
+    if args.sign
+        || identity::attest::require_agent_attestation_for(identity::attest::WriteSurface::Cli)
+    {
+        identity::attest::stamp_attestation_sync(
+            &conn,
+            &mut mem,
+            &agent_id,
+            signature.as_deref(),
+            identity::attest::WriteSurface::Cli,
+        )?;
     }
 
     // W5b/C5: governance enforcement routes through `cli::governance::enforce`
@@ -871,7 +883,7 @@ mod tests {
     // attestation_rejects_unsigned`) used to live here, SETTING the
     // process-global `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` under
     // `locked_env()`. The lock covers fellow MUTATORS, but the gate's
-    // READERS (`require_agent_attestation_enabled` callers in
+    // READERS (`require_agent_attestation_for` callers in
     // `mcp::tools::store` / `handlers::create` tests) run lock-free in
     // the same parallel lib-test process, so the set-window leaked into
     // any sibling store test scheduled concurrently (narrow-filter
