@@ -17,18 +17,26 @@
 //! persisted. Both delegate to the I/O-free [`stamp_attestation`] core so
 //! the decision logic is unit-tested without a database.
 //!
-//! # Required by default (v0.9, #1751)
+//! # Surface-scoped default (v1.0, #1985)
 //!
-//! Since v0.9 the STORE-path default is fail-closed: when
-//! `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is unset, an unsigned write (or a
-//! write whose agent has no bound key) is REJECTED instead of landing
-//! `attest_level = "claimed"`. This is the flip promised by the v0.8.0
-//! one-cycle deprecation WARN (#1464 5-agent vote, UNANIMOUS Option A).
-//! Operators opt out explicitly with
-//! `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`), restoring the
-//! pre-v0.9 permissive posture where unsigned writes land `claimed`. A
-//! *presented* signature that fails to verify is always rejected (see
-//! [`crate::identity::verify::attest_write`]) regardless of the flag.
+//! The STORE-path default for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is
+//! *surface-scoped*. With the env unset, an unsigned write is REJECTED only
+//! on the HTTP direct-write surface ([`WriteSurface::HttpDirect`] —
+//! `POST /api/v1/memories` + `/memories/bulk`); on the MCP and CLI surfaces
+//! ([`WriteSurface::Mcp`] / [`WriteSurface::Cli`]) an unsigned write is the
+//! permissive operator-as-actor path (#1621/#1675) and lands unstamped (a
+//! bare `claimed`-level write). The compiled default is resolved by
+//! [`require_agent_attestation_for`].
+//!
+//! This corrects the v0.9.0 #1751 default, which required attestation on
+//! *every* surface — an unsatisfiable posture on MCP hosts (no MCP client
+//! can construct/sign the canonical [`SignableWrite`] envelope), the #1981
+//! break. Env still wins over the compiled default: `=1`/`=true` forces
+//! strict on every surface (the v0.9.0 posture) and `=0`/`=false` forces
+//! permissive on every surface (the v0.8 posture). A *presented* signature
+//! that fails to verify is ALWAYS rejected (see
+//! [`crate::identity::verify::attest_write`]) on every surface regardless of
+//! the flag.
 //!
 //! SCOPE: this gate covers the direct CLI/MCP/HTTP store surfaces only.
 //! The federation receive path attests via the per-peer authorship
@@ -55,50 +63,89 @@ use crate::models::Memory;
 /// future timestamp) while leaving room for ordinary clock skew + transit.
 pub const ATTEST_CREATED_AT_SKEW_SECS: i64 = 300;
 
-/// `true` unless the operator has explicitly opted OUT of strict agent
-/// attestation with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (or `=false`).
+/// The API surface a store-path write arrived on (#1985).
 ///
-/// #1751 (v0.9) — the compiled STORE-path default is `true` (required):
-/// the flip promised by the v0.8.0 one-cycle deprecation WARN (#1464
-/// 5-agent vote, UNANIMOUS Option A). `=1`/`=true` remains the explicit
-/// opt-in spelling (now redundant with the default); any other value
-/// falls through to the required default so a typo fails CLOSED, never
-/// open. Env still wins over the compiled default — the standard
-/// `CLI flag > env > config > compiled default` ladder.
+/// The compiled default for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` is
+/// *surface-scoped*: with the env unset, only [`Self::HttpDirect`] requires
+/// attestation. [`Self::Mcp`] and [`Self::Cli`] are the operator-as-actor
+/// path (#1621/#1675) — the MCP host / shell user IS the operator and has no
+/// way to construct and sign the canonical [`SignableWrite`] envelope — so
+/// their compiled default is permissive. Scope is chosen by the *API
+/// surface* the write entered on, NEVER by transport or bind address: a
+/// postgres deployment that proxies MCP through the HTTP daemon still
+/// classifies those writes as [`Self::Mcp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSurface {
+    /// HTTP direct-write handlers: `POST /api/v1/memories` and
+    /// `POST /api/v1/memories/bulk`. Attestation is REQUIRED by default
+    /// (fail-closed) — an unauthenticated network client is not the
+    /// operator, so an unsigned direct write is rejected unless the operator
+    /// opts out with `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`.
+    HttpDirect,
+    /// MCP `memory_store` dispatch. Permissive by default (operator-as-actor,
+    /// #1621/#1675): an MCP host cannot sign the canonical envelope, so an
+    /// unsigned write lands as a bare `claimed`-level write.
+    Mcp,
+    /// CLI `ai-memory store`. Permissive by default (operator-as-actor): the
+    /// human at the shell is the operator. `store --sign` still upgrades a
+    /// write to `agent_attested` when a bound keypair is present.
+    Cli,
+}
+
+/// Resolve whether a store-path write on `surface` must be attested (#1985).
+///
+/// Tri-state read of `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`:
+///
+/// | env value            | `HttpDirect` | `Mcp` / `Cli` |
+/// |----------------------|--------------|---------------|
+/// | `1` / `true`         | required     | required      |
+/// | `0` / `false`        | permissive   | permissive    |
+/// | unset / unrecognized | required     | permissive    |
+///
+/// Env still wins over the compiled default — the standard
+/// `CLI flag > env > config > compiled default` ladder. Forged-signature
+/// rejection is unconditional on every surface regardless of this value (see
+/// [`crate::identity::verify::attest_write`]).
 ///
 /// SCOPE: direct CLI/MCP/HTTP store writes only; the federation receive
 /// boundary attests via the peer-authorship allowlist
 /// (`resolve_inbound_attribution`, #1464), not this flag.
 #[must_use]
-pub fn require_agent_attestation_enabled() -> bool {
-    parse_require_agent_attestation(
+pub fn require_agent_attestation_for(surface: WriteSurface) -> bool {
+    resolve_require_agent_attestation(
         std::env::var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION")
             .ok()
             .as_deref(),
+        surface,
     )
 }
 
-/// I/O-free parse core for [`require_agent_attestation_enabled`] (#1751).
+/// I/O-free parse core for [`require_agent_attestation_for`] (#1985).
 ///
-/// Explicit falsy (`0`/`false`, case-insensitive) → permissive opt-out;
-/// explicit truthy (`1`/`true`, case-insensitive) → required; unset or any
-/// unrecognized value → the required v0.9 compiled default (fail-closed).
-fn parse_require_agent_attestation(value: Option<&str>) -> bool {
+/// Explicit falsy (`0`/`false`, case-insensitive) → permissive on every
+/// surface; explicit truthy (`1`/`true`, case-insensitive) → required on
+/// every surface; unset or any unrecognized value → the surface-scoped
+/// compiled default (HTTP-direct fails CLOSED, MCP/CLI operator-as-actor stay
+/// permissive) so a typo fails closed on the network surface.
+fn resolve_require_agent_attestation(value: Option<&str>, surface: WriteSurface) -> bool {
     match value {
         Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
-        _ => true,
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => true,
+        _ => matches!(surface, WriteSurface::HttpDirect),
     }
 }
 
-/// #1751 — pin the parallel lib-test binary to the explicit permissive
-/// opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`), exactly once per
-/// process.
+/// #1751/#1985 — pin the parallel lib-test binary to the explicit
+/// permissive opt-out (`AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0`), exactly
+/// once per process.
 ///
-/// The v0.9 store-path default is REQUIRED, so every lib unit test that
-/// incidentally stores unsigned through a gated surface (MCP
-/// `handle_store`, the HTTP create handlers, CLI `store::run`) would
-/// otherwise be rejected. The strict-posture rejection paths are covered
-/// by the dedicated env-serialised integration binaries
+/// The #1985 surface-scoped default is REQUIRED on
+/// [`WriteSurface::HttpDirect`], so every lib unit test that incidentally
+/// stores unsigned through the HTTP create handlers would otherwise be
+/// rejected (MCP/CLI unit tests would pass under the unset default, but
+/// the pin keeps ALL lib tests deterministic against ambient operator
+/// env). The strict-posture rejection paths are covered by the dedicated
+/// env-serialised integration binaries
 /// (`tests/agent_attestation_integrity.rs`, `tests/config_precedence.rs`,
 /// `tests/agent_attestation_postgres.rs`) which own their child-process /
 /// guarded env.
@@ -261,9 +308,10 @@ pub fn stamp_attestation_sync(
     mem: &mut Memory,
     agent_id: &str,
     signature: Option<&[u8]>,
+    surface: WriteSurface,
 ) -> Result<AttestLevel> {
     let bound = crate::db::agent_pubkey(conn, agent_id)?;
-    let require = require_agent_attestation_enabled();
+    let require = require_agent_attestation_for(surface);
     stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)
 }
 
@@ -283,12 +331,13 @@ pub async fn stamp_attestation_async(
     mem: &mut Memory,
     agent_id: &str,
     signature: Option<&[u8]>,
+    surface: WriteSurface,
 ) -> Result<AttestLevel> {
     let bound = store
         .agent_pubkey(agent_id)
         .await
         .map_err(|e| anyhow::anyhow!("resolve bound agent pubkey: {e}"))?;
-    let require = require_agent_attestation_enabled();
+    let require = require_agent_attestation_for(surface);
     stamp_attestation(mem, agent_id, bound.as_deref(), signature, require)
 }
 
@@ -426,35 +475,50 @@ mod tests {
         assert!(err.to_string().contains("attestation failed"), "got: {err}");
     }
 
-    /// #1751 — the I/O-free parse core behind
-    /// `require_agent_attestation_enabled`. No process-env mutation here
-    /// (the parallel lib-test binary must never set the require flag —
-    /// see `src/mcp/tools/store/tests.rs` §#626); the env-backed reader
-    /// is covered by the env-serialised `tests/config_precedence.rs`.
+    /// #1985 — the I/O-free parse core behind
+    /// `require_agent_attestation_for`, over the tri-state × surface matrix.
+    /// No process-env mutation here (the parallel lib-test binary must never
+    /// set the require flag — see `src/mcp/tools/store/tests.rs` §#626); the
+    /// env-backed reader is covered by the env-serialised
+    /// `tests/config_precedence.rs`.
     #[test]
-    fn require_flag_parse_core_v09_default_required() {
-        // Unset → the v0.9 compiled default: REQUIRED (fail-closed).
-        assert!(parse_require_agent_attestation(None));
-        // Explicit opt-OUT spellings → permissive.
+    fn require_flag_parse_core_surface_scoped_default() {
+        use WriteSurface::{Cli, HttpDirect, Mcp};
+
+        // ---- Explicit opt-OUT spellings → permissive on EVERY surface. ----
         for v in ["0", "false", "FALSE", "False"] {
-            assert!(
-                !parse_require_agent_attestation(Some(v)),
-                "{v} must read as the explicit permissive opt-out"
-            );
+            for surface in [HttpDirect, Mcp, Cli] {
+                assert!(
+                    !resolve_require_agent_attestation(Some(v), surface),
+                    "{v} must read as the global permissive opt-out on {surface:?}"
+                );
+            }
         }
-        // Explicit opt-IN spellings (redundant with the default) → required.
+
+        // ---- Explicit opt-IN spellings → required on EVERY surface. ----
         for v in ["1", "true", "TRUE", "True"] {
-            assert!(
-                parse_require_agent_attestation(Some(v)),
-                "{v} must read as required"
-            );
+            for surface in [HttpDirect, Mcp, Cli] {
+                assert!(
+                    resolve_require_agent_attestation(Some(v), surface),
+                    "{v} must read as global strict on {surface:?}"
+                );
+            }
         }
-        // Unrecognized values fall through to the required default: a typo
-        // fails CLOSED, never open.
-        for v in ["no", "", "yes-please", "off", "2"] {
+
+        // ---- Unset / unrecognized → surface-scoped compiled default:
+        // HttpDirect fails CLOSED, MCP/CLI operator-as-actor stay permissive.
+        for value in [None, Some("no"), Some(""), Some("yes-please"), Some("2")] {
             assert!(
-                parse_require_agent_attestation(Some(v)),
-                "{v:?} must fall through to the required default"
+                resolve_require_agent_attestation(value, HttpDirect),
+                "{value:?} must require attestation on the HTTP-direct surface (fail-closed)"
+            );
+            assert!(
+                !resolve_require_agent_attestation(value, Mcp),
+                "{value:?} must stay permissive on the MCP surface (operator-as-actor)"
+            );
+            assert!(
+                !resolve_require_agent_attestation(value, Cli),
+                "{value:?} must stay permissive on the CLI surface (operator-as-actor)"
             );
         }
     }

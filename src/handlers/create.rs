@@ -820,7 +820,8 @@ async fn create_memory_postgres(
     // Same contract as the sqlite path, but the bound-key lookup goes
     // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
     // transport field; 403 when a presented signature fails to verify or
-    // required-attestation rejects an unsigned write.
+    // #1985 required-attestation (HTTP-direct default) rejects an unsigned
+    // write.
     {
         let presented_sig = body
             .signature
@@ -838,11 +839,14 @@ async fn create_memory_postgres(
                 }
             };
             mem.created_at = signed_created_at.to_string();
+            // #1985 — HTTP direct-write is the network surface (HttpDirect):
+            // required by default.
             if let Err(e) = crate::identity::attest::stamp_attestation_async(
                 app.store.as_ref(),
                 &mut mem,
                 agent_id,
                 Some(&sig_bytes),
+                crate::identity::attest::WriteSurface::HttpDirect,
             )
             .await
             {
@@ -855,14 +859,16 @@ async fn create_memory_postgres(
                 )
                     .into_response();
             }
-        } else if crate::identity::attest::require_agent_attestation_enabled()
-            && let Err(e) = crate::identity::attest::stamp_attestation_async(
-                app.store.as_ref(),
-                &mut mem,
-                agent_id,
-                None,
-            )
-            .await
+        } else if crate::identity::attest::require_agent_attestation_for(
+            crate::identity::attest::WriteSurface::HttpDirect,
+        ) && let Err(e) = crate::identity::attest::stamp_attestation_async(
+            app.store.as_ref(),
+            &mut mem,
+            agent_id,
+            None,
+            crate::identity::attest::WriteSurface::HttpDirect,
+        )
+        .await
         {
             return (
                 StatusCode::FORBIDDEN,
@@ -1303,9 +1309,9 @@ pub async fn create_memory(
     // the server validates the freshness window then adopts it verbatim.
     // A presented signature that fails to verify against the agent's
     // bound key is a 403; with no signature the unsigned write is a 403
-    // under the v0.9 required-attestation default (#1751) — only the
-    // explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out keeps the
-    // unsigned path unchanged.
+    // under the #1985 surface-scoped default (HTTP direct-write is the
+    // network surface `WriteSurface::HttpDirect`, required by default) —
+    // only `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opts this surface out.
     {
         let presented_sig = body
             .signature
@@ -1323,11 +1329,14 @@ pub async fn create_memory(
                 }
             };
             mem.created_at = signed_created_at.to_string();
+            // #1985 — HTTP direct-write is the network surface (HttpDirect):
+            // required by default.
             if let Err(e) = crate::identity::attest::stamp_attestation_sync(
                 &lock.0,
                 &mut mem,
                 &agent_id,
                 Some(&sig_bytes),
+                crate::identity::attest::WriteSurface::HttpDirect,
             ) {
                 return (
                     StatusCode::FORBIDDEN,
@@ -1338,10 +1347,15 @@ pub async fn create_memory(
                 )
                     .into_response();
             }
-        } else if crate::identity::attest::require_agent_attestation_enabled()
-            && let Err(e) =
-                crate::identity::attest::stamp_attestation_sync(&lock.0, &mut mem, &agent_id, None)
-        {
+        } else if crate::identity::attest::require_agent_attestation_for(
+            crate::identity::attest::WriteSurface::HttpDirect,
+        ) && let Err(e) = crate::identity::attest::stamp_attestation_sync(
+            &lock.0,
+            &mut mem,
+            &agent_id,
+            None,
+            crate::identity::attest::WriteSurface::HttpDirect,
+        ) {
             return (
                 StatusCode::FORBIDDEN,
                 Json(json!({

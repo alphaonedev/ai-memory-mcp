@@ -356,10 +356,11 @@ pub(crate) fn handle_store(
     // remote signer must supply the timestamp it used; the server validates
     // it against a bounded freshness window (replay / post-dating guard)
     // and then adopts it verbatim so the verifier re-derives the identical
-    // envelope. With no signature the unsigned write is rejected by the
-    // gate under the v0.9 required-attestation default (#1751); only the
-    // explicit `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out keeps the
-    // unsigned path byte-equal to the legacy build.
+    // envelope. #1985 — MCP is the operator-as-actor surface, so its
+    // compiled default is PERMISSIVE: with no signature the unsigned write
+    // lands `claimed` (skips the gate). Only an explicit
+    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`/`=true` forces the strict
+    // reject-unsigned posture on this surface.
     {
         let presented_sig = params["signature"]
             .as_str()
@@ -374,16 +375,32 @@ pub(crate) fn handle_store(
             // the identical envelope. `created_at` is the only signed time
             // field; `updated_at` stays at the server's persist time.
             mem.created_at = signed_created_at.to_string();
+            // #1985 — MCP is the operator-as-actor surface: classify by API
+            // surface (Mcp), never transport. The require value is moot on
+            // the signed branch (a valid sig attests, a forged one rejects,
+            // regardless), but pass Mcp so the wrapper resolves consistently.
             crate::identity::attest::stamp_attestation_sync(
                 conn,
                 &mut mem,
                 &agent_id,
                 Some(&sig_bytes),
+                crate::identity::attest::WriteSurface::Mcp,
             )
             .map_err(|e| e.to_string())?;
-        } else if crate::identity::attest::require_agent_attestation_enabled() {
-            crate::identity::attest::stamp_attestation_sync(conn, &mut mem, &agent_id, None)
-                .map_err(|e| e.to_string())?;
+        } else if crate::identity::attest::require_agent_attestation_for(
+            crate::identity::attest::WriteSurface::Mcp,
+        ) {
+            // Only reached when the env forces strict (`=1`/`=true`): the
+            // #1985 surface-scoped default leaves the MCP surface permissive,
+            // so an unsigned MCP write skips the gate and lands `claimed`.
+            crate::identity::attest::stamp_attestation_sync(
+                conn,
+                &mut mem,
+                &agent_id,
+                None,
+                crate::identity::attest::WriteSurface::Mcp,
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
 

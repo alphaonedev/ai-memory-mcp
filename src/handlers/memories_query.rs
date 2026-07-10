@@ -707,7 +707,12 @@ pub async fn bulk_create(
     // single-create contract. Per-row signature VERIFICATION (forged /
     // unverifiable → row rejected) is applied inside each backend loop
     // below via `stamp_attestation_*`.
-    let require_attest = crate::identity::attest::require_agent_attestation_enabled();
+    // #1985 — `/memories/bulk` is an HTTP direct-write endpoint, so it
+    // classifies as `WriteSurface::HttpDirect`: required by default, the same
+    // fail-closed posture as single-create above.
+    let require_attest = crate::identity::attest::require_agent_attestation_for(
+        crate::identity::attest::WriteSurface::HttpDirect,
+    );
     if require_attest
         && bodies.iter().any(|b| {
             b.signature
@@ -872,6 +877,7 @@ pub async fn bulk_create(
                             &mut mem,
                             &caller,
                             Some(&sig_bytes),
+                            crate::identity::attest::WriteSurface::HttpDirect,
                         )
                         .await
                         {
@@ -891,6 +897,7 @@ pub async fn bulk_create(
                     &mut mem,
                     &caller,
                     None,
+                    crate::identity::attest::WriteSurface::HttpDirect,
                 )
                 .await
             {
@@ -1120,6 +1127,7 @@ pub async fn bulk_create(
                             &mut mem,
                             &caller,
                             Some(&sig_bytes),
+                            crate::identity::attest::WriteSurface::HttpDirect,
                         ) {
                             tracing::warn!("bulk_create: attestation failed: {e}");
                             errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
@@ -1133,7 +1141,11 @@ pub async fn bulk_create(
                 }
             } else if require_attest
                 && let Err(e) = crate::identity::attest::stamp_attestation_sync(
-                    &lock.0, &mut mem, &caller, None,
+                    &lock.0,
+                    &mut mem,
+                    &caller,
+                    None,
+                    crate::identity::attest::WriteSurface::HttpDirect,
                 )
             {
                 tracing::warn!("bulk_create: required attestation rejected unsigned: {e}");

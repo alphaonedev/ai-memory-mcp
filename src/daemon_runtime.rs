@@ -4228,7 +4228,11 @@ pub async fn bootstrap_serve(
             args.host.as_str(),
             effective_mode,
             permission_rule_count,
-            crate::identity::attest::require_agent_attestation_enabled(),
+            // #1985 — the HTTP daemon's write surface is `HttpDirect`; report
+            // that surface's attestation posture in the boot WARN matrix.
+            crate::identity::attest::require_agent_attestation_for(
+                crate::identity::attest::WriteSurface::HttpDirect,
+            ),
         ) {
             tracing::warn!("{warning}");
         }
