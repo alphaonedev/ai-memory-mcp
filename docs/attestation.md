@@ -2,26 +2,28 @@
 layout: doc
 ---
 {% raw %}
-# Agent attestation — setup guide (required by default in v0.9.0)
+# Agent attestation — setup guide (surface-scoped default)
 
-> **What changed in v0.9.0.** Agent attestation is now **required by
-> default on every direct write** ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751)).
-> An **unsigned** `memory_store` (MCP) / `POST /api/v1/memories` (HTTP) /
-> `ai-memory store` (CLI) is **rejected** with **`403 ATTESTATION_FAILED`**
-> instead of quietly landing as `attest_level="claimed"`.
+> **What the default is.** Agent attestation is **required by default only
+> on the HTTP direct-write surface** ([#1751](https://github.com/alphaonedev/ai-memory-mcp/issues/1751),
+> surface-scoped by [#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985)):
+> an **unsigned** `POST /api/v1/memories` (+`/bulk`) is **rejected** with
+> **`403 ATTESTATION_FAILED`** instead of landing `attest_level="claimed"`.
+> The **MCP** `memory_store` and **CLI** `ai-memory store` surfaces are the
+> operator-as-actor path and are **permissive by default** — an unsigned
+> write lands `claimed`, no configuration needed. `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
+> forces strict on **every** surface; `=0` forces permissive on every surface.
+> A presented-but-forged signature is rejected on every surface regardless.
 
-> ### ⚠️ Solo user on Claude Code / Cursor / any non-signing MCP client? Read this first.
+> ### ✅ Solo user on Claude Code / Cursor / any non-signing MCP client? You're fine by default.
 > Those clients call `memory_store` **without a signature**, and there is **no
-> server-side auto-signing** for memory writes (unlike signals/checkpoints, memory
-> writes are never self-signed by the daemon). So under the v0.9.0 default, your MCP
-> writes are rejected with `403 ATTESTATION_FAILED` — this hits **every** local
-> single-user setup the first time the MCP server restarts on v0.9.0.
->
-> **If you run a single-operator local setup, the fix is one line** — set
-> `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` on the MCP server ([how ↓](#mcp-configuration-crystal-clear)).
-> Required-mode attestation is designed for **multi-agent / shared / federated**
-> deployments (where the client signs) or **signed CLI writes** — not the solo
-> Claude Code path.
+> server-side auto-signing** for memory writes. Because MCP is the
+> operator-as-actor surface, unsigned MCP writes are **accepted** (`claimed`)
+> under the compiled default — you do **not** need to set anything. (This
+> corrects the v0.9.0 GA, which required attestation on *every* surface and
+> broke non-signing MCP hosts — [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981).)
+> You only need the steps below if you set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
+> (global strict), or you write over **HTTP direct** (which stays strict).
 
 You have exactly **two** ways to move forward. Pick one:
 
@@ -70,9 +72,11 @@ variable, or the `--key-dir <path>` flag on `ai-memory identity`.
 The single knob is the environment variable
 **`AI_MEMORY_REQUIRE_AGENT_ATTESTATION`**:
 
-- `0` / `false` / `no` / `off` → attestation **not** required (unsigned
-  writes land as `claimed`, the pre-v0.9 behavior).
-- unset / `1` / `true` → **required** (the v0.9.0 default).
+- `0` / `false` → attestation **not** required on any surface (unsigned
+  writes land as `claimed` everywhere).
+- `1` / `true` → **required** on every surface (global strict).
+- unset (the compiled default) → **required on HTTP direct-write**,
+  **permissive on MCP and CLI** (operator-as-actor, #1985).
 
 Set it in the environment of **whichever surface you write from**. See
 [Setting environment variables per OS](#appendix-setting-environment-variables-per-os)
@@ -215,17 +219,18 @@ the CLI `--sign` path or Option A for MCP.
 
 This is the case most people hit first, because the ai-memory **MCP
 server** is what Claude Code (and other MCP hosts) talk to. The MCP
-`memory_store` tool enforces attestation exactly like the other surfaces:
+`memory_store` tool is the operator-as-actor surface — **permissive by
+default** (#1985):
 
 - If the tool call carries a valid `signature` + `created_at` → stored
   `agent_attested`.
-- If it carries **no** signature and attestation is required (the v0.9.0
-  default) → the write is **rejected**.
-- The only way to keep **unsigned** MCP writes working is the
-  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` opt-out.
+- If it carries **no** signature → under the compiled default the write is
+  **accepted** and lands `claimed` (no configuration needed). It is only
+  rejected if you set the global-strict `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
+- A presented-but-forged signature is **always** rejected, regardless.
 
 Today's common MCP clients (including Claude Code) call `memory_store`
-**without** signing, so you must choose a posture explicitly.
+**without** signing, and that works out of the box.
 
 ### Where MCP environment variables go
 
@@ -258,18 +263,21 @@ server reboots with the new environment.
 You run ai-memory on your own machine for your own Claude Code session
 and don't need per-write signatures:
 
-1. Add `"AI_MEMORY_REQUIRE_AGENT_ATTESTATION": "0"` to the server's
-   `env` block (above).
-2. Restart Claude Code (or your MCP host).
+1. **Nothing to configure.** MCP is permissive by default (#1985), so
+   unsigned `memory_store` calls are accepted and land `claimed`.
+2. (Only if you previously set global-strict `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`
+   and want the local surface permissive again, remove it or set `=0`.)
 
-Done — `memory_store` works, writes land `claimed`.
+Done — `memory_store` works out of the box, writes land `claimed`.
 
 ### Recipe 2 — Secure / multi-agent MCP
 
 You want every MCP write cryptographically attributed:
 
-1. Do **Option B** steps 1–3 for the agent id the MCP server presents
-   (leave `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` unset / `1`).
+1. Do **Option B** steps 1–3 for the agent id the MCP server presents,
+   and set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (global strict) so the
+   MCP surface rejects unsigned writes (the compiled default leaves MCP
+   permissive).
 2. Use an MCP client that signs — it must send `signature` + `created_at`
    on each `memory_store` call (the `SignableWrite` envelope above).
 3. Bind that client's public key with `ai-memory agents bind-key`.
@@ -288,7 +296,7 @@ Every stored memory carries `metadata.attest_level`:
 | `attest_level` | Meaning |
 |---|---|
 | `agent_attested` | Signature verified against the agent's bound key ✅ |
-| `claimed` | Unsigned, accepted because attestation is **off** (`=0`) |
+| `claimed` | Unsigned, accepted — either on a permissive-by-default surface (MCP/CLI) or because attestation is **off** (`=0`) |
 | `signed_by_peer` | Federated write attested by an enrolled peer |
 | `unsigned` | Legacy / pre-attestation row |
 
@@ -323,10 +331,10 @@ ai-memory agents revoke-key --agent-id my-agent
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `403 ATTESTATION_FAILED` on an **unsigned** write | attestation is required (v0.9.0 default) | sign the write (Option B) **or** set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (Option A) |
+| `403 ATTESTATION_FAILED` on an **unsigned** write | attestation is required on this surface — HTTP direct-write by default, or any surface under global-strict `=1` | sign the write (Option B) **or** set `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0` (Option A). Note MCP/CLI are permissive by default, so this should only appear on HTTP direct-write unless you set `=1` |
 | `403 ATTESTATION_FAILED` on a **signed** write | presented signature didn't verify | the bound public key doesn't match the signing key — re-run `agents bind-key` with the current `pub_b64`; or the `created_at` you signed drifted outside the freshness window (sign with the timestamp you send) |
 | `--sign requires a local keypair for agent '<id>'` | no `<id>.priv` in the key dir | `ai-memory identity generate --agent-id <id>` (check `AI_MEMORY_KEY_DIR`) |
-| MCP writes silently fail / host shows a tool error | MCP server rejecting unsigned writes | set the opt-out in the server's `env` block, or switch to a signing client (see [MCP configuration](#mcp-configuration-crystal-clear)) |
+| MCP writes silently fail / host shows a tool error | MCP server rejecting unsigned writes — only happens if you set global-strict `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1` (MCP is permissive by default) | remove the `=1` from the server's `env` block (or set `=0`), or switch to a signing client (see [MCP configuration](#mcp-configuration-crystal-clear)) |
 | Works on CLI, fails under MCP/daemon | env var set in your shell but not in the **server's** environment | set it where the surface runs — the `mcpServers.<name>.env` block, or the systemd/launchd unit for the HTTP daemon |
 
 ---

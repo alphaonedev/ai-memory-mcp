@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Agent attestation default is now surface-scoped** ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), resolving [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).
+  `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` becomes tri-state with a per-surface
+  compiled default: with the env unset, an unsigned direct-store write is
+  rejected (`403 ATTESTATION_FAILED`) **only on the HTTP direct-write
+  surface** (`POST /api/v1/memories` + `/memories/bulk`); the MCP
+  `memory_store` and CLI `store` surfaces are the operator-as-actor path and
+  stay permissive (unsigned → `attest_level="claimed"`). `=1` forces strict
+  on every surface (the v0.9.0 posture), `=0` forces permissive on every
+  surface (the v0.8 posture). Scope is by API surface, never transport/bind.
+  A presented-but-forged signature is rejected unconditionally on every
+  surface (unchanged). The `AttestationRequired` refusal text now names the
+  three remediation paths — sign the write (`ai-memory store --sign` with a
+  keypair bound via `ai-memory agents bind-key`), the `=0` opt-out, and that
+  HTTP-direct requires attestation by default while MCP/CLI do not ([#1984](https://github.com/alphaonedev/ai-memory-mcp/issues/1984)).
+
+### Errata (v0.9.0)
+
+- The v0.9.0 #1751 compiled default required attestation on **every** store
+  surface, but this was **unsatisfiable on MCP surfaces**: no MCP host can
+  construct and sign the canonical `SignableWrite` envelope, so an unsigned
+  `memory_store` under the default was rejected with no in-band remediation
+  (the [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)
+  external break). The reference deployment had validated the `=0` **opt-out
+  path**, not the shipped require-everywhere default. Corrected to the
+  surface-scoped default above (#1985); the v0.10.0 per-surface flips
+  (#94/#96) follow this precedent.
+
 ## [0.9.0] — 2026-07-08 — `security-hardening`
 
 **§2-property contribution (release-level declaration, per §17):** v0.9.0
