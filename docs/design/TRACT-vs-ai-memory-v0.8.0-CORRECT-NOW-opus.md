@@ -83,7 +83,7 @@ TRACT §4's "Operational NHI (Phase-0, deployable today)" is implemented almost 
 - **Forged signature rejected unconditionally** against the *enrolled* key, not the wire pubkey (`src/federation/receive_auth.rs`; `src/store/postgres.rs:12649`).
 - **Fail-closed peer enrollment** (v0.8.0 `#1789` secure default — `401 peer_not_enrolled`, `src/handlers/federation_signing_check.rs:1157-1230`).
 - **Persisted nonce-replay protection** (schema v51, `:613-634`).
-- **Attested checkpoints federated** (Pillar-1 FED-RQ-01): Ed25519 attested resolution, receiver does not re-sign, unattested rows fail `verify()` (`src/checkpoints/mod.rs:30-66,310-330`).
+- **Attested checkpoints (LOCAL substrate only)**: Ed25519 attested resolution, receiver does not re-sign, unattested rows fail `verify()` (`src/checkpoints/mod.rs:30-66,310-330`). *Correction (2026-07-10, Sprint-0 W1 #1938): checkpoint FEDERATION (FED-RQ-01) never landed at any tag — the claimed "+~282 LOC" existed only as an uncommitted review working tree. Carrier: [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936).*
 - **W-of-N quorum machinery exists** (`QuorumPolicy`, `AckTracker`, `src/replication.rs:38-78`, `src/federation/quorum.rs:19-60`).
 
 ### G. Privacy primitives: at-rest encryption + per-row visibility — *correct (server-side)*

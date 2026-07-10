@@ -90,7 +90,7 @@ Depth cap fail-closed (`src/storage/reflect.rs:413`); `epoch_freeze`/`stopper` =
 | **G24** | **CC0 test-vector conformance harness — THE KEYSTONE** | UNTRACKED | converts the L1 delta into falsifiable tests |
 | G25 | CC0/MPL split, no-CLA, N-of-M foundation | PARTIAL §7 (operator-decision) | — |
 | G26 | Postgres `archived_memory_links` snapshot/restore wiring (v70) | TRACKED | sqlite wired, pg follow-up |
-| G27 | Checkpoint/epoch federation holes FED-RQ-02..05 | TRACKED | FED-RQ-01 federates; 02–05 OPEN |
+| G27 | Checkpoint/epoch federation holes FED-RQ-01..05 | TRACKED | FED-RQ-01 never landed (no code at any tag; carrier [#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936)); 02–05 OPEN |
 | **G28** | Forbidden-export-class taxonomy absent (biometric/behavioral embeddings, master/threshold keys, signed policy-rules never cross the boundary) | UNTRACKED | forensic bundle + federation export the full row `src/forensic/bundle.rs:1114` |
 | G31 | Latency-SLO degrade actuator / ∅·A·B·C degradation manifest absent (fills Pillar 14) | UNTRACKED | degrades only on embedder *failure* (#1593), never on a latency *budget* |
 | G32 | Privacy-preserving cross-mind learning primitive (MPC / FHE / DP — shared *statistic*, never shared corpus) | TRACKED §11.7 / v1.0 FED-RQ-AGG (#1707) — horizon, **advertise-banned** | 0 production hits (`mpc`/`fhe`/`differential_privacy`) |
