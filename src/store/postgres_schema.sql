@@ -208,6 +208,21 @@ CREATE TABLE IF NOT EXISTS memories (
     -- schemas pick them up via migrate_v74().
     cid                   TEXT,
     cid_genesis           BYTEA,
+    -- v1.0.0 (#1945, spec §4, schema v79) — epistemic-typing provenance:
+    -- HOW the `memory_kind` was assigned. Closed vocab {declared,
+    -- channel_derived, regex, llm}; UNSIGNED metadata (NOT part of the
+    -- SignableWrite v2 envelope). Fresh schemas carry it inline here;
+    -- existing schemas pick it up via migrate_v79(). Mirrors
+    -- `models::KindProvenance`.
+    kind_provenance       TEXT,
+    -- v1.0.0 (#1834, schema v79) — claim-bitemporal validity window
+    -- (RFC3339 TEXT, mirroring the memory_links temporal columns): the
+    -- interval over which the recorded claim is asserted to hold,
+    -- distinct from `created_at` (when the row was written). Additive
+    -- nullable; NULL = unbounded. Existing schemas pick them up via
+    -- migrate_v79().
+    valid_from            TEXT,
+    valid_until           TEXT,
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -785,6 +800,38 @@ CREATE TABLE IF NOT EXISTS model_attestations (
 );
 CREATE INDEX IF NOT EXISTS idx_model_attestations_family
     ON model_attestations(model_family, agent_id);
+
+-- ─────────────────────────────────────────────────────────────────────
+-- agent_subkey_certs — instance sub-key certificate store
+-- (v1.0.0 crypto-core stage 2, #1942 / spec §2.3, schema v79; mirrors
+-- migrations/postgres/0038_v79_crypto_core.sql). One row per
+-- principal-root-signed `SubkeyCert` binding a per-instance sub-key
+-- (`instance_key_id` = the sub-key's raw Ed25519 verifying-key bytes) to
+-- its principal, model version, and validity window. `cert_bytes` keeps
+-- the exact canonical signed CBOR (the audit copy — the
+-- agent_lineage.record_bytes precedent); `signature` is the principal
+-- root's Ed25519 over those bytes; `revoked` is the additive revocation
+-- flag (FALSE = live). The principal-ROOT pubkey is deliberately NOT
+-- stored (the enrolled key is the sole trust authority; stage-3 verify
+-- fetches it from the agent binding). Unlike sqlite, postgres carries the
+-- lookup index inline (the bootstrap schema is applied only at fresh
+-- schema-init, never replayed over a legacy DB, so the #1861 sqlite
+-- crash-on-legacy-open hazard does not apply — cf. idx_memories_cid).
+-- ─────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS agent_subkey_certs (
+    id                 TEXT NOT NULL PRIMARY KEY,
+    principal          TEXT NOT NULL,
+    instance_key_id    BYTEA NOT NULL,
+    model_version_ref  BYTEA NOT NULL,
+    not_before         TEXT NOT NULL,
+    not_after          TEXT NOT NULL,
+    signature          BYTEA NOT NULL,
+    cert_bytes         BYTEA NOT NULL,
+    revoked            BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_subkey_certs_instance
+    ON agent_subkey_certs(instance_key_id);
 
 -- ─────────────────────────────────────────────────────────────────────
 -- signed_events_dlq — deferred-audit drainer dead-letter queue

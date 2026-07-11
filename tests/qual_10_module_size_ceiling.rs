@@ -683,7 +683,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // predicate + signed refusal audit emit).
     // 2026-07-07 (#1895) — bumped 25_960 → 26_000: the char-boundary-safe
     // `payload_preview` truncation guard landed the file at 25_966; +34 headroom.
-    ("src/store/postgres.rs", 26_000),
+    // 2026-07-11 (#1942/#1941/#1945/#1834 crypto-core stage 2) — bumped
+    // 26_000 → 26_100 for the v79 coordinated-migration arm (migrate_v79
+    // + MIGRATION_V79_CRYPTO_CORE const + ladder-comment block), landing
+    // the file at 26_032; +68 headroom. Growth justified: one additive
+    // migration, zero speculative surface.
+    ("src/store/postgres.rs", 26_100),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1046,7 +1051,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-04 (#1870 §25.3 S1) — bumped 5_050 → 5_130 for the v78
     // model_attestations migration arm + const + bootstrap SCHEMA mirror
     // + fresh-install/upgrade ladder tests.
-    ("src/storage/migrations.rs", 5_130),
+    // 2026-07-11 (#1942/#1941/#1945/#1834 crypto-core stage 2) — bumped
+    // 5_130 → 5_260 for the v79 coordinated-migration arm (probe-guarded
+    // ALTERs + agent_subkey_certs + ladder-owned index) + the bootstrap
+    // SCHEMA mirror (kind_provenance / valid_from / valid_until columns
+    // + certs table) + fresh-install/upgrade ladder tests, landing the
+    // file at 5_235; +25 headroom. Growth justified: one additive
+    // migration, zero speculative surface.
+    ("src/storage/migrations.rs", 5_260),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.

@@ -5,9 +5,10 @@ layout: doc
 
 v0.7.x extends the substrate's `MemoryKind` enum from the original
 three lifecycle variants (`Observation` / `Reflection` / `Persona`)
-with the seven-variant Batman taxonomy extension, and v0.8.0
-(Pillar 2, #1709) adds the three-variant typed-cognition cluster. The
-full set is now **13 kinds**:
+with the seven-variant Batman taxonomy extension, v0.8.0
+(Pillar 2, #1709) adds the three-variant typed-cognition cluster, and
+v1.0.0 (#1945, spec §4) adds the three-variant epistemic-typing
+cluster. The full set is now **16 kinds**:
 
 | variant | purpose |
 | --- | --- |
@@ -24,15 +25,39 @@ full set is now **13 kinds**:
 | `goal`        | a desired end-state / objective (Pillar 2 typed-cognition, #1709). |
 | `plan`        | an ordered strategy to reach a goal (Pillar 2 typed-cognition, #1709). |
 | `step`        | a single executable unit within a plan (Pillar 2 typed-cognition, #1709). |
+| `told`        | RECEIVED hearsay — a claim the agent was told, epistemically below `observation` (v1.0.0 #1945). |
+| `instruction` | a RECEIVED imperative / directive (fixes the L1 operator-directive mis-stamp) (v1.0.0 #1945). |
+| `intervention`| an ENACTED `do(X)` ground-truth — the do-calculus complement of `observation` (v1.0.0 #1945). |
 
 The first three are the v0.7.0 lifecycle variants and are unchanged.
 The next seven (Form 6) give downstream readers a richer
 filter-by-kind surface aligned with the Batman framework's exemplar
-(Tolaria's frontmatter-as-type schema). The final three
+(Tolaria's frontmatter-as-type schema). The next three
 (`goal` / `plan` / `step`, v0.8.0 #1709) are the Pillar-2
 typed-cognition kinds: a `goal` names a desired end-state, a `plan`
 is the ordered strategy to reach it, and a `step` is one executable
-unit within that plan.
+unit within that plan. The final three (`told` / `instruction` /
+`intervention`, v1.0.0 #1945) are the epistemic-typing kinds: `told`
+marks second-hand hearsay (below a first-person `observation`),
+`instruction` marks a received directive, and `intervention` marks a
+`do(X)` action the agent itself enacted. These three slugs are
+committed into the signed `SignableWrite` v2 genesis bytes
+(spec §2.2 [4]), so they are T4-frozen wire values at the v1.0 tag.
+The default-flip that would make untyped caller silence sink to
+`claim` (rather than `observation`) is PHASED to v0.10.0 (#1972) and is
+**not** part of this change — the untyped default remains
+`observation`.
+
+## Provenance metadata: `kind_provenance` (v1.0.0 #1945, schema v79)
+
+The additive nullable `memories.kind_provenance TEXT` column (schema
+v79) records **how** the kind was assigned — a closed vocabulary of
+`declared` / `channel_derived` / `regex` / `llm` (the
+`ConfidenceSource` precedent, [`crate::models::KindProvenance`]). It is
+**unsigned metadata** — NOT part of the signed envelope (unlike the
+`memory_kind` slug itself) — so it is an ESTIMABLE provenance marker: it
+records how the kind was assigned, not that the kind is true. It lets a
+consumer distinguish a caller-DECLARED kind from a channel-DERIVED one.
 
 ## Schema impact: none
 

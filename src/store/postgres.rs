@@ -281,6 +281,18 @@ const MIGRATION_V77_RECALL_OBSERVATIONS_FOLDED: &str =
 const MIGRATION_V78_MODEL_ATTESTATIONS: &str =
     include_str!("../../migrations/postgres/0037_v78_model_attestations.sql");
 
+/// v79 (#1942/#1941/#1945/#1834, v1.0.0 crypto-core stage 2) — the
+/// coordinated additive migration (postgres mirror of the sqlite v79
+/// arm). Adds `memories.kind_provenance` (#1945), the #1834
+/// claim-bitemporal `memories.valid_from` + `valid_until` columns, and
+/// the `agent_subkey_certs` SubkeyCert table + lookup index (spec §2.3).
+/// Postgres supports `ADD COLUMN IF NOT EXISTS`, so this is a single
+/// idempotent, replay-safe DDL batch (the v74 precedent). Fresh schemas
+/// carry the columns + table + index inline in `postgres_schema.sql`;
+/// existing schemas pick them up via `migrate_v79`.
+const MIGRATION_V79_CRYPTO_CORE: &str =
+    include_str!("../../migrations/postgres/0038_v79_crypto_core.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -629,7 +641,17 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       `folded = TRUE` for pre-existing (sync-touched) rows, probe-
 //       guarded so a replay never re-marks unconsumed rows.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep.
-const CURRENT_SCHEMA_VERSION: i32 = 78;
+// v79 = #1942/#1941/#1945/#1834 (v1.0.0 crypto-core stage 2) —
+//       coordinated additive migration: the epistemic-typing
+//       `memories.kind_provenance` column (#1945), the #1834
+//       claim-bitemporal `memories.valid_from` + `valid_until` columns,
+//       and the `agent_subkey_certs` SubkeyCert table (spec §2.3).
+//       Postgres supports `ADD COLUMN IF NOT EXISTS`, so the three ALTERs
+//       + the CREATE TABLE / CREATE INDEX IF NOT EXISTS are a single
+//       idempotent, replay-safe DDL batch (the v74 precedent). Purely
+//       additive, no full-table rebuild → no trigger recreation.
+//       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
+const CURRENT_SCHEMA_VERSION: i32 = 79;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1505,8 +1527,11 @@ impl PostgresStore {
         if current_version < 77 {
             self.migrate_v77().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 78 {
             self.migrate_v78().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v79().await?;
         }
 
         Ok(())
@@ -3772,8 +3797,9 @@ impl PostgresStore {
     /// create the `model_attestations` TOFU table + ladder-owned family
     /// index (postgres twin of the sqlite v78 arm). Pure additive,
     /// replay-safe DDL (CREATE TABLE / CREATE INDEX IF NOT EXISTS) in a
-    /// single transaction; stamps `CURRENT_SCHEMA_VERSION` as the new
-    /// ladder head.
+    /// single transaction. v78 is no longer the ladder head (v79 is), so
+    /// it stamps the LITERAL 78 — the same-run v79 arm advances past it
+    /// (the v76/v77 precedent).
     ///
     /// # Errors
     ///
@@ -3788,7 +3814,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v78 model_attestations", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // v78 is no longer the ladder head (v79 is); stamp the literal so
+        // the same-run v79 arm advances past it (the v76/v77 precedent).
+        record_schema_version(&mut tx, 78).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v78 ddl", e))?;
@@ -3797,6 +3825,44 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v78 applied (#1870: model_attestations — \
              loader/operator model-family attestation substrate)"
+        );
+        Ok(())
+    }
+
+    /// v1.0.0 crypto-core stage 2 (#1942/#1941/#1945/#1834) — the
+    /// coordinated additive migration (postgres twin of the sqlite v79
+    /// arm): the epistemic-typing `memories.kind_provenance` column
+    /// (#1945), the #1834 claim-bitemporal `memories.valid_from` +
+    /// `valid_until` columns, and the `agent_subkey_certs` SubkeyCert
+    /// table + lookup index (spec §2.3). Postgres supports `ADD COLUMN IF
+    /// NOT EXISTS`, so this is one idempotent, replay-safe DDL batch (the
+    /// v74 precedent — no probe needed). Purely additive, no full-table
+    /// rebuild → no trigger recreation (the v63/v65 lesson does not
+    /// arise). Stamps `CURRENT_SCHEMA_VERSION` as the new ladder head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v79(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v79 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V79_CRYPTO_CORE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v79 crypto-core", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v79 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v79 applied (#1942/#1941/#1945/#1834: \
+             crypto-core stage 2 — kind_provenance + claim-bitemporal \
+             valid_from/valid_until + agent_subkey_certs)"
         );
         Ok(())
     }

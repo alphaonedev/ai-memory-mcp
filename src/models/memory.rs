@@ -10,6 +10,19 @@ use super::default_metadata;
 // (#1558 batch 6).
 const KIND_OBSERVATION: &str = "observation";
 const KIND_REFLECTION: &str = "reflection";
+// v1.0.0 epistemic-typing vocab (#1945, spec §4 ship-now half). Named
+// consts (never scattered literals) so the vendor / hardcoded-literal
+// gates have a single definition site — the KIND_OBSERVATION precedent.
+const KIND_TOLD: &str = "told";
+const KIND_INSTRUCTION: &str = "instruction";
+const KIND_INTERVENTION: &str = "intervention";
+// v1.0.0 `kind_provenance` closed vocab (#1945, spec §4). Unsigned
+// metadata recording HOW the kind was assigned — the ConfidenceSource
+// precedent. Single-definition-site consts for the literal gates.
+const KIND_PROVENANCE_DECLARED: &str = "declared";
+const KIND_PROVENANCE_CHANNEL_DERIVED: &str = "channel_derived";
+const KIND_PROVENANCE_REGEX: &str = "regex";
+const KIND_PROVENANCE_LLM: &str = "llm";
 
 /// L1-1 (v0.7.0) — typed memory-kind discriminator stored in the
 /// `memories.memory_kind` column (schema v30).
@@ -112,6 +125,25 @@ pub enum MemoryKind {
     /// one actionable item whose completion advances the parent `Plan`
     /// toward its `Goal`.
     Step,
+    /// v1.0.0 epistemic typing (#1945, spec §4) — RECEIVED hearsay: a
+    /// claim the agent was *told* by another party, sitting epistemically
+    /// BELOW `Observation` (the agent did not witness it). Distinct from
+    /// `Claim` (a first-person propositional commitment) in that `Told`
+    /// explicitly marks second-hand provenance. This slug is committed
+    /// into the signed `SignableWrite` v2 genesis bytes (spec §2.2 [4]),
+    /// so it is a T4-frozen wire value at v1.0.
+    Told,
+    /// v1.0.0 epistemic typing (#1945, spec §4) — a RECEIVED imperative:
+    /// an instruction / directive the agent was given (fixes the L1
+    /// operator-directive mis-stamp where directives were coerced to
+    /// `Observation`). Signed genesis byte (spec §2.2 [4]); T4-frozen.
+    Instruction,
+    /// v1.0.0 epistemic typing (#1945, spec §4) — an ENACTED `do(X)`
+    /// ground-truth: the do-calculus complement of `Observation`. Marks a
+    /// memory recording an intervention the agent itself performed on the
+    /// world (not merely observed). Signed genesis byte (spec §2.2 [4]);
+    /// T4-frozen.
+    Intervention,
 }
 
 impl MemoryKind {
@@ -132,6 +164,9 @@ impl MemoryKind {
             Self::Goal => "goal",
             Self::Plan => "plan",
             Self::Step => "step",
+            Self::Told => KIND_TOLD,
+            Self::Instruction => KIND_INSTRUCTION,
+            Self::Intervention => KIND_INTERVENTION,
         }
     }
 
@@ -154,6 +189,9 @@ impl MemoryKind {
             "goal" => Some(Self::Goal),
             "plan" => Some(Self::Plan),
             "step" => Some(Self::Step),
+            KIND_TOLD => Some(Self::Told),
+            KIND_INSTRUCTION => Some(Self::Instruction),
+            KIND_INTERVENTION => Some(Self::Intervention),
             _ => None,
         }
     }
@@ -177,6 +215,9 @@ impl MemoryKind {
             Self::Goal,
             Self::Plan,
             Self::Step,
+            Self::Told,
+            Self::Instruction,
+            Self::Intervention,
         ]
     }
 
@@ -462,6 +503,77 @@ impl ConfidenceSource {
 }
 
 impl std::fmt::Display for ConfidenceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// v1.0.0 epistemic typing (#1945, spec §4) — typed discriminator for
+/// HOW a memory's [`MemoryKind`] was assigned.
+///
+/// Stored on the additive nullable `memories.kind_provenance TEXT`
+/// column (schema v79) as **unsigned metadata** — it is NOT part of the
+/// signed `SignableWrite` v2 envelope (unlike the `memory_kind` slug
+/// itself, spec §2.2 [4]). It records *how* the kind was assigned, not
+/// that the kind is true, so it is an ESTIMABLE provenance marker (spec
+/// §4), a clone of the [`ConfidenceSource`] precedent. Surfaced in recall
+/// so a consumer can distinguish a caller-DECLARED kind from a
+/// channel-DERIVED one.
+///
+/// This is a closed vocabulary. `from_str` returns `None` off-vocab so
+/// callers fall back to `None`/`Declared` (forward-compat with a future
+/// variant landing in a newer DB read by an older binary). The
+/// default-flip that makes caller silence sink to `Claim` is PHASED to
+/// v0.10.0 (#1972) and deliberately NOT part of this stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KindProvenance {
+    /// The caller explicitly declared the `memory_kind` on the write.
+    #[default]
+    Declared,
+    /// The kind was derived from the ingest channel / transport context
+    /// (e.g. an operator-directive channel stamping `Instruction`).
+    ChannelDerived,
+    /// The kind was assigned by a deterministic regex classifier
+    /// (`pre_store::auto_classify_kind` regex pass).
+    Regex,
+    /// The kind was assigned by an LLM classifier.
+    Llm,
+}
+
+impl KindProvenance {
+    /// Column-wire string for the `kind_provenance` column.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Declared => KIND_PROVENANCE_DECLARED,
+            Self::ChannelDerived => KIND_PROVENANCE_CHANNEL_DERIVED,
+            Self::Regex => KIND_PROVENANCE_REGEX,
+            Self::Llm => KIND_PROVENANCE_LLM,
+        }
+    }
+
+    /// Parse the column-wire string. Returns `None` off-vocab (forward-
+    /// compat), mirroring [`MemoryKind::from_str`].
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            KIND_PROVENANCE_DECLARED => Some(Self::Declared),
+            KIND_PROVENANCE_CHANNEL_DERIVED => Some(Self::ChannelDerived),
+            KIND_PROVENANCE_REGEX => Some(Self::Regex),
+            KIND_PROVENANCE_LLM => Some(Self::Llm),
+            _ => None,
+        }
+    }
+
+    /// Enumerate every variant in declaration order.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[Self::Declared, Self::ChannelDerived, Self::Regex, Self::Llm]
+    }
+}
+
+impl std::fmt::Display for KindProvenance {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -2150,7 +2262,7 @@ mod tests {
     #[test]
     fn memory_kind_all_enumerates_in_declaration_order() {
         let all = MemoryKind::all();
-        assert_eq!(all.len(), 13);
+        assert_eq!(all.len(), 16);
         assert_eq!(all[0], MemoryKind::Observation);
         assert_eq!(all[1], MemoryKind::Reflection);
         assert_eq!(all[2], MemoryKind::Persona);
@@ -2160,6 +2272,41 @@ mod tests {
         assert_eq!(all[10], MemoryKind::Goal);
         assert_eq!(all[11], MemoryKind::Plan);
         assert_eq!(all[12], MemoryKind::Step);
+        // v1.0.0 epistemic typing (#1945, spec §4) — the told /
+        // instruction / intervention cluster appends after Pillar-2,
+        // in declaration order (never reordered — the slugs are
+        // T4-frozen signed genesis bytes).
+        assert_eq!(all[13], MemoryKind::Told);
+        assert_eq!(all[14], MemoryKind::Instruction);
+        assert_eq!(all[15], MemoryKind::Intervention);
+    }
+
+    #[test]
+    fn memory_kind_epistemic_vocab_round_trips() {
+        // v1.0.0 (#1945) — the three epistemic kinds round-trip through
+        // the signed-byte wire slug exactly.
+        for (k, slug) in [
+            (MemoryKind::Told, "told"),
+            (MemoryKind::Instruction, "instruction"),
+            (MemoryKind::Intervention, "intervention"),
+        ] {
+            assert_eq!(k.as_str(), slug);
+            assert_eq!(MemoryKind::from_str(slug), Some(k));
+        }
+    }
+
+    #[test]
+    fn kind_provenance_round_trips_and_defaults_declared() {
+        assert_eq!(KindProvenance::default(), KindProvenance::Declared);
+        assert_eq!(KindProvenance::all().len(), 4);
+        for p in KindProvenance::all() {
+            assert_eq!(KindProvenance::from_str(p.as_str()), Some(*p));
+        }
+        assert_eq!(
+            KindProvenance::from_str("channel_derived"),
+            Some(KindProvenance::ChannelDerived)
+        );
+        assert_eq!(KindProvenance::from_str("unknown"), None);
     }
 
     #[test]
