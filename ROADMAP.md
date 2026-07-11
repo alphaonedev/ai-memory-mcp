@@ -726,7 +726,7 @@ Per §3 scope test: build/release tooling for the substrate, not the substrate i
 
 #### Hook pipeline expansion — v0.7.0 → v0.8.0
 
-v0.7.0 grand-slam ships 25 lifecycle events. v0.8.0 planned 10 events for the coordination substrate below; only `pre_signal_send` / `post_signal_ack` actually shipped (`src/hooks/events.rs::HookEvent`, 27 variants total) — the other 8 rows in this table were not implemented and remain unshipped/deferred.
+v0.7.0 grand-slam ships 25 lifecycle events. v0.8.0 planned 10 events for the coordination substrate below; only `pre_signal_send` / `post_signal_ack` actually shipped (`src/hooks/events.rs::HookEvent`, 27 variants total — verified via `awk '/^pub enum HookEvent/,/^}/' src/hooks/events.rs | grep -cE '^    [A-Z][a-zA-Z0-9]*,$'`) — the other 8 rows below (`pre_action_create`, `pre_state_change`, `post_state_change`, `pre_lease_acquire`, `on_lease_expire`, `pre_checkpoint_create`, `post_checkpoint_resolve`, `pre_routine_run`) were never implemented (zero `src/` hits for any of the 8 names) and remain unshipped/deferred; the underlying actions/leases/checkpoints/routines CRUD substrate itself DID ship (§11.4.D / Pillar 1) — only the governance-hook wiring AROUND those writes is missing. **Disposition tracked at [#1879](https://github.com/alphaonedev/ai-memory-mcp/issues/1879)** (filed per §24 so the gap isn't silently absorbed): whether the remaining 8 are genuine v1.0/backlog scope or a stale plan to strike is an OPEN operator call — no dedicated implementation issue exists yet for any of the 8.
 
 | Event | Fires at | Decision types |
 |---|---|---|
