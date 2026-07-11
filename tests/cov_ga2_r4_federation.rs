@@ -786,24 +786,24 @@ async fn schema_init_postgres_embedding_dim_conversion_round_trip() {
     // (the live-conversion arm init_and_enumerate_postgres:413-425). When the
     // DB was already at 768 from a prior run this is a no-op (false); accept
     // both so the test is order-independent on the shared scratch DB.
-    let v768 = run_at(768).await;
+    let converted = run_at(768).await;
     assert_eq!(
-        v768["embedding_dim"].as_i64(),
+        converted["embedding_dim"].as_i64(),
         Some(768),
-        "post-conv: {v768}"
+        "post-conv: {converted}"
     );
 
     // Step 3 — re-run at 768: idempotent no-op (embedding_dim_migrated=false),
     // exercising the migrate_embedding_dim Ok(false) arm.
-    let v768b = run_at(768).await;
+    let idempotent_rerun = run_at(768).await;
     assert_eq!(
-        v768b["embedding_dim"].as_i64(),
+        idempotent_rerun["embedding_dim"].as_i64(),
         Some(768),
-        "idempotent: {v768b}"
+        "idempotent: {idempotent_rerun}"
     );
     assert_eq!(
-        v768b["embedding_dim_migrated"], false,
-        "second run at the same dim must be a no-op: {v768b}"
+        idempotent_rerun["embedding_dim_migrated"], false,
+        "second run at the same dim must be a no-op: {idempotent_rerun}"
     );
 
     // Restore the shared scratch DB to the 384 baseline the other suites
