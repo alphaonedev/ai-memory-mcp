@@ -586,16 +586,16 @@ mod tests {
     fn text_length_prefix_boundaries() {
         // Empty text: header 0x60, no payload.
         assert_eq!(encode(&CborItem::Text("")), vec![0x60]);
-        // 23-byte text: header 0x77 (0x60 | 23) then the 23 bytes.
-        let t23 = "a".repeat(23);
-        let enc23 = encode(&CborItem::Text(&t23));
-        assert_eq!(enc23[0], 0x77);
-        assert_eq!(enc23.len(), 1 + 23);
-        // 24-byte text crosses to the 1-byte-length form: 0x78 0x18.
-        let t24 = "a".repeat(24);
-        let enc24 = encode(&CborItem::Text(&t24));
-        assert_eq!(&enc24[..2], &[0x78, 0x18]);
-        assert_eq!(enc24.len(), 2 + 24);
+        // Inline-length max (23 bytes): header 0x77 (0x60 | 23) then the bytes.
+        let text_at_inline_max = "a".repeat(23);
+        let enc_inline_max = encode(&CborItem::Text(&text_at_inline_max));
+        assert_eq!(enc_inline_max[0], 0x77);
+        assert_eq!(enc_inline_max.len(), 1 + 23);
+        // One past the inline max crosses to the 1-byte-length form: 0x78 0x18.
+        let text_past_inline_max = "a".repeat(24);
+        let enc_one_byte_len = encode(&CborItem::Text(&text_past_inline_max));
+        assert_eq!(&enc_one_byte_len[..2], &[0x78, 0x18]);
+        assert_eq!(enc_one_byte_len.len(), 2 + 24);
     }
 
     #[test]
@@ -614,10 +614,13 @@ mod tests {
     #[test]
     fn byte_string_length_boundaries() {
         assert_eq!(encode(&CborItem::Bytes(&[])), vec![0x40]);
-        let b23 = vec![0xabu8; 23];
-        assert_eq!(encode(&CborItem::Bytes(&b23))[0], 0x57); // 0x40 | 23
-        let b24 = vec![0xabu8; 24];
-        assert_eq!(&encode(&CborItem::Bytes(&b24))[..2], &[0x58, 0x18]);
+        let bytes_at_inline_max = vec![0xabu8; 23];
+        assert_eq!(encode(&CborItem::Bytes(&bytes_at_inline_max))[0], 0x57); // 0x40 | 23
+        let bytes_past_inline_max = vec![0xabu8; 24];
+        assert_eq!(
+            &encode(&CborItem::Bytes(&bytes_past_inline_max))[..2],
+            &[0x58, 0x18]
+        );
     }
 
     // -- array count prefix ---------------------------------------------
