@@ -1633,8 +1633,9 @@ fn default_capability_atomisation() -> CapabilityAtomisation {
 ///   `["observation", "reflection", "persona", "concept", "entity",
 ///   "claim", "relation", "event", "conversation", "decision"]`
 ///   extended at v0.8.0 (#1709) with the typed-cognition cluster
-///   `"goal", "plan", "step"` — anchored at compile time by
-///   [`crate::models::MemoryKind::all`].
+///   `"goal", "plan", "step"` and at v1.0.0 (#1945, spec §4) with the
+///   epistemic cluster `"told", "instruction", "intervention"` —
+///   anchored at compile time by [`crate::models::MemoryKind::all`].
 /// - `recall_filter`: MCP `memory_recall` and HTTP recall accept a
 ///   `kinds` parameter (CSV string or JSON array). `"implemented"`
 ///   once the param is plumbed into [`crate::mcp::tools::recall`]

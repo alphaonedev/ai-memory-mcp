@@ -129,6 +129,13 @@ pub mod lineage;
 // and no schema migration this stage. The v1 map-based `sign` path is
 // untouched and never cross-verifies with v2 (distinct domain tag).
 pub mod cbor_array;
+// v1.0.0 crypto-core stage 2 (#1942/#1941, epic #1940) — the SubkeyCert
+// instance-certification layer (spec §2.3) and the algorithm-suite
+// binding + anti-downgrade verifier rule (spec §2.4). Pure functions +
+// record types + golden vectors ONLY; no store/ingest/receive wiring this
+// stage (that is stage 3). Both build ON the stage-1 `cbor_array` encoder.
+pub mod subkey_cert;
+pub mod suite;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).

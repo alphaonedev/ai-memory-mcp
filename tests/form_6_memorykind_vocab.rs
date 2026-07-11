@@ -8,9 +8,10 @@
 //!
 //! Pins the seven externally-observable contracts added in this PR:
 //!
-//!  1. All thirteen variants of [`MemoryKind`] serialize and
+//!  1. All sixteen variants of [`MemoryKind`] serialize and
 //!     deserialize round-trip on JSON (ten Form-6 + three Pillar-2
-//!     typed-cognition kinds, #1709).
+//!     typed-cognition kinds, #1709 + three v1.0.0 epistemic kinds,
+//!     #1945).
 //!  2. Backward-compat — a row written before this change (no
 //!     `memory_kind` field on the JSON payload) reads as
 //!     `Observation`.
@@ -23,7 +24,7 @@
 //!  6. With `auto_classify` set to `Off`, the substrate keeps the
 //!     caller-supplied kind verbatim.
 //!  7. Capabilities v3 emits the new `memory_kind_vocab` block with
-//!     the full 13-variant vocabulary and the auto-classify mode
+//!     the full 16-variant vocabulary and the auto-classify mode
 //!     enum.
 
 #![allow(clippy::doc_markdown)]
@@ -99,6 +100,9 @@ fn all_thirteen_variants_round_trip_through_serde() {
         ("goal", MemoryKind::Goal),
         ("plan", MemoryKind::Plan),
         ("step", MemoryKind::Step),
+        ("told", MemoryKind::Told),
+        ("instruction", MemoryKind::Instruction),
+        ("intervention", MemoryKind::Intervention),
     ];
     for (wire, variant) in wires {
         assert_eq!(MemoryKind::from_str(wire), Some(variant));
@@ -117,8 +121,8 @@ fn memory_kind_all_returns_full_vocabulary() {
     let all = MemoryKind::all();
     assert_eq!(
         all.len(),
-        13,
-        "Form 6 (10) + Pillar 2 typed-cognition (3) = 13 variants total"
+        16,
+        "Form 6 (10) + Pillar 2 typed-cognition (3) + v1.0.0 epistemic (3) = 16 variants total"
     );
     // First three are the v0.7.0 lifecycle variants in declaration
     // order — the L1-1 / QW-2 vocabulary that pre-dates Form 6.
@@ -128,10 +132,14 @@ fn memory_kind_all_returns_full_vocabulary() {
     // Next seven are Form 6 in declaration order.
     assert_eq!(all[3], MemoryKind::Concept);
     assert_eq!(all[9], MemoryKind::Decision);
-    // Last three are the v0.8.0 Pillar-2 typed-cognition cluster (#1709).
+    // Next three are the v0.8.0 Pillar-2 typed-cognition cluster (#1709).
     assert_eq!(all[10], MemoryKind::Goal);
     assert_eq!(all[11], MemoryKind::Plan);
     assert_eq!(all[12], MemoryKind::Step);
+    // Last three are the v1.0.0 epistemic-typing cluster (#1945, spec §4).
+    assert_eq!(all[13], MemoryKind::Told);
+    assert_eq!(all[14], MemoryKind::Instruction);
+    assert_eq!(all[15], MemoryKind::Intervention);
 }
 
 #[test]
@@ -670,8 +678,10 @@ fn cap_v3_form6_carries_memory_kind_vocab_block() {
     let vocabulary = vocab["vocabulary"].as_array().expect("vocabulary array");
     let names: Vec<&str> = vocabulary.iter().filter_map(Value::as_str).collect();
     // Compile-anchored — the full 10-variant Batman taxonomy plus the
-    // 3-variant Pillar-2 typed-cognition cluster (#1709) = 13.
-    assert_eq!(names.len(), 13);
+    // 3-variant Pillar-2 typed-cognition cluster (#1709) plus the
+    // 3-variant v1.0.0 epistemic cluster (#1945: told / instruction /
+    // intervention) = 16.
+    assert_eq!(names.len(), 16);
     for required in [
         "observation",
         "reflection",
@@ -686,6 +696,9 @@ fn cap_v3_form6_carries_memory_kind_vocab_block() {
         "goal",
         "plan",
         "step",
+        "told",
+        "instruction",
+        "intervention",
     ] {
         assert!(
             names.contains(&required),

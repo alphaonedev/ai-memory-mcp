@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 78).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 79).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -174,7 +174,21 @@ CREATE TABLE IF NOT EXISTS memories (
     -- while `cid` is retained. NULL on legacy rows the v74 backfill
     -- couldn't stamp. Mirrors `models::Memory::cid`.
     cid                   TEXT,
-    cid_genesis           BLOB
+    cid_genesis           BLOB,
+    -- v1.0.0 (#1945, spec §4, schema v79) — epistemic-typing provenance:
+    -- HOW the `memory_kind` was assigned. Closed vocab {declared,
+    -- channel_derived, regex, llm}; UNSIGNED metadata (NOT part of the
+    -- SignableWrite v2 envelope). NULL on legacy rows the v79 arm couldn't
+    -- stamp; also carried by migrate v79 for upgrading DBs. Mirrors
+    -- `models::KindProvenance`.
+    kind_provenance       TEXT,
+    -- v1.0.0 (#1834, schema v79) — claim-bitemporal validity window: the
+    -- interval over which the recorded claim is asserted to hold (RFC3339
+    -- TEXT, mirroring the memory_links temporal columns). Distinct from
+    -- `created_at` (when the row was written) — these bound when the
+    -- CLAIM is valid in the world. Additive nullable; NULL = unbounded.
+    valid_from            TEXT,
+    valid_until           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_tier ON memories(tier);
@@ -407,6 +421,34 @@ CREATE TABLE IF NOT EXISTS model_attestations (
     signature     BLOB,
     created_at    TEXT NOT NULL,
     UNIQUE (provider, model_ref, model_family, agent_id)
+);
+
+-- v1.0.0 crypto-core stage 2 (#1942, spec §2.3, schema v79) — instance
+-- sub-key certificate store. One row per principal-root-signed
+-- `SubkeyCert` binding a per-instance sub-key (`instance_key_id` = the
+-- sub-key's raw Ed25519 verifying-key bytes) to its principal, model
+-- version, and validity window. `cert_bytes` keeps the exact canonical
+-- signed CBOR (the audit copy — the `agent_lineage.record_bytes`
+-- precedent); `signature` is the principal root's Ed25519 over those
+-- bytes. `revoked` is the additive revocation flag (0 = live). The
+-- principal-ROOT pubkey is deliberately NOT stored here: the enrolled
+-- key is the sole trust authority (stage-3 verify fetches it from the
+-- agent binding), so an unauthenticated column can never become a trust
+-- input. Created by migration v79 for upgrading DBs; inline here so a
+-- fresh bootstrap carries it. The `idx_agent_subkey_certs_instance`
+-- lookup index is LADDER-OWNED (the v79 arm), NOT inline — the #1861 /
+-- v75 bootstrap-inline-index lesson.
+CREATE TABLE IF NOT EXISTS agent_subkey_certs (
+    id                 TEXT NOT NULL PRIMARY KEY,
+    principal          TEXT NOT NULL,
+    instance_key_id    BLOB NOT NULL,
+    model_version_ref  BLOB NOT NULL,
+    not_before         TEXT NOT NULL,
+    not_after          TEXT NOT NULL,
+    signature          BLOB NOT NULL,
+    cert_bytes         BLOB NOT NULL,
+    revoked            INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -802,7 +844,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 78;
+const CURRENT_SCHEMA_VERSION: i64 = 79;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1390,6 +1432,22 @@ const MIGRATION_V77_SQLITE: &str =
 // in the bootstrap `SCHEMA` const.
 const MIGRATION_V78_SQLITE: &str =
     include_str!("../../migrations/sqlite/0062_v78_model_attestations.sql");
+// v79 (#1942/#1941/#1945/#1834, v1.0.0 crypto-core stage 2) — coordinated
+// additive migration: (a) the epistemic-typing `memories.kind_provenance`
+// TEXT NULL column (#1945, spec §4 — unsigned metadata, closed vocab
+// {declared, channel_derived, regex, llm}); (b) the #1834 claim-bitemporal
+// `memories.valid_from` + `memories.valid_until` TEXT NULL columns
+// (RFC3339, mirroring the memory_links temporal columns); (c) the
+// `agent_subkey_certs` table backing the SubkeyCert layer (spec §2.3).
+// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the three ALTERs run only
+// behind a column-existence probe (the v74/v75 pattern) — fresh installs
+// inherit the columns inline from the bootstrap `SCHEMA` (CREATE TABLE
+// memories). The `agent_subkey_certs` CREATE TABLE is idempotent (IF NOT
+// EXISTS) and also inline in the bootstrap SCHEMA; its lookup index is
+// LADDER-OWNED (re-asserted in the arm, NOT bootstrap-inline — the #1861
+// lesson). Purely additive, no full-table rebuild → no trigger recreation
+// (the v63/v65 lesson does not arise).
+const MIGRATION_V79_SQLITE: &str = include_str!("../../migrations/sqlite/0063_v79_crypto_core.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3345,6 +3403,36 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v79 = #1942/#1941/#1945/#1834 (v1.0.0 crypto-core stage 2) —
+            // coordinated additive migration. (a) The three additive
+            // nullable `memories` columns (`kind_provenance` +
+            // `valid_from` + `valid_until`) live in the SQL file behind a
+            // column-existence probe (SQLite has no `ADD COLUMN IF NOT
+            // EXISTS`; the v74/v75 pattern) — a fresh install already
+            // carries them from the bootstrap `SCHEMA` CREATE TABLE, so
+            // the probe skips the ALTERs; a legacy upgrade DB (columns
+            // absent) runs them exactly once. The file also carries the
+            // idempotent `agent_subkey_certs` CREATE TABLE IF NOT EXISTS.
+            // (b) The lookup index is LADDER-OWNED — re-asserted here
+            // unconditionally (covers both the fresh-install path, where
+            // the bootstrap SCHEMA carries the TABLE but NOT the index per
+            // the #1861 lesson, and the legacy-upgrade path). No
+            // full-table rebuild anywhere → no trigger recreation (the
+            // v63/v65 lesson does not arise).
+            let has_kind_provenance = conn
+                .prepare("SELECT kind_provenance FROM memories LIMIT 0")
+                .is_ok();
+            if !has_kind_provenance {
+                conn.execute_batch(MIGRATION_V79_SQLITE)?;
+            }
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_agent_subkey_certs_instance \
+                 ON agent_subkey_certs(instance_key_id)",
+                [],
+            )?;
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -4671,6 +4759,63 @@ mod tests {
         // their presence proves the v78 arm ran on the UPGRADE path.
         assert!(table_exists(&conn, "model_attestations"));
         assert!(index_exists(&conn, "idx_model_attestations_family"));
+
+        // v79 (#1942/#1941/#1945/#1834) — crypto-core stage 2. The three
+        // additive memories columns + the agent_subkey_certs table + the
+        // ladder-owned lookup index are all absent from the legacy v1
+        // schema, so their presence proves the v79 arm ran on the UPGRADE
+        // path (the ALTERs behind the column probe + the CREATE TABLE +
+        // the unconditional index re-assert).
+        assert!(column_exists(&conn, "memories", "kind_provenance"));
+        assert!(column_exists(&conn, "memories", "valid_from"));
+        assert!(column_exists(&conn, "memories", "valid_until"));
+        assert!(table_exists(&conn, "agent_subkey_certs"));
+        assert!(index_exists(&conn, "idx_agent_subkey_certs_instance"));
+    }
+
+    /// v1.0.0 crypto-core stage 2 (#1942/#1941/#1945/#1834) — the
+    /// FRESH-install path (bootstrap SCHEMA + migrate on an empty db) must
+    /// ALSO carry the three additive `memories` columns, the
+    /// `agent_subkey_certs` table, and its ladder-owned index — column-for
+    /// -column equivalent to the upgrade path. Pins the bootstrap-mirror ↔
+    /// migration-arm consistency (the v75/#1861 lesson).
+    #[test]
+    fn fresh_install_carries_v79_crypto_core_columns_and_certs_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).expect("apply bootstrap SCHEMA");
+        migrate(&conn).expect("fresh migrate to CURRENT");
+        assert_eq!(current_version(&conn), CURRENT_SCHEMA_VERSION);
+
+        assert!(column_exists(&conn, "memories", "kind_provenance"));
+        assert!(column_exists(&conn, "memories", "valid_from"));
+        assert!(column_exists(&conn, "memories", "valid_until"));
+        assert!(table_exists(&conn, "agent_subkey_certs"));
+        // The bootstrap SCHEMA carries the TABLE but NOT the index (the
+        // #1861 lesson); the v79 arm's unconditional re-assert must have
+        // created it on the fresh path.
+        assert!(index_exists(&conn, "idx_agent_subkey_certs_instance"));
+
+        // Column-level shape: the fresh-install certs table accepts a
+        // well-formed SubkeyCert row (all NOT NULL columns satisfied,
+        // revoked defaulting to 0).
+        conn.execute(
+            "INSERT INTO agent_subkey_certs
+                 (id, principal, instance_key_id, model_version_ref,
+                  not_before, not_after, signature, cert_bytes, created_at)
+             VALUES ('c1','ai:host', x'0102', x'0304',
+                     '2026-07-11T00:00:00Z','2027-07-11T00:00:00Z',
+                     x'05', x'06', '2026-07-11T00:00:00Z')",
+            [],
+        )
+        .expect("fresh certs table accepts a SubkeyCert row");
+        let revoked: i64 = conn
+            .query_row(
+                "SELECT revoked FROM agent_subkey_certs WHERE id='c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(revoked, 0, "revoked defaults to 0 (live)");
     }
 
     /// v0.9.0 §25.3 S1 (#1870) — the FRESH-install path (bootstrap SCHEMA
