@@ -3117,15 +3117,21 @@ fn test_mcp_store_invalid_metadata_defaults_to_empty() {
             .as_object()
             .unwrap_or_else(|| panic!("metadata must be an object, got: {}", mem["metadata"]));
         // #1757 — handle_store also stamps the system-managed per-memory
-        // vector clock (`version_vector`); the assertion is that NO caller
-        // metadata survived (only the system-injected agent_id + clock).
+        // vector clock (`version_vector`); #1945 (v1.0 crypto-core stage 3)
+        // additionally stamps `kind_provenance` on every store path. The
+        // assertion is that NO caller metadata survived (only the
+        // system-injected agent_id + clock + provenance).
         let caller_keys: Vec<&String> = meta
             .keys()
-            .filter(|k| k.as_str() != "agent_id" && k.as_str() != "version_vector")
+            .filter(|k| {
+                k.as_str() != "agent_id"
+                    && k.as_str() != "version_vector"
+                    && k.as_str() != "kind_provenance"
+            })
             .collect();
         assert!(
             caller_keys.is_empty(),
-            "invalid input metadata should reduce to just agent_id (+ system version_vector), got: {meta:?}"
+            "invalid input metadata should reduce to the system keys (agent_id + version_vector + kind_provenance), got: {meta:?}"
         );
         assert!(
             meta.contains_key("agent_id"),
