@@ -169,6 +169,13 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
                  (fail-closed)",
             )
             .context(CTX_WRITE_AUDIT_REPORT)?,
+            // v1.0.0 #1949 — chain verifies but is revoked (verdict-surface).
+            crate::identity::lineage::LineageCheck::Revoked { detail, .. } => writeln!(
+                out.stdout,
+                "  identity-lineage REVOKED (chain still verifies; entries in the Suspect \
+                 window are SUSPECT, not un-verified): {detail}"
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
             crate::identity::lineage::LineageCheck::Unknown
             | crate::identity::lineage::LineageCheck::NotDetected => {}
         }

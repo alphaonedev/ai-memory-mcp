@@ -760,10 +760,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_signed_events_sequence ON signed_events (s
 -- Every INSERT co-transacts with the flat `metadata.agent_pubkey` sync
 -- and a `signed_events` witness row (C4/C1).
 -- ─────────────────────────────────────────────────────────────────────
+-- v80 (#1949) widens the reason CHECK to include 'revocation' and adds
+-- `custody_class` (NULL = legacy software-file) +
+-- `suspected_compromise_from_seq` (revocation-only witness sequence).
 CREATE TABLE IF NOT EXISTS agent_lineage (
     agent_id            TEXT    NOT NULL,
     epoch               BIGINT  NOT NULL,
-    reason              TEXT    NOT NULL CHECK (reason IN ('genesis', 'rotation', 'recovery')),
+    reason              TEXT    NOT NULL
+        CHECK (reason IN ('genesis', 'rotation', 'recovery', 'revocation')),
     predecessor_pubkey  TEXT    NOT NULL,
     successor_pubkey    TEXT    NOT NULL,
     recovery_pubkey     TEXT,
@@ -772,6 +776,8 @@ CREATE TABLE IF NOT EXISTS agent_lineage (
     signature           BYTEA   NOT NULL,
     record_bytes        BYTEA   NOT NULL,
     created_at          TEXT    NOT NULL,
+    custody_class       TEXT,
+    suspected_compromise_from_seq BIGINT,
     PRIMARY KEY (agent_id, epoch)
 );
 

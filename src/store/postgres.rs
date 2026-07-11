@@ -293,6 +293,14 @@ const MIGRATION_V78_MODEL_ATTESTATIONS: &str =
 const MIGRATION_V79_CRYPTO_CORE: &str =
     include_str!("../../migrations/postgres/0038_v79_crypto_core.sql");
 
+/// v80 (#1949, v1.0.0 R13) — custody-class + signed revocation on the
+/// identity-lineage chain (postgres twin of the sqlite v80 arm). Purely
+/// additive: ADD COLUMN IF NOT EXISTS for `custody_class` +
+/// `suspected_compromise_from_seq`, then DROP/ADD the `reason` CHECK to
+/// admit 'revocation' (postgres widens a CHECK in place — no rewrite).
+const MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION: &str =
+    include_str!("../../migrations/postgres/0039_v80_lineage_custody_revocation.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -651,7 +659,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 79;
+const CURRENT_SCHEMA_VERSION: i32 = 80;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1530,8 +1538,11 @@ impl PostgresStore {
         if current_version < 78 {
             self.migrate_v78().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 79 {
             self.migrate_v79().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v80().await?;
         }
 
         Ok(())
@@ -3853,7 +3864,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v79 crypto-core", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v80
+        // now sits at the ladder head, so v79 must record exactly 79.
+        record_schema_version(&mut tx, 79).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v79 ddl", e))?;
@@ -3863,6 +3876,38 @@ impl PostgresStore {
             "schema migration v79 applied (#1942/#1941/#1945/#1834: \
              crypto-core stage 2 — kind_provenance + claim-bitemporal \
              valid_from/valid_until + agent_subkey_certs)"
+        );
+        Ok(())
+    }
+
+    /// v80 (#1949, v1.0.0 R13) — custody-class + signed revocation on the
+    /// `agent_lineage` chain (postgres twin of the sqlite v80 arm). Adds
+    /// `custody_class` + `suspected_compromise_from_seq` and widens the
+    /// `reason` CHECK to admit 'revocation'. Purely additive (no rewrite).
+    /// Stamps `CURRENT_SCHEMA_VERSION` as the new ladder head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v80(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v80 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v80 lineage custody+revocation", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v80 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v80 applied (#1949: agent_lineage custody_class + \
+             suspected_compromise_from_seq + revocation reason)"
         );
         Ok(())
     }
@@ -10363,15 +10408,31 @@ impl PostgresStore {
                 .fetch_all(&self.pool)
                 .await
                 .unwrap_or_default();
-        let mut lineage_outcomes: Vec<(String, Option<String>)> =
+        let mut lineage_outcomes: Vec<crate::identity::lineage::LineageWalkOutcome> =
             Vec::with_capacity(lineage_agents.len());
         for agent in lineage_agents {
+            use crate::identity::lineage::{CustodyClass, LineageWalkOutcome};
             let outcome = match self.verify_agent_lineage_pg(&agent).await {
-                Ok(Ok(_)) => None,
-                Ok(Err(walk_err)) => Some(walk_err.to_string()),
-                Err(read_err) => Some(format!("lineage read failed: {read_err}")),
+                Ok(Ok(verified)) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: None,
+                    revoked_from_seq: verified.revoked_from_seq,
+                    head_custody_class: verified.head_custody_class,
+                },
+                Ok(Err(walk_err)) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: Some(walk_err.to_string()),
+                    revoked_from_seq: None,
+                    head_custody_class: CustodyClass::default(),
+                },
+                Err(read_err) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: Some(format!("lineage read failed: {read_err}")),
+                    revoked_from_seq: None,
+                    head_custody_class: CustodyClass::default(),
+                },
             };
-            lineage_outcomes.push((agent, outcome));
+            lineage_outcomes.push(outcome);
         }
         let lineage =
             crate::identity::lineage::compute_lineage_check(&lineage_outcomes, require_lineage);
@@ -16185,6 +16246,13 @@ impl MemoryStore for PostgresStore {
                     .to_string(),
             ));
         }
+        // v1.0.0 #1949 — CODE refuse-guard: the OSS build STRUCTURALLY
+        // REFUSES to mint any non-`software-file` custody class
+        // (fail-closed BEFORE any write). Identical to the sqlite SSOT.
+        record
+            .custody_class
+            .ensure_oss_mintable()
+            .map_err(|e| invalid(e.to_string()))?;
         // Chain-consistency pre-flight against the current head
         // (identical refusal set to the sqlite SSOT).
         let head = self.read_lineage(agent_id).await?.into_iter().next_back();
@@ -16278,12 +16346,15 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("append_lineage_record begin tx", e))?;
         let epoch_i64 = i64::try_from(record.epoch)
             .map_err(|_| invalid("lineage epoch exceeds i64".to_string()))?;
+        let from_seq_i64 = record
+            .suspected_compromise_from_seq
+            .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
         sqlx::query(
             "INSERT INTO agent_lineage \
                 (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                  recovery_pubkey, not_before, prev_record_hash, signature, \
-                 record_bytes, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 record_bytes, created_at, custody_class, suspected_compromise_from_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(&record.agent_id)
         .bind(epoch_i64)
@@ -16296,6 +16367,8 @@ impl MemoryStore for PostgresStore {
         .bind(signature)
         .bind(&record_bytes)
         .bind(&now_rfc)
+        .bind(record.custody_class.as_str())
+        .bind(from_seq_i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -16353,6 +16426,9 @@ impl MemoryStore for PostgresStore {
                 crate::signed_events::event_types::IDENTITY_LINEAGE_SUCCESSION
             }
             LineageReason::Recovery => crate::signed_events::event_types::IDENTITY_LINEAGE_RECOVERY,
+            LineageReason::Revocation => {
+                crate::signed_events::event_types::IDENTITY_LINEAGE_REVOCATION
+            }
         };
         pg_append_signed_event_with_chain_in_tx(
             &mut tx,
@@ -16391,9 +16467,12 @@ impl MemoryStore for PostgresStore {
             String,
             Vec<u8>,
             Vec<u8>,
+            Option<String>,
+            Option<i64>,
         )> = sqlx::query_as(
             "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
-                    recovery_pubkey, not_before, prev_record_hash, signature \
+                    recovery_pubkey, not_before, prev_record_hash, signature, \
+                    custody_class, suspected_compromise_from_seq \
              FROM agent_lineage WHERE agent_id = $1 ORDER BY epoch ASC",
         )
         .bind(agent_id)
@@ -16402,7 +16481,20 @@ impl MemoryStore for PostgresStore {
         .map_err(|e| to_store_err("read_lineage", e))?;
 
         let mut out = Vec::with_capacity(rows.len());
-        for (aid, epoch, reason, pred, succ, recovery, not_before, prev_hash, sig) in rows {
+        for (
+            aid,
+            epoch,
+            reason,
+            pred,
+            succ,
+            recovery,
+            not_before,
+            prev_hash,
+            sig,
+            custody,
+            from_seq,
+        ) in rows
+        {
             let reason =
                 LineageReason::from_str(&reason).ok_or_else(|| StoreError::IntegrityFailed {
                     detail: format!("unknown lineage reason '{reason}' for '{aid}'"),
@@ -16410,6 +16502,16 @@ impl MemoryStore for PostgresStore {
             let epoch = u64::try_from(epoch).map_err(|_| StoreError::IntegrityFailed {
                 detail: format!("negative lineage epoch for '{aid}'"),
             })?;
+            // v1.0.0 #1949 — fail-closed on an unknown custody slug (NULL
+            // legacy value → software-file default).
+            let custody_class =
+                crate::identity::lineage::CustodyClass::from_stored(custody.as_deref())
+                    .ok_or_else(|| StoreError::IntegrityFailed {
+                        detail: format!(
+                            "unknown lineage custody_class '{}' for '{aid}'",
+                            custody.as_deref().unwrap_or("")
+                        ),
+                    })?;
             out.push((
                 LineageRecord {
                     agent_id: aid,
@@ -16420,6 +16522,8 @@ impl MemoryStore for PostgresStore {
                     recovery_pubkey_b64: recovery,
                     not_before,
                     prev_record_hash: prev_hash,
+                    custody_class,
+                    suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
                 },
                 sig,
             ));
@@ -16428,17 +16532,18 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn lineage_witness_hashes(&self, agent_id: &str) -> StoreResult<Vec<Vec<u8>>> {
-        let [t_genesis, t_succession, t_recovery] =
+        let [t_genesis, t_succession, t_recovery, t_revocation] =
             crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
         let rows: Vec<(Vec<u8>,)> = sqlx::query_as(
             "SELECT payload_hash FROM signed_events \
-             WHERE agent_id = $1 AND event_type IN ($2, $3, $4) \
+             WHERE agent_id = $1 AND event_type IN ($2, $3, $4, $5) \
              ORDER BY COALESCE(sequence, 0) ASC",
         )
         .bind(agent_id)
         .bind(t_genesis)
         .bind(t_succession)
         .bind(t_recovery)
+        .bind(t_revocation)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("lineage_witness_hashes", e))?;

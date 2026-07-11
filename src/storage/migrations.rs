@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 79).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 80).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -387,10 +387,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_revisions_sequence
 -- upgrading DBs; inline here so a fresh bootstrap has it. No secondary
 -- index (the PK covers the epoch-ordered read); indexes stay
 -- ladder-owned per the v75 bootstrap-inline-index lesson.
+-- v80 (#1949) widens the reason CHECK to include 'revocation' and adds
+-- the two additive columns `custody_class` (NULL = legacy software-file)
+-- + `suspected_compromise_from_seq` (revocation-only witness sequence).
 CREATE TABLE IF NOT EXISTS agent_lineage (
     agent_id            TEXT    NOT NULL,
     epoch               INTEGER NOT NULL,
-    reason              TEXT    NOT NULL CHECK (reason IN ('genesis', 'rotation', 'recovery')),
+    reason              TEXT    NOT NULL
+        CHECK (reason IN ('genesis', 'rotation', 'recovery', 'revocation')),
     predecessor_pubkey  TEXT    NOT NULL,
     successor_pubkey    TEXT    NOT NULL,
     recovery_pubkey     TEXT,
@@ -399,6 +403,8 @@ CREATE TABLE IF NOT EXISTS agent_lineage (
     signature           BLOB    NOT NULL,
     record_bytes        BLOB    NOT NULL,
     created_at          TEXT    NOT NULL,
+    custody_class       TEXT,
+    suspected_compromise_from_seq INTEGER,
     PRIMARY KEY (agent_id, epoch)
 );
 
@@ -844,7 +850,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 79;
+const CURRENT_SCHEMA_VERSION: i64 = 80;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1448,6 +1454,16 @@ const MIGRATION_V78_SQLITE: &str =
 // lesson). Purely additive, no full-table rebuild → no trigger recreation
 // (the v63/v65 lesson does not arise).
 const MIGRATION_V79_SQLITE: &str = include_str!("../../migrations/sqlite/0063_v79_crypto_core.sql");
+// v80 (#1949, v1.0.0 R13) — custody-class + signed revocation on the v76
+// identity-lineage chain. Adds `agent_lineage.custody_class` +
+// `agent_lineage.suspected_compromise_from_seq` and widens the `reason`
+// CHECK to admit 'revocation'. A CHECK change forces a SQLite table
+// rebuild, but `agent_lineage` has NO triggers / NO secondary indexes
+// (only the composite PK the new table recreates) so the v63/v65
+// trigger-drop hazard does not arise. Runs behind a `custody_class`
+// column-existence probe (the v77/v79 pattern) — a fresh install skips it.
+const MIGRATION_V80_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0064_v80_lineage_custody_revocation.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3433,6 +3449,35 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             )?;
         }
 
+        if version < CURRENT_SCHEMA_VERSION {
+            // v80 = #1949 (v1.0.0 R13) — custody-class + signed revocation
+            // on the identity-lineage chain. Widen the `agent_lineage`
+            // reason CHECK to admit 'revocation' + add the two additive
+            // columns (`custody_class`, `suspected_compromise_from_seq`).
+            // A CHECK change is only expressible via a table rebuild in
+            // SQLite; the migration file does the guarded 4-step rebuild.
+            // The v63/v65 trigger-drop hazard does NOT arise —
+            // `agent_lineage` has no triggers and no secondary indexes
+            // (the composite PK is recreated by the new table def). Probe
+            // the `custody_class` column (SQLite has no ADD COLUMN IF NOT
+            // EXISTS + we cannot re-run the DROP/RENAME) AND the table's
+            // presence (synthetic fixtures may stamp a version without the
+            // v76 table — the v58/v77 precedent).
+            let lineage_cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(agent_lineage)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if lineage_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v80: agent_lineage table absent (test fixture); skipping \
+                     custody/revocation rebuild"
+                );
+            } else if !lineage_cols.contains("custody_class") {
+                conn.execute_batch(MIGRATION_V80_SQLITE)?;
+            }
+        }
+
         conn.execute("DELETE FROM schema_version", [])?;
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?1)",
@@ -4771,6 +4816,17 @@ mod tests {
         assert!(column_exists(&conn, "memories", "valid_until"));
         assert!(table_exists(&conn, "agent_subkey_certs"));
         assert!(index_exists(&conn, "idx_agent_subkey_certs_instance"));
+
+        // v80 (#1949) — custody-class + revocation columns on
+        // agent_lineage. Absent from the legacy v1 schema (the table
+        // itself is only created by the v76 arm, then rebuilt by the v80
+        // arm), so their presence proves the v80 rebuild ran on UPGRADE.
+        assert!(column_exists(&conn, "agent_lineage", "custody_class"));
+        assert!(column_exists(
+            &conn,
+            "agent_lineage",
+            "suspected_compromise_from_seq"
+        ));
     }
 
     /// v1.0.0 crypto-core stage 2 (#1942/#1941/#1945/#1834) — the
@@ -4794,6 +4850,15 @@ mod tests {
         // #1861 lesson); the v79 arm's unconditional re-assert must have
         // created it on the fresh path.
         assert!(index_exists(&conn, "idx_agent_subkey_certs_instance"));
+
+        // v80 (#1949) — the fresh bootstrap agent_lineage carries the
+        // custody + revocation columns inline (skips the rebuild arm).
+        assert!(column_exists(&conn, "agent_lineage", "custody_class"));
+        assert!(column_exists(
+            &conn,
+            "agent_lineage",
+            "suspected_compromise_from_seq"
+        ));
 
         // Column-level shape: the fresh-install certs table accepts a
         // well-formed SubkeyCert row (all NOT NULL columns satisfied,

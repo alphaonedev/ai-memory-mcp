@@ -9337,12 +9337,19 @@ pub fn revoke_agent_pubkey(conn: &Connection, agent_id: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Map a lineage reason onto its `signed_events` witness event type.
+/// `anyhow` context string for a failed `recovery_pubkey` base64 decode
+/// on the lineage mint paths (`enroll_lineage` / `append_succession` /
+/// `append_revocation`) — one named const so the literal is not repeated
+/// (pm-v3.1 no-hardcoded-literals discipline).
+const CTX_DECODE_RECOVERY_PUBKEY: &str = "decoding recovery pubkey";
+
 fn lineage_witness_event_type(reason: crate::identity::lineage::LineageReason) -> &'static str {
     use crate::identity::lineage::LineageReason;
     match reason {
         LineageReason::Genesis => crate::signed_events::event_types::IDENTITY_LINEAGE_GENESIS,
         LineageReason::Rotation => crate::signed_events::event_types::IDENTITY_LINEAGE_SUCCESSION,
         LineageReason::Recovery => crate::signed_events::event_types::IDENTITY_LINEAGE_RECOVERY,
+        LineageReason::Revocation => crate::signed_events::event_types::IDENTITY_LINEAGE_REVOCATION,
     }
 }
 
@@ -9396,6 +9403,14 @@ pub fn append_lineage_record(
              path (and its same-epoch fork tie-break) lands in v1.0"
         );
     }
+    // v1.0.0 #1949 — the CODE refuse-guard: the OSS build STRUCTURALLY
+    // REFUSES to mint any non-`software-file` custody class (the reserved
+    // hardware classes are verify-only this train). Fail-closed BEFORE
+    // any write; nothing persisted on violation.
+    record
+        .custody_class
+        .ensure_oss_mintable()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Chain-consistency pre-flight against the current head.
     let head = lineage_head(conn, agent_id)?;
     match (&head, record.reason) {
@@ -9448,8 +9463,8 @@ pub fn append_lineage_record(
             "INSERT INTO agent_lineage \
                 (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                  recovery_pubkey, not_before, prev_record_hash, signature, \
-                 record_bytes, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 record_bytes, created_at, custody_class, suspected_compromise_from_seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 record.agent_id,
                 i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
@@ -9462,6 +9477,10 @@ pub fn append_lineage_record(
                 signature,
                 record_bytes,
                 now,
+                record.custody_class.as_str(),
+                record
+                    .suspected_compromise_from_seq
+                    .map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
             ],
         )
         .context("append_lineage_record: insert body (duplicate epoch is refused by the C5 PK)")?;
@@ -9533,7 +9552,8 @@ pub fn read_lineage(
     let mut stmt = conn
         .prepare_cached(
             "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
-                    recovery_pubkey, not_before, prev_record_hash, signature \
+                    recovery_pubkey, not_before, prev_record_hash, signature, \
+                    custody_class, suspected_compromise_from_seq \
              FROM agent_lineage WHERE agent_id = ?1 ORDER BY epoch ASC",
         )
         .context("read_lineage: prepare")?;
@@ -9549,16 +9569,38 @@ pub fn read_lineage(
                 row.get::<_, String>(6)?,
                 row.get::<_, Vec<u8>>(7)?,
                 row.get::<_, Vec<u8>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<i64>>(10)?,
             ))
         })
         .context("read_lineage: query")?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (aid, epoch, reason, pred, succ, recovery, not_before, prev_hash, sig) =
-            row.context("read_lineage: row decode")?;
+        let (
+            aid,
+            epoch,
+            reason,
+            pred,
+            succ,
+            recovery,
+            not_before,
+            prev_hash,
+            sig,
+            custody,
+            from_seq,
+        ) = row.context("read_lineage: row decode")?;
         let reason = LineageReason::from_str(&reason)
             .with_context(|| format!("unknown lineage reason '{reason}' for '{aid}'"))?;
+        // v1.0.0 #1949 — fail-closed on an unknown custody slug (a NULL
+        // legacy value resolves to the software-file default).
+        let custody_class = crate::identity::lineage::CustodyClass::from_stored(custody.as_deref())
+            .with_context(|| {
+                format!(
+                    "unknown lineage custody_class '{}' for '{aid}'",
+                    custody.as_deref().unwrap_or("")
+                )
+            })?;
         out.push((
             LineageRecord {
                 agent_id: aid,
@@ -9569,6 +9611,8 @@ pub fn read_lineage(
                 recovery_pubkey_b64: recovery,
                 not_before,
                 prev_record_hash: prev_hash,
+                custody_class,
+                suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
             },
             sig,
         ));
@@ -9610,17 +9654,18 @@ pub fn lineage_witness_hashes(conn: &Connection, agent_id: &str) -> Result<Vec<V
     if !table_exists {
         return Ok(Vec::new());
     }
-    let [t_genesis, t_succession, t_recovery] = crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
+    let [t_genesis, t_succession, t_recovery, t_revocation] =
+        crate::signed_events::IDENTITY_LINEAGE_EVENT_TYPES;
     let mut stmt = conn
         .prepare_cached(
             "SELECT payload_hash FROM signed_events \
-             WHERE agent_id = ?1 AND event_type IN (?2, ?3, ?4) \
+             WHERE agent_id = ?1 AND event_type IN (?2, ?3, ?4, ?5) \
              ORDER BY sequence ASC",
         )
         .context("lineage_witness_hashes: prepare")?;
     let rows = stmt
         .query_map(
-            params![agent_id, t_genesis, t_succession, t_recovery],
+            params![agent_id, t_genesis, t_succession, t_recovery, t_revocation],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .context("lineage_witness_hashes: query")?;
@@ -9731,6 +9776,18 @@ pub fn enroll_lineage(
     if lineage_head(conn, agent_id)?.is_some() {
         anyhow::bail!("lineage already enrolled for '{agent_id}'");
     }
+    // v1.0.0 #1949 — recovery_pubkey is REQUIRED at genesis for NEW
+    // chains so the stolen-AND-lost-key case is coverable (the recovery
+    // signer lands in v1.0; the FORMAT ships now). Existing v76 chains
+    // are grandfathered: `verify_lineage` never requires it, so a legacy
+    // genesis with no recovery key keeps verifying — only fresh
+    // enrollment is gated.
+    if recovery_pubkey_b64.is_none() {
+        anyhow::bail!(
+            "a recovery_pubkey is REQUIRED to enroll a new lineage for '{agent_id}' (#1949) — \
+             pass --recovery-pubkey so a stolen-and-lost key is recoverable"
+        );
+    }
     let k0_b64 = keypair.public_base64();
     if let Some(bound) = agent_pubkey(conn, agent_id)? {
         let bound_key = crate::identity::keypair::decode_public_base64(&bound)
@@ -9743,7 +9800,7 @@ pub fn enroll_lineage(
         }
     }
     if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context("decoding recovery pubkey")?;
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
     }
     let record = crate::identity::lineage::LineageRecord::genesis(
         agent_id,
@@ -9794,7 +9851,7 @@ pub fn append_succession(
     crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
         .context("decoding successor pubkey")?;
     if let Some(rec) = recovery_pubkey_b64 {
-        crate::identity::keypair::decode_public_base64(rec).context("decoding recovery pubkey")?;
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
     }
     // None carries the existing recovery commitment forward so a plain
     // rotation never silently drops an enrolled recovery key.
@@ -9804,6 +9861,68 @@ pub fn append_succession(
     let record = crate::identity::lineage::LineageRecord::rotation(
         &head,
         successor_pubkey_b64,
+        recovery,
+        &Utc::now().to_rfc3339(),
+    )?;
+    let sig = crate::identity::sign::sign_succession(k_old, &record.to_signable())?;
+    append_lineage_record(conn, agent_id, &record, &sig)?;
+    Ok(record)
+}
+
+/// v1.0.0 #1949 — mint + persist a REVOCATION succession from the
+/// current head to `successor_pubkey_b64` (the fresh post-revocation
+/// head), signed by `k_old` (the current head key), dating a suspected
+/// compromise from `suspected_compromise_from_seq` (a `signed_events`
+/// witness SEQUENCE high-water mark — the ordering authority, never
+/// wall-clock).
+///
+/// Rides the same chain as [`append_succession`] (epoch +1,
+/// predecessor == head successor, C1/C3/C5 anchoring, single
+/// [`crate::identity::lineage::verify_lineage`] walk). **Verdict-surface
+/// only** — entries in `[suspected_compromise_from_seq, S_rev)` are
+/// downgraded to a Suspect verdict by the verify-audit-trail readout;
+/// there is NO write-path enforcement this train (R13).
+///
+/// # Errors
+///
+/// No enrolled lineage, a `k_old` that is public-only or not the head
+/// key, an undecodable successor/recovery key, or any
+/// [`append_lineage_record`] failure.
+pub fn append_revocation(
+    conn: &Connection,
+    agent_id: &str,
+    k_old: &crate::identity::keypair::AgentKeypair,
+    successor_pubkey_b64: &str,
+    suspected_compromise_from_seq: u64,
+    recovery_pubkey_b64: Option<&str>,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    let Some((head, _)) = lineage_head(conn, agent_id)? else {
+        anyhow::bail!("no lineage enrolled for '{agent_id}' — nothing to revoke");
+    };
+    if !k_old.can_sign() {
+        anyhow::bail!("keypair for '{agent_id}' is public-only — cannot sign a revocation");
+    }
+    let head_key = crate::identity::keypair::decode_public_base64(&head.successor_pubkey_b64)
+        .context("decoding lineage head key")?;
+    if head_key.to_bytes() != k_old.public.to_bytes() {
+        anyhow::bail!(
+            "signing keypair is not the current lineage head for '{agent_id}' — only the \
+             head key can sign a revocation this train (recovery-signed revocation lands in v1.0)"
+        );
+    }
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    // None carries the existing recovery commitment forward.
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| head.recovery_pubkey_b64.clone());
+    let record = crate::identity::lineage::LineageRecord::revocation(
+        &head,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
         recovery,
         &Utc::now().to_rfc3339(),
     )?;

@@ -114,6 +114,16 @@ pub enum LineageReason {
     /// under-specified) — [`verify_lineage`] fail-closes on it and the
     /// append paths refuse to mint it.
     Recovery,
+    /// v1.0.0 #1949 (R13) — the current head signs a record at epoch
+    /// N+1 that REVOKES the chain from a suspected-compromise witness
+    /// SEQUENCE high-water mark ([`LineageRecord::suspected_compromise_from_seq`]).
+    /// Rides the same chain (`LINEAGE_DOMAIN`, C1/C3/C5, single
+    /// [`verify_lineage`] walk) as a rotation — the successor is the
+    /// fresh post-revocation head. Entries in
+    /// `[suspected_compromise_from_seq, S_rev)` are DOWNGRADED to a
+    /// Suspect verdict (never cryptographically un-verified — R13).
+    /// **Verdict-surface-only this train** (no write-path teeth).
+    Revocation,
 }
 
 impl LineageReason {
@@ -122,9 +132,10 @@ impl LineageReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Genesis => "genesis",
-            Self::Rotation => "rotation",
-            Self::Recovery => "recovery",
+            Self::Genesis => LINEAGE_REASON_GENESIS,
+            Self::Rotation => LINEAGE_REASON_ROTATION,
+            Self::Recovery => LINEAGE_REASON_RECOVERY,
+            Self::Revocation => LINEAGE_REASON_REVOCATION,
         }
     }
 
@@ -133,10 +144,162 @@ impl LineageReason {
     #[must_use]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "genesis" => Some(Self::Genesis),
-            "rotation" => Some(Self::Rotation),
-            "recovery" => Some(Self::Recovery),
+            LINEAGE_REASON_GENESIS => Some(Self::Genesis),
+            LINEAGE_REASON_ROTATION => Some(Self::Rotation),
+            LINEAGE_REASON_RECOVERY => Some(Self::Recovery),
+            LINEAGE_REASON_REVOCATION => Some(Self::Revocation),
             _ => None,
+        }
+    }
+}
+
+/// Wire slug for [`LineageReason::Genesis`] — the `agent_lineage.reason`
+/// column value and the committed CBOR `reason` field.
+pub const LINEAGE_REASON_GENESIS: &str = "genesis";
+/// Wire slug for [`LineageReason::Rotation`].
+pub const LINEAGE_REASON_ROTATION: &str = "rotation";
+/// Wire slug for [`LineageReason::Recovery`].
+pub const LINEAGE_REASON_RECOVERY: &str = "recovery";
+/// Wire slug for [`LineageReason::Revocation`] (v1.0.0 #1949).
+pub const LINEAGE_REASON_REVOCATION: &str = "revocation";
+
+/// Wire slug for [`CustodyClass::SoftwareFile`] — the ONLY class the OSS
+/// build will mint. It is the frozen DEFAULT: a record whose custody is
+/// `software-file` omits the field from the signed CBOR entirely, so
+/// every legacy v76 succession record (which predates the field) stays
+/// byte-identical and its Ed25519 signature keeps verifying.
+pub const CUSTODY_CLASS_SOFTWARE_FILE: &str = "software-file";
+/// Wire slug for [`CustodyClass::Tpm2`] (RESERVED — never OSS-mintable).
+pub const CUSTODY_CLASS_TPM2: &str = "tpm2";
+/// Wire slug for [`CustodyClass::Pkcs11Hsm`] (RESERVED — never OSS-mintable).
+pub const CUSTODY_CLASS_PKCS11_HSM: &str = "pkcs11-hsm";
+/// Wire slug for [`CustodyClass::SecureEnclave`] (RESERVED — never OSS-mintable).
+pub const CUSTODY_CLASS_SECURE_ENCLAVE: &str = "secure-enclave";
+/// Wire slug for [`CustodyClass::Kms`] (RESERVED — never OSS-mintable).
+pub const CUSTODY_CLASS_KMS: &str = "kms";
+
+/// v1.0.0 #1949 (spec §3, `da9eeb26`) — the custody environment a
+/// lineage key is held in, committed INSIDE the predecessor-signed
+/// [`SignableSuccession`](crate::identity::sign::SignableSuccession)
+/// bytes (never a bare crypto-unauthenticated column).
+///
+/// A CLOSED named-const value set: [`SoftwareFile`](Self::SoftwareFile)
+/// is the only class the OSS build mints; `{tpm2, pkcs11-hsm,
+/// secure-enclave, kms}` are RESERVED for a future commercial /
+/// hardware-attesting build. [`from_str`](Self::from_str) fail-closes
+/// (`None`) on any unknown slug, and [`ensure_oss_mintable`
+/// ](Self::ensure_oss_mintable) is the CODE refuse-guard (not docs)
+/// that structurally refuses to mint any non-`software-file` slug.
+///
+/// # ⚠️ ESTIMABLE, not ATTESTABLE (spec §3 verbatim)
+///
+/// `custody_class` is **attested-by-OSS-refusal-and-custody-separation,
+/// NOT attested-by-hardware.** It **MUST NOT be a cross-host trust
+/// input** — a peer never grants a `tpm2`-claiming key more authority
+/// than `software-file` — until a reserved inner hardware-attestation
+/// blob (TPM quote / PKCS#11 cert chain) lands. Local provenance marker
+/// + refuse-guard only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CustodyClass {
+    /// Key material is an on-disk software file. The frozen DEFAULT and
+    /// the ONLY OSS-mintable class. Omitted from the signed CBOR for
+    /// legacy byte-compat.
+    #[default]
+    SoftwareFile,
+    /// RESERVED — TPM 2.0. Verifiable-only this train (never minted).
+    Tpm2,
+    /// RESERVED — PKCS#11 HSM. Verifiable-only this train.
+    Pkcs11Hsm,
+    /// RESERVED — secure enclave. Verifiable-only this train.
+    SecureEnclave,
+    /// RESERVED — cloud KMS. Verifiable-only this train.
+    Kms,
+}
+
+/// Returned by [`CustodyClass::ensure_oss_mintable`] when a mint path is
+/// asked to stamp a non-`software-file` custody class in the OSS build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyMintRefused {
+    /// The refused (non-`software-file`) slug.
+    pub slug: &'static str,
+}
+
+impl std::fmt::Display for CustodyMintRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "custody_class '{}' cannot be minted by the OSS build — only '{}' is mintable \
+             (hardware-attesting custody classes are RESERVED for a future build)",
+            self.slug, CUSTODY_CLASS_SOFTWARE_FILE
+        )
+    }
+}
+
+impl std::error::Error for CustodyMintRefused {}
+
+impl CustodyClass {
+    /// Canonical wire slug (the `agent_lineage.custody_class` column
+    /// value and the committed CBOR field).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SoftwareFile => CUSTODY_CLASS_SOFTWARE_FILE,
+            Self::Tpm2 => CUSTODY_CLASS_TPM2,
+            Self::Pkcs11Hsm => CUSTODY_CLASS_PKCS11_HSM,
+            Self::SecureEnclave => CUSTODY_CLASS_SECURE_ENCLAVE,
+            Self::Kms => CUSTODY_CLASS_KMS,
+        }
+    }
+
+    /// Parse the stored / wire slug. `None` (FAIL-CLOSED) on any unknown
+    /// slug so a forged or future value is never silently trusted.
+    #[must_use]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            CUSTODY_CLASS_SOFTWARE_FILE => Some(Self::SoftwareFile),
+            CUSTODY_CLASS_TPM2 => Some(Self::Tpm2),
+            CUSTODY_CLASS_PKCS11_HSM => Some(Self::Pkcs11Hsm),
+            CUSTODY_CLASS_SECURE_ENCLAVE => Some(Self::SecureEnclave),
+            CUSTODY_CLASS_KMS => Some(Self::Kms),
+            _ => None,
+        }
+    }
+
+    /// Resolve a nullable stored column into a class — a NULL / absent
+    /// value is a legacy row that predates the field, which is
+    /// definitionally [`SoftwareFile`](Self::SoftwareFile). `None` (the
+    /// input `Option`) → default; `Some(unknown_slug)` → `None` return
+    /// (fail-closed, surfaced by the caller).
+    #[must_use]
+    pub fn from_stored(slug: Option<&str>) -> Option<Self> {
+        match slug {
+            None => Some(Self::default()),
+            Some(s) => Self::from_str(s),
+        }
+    }
+
+    /// `true` for the sole OSS-mintable class.
+    #[must_use]
+    pub const fn is_software_file(self) -> bool {
+        matches!(self, Self::SoftwareFile)
+    }
+
+    /// The CODE refuse-guard (spec §3: "the refuse-guard is code, not
+    /// docs"). The OSS build STRUCTURALLY REFUSES to mint any
+    /// non-`software-file` custody class — every mint path
+    /// ([`crate::storage::append_lineage_record`] and its postgres twin)
+    /// calls this before persisting.
+    ///
+    /// # Errors
+    ///
+    /// [`CustodyMintRefused`] for every RESERVED (hardware) class.
+    pub fn ensure_oss_mintable(self) -> Result<Self, CustodyMintRefused> {
+        if self.is_software_file() {
+            Ok(self)
+        } else {
+            Err(CustodyMintRefused {
+                slug: self.as_str(),
+            })
         }
     }
 }
@@ -164,6 +327,17 @@ pub struct LineageRecord {
     /// SHA-256 over the canonical bytes of the prior record;
     /// [`ZERO_PREV_HASH`] for genesis.
     pub prev_record_hash: Vec<u8>,
+    /// v1.0.0 #1949 — custody environment of `successor_pubkey_b64`.
+    /// Committed inside the signed bytes; [`CustodyClass::SoftwareFile`]
+    /// (the default) is OMITTED from the canonical CBOR so legacy v76
+    /// records stay byte-identical and keep verifying.
+    pub custody_class: CustodyClass,
+    /// v1.0.0 #1949 — for a [`LineageReason::Revocation`] record ONLY,
+    /// the `signed_events` witness SEQUENCE high-water mark from which a
+    /// suspected key compromise is dated. `None` for genesis/rotation
+    /// (omitted from the canonical CBOR → legacy byte-compat). The
+    /// ordering authority for the Suspect window (never wall-clock).
+    pub suspected_compromise_from_seq: Option<u64>,
 }
 
 impl LineageRecord {
@@ -186,6 +360,8 @@ impl LineageRecord {
             recovery_pubkey_b64,
             not_before: not_before.to_string(),
             prev_record_hash: ZERO_PREV_HASH.to_vec(),
+            custody_class: CustodyClass::SoftwareFile,
+            suspected_compromise_from_seq: None,
         }
     }
 
@@ -220,6 +396,48 @@ impl LineageRecord {
             recovery_pubkey_b64,
             not_before: clamped,
             prev_record_hash: prev.record_hash()?.to_vec(),
+            custody_class: CustodyClass::SoftwareFile,
+            suspected_compromise_from_seq: None,
+        })
+    }
+
+    /// v1.0.0 #1949 — mint a [`LineageReason::Revocation`] record that
+    /// succeeds `prev` and hands off to `successor_pubkey_b64` (the fresh
+    /// post-revocation head), committing `suspected_compromise_from_seq`
+    /// (the `signed_events` witness SEQUENCE high-water from which the
+    /// compromise is dated — the ordering authority, never wall-clock)
+    /// inside the signed bytes. Chains exactly like a rotation
+    /// (epoch +1, `predecessor == prev.successor`, hash-linked, clamped
+    /// monotonic `not_before`) so the single [`verify_lineage`] walk
+    /// carries it. **Verdict-surface-only** — no write-path teeth.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the (in practice unreachable) CBOR-encode failure from
+    /// hashing `prev`.
+    pub fn revocation(
+        prev: &LineageRecord,
+        successor_pubkey_b64: &str,
+        suspected_compromise_from_seq: u64,
+        recovery_pubkey_b64: Option<String>,
+        not_before: &str,
+    ) -> anyhow::Result<Self> {
+        let clamped = if not_before < prev.not_before.as_str() {
+            prev.not_before.clone()
+        } else {
+            not_before.to_string()
+        };
+        Ok(Self {
+            agent_id: prev.agent_id.clone(),
+            epoch: prev.epoch + 1,
+            reason: LineageReason::Revocation,
+            predecessor_pubkey_b64: prev.successor_pubkey_b64.clone(),
+            successor_pubkey_b64: successor_pubkey_b64.to_string(),
+            recovery_pubkey_b64,
+            not_before: clamped,
+            prev_record_hash: prev.record_hash()?.to_vec(),
+            custody_class: CustodyClass::SoftwareFile,
+            suspected_compromise_from_seq: Some(suspected_compromise_from_seq),
         })
     }
 
@@ -235,6 +453,8 @@ impl LineageRecord {
             recovery_pubkey: self.recovery_pubkey_b64.as_deref(),
             not_before: &self.not_before,
             prev_record_hash: &self.prev_record_hash,
+            custody_class: self.custody_class.as_str(),
+            suspected_compromise_from_seq: self.suspected_compromise_from_seq,
         }
     }
 
@@ -397,6 +617,15 @@ pub struct VerifiedLineage {
     pub epoch: u64,
     /// Records the walk verified (== chain length).
     pub records_checked: u64,
+    /// v1.0.0 #1949 — custody class of the head key (surfaced in the
+    /// verdict; ESTIMABLE, never a cross-host trust input).
+    pub head_custody_class: CustodyClass,
+    /// v1.0.0 #1949 — `suspected_compromise_from_seq` of the most-recent
+    /// [`LineageReason::Revocation`] on the chain, or `None` if the chain
+    /// carries no revocation. When `Some(from_seq)`, entries in
+    /// `[from_seq, revocation)` are SUSPECT (R13) — surfaced as
+    /// [`LineageCheck::Revoked`], the chain itself still verifies.
+    pub revoked_from_seq: Option<u64>,
 }
 
 /// Verify ONE succession record's Ed25519 signature under
@@ -482,6 +711,9 @@ pub fn verify_lineage(
     };
 
     let mut prev: Option<&LineageRecord> = None;
+    // v1.0.0 #1949 — the newest revocation's compromise-from sequence
+    // (verdict-surface-only; the chain still verifies past a revocation).
+    let mut revoked_from_seq: Option<u64> = None;
     for (record, signature) in records {
         if let Some(prior) = prev {
             // Contiguity (anti-reorder / anti-drop).
@@ -509,14 +741,28 @@ pub fn verify_lineage(
                     });
                 }
             }
-            // Authorized predecessor. Recovery is fail-closed this
-            // train (verify path + fork tie-break land in v1.0).
-            let authorized = record.reason == LineageReason::Rotation
-                && record.predecessor_pubkey_b64 == prior.successor_pubkey_b64;
+            // Authorized predecessor. Rotation AND Revocation (#1949)
+            // both hand off from the prior head key; Recovery stays
+            // fail-closed this train (verify path + fork tie-break land
+            // in v1.0).
+            let hands_off_from_head = record.predecessor_pubkey_b64 == prior.successor_pubkey_b64;
+            let authorized = matches!(
+                record.reason,
+                LineageReason::Rotation | LineageReason::Revocation
+            ) && hands_off_from_head;
             if !authorized {
                 return Err(LineageError::PredecessorMismatch {
                     epoch: record.epoch,
                 });
+            }
+        }
+
+        // v1.0.0 #1949 — a revocation carries the compromise-from
+        // witness sequence forward; the newest revocation on the chain
+        // wins the Suspect-window report.
+        if record.reason == LineageReason::Revocation {
+            if let Some(from_seq) = record.suspected_compromise_from_seq {
+                revoked_from_seq = Some(from_seq);
             }
         }
 
@@ -571,6 +817,8 @@ pub fn verify_lineage(
         head_key,
         epoch: head.epoch,
         records_checked: u64::try_from(records.len()).unwrap_or(u64::MAX),
+        head_custody_class: head.custody_class,
+        revoked_from_seq,
     })
 }
 
@@ -593,6 +841,10 @@ pub fn pubkey_b64(key: &VerifyingKey) -> String {
 ///   lineage walks genesis→head cleanly.
 /// - [`Forged`](LineageCheck::Forged) — an enrolled chain failed
 ///   [`verify_lineage`] (any [`LineageError`]). Hard-dirty.
+/// - [`Revoked`](LineageCheck::Revoked) — an enrolled chain VERIFIES but
+///   carries a [`LineageReason::Revocation`] (v1.0.0 #1949). NOT dirty —
+///   the head key is authoritative; entries in the Suspect window are
+///   surfaced, never cryptographically un-verified (R13).
 /// - [`Missing`](LineageCheck::Missing) — require-mode
 ///   (`AI_MEMORY_REQUIRE_IDENTITY_LINEAGE`) is on but no lineage is
 ///   enrolled: fail-closed (dirty).
@@ -608,34 +860,80 @@ pub enum LineageCheck {
         /// Human-readable reason (for the CLI/JSON surface).
         detail: String,
     },
+    /// v1.0.0 #1949 — an enrolled chain verifies but has been revoked.
+    /// Chain integrity holds (NOT dirty); the readout names the Suspect
+    /// window + head custody class.
+    Revoked {
+        /// The `signed_events` witness SEQUENCE the compromise is dated
+        /// from — entries in `[from_seq, revocation)` are SUSPECT.
+        from_seq: u64,
+        /// Human-readable readout (agent, Suspect window, custody).
+        detail: String,
+    },
     /// Require-mode on but no enrolled lineage (fail-closed).
     Missing,
 }
 
+/// v1.0.0 #1949 — one enrolled agent's genesis→head walk outcome, fed to
+/// [`compute_lineage_check`]. An owned struct (not a tuple) so both
+/// backends' verdict assemblies stay legible as the readout grows.
+/// SHARED by the sqlite + postgres `verify_audit_trail` twins so the
+/// verdict is IDENTICAL (K3 parity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineageWalkOutcome {
+    /// The agent whose chain this outcome describes.
+    pub agent_id: String,
+    /// `Some(detail)` = the walk's first failure (a rendered
+    /// [`LineageError`], or an infra read failure — both fail-closed once
+    /// lineage is known to exist); `None` = a clean walk.
+    pub failure: Option<String>,
+    /// `Some(from_seq)` = the clean chain carries a revocation dated from
+    /// this witness sequence; `None` = no revocation.
+    pub revoked_from_seq: Option<u64>,
+    /// Custody class of the verified head key (surfaced in the verdict;
+    /// ESTIMABLE — never a cross-host trust input). Ignored when
+    /// [`failure`](Self::failure) is `Some`.
+    pub head_custody_class: CustodyClass,
+}
+
 /// Compute the [`LineageCheck`] verdict from per-agent walk outcomes.
 ///
-/// `per_agent` carries one entry per agent that HAS lineage records:
-/// `None` = clean walk, `Some(detail)` = the walk's first failure
-/// (a rendered [`LineageError`], or an infra read failure — both are
-/// fail-closed once lineage is known to exist). SHARED by both
-/// backends (`verify_audit_trail` sqlite + postgres twins) so the
-/// verdict is IDENTICAL — the K3-parity discipline of G5b/G9.
+/// `outcomes` carries one [`LineageWalkOutcome`] per agent that HAS
+/// lineage records. Verdict precedence (fail-closed / dirty first):
+/// any failed walk → [`Forged`](LineageCheck::Forged); else any clean
+/// chain carrying a revocation → [`Revoked`](LineageCheck::Revoked)
+/// (verdict-surface, NOT dirty — #1949 R13); else
+/// [`NotDetected`](LineageCheck::NotDetected). An empty set → `Unknown`
+/// (or `Missing` under require-mode). SHARED by both backends
+/// (`verify_audit_trail` sqlite + postgres twins) so the verdict is
+/// IDENTICAL — the K3-parity discipline of G5b/G9.
 #[must_use]
-pub fn compute_lineage_check(
-    per_agent: &[(String, Option<String>)],
-    require: bool,
-) -> LineageCheck {
-    if per_agent.is_empty() {
+pub fn compute_lineage_check(outcomes: &[LineageWalkOutcome], require: bool) -> LineageCheck {
+    if outcomes.is_empty() {
         return if require {
             LineageCheck::Missing
         } else {
             LineageCheck::Unknown
         };
     }
-    for (agent_id, outcome) in per_agent {
-        if let Some(detail) = outcome {
+    // Forged (dirty) has precedence over Revoked (verdict-surface).
+    for o in outcomes {
+        if let Some(detail) = &o.failure {
             return LineageCheck::Forged {
-                detail: format!("agent '{agent_id}': {detail}"),
+                detail: format!("agent '{}': {detail}", o.agent_id),
+            };
+        }
+    }
+    for o in outcomes {
+        if let Some(from_seq) = o.revoked_from_seq {
+            return LineageCheck::Revoked {
+                from_seq,
+                detail: format!(
+                    "agent '{}': chain revoked — entries from witness sequence {from_seq} \
+                     are SUSPECT (custody: {})",
+                    o.agent_id,
+                    o.head_custody_class.as_str()
+                ),
             };
         }
     }
@@ -1006,13 +1304,22 @@ mod tests {
         );
     }
 
+    fn clean_outcome(agent: &str) -> LineageWalkOutcome {
+        LineageWalkOutcome {
+            agent_id: agent.to_string(),
+            failure: None,
+            revoked_from_seq: None,
+            head_custody_class: CustodyClass::SoftwareFile,
+        }
+    }
+
     #[test]
     fn lineage_check_verdicts() {
         // No lineage: withhold by default, fail-closed under require.
         assert_eq!(compute_lineage_check(&[], false), LineageCheck::Unknown);
         assert_eq!(compute_lineage_check(&[], true), LineageCheck::Missing);
         // Clean chains: NotDetected.
-        let clean: Vec<(String, Option<String>)> = vec![("agent-a".to_string(), None)];
+        let clean = vec![clean_outcome("agent-a")];
         assert_eq!(
             compute_lineage_check(&clean, false),
             LineageCheck::NotDetected
@@ -1023,11 +1330,13 @@ mod tests {
         );
         // Any failure: Forged with the agent + error in the detail.
         let dirty = vec![
-            ("agent-a".to_string(), None),
-            (
-                "agent-b".to_string(),
-                Some(LineageError::HeadKeyMismatch.to_string()),
-            ),
+            clean_outcome("agent-a"),
+            LineageWalkOutcome {
+                agent_id: "agent-b".to_string(),
+                failure: Some(LineageError::HeadKeyMismatch.to_string()),
+                revoked_from_seq: None,
+                head_custody_class: CustodyClass::default(),
+            },
         ];
         match compute_lineage_check(&dirty, false) {
             LineageCheck::Forged { detail } => {
@@ -1036,6 +1345,140 @@ mod tests {
             }
             other => panic!("expected Forged, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn revoked_chain_yields_revoked_verdict_but_forged_wins() {
+        // v1.0.0 #1949 — a clean-but-revoked chain surfaces Revoked (NOT
+        // dirty); the from_seq + custody are in the detail.
+        let revoked = vec![LineageWalkOutcome {
+            agent_id: "agent-r".to_string(),
+            failure: None,
+            revoked_from_seq: Some(42),
+            head_custody_class: CustodyClass::SoftwareFile,
+        }];
+        match compute_lineage_check(&revoked, false) {
+            LineageCheck::Revoked { from_seq, detail } => {
+                assert_eq!(from_seq, 42);
+                assert!(detail.contains("agent-r"), "got: {detail}");
+                assert!(detail.contains("42"), "got: {detail}");
+                assert!(
+                    detail.contains(CUSTODY_CLASS_SOFTWARE_FILE),
+                    "got: {detail}"
+                );
+            }
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        // Forged (dirty) has precedence over Revoked (verdict-surface).
+        let mixed = vec![
+            LineageWalkOutcome {
+                agent_id: "agent-r".to_string(),
+                failure: None,
+                revoked_from_seq: Some(7),
+                head_custody_class: CustodyClass::SoftwareFile,
+            },
+            LineageWalkOutcome {
+                agent_id: "agent-f".to_string(),
+                failure: Some(LineageError::HeadKeyMismatch.to_string()),
+                revoked_from_seq: None,
+                head_custody_class: CustodyClass::default(),
+            },
+        ];
+        assert!(matches!(
+            compute_lineage_check(&mixed, false),
+            LineageCheck::Forged { .. }
+        ));
+    }
+
+    #[test]
+    fn custody_class_slugs_round_trip_and_fail_closed() {
+        for class in [
+            CustodyClass::SoftwareFile,
+            CustodyClass::Tpm2,
+            CustodyClass::Pkcs11Hsm,
+            CustodyClass::SecureEnclave,
+            CustodyClass::Kms,
+        ] {
+            assert_eq!(CustodyClass::from_str(class.as_str()), Some(class));
+        }
+        // Unknown slug fail-closes to None (never guessed).
+        assert_eq!(CustodyClass::from_str("hsm-of-the-future"), None);
+        // NULL legacy column → software-file default; unknown → None.
+        assert_eq!(
+            CustodyClass::from_stored(None),
+            Some(CustodyClass::SoftwareFile)
+        );
+        assert_eq!(CustodyClass::from_stored(Some("bogus")), None);
+        assert!(CustodyClass::default().is_software_file());
+    }
+
+    #[test]
+    fn custody_refuse_guard_only_mints_software_file() {
+        // The OSS refuse-guard is CODE: software-file passes, every
+        // reserved hardware class is refused.
+        assert_eq!(
+            CustodyClass::SoftwareFile.ensure_oss_mintable(),
+            Ok(CustodyClass::SoftwareFile)
+        );
+        for class in [
+            CustodyClass::Tpm2,
+            CustodyClass::Pkcs11Hsm,
+            CustodyClass::SecureEnclave,
+            CustodyClass::Kms,
+        ] {
+            let err = class.ensure_oss_mintable().expect_err("must refuse");
+            assert_eq!(err.slug, class.as_str());
+        }
+    }
+
+    #[test]
+    fn revocation_record_verifies_and_surfaces_the_window() {
+        // A revocation record rides the chain like a rotation, and the
+        // walk surfaces its suspected_compromise_from_seq + head custody.
+        let (records, _w, _k0, k1, k2) = chain_fixture();
+        let r1 = &records[1].0;
+        let revocation = LineageRecord::revocation(
+            r1,
+            &k2.public_base64(),
+            99,
+            None,
+            "2026-06-04T00:00:00+00:00",
+        )
+        .expect("build revocation");
+        assert_eq!(revocation.reason, LineageReason::Revocation);
+        assert_eq!(revocation.suspected_compromise_from_seq, Some(99));
+        let rebuilt = vec![
+            records[0].clone(),
+            records[1].clone(),
+            signed(&revocation, &k1),
+        ];
+        let witnesses: Vec<Vec<u8>> = rebuilt
+            .iter()
+            .map(|(r, _)| r.witness_payload_hash().unwrap())
+            .collect();
+        let v = verify_lineage(&rebuilt, &witnesses, Some(&k2.public_base64()))
+            .expect("revoked chain still verifies (R13)");
+        assert_eq!(v.epoch, 2);
+        assert_eq!(v.revoked_from_seq, Some(99));
+        assert_eq!(v.head_custody_class, CustodyClass::SoftwareFile);
+        assert_eq!(v.head_key.to_bytes(), k2.public.to_bytes());
+    }
+
+    #[test]
+    fn legacy_software_file_record_bytes_are_unchanged() {
+        // v1.0.0 #1949 back-compat pin: a software-file / no-revocation
+        // record's canonical signing bytes are byte-identical to a
+        // record with the additive fields at their omitted defaults — so
+        // legacy v76 signatures keep verifying.
+        let (records, _w, _k0, _k1, _k2) = chain_fixture();
+        let genesis = &records[0].0;
+        let mut with_defaults = genesis.clone();
+        with_defaults.custody_class = CustodyClass::SoftwareFile;
+        with_defaults.suspected_compromise_from_seq = None;
+        assert_eq!(
+            genesis.canonical_bytes().unwrap(),
+            with_defaults.canonical_bytes().unwrap()
+        );
     }
 
     #[test]
