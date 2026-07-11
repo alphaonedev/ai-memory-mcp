@@ -361,7 +361,16 @@ pub(crate) fn handle_store(
     // lands `claimed` (skips the gate). Only an explicit
     // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`/`=true` forces the strict
     // reject-unsigned posture on this surface.
-    {
+    // v1.0.0 crypto-core stage 3 (#1942/#1941) — a presented v2 envelope
+    // (`write_v2`) takes precedence over the v1 `signature` path and runs the
+    // mandatory §2.3 cert→write→suite chain. Absent → the v1 block below runs
+    // byte-for-byte unchanged. A presented-but-invalid/forged v2 is a hard
+    // REJECT on every surface (including MCP), regardless of the require flag.
+    let presented_v2 =
+        crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
+    if let Some(v2) = presented_v2 {
+        crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)?;
+    } else {
         let presented_sig = params["signature"]
             .as_str()
             .map(str::trim)

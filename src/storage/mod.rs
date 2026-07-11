@@ -728,6 +728,20 @@ pub(crate) fn extract_mentioned_entity_id(mem: &Memory) -> Option<String> {
     None
 }
 
+/// v1.0.0 (#1945, spec §4) — denormalise the `kind_provenance` column from
+/// the `metadata.kind_provenance` carrier at the persist funnel (the
+/// `mentioned_entity_id` precedent).
+///
+/// Returns the validated closed-vocab wire string
+/// (`declared`/`channel_derived`/`regex`/`llm`) stamped by the write entry
+/// point, or `None` when unstamped / off-vocab — so the column stays NULL on
+/// legacy and untyped rows (NULL is legal). The provenance value itself also
+/// lives in `metadata` (surfaced in recall); this column is the SQL-queryable
+/// copy.
+pub(crate) fn extract_kind_provenance(mem: &Memory) -> Option<&'static str> {
+    crate::models::KindProvenance::from_metadata(&mem.metadata).map(|p| p.as_str())
+}
+
 /// Insert with upsert on title+namespace. Returns the ID (existing or new).
 ///
 /// Ultrareview #352: collapses the previous `INSERT`/`ON CONFLICT` +
@@ -831,8 +845,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
             -- content-id + pre-image (self-assign, never the excluded
@@ -933,9 +947,15 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- If-Match could overwrite the merge invisibly. The decay
             -- sweep remains the only documented non-bumping mutator
             -- (tests/non_version_bumping_sites_1036.rs).
-            version = memories.version + 1
+            version = memories.version + 1,
+            -- v1.0.0 (#1945) — the epistemic-typing provenance follows the
+            -- incoming write when it carries one, else keeps the stored
+            -- value (a re-store that omits the carrier must not blank an
+            -- existing marker). COALESCE, like the Form-4/5 columns above.
+            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance)
          RETURNING id",
     )?;
+    let kind_provenance_col = extract_kind_provenance(mem);
     let actual_id: String = insert_stmt.query_row(
         params![
             mem.id,
@@ -968,6 +988,7 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             encrypted_envelope,
             cid_stamp.cid,
             cid_stamp.genesis,
+            kind_provenance_col,
         ],
         |r| r.get(0),
     )?;
@@ -9134,6 +9155,112 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
         .ok()
         .flatten();
     Ok(pubkey)
+}
+
+/// v1.0.0 crypto-core stage 3 (#1942, spec §2.3) — TOFU-persist a verified
+/// [`crate::identity::attest_v2::SubkeyCertRecord`] into the v79
+/// `agent_subkey_certs` table.
+///
+/// The caller MUST only invoke this AFTER the cert verified under the
+/// enrolled principal root (see `attest_v2::verify_v2_write`), so a row is
+/// guaranteed root-signed — an unauthenticated caller can never seed a
+/// trusted row. Idempotent: `INSERT OR IGNORE` on the cid-derived PK means a
+/// re-presented cert is a no-op, so the write path can persist on every
+/// valid presentation without duplicate rows. The principal-ROOT key is
+/// deliberately NOT stored (the enrolled key is the sole trust authority).
+///
+/// # Errors
+///
+/// Surfaces underlying `INSERT` failures.
+pub fn insert_subkey_cert(
+    conn: &Connection,
+    rec: &crate::identity::attest_v2::SubkeyCertRecord,
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO agent_subkey_certs
+            (id, principal, instance_key_id, model_version_ref, not_before,
+             not_after, signature, cert_bytes, revoked, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+        params![
+            rec.id,
+            rec.principal,
+            rec.instance_key_id,
+            rec.model_version_ref,
+            rec.not_before,
+            rec.not_after,
+            rec.signature,
+            rec.cert_bytes,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// A read-back row of the `agent_subkey_certs` table (spec §2.3), for the
+/// `ai-memory agents subkey-certs` inspect surface.
+#[derive(Debug, Clone)]
+pub struct SubkeyCertRow {
+    /// cid-derived row id (`b3:` of the canonical cert bytes).
+    pub id: String,
+    /// Certified principal.
+    pub principal: String,
+    /// Certified per-instance sub-key id (raw Ed25519 verifying-key bytes).
+    pub instance_key_id: Vec<u8>,
+    /// Bound model-version reference bytes.
+    pub model_version_ref: Vec<u8>,
+    /// Validity window start (RFC3339).
+    pub not_before: String,
+    /// Validity window end (RFC3339).
+    pub not_after: String,
+    /// Whether the cert has been revoked (0 = live).
+    pub revoked: bool,
+    /// When the row was first persisted (RFC3339).
+    pub created_at: String,
+}
+
+/// List persisted sub-key certificates (spec §2.3), optionally filtered to a
+/// single `principal`. Ordered by `created_at` for stable inspect output.
+///
+/// # Errors
+///
+/// Surfaces underlying query failures.
+pub fn list_subkey_certs(conn: &Connection, principal: Option<&str>) -> Result<Vec<SubkeyCertRow>> {
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SubkeyCertRow> {
+        Ok(SubkeyCertRow {
+            id: row.get(0)?,
+            principal: row.get(1)?,
+            instance_key_id: row.get(2)?,
+            model_version_ref: row.get(3)?,
+            not_before: row.get(4)?,
+            not_after: row.get(5)?,
+            revoked: row.get::<_, i64>(6)? != 0,
+            created_at: row.get(7)?,
+        })
+    };
+    let mut out = Vec::new();
+    if let Some(p) = principal {
+        let mut stmt = conn.prepare(
+            "SELECT id, principal, instance_key_id, model_version_ref, not_before,
+                    not_after, revoked, created_at
+             FROM agent_subkey_certs WHERE principal = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![p], map_row)?;
+        for r in rows {
+            out.push(r?);
+        }
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, principal, instance_key_id, model_version_ref, not_before,
+                    not_after, revoked, created_at
+             FROM agent_subkey_certs ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], map_row)?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
 }
 
 /// Clear the Ed25519 public key bound to `agent_id` (#626 Layer-3,

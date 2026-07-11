@@ -12545,12 +12545,12 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
                 mentioned_entity_id, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis
+                cid, cid_genesis, kind_provenance
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26, $27, $28, $29, $30)
+                      $26, $27, $28, $29, $30, $31)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #228 Commit B — content + envelope move together on upsert
@@ -12633,7 +12633,11 @@ impl MemoryStore for PostgresStore {
                 -- #1632 (pg twin) — upsert-merge IS a mutation, so the Gap-1
                 -- optimistic-concurrency counter bumps exactly like
                 -- db::update (sqlite landed in 27b45dc2).
-                version = memories.version + 1
+                version = memories.version + 1,
+                -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
+                -- provenance follows the incoming write when present, else
+                -- keeps the stored marker (COALESCE).
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -12666,6 +12670,10 @@ impl MemoryStore for PostgresStore {
         .bind(store_encrypted_envelope)
         .bind(&store_cid.cid)
         .bind(&store_cid.genesis)
+        // v1.0.0 (#1945) — denormalised epistemic-typing provenance column
+        // ($31), derived from the `metadata.kind_provenance` carrier (sqlite
+        // `db::insert` parity via `extract_kind_provenance`).
+        .bind(crate::storage::extract_kind_provenance(memory))
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?

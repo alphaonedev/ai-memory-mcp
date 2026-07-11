@@ -254,6 +254,10 @@ pub fn maybe_auto_classify(mem: &mut Memory, policy: Option<MemoryKindAutoClassi
     }
     if let Some(kind) = classify_by_regex(&mem.title, &mem.content) {
         mem.memory_kind = kind;
+        // v1.0.0 (#1945, spec §4) — the deterministic regex classifier
+        // assigned the kind: record `regex` provenance, overriding any
+        // `channel_derived` base the entry point stamped.
+        crate::models::KindProvenance::Regex.stamp(&mut mem.metadata);
         return kind;
     }
     // RegexThenLlm path. The substrate keeps an LLM classifier
@@ -264,6 +268,8 @@ pub fn maybe_auto_classify(mem: &mut Memory, policy: Option<MemoryKindAutoClassi
         && let Some(kind) = llm_classify_shim(&mem.title, &mem.content)
     {
         mem.memory_kind = kind;
+        // v1.0.0 (#1945) — the LLM classifier assigned the kind.
+        crate::models::KindProvenance::Llm.stamp(&mut mem.metadata);
         return kind;
     }
     mem.memory_kind

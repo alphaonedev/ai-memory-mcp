@@ -78,6 +78,29 @@ pub const ATTEST_LEVEL: &str = "attest_level";
 ///
 /// [`SignableWrite`]: crate::identity::sign::SignableWrite
 pub const WRITE_SIGNATURE: &str = "write_signature";
+/// v1.0.0 crypto-core (#1942, spec §2.3) — `write_v2` presentation-envelope
+/// + `agent_subkey_certs` JSON field keys. One named const per key so the
+/// v2 ingest parser, the CLI enroll/inspect surface, and the docs never
+/// scatter the raw string (the hardcoded-literal gate SSOT).
+pub const CERT_SIGNATURE: &str = "cert_signature";
+/// `not_before` — sub-key cert validity-window start (RFC3339).
+pub const NOT_BEFORE: &str = "not_before";
+/// `not_after` — sub-key cert validity-window end (RFC3339).
+pub const NOT_AFTER: &str = "not_after";
+/// `instance_key_id` — certified per-instance sub-key id (base64 bytes).
+pub const INSTANCE_KEY_ID: &str = "instance_key_id";
+/// `model_version_ref` — bound model-version reference (base64 bytes).
+pub const MODEL_VERSION_REF: &str = "model_version_ref";
+/// `content_codec` — v2 content-digest multihash codec token.
+pub const CONTENT_CODEC: &str = "content_codec";
+/// `cert` — the nested sub-key-cert object in a `write_v2` envelope.
+pub const CERT: &str = "cert";
+/// `principal` — the certified principal (agent id) key.
+pub const PRINCIPAL: &str = "principal";
+/// `suite_tag` — committed advisory algorithm-suite tag key.
+pub const SUITE_TAG: &str = "suite_tag";
+/// `session_id` — optional presence-encoded session id key.
+pub const SESSION_ID: &str = "session_id";
 /// `version_vector` — per-memory CRDT vector-clock metadata key (#1756 /
 /// #1719 item 2). Lives inside `metadata`; merged by pointwise-max.
 pub const VERSION_VECTOR: &str = "version_vector";

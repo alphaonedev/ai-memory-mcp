@@ -57,6 +57,25 @@ pub enum AgentsAction {
         #[arg(long)]
         agent_id: String,
     },
+    /// v1.0.0 crypto-core (#1942, spec §2.3) — pre-enroll a per-instance
+    /// sub-key certificate from a JSON file. The cert is verified under the
+    /// principal's bound root key (`bind-key` first) BEFORE it is stored, so
+    /// only a root-signed cert can be enrolled. The file carries the frozen
+    /// bound fields + the principal-root signature:
+    /// `{principal, instance_key_id, model_version_ref, not_before,
+    /// not_after, cert_signature}` (bytes base64-encoded).
+    EnrollSubkeyCert {
+        /// Path to the JSON cert-envelope file.
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+    /// v1.0.0 crypto-core (#1942, spec §2.3) — list persisted sub-key
+    /// certificates (optionally for one principal).
+    SubkeyCerts {
+        /// Filter to a single principal (agent id).
+        #[arg(long)]
+        agent_id: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -189,6 +208,121 @@ pub fn run_agents(
                 writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
             }
         }
+        AgentsAction::EnrollSubkeyCert { file } => {
+            enroll_subkey_cert(&conn, &file, json_out, out)?;
+        }
+        AgentsAction::SubkeyCerts { agent_id } => {
+            let rows = db::list_subkey_certs(&conn, agent_id.as_deref())?;
+            if json_out {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let certs: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            (field_names::PRINCIPAL): r.principal,
+                            (field_names::INSTANCE_KEY_ID): b64.encode(&r.instance_key_id),
+                            (field_names::MODEL_VERSION_REF): b64.encode(&r.model_version_ref),
+                            (field_names::NOT_BEFORE): r.not_before,
+                            (field_names::NOT_AFTER): r.not_after,
+                            "revoked": r.revoked,
+                            (field_names::CREATED_AT): r.created_at,
+                        })
+                    })
+                    .collect();
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({"count": rows.len(), "subkey_certs": certs})
+                )?;
+            } else if rows.is_empty() {
+                writeln!(out.stdout, "no sub-key certificates")?;
+            } else {
+                for r in &rows {
+                    writeln!(
+                        out.stdout,
+                        "{}  principal={}  window=[{}..{}]  revoked={}",
+                        id_short(&r.id),
+                        r.principal,
+                        r.not_before,
+                        r.not_after,
+                        r.revoked
+                    )?;
+                }
+                writeln!(out.stdout, "{} sub-key certificate(s)", rows.len())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pre-enroll a sub-key certificate: parse the JSON envelope, verify it under
+/// the principal's bound root key, and TOFU-persist it (#1942, spec §2.3).
+fn enroll_subkey_cert(
+    conn: &rusqlite::Connection,
+    file: &Path,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let raw = std::fs::read_to_string(file)
+        .map_err(|e| anyhow::anyhow!("read cert file {}: {e}", file.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| anyhow::anyhow!("parse cert JSON: {e}"))?;
+    let get_str = |k: &str| -> Result<String> {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("cert file missing string field `{k}`"))
+    };
+    let get_b64 = |k: &str| -> Result<Vec<u8>> {
+        b64.decode(get_str(k)?.trim())
+            .map_err(|e| anyhow::anyhow!("cert field `{k}` not base64: {e}"))
+    };
+    let principal = get_str(field_names::PRINCIPAL)?;
+    validate::validate_agent_id(&principal)?;
+    let instance_key_id = get_b64(field_names::INSTANCE_KEY_ID)?;
+    let model_version_ref = get_b64(field_names::MODEL_VERSION_REF)?;
+    let not_before = get_str(field_names::NOT_BEFORE)?;
+    let not_after = get_str(field_names::NOT_AFTER)?;
+    let cert_signature = get_b64(field_names::CERT_SIGNATURE)?;
+
+    let root_b64 = db::agent_pubkey(conn, &principal)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "principal '{principal}' has no bound root key — run `ai-memory agents bind-key` first"
+        )
+    })?;
+    let root = identity::keypair::decode_public_base64(&root_b64)
+        .map_err(|e| anyhow::anyhow!("bound root key for '{principal}' is malformed: {e}"))?;
+    let rec = identity::attest_v2::verify_and_record_cert(
+        &root,
+        &principal,
+        &instance_key_id,
+        &model_version_ref,
+        &not_before,
+        &not_after,
+        &cert_signature,
+    )
+    .map_err(|e| anyhow::anyhow!("cert verification failed: {e}"))?;
+    db::insert_subkey_cert(conn, &rec)?;
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "enrolled": true,
+                "id": rec.id,
+                "principal": rec.principal,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "enrolled sub-key cert {} for {principal}",
+            id_short(&rec.id)
+        )?;
     }
     Ok(())
 }

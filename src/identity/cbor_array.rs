@@ -243,7 +243,7 @@ const MULTIHASH_CODEC_SHA2_256: u64 = 0x12;
 /// Multihash codec byte for BLAKE3 (32-byte digest).
 const MULTIHASH_CODEC_BLAKE3: u64 = 0x1e;
 /// Digest length (in bytes) for every codec this stage supports.
-const MULTIHASH_DIGEST_LEN: usize = 32;
+pub const MULTIHASH_DIGEST_LEN: usize = 32;
 
 /// A self-describing content-digest hash family (spec Appendix A.2).
 ///

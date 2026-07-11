@@ -103,6 +103,11 @@ pub mod replay;
 // direct write is REJECTED unless AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0;
 // a presented-but-bad sig is always fail-closed regardless of the flag.
 pub mod attest;
+// v1.0.0 crypto-core stage 3 (#1942/#1941) — live v2 write-attestation
+// path: composes the stage-1 cbor_array encoder + stage-2 SubkeyCert chain
+// + suite binding into the store-path `write_v2` presentation gate. Additive
+// and opt-in by presentation; absent → today's v1/claimed behaviour.
+pub mod attest_v2;
 // #1558 — reserved caller-identity sentinel SSOT. Every internal /
 // system principal string (privileged carve-outs, resolve-failure
 // sentinels, daemon agent ids) lives here as one named const;

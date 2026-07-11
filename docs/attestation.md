@@ -423,5 +423,96 @@ would land `claimed`) is **stored** with the system-only lifecycle state
 
 ---
 
+## v2 write attestation (v1.0.0 crypto-core, #1942/#1941)
+
+The v1.0.0 crypto-core adds an **additive, opt-in** second attestation
+envelope alongside the v1 detached-signature path above. The v1 six-field
+envelope is unchanged; **when no v2 envelope is presented, behaviour is
+byte-for-byte identical to today.** A v2 envelope is stronger: the write is
+signed by a **per-instance sub-key** that is itself **certified by the
+agent's enrolled root key** (`bind-key`), so a compromised or lost instance
+key is bounded by the cert's validity window and revocation.
+
+### Presentation channel
+
+A v2 write arrives as a single `write_v2` object — a `params` key on MCP
+`memory_store`, a body field on `POST /api/v1/memories`, or a `--write-v2
+<file>` JSON payload on `ai-memory store`. Its presence (and only its
+presence) routes the write through the v2 gate, taking precedence over the
+v1 `signature` path. The object is self-contained and offline-verifiable:
+
+```json
+{
+  "cert": {
+    "principal": "<agent_id>",
+    "instance_key_id":   "<base64 raw Ed25519 sub-key pubkey>",
+    "model_version_ref": "<base64 model-version ref>",
+    "not_before": "<RFC3339>",
+    "not_after":  "<RFC3339>"
+  },
+  "cert_signature":  "<base64 principal-root Ed25519 over the cert>",
+  "write_signature": "<base64 sub-key Ed25519 over the v2 write pre-image>",
+  "suite_tag": 0,
+  "content_codec": "sha2-256",
+  "created_at": "<RFC3339 the caller signed>"
+}
+```
+
+The signed write pre-image is the pinned CBOR **array** of the frozen spec
+§2.2 (`docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md`).
+`title` and `content` are mode-independently secret-screened before the
+digest, exactly like the `cid` genesis, so signer and verifier converge.
+
+### Mandatory ingest order (spec §2.3 / §2.4)
+
+1. **Cert under root FIRST** — the `SubkeyCert` must verify under the
+   agent's C3-bound principal-root key (the *sole* trust authority). A
+   self-declared instance with no root-signed cert is rejected here.
+2. **Write under the certified sub-key** — the write signature must verify
+   under the certified `instance_key_id`.
+3. **Validity window**, then **suite cross-check** — the wire `suite_tag`
+   is *advisory only*, cross-checked against the enrolled suite; it is
+   **never** used to select the verify path (the JWS `alg`-confusion class
+   is structurally unrepresentable). Unknown/mismatched tag → reject.
+
+A valid v2 write is stamped `attest_level = agent_attested`. Any
+invalid/forged/expired/mismatched envelope is a **hard reject on every
+surface**, regardless of `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`.
+
+### Sub-key certificate enrollment
+
+Certs are **verified inline** on first presentation and TOFU-persisted to
+the `agent_subkey_certs` table (safe: they are root-signed) for audit and
+future revocation. An operator may also **pre-enroll** a cert:
+
+```bash
+# The JSON file carries the same fields as write_v2.cert + cert_signature.
+ai-memory agents enroll-subkey-cert --file subkey-cert.json
+ai-memory agents subkey-certs [--agent-id <id>]      # inspect
+```
+
+The enrolled principal root (`ai-memory agents bind-key`) is the only trust
+input; the principal-root pubkey is deliberately **not** stored in the cert
+table.
+
+## Epistemic-typing provenance (`kind_provenance`, #1945)
+
+Every store path now records **how** a memory's `memory_kind` was assigned,
+in the additive v79 `kind_provenance` column (closed vocab: `declared`,
+`channel_derived`, `regex`, `llm`). It is **unsigned** (not part of the v2
+envelope) and NULL-legal on legacy rows:
+
+- caller-supplied `kind` → `declared`
+- the auto-classify regex pass (MCP) → `regex`; the LLM classifier → `llm`
+- caller silence / channel default (incl. L4 turn capture) → `channel_derived`
+
+The value is stamped into `metadata.kind_provenance` at the write entry
+point (surfaced in recall via metadata, like `attest_level`) and
+denormalised into the queryable column at the persist funnel (the
+`mentioned_entity_id` precedent). The untyped→`Observation` default flip is
+**deliberately NOT** part of this change — it is phased to v0.10.0 (#1972).
+
+---
+
 *See also: [Agent identity](agent-identity.html) · [Governance](governance.html) · [Encryption](encryption.html) · [v0.9.0 release notes](v0.9.0/release-notes.html)*
 {% endraw %}

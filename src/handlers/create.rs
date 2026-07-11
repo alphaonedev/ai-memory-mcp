@@ -816,6 +816,14 @@ async fn create_memory_postgres(
         lifecycle_state: crate::models::LifecycleState::Open,
         cid: None,
     };
+    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance: a caller-
+    // supplied `kind` is `declared`; caller silence (the system default) is
+    // `channel_derived`. HTTP does not run the auto-classify hook (MCP-only).
+    if body.kind.is_some() {
+        crate::models::KindProvenance::Declared.stamp(&mut mem.metadata);
+    } else {
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut mem.metadata);
+    }
     // #626 Layer-3 (C7) — agent-attestation gate (postgres SAL branch).
     // Same contract as the sqlite path, but the bound-key lookup goes
     // through the async `MemoryStore::agent_pubkey`. 400 for a malformed
@@ -1299,6 +1307,13 @@ pub async fn create_memory(
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
     };
+    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance (sqlite branch
+    // parity with the postgres branch above).
+    if body.kind.is_some() {
+        crate::models::KindProvenance::Declared.stamp(&mut mem.metadata);
+    } else {
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut mem.metadata);
+    }
 
     // #626 Layer-3 (C7) — agent-attestation gate on the HTTP store path.
     // Mirrors the MCP `handle_store` gate: a remote caller signs the
