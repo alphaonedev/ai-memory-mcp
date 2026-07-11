@@ -199,6 +199,14 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
+      # #1986 — widened pass at the STRIPPED feature combo. Test files gated
+      # `#![cfg(feature = "sal-postgres")]` lose their file-level
+      # `#![allow(clippy::*)]` attributes when that cfg is false, but their
+      # crate-level `//!` docs are still linted, so pedantic doc lints fire
+      # ONLY in this configuration — invisible to both the default-features
+      # pass above and the postgres-feature job's fully-compiled pass.
+      - name: Clippy (all targets, sal — cfg-stripped doc-lint class)
+        run: cargo clippy --all-targets --features sal -- -D warnings -D clippy::all -D clippy::pedantic
 
   # actionlint — workflow-injection guard (#1851, audit follow-up #1855).
   # actionlint's NATIVE expression-injection check flags the #1851 class: an

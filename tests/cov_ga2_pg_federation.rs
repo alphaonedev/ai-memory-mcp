@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! cov_ga2_pg — GA-gate coverage backfill for the DEEP postgres federation
+//! `cov_ga2_pg` — GA-gate coverage backfill for the DEEP postgres federation
 //! receive body under the operator's uniform-90-per-module directive.
 //!
 //! The prior wave (`tests/cov_ga2_federation.rs`) and

@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! cov_ga2 round-4 — error / edge / match-arm coverage for the three
+//! `cov_ga2` round-4 — error / edge / match-arm coverage for the three
 //! near-90 handler modules `handlers::admin`, `handlers::links`, and
 //! `handlers::approvals`.
 //!
@@ -27,13 +27,13 @@
 //! DB; no test asserts global-table emptiness — assertions filter to
 //! this suite's own unique ids only.
 //!
-//! Covered handler arms (file:function):
-//!   - `admin::register_agent` — invalid agent_id 400, invalid
-//!     agent_type 400, invalid capabilities 400, sqlite create path.
-//!   - `admin::bind_agent_pubkey` — non-admin 403, invalid agent_id
+//! Covered handler arms (`file:function`):
+//!   - `admin::register_agent` — invalid `agent_id` 400, invalid
+//!     `agent_type` 400, invalid capabilities 400, sqlite create path.
+//!   - `admin::bind_agent_pubkey` — non-admin 403, invalid `agent_id`
 //!     400, invalid pubkey 400.
 //!   - `admin::list_agents` — non-admin 403, sqlite list path.
-//!   - `admin::quota_status_handler` — invalid agent_id 400, body /
+//!   - `admin::quota_status_handler` — invalid `agent_id` 400, body /
 //!     caller mismatch 403, sqlite single-agent + namespace arms,
 //!     sqlite operator-list arm, non-admin list 403.
 //!   - `admin::get_stats` — non-admin 403, sqlite stats path.
@@ -42,13 +42,13 @@
 //!   - `admin::import_memories` — oversize 400, non-admin 403, sqlite
 //!     import path (restamp + provenance), `tools_list`.
 //!   - `links::verify_link_handler` — missing-args 400, invalid
-//!     source_id 400, invalid target_id 400, strict-nonce 400,
-//!     back-compat no-nonce path, sqlite NOT_IMPLEMENTED is
+//!     `source_id` 400, invalid `target_id` 400, strict-nonce 400,
+//!     back-compat no-nonce path, sqlite `NOT_IMPLEMENTED` is
 //!     unreachable under `sal` (the pg/sal arm runs).
-//!   - `links::create_link` — unknown_field 400, deserialize 400,
-//!     invalid triple 400, invalid_relation 400, source-not-found
+//!   - `links::create_link` — `unknown_field` 400, deserialize 400,
+//!     invalid triple 400, `invalid_relation` 400, source-not-found
 //!     404, not-owner 403, sqlite create path.
-//!   - `links::delete_link` — unknown_field 400, deserialize 400,
+//!   - `links::delete_link` — `unknown_field` 400, deserialize 400,
 //!     invalid triple 400, missing-source deleted:false, not-owner
 //!     403, sqlite delete path.
 //!   - `links::get_links` — invalid id 400, sqlite visibility-filter
