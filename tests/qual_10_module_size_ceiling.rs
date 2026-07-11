@@ -299,8 +299,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // lanes + the sqlite `dequarantine` raw-UPDATE primitive + doc
     // contracts (~414 LOC at 23_400). Growth is justified: one SSOT
     // clause referenced at every read lane, zero speculative surface.
-    // 23_500 = 23_400 + 100 headroom.
-    ("src/storage/mod.rs", 23_500),
+    // 23_500 = 23_400 + 100 headroom. 2026-07-11 (#1942 stage 3): the
+    // v79 agent_subkey_certs storage primitives (insert/list) + the
+    // kind_provenance column denorm at the insert funnel landed the file
+    // at 23_527; ceiling 23_600 (+73 headroom).
+    ("src/storage/mod.rs", 23_600),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
