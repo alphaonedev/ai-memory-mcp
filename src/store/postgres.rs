@@ -4176,6 +4176,31 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW
+    /// dequarantine (postgres twin of [`crate::storage::dequarantine`]);
+    /// the body of the [`MemoryStore::dequarantine`] trait impl below. Clears
+    /// a [`crate::models::LifecycleState::Quarantined`] row back to
+    /// [`crate::models::LifecycleState::Open`] via a raw UPDATE that bypasses
+    /// the transition gate (`Quarantined` is terminal + absent from
+    /// `can_transition_to`). The `AND lifecycle_state = 'quarantined'` guard
+    /// makes it idempotent and a no-op on non-quarantined rows.
+    ///
+    /// # Errors
+    /// [`StoreError::BackendUnavailable`] on any sqlx error.
+    async fn dequarantine_raw(&self, id: &str) -> StoreResult<bool> {
+        let res = sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), version = version + 1 \
+             WHERE id = $2 AND lifecycle_state = $3",
+        )
+        .bind(crate::models::LifecycleState::Open.as_str())
+        .bind(id)
+        .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("dequarantine", e))?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// #1641 — single gate-CAS attempt. Returns `Ok(Some(new_version))`
     /// on success, `Ok(None)` when the guarded UPDATE matched 0 rows
     /// (version drifted / row vanished — the caller decides retry vs
@@ -4853,7 +4878,7 @@ impl PostgresStore {
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57) instead of recomputing
         // to_tsvector(title||' '||content) per matched row.
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT m.*,
                     ts_rank(m.tsv, plainto_tsquery('english', $1)) AS rank
              FROM memories m
@@ -4864,11 +4889,14 @@ impl PostgresStore {
                AND ($4::timestamptz IS NULL OR m.created_at >= $4)
                AND ($5::timestamptz IS NULL OR m.created_at <= $5)
                AND ($6::text IS NULL OR m.source_uri = $6)
+               {lifecycle_vis}
              ORDER BY rank DESC,
                       m.priority DESC,
                       m.updated_at DESC
              LIMIT $7",
-        )
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+            lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        ))
         .bind(query)
         .bind(filter.namespace.as_ref())
         .bind(filter.tier.as_ref().map(Tier::as_str))
@@ -4901,13 +4929,16 @@ impl PostgresStore {
             .unwrap_or(crate::storage::LIST_DEFAULT_CAP)
             .min(crate::storage::LIST_MAX_LIMIT);
         let cap: i64 = i64::try_from(cap_usize).unwrap_or(DEFAULT_LIST_CAP_I64);
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT m.* FROM memories m
               WHERE m.source_uri = $1
                 AND ($2::text IS NULL OR m.namespace = $2)
+                {lifecycle_vis}
               ORDER BY m.created_at ASC
               LIMIT $3",
-        )
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+            lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
+        ))
         .bind(source_uri)
         .bind(namespace)
         .bind(cap)
@@ -6799,7 +6830,15 @@ impl PostgresStore {
             SELECT target_id, relation, depth,
                    array_to_string(nodes, '->') AS path
             FROM traversal
-            ORDER BY depth ASC, target_id ASC"
+            WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = traversal.target_id {lifecycle_vis})
+            ORDER BY depth ASC, target_id ASC",
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
+            // general KG graph traversal, matching the SQLite `kg_query`
+            // memories-JOIN. The EXISTS also converges postgres to SQLite's
+            // require-target-exists semantics. (The lineage-DAG walk
+            // `lineage_cte` deliberately does NOT filter — a Tombstoned
+            // ancestor is the point of a conserved lineage.)
+            lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
         );
 
         let rows = sqlx::query(&sql)
@@ -12339,6 +12378,12 @@ impl MemoryStore for PostgresStore {
             | Capabilities::ATOMIC_MULTI_WRITE
     }
 
+    /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the
+    /// inherent [`PostgresStore::dequarantine_raw`]).
+    async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
+        self.dequarantine_raw(id).await
+    }
+
     /// v0.7.0.1 S75 — read `MAX(version)` from the live `schema_version`
     /// table so the `/api/v1/capabilities.db_schema_version` field
     /// reflects the actual applied migration ladder rather than a
@@ -14195,8 +14240,12 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'target_agent_id' = $6
                )
                AND ($7::text IS NULL OR metadata->>'agent_id' = $7)
+               {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC
-             LIMIT $5"
+             LIMIT $5",
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. Also
+            // covers the export egress: `export_memories` delegates to `list`.
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
         );
         let rows = sqlx::query(&list_sql)
             .bind(filter.namespace.as_ref())
@@ -14249,12 +14298,15 @@ impl MemoryStore for PostgresStore {
         let upper = prefix_upper_bound(prefix);
         let rows = match upper {
             Some(ref upper) => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "SELECT * FROM memories
                      WHERE namespace ~>=~ $1 AND namespace ~<~ $2
+                       {lifecycle_vis}
                      ORDER BY namespace USING ~<~
                      LIMIT $3",
-                )
+                    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+                    lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+                ))
                 .bind(prefix)
                 .bind(upper)
                 .bind(limit)
@@ -14262,12 +14314,15 @@ impl MemoryStore for PostgresStore {
                 .await
             }
             None => {
-                sqlx::query(
+                sqlx::query(&format!(
                     "SELECT * FROM memories
                      WHERE namespace ~>=~ $1
+                       {lifecycle_vis}
                      ORDER BY namespace USING ~<~
                      LIMIT $2",
-                )
+                    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+                    lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+                ))
                 .bind(prefix)
                 .bind(limit)
                 .fetch_all(&self.pool)
@@ -14362,7 +14417,7 @@ impl MemoryStore for PostgresStore {
         // recomputed the tsvector PER MATCHED ROW (~305 of 306 ms at
         // 8k rows in the P3 fleet audit); the GIN expression index
         // only ever served the `@@` match, never the rank.
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT *,
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
@@ -14389,9 +14444,12 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'agent_id' = $7
                    OR metadata->>'target_agent_id' = $7
                )
+               {lifecycle_vis}
              ORDER BY rank DESC, priority DESC
              LIMIT $6",
-        )
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+        ))
         .bind(&or_tsquery)
         .bind(filter.namespace.as_ref())
         .bind(filter.tier.as_ref().map(Tier::as_str))
@@ -14659,22 +14717,28 @@ impl MemoryStore for PostgresStore {
         // (`Index Cond: updated_at > $1`) or drop entirely (None branch),
         // with early-stop under the LIMIT. Verified via EXPLAIN
         // GENERIC_PLAN on a 200k-row probe (full-scan cost 7177 → 2396).
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. A
+        // Tombstoned/Quarantined row must not relay onward on this federation
+        // catch-up outbound path (honest caveat: quarantined rows black-hole
+        // until dequarantine). Unqualified `memories` columns.
+        let lifecycle_vis = crate::models::lifecycle_visible_clause("");
         let rows = match since_dt {
-            None => sqlx::query(
+            None => sqlx::query(&format!(
                 "SELECT * FROM memories \
+                     WHERE true {lifecycle_vis} \
                      ORDER BY updated_at ASC \
                      LIMIT $1",
-            )
+            ))
             .bind(limit_i)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("list memories updated since", e))?,
-            Some(dt) => sqlx::query(
+            Some(dt) => sqlx::query(&format!(
                 "SELECT * FROM memories \
-                     WHERE updated_at > $1 \
+                     WHERE updated_at > $1 {lifecycle_vis} \
                      ORDER BY updated_at ASC \
                      LIMIT $2",
-            )
+            ))
             .bind(dt)
             .bind(limit_i)
             .fetch_all(&self.pool)
@@ -15349,7 +15413,7 @@ impl MemoryStore for PostgresStore {
         // per row.
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57); see search() above for the rationale.
-        let fts_rows = sqlx::query(
+        let fts_rows = sqlx::query(&format!(
             "SELECT *,
                     ts_rank(tsv, to_tsquery('english', $1))
                     + (priority * 0.5)
@@ -15379,9 +15443,12 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'agent_id' = $9
                    OR metadata->>'target_agent_id' = $9
                )
+               {lifecycle_vis}
              ORDER BY fts_score DESC
              LIMIT $8",
-        )
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list (FTS pool).
+            lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+        ))
         .bind(&or_tsquery)
         .bind(filter.namespace.as_ref())
         .bind(filter.tier.as_ref().map(Tier::as_str))
@@ -15423,7 +15490,7 @@ impl MemoryStore for PostgresStore {
             let ann_pool: i64 = (limit_eff * 5).max(50);
             let qvec = pgvector::Vector::from(qe.to_vec());
             // #910 SAL-level scope=private gate via $9.
-            let sem_rows = sqlx::query(
+            let sem_rows = sqlx::query(&format!(
                 "SELECT *, (1.0 - (embedding <=> $1)) AS cosine_sim,
                           octet_length(content) AS content_len
                  FROM memories
@@ -15441,9 +15508,12 @@ impl MemoryStore for PostgresStore {
                        OR COALESCE(metadata->>'scope', 'private') <> 'private'
                        OR metadata->>'agent_id' = $9
                    )
+                   {lifecycle_vis}
                  ORDER BY embedding <=> $1
                  LIMIT $8",
-            )
+                // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list (semantic pool).
+                lifecycle_vis = crate::models::lifecycle_visible_clause(""),
+            ))
             .bind(&qvec)
             .bind(filter.namespace.as_ref())
             .bind(filter.tier.as_ref().map(Tier::as_str))

@@ -921,6 +921,25 @@ pub trait MemoryStore: Send + Sync {
         })
     }
 
+    /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW
+    /// dequarantine: clear a [`crate::models::LifecycleState::Quarantined`]
+    /// row back to [`crate::models::LifecycleState::Open`] via a raw UPDATE
+    /// that bypasses the `can_transition_to` gate (`Quarantined` is terminal +
+    /// system-only). The adapter guards on `lifecycle_state = 'quarantined'`
+    /// so it is idempotent and a no-op on any non-quarantined row. This is the
+    /// shared route-OUT surface for both dequarantine-on-attest (federation
+    /// receive-attestation upgrade) and operator dequarantine.
+    ///
+    /// Returns `true` when a quarantined row was cleared.
+    ///
+    /// # Errors
+    ///
+    /// Adapter-specific backend error. The default is a no-op `Ok(false)`
+    /// (in-memory / test adapters that hold no quarantine state).
+    async fn dequarantine(&self, _id: &str) -> StoreResult<bool> {
+        Ok(false)
+    }
+
     /// Execute an approved pending governance action — mirrors
     /// `db::execute_pending_action` on the SQLite path. The pending
     /// row's `action_type` selects the operation (`store` / `delete`

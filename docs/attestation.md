@@ -385,5 +385,43 @@ does **not** reach an MCP server the host launches with its own environment.
 
 ---
 
+## Quarantine of provenance-less federated writes (v1.0.0 R19/A3, #1948)
+
+A federated node can OPT IN to hiding inbound relayed memories it cannot
+attribute. Set `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1` (default **off** /
+permissive) and any inbound `/sync/push` memory that does not reach
+`attest_level=agent_attested` (no verified per-write content signature — it
+would land `claimed`) is **stored** with the system-only lifecycle state
+`quarantined`:
+
+- **The row still converges.** Quarantine is a NODE-LOCAL VIEW decision — the
+  bytes replicate normally (CRDT-safe); only *this* node hides the row.
+- **Structurally invisible.** A `quarantined` (and a `tombstoned`) row is
+  excluded from every read/egress lane — recall, list, search, export,
+  federation catch-up (`/sync/since`), and general KG traversal — by ONE
+  shared fail-CLOSED allow-list predicate (`lifecycle_state IN
+  ('open','active','blocked','done','abandoned')`; unknown/future states fail
+  closed). The lineage-DAG walk is the deliberate EXCEPTION: it conserves a
+  tombstoned ancestor because provenance is the whole point of lineage.
+- **System-only.** A caller can never set `quarantined` (or `tombstoned`): it
+  is absent from the lifecycle transition graph and rejected by input
+  validation. It is set/cleared only by system raw-UPDATE paths.
+
+### Getting a row OUT of quarantine (route-out)
+
+- **Dequarantine-on-attest (automatic).** When the author's write is later
+  re-received WITH a signature that verifies against their enrolled key
+  (`agent_attested`), the node clears the quarantine automatically.
+- **Operator dequarantine (manual).** The `dequarantine` storage/SAL
+  primitive raw-clears `quarantined → open` (idempotent; a no-op on any
+  non-quarantined row).
+
+> **Honest caveat.** A quarantined row **does not relay onward** from this
+> node — it is a local black-hole until it is dequarantined. Quarantine
+> defaults **off**; turn it on only when you want unattributed inbound
+> replication held back from local reads.
+
+---
+
 *See also: [Agent identity](agent-identity.html) · [Governance](governance.html) · [Encryption](encryption.html) · [v0.9.0 release notes](v0.9.0/release-notes.html)*
 {% endraw %}
