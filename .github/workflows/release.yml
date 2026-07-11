@@ -198,6 +198,91 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # --------------------------------------------------------------------
+  # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
+  #
+  # Emits a standalone CycloneDX JSON Software Bill of Materials via
+  # cargo-cyclonedx, a CI-installed release-workflow tool (NOT a
+  # Cargo.toml dependency; never linked into the shipped binary) per
+  # the 2x5 ruling fad215c5 / #1951 - the repo's operator-gated-
+  # dependency / no-external-code-injection rule permits a pinned,
+  # cargo-installed tool used only at release time.
+  #
+  # The SBOM enumerates every resolved dependency in Cargo.lock (name,
+  # version, purl, declared license); SHA-256 is present only for
+  # registry (crates.io) dependencies because Cargo.lock carries no
+  # hash for git/path deps. This is an inventory, not an assurance -
+  # it lists what is in the dependency graph and vouches for none of
+  # it. `cargo audit` (RustSec) remains the substrate's vulnerability
+  # gate; the SBOM is for compliance/procurement tooling to ingest.
+  #
+  # SOURCE_DATE_EPOCH is pinned to the tagged commit's own timestamp so
+  # the emitted metadata.timestamp (and any other clock-derived bytes)
+  # are byte-stable across re-runs of the same tag - this is the
+  # byte-stability lever this cargo-cyclonedx version exposes; the
+  # component list itself is already a deterministic function of the
+  # locked (and already-committed) dependency graph, so there is no
+  # separate sort step to run.
+  # --------------------------------------------------------------------
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+
+      - name: Install Rust 1.96.0
+        # Pin to rust-toolchain.toml (1.96.0) so cargo-cyclonedx reads
+        # the same Cargo.lock / MSRV-compatible metadata every other
+        # release job builds against.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sbom-${{ needs.preflight.outputs.tag }}
+
+      - name: Install cargo-cyclonedx (pinned version, CI tool only)
+        # Pinned per #1973 (2x5 ruling fad215c5): a cargo-installed
+        # release-workflow tool is acceptable here; it is never added
+        # to Cargo.toml and never compiled into the shipped binary.
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Generate CycloneDX SBOM (JSON)
+        run: |
+          set -euo pipefail
+          # Pin the emitted timestamp to the tagged commit's own
+          # timestamp (HEAD is already checked out at the release tag)
+          # so the SBOM is byte-stable across re-runs of the same tag.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          cargo cyclonedx --format json
+          mkdir -p dist
+          cp ai-memory.cdx.json dist/
+          cd dist
+          sha256sum ai-memory.cdx.json > ai-memory.cdx.json.sha256
+          ls -la ai-memory.cdx.json*
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          files: |
+            dist/ai-memory.cdx.json
+            dist/ai-memory.cdx.json.sha256
+          prerelease: ${{ needs.preflight.outputs.is_prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload workflow artifact (for cross-job inspection)
+        uses: actions/upload-artifact@v5
+        with:
+          name: ai-memory-sbom
+          path: dist/ai-memory.cdx.json*
+
+  # --------------------------------------------------------------------
   # v0.7.0 Posture-1a (issue #1068) — iOS xcframework artifact.
   #
   # Produces `ai-memory-ios.xcframework.tar.gz` containing a multi-arch
