@@ -302,12 +302,58 @@ footer a{color:var(--text-muted)}
     <table class="facts">
       <thead><tr><th>Certification</th><th>Status</th><th>Authority</th></tr></thead>
       <tbody>
-        <tr><td>A2A-Certified (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A gate</a> · v0.6.2 + v0.6.3</td></tr>
-        <tr><td>Ship-Gate (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship gate</a> · 9/9 cert + 5/5 channels green at v0.6.2 cut</td></tr>
+        <tr><td>A2A-Certified (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ai2ai-gate/">A2A gate</a> · v0.6.2 + v0.6.3 — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
+        <tr><td>Ship-Gate (internal)</td><td class="num">Yes</td><td class="src"><a href="https://alphaonedev.github.io/ai-memory-ship-gate/">Ship gate</a> · 9/9 cert + 5/5 channels green at v0.6.2 cut — last full 4-phase cell run; not re-run at v0.7.0/v0.8.x/v0.9.0, see currency note below</td></tr>
         <tr><td>SOC 2</td><td class="num">No</td><td class="src">No third-party audit. Do not represent.</td></tr>
         <tr><td>ISO 27001</td><td class="num">No</td><td class="src">No third-party audit. Do not represent.</td></tr>
         <tr><td>FedRAMP</td><td class="num">No</td><td class="src">No authorization. Do not represent.</td></tr>
         <tr><td>HIPAA</td><td class="num">No</td><td class="src">No BAA. Do not represent.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>Ship-Gate / A2A-Gate currency note (#1938 Gate-0 W3, 2026-07-11).</strong>
+      The linked Ship-Gate and A2A-Gate pages are separate GitHub Pages sites
+      (<code>ai-memory-ship-gate</code>, <code>ai-memory-ai2ai-gate</code> repos) whose
+      last full 4-phase cell run is the v0.6.2/v0.6.3 cut cited above — neither was
+      re-run as a full 4-phase cell for v0.7.0, v0.8.0, v0.8.1, or v0.9.0.
+      <strong>v0.9.0 shipped under a one-time recorded descope of the 4-phase
+      ship-gate/A2A-gate re-run</strong> (ruling <code>wf_26d176ac</code>, 10/10,
+      tracked on <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>).
+      This is not the same as "no evidence" — real, in-repo evidence exists for
+      v0.8.0/v0.8.1/v0.9.0; it is just not organized as a 4-phase cell run. See
+      the table below for exactly what exists and what does not. The v0.6.2/v0.6.3
+      boundary is covered forward by the v1.0.0 Gate-3 full-spectrum campaign,
+      which is scoped to re-run (or formally supersede) the 4-phase cell against
+      the current release line.
+    </div>
+
+    <h3>v0.8.0 / v0.8.1 / v0.9.0 — what evidence actually exists</h3>
+    <p>No 4-phase ship-gate or A2A-gate cell exists for these three releases. The
+    table below links the real evidence that does exist for each, in this repo,
+    and says plainly where a class of evidence (e.g. a live A2A cell run) is
+    absent.</p>
+    <table class="facts">
+      <thead><tr><th>Release</th><th>A2A / federation evidence</th><th>Operational + dogfood evidence</th><th>Security review</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>v0.8.0<br><span class="src">GA 2026-06-25</span></td>
+          <td class="src">IronClaw live 2-daemon A2A campaign, 2026-06-24, Grok-4.3 brain: GREEN on B.0–B.8 (HEAD binary, boot security-posture WARNs, mesh health, embedder fail-closed, peer-enrollment fail-closed, require-sig, push-DLQ, admin-gate) with <strong>zero product defects</strong>; B.9 enrolled-peer happy-path is CI-covered but <strong>not driven live</strong> (test-infra gap, filed for v0.9). <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.0/test-campaign-2026-06-24-ironclaw-a2a/track-b-a2a-results.md">track-b-a2a-results.md</a></td>
+          <td class="src">No dedicated v0.8.0 DO/dogfood record beyond the IronClaw campaign at left.</td>
+          <td class="src"><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.0/release-notes.md">release-notes.md</a> §"Security review + NHI validation"</td>
+        </tr>
+        <tr>
+          <td>v0.8.1<br><span class="src">GA 2026-06-29</span></td>
+          <td class="src">No dedicated A2A cell run for v0.8.1. The mTLS 3-leg federation encryption path (server TLS, client mTLS, quorum peer TLS) was verified live on a real droplet — see operational evidence at right.</td>
+          <td class="src">Live DigitalOcean droplet (NYC3), PASS on W1 (secret-screen refuse), W2 (erasure — store/forget/recall-nothing), W3 (honest durability — 202 not 503 on quorum miss), plus AI-NHI dogfood (G29/G30/G12 test suites + interactive MCP transcript). <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.1/operational-evidence-do.md">operational-evidence-do.md</a> / <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.1/dogfood-evidence.md">dogfood-evidence.md</a></td>
+          <td class="src">9 findings surfaced by a 7-lane adversarial review, all fixed and closed, contested calls decided by 5-agent vote — <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">CHANGELOG.md [0.8.1]</a> (#1821)</td>
+        </tr>
+        <tr>
+          <td>v0.9.0<br><span class="src">GA 2026-07-08</span></td>
+          <td class="src"><strong>No v0.9.0 A2A cell run exists.</strong> Stated plainly, not backfilled — the last live A2A cell evidence remains the v0.8.0 IronClaw campaign above.</td>
+          <td class="src">Live DigitalOcean droplet, 3 consecutive GREEN rounds (17/17 assertions each) on the fully-hardened <code>release/v0.9.0</code> binary, all 3 encryption legs (server TLS, client↔daemon, daemon↔Postgres) verified. Separately, an AI-NHI dogfood against a copy of a real 1,667-memory production database migrated schema v71→v78 with zero memory loss, 3/3 behavioral rounds GREEN. <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.9.0/operational-evidence-do-crypto.md">operational-evidence-do-crypto.md</a> / <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.9.0/dogfood-evidence.md">dogfood-evidence.md</a></td>
+          <td class="src"><a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.9.0/release-notes.md">release-notes.md</a> — security-hardening release; the crypto operational-evidence run cites "all 49 hardening findings fixed" on the tested binary.</td>
+        </tr>
       </tbody>
     </table>
   </div>

@@ -157,6 +157,113 @@ footer{padding:2rem 1.5rem;text-align:center;color:var(--text-dim);font-size:.85
       </div>
 
     </div>
+
+    <div class="callout">
+      <strong>Hub currency note (#1938 Gate-0 W3, 2026-07-11).</strong> The cards
+      above are every campaign entry this hub carried through v0.7.0 — there was
+      no v0.8.0, v0.8.1, or v0.9.0 entry until this update. Real evidence for
+      those three releases DOES exist in-repo; it was produced under different
+      campaign scaffolding (<code>docs/v0.8.0/</code>, <code>docs/v0.8.1/</code>,
+      <code>docs/v0.9.0/</code>) and is indexed in the "Post-v0.7.0 campaigns"
+      section below rather than backfilled into the v0.7.0-shaped cards above
+      (backfilling would misrepresent when/how each result was produced). No
+      4-phase ship-gate/A2A-gate cell run exists for any of the three — see the
+      <a href="../evidence.html">Frozen Claims</a> page's currency note for the
+      full explanation and the ruling that covers it (<code>wf_26d176ac</code>,
+      tracked on <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1938">#1938</a>).
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="eyebrow">Campaigns · v0.8.0 / v0.8.1 / v0.9.0</span>
+    <h2>Post-v0.7.0 campaigns.</h2>
+    <p>These three releases did not run the v0.7.0-style regression-run
+    scaffolding above; their real evidence lives under
+    <code>docs/v0.8.0/</code>, <code>docs/v0.8.1/</code>, <code>docs/v0.9.0/</code>.
+    Linked here so this hub is a complete index, not just the v0.7.0 subset.</p>
+    <div class="card-grid">
+
+      <div class="ecard green">
+        <span class="tag">GREEN · zero product defects</span>
+        <h3>v0.8.0 — IronClaw live A2A campaign, 2026-06-24</h3>
+        <p>Live 2-daemon agent-to-agent mesh against <code>release/v0.8.0</code> HEAD
+        <code>3e57ec3c</code>, Grok-4.3 brain over OpenRouter, shared pg-age Postgres
+        backend. B.0–B.8 GREEN (HEAD-binary check, boot security-posture WARNs,
+        mesh health, embedder fail-closed degrade, peer-enrollment fail-closed
+        #1789, require-sig #29, push-DLQ resilience, admin-gate); B.9 enrolled-peer
+        happy-path is CI-covered (8-green integration suite) but was NOT driven
+        live in the bare compose — a test-infra gap, not a product defect.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.0/test-campaign-2026-06-24-ironclaw-a2a/track-b-a2a-results.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">PASS</span>
+        <h3>v0.8.1 — DigitalOcean operational evidence, 2026-06-28</h3>
+        <p>Live DigitalOcean droplet (NYC3), <code>release/v0.8.1</code> binary
+        (sqlite backend). W1 (G29 secret-screen refuse) PASS, W2 (G30 erasure —
+        store/forget/recall-nothing) PASS, W3 (G12 honest durability — quorum
+        miss returns 202 not 503) PASS. The mTLS 3-leg federation encryption path
+        (server TLS, client mTLS, quorum peer TLS) verified live across two nodes.
+        Four pre-existing <code>do-hive</code> infra defects found while
+        standing up the droplet (#1841 firewall-var + 2 unfiled config bugs
+        fixed inline; #1842 postgres/AGE bootstrap gap, worked around by
+        smoke-testing sqlite instead).</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.1/operational-evidence-do.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">GREEN</span>
+        <h3>v0.8.1 — AI-NHI dogfood evidence</h3>
+        <p>Real-use verification of the v0.8.1 defect fixes by driving the actual
+        release binary as an AI-NHI agent's memory layer over MCP stdio
+        (fresh-subprocess probes). G29 secret-screen (5 tests), G30 erasure
+        fan-out incl. live-PG (5+5 tests), G12 quorum-miss durability (17 tests,
+        in-daemon), plus MCP governance + postgres L2 rehydration. Interactive
+        MCP dogfood transcript on the rebuilt release binary.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.8.1/dogfood-evidence.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">3 CONSECUTIVE ROUNDS GREEN</span>
+        <h3>v0.9.0 — DigitalOcean crypto-hardened operational evidence</h3>
+        <p>Live DigitalOcean droplet (NYC3, <code>s-1vcpu-2gb</code>), fully-hardened
+        <code>release/v0.9.0</code> tip <code>65772202</code> (all 49 hardening
+        findings fixed per this run), built <code>--release --features
+        sal,sal-postgres</code>. 3 consecutive green rounds, 17/17 assertions each,
+        across all 3 encryption legs (server TLS, client↔daemon, daemon↔Postgres —
+        PostgreSQL 16.14 + Apache AGE 1.6.0 + pgvector 0.6.0). Every SSH/scp channel
+        encrypted; zero droplets left running after teardown.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.9.0/operational-evidence-do-crypto.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard green">
+        <span class="tag">3/3 GREEN, 0 RED</span>
+        <h3>v0.9.0 — AI-NHI dogfood, real-data migration</h3>
+        <p>The <code>release/v0.9.0</code> binary (tip <code>728db5b2</code>) run
+        against a COPY of the operator's live production memory database (1,667
+        real memories, schema v71) to exercise the real upgrade path. Migrated
+        v71 → v78 in-place on open with zero memory loss and a clean
+        <code>doctor</code> report. 3 consecutive behavioral rounds (store, recall,
+        graph link, secret-screen refusal, forget) all GREEN. Confirms the
+        v0.9.0 default-attestation secure-default flip (#1751) behaves exactly
+        as documented.</p>
+        <a class="more" href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/v0.9.0/dogfood-evidence.md">Full evidence →</a>
+      </div>
+
+      <div class="ecard pending">
+        <span class="tag">No live cell run</span>
+        <h3>v0.9.0 — A2A / ship-gate coverage gap (stated plainly)</h3>
+        <p>No v0.9.0 A2A cell run and no v0.8.0/v0.8.1/v0.9.0 4-phase
+        ship-gate re-run exist. This is a one-time recorded descope (ruling
+        <code>wf_26d176ac</code>, #1938) — not a silent gap. The v1.0.0 Gate-3
+        full-spectrum campaign is scoped to re-run (or formally supersede) the
+        4-phase cell against the current release line.</p>
+        <a class="more" href="../evidence.html">Currency note on Frozen Claims →</a>
+      </div>
+
+    </div>
   </div>
 </section>
 
