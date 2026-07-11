@@ -403,22 +403,23 @@ impl PresentedWriteV2 {
 ///
 /// # Errors
 ///
-/// A human-readable string when `created_at` is not RFC3339 or is outside the
-/// [`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] window.
+/// When `created_at` is not RFC3339 or is outside the
+/// [`crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS`] window; the
+/// message is wire-suitable (QUAL-7: typed `anyhow`, not `String`).
 fn adopt_created_at(
     mem: &mut crate::models::Memory,
     presented: &PresentedWriteV2,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     let parsed = chrono::DateTime::parse_from_rfc3339(&presented.created_at)
-        .map_err(|e| format!("invalid v2 `created_at` (expected RFC3339): {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid v2 `created_at` (expected RFC3339): {e}"))?;
     let skew = (chrono::Utc::now() - parsed.with_timezone(&chrono::Utc))
         .num_seconds()
         .abs();
     if skew > crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS {
-        return Err(format!(
+        anyhow::bail!(
             "v2 `created_at` is outside the ±{}s attestation freshness window (skew {skew}s)",
             crate::identity::attest::ATTEST_CREATED_AT_SKEW_SECS
-        ));
+        );
     }
     mem.created_at = presented.created_at.clone();
     Ok(())
@@ -442,21 +443,21 @@ fn stamp_agent_attested(mem: &mut crate::models::Memory) {
 ///
 /// # Errors
 ///
-/// A human-readable string (suitable for a 4xx / MCP error envelope) on any
-/// verification, key-resolution, or freshness failure. A presented-but-
-/// unverifiable envelope is NEVER silently downgraded.
+/// On any verification, key-resolution, or freshness failure; the rendered
+/// message is suitable for a 4xx / MCP error envelope (QUAL-7: typed
+/// `anyhow`, not `String`). A presented-but-unverifiable envelope is NEVER
+/// silently downgraded.
 pub fn stamp_v2_sync(
     conn: &rusqlite::Connection,
     mem: &mut crate::models::Memory,
     agent_id: &str,
     presented: &PresentedWriteV2,
-) -> Result<(), String> {
+) -> anyhow::Result<()> {
     adopt_created_at(mem, presented)?;
-    let root_b64 = crate::db::agent_pubkey(conn, agent_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| AttestV2Error::NoRootKey.to_string())?;
+    let root_b64 = crate::db::agent_pubkey(conn, agent_id)?
+        .ok_or_else(|| anyhow::anyhow!(AttestV2Error::NoRootKey))?;
     let root = crate::identity::keypair::decode_public_base64(&root_b64)
-        .map_err(|_| AttestV2Error::BadRootKey.to_string())?;
+        .map_err(|_| anyhow::anyhow!(AttestV2Error::BadRootKey))?;
     let now = chrono::Utc::now().to_rfc3339();
     verify_v2_write(
         &root,
@@ -469,7 +470,7 @@ pub fn stamp_v2_sync(
         presented,
         &now,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     stamp_agent_attested(mem);
     if let Err(e) = crate::db::insert_subkey_cert(conn, &presented.to_record()) {
         tracing::warn!(error = %e, "v2 subkey-cert TOFU persist failed (write still attested)");
@@ -872,7 +873,10 @@ mod tests {
         let presented = parse_presented(&params).unwrap().expect("present");
         let mut mem = mem_fixture();
         let err = stamp_v2_sync(&conn, &mut mem, AGENT, &presented).unwrap_err();
-        assert!(err.contains("no bound principal-root key"), "got: {err}");
+        assert!(
+            err.to_string().contains("no bound principal-root key"),
+            "got: {err}"
+        );
     }
 
     // -- kind_provenance column denormalisation (#1945) ------------------
