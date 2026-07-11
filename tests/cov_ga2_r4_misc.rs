@@ -5,15 +5,15 @@
 //! four near-90 handler / MCP modules that the prior cov rounds left just
 //! under the uniform 90% per-module floor:
 //!
-//! - [`ai_memory::handlers`] `hook_subscribers.rs` — the SQLite branches of
+//! - [`ai_memory::handlers`] `hook_subscribers.rs` — the `SQLite` branches of
 //!   `get_inbox` / `session_start` / `set_namespace_standard` /
 //!   `get_namespace_standard` / `clear_namespace_standard` (and their
 //!   query-string + path-segment siblings). The prior round
 //!   (`tests/cov_ga2_pg_handlers_2.rs`) drove the `StorageBackend::Postgres`
 //!   arms; the residual dark lines are the auto-seed-placeholder + ownership
-//!   gate + governance-merge + fanout-disabled SQLite arms, plus the
+//!   gate + governance-merge + fanout-disabled `SQLite` arms, plus the
 //!   `?agent_id=` 403 mismatch + invalid-agent-id 400 validation arms.
-//! - [`ai_memory::handlers`] `power_consolidation.rs` — the SQLite branches
+//! - [`ai_memory::handlers`] `power_consolidation.rs` — the `SQLite` branches
 //!   of `consolidate_memories` / `fetch_consolidate_source_pairs` /
 //!   `fetch_memory_for_handler` / `load_family_handler`, plus the no-LLM
 //!   503 arm of `auto_tag_handler` / `expand_query_handler` and the

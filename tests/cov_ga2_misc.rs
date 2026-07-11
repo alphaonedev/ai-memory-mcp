@@ -89,6 +89,9 @@ fn sqlite_url(path: &std::path::Path) -> String {
 /// Live-Postgres connection string for the postgres arms. `None` when
 /// the operator hasn't provisioned the test instance — the postgres
 /// tests then become structural no-ops rather than hard failures.
+/// Both call sites are `sal-postgres`-gated, so the helper carries the
+/// same gate (dead under `--features sal` alone).
+#[cfg(feature = "sal-postgres")]
 fn postgres_url() -> Option<String> {
     std::env::var("AI_MEMORY_TEST_POSTGRES_URL")
         .ok()

@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! cov_ga2 — REAL-Postgres router coverage for the four handler modules
+//! `cov_ga2` — REAL-Postgres router coverage for the four handler modules
 //! whose `#[cfg(feature = "sal-postgres")]` dispatch arms were left dark
 //! by the prior wave's "fake-postgres" harness (an `AppState` whose
 //! `storage_backend = Postgres` but whose `store` is a `SqliteStore`
