@@ -78,3 +78,9 @@ coverage/*.profdata
 
 # local gate/run logs (never commit)
 /.local-runs-*
+
+# CycloneDX SBOM (#1973, v1.0) — `cargo cyclonedx` drops this at the repo
+# root when run locally to verify the release.yml SBOM step. It is a
+# release-time artifact generated fresh per tag in CI and attached to the
+# GitHub Release; never committed to the tree.
+/*.cdx.json

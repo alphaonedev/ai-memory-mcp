@@ -508,7 +508,7 @@ footer a{color:var(--text-muted)}
     <span class="eyebrow">The Rust language itself</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Without Rust, none of this.</h2>
     <p class="lede">ai-memory is written in Rust because Rust gives memory safety, fearless concurrency, and zero-cost abstractions in one language. Every guarantee about no use-after-free, no data races, no buffer overflows traces back to the Rust compiler doing its job. Thanks to the Rust team, the Rust Foundation, and every contributor whose work made <code>cargo build</code> reliable.</p>
-    <p style="margin-top:.85rem;font-size:.9rem"><strong style="color:var(--p1)">Rust is licensed Apache 2.0 / MIT.</strong> The full Cargo.lock dependency graph is shipped with every release as the SBOM (CycloneDX format). Operators who need the complete attribution list can extract it from the SBOM.</p>
+    <p style="margin-top:.85rem;font-size:.9rem"><strong style="color:var(--p1)">Rust is licensed Apache 2.0 / MIT.</strong> Starting at v1.0.0, the full Cargo.lock dependency graph ships with every release as a CycloneDX JSON SBOM (an inventory, not a security guarantee); operators who need the complete attribution list can extract it from the SBOM once it lands in the release artifacts.</p>
   </div>
 </section>
 
