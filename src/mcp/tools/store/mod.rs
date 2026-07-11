@@ -369,7 +369,8 @@ pub(crate) fn handle_store(
     let presented_v2 =
         crate::identity::attest_v2::parse_presented(params).map_err(|e| e.to_string())?;
     if let Some(v2) = presented_v2 {
-        crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)?;
+        crate::identity::attest_v2::stamp_v2_sync(conn, &mut mem, &agent_id, &v2)
+            .map_err(|e| format!("{e:#}"))?;
     } else {
         let presented_sig = params["signature"]
             .as_str()
