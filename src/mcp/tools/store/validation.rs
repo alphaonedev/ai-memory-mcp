@@ -251,6 +251,18 @@ pub(super) fn parse_and_build_memory(
     crate::validate::validate_kind(kind_param).map_err(|e| e.to_string())?;
     let caller_kind = kind_param.and_then(crate::models::MemoryKind::from_str);
 
+    // v1.0.0 (#1945, spec §4) — stamp the BASE epistemic-typing provenance:
+    // a caller-supplied kind is `declared`; caller silence (the system
+    // Observation default) is `channel_derived`. The `pre_store` auto-classify
+    // hook OVERRIDES this to `regex`/`llm` when it fires (only possible when
+    // the caller left the kind unset). Surfaced in recall via `metadata` and
+    // denormalised into the v79 `kind_provenance` column at persist.
+    if caller_kind.is_some() {
+        crate::models::KindProvenance::Declared.stamp(&mut metadata);
+    } else {
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut metadata);
+    }
+
     // v0.8.0 Pillar 2 (#1709) — caller-supplied initial `lifecycle_state`.
     // An explicit, non-parseable value is REJECTED (naming the valid set);
     // omitted / unknown-after-validation → `Open` (the schema DEFAULT).

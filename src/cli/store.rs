@@ -92,6 +92,13 @@ pub struct StoreArgs {
     /// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
     #[arg(long)]
     pub sign: bool,
+    /// v1.0.0 crypto-core (#1942/#1941, spec §2.2/§2.3) — path to a JSON
+    /// `write_v2` presentation envelope (certified sub-key signature over the
+    /// v2 CBOR-array pre-image). When present it takes precedence over
+    /// `--sign` and, on success, stamps `agent_attested`; an invalid/forged
+    /// envelope is REJECTED. See `docs/attestation.md` §"v2".
+    #[arg(long = "write-v2")]
+    pub write_v2: Option<std::path::PathBuf>,
     /// v0.9.0 G10.1 (#1827) — optional macaroon capability token
     /// (`cap1:...`) that may flip a governance Deny/Pending to Allow
     /// within its caveats. Inert unless `[capabilities].enabled`.
@@ -198,6 +205,14 @@ pub fn run(
             )
         })?,
     };
+    // v1.0.0 (#1945, spec §4) — epistemic-typing provenance. The CLI does
+    // not run the auto-classify hook (MCP-only), so the kind is either
+    // caller-`declared` (`--kind`) or the `channel_derived` system default.
+    if args.kind.is_some() {
+        crate::models::KindProvenance::Declared.stamp(&mut metadata);
+    } else {
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut metadata);
+    }
     let citations: Vec<crate::models::Citation> = match args.citations.as_deref() {
         None => Vec::new(),
         Some(s) => {
@@ -273,30 +288,49 @@ pub fn run(
     // an unsigned write takes the no-stamp `claimed` path; the gate is only
     // additionally invoked (with no signature) when the operator forces
     // strict via `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`.
-    let signature: Option<Vec<u8>> = if args.sign {
-        let dir = identity::keypair::default_key_dir()?;
-        let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
-            anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
-        })?;
-        Some(identity::attest::sign_memory_write(&kp, &mem, &agent_id)?)
+    // v1.0.0 crypto-core stage 3 (#1942/#1941) — a `--write-v2` envelope takes
+    // precedence over the v1 `--sign` path and runs the mandatory §2.3
+    // cert→write→suite chain; an invalid/forged envelope is REJECTED. Absent
+    // → the v1 attestation path below runs unchanged.
+    if let Some(v2_path) = args.write_v2.as_ref() {
+        let raw = std::fs::read_to_string(v2_path)
+            .map_err(|e| anyhow::anyhow!("read --write-v2 file {}: {e}", v2_path.display()))?;
+        let inner: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse --write-v2 JSON: {e}"))?;
+        let params = serde_json::json!({ "write_v2": inner });
+        let presented = identity::attest_v2::parse_presented(&params)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("--write-v2 file did not contain a write_v2 envelope")
+            })?;
+        identity::attest_v2::stamp_v2_sync(&conn, &mut mem, &agent_id, &presented)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
-        None
-    };
-    // #1985 — CLI is the operator-as-actor surface (WriteSurface::Cli): its
-    // compiled default is PERMISSIVE, so an unsigned `ai-memory store` lands
-    // `claimed` unless the operator forces strict with
-    // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`. `--sign` still upgrades to
-    // `agent_attested`; a forged signature is rejected regardless.
-    if args.sign
-        || identity::attest::require_agent_attestation_for(identity::attest::WriteSurface::Cli)
-    {
-        identity::attest::stamp_attestation_sync(
-            &conn,
-            &mut mem,
-            &agent_id,
-            signature.as_deref(),
-            identity::attest::WriteSurface::Cli,
-        )?;
+        let signature: Option<Vec<u8>> = if args.sign {
+            let dir = identity::keypair::default_key_dir()?;
+            let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
+                anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
+            })?;
+            Some(identity::attest::sign_memory_write(&kp, &mem, &agent_id)?)
+        } else {
+            None
+        };
+        // #1985 — CLI is the operator-as-actor surface (WriteSurface::Cli): its
+        // compiled default is PERMISSIVE, so an unsigned `ai-memory store` lands
+        // `claimed` unless the operator forces strict with
+        // `AI_MEMORY_REQUIRE_AGENT_ATTESTATION=1`. `--sign` still upgrades to
+        // `agent_attested`; a forged signature is rejected regardless.
+        if args.sign
+            || identity::attest::require_agent_attestation_for(identity::attest::WriteSurface::Cli)
+        {
+            identity::attest::stamp_attestation_sync(
+                &conn,
+                &mut mem,
+                &agent_id,
+                signature.as_deref(),
+                identity::attest::WriteSurface::Cli,
+            )?;
+        }
     }
 
     // W5b/C5: governance enforcement routes through `cli::governance::enforce`
@@ -413,6 +447,7 @@ mod tests {
             source_span: None,
             entity_id: None,
             sign: false,
+            write_v2: None,
             capability: None,
         }
     }

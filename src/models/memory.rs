@@ -696,6 +696,41 @@ impl std::fmt::Display for KindProvenance {
     }
 }
 
+/// Metadata carrier key for [`KindProvenance`] (#1945, spec §4).
+///
+/// The provenance is stamped into `metadata` at each write entry point —
+/// exactly the `attest_level` precedent — so it round-trips through the
+/// `memories.metadata` column and is surfaced in recall automatically. The
+/// physical v79 `kind_provenance` column is a denormalised, SQL-queryable
+/// copy the persist funnel derives from this key (the `mentioned_entity_id`
+/// precedent). Unsigned: it is NOT part of the `SignableWrite` v2 envelope.
+pub const METADATA_KIND_PROVENANCE_KEY: &str = "kind_provenance";
+
+impl KindProvenance {
+    /// Stamp this provenance into a memory's `metadata` object (idempotent
+    /// overwrite). A non-object metadata value is left untouched (the write
+    /// paths always build an object metadata).
+    pub fn stamp(self, metadata: &mut serde_json::Value) {
+        if let Some(obj) = metadata.as_object_mut() {
+            obj.insert(
+                METADATA_KIND_PROVENANCE_KEY.to_string(),
+                serde_json::Value::String(self.as_str().to_string()),
+            );
+        }
+    }
+
+    /// Read the provenance stamped in a memory's `metadata`, if any and if
+    /// on-vocab. `None` for legacy/unstamped rows (NULL stays legal) and for
+    /// an off-vocab value (forward-compat with a future variant).
+    #[must_use]
+    pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        metadata
+            .get(METADATA_KIND_PROVENANCE_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(Self::from_str)
+    }
+}
+
 /// v0.7.0 Form 5 (issue #758) — JSON snapshot of the signals that
 /// produced an auto-derived or calibrated confidence value.
 ///

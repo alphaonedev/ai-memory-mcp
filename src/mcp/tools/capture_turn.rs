@@ -515,6 +515,10 @@ pub(crate) fn prepare_capture_turn(
             obj.entry("agent_id".to_string())
                 .or_insert_with(|| Value::String(caller.to_string()));
         }
+        // v1.0.0 (#1945, spec §4) — a captured turn's `Observation` kind is
+        // assigned by the L4 capture channel, not caller-declared:
+        // `channel_derived` provenance.
+        crate::models::KindProvenance::ChannelDerived.stamp(&mut m);
         m
     };
 
