@@ -122,6 +122,13 @@ pub mod cid;
 // resolution, and cross-host federation are deferred to v1.0 — G13
 // stays OPEN this train (see the module docs' honest-scope section).
 pub mod lineage;
+// v1.0.0 crypto-core stage 1 (#1942, epic #1940) — pinned, in-house,
+// profile-enforcing CBOR *array* encoder for the v2 `Signable*` record
+// family (spec `docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md`
+// §1/§2.2/Appendix A). FORMAT layer only: additive, no store/verify wiring
+// and no schema migration this stage. The v1 map-based `sign` path is
+// untouched and never cross-verifies with v2 (distinct domain tag).
+pub mod cbor_array;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).
