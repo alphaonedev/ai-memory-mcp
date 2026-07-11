@@ -391,6 +391,135 @@ pub fn canonical_cbor_write_v2(w: &SignableWriteV2<'_>) -> Vec<u8> {
     encode(&array)
 }
 
+// ---------------------------------------------------------------------------
+// A3 dormant ingestion-event record (spec §6 / #1948, decision `560c8007`).
+//
+// FROZEN FORMAT, ZERO RUNTIME: the domain-separated ("ingestion-v1") canonical-
+// CBOR record for the day in-weights learning arrives. Frozen now because the
+// first real event's bytes become a permanent back-compat + forensic
+// obligation at the v1.0 tag. There is NO wiring into any live path and NO
+// schema migration — only the type, the encoder, the record-set Merkle-root
+// builder (which structurally excludes quarantined rows), and their golden
+// vectors.
+// ---------------------------------------------------------------------------
+
+/// The number of positional elements in an `ingestion-v1` record (spec §6).
+pub const INGESTION_V1_ELEMENTS: usize = 6;
+
+/// Digest length (bytes) of the record-set Merkle root — BLAKE3-256.
+pub const MERKLE_DIGEST_LEN: usize = 32;
+
+/// Domain-separation prefix for a Merkle *leaf* hash (a single record).
+const MERKLE_LEAF_DOMAIN: &[u8] = b"ai-memory/ingestion-v1/leaf";
+/// Domain-separation prefix for a Merkle *internal-node* hash.
+const MERKLE_NODE_DOMAIN: &[u8] = b"ai-memory/ingestion-v1/node";
+/// Domain-separated root of the EMPTY record-set (no visible records).
+const MERKLE_EMPTY_DOMAIN: &[u8] = b"ai-memory/ingestion-v1/empty";
+
+/// The dormant `ingestion-v1` weight-ingestion event (spec §6, A.3).
+///
+/// Commits the identity of a batch of learning: the Merkle root over the
+/// ingested record-set, the checkpoint the model advanced FROM and TO, the
+/// signing instance, and a timestamp. Element order + field set are FROZEN;
+/// distinct domain tag ([`INGESTION_V1_DOMAIN`]) never cross-verifies another
+/// record type (§1).
+///
+/// Frozen positions:
+/// ```text
+/// [0] "ingestion-v1"       (domain tag)
+/// [1] record_set_root      (bytes; BLAKE3-256 Merkle root — see
+///                           `ingestion_record_set_root`)
+/// [2] pre_checkpoint_ref   (bytes; the checkpoint the model advanced FROM)
+/// [3] post_checkpoint_ref  (bytes; the checkpoint the model advanced TO)
+/// [4] instance_id          (bytes; the root-certified signing instance)
+/// [5] timestamp            (text; RFC3339, mirroring the write-v2 created_at)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignableIngestionV1<'a> {
+    /// Merkle root over the (quarantine-excluded) ingested record-set (element [1]).
+    pub record_set_root: &'a [u8],
+    /// Reference to the pre-ingestion checkpoint (element [2]).
+    pub pre_checkpoint_ref: &'a [u8],
+    /// Reference to the post-ingestion checkpoint (element [3]).
+    pub post_checkpoint_ref: &'a [u8],
+    /// Root-certified per-instance id that signs the event (element [4]).
+    pub instance_id: &'a [u8],
+    /// RFC3339 event timestamp (element [5]).
+    pub timestamp: &'a str,
+}
+
+/// Encode a [`SignableIngestionV1`] to its canonical, profile-restricted signed
+/// bytes: the frozen 6-element positional array of spec §6.
+///
+/// These are the exact bytes an Ed25519 signature would be computed over when
+/// the runtime lands; the golden vector pins this function's output now.
+#[must_use]
+pub fn canonical_cbor_ingestion_v1(e: &SignableIngestionV1<'_>) -> Vec<u8> {
+    let array = CborItem::Array(vec![
+        CborItem::Text(INGESTION_V1_DOMAIN),    // [0] _dst
+        CborItem::Bytes(e.record_set_root),     // [1]
+        CborItem::Bytes(e.pre_checkpoint_ref),  // [2]
+        CborItem::Bytes(e.post_checkpoint_ref), // [3]
+        CborItem::Bytes(e.instance_id),         // [4]
+        CborItem::Text(e.timestamp),            // [5]
+    ]);
+    debug_assert!(
+        matches!(&array, CborItem::Array(v) if v.len() == INGESTION_V1_ELEMENTS),
+        "ingestion-v1 must encode exactly {INGESTION_V1_ELEMENTS} elements",
+    );
+    encode(&array)
+}
+
+/// v1.0.0 R19/A3 (#1948) — build the record-set Merkle root over an ingestion
+/// batch, **structurally excluding quarantined (and every other non-recall-
+/// visible) record** so a quarantined memory can never enter a signed
+/// ingestion commitment.
+///
+/// Each input is a `(record_id, lifecycle_state)`. A record is INCLUDED only
+/// when [`crate::models::LifecycleState::is_recall_visible`] holds — so
+/// `Quarantined`, `Tombstoned`, and any unknown/future state are dropped by
+/// construction (the same fail-closed allow-list the read lanes enforce). The
+/// included ids are sorted (order-independent, dedup-free canonical order),
+/// domain-separated leaf-hashed, and folded into a binary BLAKE3-256 Merkle
+/// tree (last node duplicated on an odd level). The empty set returns a fixed
+/// domain-separated sentinel root (never all-zero, which could collide a
+/// "no digest" placeholder).
+#[must_use]
+pub fn ingestion_record_set_root<'a>(
+    records: impl IntoIterator<Item = (&'a str, crate::models::LifecycleState)>,
+) -> [u8; MERKLE_DIGEST_LEN] {
+    let mut ids: Vec<&str> = records
+        .into_iter()
+        .filter_map(|(id, state)| state.is_recall_visible().then_some(id))
+        .collect();
+    ids.sort_unstable();
+    if ids.is_empty() {
+        return blake3::hash(MERKLE_EMPTY_DOMAIN).into();
+    }
+    let mut level: Vec<[u8; MERKLE_DIGEST_LEN]> = ids
+        .iter()
+        .map(|id| {
+            let mut h = blake3::Hasher::new();
+            h.update(MERKLE_LEAF_DOMAIN);
+            h.update(id.as_bytes());
+            h.finalize().into()
+        })
+        .collect();
+    while level.len() > 1 {
+        let mut next: Vec<[u8; MERKLE_DIGEST_LEN]> = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let mut h = blake3::Hasher::new();
+            h.update(MERKLE_NODE_DOMAIN);
+            h.update(&pair[0]);
+            // Duplicate the last node on an odd level (standard Merkle padding).
+            h.update(pair.get(1).unwrap_or(&pair[0]));
+            next.push(h.finalize().into());
+        }
+        level = next;
+    }
+    level[0]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +779,83 @@ mod tests {
         assert_representable(&CborItem::Text("t"));
         assert_representable(&CborItem::Bytes(&[0x00]));
         assert_representable(&CborItem::Array(vec![CborItem::Uint(0)]));
+    }
+
+    // -- A3 dormant ingestion-v1 record (spec §6 / #1948) ---------------
+
+    #[test]
+    fn ingestion_v1_golden_bytes() {
+        let root = [0xAAu8; 32];
+        let pre = [0xBBu8; 32];
+        let post = [0xCCu8; 32];
+        let inst = [0xDDu8; 32];
+        let ts = "2026-07-09T00:00:00Z";
+        let rec = SignableIngestionV1 {
+            record_set_root: &root,
+            pre_checkpoint_ref: &pre,
+            post_checkpoint_ref: &post,
+            instance_id: &inst,
+            timestamp: ts,
+        };
+        let enc = canonical_cbor_ingestion_v1(&rec);
+
+        // Independently reconstruct the frozen bytes from first principles
+        // (literal CBOR heads), NOT by calling the encoder — a genuine
+        // cross-check of the pinned bytes, not a circular re-derivation.
+        let mut expected = Vec::new();
+        expected.push(0x86); // 6-element definite-length array
+        expected.push(0x6c); // text head 0x60 | 12 for "ingestion-v1"
+        expected.extend_from_slice(INGESTION_V1_DOMAIN.as_bytes());
+        for payload in [&root, &pre, &post, &inst] {
+            expected.push(0x58); // byte-string, 1-byte length
+            expected.push(0x20); // length 32
+            expected.extend_from_slice(payload);
+        }
+        expected.push(0x74); // text head 0x60 | 20 for the RFC3339 timestamp
+        expected.extend_from_slice(ts.as_bytes());
+
+        assert_eq!(enc, expected, "ingestion-v1 golden bytes drifted");
+        // Determinism (Ed25519 precondition + the R24 re-encode path).
+        assert_eq!(enc, canonical_cbor_ingestion_v1(&rec));
+        // Header + domain-tag spot check.
+        assert_eq!(enc[0], 0x86);
+        assert_eq!(
+            &enc[2..2 + INGESTION_V1_DOMAIN.len()],
+            INGESTION_V1_DOMAIN.as_bytes()
+        );
+    }
+
+    #[test]
+    fn ingestion_record_set_excludes_quarantined_and_tombstoned() {
+        use crate::models::LifecycleState::{Active, Open, Quarantined, Tombstoned};
+        // The root over {a(open), b(active)} must be identical whether or not
+        // a quarantined + a tombstoned record are ALSO passed in — a
+        // system-hidden row can never enter the signed commitment.
+        let visible = ingestion_record_set_root([("a", Open), ("b", Active)]);
+        let with_hidden = ingestion_record_set_root([
+            ("a", Open),
+            ("z", Quarantined),
+            ("b", Active),
+            ("y", Tombstoned),
+        ]);
+        assert_eq!(
+            visible, with_hidden,
+            "quarantined/tombstoned rows must be structurally excluded from the record-set"
+        );
+    }
+
+    #[test]
+    fn ingestion_record_set_order_independent_and_empty_sentinel() {
+        use crate::models::LifecycleState::{Active, Open, Quarantined};
+        let a = ingestion_record_set_root([("a", Open), ("b", Active)]);
+        let b = ingestion_record_set_root([("b", Active), ("a", Open)]);
+        assert_eq!(a, b, "root must be order-independent (sorted leaves)");
+        // An all-hidden batch collapses to the same fixed sentinel as a truly
+        // empty batch — and the sentinel is never all-zero.
+        let all_hidden = ingestion_record_set_root([("q", Quarantined)]);
+        let truly_empty = ingestion_record_set_root(std::iter::empty());
+        assert_eq!(all_hidden, truly_empty);
+        assert_ne!(all_hidden, a);
+        assert_ne!(all_hidden, [0u8; MERKLE_DIGEST_LEN]);
     }
 }

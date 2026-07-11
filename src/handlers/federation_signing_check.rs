@@ -219,6 +219,14 @@ pub(super) async fn sync_push_via_store(
             skipped += 1;
             continue;
         }
+        // v1.0.0 R19/A3 (#1948) — route-IN quarantine of a provenance-less
+        // (non-`agent_attested`) relayed write (postgres twin). Opt-in +
+        // permissive default; sets lifecycle_state=Quarantined so the
+        // downstream merge persists it.
+        crate::handlers::federation_receive::maybe_quarantine_unattributed(
+            &mut to_insert,
+            crate::federation::receive_auth::quarantine_unattributed_enabled(),
+        );
         let bytes_estimate = i64::try_from(
             to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
         )
@@ -297,6 +305,13 @@ pub(super) async fn sync_push_via_store(
         match app.store.apply_remote_memory(&ctx, &to_insert).await {
             Ok(applied_id) => {
                 applied += 1;
+                // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest
+                // (postgres twin). `apply_remote_memory` PRESERVES an existing
+                // row's lifecycle_state on conflict, so a now-attested write
+                // clears any prior quarantine via the SAL raw-UPDATE surface.
+                if crate::handlers::federation_receive::row_is_agent_attested(&to_insert) {
+                    let _ = app.store.dequarantine(&applied_id).await;
+                }
                 // v0.7.0 Wave-3 Continuation 5 (S18+S79 federation
                 // semantic recall) — the postgres `embedding` column
                 // must land populated or peer-side semantic recall

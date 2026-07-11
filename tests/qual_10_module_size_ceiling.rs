@@ -292,7 +292,15 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 22_986). Growth is justified: the fold is the single writer that
     // replaces the recall-path touch, zero speculative surface.
     // 23_100 = 22_986 + 114 headroom; far under the 1.5x cap.
-    ("src/storage/mod.rs", 23_100),
+    //
+    // 2026-07-11 — bumped 23_100 → 23_500 by #1948 Gate-1 (quarantine
+    // read-visibility): the shared `lifecycle_visible_clause` filter
+    // applied across recall/list/search/export/kg/federation-catchup
+    // lanes + the sqlite `dequarantine` raw-UPDATE primitive + doc
+    // contracts (~414 LOC at 23_400). Growth is justified: one SSOT
+    // clause referenced at every read lane, zero speculative surface.
+    // 23_500 = 23_400 + 100 headroom.
+    ("src/storage/mod.rs", 23_500),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -683,12 +691,13 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // predicate + signed refusal audit emit).
     // 2026-07-07 (#1895) — bumped 25_960 → 26_000: the char-boundary-safe
     // `payload_preview` truncation guard landed the file at 25_966; +34 headroom.
-    // 2026-07-11 (#1942/#1941/#1945/#1834 crypto-core stage 2) — bumped
-    // 26_000 → 26_100 for the v79 coordinated-migration arm (migrate_v79
-    // + MIGRATION_V79_CRYPTO_CORE const + ladder-comment block), landing
-    // the file at 26_032; +68 headroom. Growth justified: one additive
-    // migration, zero speculative surface.
-    ("src/store/postgres.rs", 26_100),
+    // 2026-07-11 (#1942/#1941/#1945/#1834 crypto-core stage 2) — v79
+    // coordinated-migration arm (migrate_v79 + MIGRATION_V79_CRYPTO_CORE
+    // + ladder-comment block). 2026-07-11 (#1948) — quarantine Gate-1
+    // lifecycle-visibility filters on the postgres read lanes + the
+    // `dequarantine` SAL impl. The two lanes landed independently at
+    // 26_032/26_036 and merge to 26_102; ceiling 26_200 (+98 headroom).
+    ("src/store/postgres.rs", 26_200),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

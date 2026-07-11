@@ -1953,6 +1953,37 @@ pub fn set_lifecycle_state(
     Ok(n > 0)
 }
 
+/// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only RAW dequarantine.
+///
+/// Clears a [`crate::models::LifecycleState::Quarantined`] row back to
+/// [`crate::models::LifecycleState::Open`] (per
+/// [`crate::models::LifecycleState::dequarantine_target`]) via a raw UPDATE
+/// that BYPASSES the [`set_lifecycle_state`] transition gate — `Quarantined`
+/// is terminal + absent from `can_transition_to`, so the ordinary caller path
+/// can neither reach nor leave it. The `WHERE lifecycle_state = 'quarantined'`
+/// guard makes this idempotent and a strict no-op on any non-quarantined row.
+///
+/// This is the shared route-OUT primitive for BOTH dequarantine-on-attest
+/// (the federation receive-attestation upgrade path) and operator
+/// dequarantine. Returns `true` when a quarantined row was cleared.
+///
+/// # Errors
+/// Propagates the `rusqlite` update error.
+pub fn dequarantine(conn: &Connection, id: &str) -> Result<bool> {
+    let now = Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "UPDATE memories SET lifecycle_state = ?1, updated_at = ?2, version = version + 1 \
+         WHERE id = ?3 AND lifecycle_state = ?4",
+        params![
+            crate::models::LifecycleState::Open.as_str(),
+            now,
+            id,
+            crate::models::LifecycleState::Quarantined.as_str(),
+        ],
+    )?;
+    Ok(n > 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn update(
     conn: &Connection,
@@ -4362,6 +4393,11 @@ pub fn build_list_query(
         sql.push_str(" AND agent_id_idx = ?");
         params_vec.push(Box::new(a.to_string()));
     }
+    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
+    // Tombstoned/Quarantined (and any unknown state) from list. No alias in
+    // SQL_LIST_BASE, so the unqualified column is used.
+    sql.push(' ');
+    sql.push_str(&crate::models::lifecycle_visible_clause(""));
     sql.push_str(SQL_LIST_ORDER_LIMIT);
     params_vec.push(Box::new(limit));
     params_vec.push(Box::new(offset));
@@ -4534,6 +4570,7 @@ pub fn search_with_source_uri(
            {archived_fragment}
            {source_uri_fragment}
            {vis}
+           {lifecycle_vis}
          ORDER BY (fts.rank * -1)
            + (m.priority * 0.5)
            + (MIN(m.access_count, 50) * 0.1)
@@ -4542,6 +4579,8 @@ pub fn search_with_source_uri(
            DESC
          LIMIT ?9",
         vis = visibility_clause(11, 15, "m"),
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(uri) = source_uri {
@@ -4637,9 +4676,12 @@ pub fn list_by_source_uri(
          WHERE m.source_uri = ?1
            AND (?2 IS NULL OR m.namespace = ?2)
            {vis}
+           {lifecycle_vis}
          ORDER BY m.created_at ASC
          LIMIT ?3",
         vis = visibility_clause(4, 8, "m"),
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list.
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
@@ -5109,9 +5151,13 @@ pub fn recall(
            {archived_fragment}
            {source_uri_fragment}
            {vis}
+           {lifecycle_vis}
          ORDER BY score DESC
          LIMIT ?7",
         vis = visibility_clause(8, 12, "m"),
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list: hides
+        // Tombstoned/Quarantined (and any unknown state) from recall.
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
     let mut stmt = conn.prepare(&sql)?;
     // Bind ?13 only when the source-URI fragment is active; SQLite
@@ -8494,9 +8540,15 @@ pub fn kg_query(
                 (SELECT group_concat(value, '->') FROM json_each(t.path)) \
          FROM traversal t \
          JOIN memories m ON m.id = t.target_id \
+         WHERE 1=1 {lifecycle_vis} \
          ORDER BY t.depth ASC, COALESCE(t.valid_from, t.link_created_at) ASC, \
                   t.link_created_at ASC \
          LIMIT ?{limit_ph}",
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
+        // general KG graph traversal. (The lineage-DAG walk `lineage_traverse`
+        // deliberately does NOT filter — a Tombstoned ancestor is the point of
+        // a conserved lineage.)
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
 
     let mut stmt = conn.prepare(&sql)?;
@@ -10595,9 +10647,14 @@ pub fn archive_stats(conn: &Connection) -> Result<serde_json::Value> {
 
 pub fn export_all(conn: &Connection) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
-    let mut stmt = conn.prepare(
-        "SELECT * FROM memories WHERE expires_at IS NULL OR expires_at > ?1 ORDER BY created_at ASC",
-    )?;
+    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list keeps
+    // Tombstoned/Quarantined rows out of the export egress. The expiry OR is
+    // parenthesised so the trailing AND binds to the whole predicate.
+    let lifecycle_vis = crate::models::lifecycle_visible_clause("");
+    let sql = format!(
+        "SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?1) {lifecycle_vis} ORDER BY created_at ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![now], row_to_memory)?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
@@ -12242,12 +12299,16 @@ fn fts_keyword_phase(
            {fts_archived_fragment}
            {fts_source_uri_fragment}
            {vis}
+           {lifecycle_vis}
          ORDER BY fts_score DESC
          LIMIT ?7",
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
         vis = visibility_clause(8, 12, "m"),
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
+        // hybrid-recall FTS branch.
+        lifecycle_vis = crate::models::lifecycle_visible_clause("m"),
     );
     // #1579 B6 — recall’s FTS branch is the hottest read statement;
     // prepare_cached amortises re-parsing across recalls (shape cardinality
@@ -12535,6 +12596,14 @@ fn semantic_phase(
             if !is_visible(mem, &prep.prefixes, prep.caller.as_deref()) {
                 continue;
             }
+            // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list mirror.
+            // The HNSW branch loads candidates via `get_many` (bypassing the
+            // SQL WHERE the FTS/linear-scan branches carry), so the exclusion
+            // is applied in Rust here. Hides Tombstoned/Quarantined + any
+            // unknown state, matching `lifecycle_visible_clause`.
+            if !mem.lifecycle_state.is_recall_visible() {
+                continue;
+            }
             if !include_archived && is_archived_source(mem) {
                 continue;
             }
@@ -12578,11 +12647,15 @@ fn semantic_phase(
            AND (?5 IS NULL OR created_at <= ?5)
            {sem_archived_fragment}
            {sem_source_uri_fragment}
-           {vis}",
+           {vis}
+           {lifecycle_vis}",
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
         vis = visibility_clause(6, 10, "memories"),
+        // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
+        // semantic linear-scan branch (unqualified `memories` columns).
+        lifecycle_vis = crate::models::lifecycle_visible_clause("memories"),
     );
     // #1579 B6 — same prepare_cached treatment as the FTS branch above.
     let mut sem_stmt = conn.prepare_cached(&sem_sql)?;
@@ -13241,15 +13314,22 @@ pub fn memories_updated_since(
                 source, access_count, created_at, updated_at, last_accessed_at, \
                 expires_at, metadata, encrypted_envelope \
          FROM memories ";
+    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list. A
+    // Tombstoned/Quarantined row must not relay onward on this federation
+    // catch-up outbound path (honest caveat: quarantined rows black-hole
+    // until dequarantine). No alias in COLS → unqualified column.
+    let lifecycle_vis = crate::models::lifecycle_visible_clause("");
     let rows = match since {
         None => {
-            let mut stmt = conn.prepare(&format!("{COLS} ORDER BY updated_at ASC LIMIT ?1"))?;
+            let mut stmt = conn.prepare(&format!(
+                "{COLS} WHERE 1=1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?1"
+            ))?;
             stmt.query_map(params![limit], row_to_memory)?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }
         Some(s) => {
             let mut stmt = conn.prepare(&format!(
-                "{COLS} WHERE updated_at > ?1 ORDER BY updated_at ASC LIMIT ?2"
+                "{COLS} WHERE updated_at > ?1 {lifecycle_vis} ORDER BY updated_at ASC LIMIT ?2"
             ))?;
             stmt.query_map(params![s, limit], row_to_memory)?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -23052,5 +23132,269 @@ mod tests {
         );
         assert_eq!(merged.latest_from("p-stable"), Some("2026-05-01T00:00:00Z"));
         assert_eq!(merged.latest_from("p-new"), Some("2026-02-01T00:00:00Z"));
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle-visibility allow-list.
+    //
+    // One regression test PER read/egress lane proving a Tombstoned row (THE
+    // LIVE BUG — no SQL predicate excluded it before this change) AND a
+    // Quarantined row are BOTH invisible, while an Open row still surfaces.
+    // -----------------------------------------------------------------------
+
+    fn raw_set_lifecycle(conn: &Connection, id: &str, state: &str) {
+        // Raw UPDATE — deliberately bypasses the `set_lifecycle_state`
+        // transition gate to plant a terminal system-only state, exactly as
+        // the tombstone / quarantine system paths do.
+        conn.execute(
+            "UPDATE memories SET lifecycle_state = ?1 WHERE id = ?2",
+            rusqlite::params![state, id],
+        )
+        .unwrap();
+    }
+
+    /// Insert three rows sharing the searchable token "widget": one Open
+    /// (visible), one raw-Tombstoned, one raw-Quarantined. Returns
+    /// `(open_id, tomb_id, quar_id)`.
+    fn seed_lifecycle_corpus(conn: &Connection, ns: &str) -> (String, String, String) {
+        let vis = insert(conn, &make_memory("widget open", ns, Tier::Long, 5)).unwrap();
+        let tomb = insert(conn, &make_memory("widget tomb", ns, Tier::Long, 5)).unwrap();
+        let quar = insert(conn, &make_memory("widget quar", ns, Tier::Long, 5)).unwrap();
+        raw_set_lifecycle(conn, &tomb, "tombstoned");
+        raw_set_lifecycle(conn, &quar, "quarantined");
+        (vis, tomb, quar)
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_recall() {
+        let conn = test_db();
+        let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
+        let (rows, _) = recall(
+            &conn, "widget", None, 50, None, None, None, 0, 0, None, None, false, None, None,
+        )
+        .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&vis.as_str()),
+            "open row must surface in recall"
+        );
+        assert!(
+            !ids.contains(&tomb.as_str()),
+            "LIVE BUG: tombstoned row leaked into recall"
+        );
+        assert!(
+            !ids.contains(&quar.as_str()),
+            "quarantined row leaked into recall"
+        );
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_search() {
+        let conn = test_db();
+        let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
+        let rows = search(
+            &conn, "widget", None, None, 50, None, None, None, None, None, None, false, None,
+        )
+        .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&vis.as_str()));
+        assert!(
+            !ids.contains(&tomb.as_str()),
+            "LIVE BUG: tombstoned in search"
+        );
+        assert!(!ids.contains(&quar.as_str()), "quarantined in search");
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_list() {
+        let conn = test_db();
+        let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
+        let rows = list(
+            &conn,
+            Some("ns/life"),
+            None,
+            50,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&vis.as_str()));
+        assert!(
+            !ids.contains(&tomb.as_str()),
+            "LIVE BUG: tombstoned in list"
+        );
+        assert!(!ids.contains(&quar.as_str()), "quarantined in list");
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_export_all() {
+        let conn = test_db();
+        let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
+        let rows = export_all(&conn).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&vis.as_str()));
+        assert!(
+            !ids.contains(&tomb.as_str()),
+            "LIVE BUG: tombstoned in export"
+        );
+        assert!(!ids.contains(&quar.as_str()), "quarantined in export");
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_memories_updated_since() {
+        let conn = test_db();
+        let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
+        // Both the None (no `since`) and Some(`since`) sargable branches.
+        for since in [None, Some("2000-01-01T00:00:00Z")] {
+            let rows = memories_updated_since(&conn, since, 50).unwrap();
+            let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+            assert!(ids.contains(&vis.as_str()), "open row must relay onward");
+            assert!(
+                !ids.contains(&tomb.as_str()),
+                "LIVE BUG: tombstoned relayed on /sync/since (since={since:?})"
+            );
+            assert!(
+                !ids.contains(&quar.as_str()),
+                "quarantined relayed on /sync/since (since={since:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_list_by_source_uri() {
+        let conn = test_db();
+        let uri = "doc:widget";
+        let mk = |title: &str, state: &str| -> String {
+            let mut m = make_memory(title, "ns/life", Tier::Long, 5);
+            m.source_uri = Some(uri.to_string());
+            let id = insert(&conn, &m).unwrap();
+            if state != "open" {
+                raw_set_lifecycle(&conn, &id, state);
+            }
+            id
+        };
+        let vis = mk("uri open", "open");
+        let tomb = mk("uri tomb", "tombstoned");
+        let quar = mk("uri quar", "quarantined");
+        let rows = list_by_source_uri(&conn, uri, None, Some(50), None, None).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&vis.as_str()));
+        assert!(
+            !ids.contains(&tomb.as_str()),
+            "tombstoned in list_by_source_uri"
+        );
+        assert!(
+            !ids.contains(&quar.as_str()),
+            "quarantined in list_by_source_uri"
+        );
+    }
+
+    #[test]
+    fn lifecycle_allowlist_lane_kg_query() {
+        let conn = test_db();
+        let src = insert(&conn, &make_memory("kg source", "ns/kg", Tier::Long, 5)).unwrap();
+        let vis = insert(&conn, &make_memory("kg visible", "ns/kg", Tier::Long, 5)).unwrap();
+        let tomb = insert(&conn, &make_memory("kg tomb", "ns/kg", Tier::Long, 5)).unwrap();
+        let quar = insert(&conn, &make_memory("kg quar", "ns/kg", Tier::Long, 5)).unwrap();
+        for t in [&vis, &tomb, &quar] {
+            create_link(&conn, &src, t, "related_to").unwrap();
+        }
+        raw_set_lifecycle(&conn, &tomb, "tombstoned");
+        raw_set_lifecycle(&conn, &quar, "quarantined");
+        let nodes = kg_query(&conn, &src, 3, None, None, Some(50), false).unwrap();
+        let targets: Vec<&str> = nodes.iter().map(|n| n.target_id.as_str()).collect();
+        assert!(
+            targets.contains(&vis.as_str()),
+            "open target must appear in kg walk"
+        );
+        assert!(
+            !targets.contains(&tomb.as_str()),
+            "LIVE BUG: tombstoned target in kg walk"
+        );
+        assert!(
+            !targets.contains(&quar.as_str()),
+            "quarantined target in kg walk"
+        );
+    }
+
+    #[test]
+    fn lifecycle_lineage_deliberately_keeps_tombstoned_ancestor() {
+        // The intentional EXCEPTION: the lineage-DAG walk conserves provenance,
+        // so a Tombstoned ancestor MUST still be reachable (contrast kg_query).
+        let conn = test_db();
+        let parent = insert(
+            &conn,
+            &make_memory("lineage parent", "ns/lin", Tier::Long, 5),
+        )
+        .unwrap();
+        let child = insert(
+            &conn,
+            &make_memory("lineage child", "ns/lin", Tier::Long, 5),
+        )
+        .unwrap();
+        create_link(&conn, &child, &parent, "derived_from").unwrap();
+        raw_set_lifecycle(&conn, &parent, "tombstoned");
+        let ancestors = lineage_ancestors(&conn, &child, 3).unwrap();
+        let ids: Vec<&str> = ancestors.iter().map(|n| n.id.as_str()).collect();
+        assert!(
+            ids.contains(&parent.as_str()),
+            "lineage must conserve a tombstoned ancestor (the whole point of lineage)"
+        );
+    }
+
+    #[test]
+    fn dequarantine_clears_only_quarantined_rows() {
+        let conn = test_db();
+        let (open_id, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/deq");
+        // Quarantined → Open, idempotent, and returns true once.
+        assert!(
+            dequarantine(&conn, &quar).unwrap(),
+            "should clear a quarantined row"
+        );
+        assert!(
+            !dequarantine(&conn, &quar).unwrap(),
+            "second call is a no-op"
+        );
+        let now_open: String = conn
+            .query_row(
+                "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                rusqlite::params![quar],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(now_open, "open");
+        // No-op on Open + Tombstoned rows (only clears quarantine).
+        assert!(!dequarantine(&conn, &open_id).unwrap());
+        assert!(!dequarantine(&conn, &tomb).unwrap());
+        let tomb_state: String = conn
+            .query_row(
+                "SELECT lifecycle_state FROM memories WHERE id = ?1",
+                rusqlite::params![tomb],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tomb_state, "tombstoned",
+            "dequarantine must not touch tombstoned"
+        );
+    }
+
+    #[test]
+    fn set_lifecycle_state_cannot_reach_quarantined() {
+        // System-only: the caller transition path can never set Quarantined
+        // (absent from `can_transition_to`).
+        let conn = test_db();
+        let id = insert(
+            &conn,
+            &make_memory("no self quarantine", "ns/q", Tier::Long, 5),
+        )
+        .unwrap();
+        let err = set_lifecycle_state(&conn, &id, crate::models::LifecycleState::Quarantined);
+        assert!(err.is_err(), "caller must not be able to set Quarantined");
     }
 }

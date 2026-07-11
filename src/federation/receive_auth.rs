@@ -195,6 +195,35 @@ pub fn require_signal_sig_enabled() -> bool {
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
+/// Env knob gating the v1.0.0 R19/A3 (#1948) route-IN quarantine of
+/// provenance-less inbound federation-receive memory writes.
+pub const FED_QUARANTINE_UNATTRIBUTED_ENV: &str = "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED";
+
+/// Whether a provenance-less inbound relayed memory should be **quarantined**
+/// (stored with `lifecycle_state='quarantined'`, structurally hidden from
+/// every read/egress lane by the fail-closed
+/// [`crate::models::lifecycle_visible_clause`] allow-list) rather than landing
+/// visible.
+///
+/// **Default permissive (`false`)** per the #1948 decision (`560c8007`,
+/// 2×5-voted): a relayed memory is *data* (replication) — the bytes converge
+/// (CRDT-safe) regardless, and only this node's LOCAL VIEW differs. Mirrors the
+/// secure-opt-in shape of [`require_write_sig_enabled`] (#1464): unset / any
+/// non-truthy value keeps the pre-#1948 accept-visible posture; an operator
+/// opts in with `1`/`true`/`yes`/`on`.
+///
+/// "Provenance-less" here means an inbound write the receive path could NOT
+/// attribute to an author with a verified per-write content signature — i.e.
+/// it would land `attest_level=claimed` (never `agent_attested`). Honest
+/// caveat: a quarantined row does not relay onward (black-hole until
+/// dequarantine via the route-out attest / operator paths).
+#[must_use]
+pub fn quarantine_unattributed_enabled() -> bool {
+    std::env::var(FED_QUARANTINE_UNATTRIBUTED_ENV)
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +333,27 @@ mod tests {
             assert!(!require_signal_sig_enabled(), "{falsy:?} → permissive");
         }
         unsafe { std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV) };
+    }
+
+    #[test]
+    fn quarantine_unattributed_default_permissive_and_truthy_opts_in() {
+        // #1948 — mirrors the #1464 write-sig knob shape: default OFF
+        // (permissive), truthy (`1`/`true`/`yes`/`on`) opts in. SAFETY:
+        // single-threaded mutation of a var no other test reads.
+        unsafe { std::env::remove_var(FED_QUARANTINE_UNATTRIBUTED_ENV) };
+        assert!(
+            !quarantine_unattributed_enabled(),
+            "unset → permissive default"
+        );
+        for truthy in ["1", "true", "yes", "on", "  on  "] {
+            unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, truthy) };
+            assert!(quarantine_unattributed_enabled(), "{truthy:?} → opt-in");
+        }
+        for falsy in ["0", "false", "no", "off", ""] {
+            unsafe { std::env::set_var(FED_QUARANTINE_UNATTRIBUTED_ENV, falsy) };
+            assert!(!quarantine_unattributed_enabled(), "{falsy:?} → permissive");
+        }
+        unsafe { std::env::remove_var(FED_QUARANTINE_UNATTRIBUTED_ENV) };
     }
 
     #[test]

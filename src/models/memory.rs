@@ -324,6 +324,17 @@ pub enum LifecycleState {
     /// a raw UPDATE (it is not a caller-reachable [`Self::can_transition_to`]
     /// target); terminal, mirroring [`crate::revisions::RecordKind::Tombstone`].
     Tombstoned,
+    /// v1.0.0 R19/A3 (#1948, decision `560c8007`) — system-only quarantine:
+    /// the row is STORED (bytes converge, CRDT-safe) but structurally hidden
+    /// from every ordinary read/egress lane by the fail-CLOSED
+    /// [`lifecycle_visible_clause`] allow-list. Set ONLY by the system
+    /// route-in path (provenance-less inbound federation-receive under
+    /// `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`) via a raw UPDATE — it is
+    /// ABSENT from [`Self::can_transition_to`] and REJECTED by
+    /// [`crate::validate::validate_lifecycle_state`] as caller input (no
+    /// self-exfiltration, no self-quarantine). Terminal; cleared only via
+    /// the route-out dequarantine helpers.
+    Quarantined,
 }
 
 impl LifecycleState {
@@ -337,6 +348,7 @@ impl LifecycleState {
             Self::Done => "done",
             Self::Abandoned => "abandoned",
             Self::Tombstoned => "tombstoned",
+            Self::Quarantined => "quarantined",
         }
     }
 
@@ -352,6 +364,7 @@ impl LifecycleState {
             "done" => Some(Self::Done),
             "abandoned" => Some(Self::Abandoned),
             "tombstoned" => Some(Self::Tombstoned),
+            "quarantined" => Some(Self::Quarantined),
             _ => None,
         }
     }
@@ -367,15 +380,57 @@ impl LifecycleState {
             Self::Done,
             Self::Abandoned,
             Self::Tombstoned,
+            Self::Quarantined,
         ]
     }
 
     /// Terminal states accept no outbound transition. `Tombstoned` (the
-    /// v0.9.0 G13-mem logical-delete state) is terminal like `Done` /
-    /// `Abandoned`.
+    /// v0.9.0 G13-mem logical-delete state) and `Quarantined` (the v1.0.0
+    /// R19/A3 system-only quarantine) are terminal like `Done` / `Abandoned`.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::Abandoned | Self::Tombstoned)
+        matches!(
+            self,
+            Self::Done | Self::Abandoned | Self::Tombstoned | Self::Quarantined
+        )
+    }
+
+    /// System-only states — never settable by a caller. They are ABSENT
+    /// from [`Self::can_transition_to`] (so the `memory_update` transition
+    /// path can never reach them) AND rejected by
+    /// [`crate::validate::validate_lifecycle_state`] as caller input. Set
+    /// only by the system tombstone / quarantine raw-UPDATE paths.
+    #[must_use]
+    pub fn is_system_only(self) -> bool {
+        matches!(self, Self::Tombstoned | Self::Quarantined)
+    }
+
+    /// Whether this state is surfaced on ordinary read/egress lanes
+    /// (recall, list, search, export, forensic bundle, federation
+    /// catch-up, kg traversal). The Rust mirror of the SQL
+    /// [`lifecycle_visible_clause`] allow-list — fail-CLOSED: only the
+    /// [`RECALL_VISIBLE_LIFECYCLE_STATES`] set is visible; `Tombstoned`,
+    /// `Quarantined`, and any future/unknown state are hidden. Used by the
+    /// HNSW/linear-scan recall branches that filter loaded [`Memory`] rows
+    /// in Rust rather than in SQL.
+    #[must_use]
+    pub fn is_recall_visible(self) -> bool {
+        RECALL_VISIBLE_LIFECYCLE_STATES.contains(&self)
+    }
+
+    /// v1.0.0 R19/A3 (#1948) route-OUT — the state a quarantined row returns
+    /// to when it is dequarantined (either dequarantine-on-attest, when the
+    /// author's write later verifies, or an operator dequarantine).
+    ///
+    /// Only a [`Self::Quarantined`] row dequarantines; every other state
+    /// yields `None` (a no-op — nothing to clear). The target is
+    /// [`Self::Open`] (the initial working state) so the row rejoins ordinary
+    /// [`lifecycle_visible_clause`] visibility. Applied via a raw UPDATE
+    /// (`Quarantined` is absent from [`Self::can_transition_to`], so this is
+    /// deliberately NOT a caller transition).
+    #[must_use]
+    pub fn dequarantine_target(self) -> Option<Self> {
+        matches!(self, Self::Quarantined).then_some(Self::Open)
     }
 
     /// Whether `self → to` is a legal lifecycle transition. No self-loops;
@@ -399,6 +454,68 @@ impl std::fmt::Display for LifecycleState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// v1.0.0 R19/A3 (#1948, decision `560c8007`) — the fail-CLOSED allow-list
+/// of lifecycle states that are surfaced on ordinary read/egress lanes.
+///
+/// This is the ONE canonical vocabulary for read-path visibility. It is an
+/// **allow-list, not a deny-list**: any state NOT in this set — the
+/// system-only [`LifecycleState::Tombstoned`] / [`LifecycleState::Quarantined`],
+/// or any future/unknown value read by an older binary — is invisible.
+/// Adding a caller-visible state is a one-line edit here; forgetting to add
+/// a new system-only state fails safe (hidden by default).
+///
+/// The SQL twin is [`lifecycle_visible_clause`]; the Rust twin is
+/// [`LifecycleState::is_recall_visible`]. Both derive their vocabulary from
+/// this slice — the allow-list is never re-spelled as scattered literals.
+pub const RECALL_VISIBLE_LIFECYCLE_STATES: [LifecycleState; 5] = [
+    LifecycleState::Open,
+    LifecycleState::Active,
+    LifecycleState::Blocked,
+    LifecycleState::Done,
+    LifecycleState::Abandoned,
+];
+
+/// v1.0.0 R19/A3 (#1948, decision `560c8007`) — build the shared
+/// fail-CLOSED lifecycle-visibility SQL fragment for a read/egress lane.
+///
+/// Returns `AND (<col> IS NULL OR <col> IN ('open', ...))` with a leading
+/// `AND ` so it drops into a `WHERE` that already has preceding predicates
+/// (mirrors the storage-layer `visibility_clause` /
+/// `archived_source_clause` fragments). The allow-list is generated from
+/// [`RECALL_VISIBLE_LIFECYCLE_STATES`] via `as_str()` — never hardcoded
+/// literals — so the vocabulary lives in exactly one place.
+///
+/// `NULL` is treated as **visible-legacy**: the v64 column is
+/// `lifecycle_state TEXT NOT NULL DEFAULT 'open'`, so live `memories` rows
+/// are never NULL, but `COALESCE`/`LEFT JOIN` read shapes can surface a
+/// NULL; those legacy/derived reads keep their prior visibility.
+///
+/// The fragment is **placeholder-free** (literal allow-list) so injecting
+/// it never renumbers a call site's bound parameters. It is used verbatim
+/// by BOTH backends (SQLite `?N` and Postgres `$N` queries) because it
+/// binds nothing.
+///
+/// `table_alias` is the memories-table alias in the host query (`"m"`,
+/// `"memories"`, or `""` for an unqualified column).
+#[must_use]
+pub fn lifecycle_visible_clause(table_alias: &str) -> String {
+    let col = if table_alias.is_empty() {
+        super::field_names::LIFECYCLE_STATE.to_string()
+    } else {
+        format!("{table_alias}.{}", super::field_names::LIFECYCLE_STATE)
+    };
+    let mut list = String::new();
+    for (i, state) in RECALL_VISIBLE_LIFECYCLE_STATES.iter().enumerate() {
+        if i > 0 {
+            list.push_str(", ");
+        }
+        list.push('\'');
+        list.push_str(state.as_str());
+        list.push('\'');
+    }
+    format!("AND ({col} IS NULL OR {col} IN ({list}))")
 }
 
 /// v0.7.0 Form 5 (issue #758) — typed discriminator for the provenance
@@ -2369,6 +2486,7 @@ mod tests {
             LifecycleState::Done,
             LifecycleState::Abandoned,
             LifecycleState::Tombstoned,
+            LifecycleState::Quarantined,
         ] {
             assert_eq!(LifecycleState::from_str(s.as_str()), Some(s));
         }
@@ -2397,6 +2515,7 @@ mod tests {
                 LifecycleState::Done,
                 LifecycleState::Abandoned,
                 LifecycleState::Tombstoned,
+                LifecycleState::Quarantined,
             ]
         );
     }
@@ -2408,9 +2527,75 @@ mod tests {
         // v0.9.0 G13-mem (#1859) — the consolidation logical-delete state
         // is terminal too.
         assert!(LifecycleState::Tombstoned.is_terminal());
+        // v1.0.0 R19/A3 (#1948) — the system-only quarantine state is terminal.
+        assert!(LifecycleState::Quarantined.is_terminal());
         assert!(!LifecycleState::Open.is_terminal());
         assert!(!LifecycleState::Active.is_terminal());
         assert!(!LifecycleState::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn lifecycle_quarantined_is_system_only_and_unreachable_by_transition() {
+        // Quarantined is absent from `can_transition_to` for every source
+        // (no caller path reaches it), and flagged system-only.
+        for from in LifecycleState::all() {
+            assert!(
+                !from.can_transition_to(LifecycleState::Quarantined),
+                "{from} -> Quarantined must be an illegal caller transition"
+            );
+        }
+        assert!(LifecycleState::Quarantined.is_system_only());
+        assert!(LifecycleState::Tombstoned.is_system_only());
+        assert!(!LifecycleState::Open.is_system_only());
+        assert!(!LifecycleState::Done.is_system_only());
+    }
+
+    #[test]
+    fn lifecycle_recall_visible_allowlist_is_fail_closed() {
+        // Exactly the RECALL_VISIBLE_LIFECYCLE_STATES set is visible; the
+        // system-only states are hidden (fail-closed).
+        assert!(LifecycleState::Open.is_recall_visible());
+        assert!(LifecycleState::Active.is_recall_visible());
+        assert!(LifecycleState::Blocked.is_recall_visible());
+        assert!(LifecycleState::Done.is_recall_visible());
+        assert!(LifecycleState::Abandoned.is_recall_visible());
+        assert!(!LifecycleState::Tombstoned.is_recall_visible());
+        assert!(!LifecycleState::Quarantined.is_recall_visible());
+        // Every allow-list member is non-system-only, and vice-versa.
+        for st in LifecycleState::all() {
+            assert_eq!(st.is_recall_visible(), !st.is_system_only());
+        }
+    }
+
+    #[test]
+    fn lifecycle_dequarantine_target_only_for_quarantined() {
+        assert_eq!(
+            LifecycleState::Quarantined.dequarantine_target(),
+            Some(LifecycleState::Open)
+        );
+        for st in LifecycleState::all() {
+            if *st != LifecycleState::Quarantined {
+                assert_eq!(st.dequarantine_target(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_visible_clause_builds_fail_closed_allowlist() {
+        // The SQL twin: an allow-list IN(...) over the visible vocabulary,
+        // with the NULL-legacy escape, derived from the const (not literals).
+        let bare = lifecycle_visible_clause("");
+        assert!(bare.contains("lifecycle_state IS NULL"));
+        assert!(bare.contains("lifecycle_state IN ("));
+        for st in RECALL_VISIBLE_LIFECYCLE_STATES {
+            assert!(bare.contains(&format!("'{}'", st.as_str())), "missing {st}");
+        }
+        // System-only states are NOT in the clause (fail-closed).
+        assert!(!bare.contains("'tombstoned'"));
+        assert!(!bare.contains("'quarantined'"));
+        // Alias-qualified form.
+        let aliased = lifecycle_visible_clause("m");
+        assert!(aliased.contains("m.lifecycle_state IN ("));
     }
 
     #[test]

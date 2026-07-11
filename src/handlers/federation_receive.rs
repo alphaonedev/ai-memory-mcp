@@ -409,6 +409,45 @@ pub(super) fn apply_inbound_write_attestation(
     .map(|_| ())
 }
 
+/// v1.0.0 R19/A3 (#1948, decision `560c8007`) — route-IN quarantine of a
+/// provenance-less inbound relayed memory (write boundary only).
+///
+/// Call AFTER [`apply_inbound_write_attestation`] has stamped `attest_level`.
+/// When `quarantine_enabled`
+/// (`AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED`, resolved by
+/// [`crate::federation::receive_auth::quarantine_unattributed_enabled`], default
+/// OFF/permissive) AND the row did NOT reach
+/// [`crate::models::AttestLevel::AgentAttested`] (i.e. it landed `claimed` — no
+/// verified per-write content signature), the row's `lifecycle_state` is set to
+/// [`crate::models::LifecycleState::Quarantined`].
+///
+/// The row is still STORED (the bytes converge — CRDT-safe); only this node's
+/// local read/egress view hides it via the fail-closed
+/// [`crate::models::lifecycle_visible_clause`] allow-list, until a route-out
+/// dequarantine (attest upgrade or operator). With the knob off this is a
+/// byte-identical no-op (the pre-#1948 accept-visible posture). Honest caveat:
+/// a quarantined row does not relay onward (black-hole until dequarantine).
+pub(super) fn maybe_quarantine_unattributed(to_insert: &mut Memory, quarantine_enabled: bool) {
+    if !quarantine_enabled {
+        return;
+    }
+    if !row_is_agent_attested(to_insert) {
+        to_insert.lifecycle_state = crate::models::LifecycleState::Quarantined;
+    }
+}
+
+/// Whether a memory's stamped `metadata.attest_level` is
+/// [`crate::models::AttestLevel::AgentAttested`] — i.e. its per-write content
+/// signature verified against the attributed author's enrolled key. Shared by
+/// the route-IN quarantine ([`maybe_quarantine_unattributed`]) and route-OUT
+/// dequarantine-on-attest decisions (#1948).
+pub(super) fn row_is_agent_attested(mem: &Memory) -> bool {
+    mem.metadata
+        .get(crate::models::field_names::ATTEST_LEVEL)
+        .and_then(serde_json::Value::as_str)
+        == Some(crate::identity::verify::AttestLevel::AgentAttested.as_str())
+}
+
 /// #1920 (CWE-862) — authorship gate for an inbound federated PENDING
 /// action, mirroring [`resolve_inbound_attribution`] (memories) and
 /// [`signal_author_authorized`] (signals). A pending action is an
@@ -1087,6 +1126,12 @@ pub async fn sync_push(
             skipped += 1;
             continue;
         }
+        // v1.0.0 R19/A3 (#1948) — route-IN quarantine of a provenance-less
+        // (non-`agent_attested`) relayed write. Opt-in + permissive default.
+        maybe_quarantine_unattributed(
+            &mut to_insert,
+            crate::federation::receive_auth::quarantine_unattributed_enabled(),
+        );
         let bytes_estimate = i64::try_from(
             to_insert.title.len() + to_insert.content.len() + to_insert.metadata.to_string().len(),
         )
@@ -1179,6 +1224,14 @@ pub async fn sync_push(
         match db::merge_inbound(&lock.0, &to_insert) {
             Ok(actual_id) => {
                 applied += 1;
+                // v1.0.0 R19/A3 (#1948) — route-OUT dequarantine-on-attest.
+                // `merge_inbound` PRESERVES an existing row's lifecycle_state
+                // on conflict, so when the author's write NOW verifies
+                // (agent_attested) we clear any prior quarantine via a raw
+                // UPDATE (no-op on a non-quarantined row).
+                if row_is_agent_attested(&to_insert) {
+                    let _ = db::dequarantine(&lock.0, &actual_id);
+                }
                 // #1566 / #1579 B1 — store a dim-matching shipped
                 // vector directly (no local embed at all); anything
                 // else falls back to the deferred background embed.
@@ -2371,5 +2424,37 @@ mod tests {
     fn extract_peer_id_absent_returns_none() {
         let h = HeaderMap::new();
         assert_eq!(extract_peer_id(&h), None);
+    }
+
+    // -- #1948 route-IN quarantine helper -------------------------------
+
+    #[test]
+    fn route_in_quarantines_only_unattributed_and_only_when_enabled() {
+        use crate::models::LifecycleState;
+
+        // Knob OFF (permissive): a claimed (unattributed) row stays Open.
+        let mut claimed = wsig_mem("ai:curator");
+        claimed
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("attest_level".to_string(), serde_json::json!("claimed"));
+        maybe_quarantine_unattributed(&mut claimed, false);
+        assert_eq!(claimed.lifecycle_state, LifecycleState::Open);
+
+        // Knob ON + claimed → quarantined.
+        maybe_quarantine_unattributed(&mut claimed, true);
+        assert_eq!(claimed.lifecycle_state, LifecycleState::Quarantined);
+        assert!(!row_is_agent_attested(&claimed));
+
+        // Knob ON but agent_attested → NOT quarantined (provenance present).
+        let mut attested = wsig_mem("ai:curator");
+        attested.metadata.as_object_mut().unwrap().insert(
+            "attest_level".to_string(),
+            serde_json::json!("agent_attested"),
+        );
+        assert!(row_is_agent_attested(&attested));
+        maybe_quarantine_unattributed(&mut attested, true);
+        assert_eq!(attested.lifecycle_state, LifecycleState::Open);
     }
 }

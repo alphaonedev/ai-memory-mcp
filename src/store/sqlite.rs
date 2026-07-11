@@ -230,6 +230,13 @@ impl MemoryStore for SqliteStore {
         Ok(())
     }
 
+    /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the raw
+    /// [`crate::storage::dequarantine`] primitive).
+    async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        db::dequarantine(&conn, id).map_err(box_err)
+    }
+
     async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
         let conn = self.state.lock().await;
         let removed = db::delete(&conn, id).map_err(box_err)?;

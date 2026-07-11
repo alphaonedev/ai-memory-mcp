@@ -1018,17 +1018,35 @@ pub fn validate_kind(kind: Option<&str>) -> Result<()> {
 /// Returns an error when `state` is `Some` and not one of the
 /// [`crate::models::LifecycleState`] wire strings.
 pub fn validate_lifecycle_state(state: Option<&str>) -> Result<()> {
-    if let Some(s) = state
-        && crate::models::LifecycleState::from_str(s).is_none()
-    {
-        let expected = crate::models::LifecycleState::all()
-            .iter()
-            .map(|k| k.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!("invalid lifecycle_state '{s}' (expected one of: {expected})");
+    let Some(s) = state else { return Ok(()) };
+    match crate::models::LifecycleState::from_str(s) {
+        // v1.0.0 R19/A3 (#1948) — `Tombstoned` / `Quarantined` are
+        // SYSTEM-ONLY: they parse (so a newer DB round-trips them on an
+        // older read) but a CALLER may never set them via a write. Rejecting
+        // them here blocks self-tombstone / self-quarantine at the write
+        // boundary (they are also absent from `can_transition_to`).
+        Some(st) if st.is_system_only() => {
+            let allowed = crate::models::LifecycleState::all()
+                .iter()
+                .filter(|k| !k.is_system_only())
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "lifecycle_state '{s}' is system-only and cannot be set by a caller (expected one of: {allowed})"
+            );
+        }
+        Some(_) => Ok(()),
+        None => {
+            let allowed = crate::models::LifecycleState::all()
+                .iter()
+                .filter(|k| !k.is_system_only())
+                .map(|k| k.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!("invalid lifecycle_state '{s}' (expected one of: {allowed})");
+        }
     }
-    Ok(())
 }
 
 /// Validate a full Memory (used for import).
@@ -3118,5 +3136,30 @@ mod tests {
         // verbatim (reason only, no field prefix).
         let ve = ValidationError::new("namespace", "namespace cannot be empty");
         assert_eq!(format!("{ve}"), "namespace cannot be empty");
+    }
+
+    #[test]
+    fn validate_lifecycle_state_rejects_system_only_and_unknown() {
+        // Caller-settable states + None pass.
+        assert!(validate_lifecycle_state(None).is_ok());
+        for ok in ["open", "active", "blocked", "done", "abandoned"] {
+            assert!(
+                validate_lifecycle_state(Some(ok)).is_ok(),
+                "{ok} should pass"
+            );
+        }
+        // v1.0.0 R19/A3 (#1948) — system-only states parse but a CALLER may
+        // NOT set them (no self-tombstone / self-quarantine).
+        for bad in ["tombstoned", "quarantined"] {
+            let err = validate_lifecycle_state(Some(bad)).unwrap_err().to_string();
+            assert!(err.contains("system-only"), "{bad}: {err}");
+        }
+        // Unknown value is still rejected, and the error names the caller-
+        // settable set (never the system-only states).
+        let err = validate_lifecycle_state(Some("bogus"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid lifecycle_state"));
+        assert!(!err.contains("tombstoned") && !err.contains("quarantined"));
     }
 }
