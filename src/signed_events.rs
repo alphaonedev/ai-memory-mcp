@@ -298,6 +298,14 @@ pub mod event_types {
     /// `reason = recovery` until the recovery VERIFY path lands).
     pub const IDENTITY_LINEAGE_RECOVERY: &str = "identity.lineage.recovery";
 
+    /// v1.0.0 #1949 (R13) — witness row for an identity-lineage
+    /// REVOCATION record: the head key signs a record dating a suspected
+    /// compromise from a `signed_events` witness SEQUENCE high-water mark.
+    /// Same payload / signature shape as [`IDENTITY_LINEAGE_GENESIS`]; the
+    /// row's own sequence is `S_rev` (the upper bound of the Suspect
+    /// window `[suspected_compromise_from_seq, S_rev)`).
+    pub const IDENTITY_LINEAGE_REVOCATION: &str = "identity.lineage.revocation";
+
     /// v0.9.0 §25.3 S5 (RQ-10, #1853) — witness row for an accepted,
     /// operator-signed epoch manifest (the monotonic panel/utility-weight
     /// freeze for one epoch), written by `ai-memory epoch-apply` in the
@@ -313,14 +321,15 @@ pub mod event_types {
     pub const EPOCH_APPLIED: &str = "epoch.manifest_applied";
 }
 
-/// v0.9.0 G13 (#1828) — the three `identity.lineage.*` witness event
-/// types, in one place for the (agent-scoped) witness reads both
+/// v0.9.0 G13 (#1828) + v1.0.0 #1949 — the `identity.lineage.*` witness
+/// event types, in one place for the (agent-scoped) witness reads both
 /// backends run. Order matches the epoch-0-first narrative; the SQL
-/// reads treat it as a set.
-pub const IDENTITY_LINEAGE_EVENT_TYPES: [&str; 3] = [
+/// reads treat it as a set. #1949 appends `IDENTITY_LINEAGE_REVOCATION`.
+pub const IDENTITY_LINEAGE_EVENT_TYPES: [&str; 4] = [
     event_types::IDENTITY_LINEAGE_GENESIS,
     event_types::IDENTITY_LINEAGE_SUCCESSION,
     event_types::IDENTITY_LINEAGE_RECOVERY,
+    event_types::IDENTITY_LINEAGE_REVOCATION,
 ];
 
 /// One row of the `signed_events` audit table.
@@ -1840,17 +1849,34 @@ fn compute_identity_lineage_verdict(
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap_or_default();
-    let outcomes: Vec<(String, Option<String>)> = agents
+    let outcomes: Vec<crate::identity::lineage::LineageWalkOutcome> = agents
         .into_iter()
         .map(|agent| {
-            let outcome = match crate::storage::verify_agent_lineage(conn, &agent) {
-                Ok(Ok(_)) => None,
-                Ok(Err(walk_err)) => Some(walk_err.to_string()),
+            use crate::identity::lineage::{CustodyClass, LineageWalkOutcome};
+            match crate::storage::verify_agent_lineage(conn, &agent) {
+                Ok(Ok(verified)) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: None,
+                    // v1.0.0 #1949 — surface the revocation window + head
+                    // custody class the walk resolved.
+                    revoked_from_seq: verified.revoked_from_seq,
+                    head_custody_class: verified.head_custody_class,
+                },
+                Ok(Err(walk_err)) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: Some(walk_err.to_string()),
+                    revoked_from_seq: None,
+                    head_custody_class: CustodyClass::default(),
+                },
                 // Infra read failure on an agent KNOWN to have lineage
                 // rows — fail-closed (never silently withhold).
-                Err(read_err) => Some(format!("lineage read failed: {read_err:#}")),
-            };
-            (agent, outcome)
+                Err(read_err) => LineageWalkOutcome {
+                    agent_id: agent,
+                    failure: Some(format!("lineage read failed: {read_err:#}")),
+                    revoked_from_seq: None,
+                    head_custody_class: CustodyClass::default(),
+                },
+            }
         })
         .collect();
     crate::identity::lineage::compute_lineage_check(&outcomes, require)

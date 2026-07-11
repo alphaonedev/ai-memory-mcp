@@ -1055,6 +1055,20 @@ pub struct SignableSuccession<'a> {
     /// SHA-256 (32 bytes) over the canonical CBOR of the prior record;
     /// 32 zero bytes for genesis.
     pub prev_record_hash: &'a [u8],
+    /// v1.0.0 #1949 — custody-class slug of `successor_pubkey` (spec §3).
+    /// The frozen default `"software-file"`
+    /// ([`CUSTODY_CLASS_SOFTWARE_FILE`
+    /// ](crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE)) is
+    /// OMITTED from the canonical CBOR so every legacy v76 record (which
+    /// predates the field) re-encodes byte-identically and its signature
+    /// keeps verifying; a non-default class is committed as a text field.
+    pub custody_class: &'a str,
+    /// v1.0.0 #1949 — for a `"revocation"` record ONLY, the
+    /// `signed_events` witness SEQUENCE high-water the compromise is
+    /// dated from (the ordering authority — never wall-clock). `None`
+    /// (genesis/rotation) is OMITTED from the canonical CBOR (legacy
+    /// byte-compat); `Some(seq)` is committed as a CBOR integer.
+    pub suspected_compromise_from_seq: Option<u64>,
 }
 
 /// RFC 8949 §4.2.1 deterministic CBOR encoding of the eight signable
@@ -1080,7 +1094,8 @@ pub struct SignableSuccession<'a> {
 /// so callers don't have to choose between panicking and silently
 /// signing a truncated payload.
 pub fn canonical_cbor_succession(s: &SignableSuccession<'_>) -> Result<Vec<u8>> {
-    let value = canonical_cbor_map(vec![
+    // The eight v76 fields — ALWAYS emitted, in the historical key set.
+    let mut entries = vec![
         ("agent_id", ciborium::Value::Text(s.agent_id.to_string())),
         (
             "epoch",
@@ -1104,7 +1119,25 @@ pub fn canonical_cbor_succession(s: &SignableSuccession<'_>) -> Result<Vec<u8>> 
             "prev_record_hash",
             ciborium::Value::Bytes(s.prev_record_hash.to_vec()),
         ),
-    ]);
+    ];
+    // v1.0.0 #1949 — ADDITIVE fields, committed ONLY when non-default so
+    // legacy v76 records (software-file custody, no revocation) re-encode
+    // byte-identically and keep verifying. `canonical_cbor_map` sorts the
+    // full key set into RFC 8949 §4.2.1 order, so append order is
+    // irrelevant to the output bytes.
+    if s.custody_class != crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE {
+        entries.push((
+            "custody_class",
+            ciborium::Value::Text(s.custody_class.to_string()),
+        ));
+    }
+    if let Some(seq) = s.suspected_compromise_from_seq {
+        entries.push((
+            "suspected_compromise_from_seq",
+            ciborium::Value::Integer(ciborium::value::Integer::from(seq)),
+        ));
+    }
+    let value = canonical_cbor_map(entries);
     let mut out: Vec<u8> = Vec::with_capacity(256);
     ciborium::ser::into_writer(&value, &mut out).context("CBOR encode SignableSuccession")?;
     Ok(out)
@@ -2493,6 +2526,8 @@ mod tests {
             recovery_pubkey: Some("recKeyB64"),
             not_before: "2026-06-30T00:00:00+00:00",
             prev_record_hash: prev_hash,
+            custody_class: crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE,
+            suspected_compromise_from_seq: None,
         }
     }
 
@@ -2509,6 +2544,8 @@ mod tests {
         let successor_pubkey = "pk-new";
         let recovery_pubkey = Some("pk-rec");
         let not_before = "2026-06-30T00:00:00+00:00";
+        let custody_class = crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE;
+        let suspected_compromise_from_seq = None;
 
         let perm1 = SignableSuccession {
             agent_id,
@@ -2519,6 +2556,8 @@ mod tests {
             recovery_pubkey,
             not_before,
             prev_record_hash: &prev,
+            custody_class,
+            suspected_compromise_from_seq,
         };
         let perm2 = SignableSuccession {
             prev_record_hash: &prev,
@@ -2529,6 +2568,8 @@ mod tests {
             reason,
             epoch,
             agent_id,
+            custody_class,
+            suspected_compromise_from_seq,
         };
         let perm3 = SignableSuccession {
             reason,
@@ -2539,6 +2580,8 @@ mod tests {
             predecessor_pubkey,
             prev_record_hash: &prev,
             recovery_pubkey,
+            custody_class,
+            suspected_compromise_from_seq,
         };
 
         let b1 = canonical_cbor_succession(&perm1).expect("encode perm1");
@@ -2579,6 +2622,51 @@ mod tests {
         };
         let d = canonical_cbor_succession(&altered_reason).expect("encode altered reason");
         assert_ne!(a, d, "different reason must produce different bytes");
+    }
+
+    #[test]
+    fn canonical_cbor_succession_additive_fields_are_backcompat_and_bound() {
+        // v1.0.0 #1949 — the software-file default + no revocation is
+        // OMITTED so legacy v76 bytes are byte-identical; a non-default
+        // custody class OR a committed revocation sequence changes the
+        // bytes (they are cryptographically bound inside the signature).
+        let prev = body_hash_fixture(0x60);
+        let base = succession_fixture(&prev); // software-file, no seq
+        let base_bytes = canonical_cbor_succession(&base).expect("encode base");
+
+        // Explicit software-file + None must equal the omitted default.
+        let explicit_default = SignableSuccession {
+            custody_class: crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE,
+            suspected_compromise_from_seq: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            base_bytes,
+            canonical_cbor_succession(&explicit_default).expect("encode"),
+            "software-file default must be omitted (legacy byte-compat)"
+        );
+
+        // A reserved custody class is committed → different bytes.
+        let tpm = SignableSuccession {
+            custody_class: crate::identity::lineage::CUSTODY_CLASS_TPM2,
+            ..base.clone()
+        };
+        assert_ne!(
+            base_bytes,
+            canonical_cbor_succession(&tpm).expect("encode"),
+            "a non-default custody class must be committed (bound)"
+        );
+
+        // A revocation sequence is committed → different bytes.
+        let revoked = SignableSuccession {
+            suspected_compromise_from_seq: Some(1),
+            ..base.clone()
+        };
+        assert_ne!(
+            base_bytes,
+            canonical_cbor_succession(&revoked).expect("encode"),
+            "a committed revocation sequence must change the bytes"
+        );
     }
 
     #[test]

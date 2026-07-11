@@ -325,6 +325,49 @@ ai-memory identity succeed --agent-id my-agent
 ai-memory agents revoke-key --agent-id my-agent
 ```
 
+### Custody class + signed revocation on the lineage chain (v1.0.0 #1949)
+
+The v0.9.0 lineage chain (`#1828`) is extended additively at v1.0.0
+(`#1949`, spec §3) with two forensic read-outs, both **committed inside
+the predecessor-signed succession bytes** (never a bare, unauthenticated
+column):
+
+- **`custody_class`** — a CLOSED set naming where a key is held:
+  `software-file` (the only value the OSS build ever mints) plus the
+  RESERVED `{tpm2, pkcs11-hsm, secure-enclave, kms}`. An unknown slug
+  fails **closed** (the record is refused, not guessed), and the OSS
+  build **structurally refuses** (in code, not docs) to mint any
+  non-`software-file` class. Legacy v0.9.0 records — which predate the
+  field — keep verifying unchanged: `software-file` is the omitted
+  default, so their signed bytes are byte-identical.
+
+  > ⚠️ **ESTIMABLE, not ATTESTABLE.** `custody_class` is
+  > **attested-by-OSS-refusal-and-custody-separation, NOT
+  > attested-by-hardware.** It is a *local provenance marker* only, and
+  > **MUST NOT be used as a cross-host trust input** — a peer never
+  > grants a `tpm2`-claiming key more authority than a `software-file`
+  > one. Genuine hardware attestation (a TPM quote / PKCS#11 cert chain
+  > carried in a reserved inner blob) is a future commercial addition;
+  > until then a claimed hardware custody is a claim, not a proof.
+
+- **Signed revocation** — a 4th lineage reason (`revocation`) the current
+  head key signs at the next epoch, dating a suspected compromise from a
+  `signed_events` **witness SEQUENCE high-water mark** (the ordering
+  authority — never wall-clock, which is attacker-forgeable). Entries in
+  the window `[suspected_compromise_from_seq, revocation)` are surfaced
+  by `ai-memory verify-audit-trail` as **SUSPECT** — never
+  cryptographically un-verified (a pre-revocation signature that was
+  valid stays valid, the CRL/OCSP/SSH-`known_hosts` parity).
+
+  > ⚠️ **Verdict-surface only this train.** Revocation is a **read-out**
+  > (the audit-trail verdict shows `identity-lineage REVOKED` + the
+  > Suspect window); there is **no write-path enforcement** — an
+  > epoch-aware multi-key write-path verifier is a separate later change.
+  > `recovery_pubkey` is now REQUIRED at genesis for **new** chains (so a
+  > stolen-AND-lost key is recoverable), but the recovery *verify* path
+  > itself remains v1.0-deferred (the format ships now; existing chains
+  > are grandfathered and keep verifying).
+
 ---
 
 ## Troubleshooting

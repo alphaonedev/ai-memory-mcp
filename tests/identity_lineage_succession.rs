@@ -88,7 +88,9 @@ fn kp(label: &str) -> AgentKeypair {
 fn register_and_enroll(conn: &Connection, agent_id: &str) -> AgentKeypair {
     db::register_agent(conn, agent_id, "ai:test", &[]).expect("register agent");
     let k0 = kp(agent_id);
-    db::enroll_lineage(conn, agent_id, &k0, None).expect("enroll genesis");
+    // #1949 — recovery_pubkey is now REQUIRED at genesis for new chains.
+    let recovery = kp(agent_id).public_base64();
+    db::enroll_lineage(conn, agent_id, &k0, Some(&recovery)).expect("enroll genesis");
     k0
 }
 
@@ -194,7 +196,13 @@ fn genesis_self_signs_and_verifies() {
     );
 
     // A second enroll is refused (single genesis per identity).
-    let err = db::enroll_lineage(&conn, "gen-agent", &k0, None).expect_err("re-enroll refused");
+    let err = db::enroll_lineage(
+        &conn,
+        "gen-agent",
+        &k0,
+        Some(&kp("gen-agent").public_base64()),
+    )
+    .expect_err("re-enroll refused");
     assert!(format!("{err:#}").contains("already"), "got: {err:#}");
 }
 
@@ -761,7 +769,13 @@ fn rotate_with_succession_end_to_end() {
     db::register_agent(&conn, "rot-agent", "ai:test", &[]).expect("register");
     let k0 = kp("rot-agent");
     keypair::save(&k0, key_dir.path()).expect("save K0");
-    db::enroll_lineage(&conn, "rot-agent", &k0, None).expect("enroll");
+    db::enroll_lineage(
+        &conn,
+        "rot-agent",
+        &k0,
+        Some(&kp("rot-agent").public_base64()),
+    )
+    .expect("enroll");
 
     let outcome = keypair::rotate_with_succession("rot-agent", key_dir.path(), |k_old, k_new| {
         db::append_succession(&conn, "rot-agent", k_old, &k_new.public_base64(), None).map(|_| ())
@@ -812,6 +826,182 @@ fn rotate_with_succession_end_to_end() {
         carried.recovery_pubkey_b64.as_deref(),
         Some(recovery.public_base64().as_str()),
         "recovery commitment must carry forward"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #1949 (R13) — custody-class + signed revocation on the chain
+// ---------------------------------------------------------------------------
+
+/// Enroll a genesis, then append a rotation, returning (k0, k1).
+fn enroll_and_rotate(conn: &Connection, agent_id: &str) -> (AgentKeypair, AgentKeypair) {
+    let k0 = register_and_enroll(conn, agent_id);
+    let k1 = kp(agent_id);
+    db::append_succession(conn, agent_id, &k0, &k1.public_base64(), None).expect("rotate");
+    (k0, k1)
+}
+
+#[test]
+fn revocation_round_trips_and_verifies_suspect_window() {
+    // #1949 — mint a revocation, read it back losslessly, and confirm the
+    // chain still verifies with the Suspect window surfaced (R13).
+    let (_dir, conn) = fresh_db();
+    let (_k0, k1) = enroll_and_rotate(&conn, "rev-agent");
+    let k2 = kp("rev-agent");
+    let record = db::append_revocation(&conn, "rev-agent", &k1, &k2.public_base64(), 77, None)
+        .expect("append revocation");
+    assert_eq!(record.epoch, 2);
+    assert_eq!(
+        record.reason,
+        ai_memory::identity::lineage::LineageReason::Revocation
+    );
+    assert_eq!(record.suspected_compromise_from_seq, Some(77));
+
+    // read_lineage reconstructs the revocation fields losslessly.
+    let read = db::read_lineage(&conn, "rev-agent").expect("read");
+    let (head, _) = read.last().expect("head");
+    assert_eq!(
+        head.reason,
+        ai_memory::identity::lineage::LineageReason::Revocation
+    );
+    assert_eq!(head.suspected_compromise_from_seq, Some(77));
+    assert_eq!(
+        head.custody_class,
+        ai_memory::identity::lineage::CustodyClass::SoftwareFile
+    );
+
+    // The chain STILL verifies (revocation is not a break), and surfaces
+    // the window + head custody.
+    let verified = db::verify_agent_lineage(&conn, "rev-agent")
+        .expect("read")
+        .expect("revoked chain still verifies");
+    assert_eq!(verified.epoch, 2);
+    assert_eq!(verified.revoked_from_seq, Some(77));
+    assert_eq!(
+        verified.head_custody_class,
+        ai_memory::identity::lineage::CustodyClass::SoftwareFile
+    );
+}
+
+#[test]
+fn revocation_ordering_is_witness_sequence_not_wall_clock() {
+    // #1949 — the Suspect window is dated by the witness SEQUENCE the
+    // caller commits, INDEPENDENT of any not_before wall-clock. A record
+    // minted with a stale/backdated not_before still reports the same
+    // committed from_seq (wall-clock manipulation changes nothing).
+    let (_dir, conn) = fresh_db();
+    let (_k0, k1) = enroll_and_rotate(&conn, "seq-agent");
+    let k2 = kp("seq-agent");
+    db::append_revocation(&conn, "seq-agent", &k1, &k2.public_base64(), 500, None).expect("revoke");
+    let verified = db::verify_agent_lineage(&conn, "seq-agent")
+        .expect("read")
+        .expect("verifies");
+    // The ordering authority is the committed sequence, not any clock.
+    assert_eq!(verified.revoked_from_seq, Some(500));
+}
+
+#[test]
+fn truncation_after_revocation_is_detected() {
+    // #1949 / C3 — rolling back the revocation record from the mutable
+    // table while its append-only witness survives is still detected as
+    // truncation.
+    let (_dir, conn) = fresh_db();
+    let (_k0, k1) = enroll_and_rotate(&conn, "trunc-agent");
+    let k2 = kp("trunc-agent");
+    db::append_revocation(&conn, "trunc-agent", &k1, &k2.public_base64(), 9, None).expect("revoke");
+    // Delete the newest (revocation) row; its witness row remains.
+    conn.execute(
+        "DELETE FROM agent_lineage WHERE agent_id = 'trunc-agent' AND epoch = 2",
+        [],
+    )
+    .expect("delete head");
+    let err = db::verify_agent_lineage(&conn, "trunc-agent")
+        .expect("read")
+        .expect_err("truncation detected");
+    assert!(
+        matches!(err, LineageError::Truncated { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn custody_refuse_guard_blocks_non_software_file_mint() {
+    // #1949 — the OSS refuse-guard is CODE: append_lineage_record refuses
+    // any record whose custody_class is not software-file, and persists
+    // nothing.
+    let (_dir, conn) = fresh_db();
+    db::register_agent(&conn, "cust-agent", "ai:test", &[]).expect("register");
+    let k0 = kp("cust-agent");
+    let mut genesis = LineageRecord::genesis(
+        "cust-agent",
+        &k0.public_base64(),
+        Some(kp("cust-agent").public_base64()),
+        "2026-06-01T00:00:00+00:00",
+    );
+    genesis.custody_class = ai_memory::identity::lineage::CustodyClass::Tpm2;
+    let sig = sign_succession(&k0, &genesis.to_signable()).expect("sign");
+    let err = db::append_lineage_record(&conn, "cust-agent", &genesis, &sig)
+        .expect_err("non-software-file mint refused");
+    assert!(format!("{err:#}").contains("software-file"), "got: {err:#}");
+    // Nothing persisted.
+    assert!(
+        db::read_lineage(&conn, "cust-agent")
+            .expect("read")
+            .is_empty(),
+        "refused mint must persist nothing"
+    );
+}
+
+#[test]
+fn unknown_custody_slug_fails_closed_on_read() {
+    // #1949 — a forged/unknown custody_class column value fails closed on
+    // read (never guessed to software-file).
+    let (_dir, conn) = fresh_db();
+    let _k0 = register_and_enroll(&conn, "slug-agent");
+    conn.execute(
+        "UPDATE agent_lineage SET custody_class = 'quantum-vault' \
+         WHERE agent_id = 'slug-agent' AND epoch = 0",
+        [],
+    )
+    .expect("inject bogus slug");
+    let err = db::read_lineage(&conn, "slug-agent").expect_err("unknown slug fails closed");
+    assert!(format!("{err:#}").contains("custody_class"), "got: {err:#}");
+}
+
+#[test]
+fn legacy_null_custody_verifies_as_software_file() {
+    // #1949 back-compat — a legacy row (NULL custody_class, as an upgrade
+    // DB carries) reads as software-file and verifies unchanged.
+    let (_dir, conn) = fresh_db();
+    let k0 = register_and_enroll(&conn, "legacy-agent");
+    // Simulate a pre-v80 row: NULL the custody column the mint wrote.
+    conn.execute(
+        "UPDATE agent_lineage SET custody_class = NULL WHERE agent_id = 'legacy-agent'",
+        [],
+    )
+    .expect("null the column");
+    let read = db::read_lineage(&conn, "legacy-agent").expect("read");
+    assert_eq!(
+        read[0].0.custody_class,
+        ai_memory::identity::lineage::CustodyClass::SoftwareFile
+    );
+    let verified = db::verify_agent_lineage(&conn, "legacy-agent")
+        .expect("read")
+        .expect("legacy chain verifies");
+    assert_eq!(verified.head_key.to_bytes(), k0.public.to_bytes());
+}
+
+#[test]
+fn enroll_requires_recovery_pubkey_for_new_chains() {
+    // #1949 — recovery_pubkey is REQUIRED at genesis for new chains.
+    let (_dir, conn) = fresh_db();
+    db::register_agent(&conn, "no-rec-agent", "ai:test", &[]).expect("register");
+    let k0 = kp("no-rec-agent");
+    let err = db::enroll_lineage(&conn, "no-rec-agent", &k0, None)
+        .expect_err("genesis without recovery refused");
+    assert!(
+        format!("{err:#}").contains("recovery_pubkey"),
+        "got: {err:#}"
     );
 }
 

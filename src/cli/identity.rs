@@ -1147,7 +1147,11 @@ mod tests {
             .unwrap();
         }
 
-        // enroll-lineage (JSON mode).
+        // enroll-lineage (JSON mode). #1949 — recovery_pubkey is now
+        // REQUIRED at genesis for new chains.
+        let recovery_b64 = keypair::generate("lin-alice-recovery")
+            .unwrap()
+            .public_base64();
         env.stdout.clear();
         env.stderr.clear();
         {
@@ -1158,7 +1162,7 @@ mod tests {
                     key_dir: Some(dir_path.clone()),
                     action: IdentityAction::EnrollLineage {
                         agent_id: Some("lin-alice".to_string()),
-                        recovery_pubkey: None,
+                        recovery_pubkey: Some(recovery_b64.clone()),
                     },
                 },
                 true,
@@ -1169,7 +1173,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
         assert_eq!(v["enrolled"], true);
         assert_eq!(v["epoch"], 0);
-        assert_eq!(v["recovery_pubkey_registered"], false);
+        assert_eq!(v["recovery_pubkey_registered"], true);
 
         // succeed (text mode) — rotates on disk AND appends the chain.
         env.stdout.clear();
