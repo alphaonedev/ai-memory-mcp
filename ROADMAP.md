@@ -282,7 +282,7 @@ This is the floor every plan below builds on. Numbers are sourced from the publi
 | Metric | Result | Source |
 |---|---|---|
 | Library tests passing (v0.7.0) | 6,961+ | release notes |
-| Line coverage (v0.7.0) | ≥93% (locked at v0.6.3.1 93.84% baseline; gate ≥93%) | release notes |
+| Line coverage gate (current, corrects a stale ≥93%/`--fail-under-lines 92`/"locked at 93.84%" claim per [#1970](https://github.com/alphaonedev/ai-memory-mcp/issues/1970)) | **Not a single flat percentage.** Two independent CI jobs enforce it: (1) `ci.yml`'s "Code Coverage" job — an absolute floor `MIN_COVERAGE_PCT=90` on TOTAL line coverage (`--features sal` build), plus a ratchet requiring `>= .coverage-baseline − 0.5%` slack (`.coverage-baseline` currently `92.59`, bumped forward-only as coverage rises, never lowered); (2) `coverage.yml`'s "Per-Module Coverage Thresholds" job — a **uniform 90% per-module floor** (`coverage/thresholds.toml`, operator standard 2026-06-11: "every module must reach 90%; a module may sit below 90 ONLY when structurally impossible to cover, proven in `coverage/policy.md`") plus its own `min_line_coverage = 90.0` workspace-global floor (`--features sal,sal-postgres`, live-PG+AGE+pgvector). A documented set of per-module floors sits below 90% as recorded structural exceptions (e.g. `handlers/power.rs` 53%, `handlers/governance.rs` 57%, `store/postgres.rs` 79%) — these are NOT gate weakenings; thresholds rise across releases and never fall without explicit operator approval (`coverage/check-thresholds.sh`). | `coverage/check-thresholds.sh`, `coverage/thresholds.toml`, `.coverage-baseline`, `.github/workflows/ci.yml`, `.github/workflows/coverage.yml` |
 | Region coverage | 93.11% (v0.6.3 baseline; trending up) | evidence.html |
 | Function coverage | 92.55% (v0.6.3 baseline; trending up) | evidence.html |
 | Platform CI matrix | ubuntu-latest, macos-latest, windows-latest, iOS sim, Android emulator | evidence.html, mobile-runtime.yml |
@@ -989,7 +989,10 @@ cargo fmt --check
 cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
-cargo llvm-cov --fail-under-lines 92    # locked at 93.84% baseline
+scripts/coverage.sh   # per #1970: NOT a flat "--fail-under-lines 92"/93.84% claim — mirrors
+                       # ci.yml's 90% absolute floor + ratchet vs .coverage-baseline (0.5% slack)
+                       # AND coverage.yml's uniform-90% per-module floor via check-thresholds.sh
+                       # (full gate mechanics in §9.1)
 ai-memory bench --baseline performance/baseline.json
 ```
 
