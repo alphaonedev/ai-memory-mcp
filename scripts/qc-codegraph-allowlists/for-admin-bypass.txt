@@ -19,3 +19,4 @@ src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
 src/migrate.rs:AI_MIGRATE
 src/store/postgres.rs:EXPORT_INTERNAL
 src/store/postgres.rs:GOVERNANCE_INTERNAL
+src/cli/stop.rs:AI_OPERATOR
