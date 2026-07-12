@@ -1263,6 +1263,10 @@
         "properties": {
           "memory_id": {
             "type": "string"
+          },
+          "transitive": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [

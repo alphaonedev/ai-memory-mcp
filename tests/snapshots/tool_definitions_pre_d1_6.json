@@ -1254,6 +1254,10 @@
           "memory_id": {
             "description": "Invalidated reflection id.",
             "type": "string"
+          },
+          "transitive": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "required": [
