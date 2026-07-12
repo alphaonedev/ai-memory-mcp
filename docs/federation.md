@@ -178,6 +178,37 @@ independently — these are layered on top.
   window. Decision function:
   [`src/federation/receive_auth.rs::authorize_remote_transition`](../src/federation/receive_auth.rs).
 
+- **Inbound checkpoint-resolution signature gate — FED-RQ-01
+  ([#1936](https://github.com/alphaonedev/ai-memory-mcp/issues/1936)).**
+  `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` (default `1`, **fail-closed**)
+  gates the `checkpoints` subcollection on `/sync/push`. A resolved
+  commit-checkpoint is an *authority-granting* write — the
+  separation-of-duties freeze anchor (who resolved this coordination
+  gate, to what verdict, when) that the epoch-apply verify-only consumer
+  ([#1878](https://github.com/alphaonedev/ai-memory-mcp/issues/1878))
+  later trusts — so it shares the authority-lane posture of the
+  action-transition gate, NOT the permissive data-lane default. An
+  inbound resolution is applied only when its Ed25519 resolution
+  signature verifies against the resolver's (`resolved_by`)
+  locally-**enrolled** key (never the wire `resolver_pubkey`). Unsigned /
+  non-enrolled resolutions are refused; a **forged** signature is
+  rejected **unconditionally** regardless of this knob. Set falsy
+  (`0`/`false`/`no`/`off`) for a heterogeneous-rollout window. The
+  receiver NEVER re-signs (the v0.8.0 local-substrate rule); the sender's
+  attestation is persisted verbatim. Application is idempotent under a
+  **first-resolution-wins** rule: a checkpoint already resolved locally
+  with a *different* resolution is a per-item conflict (local kept,
+  counted `checkpoints_conflicted`), never a batch drop. The
+  `EpochAdvance` epoch-freeze checkpoint rides this transport (ROADMAP
+  §25.2). Decision function:
+  [`src/federation/receive_auth.rs::authorize_remote_checkpoint_resolution`](../src/federation/receive_auth.rs);
+  apply: `src/checkpoints/mod.rs::apply_inbound_resolution`. On a
+  postgres-backed receiver the checkpoints table is not yet
+  MemoryStore-trait-covered for a federated verbatim-resolution write, so
+  the postgres funnel reports inbound checkpoints as
+  `unsupported_on_postgres` (honest count, never a silent drop) — the
+  sqlite / MCP-native path applies them fully.
+
 - **Per-transition replay nonce
   ([#1805](https://github.com/alphaonedev/ai-memory-mcp/issues/1805)).**
   The signed transition nonce is recorded in the per-peer

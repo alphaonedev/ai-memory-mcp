@@ -679,6 +679,19 @@ pub struct SyncPushBody {
     /// `4d3ea1c5`). An op for an action this node does not have is a no-op.
     #[serde(default)]
     pub action_transitions: Vec<crate::federation::sync::ActionTransitionOp>,
+    /// FED-RQ-01 (#1936) — resolved commit-checkpoints the sender wants
+    /// propagated (the v61 `checkpoints` table). Applied FAIL-CLOSED like
+    /// `action_transitions`: a resolved checkpoint is an *authority-granting*
+    /// write (the separation-of-duties freeze anchor), so each row's Ed25519
+    /// resolution attestation is verified against the resolver's locally-enrolled
+    /// key (`receive_auth::authorize_remote_checkpoint_resolution`) before the
+    /// first-resolution-wins CRDT apply (`checkpoints::apply_inbound_resolution`).
+    /// The `EpochAdvance` epoch-freeze checkpoint rides this transport (§25.2).
+    /// Reuses the `Checkpoint` model on the wire (like `signals` reuse `Signal`)
+    /// so the subject + its attested resolution travel together; the receiver
+    /// NEVER re-signs (the v0.8.0 local-substrate rule).
+    #[serde(default)]
+    pub checkpoints: Vec<crate::models::Checkpoint>,
     /// Preview mode — classify and count, do not write.
     #[serde(default)]
     pub dry_run: bool,
@@ -910,6 +923,18 @@ pub async fn sync_push(
             Json(json!({
                 "error": format!(
                     "sync_push limited to {} action_transitions per request",
+                    app.max_page_size
+                )
+            })),
+        )
+            .into_response();
+    }
+    if body.checkpoints.len() > app.max_page_size {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "sync_push limited to {} checkpoints per request",
                     app.max_page_size
                 )
             })),
@@ -1885,6 +1910,85 @@ pub async fn sync_push(
         }
     }
 
+    // FED-RQ-01 (#1936) — process incoming resolved commit-checkpoints.
+    // FAIL-CLOSED authorization (a resolution is an authority-granting write,
+    // like action_transitions): each resolution's Ed25519 attestation is
+    // verified against the RESOLVER'S enrolled key (never the wire
+    // `resolver_pubkey` — the #1718/#87 authority-lane discipline) via
+    // `receive_auth::authorize_remote_checkpoint_resolution` BEFORE the
+    // first-resolution-wins CRDT apply (`checkpoints::apply_inbound_resolution`).
+    // The receiver NEVER re-signs; the sender's attestation is persisted
+    // verbatim (v0.8.0 local-substrate rule). Per-item skip on
+    // unverifiable/conflict — the batch survives. No storage quota is charged
+    // (a resolution is a state change, not net-new authorship — #1544 scope).
+    // Format spine votes: `4d3ea1c5` + #1947 decision `00d599ec`.
+    let mut checkpoints_applied = 0usize;
+    let mut checkpoints_conflicted = 0usize;
+    let require_checkpoint_sig = crate::federation::receive_auth::require_checkpoint_sig_enabled();
+    for cp in &body.checkpoints {
+        if validate::validate_id(&cp.id).is_err()
+            || validate::validate_namespace(&cp.namespace).is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        // Only RESOLVED checkpoints federate — a pending checkpoint carries no
+        // resolution attestation, so there is nothing to authorize or apply.
+        if cp.state == crate::models::CheckpointState::Pending {
+            skipped += 1;
+            continue;
+        }
+        let enrolled = cp
+            .resolved_by
+            .as_deref()
+            .and_then(crate::identity::verify::lookup_peer_public_key);
+        let signable = crate::checkpoints::resolution_signable(cp);
+        match crate::federation::receive_auth::authorize_remote_checkpoint_resolution(
+            &signable,
+            &cp.signature,
+            enrolled.as_ref(),
+            require_checkpoint_sig,
+        ) {
+            crate::federation::receive_auth::CheckpointResolutionAuthz::Accept => {
+                if body.dry_run {
+                    noop += 1;
+                    continue;
+                }
+                match crate::checkpoints::apply_inbound_resolution(&lock.0, cp) {
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Applied) => {
+                        checkpoints_applied += 1;
+                    }
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Noop) => noop += 1,
+                    Ok(crate::checkpoints::InboundResolutionOutcome::Conflict) => {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            checkpoint_id = %cp.id,
+                            "sync_push: inbound checkpoint resolution conflicts with a different \
+                             local resolution — first-resolution-wins, keeping local (#1936)"
+                        );
+                        checkpoints_conflicted += 1;
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "sync_push: checkpoint resolution apply failed for {}: {e}",
+                            cp.id
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            verdict => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    checkpoint_id = %cp.id,
+                    "sync_push: inbound checkpoint resolution refused ({verdict:?}) (#1936)"
+                );
+                skipped += 1;
+            }
+        }
+    }
+
     // v0.6.2 (S35): process incoming namespace_meta rows. Applies via
     // `set_namespace_standard` so the peer's inheritance-chain walk has
     // the originator's explicit parent link. The standard memory itself
@@ -2011,6 +2115,8 @@ pub async fn sync_push(
             "pending_decisions_applied": pending_decisions_applied,
             "signals_applied": signals_applied,
             "action_transitions_applied": action_transitions_applied,
+            "checkpoints_applied": checkpoints_applied,
+            "checkpoints_conflicted": checkpoints_conflicted,
             "namespace_meta_applied": namespace_meta_applied,
             "namespace_meta_cleared": namespace_meta_cleared,
             "noop": noop,

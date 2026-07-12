@@ -1478,6 +1478,112 @@ pub async fn broadcast_action_transition_quorum(
     Ok(tracker)
 }
 
+/// FED-RQ-01 (#1936) — fan out a resolved commit-checkpoint to peers via the
+/// `/sync/push` envelope's `checkpoints` subcollection and collect W-of-N acks.
+/// Mirrors [`broadcast_action_transition_quorum`] exactly (reusing `AckTracker`
+/// + `finalise_quorum`); only the subcollection key + target id differ. The
+/// `Checkpoint` model already carries its Ed25519 resolution `signature` +
+/// `resolver_pubkey`, so the receiver
+/// (`receive_auth::authorize_remote_checkpoint_resolution`) can verify the
+/// resolution's authorship against the resolver's enrolled key end-to-end;
+/// checkpoints dedupe on their id under the first-resolution-wins apply
+/// (`checkpoints::apply_inbound_resolution`). The `EpochAdvance` epoch-freeze
+/// checkpoint rides this transport (§25.2). Format spine votes: `4d3ea1c5` +
+/// #1947 decision `00d599ec`.
+///
+/// # Errors
+///
+/// Returns `QuorumError::LocalWriteFailed` on the pathological detach race
+/// where the tracker `Arc` is still referenced after fan-out.
+pub async fn broadcast_checkpoint_resolution_quorum(
+    config: &FederationConfig,
+    checkpoint: &crate::models::Checkpoint,
+) -> Result<AckTracker, QuorumError> {
+    let now = Instant::now();
+    let tracker = Arc::new(Mutex::new(AckTracker::new(config.policy.clone(), now)));
+    tracker.lock().await.record_local();
+
+    let body = serde_json::json!({
+        (field_names::SENDER_AGENT_ID): config.sender_agent_id,
+        "memories": [],
+        "checkpoints": [checkpoint],
+        "dry_run": false,
+    });
+
+    let mut joins: JoinSet<(String, AckOutcome)> = JoinSet::new();
+    for peer in &config.peers {
+        let client = config.client.clone();
+        let url = peer.sync_push_url.clone();
+        let peer_id = peer.id.clone();
+        let payload = body.clone();
+        let target_id = checkpoint.id.clone();
+        let api_key = config.api_key.clone();
+        let signing_key = config.signing_key.clone();
+        joins.spawn(async move {
+            let outcome = post_and_classify(
+                &client,
+                &url,
+                &payload,
+                &target_id,
+                Some(&target_id),
+                api_key.as_deref(),
+                signing_key.as_deref(),
+            )
+            .await;
+            (peer_id, outcome)
+        });
+    }
+
+    let deadline = now + config.policy.ack_timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, joins.join_next()).await {
+            Ok(Some(Ok((peer_id, AckOutcome::Ack)))) => {
+                tracker.lock().await.record_peer_ack(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::IdDrift)))) => {
+                tracker.lock().await.record_id_drift(peer_id);
+            }
+            Ok(Some(Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))))) => {
+                tracing::warn!(
+                    "federation: checkpoint-resolution peer {peer_id} failed for {}: {reason}",
+                    checkpoint.id
+                );
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!("federation: checkpoint-resolution peer join error: {e}");
+            }
+            Ok(None) | Err(_) => break,
+        }
+        if tracker.lock().await.is_quorum_met(Instant::now()) {
+            break;
+        }
+    }
+
+    if !joins.is_empty() {
+        tokio::spawn(async move {
+            while let Some(res) = joins.join_next().await {
+                if let Ok((peer_id, AckOutcome::Fail(reason) | AckOutcome::Throttled(reason))) = res
+                {
+                    tracing::debug!(
+                        "federation: post-quorum checkpoint-resolution peer {peer_id} did not ack: {reason}"
+                    );
+                }
+            }
+        });
+    }
+
+    let tracker = Arc::try_unwrap(tracker)
+        .map_err(|_| QuorumError::LocalWriteFailed {
+            detail: TRACKER_ARC_STILL_REFERENCED.to_string(),
+        })?
+        .into_inner();
+    Ok(tracker)
+}
+
 /// #1718 Commit B — fan out a freshly-created signal to peers via the
 /// `/sync/push` envelope's `signals` subcollection and collect W-of-N acks.
 /// Mirrors [`broadcast_pending_quorum`] exactly. The `Signal` model already

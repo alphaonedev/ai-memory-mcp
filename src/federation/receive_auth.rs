@@ -21,8 +21,8 @@
 //! action / lease, then apply the CAS) differs per backend, but the
 //! authorization verdict does not.
 
-use crate::identity::sign::SignableTransition;
-use crate::identity::verify::verify_transition;
+use crate::identity::sign::{SignableCheckpointResolution, SignableTransition};
+use crate::identity::verify::{verify_checkpoint_resolution, verify_transition};
 use ed25519_dalek::VerifyingKey;
 
 /// Verdict for an inbound federated action transition. Every `Reject*` variant
@@ -96,6 +96,75 @@ pub fn authorize_remote_transition(
     }
 }
 
+/// FED-RQ-01 (#1936) — verdict for an inbound federated checkpoint RESOLUTION.
+/// A resolved commit-checkpoint is an **authority-granting** write (the
+/// separation-of-duties attestation: who resolved this coordination gate, to
+/// what verdict, when — later consumed as the freeze anchor by the epoch-apply
+/// verify-only consumer #1878), so it is fail-closed exactly like the
+/// action-transition sibling ([`TransitionAuthz`]). Every `Reject*` variant is a
+/// per-item no-op the receive loop counts as `skipped` (reason logged) — never
+/// a hard error that drops the rest of the push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointResolutionAuthz {
+    /// Authenticated (or permissively accepted) — apply the resolution.
+    Accept,
+    /// Unsigned resolution while signatures are required (fail-closed default).
+    RejectUnsigned,
+    /// Signed, but the attested resolver has no enrolled public key locally.
+    RejectNotEnrolled,
+    /// Signature present but does not verify against the resolver's enrolled
+    /// key (forged, wrong key, or tampered resolution). Rejected unconditionally.
+    RejectForged,
+}
+
+/// FED-RQ-01 (#1936) — decide whether an inbound federated checkpoint
+/// resolution may be applied. Mirrors [`authorize_remote_transition`] exactly:
+/// the outer `/sync/push` envelope authenticates the peer NODE, not the RESOLVER
+/// the resolution is attributed to, so the resolution's own Ed25519 attestation
+/// must be verified against the resolver's locally-**enrolled** key — NOT the
+/// wire `resolver_pubkey` (verifying against the wire key would let a relayer
+/// forge resolver identity, the #1718/#87 authority-lane discipline).
+///
+/// Pure (no I/O): the caller re-derives `signable` from the inbound checkpoint
+/// ([`crate::checkpoints::resolution_signable`]) and looks up the resolver's
+/// enrolled key (`lookup_peer_public_key(resolved_by)`), then this renders the
+/// verdict:
+///
+/// 1. **Unsigned →** fail-closed ([`CheckpointResolutionAuthz::RejectUnsigned`])
+///    under `require_sig`, else [`CheckpointResolutionAuthz::Accept`] (operator
+///    opt-out for a heterogeneous-rollout window).
+/// 2. **Signed →** the resolver MUST have an enrolled key and the signature MUST
+///    verify against *that* key. A present-but-invalid signature is
+///    [`CheckpointResolutionAuthz::RejectForged`] **unconditionally** (even under
+///    permissive `require_sig == false`).
+#[must_use]
+pub fn authorize_remote_checkpoint_resolution(
+    signable: &SignableCheckpointResolution<'_>,
+    signature: &[u8],
+    enrolled_key: Option<&VerifyingKey>,
+    require_sig: bool,
+) -> CheckpointResolutionAuthz {
+    if signature.is_empty() {
+        return if require_sig {
+            CheckpointResolutionAuthz::RejectUnsigned
+        } else {
+            CheckpointResolutionAuthz::Accept
+        };
+    }
+    let Some(key) = enrolled_key else {
+        return if require_sig {
+            CheckpointResolutionAuthz::RejectNotEnrolled
+        } else {
+            CheckpointResolutionAuthz::Accept
+        };
+    };
+    if verify_checkpoint_resolution(signable, signature, key.as_bytes()) {
+        CheckpointResolutionAuthz::Accept
+    } else {
+        CheckpointResolutionAuthz::RejectForged
+    }
+}
+
 /// Env knob gating the inbound action-transition signature requirement
 /// (`require_sig` fed to [`authorize_remote_transition`]).
 pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_SIG";
@@ -112,6 +181,32 @@ pub const REQUIRE_TRANSITION_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_TRANSITION_S
 #[must_use]
 pub fn require_transition_sig_enabled() -> bool {
     env_flag_default_on(REQUIRE_TRANSITION_SIG_ENV)
+}
+
+/// FED-RQ-01 (#1936) — env knob gating the inbound checkpoint-RESOLUTION
+/// signature requirement (`require_sig` fed to
+/// [`authorize_remote_checkpoint_resolution`]).
+pub const REQUIRE_CHECKPOINT_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG";
+
+/// Whether inbound federated checkpoint resolutions must be cryptographically
+/// attested to the resolver's enrolled key.
+///
+/// **Default fail-closed (`true`)** — a resolved commit-checkpoint is an
+/// authority-granting write (the separation-of-duties freeze anchor the
+/// epoch-apply verify-only consumer #1878 later trusts), so it shares the
+/// authority-lane posture of [`require_transition_sig_enabled`] (#1718) rather
+/// than the permissive DATA-lane default of [`require_write_sig_enabled`] (#1464)
+/// / [`require_signal_sig_enabled`] (#1843). An unsigned / non-enrolled inbound
+/// resolution is refused unless the operator opts out for a rollout window by
+/// setting `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` to a falsy value
+/// (`0`/`false`/`no`/`off`). A *forged* signature is still rejected
+/// unconditionally regardless of this knob (see
+/// [`authorize_remote_checkpoint_resolution`]). FED-RQ-01 format spine votes:
+/// `4d3ea1c5` (authority-write fail-closed) + #1947 decision `00d599ec`
+/// (head-entanglement rides checkpoint resolutions over this transport).
+#[must_use]
+pub fn require_checkpoint_sig_enabled() -> bool {
+    env_flag_default_on(REQUIRE_CHECKPOINT_SIG_ENV)
 }
 
 /// Shared grammar for federation security knobs that default **ON**
@@ -371,5 +466,109 @@ mod tests {
             authorize_remote_transition(&s, &sig, Some(&kp.public), Some("alice"), true),
             TransitionAuthz::Accept
         );
+    }
+
+    // ---- FED-RQ-01 (#1936) — authorize_remote_checkpoint_resolution ----
+
+    fn cp_fixture(verdict: &'static str) -> SignableCheckpointResolution<'static> {
+        SignableCheckpointResolution {
+            checkpoint_id: "cp-1",
+            namespace: "_epoch",
+            state: "resolved",
+            resolved_by: "alice",
+            resolution: Some(verdict),
+            resolved_at: 1_700_000_900,
+        }
+    }
+
+    #[test]
+    fn checkpoint_signed_with_enrolled_key_accepts() {
+        let kp = kp_mod::generate("alice").unwrap();
+        let r = cp_fixture("approved");
+        let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &sig, Some(&kp.public), true),
+            CheckpointResolutionAuthz::Accept
+        );
+    }
+
+    #[test]
+    fn checkpoint_unsigned_rejected_when_required_accepted_when_permissive() {
+        let r = cp_fixture("approved");
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &[], None, true),
+            CheckpointResolutionAuthz::RejectUnsigned
+        );
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &[], None, false),
+            CheckpointResolutionAuthz::Accept
+        );
+    }
+
+    #[test]
+    fn checkpoint_signed_but_resolver_not_enrolled_rejects_when_required() {
+        let kp = kp_mod::generate("alice").unwrap();
+        let r = cp_fixture("approved");
+        let sig = sign::sign_checkpoint_resolution(&kp, &r).unwrap();
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &sig, None, true),
+            CheckpointResolutionAuthz::RejectNotEnrolled
+        );
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &sig, None, false),
+            CheckpointResolutionAuthz::Accept
+        );
+    }
+
+    #[test]
+    fn checkpoint_forged_signature_rejected_even_when_permissive() {
+        let mallory = kp_mod::generate("mallory").unwrap();
+        let alice = kp_mod::generate("alice").unwrap();
+        let r = cp_fixture("approved");
+        // Mallory signs, but we verify against alice's enrolled key → forged.
+        let sig = sign::sign_checkpoint_resolution(&mallory, &r).unwrap();
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &sig, Some(&alice.public), true),
+            CheckpointResolutionAuthz::RejectForged
+        );
+        // Forged is rejected unconditionally — permissive mode does not relax it.
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&r, &sig, Some(&alice.public), false),
+            CheckpointResolutionAuthz::RejectForged
+        );
+    }
+
+    #[test]
+    fn checkpoint_tampered_verdict_rejected() {
+        let kp = kp_mod::generate("alice").unwrap();
+        let signed_over = cp_fixture("approved");
+        let sig = sign::sign_checkpoint_resolution(&kp, &signed_over).unwrap();
+        // Same signature, but the verdict was flipped after signing.
+        let tampered = cp_fixture("rejected");
+        assert_eq!(
+            authorize_remote_checkpoint_resolution(&tampered, &sig, Some(&kp.public), true),
+            CheckpointResolutionAuthz::RejectForged
+        );
+    }
+
+    #[test]
+    fn require_checkpoint_sig_default_fail_closed_and_falsy_opts_out() {
+        // FED-RQ-01 — mirrors the #1718 transition knob: default ON
+        // (fail-closed), falsy (`0`/`false`/`no`/`off`) opts out. SAFETY:
+        // single-threaded mutation of a var no other test reads.
+        unsafe { std::env::remove_var(REQUIRE_CHECKPOINT_SIG_ENV) };
+        assert!(
+            require_checkpoint_sig_enabled(),
+            "unset → fail-closed default"
+        );
+        for falsy in ["0", "false", "no", "off", "  off  "] {
+            unsafe { std::env::set_var(REQUIRE_CHECKPOINT_SIG_ENV, falsy) };
+            assert!(!require_checkpoint_sig_enabled(), "{falsy:?} → permissive");
+        }
+        for truthy in ["1", "true", "yes", "on", ""] {
+            unsafe { std::env::set_var(REQUIRE_CHECKPOINT_SIG_ENV, truthy) };
+            assert!(require_checkpoint_sig_enabled(), "{truthy:?} → strict");
+        }
+        unsafe { std::env::remove_var(REQUIRE_CHECKPOINT_SIG_ENV) };
     }
 }

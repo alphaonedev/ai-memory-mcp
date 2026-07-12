@@ -19,7 +19,8 @@
 //! - `post_and_classify` retry-once recovering a transient 500.
 //! - Per-variant `AckOutcome::Fail` warn arms (peer 500 at W=2 ⇒ quorum
 //!   unmet) for delete / restore / consolidate / pending / pending-decision /
-//!   action-transition / signal / namespace-meta / namespace-meta-clear.
+//!   action-transition / signal / checkpoint-resolution (FED-RQ-01 #1936) /
+//!   namespace-meta / namespace-meta-clear.
 //! - `broadcast_store_quorum*` #933 DLQ landing: explicit-failure reason,
 //!   the `deadline_exceeded` fallback for deadline-evicted peers, and the
 //!   sink-error non-fatal arm.
@@ -260,6 +261,29 @@ fn fixture_transition() -> sync::ActionTransitionOp {
         signature: Vec::new(),
         signer_pubkey: Vec::new(),
         nonce: Vec::new(),
+    }
+}
+
+/// FED-RQ-01 (#1936) — a resolved commit-checkpoint for the outbound
+/// `broadcast_checkpoint_resolution_quorum` fanout arm.
+fn fixture_checkpoint() -> ai_memory::models::Checkpoint {
+    ai_memory::models::Checkpoint {
+        id: "cov-sync-checkpoint-1".to_string(),
+        namespace: "_epoch".to_string(),
+        title: "epoch advance 7".to_string(),
+        condition_type: ai_memory::models::ConditionType::EpochAdvance,
+        condition: serde_json::Value::Null,
+        state: ai_memory::models::CheckpointState::Resolved,
+        created_by: SENDER.to_string(),
+        resolved_by: Some(SENDER.to_string()),
+        resolution: Some("deadbeef".to_string()),
+        resolution_note: None,
+        signature: Vec::new(),
+        resolver_pubkey: Vec::new(),
+        created_at: 1_700_000_000,
+        deadline_at: None,
+        resolved_at: Some(1_700_000_900),
+        metadata: serde_json::Value::Null,
     }
 }
 
@@ -712,6 +736,14 @@ async fn action_transition_quorum_ack_and_fail_arms() {
 async fn signal_create_quorum_ack_and_fail_arms() {
     let signal = fixture_signal();
     assert_variant_quorum_arms!(|cfg| sync::broadcast_signal_create_quorum(&cfg, &signal));
+}
+
+#[tokio::test]
+async fn checkpoint_resolution_quorum_ack_and_fail_arms() {
+    // FED-RQ-01 (#1936) — the checkpoint-resolution fanout arm satisfies the
+    // same W-of-N quorum contract as every sibling broadcast variant.
+    let cp = fixture_checkpoint();
+    assert_variant_quorum_arms!(|cfg| sync::broadcast_checkpoint_resolution_quorum(&cfg, &cp));
 }
 
 #[tokio::test]
