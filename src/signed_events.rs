@@ -357,6 +357,23 @@ pub mod event_types {
     /// constructed, so no memory content ever leaves the host for the
     /// refused vendor — this row is the audit witness of that refusal.
     pub const EGRESS_INFERENCE_REFUSED: &str = "egress.inference_refused";
+
+    /// v1.0.0 G28 (#1838) — `signed_events.event_type` for a forbidden
+    /// export-class refusal at an export boundary (forensic bundle,
+    /// memory export). Emitted by
+    /// [`crate::export_taxonomy::screen_export_value_audited`] when a
+    /// candidate export record is classified into one of the closed
+    /// [`crate::export_taxonomy::ForbiddenExportClass`] classes (private
+    /// key material, master/threshold secret, governance-rule signing
+    /// key, biometric/behavioral embedding) that must NEVER cross the
+    /// export boundary. `payload_hash` = SHA-256 over the canonical
+    /// pre-image of the (non-secret) forbidden class + the artifact path
+    /// the record would have occupied + the reason; substrate-emitted
+    /// (`daemon_signed` when a key is enrolled, else `unsigned`), the
+    /// same posture as [`EGRESS_INFERENCE_REFUSED`]. The refused record
+    /// is never emitted into the export artifact — this row is the audit
+    /// witness of that fail-closed redaction.
+    pub const EXPORT_FORBIDDEN_CLASS_REFUSED: &str = "export.forbidden_class_refused";
 }
 
 /// v0.9.0 G13 (#1828) + v1.0.0 #1949 — the `identity.lineage.*` witness
