@@ -575,6 +575,8 @@ fn run_local(db_path: &Path) -> Report {
 
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
+    sections.push(section_recall_index_coverage_1964(&conn));
+    sections.push(section_corpus_lifecycle_1965(&conn));
     sections.push(section_recall_local());
     sections.push(section_governance(&conn));
     sections.push(section_sync(&conn));
@@ -690,6 +692,157 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
     ReportSection {
         name: "Index".into(),
         severity,
+        facts,
+        note,
+    }
+}
+
+/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation.
+///
+/// Reconciles what the recall INDEXES (FTS5 keyword, ANN semantic) cover
+/// against the `memories` table and surfaces the coverage fractions
+/// HONESTLY so a partially-indexed corpus is visible rather than silently
+/// serving incomplete recall. ANN coverage below 100 % is EXPECTED
+/// (keyword-tier / oversize rows never embed) → INFO with an honest note;
+/// an FTS shortfall is a genuine index desync / tamper signal → WARN.
+fn section_recall_index_coverage_1964(conn: &rusqlite::Connection) -> ReportSection {
+    let mut facts = Vec::new();
+    let mut severity = Severity::Info;
+    let mut note: Option<String> = None;
+
+    match crate::storage::index_coverage::recall_index_coverage(conn) {
+        Ok(cov) => {
+            facts.push((
+                field_names::TOTAL_MEMORIES.into(),
+                cov.total_rows.to_string(),
+            ));
+            facts.push(("ann_indexed_rows".into(), cov.ann_indexed_rows.to_string()));
+            facts.push((
+                "ann_coverage_fraction".into(),
+                format!("{:.4}", cov.ann_coverage_fraction()),
+            ));
+            facts.push((
+                "ann_unindexed_rows".into(),
+                cov.ann_unindexed_rows().to_string(),
+            ));
+            match (cov.fts_indexed_rows, cov.fts_coverage_fraction()) {
+                (Some(n), Some(frac)) => {
+                    facts.push(("fts_indexed_rows".into(), n.to_string()));
+                    facts.push(("fts_coverage_fraction".into(), format!("{frac:.4}")));
+                }
+                _ => {
+                    facts.push(("fts_indexed_rows".into(), "not_observable".into()));
+                }
+            }
+
+            // ANN < 100% is legitimate — semantic recall simply cannot reach
+            // the un-embedded rows; surface it honestly without alarming.
+            if cov.ann_unindexed_rows() > 0 {
+                note = Some(format!(
+                    "{} of {} rows are NOT vector-indexed — semantic recall cannot reach them \
+                     (keyword recall still can)",
+                    cov.ann_unindexed_rows(),
+                    cov.total_rows
+                ));
+            }
+            // FTS < 100% means rows are missing from keyword recall — a real
+            // index desync / tamper signal.
+            if !cov.fts_fully_covered() {
+                severity = Severity::Warning;
+                let missing = cov.fts_unindexed_rows().unwrap_or(0);
+                note = Some(format!(
+                    "{missing} of {} rows are MISSING from the FTS index — keyword recall silently \
+                     skips them (index desync/tamper)",
+                    cov.total_rows
+                ));
+            }
+        }
+        Err(e) => {
+            severity = Severity::Warning;
+            facts.push(("coverage_error".into(), e.to_string()));
+        }
+    }
+
+    ReportSection {
+        name: "Recall Index Coverage (#1964)".into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// #1965 [P1] — corpus-lifecycle EXPIRE / EVICT / DISTILL pressure.
+///
+/// Surfaces the bounded-growth pressure the three-transition contract
+/// (`docs/corpus-lifecycle.md`) governs, so unbounded-corpus-by-default is
+/// visible: the EXPIRE backlog (rows past TTL awaiting the next gc sweep),
+/// the largest-namespace live corpus bytes (the EVICT / byte-cap pressure
+/// indicator), and the DISTILL driver (curator consolidation). The
+/// transition slugs come from [`crate::storage::lifecycle::LifecycleTransition`].
+fn section_corpus_lifecycle_1965(conn: &rusqlite::Connection) -> ReportSection {
+    use crate::storage::lifecycle::LifecycleTransition;
+
+    let mut facts = Vec::new();
+    let mut note: Option<String> = None;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // EXPIRE pressure — rows whose TTL has elapsed but gc has not yet reaped
+    // (mirrors the `gc` predicate `expires_at IS NOT NULL AND expires_at < now`).
+    let expire_backlog: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?1",
+            [now.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    facts.push((
+        format!("{}_backlog", LifecycleTransition::Expire.as_str()),
+        expire_backlog.to_string(),
+    ));
+
+    // EVICT pressure indicator — the largest namespace's live corpus bytes
+    // (the `size_gc` byte metric). The byte cap is not operator-exposed by
+    // default, so this is a growth signal, not an eviction-eligibility count.
+    let largest: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT namespace, \
+             SUM(length(title) + length(content) + length(metadata)) AS bytes \
+             FROM memories GROUP BY namespace ORDER BY bytes DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+    if let Some((ns, bytes)) = largest {
+        facts.push((
+            format!("{}_largest_namespace", LifecycleTransition::Evict.as_str()),
+            ns,
+        ));
+        facts.push((
+            format!(
+                "{}_largest_namespace_bytes",
+                LifecycleTransition::Evict.as_str()
+            ),
+            bytes.to_string(),
+        ));
+    }
+
+    // DISTILL is curator-driven (consolidation) and needs embedding
+    // comparison; it is not measured at the DB level here.
+    facts.push((
+        format!("{}_driver", LifecycleTransition::Distill.as_str()),
+        "curator_consolidation".into(),
+    ));
+
+    if expire_backlog > 0 {
+        note = Some(format!(
+            "{expire_backlog} rows past TTL awaiting the next gc sweep (EXPIRE) — \
+             see docs/corpus-lifecycle.md"
+        ));
+    }
+
+    ReportSection {
+        name: "Corpus Lifecycle (#1965)".into(),
+        severity: Severity::Info,
         facts,
         note,
     }
@@ -1846,20 +1999,24 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_ten_sections() {
+    fn local_run_on_empty_db_produces_twelve_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
         // L1-4 added "Reflection Health"; #1146 added
         // "LLM Reachability (#1146)"; #1598 added
-        // "Embeddings Reachability (#1598)" — total is now 10.
-        assert_eq!(report.sections.len(), 10);
+        // "Embeddings Reachability (#1598)"; #1964 added
+        // "Recall Index Coverage (#1964)"; #1965 added
+        // "Corpus Lifecycle (#1965)" — total is now 12.
+        assert_eq!(report.sections.len(), 12);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Storage",
                 "Index",
+                "Recall Index Coverage (#1964)",
+                "Corpus Lifecycle (#1965)",
                 "Recall",
                 "Governance",
                 "Sync",

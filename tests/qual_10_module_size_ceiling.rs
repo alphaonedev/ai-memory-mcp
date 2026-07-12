@@ -308,7 +308,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-12 (#1956 crypto-erase): envelope-key destruction + tombstone
     // fanout on the forget/gc/size_gc delete paths land storage/mod.rs at
     // 23_932; ceiling 24_050 (+118).
-    ("src/storage/mod.rs", 24_050),
+    // 2026-07-12 (#1965/#1964): lifecycle-classify + index-coverage query
+    // land storage/mod.rs at 24_119; ceiling 24_250 (+131).
+    ("src/storage/mod.rs", 24_250),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

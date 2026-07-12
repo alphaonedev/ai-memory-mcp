@@ -431,6 +431,15 @@ pub(crate) mod connection;
 // #1720 B3 — boot owner-lockout probe (read-only COUNT over the indexed
 // visibility generated columns). Lives in its own submodule to keep this
 // already-large module under the qual_10 size ceiling.
+/// #1964 [P1][D14] — recall-completeness index-coverage reconciliation:
+/// reconciles what the FTS5 + ANN recall indexes cover against the
+/// `memories` table so recall can report its coverage honestly.
+pub mod index_coverage;
+/// #1965 [P1] — corpus-lifecycle EXPIRE / EVICT / DISTILL contract: the
+/// spec + scoring layer that names the three bounded-growth transitions and
+/// classifies which one a candidate is under (mirrors the live gc / size_gc
+/// / consolidation triggers; changes no eviction behaviour).
+pub mod lifecycle;
 pub mod lockout;
 pub mod migration_meta;
 pub mod migrations;
@@ -18030,6 +18039,102 @@ mod tests {
             get(&conn, &other.id).unwrap().is_some(),
             "other namespace untouched even though it is over the same cap"
         );
+    }
+
+    // ── #1964 index-coverage reconciliation (DB-backed) ───────────────
+
+    #[test]
+    fn index_coverage_reports_honest_ann_and_fts_counts_1964() {
+        use crate::storage::index_coverage::recall_index_coverage;
+        let conn = test_db();
+        let id0 = insert(&conn, &make_memory("cov0", "cov", Tier::Long, 5)).unwrap();
+        let id1 = insert(&conn, &make_memory("cov1", "cov", Tier::Long, 5)).unwrap();
+        let _id2 = insert(&conn, &make_memory("cov2", "cov", Tier::Long, 5)).unwrap();
+        let _id3 = insert(&conn, &make_memory("cov3", "cov", Tier::Long, 5)).unwrap();
+        // Embed only two of the four rows.
+        set_embedding(&conn, &id0, &[0.1_f32; 8]).unwrap();
+        set_embedding(&conn, &id1, &[0.2_f32; 8]).unwrap();
+
+        let cov = recall_index_coverage(&conn).unwrap();
+        assert_eq!(cov.total_rows, 4);
+        assert_eq!(cov.ann_indexed_rows, 2);
+        assert!((cov.ann_coverage_fraction() - 0.5).abs() < 1e-9);
+        assert_eq!(cov.ann_unindexed_rows(), 2, "semantic recall misses these");
+        // Every row is FTS-indexed by trigger — full keyword coverage.
+        assert_eq!(cov.fts_indexed_rows, Some(4));
+        assert!(cov.fts_fully_covered());
+        assert_eq!(cov.fts_coverage_fraction(), Some(1.0));
+    }
+
+    #[test]
+    fn index_coverage_tracks_eviction_honestly_1964() {
+        use crate::storage::index_coverage::recall_index_coverage;
+        let conn = test_db();
+        let a = sized_memory("a", "ev", Tier::Short, 1, 2000);
+        let b = sized_memory("b", "ev", Tier::Long, 9, 2000);
+        insert(&conn, &a).unwrap();
+        insert(&conn, &b).unwrap();
+        set_embedding(&conn, &a.id, &[0.1_f32; 8]).unwrap();
+        set_embedding(&conn, &b.id, &[0.2_f32; 8]).unwrap();
+
+        let before = recall_index_coverage(&conn).unwrap();
+        assert_eq!(before.total_rows, 2);
+        assert_eq!(before.ann_indexed_rows, 2);
+        assert!(before.fts_fully_covered());
+
+        // Byte-cap EVICT (hard delete). The DELETE trigger reaps the FTS
+        // doc too, so coverage stays reconciled at the smaller live count.
+        let evicted = size_gc(&conn, "ev", 500, false).unwrap();
+        assert!(evicted >= 1, "over-cap corpus evicts at least one victim");
+
+        let after = recall_index_coverage(&conn).unwrap();
+        assert!(
+            after.total_rows < before.total_rows,
+            "eviction dropped the live count honestly"
+        );
+        assert!(
+            after.fts_fully_covered(),
+            "FTS index stays in sync with the table after eviction"
+        );
+    }
+
+    // ── #1965 lifecycle EXPIRE predicate ≡ the live gc trigger ────────
+
+    #[test]
+    fn lifecycle_expire_predicate_matches_gc_trigger_1965() {
+        use crate::storage::lifecycle::{LifecycleTransition, is_expired};
+        let conn = test_db();
+        let m = insert(&conn, &make_memory("doomed", "life", Tier::Mid, 5)).unwrap();
+        // Force the row's TTL into the distant past.
+        let past = "2000-01-01T00:00:00+00:00";
+        conn.execute(
+            "UPDATE memories SET expires_at = ?1 WHERE id = ?2",
+            params![past, m],
+        )
+        .unwrap();
+        let now = Utc::now().to_rfc3339();
+
+        // The spec predicate agrees the row is EXPIRE-eligible...
+        assert!(is_expired(Some(past), &now));
+        let candidate = crate::storage::lifecycle::LifecycleCandidate {
+            expires_at: Some(past),
+            best_jaccard: 0.0,
+            best_cosine: None,
+        };
+        let pressure = crate::storage::lifecycle::CorpusPressure {
+            now: &now,
+            corpus_bytes: 0,
+            max_corpus_bytes: None,
+        };
+        assert_eq!(
+            crate::storage::lifecycle::classify_lifecycle_transition(&candidate, &pressure),
+            Some(LifecycleTransition::Expire)
+        );
+
+        // ...and the live gc path reaps exactly that row.
+        let reaped = gc(&conn, false).unwrap();
+        assert_eq!(reaped, 1);
+        assert!(get(&conn, &m).unwrap().is_none());
     }
 
     #[test]
