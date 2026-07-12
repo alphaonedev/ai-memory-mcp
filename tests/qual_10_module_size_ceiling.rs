@@ -704,7 +704,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 26_032/26_036 and merge to 26_102; ceiling 26_200 (+98 headroom).
     // 2026-07-11 (#1949 + stage 3 merged): v80 migrate arm + subkey-cert
     // SAL surface land the file at 26_215; ceiling 26_300 (+85 headroom).
-    ("src/store/postgres.rs", 26_300),
+    // 2026-07-12 (#1955 record-stop): the SAL record_stop methods +
+    // gate wiring land postgres.rs at 26_352; ceiling 26_450 (+98).
+    ("src/store/postgres.rs", 26_450),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
