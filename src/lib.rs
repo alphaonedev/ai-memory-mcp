@@ -606,6 +606,11 @@ pub mod hnsw;
 // refusals. Extends the substrate's default-deny-able egress posture to
 // outbound LLM/embedding vendor POSTs at the semantic/smart tiers.
 pub mod egress;
+// v1.0.0 G28 (#1838) — forbidden-export-class taxonomy + fail-closed
+// export-boundary enforcement (private key material / master-threshold
+// secrets / governance signing keys / biometric-behavioral embeddings must
+// never cross the export boundary in the clear).
+pub mod export_taxonomy;
 pub mod hooks;
 pub mod identity;
 // v0.7.0 L1-2 — knowledge-graph substrate helpers (anti-cycle check).

@@ -610,6 +610,53 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
+/// v1.0.0 G28 (#1838) — fail-closed forbidden-export-class filter for the
+/// corpus-export egress. Drops any memory whose serialized row is classified
+/// into a [`crate::export_taxonomy::ForbiddenExportClass`] (private key
+/// material / master-threshold secret / governance signing key / a
+/// producer-tagged biometric embedding) so it never leaves in the clear.
+/// When `audit_conn` is `Some` (the sqlite export path) each drop emits a
+/// signed `export.forbidden_class_refused` row; the postgres path has no
+/// rusqlite handle and WARN-only skips the audit row (documented honest
+/// boundary) — the DROP itself always holds.
+fn screen_exported_memories(
+    memories: Vec<crate::models::Memory>,
+    audit_conn: Option<&rusqlite::Connection>,
+) -> Vec<crate::models::Memory> {
+    memories
+        .into_iter()
+        .filter(|m| {
+            let Some(class) = crate::export_taxonomy::classify_memory(m) else {
+                return true;
+            };
+            let path = format!("memories/{}.json", m.id);
+            let reason = format!(
+                "export refused: memory classified {} ({}) — dropped from export artifact",
+                class.as_str(),
+                class.description()
+            );
+            if let Some(conn) = audit_conn {
+                if let Err(e) = crate::export_taxonomy::emit_export_refusal(
+                    conn,
+                    class,
+                    &path,
+                    crate::identity::sentinels::DAEMON_PRINCIPAL,
+                    &reason,
+                ) {
+                    tracing::warn!(
+                        "forbidden-export-class signed refusal NOT recorded for {path}: {e}"
+                    );
+                }
+            }
+            tracing::warn!(
+                "export boundary dropped a {} memory — {path} withheld fail-closed",
+                class.as_str()
+            );
+            false
+        })
+        .collect()
+}
+
 pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // #957 (security-critical, 2026-05-20) — admin-role gate.
     // Pre-#957 the handler took NO headers, accepted no caller, and
@@ -655,6 +702,11 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
         };
+        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed).
+        // The postgres export has no rusqlite audit handle, so the signed
+        // refusal is skipped with a WARN (documented honest boundary); the
+        // fail-closed DROP still holds so a forbidden-class row never leaves.
+        let mems = screen_exported_memories(mems, None);
         let links = match app.store.export_links().await {
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
@@ -674,6 +726,10 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
     let lock = app.db.lock().await;
     match (db::export_all(&lock.0), db::export_links(&lock.0)) {
         (Ok(memories), Ok(links)) => {
+            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
+            // sqlite path holds the audit connection so a drop emits a signed
+            // `export.forbidden_class_refused` row.
+            let memories = screen_exported_memories(memories, Some(&lock.0));
             let count = memories.len();
             Json(json!({"memories": memories, "links": links, "count": count, (field_names::EXPORTED_AT): Utc::now().to_rfc3339()})).into_response()
         }
