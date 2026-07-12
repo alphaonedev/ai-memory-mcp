@@ -1,0 +1,40 @@
+# ai-memory — STANDARD deployment config template (v1.0.0, PE-1 / #1962)
+#
+# This is the baseline reference config. It keeps every security knob at
+# its own compiled default (byte-identical legacy). Copy it to
+# ~/.config/ai-memory/config.toml (or the path named by --config) and edit.
+#
+# For a maximally-hardened, fail-closed-everything deployment use
+# config.asi-hard.toml + asi-hard.env instead (see README.md).
+
+schema_version = 2
+
+# Feature tier: keyword | semantic | smart | autonomous
+tier = "semantic"
+
+# db = "/var/lib/ai-memory/ai-memory.db"
+
+[mcp]
+# Advertised MCP tool surface: core (default, 7 tools) | graph | admin |
+# power | full | comma-list.
+profile = "core"
+
+[storage]
+# default_namespace = "team/eng"
+archive_on_gc = true
+
+[limits]
+max_memories_per_day  = 1000
+max_storage_bytes     = 104857600   # 100 MiB
+max_links_per_day     = 5000
+max_page_size         = 1000
+
+# [security]
+# secret_screen_mode = "refuse"   # already the compiled default at v0.8.1+
+
+# [hooks]
+# enforce_mode   = "off"          # PE-1 presence enforcement OFF by default
+# required_events = []            # empty = no-op even under enforce
+
+# [governance]
+# require_operator_pubkey = false

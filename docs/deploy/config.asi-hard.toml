@@ -1,0 +1,85 @@
+# ai-memory — asi-hard PROCUREMENT deployment config template
+# (v1.0.0, PE-1 / #1962; hardened security posture / #1961; egress / #1963)
+#
+# The maximally-hardened, fail-closed-everything posture. This is the
+# CONFIG half of the asi-hard template; pair it with `asi-hard.env` (the
+# ENV half) which selects the named `asi-hard` security posture and pins
+# the fail-closed env knobs. Copy BOTH into your deployment.
+#
+#   cp config.asi-hard.toml  ~/.config/ai-memory/config.toml
+#   # then export the vars in asi-hard.env before launching the daemon
+#   set -a; . /etc/ai-memory/asi-hard.env; set +a
+#   ai-memory serve
+#
+# What this file pins (config-backed knobs — the env-backed fail-closed
+# set is pinned by AI_MEMORY_SECURITY_PROFILE=asi-hard in asi-hard.env):
+#
+#   [security].secret_screen_mode = "refuse"
+#       Pre-write credential screen REFUSES any write whose content matches
+#       a credential detector (never stores it). (env #95)
+#   [hooks].enforce_mode = "enforce" + non-empty required_events
+#       PE-1 mandatory-hook PRESENCE enforcement: a missing pre-* governance
+#       hook for a required event fails CLOSED (Deny 503) instead of silent
+#       no-enforcement. required_events MUST be non-empty or enforce is a
+#       self-DOS-guarded no-op. (env #83)
+#   [governance].require_operator_pubkey = true
+#       Governance boot refuses to run without a resolvable operator key
+#       (also bridged automatically by the asi-hard posture).
+#
+# NAMESPACE write != Any (PE-1): config.toml does NOT carry namespace
+# standards — they are attached at runtime via `memory_namespace_set_standard`
+# (MCP) so production namespaces carry an explicit non-permissive write gate
+# (e.g. write=owner, promote=owner/approve). A hardened deployment MUST set a
+# standard on every production namespace; see README.md and docs/governance.md.
+
+schema_version = 2
+
+# Hardened deployments run at least the semantic tier; autonomous adds the
+# cross-encoder reranker. Keep inference LOCAL (see asi-hard.env
+# AI_MEMORY_INFERENCE_EGRESS=loopback-only) so memory content never leaves
+# the host for an external vendor.
+tier = "autonomous"
+
+# db = "/var/lib/ai-memory/ai-memory.db"
+
+[mcp]
+profile = "full"
+
+[security]
+# Pre-write credential screen: refuse (do not store secrets).
+secret_screen_mode = "refuse"
+
+[hooks]
+# PE-1 mandatory-hook presence enforcement. `enforce` + a NON-EMPTY
+# required_events list is the hardened posture: a required pre-* event with
+# no enabled hook fails CLOSED. Wire real hooks for each event before
+# shipping (`ai-memory doctor --hooks` verifies presence at pre-flight).
+enforce_mode = "enforce"
+required_events = [
+    "pre_store",
+    "pre_delete",
+    "pre_promote",
+    "pre_link",
+    "pre_consolidate",
+    "pre_governance_decision",
+    "pre_reflect",
+]
+
+[governance]
+# Refuse to run governance without a resolvable operator pubkey.
+require_operator_pubkey = true
+
+[capabilities]
+# Macaroon capability-token grant layer on (default-on at v1.0.0). Mint an
+# owner root with `ai-memory capability init`.
+enabled = true
+
+[storage]
+# default_namespace = "team/eng"
+archive_on_gc = true
+
+[limits]
+max_memories_per_day  = 1000
+max_storage_bytes     = 104857600   # 100 MiB
+max_links_per_day     = 5000
+max_page_size         = 1000

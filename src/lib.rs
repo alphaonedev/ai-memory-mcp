@@ -602,6 +602,10 @@ pub mod hnsw;
 // the config schema + SIGHUP hot-reload plumbing; the executor
 // (G3) and the actual fire points (G7+) layer on top of this
 // module without touching call sites in `handlers.rs` etc.
+// v1.0.0 #1963 (R68/D14) — inference-plane egress-class gate + signed
+// refusals. Extends the substrate's default-deny-able egress posture to
+// outbound LLM/embedding vendor POSTs at the semantic/smart tiers.
+pub mod egress;
 pub mod hooks;
 pub mod identity;
 // v0.7.0 L1-2 — knowledge-graph substrate helpers (anti-cycle check).
