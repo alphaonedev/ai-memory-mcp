@@ -717,6 +717,7 @@ pub mod synthesis;
 pub mod tls;
 pub mod toon;
 pub mod transcripts;
+pub mod trust;
 pub mod validate;
 /// #951 (Track A QC sweep, 2026-05-20) — canonical
 /// `is_visible_to_caller` helper, non-sal-gated so both feature

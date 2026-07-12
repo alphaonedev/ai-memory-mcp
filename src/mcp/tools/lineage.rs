@@ -117,11 +117,21 @@ pub fn handle_lineage(
     // too much" from a real fault.
     .map_err(|e| e.to_string())?;
 
+    // v1.0.0 R20 (#1958) — surface the root's read-time min-propagated trust
+    // tier: min(own attest_level, all recorded ancestors' attest_levels) over
+    // P. It is a property of the root (its ancestry), independent of the walk
+    // direction, so it is computed once here. ESTIMABLE — bounded by recorded
+    // provenance completeness.
+    let propagated_trust = db::propagated_trust_tier(conn, id, db::LINEAGE_MAX_DEPTH)
+        .map(|t| t.as_str())
+        .unwrap_or_else(|_| crate::trust::TrustTier::Unattested.as_str());
+
     Ok(json!({
         "id": id,
         "direction": direction,
         "nodes": nodes,
         "count": nodes.len(),
+        "propagated_trust": propagated_trust,
     }))
 }
 

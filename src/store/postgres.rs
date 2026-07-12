@@ -17114,6 +17114,9 @@ impl MemoryStore for PostgresStore {
         // `metadata.derived_from_cids` record + the tombstone-path edge
         // stamps below.
         let mut source_cids: Vec<Option<String>> = Vec::with_capacity(ids.len());
+        // v1.0.0 R20 (#1958) — each source's EFFECTIVE trust tier for the
+        // write-time min-propagation stamp below (sqlite `consolidate` twin).
+        let mut source_trust_tiers: Vec<crate::trust::TrustTier> = Vec::with_capacity(ids.len());
 
         for id in ids {
             use sqlx::Row;
@@ -17142,6 +17145,7 @@ impl MemoryStore for PostgresStore {
             }
             let metadata: serde_json::Value =
                 row.try_get("metadata").unwrap_or(serde_json::json!({}));
+            source_trust_tiers.push(crate::trust::TrustTier::of_metadata(&metadata));
             if let serde_json::Value::Object(map) = metadata {
                 for (k, v) in map {
                     if k == "agent_id" {
@@ -17197,6 +17201,15 @@ impl MemoryStore for PostgresStore {
             merged_metadata.insert(
                 "derived_from_cids".to_string(),
                 serde_json::Value::Array(cids),
+            );
+            // v1.0.0 R20 (#1958) — min-propagation (sqlite `consolidate`
+            // twin): bound the derived record's effective trust tier by the
+            // minimum over its sources so a low-trust input cannot be
+            // laundered into the `confidence = 1.0` consolidated summary.
+            let propagated = crate::trust::TrustTier::min_over(source_trust_tiers.iter().copied());
+            merged_metadata.insert(
+                crate::trust::PROPAGATED_TRUST_KEY.to_string(),
+                serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
         let merged_metadata_value = serde_json::Value::Object(merged_metadata);

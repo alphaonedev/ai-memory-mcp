@@ -6726,6 +6726,10 @@ pub fn consolidate(
         // edges, the leaves, and `metadata.derived_from_cids` need no
         // re-read.
         let mut source_rows: Vec<(String, Option<String>, i64, String)> = Vec::new();
+        // v1.0.0 R20 (#1958) — each source's EFFECTIVE trust tier, captured
+        // in this same read so the write-time min-propagation stamp below
+        // needs no re-read. The derived record cannot outrank the minimum.
+        let mut source_trust_tiers: Vec<crate::trust::TrustTier> = Vec::new();
         for id in ids {
             match get(conn, id)? {
                 Some(mem) => {
@@ -6735,6 +6739,7 @@ pub fn consolidate(
                         mem.version,
                         mem.namespace.clone(),
                     ));
+                    source_trust_tiers.push(crate::trust::TrustTier::of_metadata(&mem.metadata));
                     max_priority = max_priority.max(mem.priority);
                     all_tags.extend(mem.tags);
                     total_access = total_access.saturating_add(mem.access_count);
@@ -6825,6 +6830,16 @@ pub fn consolidate(
             merged_metadata.insert(
                 "derived_from_cids".to_string(),
                 serde_json::Value::Array(cids),
+            );
+            // v1.0.0 R20 (#1958) — min-propagation: the consolidated
+            // (derived) record's effective trust tier is bounded by the
+            // MINIMUM over its sources so low-trust inputs cannot be
+            // laundered into a high-trust `confidence = 1.0` summary. Stamped
+            // write-time under the same DAG-master gate as the cid mirror.
+            let propagated = crate::trust::TrustTier::min_over(source_trust_tiers.iter().copied());
+            merged_metadata.insert(
+                crate::trust::PROPAGATED_TRUST_KEY.to_string(),
+                serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
         let merged_metadata_value = serde_json::Value::Object(merged_metadata);
@@ -8962,6 +8977,73 @@ pub fn lineage_descendants(
     max_depth: usize,
 ) -> Result<Vec<crate::models::LineageNode>> {
     lineage_traverse(conn, root_id, max_depth, LineageDirection::Descendants)
+}
+
+/// v1.0.0 R20 (#1958) — read-time min-propagation: the EFFECTIVE trust tier
+/// of `id`, bounded by the minimum over `id`'s own attest level and every
+/// ANCESTOR reachable through the provenance subset P
+/// ([`crate::models::MemoryLinkRelation::LINEAGE`]), up to `max_depth` hops.
+///
+/// This is the general read-time surface complementing the write-time stamp
+/// that [`consolidate`] lands on `metadata.propagated_trust`: it computes
+/// the same bound for ANY derived record (reflections, atomisation
+/// derivatives, or externally-authored `derived_from` edges) whose ancestry
+/// was never stamped. A `None`/missing root resolves to
+/// [`crate::trust::TrustTier::Unattested`].
+///
+/// ## Honest boundary (ESTIMABLE)
+///
+/// The bound is only as complete as the RECORDED lineage — an un-recorded
+/// derivation is invisible, so the returned tier is an UPPER bound on the
+/// true laundering exposure, not a proof.
+///
+/// # Errors
+///
+/// Propagates traversal errors from [`lineage_ancestors`] (e.g. `max_depth`
+/// out of range) and `rusqlite` errors from the per-node metadata reads.
+pub fn propagated_trust_tier(
+    conn: &Connection,
+    id: &str,
+    max_depth: usize,
+) -> Result<crate::trust::TrustTier> {
+    let mut tier = get(conn, id)?
+        .map(|m| crate::trust::TrustTier::of_metadata(&m.metadata))
+        .unwrap_or(crate::trust::TrustTier::Unattested);
+    for node in lineage_ancestors(conn, id, max_depth)? {
+        if let Some(m) = get(conn, &node.id)? {
+            tier = tier.min(crate::trust::TrustTier::of_metadata(&m.metadata));
+        }
+    }
+    Ok(tier)
+}
+
+/// v1.0.0 R55 (#1959) — the TRANSITIVE suspect set of an invalidated /
+/// suspect root: every memory reachable DOWNSTREAM over the provenance
+/// subset P, i.e. every record derived (transitively) from `root_id`. A
+/// suspect source taints its derivations, so invalidating `root_id` reports
+/// all N transitive derivations as suspect.
+///
+/// This is the transitive generalisation of the direct-only reflects_on
+/// walk in [`crate::notification::invalidation::list_dependents_of_invalidated`].
+/// It is LAZY / computed (no write amplification): it reuses the cycle-safe,
+/// depth-bounded [`lineage_descendants`] walk (`json_each` visited-set +
+/// `max_depth` ceiling), so a cyclic or pathologically deep provenance graph
+/// terminates cleanly. Records NOT derived from `root_id` never appear.
+///
+/// ## Honest boundary (ESTIMABLE)
+///
+/// The set is exactly the RECORDED downstream lineage — an un-recorded
+/// derivation of a suspect source will not be flagged.
+///
+/// # Errors
+///
+/// See [`lineage_descendants`].
+pub fn transitive_suspects(
+    conn: &Connection,
+    root_id: &str,
+    max_depth: usize,
+) -> Result<Vec<crate::models::LineageNode>> {
+    lineage_descendants(conn, root_id, max_depth)
 }
 
 /// Default cap on paths returned by [`find_paths`] when the caller does
