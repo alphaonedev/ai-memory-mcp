@@ -830,7 +830,16 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // old ceiling). Growth is justified: operator flags for the P0-1
     // behavior change, zero speculative surface. 12_350 = 12_234 + 116
     // headroom.
-    ("src/config.rs", 12_350),
+    // 2026-07-12 — bumped 12_350 → 12_500 by #1989 (v0.10.0 tag
+    // blocker): the v1.0.0 Gate-1prime crypto-core config growth
+    // (#1942/#1945/#1953/#1954 flip-ready consts + resolvers/env
+    // knobs) pushed config.rs from 12_268 to 12_401 at commit
+    // 64799a0e WITHOUT the mandated lockstep ceiling bump, so this
+    // integration test has failed on every `__ALL__` (tag) CI run
+    // since — invisible to push CI because impact-selection never
+    // dispatches qual_10. Actual LOC at the bump: 12_401.
+    // 12_500 = 12_401 + 99 headroom.
+    ("src/config.rs", 12_500),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
