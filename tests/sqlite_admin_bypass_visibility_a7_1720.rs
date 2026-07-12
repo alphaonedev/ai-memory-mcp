@@ -4,7 +4,7 @@
 #![allow(clippy::needless_update)]
 
 //! v0.8.0 #1709/#1720 Workstream-A (unit A7) — admin/operator
-//! BYPASS-path correctness regression on the SQLite SAL adapter.
+//! BYPASS-path correctness regression on the `SQLite` `SAL` adapter.
 //!
 //! ## Why this binary exists
 //!
@@ -32,7 +32,7 @@
 //! bypass path** — a fail-CLOSED regression for the very paths that
 //! are supposed to read everything (migrate, full export, federation
 //! catchup, GC sweeps), AND a divergence from the Postgres adapter,
-//! whose recall/search/recall_hybrid bind `caller = NULL` on bypass
+//! whose `recall/search/recall_hybrid` bind `caller = NULL` on bypass
 //! and trust-all via `$N::text IS NULL` REGARDLESS of `as_agent`.
 //!
 //! ## The contract this binary pins (matches Postgres)

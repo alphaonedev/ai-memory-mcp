@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! cov_ga2 — GA-gate coverage backfill for the three sub-90% federation
+//! `cov_ga2` — GA-gate coverage backfill for the three sub-90% federation
 //! modules under the operator's uniform-90-per-module directive:
 //!
 //! - `handlers/federation_receive` — drives the production `/sync/push`
