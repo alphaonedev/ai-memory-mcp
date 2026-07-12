@@ -4486,14 +4486,66 @@ pub const ENV_ACCESS_FOLD_INTERVAL_SECS: &str = "AI_MEMORY_ACCESS_FOLD_INTERVAL_
 /// [`ENV_ACCESS_FOLD_INTERVAL_SECS`]).
 pub const DEFAULT_ACCESS_FOLD_INTERVAL_SECS: u64 = 60;
 
+/// One-shot latch primitive backing the v0.10.0 WARN-carrier release
+/// (Gate-1', #1972): the deprecation / secure-default-flip WARNs for
+/// [`ENV_RECALL_TOUCH_SYNC`] (#1953), the federation fed-sig defaults
+/// (#1954), and the decorrelation advisory (#1952).
+///
+/// Returns `true` on the FIRST call for a given `latch` and `false` on
+/// every subsequent call, so a WARN fires once per process rather than
+/// once per invocation. Relaxed ordering is sufficient: the only
+/// invariant is "emit at most once", with no happens-before relation
+/// to any other state.
+pub(crate) fn one_shot_latch_take(latch: &std::sync::atomic::AtomicBool) -> bool {
+    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// v0.10.0 Gate-1' (#1953) — one-cycle deprecation notice for the legacy
+/// synchronous recall-touch knob. Removal is targeted v1.0.0; the migration
+/// is to rely on the pure-recall fold ledger. Cites the #1869 vote that made
+/// recall pure and deprecated this knob at birth.
+pub const RECALL_TOUCH_SYNC_DEPRECATION_WARNING: &str = "AI_MEMORY_RECALL_TOUCH_SYNC=1 is DEPRECATED and will be REMOVED in v1.0.0 (#1869). \
+     The legacy synchronous recall-time touch is superseded by pure recall plus the \
+     periodic access-fold ledger — unset this knob and rely on the fold ledger \
+     (recall_observations rows folded by the access-fold loop) for the access-count, \
+     last_accessed_at, TTL-floor, and promotion ladders. One-cycle v0.10.0 deprecation \
+     WARN; the knob still works this release.";
+
+/// Raw env read for [`ENV_RECALL_TOUCH_SYNC`] with NO side effects — the
+/// pure predicate the one-shot WARN gate and [`recall_touch_sync_enabled`]
+/// both build on.
+fn recall_touch_sync_raw() -> bool {
+    std::env::var(ENV_RECALL_TOUCH_SYNC).is_ok_and(|v| v == "1")
+}
+
+/// Emit [`RECALL_TOUCH_SYNC_DEPRECATION_WARNING`] at most once per process,
+/// and only when the deprecated knob is actually set. Called from BOTH the
+/// daemon boot path ([`crate::daemon_runtime::bootstrap_serve`]) and the
+/// first recall-path use of [`recall_touch_sync_enabled`] (#1953).
+pub fn warn_recall_touch_sync_deprecation_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if recall_touch_sync_raw() && one_shot_latch_take(&WARNED) {
+        tracing::warn!("{RECALL_TOUCH_SYNC_DEPRECATION_WARNING}");
+    }
+}
+
 /// Returns `true` when [`ENV_RECALL_TOUCH_SYNC`] is set to `"1"` —
 /// the legacy synchronous recall-touch posture. Pattern mirrors
 /// [`crate::confidence::decay::decay_enabled`]. Callers on the recall
 /// path MUST evaluate this ONCE per recall (never per row) and only
 /// on write paths.
+///
+/// Side effect (#1953): on the first call in a process where the knob is
+/// set, emits the one-shot v0.10.0 removal-deprecation WARN. The emission
+/// is latched, so the hot fold path pays only a relaxed atomic load after
+/// the first recall.
 #[must_use]
 pub fn recall_touch_sync_enabled() -> bool {
-    std::env::var(ENV_RECALL_TOUCH_SYNC).is_ok_and(|v| v == "1")
+    let enabled = recall_touch_sync_raw();
+    if enabled {
+        warn_recall_touch_sync_deprecation_once();
+    }
+    enabled
 }
 
 /// Resolve the fold-loop cadence from [`ENV_ACCESS_FOLD_INTERVAL_SECS`].
@@ -4519,11 +4571,17 @@ mod recall_purity_flag_tests {
     #[test]
     fn recall_touch_sync_default_off_and_opt_in() {
         // SAFETY: single test owns this var; no concurrent reader in
-        // this binary mutates it.
+        // this binary mutates it. (#1953 removal-readiness assertions are
+        // folded in here so exactly ONE test mutates this process-global var.)
         unsafe { std::env::remove_var(ENV_RECALL_TOUCH_SYNC) };
         assert!(!recall_touch_sync_enabled(), "default is pure (OFF)");
+        assert!(!recall_touch_sync_raw(), "unset → no deprecation WARN gate");
         unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "1") };
         assert!(recall_touch_sync_enabled());
+        // #1953: the knob STILL works this release; the WARN gate is armed
+        // only when opted in. The one-shot emitter is panic-free either way.
+        assert!(recall_touch_sync_raw(), "opted-in → WARN gate armed");
+        warn_recall_touch_sync_deprecation_once();
         // Only the exact "1" spelling opts in — a typo stays pure.
         unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "true") };
         assert!(!recall_touch_sync_enabled());
@@ -4549,6 +4607,57 @@ mod recall_purity_flag_tests {
             "garbage falls back to the default"
         );
         unsafe { std::env::remove_var(ENV_ACCESS_FOLD_INTERVAL_SECS) };
+    }
+
+    // ---- v0.10.0 Gate-1' WARN-carrier tests (#1953 / #1952 / #1972) ----
+
+    #[test]
+    fn one_shot_latch_take_fires_exactly_once() {
+        // The one-shot mechanism proven deterministically with a FRESH
+        // local latch — decoupled from the process-wide statics so other
+        // tests in this binary cannot race the assertion (#1972 E).
+        let latch = std::sync::atomic::AtomicBool::new(false);
+        assert!(one_shot_latch_take(&latch), "first take fires");
+        assert!(!one_shot_latch_take(&latch), "second take is suppressed");
+        assert!(!one_shot_latch_take(&latch), "and stays suppressed");
+    }
+
+    #[test]
+    fn recall_touch_sync_deprecation_message_cites_removal_and_1869() {
+        // The named-const message must carry the load-bearing facts:
+        // removal version + the #1869 provenance + the fold-ledger migration.
+        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("v1.0.0"));
+        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("#1869"));
+        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("fold ledger"));
+    }
+
+    #[test]
+    fn decorrelation_advisory_message_cites_v1_and_plan() {
+        // #1952: the advisory names the v1.0.0 advisory default + the
+        // enforce-as-default plan (D3-021) + the tracking issue.
+        assert!(REFLECT_DECORRELATION_ADVISORY_NOTICE.contains("v1.0.0"));
+        assert!(REFLECT_DECORRELATION_ADVISORY_NOTICE.contains("ADVISORY"));
+        assert!(REFLECT_DECORRELATION_ADVISORY_NOTICE.contains("D3-021"));
+        assert!(REFLECT_DECORRELATION_ADVISORY_NOTICE.contains("#1952"));
+    }
+
+    #[test]
+    fn decorrelation_advisory_gate_tracks_mode() {
+        // The advisory fires only when the mode is inactive (unset/off);
+        // an explicit advisory/enforce mode suppresses it.
+        // SAFETY: single test owns this var.
+        unsafe { std::env::remove_var(ENV_REFLECT_DECORRELATION_MODE) };
+        assert!(
+            !reflect_decorrelation_mode().is_active(),
+            "unset → inactive → advisory gate armed"
+        );
+        warn_reflect_decorrelation_default_once(); // panic-free no-op path
+        unsafe { std::env::set_var(ENV_REFLECT_DECORRELATION_MODE, "advisory") };
+        assert!(
+            reflect_decorrelation_mode().is_active(),
+            "advisory → active → gate suppressed"
+        );
+        unsafe { std::env::remove_var(ENV_REFLECT_DECORRELATION_MODE) };
     }
 }
 
@@ -5314,6 +5423,30 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
         .ok()
         .and_then(|s| ReflectDecorrelationMode::from_str_opt(&s))
         .unwrap_or_default()
+}
+
+/// v0.10.0 Gate-1' (#1952) — advisory notice emitted once per curator
+/// `--reflect` run when the reflection-corpus decorrelation probe mode is
+/// unset / `off`. States that v1.0.0 keeps the probe defaulting to ADVISORY
+/// (visibility-on, per D3-021) and names the tracked v1.x enforce-as-default
+/// plan (D3-021 → D3-031 → D3-060). No behaviour change: the anti-theater
+/// refusal rules are unchanged and enforce stays opt-in this release.
+pub const REFLECT_DECORRELATION_ADVISORY_NOTICE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE is unset/off: the reflection-corpus \
+     decorrelation probe is INACTIVE this run. v1.0.0 defaults this probe to \
+     ADVISORY (visibility-on-by-default, per D3-021); enforce-as-default is the \
+     tracked v1.x lane (D3-021 -> D3-031 -> D3-060, #1952). Set \
+     AI_MEMORY_REFLECT_DECORRELATION_MODE=advisory now to adopt the v1.0.0 default \
+     early. One-shot advisory; no behaviour changes this release.";
+
+/// Emit [`REFLECT_DECORRELATION_ADVISORY_NOTICE`] at most once per process,
+/// and only when [`reflect_decorrelation_mode`] resolves INACTIVE (unset /
+/// `off`). Called from the curator `--reflect` run (#1952); an explicit
+/// `advisory`/`enforce` mode suppresses the notice (the operator has chosen).
+pub fn warn_reflect_decorrelation_default_once() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !reflect_decorrelation_mode().is_active() && one_shot_latch_take(&WARNED) {
+        tracing::warn!("{REFLECT_DECORRELATION_ADVISORY_NOTICE}");
+    }
 }
 
 /// v0.9.0 §25.3 S2 (D3-021, #1767) — write-time attested-family quorum N.

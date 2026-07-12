@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **v0.10.0 WARN-carrier release — deprecation WARNs ahead of the v1.0.0 fail-open → fail-closed flips** ([#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972)). Every v1.0.0 secure-default flip rides the one-cycle-deprecation pattern: v0.10.0 EMITS the WARN, v1.0.0 flips. This release flips **no** default — it only adds the WARN machinery and the flip-ready code paths behind the existing env knobs.
+  - `AI_MEMORY_RECALL_TOUCH_SYNC=1` is deprecated and will be **removed in v1.0.0** ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953), citing the [#1869](https://github.com/alphaonedev/ai-memory-mcp/issues/1869) pure-recall vote). A one-shot WARN fires at daemon boot and on first recall-path use when the knob is set; migrate by unsetting it and relying on the pure-recall fold ledger. The knob still works this release.
+  - `AI_MEMORY_FED_REQUIRE_WRITE_SIG` (env-table row 94, [#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)) and `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` (row 96, [#1843](https://github.com/alphaonedev/ai-memory-mcp/issues/1843)) each emit a one-shot boot WARN when **unset**, announcing the v1.0.0 flip of their shared compiled default to **required-per-surface** — federation inbound is the network surface (ruling `9e9c3cf2` condition 7) ([#1954](https://github.com/alphaonedev/ai-memory-mcp/issues/1954)). The resolution now routes through the single named `FED_REQUIRE_SIG_DEFAULT` const (currently `false`; the v1.0.0 flip is a one-line diff), and the `=0` opt-out keeps working past the flip.
+  - `AI_MEMORY_REFLECT_DECORRELATION_MODE` unset/off emits a one-shot advisory on each `curator --reflect` run: v1.0.0 defaults the decorrelation probe to **advisory** (per D3-021), with enforce-as-default tracked for v1.x (D3-021 → D3-031 → D3-060) ([#1952](https://github.com/alphaonedev/ai-memory-mcp/issues/1952)). No behaviour change; the anti-theater refusal rules are unchanged.
+
 ### Changed
 
 - **Agent attestation default is now surface-scoped** ([#1985](https://github.com/alphaonedev/ai-memory-mcp/issues/1985), resolving [#1981](https://github.com/alphaonedev/ai-memory-mcp/issues/1981)).
