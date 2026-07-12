@@ -43,6 +43,35 @@ use crate::db;
 use crate::models::{Memory, Tier};
 use crate::reranker::{BatchedReranker, CrossEncoder};
 
+/// #1961 (R23/R7) — fixed per-write Ed25519 SIGN cost headroom (ms) the
+/// verified write path adds on top of the plain `memory_store` budget. The
+/// signature is over the six-field `SignableWrite` envelope (bounded
+/// `sha256(content)`), so the crypto cost is corpus-scale-INVARIANT — it is
+/// a constant addend regardless of how many rows the table holds.
+pub const VERIFIED_SIGN_HEADROOM_MS: f64 = 10.0;
+
+/// #1961 (R23/R7) — fixed per-recall Ed25519 VERIFY cost headroom (ms) the
+/// verified recall path adds on top of the plain `memory_recall` budget: one
+/// `verify_write` per returned candidate (bounded by the recall `limit`), so
+/// again corpus-scale-invariant.
+pub const VERIFIED_VERIFY_HEADROOM_MS: f64 = 20.0;
+
+/// Agent id used by the verified-path bench operations for the process-
+/// lifetime signing keypair + the `SignableWrite.agent_id` field. One named
+/// site so the id is not scattered as a literal across the two runners.
+const BENCH_VERIFIED_AGENT_ID: &str = "bench-verified";
+
+/// The fixed warm-up recall query the recall-family runners issue before the
+/// timed loop (matches the `topic-N / category-M` corpus vocabulary).
+const BENCH_WARMUP_QUERY: &str = "topic 0 category 0";
+
+/// Build the per-iteration recall query for the recall-family runners. Named
+/// helper so the `topic/category` query template lives at one site.
+fn bench_topic_query(i: usize) -> String {
+    let (topic, category) = (i % 50, i % 10);
+    format!("topic {topic} category {category}")
+}
+
 /// CI guard tolerance — measured p95 may exceed budget by this factor
 /// before the run is marked `Fail`. Mirrors `PERFORMANCE.md`.
 pub const P95_TOLERANCE: f64 = 1.10;
@@ -203,6 +232,17 @@ pub enum Operation {
     KgQueryDepth5,
     /// `memory_kg_timeline` — ordered timeline for a single source.
     KgTimeline,
+    /// #1961 (R23/R7) — the VERIFIED/attested write path: mint the six-field
+    /// `SignableWrite` envelope, Ed25519-`sign_write` it, then persist.
+    /// Exercises the attestation crypto cost the plain `StoreNoEmbedding` op
+    /// omits (the #1961 gap: today's bench has no verify in the path). Only
+    /// present when the bench is run with `--verified`.
+    VerifiedStore,
+    /// #1961 (R23/R7) — the VERIFIED/attested recall path: keyword recall
+    /// followed by an Ed25519 `verify_write` over each returned candidate's
+    /// signed envelope (the attested-read cost). Only present with
+    /// `--verified`.
+    VerifiedRecall,
 }
 
 impl Operation {
@@ -217,6 +257,8 @@ impl Operation {
             Self::KgQueryDepth3 => "memory_kg_query (depth=3)",
             Self::KgQueryDepth5 => "memory_kg_query (depth=5)",
             Self::KgTimeline => crate::mcp::registry::tool_names::MEMORY_KG_TIMELINE,
+            Self::VerifiedStore => "memory_store (verified/attested)",
+            Self::VerifiedRecall => "memory_recall (verified/attested)",
         }
     }
 
@@ -244,6 +286,11 @@ impl Operation {
             Self::KgQueryDepth3 => 100.0,
             Self::KgQueryDepth5 => 250.0,
             Self::KgTimeline => 100.0,
+            // #1961 — verified path = plain budget + fixed crypto headroom.
+            Self::VerifiedStore => {
+                Self::StoreNoEmbedding.target_p95_ms() + VERIFIED_SIGN_HEADROOM_MS
+            }
+            Self::VerifiedRecall => Self::RecallHot.target_p95_ms() + VERIFIED_VERIFY_HEADROOM_MS,
         }
     }
 
@@ -276,6 +323,11 @@ impl Operation {
             Self::SearchFts => budgets.search_fts_ms,
             Self::RecallHot => budgets.recall_hot_ms,
             Self::RecallRerankHot => budgets.recall_rerank_hot_ms,
+            // #1961 — the verified path carries the SAME corpus sensitivity as
+            // its plain sibling (the store/recall portion scales with the
+            // corpus) PLUS the scale-INVARIANT crypto headroom.
+            Self::VerifiedStore => budgets.store_no_embedding_ms + VERIFIED_SIGN_HEADROOM_MS,
+            Self::VerifiedRecall => budgets.recall_hot_ms + VERIFIED_VERIFY_HEADROOM_MS,
             Self::KgQueryDepth1 | Self::KgQueryDepth3 | Self::KgQueryDepth5 | Self::KgTimeline => {
                 self.target_p95_ms()
             }
@@ -322,6 +374,12 @@ pub struct BenchConfig {
     /// into the bench namespace before the operations run and gates
     /// the verdict against the [`SCALE_BUDGETS`] table instead.
     pub scale: Option<usize>,
+    /// #1961 (R23/R7) — when `true`, additionally run the VERIFIED/attested
+    /// write+recall path operations ([`Operation::VerifiedStore`] +
+    /// [`Operation::VerifiedRecall`]) so the p95 gate covers the attestation
+    /// crypto cost the plain hot-path ops omit. `false` (default) keeps the
+    /// legacy 8-operation result set byte-for-byte.
+    pub verified: bool,
 }
 
 impl Default for BenchConfig {
@@ -331,6 +389,7 @@ impl Default for BenchConfig {
             warmup: DEFAULT_WARMUP,
             namespace: BENCH_NAMESPACE.to_string(),
             scale: None,
+            verified: false,
         }
     }
 }
@@ -368,7 +427,7 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
     let kg_query_d5 =
         run_kg_query_chain(conn, config, &kg_chain_sources, Operation::KgQueryDepth5, 5)?;
     let kg_timeline = run_kg_timeline(conn, config, &kg_sources)?;
-    Ok(vec![
+    let mut results = vec![
         store,
         search,
         recall,
@@ -377,7 +436,142 @@ pub fn run(conn: &Connection, config: &BenchConfig) -> Result<Vec<OperationResul
         kg_query_d3,
         kg_query_d5,
         kg_timeline,
-    ])
+    ];
+    // #1961 (R23/R7) — the VERIFIED/attested path is opt-in (`--verified`)
+    // so the default 8-operation result set stays byte-for-byte. When on,
+    // the two crypto-bearing operations are appended AFTER the legacy set.
+    if config.verified {
+        results.push(run_verified_store(conn, config)?);
+        results.push(run_verified_recall(conn, config)?);
+    }
+    Ok(results)
+}
+
+/// #1961 (R23/R7) — the VERIFIED/attested WRITE path.
+///
+/// Each iteration mints the six-field `SignableWrite` envelope for a synthetic
+/// memory (`agent_id + namespace + title + kind + created_at + sha256(content)`),
+/// Ed25519-signs it with a process-lifetime keypair via `sign_write` (the same
+/// crypto the `#626` per-write content-attestation lane runs), then persists the
+/// row. The timed path is `sign_write` + `db::insert`, so the p95 gate finally
+/// covers the attestation cost the plain [`run_store_no_embedding`] omits.
+fn run_verified_store(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
+    use sha2::{Digest, Sha256};
+    // One process-lifetime signing keypair, mirroring the daemon's outbound
+    // link-signing handle (built once, reused across writes).
+    let keypair = crate::identity::keypair::generate(BENCH_VERIFIED_AGENT_ID)
+        .context("verified bench: generate signing keypair")?;
+    let total = config.warmup + config.iterations;
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..total {
+        let mem = synth_memory(&config.namespace, i, "verified-store");
+        let start = Instant::now();
+        // Timed path = the attestation envelope + Ed25519 sign + the persist.
+        let content_sha: [u8; 32] = Sha256::digest(mem.content.as_bytes()).into();
+        let write = crate::identity::sign::SignableWrite {
+            agent_id: BENCH_VERIFIED_AGENT_ID,
+            namespace: &mem.namespace,
+            title: &mem.title,
+            kind: mem.memory_kind.as_str(),
+            created_at: &mem.created_at,
+            content_sha256: &content_sha,
+        };
+        let _sig =
+            crate::identity::sign::sign_write(&keypair, &write).context("verified bench: sign")?;
+        db::insert(conn, &mem)?;
+        let elapsed = start.elapsed();
+        if i >= config.warmup {
+            samples.push(elapsed);
+        }
+    }
+    Ok(percentile_summary(
+        Operation::VerifiedStore,
+        &samples,
+        config.scale,
+    ))
+}
+
+/// #1961 (R23/R7) — the VERIFIED/attested RECALL path.
+///
+/// Keyword recall followed by an Ed25519 `verify_write` over the signed
+/// envelope of each returned candidate — the attested-read cost a plain
+/// [`run_recall_hot`] never pays. A process-lifetime keypair pre-signs the
+/// probe envelope so every iteration exercises a REAL signature verification
+/// (`verify_write`), not a stubbed one; the target is the VERIFY STAGE COST
+/// being visible to the p95 gate.
+fn run_verified_recall(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
+    use sha2::{Digest, Sha256};
+    seed_corpus(conn, &config.namespace, "verified-recall", 200)?;
+    let keypair = crate::identity::keypair::generate(BENCH_VERIFIED_AGENT_ID)
+        .context("verified bench: generate signing keypair")?;
+    // Pre-mint one signed envelope; each recalled candidate is verified
+    // against it (a real Ed25519 `verify_strict`), so the timed stage is a
+    // genuine per-candidate signature check.
+    let probe_content_sha: [u8; 32] = Sha256::digest(b"verified recall probe").into();
+    let now = chrono::Utc::now().to_rfc3339();
+    let probe = crate::identity::sign::SignableWrite {
+        agent_id: BENCH_VERIFIED_AGENT_ID,
+        namespace: &config.namespace,
+        title: "verified-recall-probe",
+        kind: "observation",
+        created_at: &now,
+        content_sha256: &probe_content_sha,
+    };
+    let sig = crate::identity::sign::sign_write(&keypair, &probe)
+        .context("verified bench: sign probe")?;
+    let warmup_query = BENCH_WARMUP_QUERY;
+    for _ in 0..config.warmup {
+        let (results, _) = db::recall(
+            conn,
+            warmup_query,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )?;
+        for _ in &results {
+            let _ = crate::identity::verify::verify_write(&keypair.public, &probe, &sig);
+        }
+    }
+    let mut samples = Vec::with_capacity(config.iterations);
+    for i in 0..config.iterations {
+        let query = bench_topic_query(i);
+        let start = Instant::now();
+        let (results, _) = db::recall(
+            conn,
+            &query,
+            Some(&config.namespace),
+            10,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )?;
+        // Timed path = recall + the per-candidate VERIFY stage.
+        for _ in &results {
+            let _ = crate::identity::verify::verify_write(&keypair.public, &probe, &sig);
+        }
+        samples.push(start.elapsed());
+    }
+    Ok(percentile_summary(
+        Operation::VerifiedRecall,
+        &samples,
+        config.scale,
+    ))
 }
 
 fn run_store_no_embedding(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
@@ -435,7 +629,7 @@ fn run_search_fts(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
 
 fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationResult> {
     seed_corpus(conn, &config.namespace, "recall", 200)?;
-    let warmup_query = "topic 0 category 0";
+    let warmup_query = BENCH_WARMUP_QUERY;
     for _ in 0..config.warmup {
         let _ = db::recall(
             conn,
@@ -456,7 +650,7 @@ fn run_recall_hot(conn: &Connection, config: &BenchConfig) -> Result<OperationRe
     }
     let mut samples = Vec::with_capacity(config.iterations);
     for i in 0..config.iterations {
-        let query = format!("topic {} category {}", i % 50, i % 10);
+        let query = bench_topic_query(i);
         let start = Instant::now();
         let _ = db::recall(
             conn,
@@ -504,7 +698,7 @@ fn run_recall_rerank_hot(conn: &Connection, config: &BenchConfig) -> Result<Oper
     // round-trip) — the same code the autonomous tier runs when its
     // neural model is unavailable / degraded.
     let reranker = BatchedReranker::new(CrossEncoder::new());
-    let warmup_query = "topic 0 category 0";
+    let warmup_query = BENCH_WARMUP_QUERY;
     for _ in 0..config.warmup {
         let (results, _) = db::recall(
             conn,
@@ -526,7 +720,7 @@ fn run_recall_rerank_hot(conn: &Connection, config: &BenchConfig) -> Result<Oper
     }
     let mut samples = Vec::with_capacity(config.iterations);
     for i in 0..config.iterations {
-        let query = format!("topic {} category {}", i % 50, i % 10);
+        let query = bench_topic_query(i);
         let start = Instant::now();
         // Timed path = recall + the handler-layer rerank STAGE.
         let (results, _) = db::recall(
@@ -1024,6 +1218,7 @@ mod tests {
             warmup: 5,
             namespace: "bench-test".to_string(),
             scale: None,
+            verified: false,
         }
     }
 
@@ -1232,6 +1427,7 @@ mod tests {
             warmup: 2,
             namespace: ns.to_string(),
             scale: Some(300),
+            verified: false,
         };
         let results = run(&conn, &config).unwrap();
         assert_eq!(results.len(), 8);
@@ -1435,6 +1631,73 @@ mod tests {
         assert!((loaded[0].measured_p95_ms - 9.0).abs() < 1e-9);
         assert_eq!(loaded[1].operation, Operation::SearchFts);
         assert!((loaded[1].measured_p95_ms - 31.0).abs() < 1e-9);
+    }
+
+    /// #1961 (R23/R7) — `--verified` appends the two attested-path ops so
+    /// the default 8-op set becomes 10, and the verified ops actually sign +
+    /// verify (they report well-formed, in-budget results on the default
+    /// workload).
+    #[test]
+    fn verified_run_appends_attested_path_ops() {
+        let conn = fresh_conn();
+        let config = BenchConfig {
+            iterations: 20,
+            warmup: 3,
+            namespace: "bench-verified-test".to_string(),
+            scale: None,
+            verified: true,
+        };
+        let results = run(&conn, &config).unwrap();
+        assert_eq!(results.len(), 10, "verified run appends 2 ops (8 -> 10)");
+        assert_eq!(results[8].operation, Operation::VerifiedStore);
+        assert_eq!(results[9].operation, Operation::VerifiedRecall);
+        for r in &results[8..] {
+            assert!(r.samples > 0);
+            assert!(r.measured_p50_ms <= r.measured_p95_ms);
+            assert!(r.target_p95_ms > 0.0);
+        }
+        // Verified budgets = plain budget + fixed crypto headroom.
+        assert!(
+            (results[8].target_p95_ms - (20.0 + VERIFIED_SIGN_HEADROOM_MS)).abs() < 1e-9,
+            "verified-store budget = store (20) + sign headroom"
+        );
+        assert!(
+            (results[9].target_p95_ms - (50.0 + VERIFIED_VERIFY_HEADROOM_MS)).abs() < 1e-9,
+            "verified-recall budget = recall (50) + verify headroom"
+        );
+    }
+
+    /// #1961 — the default (non-verified) run stays byte-for-byte 8 ops so
+    /// the attested path is strictly opt-in.
+    #[test]
+    fn default_run_omits_verified_ops() {
+        let conn = fresh_conn();
+        let results = run(&conn, &small_config()).unwrap();
+        assert_eq!(results.len(), 8);
+        assert!(!results.iter().any(|r| matches!(
+            r.operation,
+            Operation::VerifiedStore | Operation::VerifiedRecall
+        )));
+    }
+
+    /// #1961 — verified scale budgets carry the corpus-sensitive store/recall
+    /// portion PLUS the scale-invariant crypto headroom.
+    #[test]
+    fn verified_scale_budgets_add_crypto_headroom() {
+        let at_gate = Some(CI_SCALE_GATE_ROWS);
+        // store 120 + sign headroom; recall 80 + verify headroom.
+        assert!(
+            (Operation::VerifiedStore.target_p95_ms_at_scale(at_gate)
+                - (120.0 + VERIFIED_SIGN_HEADROOM_MS))
+                .abs()
+                < 1e-9
+        );
+        assert!(
+            (Operation::VerifiedRecall.target_p95_ms_at_scale(at_gate)
+                - (80.0 + VERIFIED_VERIFY_HEADROOM_MS))
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]

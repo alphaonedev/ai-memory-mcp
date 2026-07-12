@@ -79,12 +79,54 @@ fn db_mmap_size() -> i64 {
         .unwrap_or(&DEFAULT_DB_MMAP_SIZE_BYTES)
 }
 
+/// v1.0.0 #1961 (R23/R7) — env knob selecting the `PRAGMA synchronous`
+/// durability level applied by every [`open`].
+///
+/// The compiled default is `NORMAL` (the #1579 B7 performance posture):
+/// under WAL, `NORMAL` fsyncs at each checkpoint but NOT at every commit,
+/// so a **power loss** (not merely a process crash) can lose the tail of
+/// acknowledged commits that were in the WAL but not yet checkpoint-fsync'd.
+/// A power-loss-durable deployment sets `AI_MEMORY_DB_SYNCHRONOUS=FULL`
+/// (or the harder `EXTRA`), which fsyncs the WAL at every commit so an
+/// acknowledged write survives a power cut — at a throughput cost. The
+/// `asi-hard` hardened profile ([`crate::security_profile`]) pins `FULL`.
+pub const ENV_DB_SYNCHRONOUS: &str = "AI_MEMORY_DB_SYNCHRONOUS";
+
+/// The compiled-default `PRAGMA synchronous` level. `NORMAL` keeps the
+/// #1579 B7 performance posture byte-for-byte for deployments that do not
+/// opt into power-loss durability.
+pub const DEFAULT_DB_SYNCHRONOUS: &str = "NORMAL";
+
+/// Resolve the effective `PRAGMA synchronous` token for this process.
+///
+/// Ladder: [`ENV_DB_SYNCHRONOUS`] env (case-insensitive; one of
+/// `OFF` / `NORMAL` / `FULL` / `EXTRA`) > compiled
+/// [`DEFAULT_DB_SYNCHRONOUS`]. An unset or unrecognised value falls
+/// through to the default so a typo never silently weakens durability
+/// below the compiled floor.
+#[must_use]
+pub fn db_synchronous() -> &'static str {
+    match std::env::var(ENV_DB_SYNCHRONOUS) {
+        Ok(v) => match v.trim().to_ascii_uppercase().as_str() {
+            "OFF" => "OFF",
+            "FULL" => "FULL",
+            "EXTRA" => "EXTRA",
+            "NORMAL" => "NORMAL",
+            _ => DEFAULT_DB_SYNCHRONOUS,
+        },
+        Err(_) => DEFAULT_DB_SYNCHRONOUS,
+    }
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path).context("failed to open database")?;
     apply_sqlcipher_key(&conn)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // v1.0.0 #1961 (R23/R7) — resolved `PRAGMA synchronous`. Default
+    // `NORMAL` (perf posture); `AI_MEMORY_DB_SYNCHRONOUS=FULL` upgrades to
+    // power-loss durability. The `asi-hard` profile pins `FULL`.
+    conn.pragma_update(None, "synchronous", db_synchronous())?;
     // #1579 B7 — memory-mapped I/O. See DEFAULT_DB_MMAP_SIZE_BYTES for
     // the P1 A/B evidence + override ladder.
     conn.pragma_update(None, "mmap_size", db_mmap_size())?;
@@ -352,6 +394,31 @@ mod tests {
             mmap, DEFAULT_DB_MMAP_SIZE_BYTES,
             "open() must apply the P1-proven 256 MiB mmap_size default"
         );
+    }
+
+    #[test]
+    fn db_synchronous_defaults_to_normal_when_unset() {
+        // v1.0.0 #1961 — with no `AI_MEMORY_DB_SYNCHRONOUS` override the
+        // compiled default is `NORMAL` (the #1579 B7 perf posture). The
+        // test binary never sets the var, so this exercises the
+        // fall-through arm; the FULL/EXTRA arms are exercised end-to-end
+        // by the power-loss integration harness (which sets the env in a
+        // dedicated child process, avoiding an in-process env race).
+        assert_eq!(db_synchronous(), DEFAULT_DB_SYNCHRONOUS);
+        assert_eq!(DEFAULT_DB_SYNCHRONOUS, "NORMAL");
+    }
+
+    #[test]
+    fn open_applies_resolved_synchronous_pragma() {
+        // `open` must apply the resolved `PRAGMA synchronous`. Unseeded /
+        // no-env → NORMAL (which SQLite reports as the integer 1).
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = open(tmp.path()).expect("open");
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .expect("synchronous");
+        // 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+        assert_eq!(sync, 1, "default open() must apply synchronous=NORMAL");
     }
 
     #[test]

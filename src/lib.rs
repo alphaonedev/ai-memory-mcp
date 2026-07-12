@@ -692,6 +692,8 @@ pub mod replication;
 pub mod reranker;
 pub mod revisions;
 pub mod secret_screen;
+// v1.0.0 #1961 (R23/R7) — the `asi-hard` hardened, no-disable security posture.
+pub mod security_profile;
 pub mod sequencer;
 // v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
 // substrate state (HMAC override, decompression cap, audit chain,

@@ -463,6 +463,8 @@ pub use connection::open_read_only;
 // compiled fallback the `AppConfig::resolve_storage()` ladder bottoms
 // out on (also consumed by the config-precedence tests).
 pub use connection::{DEFAULT_DB_MMAP_SIZE_BYTES, set_db_mmap_size};
+// v1.0.0 #1961 (R23/R7) — power-loss durability knob (`PRAGMA synchronous`).
+pub use connection::{DEFAULT_DB_SYNCHRONOUS, ENV_DB_SYNCHRONOUS, db_synchronous};
 // v0.7.0 refactor PR-1 (#793) — schema-pins SSOT. Re-export the
 // test-facing helper so callers can use either
 // `ai_memory::storage::current_schema_version_for_tests()` or the

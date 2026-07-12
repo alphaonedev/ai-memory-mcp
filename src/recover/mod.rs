@@ -24,6 +24,8 @@
 //! for the full design + acceptance criteria; see CLAUDE.md
 //! §"Auto-capture" for operator-facing documentation.
 
+// v1.0.0 #1961 (R23/R7) — power-loss durability self-test + fault injection.
+pub mod durability;
 pub mod nag;
 pub mod parsers;
 pub mod transcript_paths;
