@@ -555,6 +555,61 @@ denormalised into the queryable column at the persist funnel (the
 `mentioned_entity_id` precedent). The untyped→`Observation` default flip is
 **deliberately NOT** part of this change — it is phased to v0.10.0 (#1972).
 
+## Equivocation proofs + peer-head entanglement (v1.0.0 §5.2, #1947)
+
+A federated peer that signs **two different heads** for the same point in
+its own history has *equivocated* — told two nodes two incompatible stories.
+v1.0.0 freezes the two byte shapes that make such a contradiction into a
+**self-contained, offline-verifiable proof** any third peer can check with
+ZERO shared state (no DB, no network). This lane ships the **format + the
+offline verifier only**; the transport that carries proofs between peers
+(#1936) and the automatic-eviction runtime (FED-RQ-02/03) are separate,
+later carriers.
+
+- **`SignableHeadAttestation`** (`"ai-memory/peer-head-attestation-v1"`) — a
+  subject-signed claim committing `{subject_agent_id, epoch, head_sequence,
+  head_hash, signed_at}` as a domain-tagged CBOR array (the domain tag is
+  **inside** the signed pre-image). `epoch` is drawn from the subject's
+  **signed** v76 lineage succession — never self-declared, so an accuser
+  cannot forge it — and `head_sequence`/`head_hash` come from the subject's
+  own `signed_events` V-4 `prev_hash` chain.
+- **`EquivocationProof`** (`"ai-memory/equivocation-proof/v1"`) — carries the
+  subject's 32-byte Ed25519 pubkey plus **both** conflicting signed
+  attestations. A third peer verifies both signatures under the embedded
+  pubkey, then asserts the **divergence key**
+  `(subject_id, epoch, head_sequence)` is identical while `head_hash`
+  **differs**. Same-hash, cross-epoch, cross-sequence, or bad-signature pairs
+  are typed rejects — **not** an accusation.
+
+### Honest scope — LIVENESS, not SAFETY
+
+Detection is a **LIVENESS** property, not a safety one. A permanently
+partitioned Byzantine node that never lets one verifier see both of its
+stories stays invisible until the views heal — the inherent equivocation
+lower bound. What **does** hold unconditionally is **SAFETY**: a well-formed
+proof is a genuine two-signature contradiction, so the verifier never
+falsely accuses and never accepts a fork as linear once it has observed one.
+
+When a verifier's own lineage view **cannot confirm** the proof's epoch (a
+stale or re-keyed view — e.g. the subject legitimately performed a genesis
+re-key the verifier has not yet observed), the offline verifier returns
+**INDETERMINATE**, never an accusation and never an all-clear. This is
+*correct-failing*: withholding judgement is the safe disposition. The verify
+API therefore exposes a variant taking an optional **lineage-epoch
+resolver**; the base `verify()` trusts the subject-signed epoch, while a
+node with a real lineage view uses `verify_with_lineage(..)` to gate on it.
+
+### Eviction consults lineage (deferred runtime)
+
+The automatic-eviction actuator — deferred to FED-RQ-02/03 — consults the
+**v76 lineage chain**, not the raw pubkey, so a stale proof minted against a
+key the subject has since rotated away from (via a legitimate signed
+succession) cannot self-evict the subject. The entanglement bookkeeping is a
+free-text `ConditionType::PeerHeadEntanglement` resolved-checkpoint (no
+schema migration — the SAL enforces the closed condition set), and its rows
+live under the write-reserved `_peer_head_entanglement` namespace (a normal
+caller memory write to that namespace is refused at the validate layer).
+
 ---
 
 *See also: [Agent identity](agent-identity.html) · [Governance](governance.html) · [Encryption](encryption.html) · [v0.9.0 release notes](v0.9.0/release-notes.html)*
