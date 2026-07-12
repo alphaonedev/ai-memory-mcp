@@ -369,7 +369,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // mandatory-hook-presence enforcement gate (PreEventEnforceGate + install +
     // consult_pre_event_gate + test installer) + consult wiring in the
     // eligible pre-event dispatchers landed the file at 15_482; +48 headroom.
-    ("src/mcp/mod.rs", 15_530),
+    ("src/mcp/mod.rs", 15_650), /* 2026-07-12 #1963 inference-egress gate at 2 MCP init sites (15_541) */
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —
@@ -1011,7 +1011,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + `url_has_userinfo_password` + their #1927 adversarial tests), the #1926
     // log-redaction fix, and the #1924 HTTP pre-event enforcement-gate install
     // in `serve` landed the file at 9_854; +96 headroom.
-    ("src/daemon_runtime.rs", 9_950),
+    ("src/daemon_runtime.rs", 10_100), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

@@ -6221,10 +6221,22 @@ mod tests {
     /// Proof the exploit is closed: a non-argv channel now resolves the URL, so
     /// the operator can keep the credential OUT of argv entirely. Fail-before
     /// (no channel) vs pass-after (env/file channel).
+    /// Shared lock for every test that reads or mutates the process-global
+    /// `AI_MEMORY_STORE_URL` / `_FILE` env channel (#1927). A per-test local
+    /// mutex does NOT serialise against a sibling test using its own mutex, so
+    /// all store-url-env tests must take THIS one (fixed a real cross-test
+    /// pollution race that failed `fx_f2_build_store_handle_no_url` under
+    /// parallel ordering).
+    fn store_url_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        &LOCK
+    }
+
     #[test]
     fn issue_1927_non_argv_store_url_channel_exists() {
-        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Clean slate.
         // SAFETY: env mutation is serialized by ENV_GUARD; these keys are read
         // only by `resolve_store_url`, which no other test drives concurrently.
@@ -9772,6 +9784,18 @@ decision = "allow"
     #[cfg(feature = "sal")]
     #[tokio::test]
     async fn fx_f2_build_store_handle_no_url_falls_through_to_db_path() {
+        // "Absent --store-url" means no arg AND no env channel. Take the
+        // shared store-url env lock and clear the #1927 env vars so a
+        // concurrent sibling test can't leak a postgres:// URL into this
+        // fallthrough assertion (the pollution race this pins closed).
+        let _g = store_url_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: env mutation serialised by store_url_env_lock.
+        unsafe {
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(STORE_URL_FILE_ENV);
+        }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("fallthrough.db");
         let (backend, _store) =
