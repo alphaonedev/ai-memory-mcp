@@ -746,6 +746,11 @@ pub struct PostgresStore {
     /// back to the recursive-CTE path when AGE is absent. See
     /// [`Self::kg_backend`].
     kg_backend: KgBackend,
+    /// #1955 [P1][R45] — in-process record-stop cache for this store.
+    /// Seeded from the `signed_events` chain at connect time (so a
+    /// persisted stop survives restart) and flipped by
+    /// [`Self::record_stop`]. The funnel gate is a single atomic load.
+    record_stop: crate::store::record_stop::RecordStopFlag,
 }
 
 /// #1628 — wire-pinned refusal text for legacy rows with no
@@ -1124,8 +1129,15 @@ impl PostgresStore {
             // We hold the bootstrap advisory lock at the outer scope, so
             // call the lock-free body `migrate_locked()` here to avoid a
             // second acquire-from-different-session that would deadlock.
-            let store = Self { pool, kg_backend };
+            let store = Self {
+                pool,
+                kg_backend,
+                record_stop: crate::store::record_stop::RecordStopFlag::default(),
+            };
             store.migrate_locked().await?;
+            // #1955 R45 — derive the persisted record-stop state from the
+            // audit chain so a stop set before this connect is honored.
+            store.seed_record_stop().await;
 
             Ok(store)
         }
@@ -12438,8 +12450,108 @@ async fn record_memory_quota_batch_in_tx(
     Ok(())
 }
 
+impl PostgresStore {
+    /// #1955 R45 — SAL write-funnel gate (one atomic load).
+    fn gate_record_stop(&self) -> StoreResult<()> {
+        self.record_stop.gate()
+    }
+
+    /// #1955 R45 — derive the record-stop state from the pg
+    /// `signed_events` chain and apply it to the cache. Best-effort — a
+    /// read error leaves the plane RUNNING (never wedges connect).
+    async fn seed_record_stop(&self) {
+        match self.pg_read_record_stop_state().await {
+            Ok(Some(issued_by)) => self
+                .record_stop
+                .engage(&issued_by, crate::store::record_stop::SCOPE_RECORD_PLANE),
+            Ok(None) => self.record_stop.release(),
+            Err(e) => tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                "record-stop seed read failed: {e}"
+            ),
+        }
+    }
+
+    /// Latest stop/resume event from the chain → `Some(issued_by)` when
+    /// the record plane is currently stopped, else `None`.
+    async fn pg_read_record_stop_state(&self) -> Result<Option<String>, sqlx::Error> {
+        use crate::signed_events::event_types::{SUBSTRATE_RECORD_RESUME, SUBSTRATE_RECORD_STOP};
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT event_type, agent_id FROM signed_events \
+             WHERE event_type IN ($1, $2) \
+             ORDER BY COALESCE(sequence, 0) DESC, ctid DESC LIMIT 1",
+        )
+        .bind(SUBSTRATE_RECORD_STOP)
+        .bind(SUBSTRATE_RECORD_RESUME)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some((et, issued_by)) if et == SUBSTRATE_RECORD_STOP => Some(issued_by),
+            _ => None,
+        })
+    }
+
+    /// #1955 R45 — persist + apply a record-stop actuation on postgres:
+    /// append the signed attestation to the chain, then flip the cache.
+    /// Returns `true` when the state changed.
+    async fn pg_actuate_record_stop(
+        &self,
+        engage: bool,
+        issued_by: &str,
+        scope: &str,
+    ) -> StoreResult<bool> {
+        if self.record_stop.is_stopped() == engage {
+            return Ok(false); // already in the desired state — no duplicate event
+        }
+        let (event, now) = crate::store::record_stop::build_attestation(engage, issued_by, scope);
+        let insert_row = PgSignedEventInsert {
+            id: event.id.as_str(),
+            agent_id: event.agent_id.as_str(),
+            event_type: event.event_type.as_str(),
+            payload_hash: event.payload_hash.as_slice(),
+            signature: event.signature.as_deref(),
+            attest_level: event.attest_level.as_str(),
+            timestamp: now,
+            // v73 (#1822) audit cause-binding — the actuation event has
+            // no distinct triggering cause; it stands on its own payload.
+            cause_hash: None,
+        };
+        pg_append_signed_event_with_chain(&self.pool, insert_row)
+            .await
+            .map_err(|e| StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                detail: e.to_string(),
+            })?;
+        if engage {
+            self.record_stop.engage(issued_by, scope);
+        } else {
+            self.record_stop.release();
+        }
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl MemoryStore for PostgresStore {
+    /// #1955 R45 — engage/release the record-stop on postgres.
+    async fn record_stop(
+        &self,
+        _ctx: &CallerContext,
+        engage: bool,
+        issued_by: &str,
+        scope: &str,
+    ) -> StoreResult<bool> {
+        self.pg_actuate_record_stop(engage, issued_by, scope).await
+    }
+
+    /// #1955 R45 — current record-stop status on postgres.
+    async fn record_stop_status(
+        &self,
+        _ctx: &CallerContext,
+    ) -> StoreResult<crate::store::record_stop::RecordStopStatus> {
+        Ok(self.record_stop.status())
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities::TRANSACTIONS
             | Capabilities::NATIVE_VECTOR
@@ -12472,6 +12584,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        self.gate_record_stop()?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity with the sqlite db::insert funnel). No-op unless screening
         // was seeded non-`off` and content carries credential material.
@@ -12792,6 +12905,7 @@ impl MemoryStore for PostgresStore {
         ctx: &CallerContext,
         memories: &[Memory],
     ) -> StoreResult<Vec<String>> {
+        self.gate_record_stop()?;
         if memories.is_empty() {
             return Ok(Vec::new());
         }
@@ -13114,6 +13228,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
+        self.gate_record_stop()?;
         // Step 1 — dedup fast-path (no transaction needed for the read).
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT memory_id FROM transcript_line_dedup \
@@ -13573,6 +13688,7 @@ impl MemoryStore for PostgresStore {
         memory: &Memory,
         embedding: Option<&[f32]>,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity); masks before the embedding + bind. No-op unless seeded.
         let screened = screen_storage_memory(memory);
@@ -13901,6 +14017,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn update(&self, ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
+        self.gate_record_stop()?;
         // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
         // gate. Pre-fix `PostgresStore::update` discarded `_ctx` and
         // let any authenticated HTTP/MCP caller rewrite any tenant's
@@ -14172,6 +14289,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn delete(&self, ctx: &CallerContext, id: &str) -> StoreResult<()> {
+        self.gate_record_stop()?;
         // v0.7.0 #1412 (CRITICAL, 2026-05-30) — SAL-side caller-owns
         // gate. Sister fix to `PostgresStore::update` above; same
         // threat model (cross-tenant write hijack on postgres-backed
@@ -14589,6 +14707,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn link(&self, _ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
+        self.gate_record_stop()?;
         // F6 Gap 3 (v0.7.0) — unsigned link write. The trait method
         // does not surface a keypair so we always land the row with
         // `attest_level = "unsigned"`. Callers that want signing route
@@ -14602,6 +14721,7 @@ impl MemoryStore for PostgresStore {
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        self.gate_record_stop()?;
         self.link_internal(link, keypair).await
     }
 
@@ -14833,6 +14953,7 @@ impl MemoryStore for PostgresStore {
         _ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         // ARCH-1 (CRITICAL) — substrate governance pre-write parity.
         // Federation-pushed memories must clear the same pre-write
         // hook as locally-authored writes; otherwise a peer could push
@@ -15115,6 +15236,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn merge_inbound(&self, ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        self.gate_record_stop()?;
         // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard (postgres parity
         // with the sqlite insert_if_newer gate). DROP an inbound write for a
         // tombstoned id (tombstone-wins) so a peer cannot revive a forgotten
@@ -15301,6 +15423,7 @@ impl MemoryStore for PostgresStore {
         link: &MemoryLink,
         attest_level: &str,
     ) -> StoreResult<()> {
+        self.gate_record_stop()?;
         // Mirrors sqlite db::create_link_inbound. The unique
         // (source_id, target_id, relation) index makes duplicate
         // pushes a no-op (ON CONFLICT DO NOTHING), so retries and
@@ -15385,6 +15508,7 @@ impl MemoryStore for PostgresStore {
     }
 
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact TOMBSTONE
         // (origin=remote). This is the headline data-loss fix: the legacy
         // path hard-deletes the row pool-direct (no tx, no audit trail).
@@ -16889,6 +17013,7 @@ impl MemoryStore for PostgresStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         if ids.is_empty() {
             return Err(StoreError::InvalidInput {
                 detail: "consolidate requires at least one source id".to_string(),
@@ -17616,6 +17741,7 @@ impl MemoryStore for PostgresStore {
         claim_unowned: bool,
         dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
+        self.gate_record_stop()?;
         // v0.8.0 #1709/#1720 WS-B B2 — postgres twin of
         // `crate::storage::reown`. `metadata` is JSONB; `jsonb_set` on
         // the single `{agent_id}` path preserves every other key, and
@@ -20733,6 +20859,7 @@ impl MemoryStore for PostgresStore {
         id: &str,
         new_kind: crate::models::MemoryKind,
     ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         let new_kind_str = new_kind.as_str();
         let mut tx = self
             .pool

@@ -709,6 +709,11 @@ pub fn store_err_to_response(e: crate::store::StoreError) -> Response {
                 "storage backend unavailable".to_string(),
             )
         }
+        // #1955 R45 — the record plane is stopped: mutating writes refuse
+        // with 503 (the substrate is deliberately in a stopped state);
+        // reads are unaffected. The message is caller-safe (no adapter
+        // internals) so no sanitisation is needed.
+        StoreError::Stopped { .. } => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
         _ => {
             tracing::error!("store backend error: {e}");
             (

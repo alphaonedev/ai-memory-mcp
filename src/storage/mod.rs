@@ -750,6 +750,9 @@ pub(crate) fn extract_kind_provenance(mem: &Memory) -> Option<&'static str> {
 /// and the `SELECT` would return the wrong row id. `SQLite` 3.35+
 /// supports `RETURNING`; it executes atomically within the `INSERT`.
 pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
+    // #1955 R45 — record-stop fence: outermost of the write funnel, so a
+    // stopped record plane refuses even before governance evaluates.
+    crate::store::record_stop::gate_storage_conn(conn)?;
     // v0.7.0 L1-6 Deliverable E — substrate governance pre-write
     // gate. Consults the (optional) `GOVERNANCE_PRE_WRITE` hook
     // BEFORE any SQL touches the DB; a refusal returns cleanly with
@@ -1286,6 +1289,9 @@ pub fn recover_turn_idempotent(
 ///   `title (N)` slot is found within the safety cap (see
 ///   [`next_versioned_title`]).
 pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode) -> Result<String> {
+    // #1955 R45 — record-stop fence (covers the Error / Version branches
+    // that do not route through `insert`).
+    crate::store::record_stop::gate_storage_conn(conn)?;
     match mode {
         ConflictMode::Merge => insert(conn, mem),
         ConflictMode::Error => {
@@ -2055,6 +2061,8 @@ pub fn update_with_expected_version(
     source_uri: Option<&str>,
     expected_version: Option<i64>,
 ) -> Result<(bool, bool)> {
+    // #1955 R45 — record-stop fence for the update funnel.
+    crate::store::record_stop::gate_storage_conn(conn)?;
     let mut stmt = conn.prepare_cached(SQL_SELECT_MEMORY_ROW_BY_ID)?;
     let mut rows = stmt.query_map(params![id], row_to_memory)?;
     let Some(Ok(existing)) = rows.next() else {
@@ -2521,6 +2529,8 @@ pub fn update_with_archive_on_supersede(
 }
 
 pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
+    // #1955 R45 — record-stop fence for the delete funnel.
+    crate::store::record_stop::gate_storage_conn(conn)?;
     // Clean up namespace_meta if this memory was a namespace standard
     conn.execute(SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID, params![id])?;
     // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append ONE
@@ -5879,6 +5889,9 @@ pub fn create_link_signed(
     relation: &str,
     keypair: Option<&crate::identity::keypair::AgentKeypair>,
 ) -> Result<&'static str> {
+    // #1955 R45 — record-stop fence for the link funnel (every caller —
+    // MCP, HTTP, SAL, federation — reaches this one primitive).
+    crate::store::record_stop::gate_storage_conn(conn)?;
     // v0.7.0 fix-campaign A3 (LINK-PARITY, #690) — gates that were
     // previously enforced only at `src/mcp/tools/link.rs::handle_link`
     // now run here so EVERY caller (MCP, HTTP, SAL, federation) hits
@@ -6466,6 +6479,8 @@ pub fn consolidate(
     source: &str,
     consolidator_agent_id: &str,
 ) -> Result<String> {
+    // #1955 R45 — record-stop fence for the consolidate funnel.
+    crate::store::record_stop::gate_storage_conn(conn)?;
     let now = Utc::now().to_rfc3339();
     let new_id = uuid::Uuid::new_v4().to_string();
 
@@ -10956,6 +10971,12 @@ pub fn export_links(conn: &Connection) -> Result<Vec<MemoryLink>> {
 /// winners per peer, causing permanent mesh divergence. Adding the
 /// memory.id tiebreaker yields a total order every peer agrees on.
 pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
+    // #1955 R45 — record-stop fence on the federation-receive funnel.
+    // DISPOSITION: inbound federated writes ARE stopped — a relayed write
+    // is still a record-plane mutation, so record-stop pauses convergence
+    // on THIS substrate (the issue's "atomic write-fence"). The bytes are
+    // not lost; the peer retries / re-pushes after resume.
+    crate::store::record_stop::gate_storage_conn(conn)?;
     // v0.7.0 L1-6 Deliverable E — substrate governance pre-write
     // gate. Federation `sync_push` / catchup-loop peer pushes flow
     // through this entry point; treating them identically to direct

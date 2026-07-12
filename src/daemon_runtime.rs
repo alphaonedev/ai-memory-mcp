@@ -533,6 +533,19 @@ pub enum Command {
     /// tool — no schema change, no visibility-behaviour change, no
     /// MCP/HTTP surface (like `reembed`).
     Reown(crate::cli::reown::ReownArgs),
+    /// #1955 [P1][R45] — `ai-memory stop [--resume] [--status]`
+    /// substrate record-stop actuator. Freezes THIS substrate's own
+    /// mutating record plane (store/update/link/delete/promote/
+    /// consolidate + federation-receive convergence) — reads stay live so
+    /// the record remains auditable. Engaging/releasing emits ONE signed
+    /// `substrate.record_stop` / `substrate.record_resume` attestation to
+    /// the append-only chain, which IS the persisted flag (survives
+    /// restart). Vocabulary: record-stop, NOT kill-switch (§2.3) — it
+    /// stops the substrate's record plane, NOT any external cognition.
+    /// Routes through the backend-blind
+    /// [`crate::store::MemoryStore::record_stop`] so SQLite + Postgres
+    /// behave identically.
+    Stop(crate::cli::stop::StopArgs),
     /// v0.7.0 ARCH-3 / FX-12 — `ai-memory replay` subcommand.
     /// Reconstruct the conversation transcript chain that produced a
     /// memory. CLI parity for `memory_replay`.
@@ -1970,6 +1983,21 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
             // v0.8.0 #1709/#1720 WS-B B2 — namespace ownership re-stamp.
             match cli::reown::run(&db_path, &a, &mut out)? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Command::Stop(a) => {
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let mut so = stdout.lock();
+            let mut se = stderr.lock();
+            let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+            // #1955 R45 — substrate record-stop actuator. Builds the SAL
+            // store (--store-url postgres/sqlite, else the --db sqlite
+            // path) and routes through the backend-blind
+            // `MemoryStore::record_stop` / `record_stop_status`.
+            match cli::stop::cmd_stop(&db_path, &a, app_config, &mut out).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
