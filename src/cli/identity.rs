@@ -135,6 +135,73 @@ pub enum IdentityAction {
         #[arg(long, value_name = "PUBKEY_B64")]
         recovery_pubkey: String,
     },
+    /// v1.0.0 G17 (#1831) — phase 1 of the M-of-N recovery ceremony: mint
+    /// the prospective recovery record that hands the LOST head off to a
+    /// FRESH primary key (`--successor-pubkey`), and print the base64
+    /// "challenge" bytes each enrolled recovery guardian must sign offline.
+    /// DB-backed (reads the current head). Echo `not_before` verbatim into
+    /// `recover`. This is the key-LOSS recovery path (closes gap G13).
+    RecoverPrepare {
+        /// Agent identifier whose identity is being recovered.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// base64 Ed25519 PUBLIC key of the FRESH primary key that becomes
+        /// the new head (generate it with `identity generate` + export-pub).
+        #[arg(long, value_name = "PUBKEY_B64")]
+        successor_pubkey: String,
+        /// Optional: also date a suspected key compromise from this
+        /// `signed_events` witness SEQUENCE (a recovery doubling as a
+        /// revocation — for the stolen-AND-lost-key case).
+        #[arg(long, value_name = "SEQ")]
+        from_seq: Option<u64>,
+        /// Optional: (re-)register a cold recovery public key on the fresh
+        /// head. Absent carries the head's existing commitment forward.
+        #[arg(long, value_name = "PUBKEY_B64")]
+        recovery_pubkey: Option<String>,
+    },
+    /// v1.0.0 G17 (#1831) — guardian side of the M-of-N recovery ceremony:
+    /// sign the base64 `--challenge` emitted by `recover-prepare` with THIS
+    /// guardian's keypair and print `{guardian_pubkey_b64, signature_b64}`.
+    /// DB-free — a guardian never needs the recovered agent's database.
+    SignRecovery {
+        /// The guardian's own key label (defaults to the NHI id). The
+        /// guardian signs with the private key stored under this id.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// base64 recovery challenge from `recover-prepare`.
+        #[arg(long, value_name = "CHALLENGE_B64")]
+        challenge: String,
+    },
+    /// v1.0.0 G17 (#1831) — phase 2 of the M-of-N recovery ceremony:
+    /// re-mint the SAME recovery record (pass the `--not-before` echoed by
+    /// `recover-prepare`), assemble the collected guardian attestations, and
+    /// persist it — verifying the M-of-N quorum against the enrolled
+    /// guardian set (`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS` /
+    /// `AI_MEMORY_RECOVERY_THRESHOLD`) + the optional dead-man window BEFORE
+    /// any write. On success the fresh key is the new authoritative head.
+    Recover {
+        /// Agent identifier whose identity is being recovered.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// The SAME fresh-primary public key passed to `recover-prepare`.
+        #[arg(long, value_name = "PUBKEY_B64")]
+        successor_pubkey: String,
+        /// Echo the `not_before` value `recover-prepare` printed (so the
+        /// re-minted record is byte-identical to what the guardians signed).
+        #[arg(long, value_name = "RFC3339")]
+        not_before: String,
+        /// The SAME `--from-seq` (if any) passed to `recover-prepare`.
+        #[arg(long, value_name = "SEQ")]
+        from_seq: Option<u64>,
+        /// The SAME `--recovery-pubkey` (if any) passed to `recover-prepare`.
+        #[arg(long, value_name = "PUBKEY_B64")]
+        recovery_pubkey: Option<String>,
+        /// A guardian attestation `guardian_pubkey_b64:signature_b64` (from
+        /// `sign-recovery`). Repeat once per guardian; M distinct enrolled
+        /// signers must be presented.
+        #[arg(long = "attestation", value_name = "PUBKEY_B64:SIG_B64")]
+        attestations: Vec<String>,
+    },
 }
 
 /// Resolve the key storage directory from `--key-dir` (caller override)
@@ -205,6 +272,42 @@ pub fn run(
             &dir,
             agent_id.as_deref(),
             &recovery_pubkey,
+            json_out,
+            out,
+        ),
+        IdentityAction::RecoverPrepare {
+            agent_id,
+            successor_pubkey,
+            from_seq,
+            recovery_pubkey,
+        } => recover_prepare(
+            db_path,
+            agent_id.as_deref(),
+            &successor_pubkey,
+            from_seq,
+            recovery_pubkey.as_deref(),
+            json_out,
+            out,
+        ),
+        IdentityAction::SignRecovery {
+            agent_id,
+            challenge,
+        } => sign_recovery(&dir, agent_id.as_deref(), &challenge, json_out, out),
+        IdentityAction::Recover {
+            agent_id,
+            successor_pubkey,
+            not_before,
+            from_seq,
+            recovery_pubkey,
+            attestations,
+        } => recover(
+            db_path,
+            agent_id.as_deref(),
+            &successor_pubkey,
+            &not_before,
+            from_seq,
+            recovery_pubkey.as_deref(),
+            &attestations,
             json_out,
             out,
         ),
@@ -434,6 +537,13 @@ fn resolve_lineage_id(explicit: Option<&str>) -> Result<String> {
     }
 }
 
+/// Write the shared `  head_pub_b64 = <b64>` readout line for the lineage
+/// verbs — one definition so the format string is not scattered across the
+/// enroll / succeed / recover handlers (pm-v3.1 no-scattered-literals).
+fn write_head_pub_line(out: &mut CliOutput<'_>, pub_b64: &str) -> std::io::Result<()> {
+    writeln!(out.stdout, "  head_pub_b64 = {pub_b64}")
+}
+
 fn enroll_lineage(
     db_path: &Path,
     dir: &Path,
@@ -461,11 +571,7 @@ fn enroll_lineage(
         )?;
     } else {
         writeln!(out.stdout, "enrolled identity lineage for {id} (epoch 0)")?;
-        writeln!(
-            out.stdout,
-            "  head_pub_b64 = {}",
-            record.successor_pubkey_b64
-        )?;
+        write_head_pub_line(out, &record.successor_pubkey_b64)?;
         if record.recovery_pubkey_b64.is_some() {
             writeln!(
                 out.stdout,
@@ -517,11 +623,7 @@ fn succeed(
             "rotated keypair for {id} with signed succession (epoch {})",
             record.epoch
         )?;
-        writeln!(
-            out.stdout,
-            "  head_pub_b64 = {}",
-            record.successor_pubkey_b64
-        )?;
+        write_head_pub_line(out, &record.successor_pubkey_b64)?;
         writeln!(
             out.stdout,
             "  archived_prior_pub = {}",
@@ -563,6 +665,194 @@ fn register_recovery_key(
             "registered recovery key for {id} (epoch {}) — the recovery VERIFY path \
              lands in v1.0; this commits the key for forward-compat only",
             record.epoch
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 G17 (#1831) — M-of-N threshold key recovery ceremony.
+//
+// Honest scope: SINGLE-NODE key-LOSS recovery. The M-of-N recovery-quorum
+// signatures + the lineage chain are ATTESTABLE; guardian-key custody +
+// enrollment (AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS) are ESTIMABLE /
+// operational (same custody boundary as the #1957 approver quorum).
+// Cross-host propagation stays deferred like the rest of the lineage layer.
+// ---------------------------------------------------------------------------
+
+/// Decode a base64 blob accepting standard OR url-safe-no-pad spelling.
+fn decode_recovery_b64(s: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    let t = s.trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(t)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(t))
+        .map_err(|_| anyhow::anyhow!("value is not valid base64"))
+}
+
+fn recover_prepare(
+    db_path: &Path,
+    explicit_agent_id: Option<&str>,
+    successor_pubkey: &str,
+    from_seq: Option<u64>,
+    recovery_pubkey: Option<&str>,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    use base64::Engine as _;
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    let conn = crate::db::open(db_path)?;
+    let not_before = chrono::Utc::now().to_rfc3339();
+    let (record, challenge) = crate::db::prepare_recovery_challenge(
+        &conn,
+        &id,
+        successor_pubkey,
+        from_seq,
+        recovery_pubkey,
+        &not_before,
+    )?;
+    let challenge_b64 = base64::engine::general_purpose::STANDARD.encode(&challenge);
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "recovery_prepared": true,
+                "agent_id": id,
+                "epoch": record.epoch,
+                "successor_pubkey": record.successor_pubkey_b64,
+                (crate::models::field_names::NOT_BEFORE): record.not_before,
+                "from_seq": from_seq,
+                "challenge_b64": challenge_b64,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "prepared recovery for {id} (epoch {}) — distribute the challenge to each \
+             enrolled recovery guardian:",
+            record.epoch
+        )?;
+        writeln!(out.stdout, "  not_before   = {}", record.not_before)?;
+        writeln!(out.stdout, "  challenge_b64 = {challenge_b64}")?;
+        writeln!(
+            out.stdout,
+            "each guardian runs: ai-memory identity sign-recovery --agent-id <guardian> \
+             --challenge {challenge_b64}"
+        )?;
+        writeln!(
+            out.stdout,
+            "then complete: ai-memory identity recover --agent-id {id} --successor-pubkey {} \
+             --not-before {} --attestation <pub:sig> ...",
+            record.successor_pubkey_b64, record.not_before
+        )?;
+    }
+    Ok(())
+}
+
+fn sign_recovery(
+    dir: &Path,
+    explicit_agent_id: Option<&str>,
+    challenge: &str,
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    use base64::Engine as _;
+    use ed25519_dalek::Signer;
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    let kp = keypair::load(&id, dir).with_context(|| {
+        format!("loading guardian keypair for {id} (run `identity generate` first)")
+    })?;
+    let signing = kp
+        .private
+        .as_ref()
+        .with_context(|| format!("guardian keypair for {id} is public-only — cannot sign"))?;
+    let challenge_bytes = decode_recovery_b64(challenge).context("decoding --challenge")?;
+    let sig = signing.sign(&challenge_bytes);
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let guardian_pub = kp.public_base64();
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "signed": true,
+                "guardian_pubkey_b64": guardian_pub,
+                (crate::models::field_names::SIGNATURE_B64): sig_b64,
+                "attestation": format!("{guardian_pub}:{sig_b64}"),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "signed recovery challenge as guardian {id}; hand this attestation back:"
+        )?;
+        writeln!(out.stdout, "  {guardian_pub}:{sig_b64}")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover(
+    db_path: &Path,
+    explicit_agent_id: Option<&str>,
+    successor_pubkey: &str,
+    not_before: &str,
+    from_seq: Option<u64>,
+    recovery_pubkey: Option<&str>,
+    attestations: &[String],
+    json_out: bool,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let id = resolve_lineage_id(explicit_agent_id)?;
+    if attestations.is_empty() {
+        bail!("no --attestation presented — collect M guardian attestations via sign-recovery");
+    }
+    let mut quorum: Vec<crate::identity::lineage::RecoveryAttestation> =
+        Vec::with_capacity(attestations.len());
+    for att in attestations {
+        let (pk, sig) = att.split_once(':').with_context(|| {
+            format!("malformed --attestation '{att}' (expected guardian_pubkey_b64:signature_b64)")
+        })?;
+        let signature = decode_recovery_b64(sig)
+            .with_context(|| format!("decoding signature in --attestation for {pk}"))?;
+        quorum.push(crate::identity::lineage::RecoveryAttestation {
+            guardian_pubkey_b64: pk.trim().to_string(),
+            signature,
+        });
+    }
+    let conn = crate::db::open(db_path)?;
+    let record = crate::db::append_recovery(
+        &conn,
+        &id,
+        successor_pubkey,
+        &quorum,
+        from_seq,
+        recovery_pubkey,
+        not_before,
+    )?;
+    if json_out {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "recovered": true,
+                "agent_id": id,
+                "epoch": record.epoch,
+                (PUBLIC_KEY_B64_FIELD): record.successor_pubkey_b64,
+                "guardians_presented": quorum.len(),
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "RECOVERED identity {id} to a fresh head via M-of-N guardian quorum (epoch {})",
+            record.epoch
+        )?;
+        write_head_pub_line(out, &record.successor_pubkey_b64)?;
+        writeln!(
+            out.stdout,
+            "  the lost key is retired; install the fresh keypair on disk under '{id}'"
         )?;
     }
     Ok(())
@@ -1339,5 +1629,153 @@ mod tests {
         let stdout = env.stdout_str().to_string();
         assert!(stdout.contains("registered recovery key"), "got: {stdout}");
         assert!(stdout.contains("v1.0"), "got: {stdout}");
+    }
+
+    // ----- v1.0.0 G17 (#1831) M-of-N recovery ceremony (CLI) ----------
+
+    /// Drive the full recovery ceremony through the CLI dispatch:
+    /// enroll-lineage → recover-prepare → (guardians) sign-recovery →
+    /// recover, then assert the chain verifies to the fresh head via the
+    /// 2-of-3 guardian quorum. Exercises the actual `run()` handlers.
+    #[test]
+    fn recovery_ceremony_cli_end_to_end() {
+        use crate::identity::lineage::{RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV};
+        let _envg = keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut env, dir) = fresh_env();
+        let dir_path = dir.path().to_path_buf();
+        let db_path = env.db_path.clone();
+        {
+            let conn = crate::db::open(&db_path).unwrap();
+            crate::db::register_agent(&conn, "rec-cli", "ai:test", &[]).unwrap();
+        }
+        // Generate + enroll K0 (with a cold recovery commitment).
+        let cold = keypair::generate("cold").unwrap();
+        let run_action = |env: &mut TestEnv, action: IdentityAction, json: bool| {
+            let mut out = env.output();
+            run(
+                &db_path,
+                IdentityArgs {
+                    key_dir: Some(dir_path.clone()),
+                    action,
+                },
+                json,
+                &mut out,
+            )
+        };
+        run_action(
+            &mut env,
+            IdentityAction::Generate {
+                agent_id: Some("rec-cli".to_string()),
+                force: false,
+                no_overwrite: false,
+            },
+            false,
+        )
+        .unwrap();
+        run_action(
+            &mut env,
+            IdentityAction::EnrollLineage {
+                agent_id: Some("rec-cli".to_string()),
+                recovery_pubkey: Some(cold.public_base64()),
+            },
+            false,
+        )
+        .unwrap();
+
+        // Fresh primary + 3 guardians persisted on disk (sign-recovery
+        // loads the guardian private key from the key dir).
+        let k_new = keypair::generate("rec-cli-new").unwrap();
+        keypair::save(&k_new, &dir_path).unwrap();
+        for g in ["g0", "g1", "g2"] {
+            let kp = keypair::generate(g).unwrap();
+            keypair::save(&kp, &dir_path).unwrap();
+        }
+        let guardian_pub = |g: &str| keypair::load(g, &dir_path).unwrap().public_base64();
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe {
+            std::env::set_var(
+                RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                format!(
+                    "{},{},{}",
+                    guardian_pub("g0"),
+                    guardian_pub("g1"),
+                    guardian_pub("g2")
+                ),
+            );
+            std::env::set_var(RECOVERY_THRESHOLD_ENV, "2");
+        }
+
+        // Phase 1 — recover-prepare (JSON).
+        env.stdout.clear();
+        env.stderr.clear();
+        run_action(
+            &mut env,
+            IdentityAction::RecoverPrepare {
+                agent_id: Some("rec-cli".to_string()),
+                successor_pubkey: k_new.public_base64(),
+                from_seq: None,
+                recovery_pubkey: None,
+            },
+            true,
+        )
+        .unwrap();
+        let prep: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(prep["recovery_prepared"], true);
+        let challenge = prep["challenge_b64"].as_str().unwrap().to_string();
+        let not_before = prep["not_before"].as_str().unwrap().to_string();
+
+        // Phase 1.5 — two guardians sign.
+        let mut attestations = Vec::new();
+        for g in ["g0", "g1"] {
+            env.stdout.clear();
+            env.stderr.clear();
+            run_action(
+                &mut env,
+                IdentityAction::SignRecovery {
+                    agent_id: Some(g.to_string()),
+                    challenge: challenge.clone(),
+                },
+                true,
+            )
+            .unwrap();
+            let sig: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+            attestations.push(sig["attestation"].as_str().unwrap().to_string());
+        }
+
+        // Phase 2 — recover.
+        env.stdout.clear();
+        env.stderr.clear();
+        run_action(
+            &mut env,
+            IdentityAction::Recover {
+                agent_id: Some("rec-cli".to_string()),
+                successor_pubkey: k_new.public_base64(),
+                not_before,
+                from_seq: None,
+                recovery_pubkey: None,
+                attestations,
+            },
+            true,
+        )
+        .unwrap();
+        let rec: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(rec["recovered"], true);
+        assert_eq!(rec["epoch"], 1);
+
+        // The chain verifies to the fresh head via the guardian quorum.
+        let conn = crate::db::open(&db_path).unwrap();
+        let verified = crate::db::verify_agent_lineage(&conn, "rec-cli")
+            .unwrap()
+            .expect("chain verifies after recovery");
+        assert_eq!(verified.head_key.to_bytes(), k_new.public.to_bytes());
+        assert_eq!(verified.recovered_at_epoch, Some(1));
+
+        // SAFETY: test-only env cleanup serialised by the lock above.
+        unsafe {
+            std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
+            std::env::remove_var(RECOVERY_THRESHOLD_ENV);
+        }
     }
 }
