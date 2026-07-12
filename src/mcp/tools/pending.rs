@@ -48,6 +48,21 @@ impl McpTool for PendingListTool {
     }
 }
 
+/// R40 (#1957) — one human-key approver signature carried in an
+/// `memory_pending_approve` call. The operator collects M of these offline
+/// (airgapped) and submits them together; the gate counts distinct valid
+/// enrolled signers.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub struct ApproverSignatureArg {
+    /// Base64 Ed25519 public key of an enrolled approver.
+    #[serde(default)]
+    pub pubkey: String,
+    /// Base64 Ed25519 signature over this pending id's approval bytes.
+    #[serde(default)]
+    pub signature: String,
+}
+
 /// v0.7.0 #972 D1.4 (#985) — request body for `memory_pending_approve`.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 #[allow(dead_code)]
@@ -58,6 +73,12 @@ pub struct PendingApproveRequest {
     /// K10 persistence horizon.
     #[serde(default)]
     pub remember: Option<String>,
+
+    /// R40 (#1957) — optional human-key approver signatures (m-of-n). A
+    /// pending action routed from a typed escalation REQUIRES these; the
+    /// signature quorum must be met before the underlying approve proceeds.
+    #[serde(default)]
+    pub approvals: Option<Vec<ApproverSignatureArg>>,
 }
 
 /// v0.7.0 #972 D1.4 (#985) — `McpTool` impl for `memory_pending_approve`.
@@ -244,6 +265,26 @@ fn parse_remember_param(params: &Value) -> crate::approvals::Remember {
     }
 }
 
+/// R40 (#1957) — parse the optional `approvals` array of human-key approver
+/// signatures from the raw MCP params. Accepts `{pubkey, signature}` objects;
+/// missing / malformed entries are dropped (the quorum verifier then reports
+/// the honest shortfall). Empty when no signatures were presented.
+fn parse_signed_approvals(params: &Value) -> Vec<crate::approvals::signed::SignedApproval> {
+    let Some(arr) = params["approvals"].as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let pubkey = entry["pubkey"].as_str()?;
+            let signature = entry["signature"].as_str()?;
+            Some(crate::approvals::signed::SignedApproval {
+                signer_pubkey_b64: pubkey.to_string(),
+                signature_b64: signature.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// v0.7 K10 — record a synthetic rule + publish on the approval bus
 /// for an MCP-side approve/reject. Mirrors the HTTP-side hook in
 /// `handlers::approval_decide` so the three transports stay
@@ -322,6 +363,48 @@ pub fn handle_pending_approve(
         "",
         json!({ (field_names::PENDING_ID): id }),
     );
+
+    // R40 (#1957) — human-key-signed approval gate. When the pending action was
+    // routed from a typed escalation (`requires_signed_approval`) OR the caller
+    // presents approver signatures, an m-of-n Ed25519 signature quorum over
+    // enrolled operator/approver keys MUST be met before the underlying approve
+    // proceeds. Back-compat: an ordinary (non-escalated) pending with no
+    // signatures skips this gate entirely.
+    let signed_snapshot = db::get_pending_action(conn, id).map_err(|e| e.to_string())?;
+    let requires_signed = signed_snapshot
+        .as_ref()
+        .is_some_and(|p| crate::approvals::signed::pending_requires_signed_approval(&p.payload));
+    let presented = parse_signed_approvals(params);
+    if requires_signed || !presented.is_empty() {
+        match crate::approvals::signed::verify_quorum_from_env(
+            id,
+            crate::approvals::Decision::Approve,
+            &presented,
+        ) {
+            Ok(quorum) => {
+                crate::approvals::signed::record_quorum_event(
+                    id,
+                    crate::approvals::Decision::Approve,
+                    &quorum,
+                );
+                // Quorum met — fall through to the existing approve + execute path.
+            }
+            Err(crate::approvals::signed::QuorumError::ThresholdNotMet {
+                distinct,
+                threshold,
+            }) => {
+                return Ok(json!({
+                    "approved": false,
+                    "status": "pending",
+                    "id": id,
+                    "signed_votes": distinct,
+                    "signed_quorum": threshold,
+                    "reason": "signed approval quorum not yet met",
+                }));
+            }
+            Err(e) => return Err(format!("signed approval rejected: {e}")),
+        }
+    }
 
     // #1796 (5-agent vote 4d3ea1c5) — MCP/stdio is the single-operator surface;
     // keep the Human-arm gate on the AI_MEMORY_AGENT_ID opt-in (an unconditional
