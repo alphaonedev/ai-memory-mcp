@@ -461,6 +461,15 @@ jobs:
           run_tests() {
             local label="$1"; shift
             local rc=0
+            # #1989: COMPILE the test binaries OUTSIDE the watchdog first, so
+            # the 1500s per-invocation cap times test RUNTIME (the hang-detection
+            # purpose) rather than compile+run wall-time. The __ALL__ tag path
+            # builds ~448 debug integration binaries; that compile legitimately
+            # grew past 1500s during the v1.0.0 epic, which the watchdog was
+            # misreading as a hang (it is not — the full suite runs to
+            # completion). The job-level `timeout-minutes` cap still bounds the
+            # build. A genuine runtime hang still trips the 1500s below.
+            cargo test --no-run "$@" || return "$?"
             if [ -n "$TIMEOUT_BIN" ]; then
               "$TIMEOUT_BIN" --signal=TERM --kill-after=60 1500 cargo test "$@" || rc=$?
             else
