@@ -141,6 +141,12 @@ pub mod cbor_array;
 // stage (that is stage 3). Both build ON the stage-1 `cbor_array` encoder.
 pub mod subkey_cert;
 pub mod suite;
+// v1.0.0 R22 (#1947, epic #1940) — equivocation-proof format spine (spec
+// §5.2): the subject-signed `SignableHeadAttestation` + the self-contained,
+// offline-verifiable `EquivocationProof`, both on the stage-1 `cbor_array`
+// encoder. FORMAT + offline verifier ONLY — no federation/transport (#1936)
+// or eviction-runtime (FED-RQ-02/03) wiring, no schema migration this lane.
+pub mod equivocation;
 
 /// Environment variable override for `agent_id` (used by CLI via clap's
 /// `env = "AI_MEMORY_AGENT_ID"`; read directly for MCP fallback).

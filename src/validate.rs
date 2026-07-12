@@ -948,11 +948,38 @@ pub fn validate_source_span_for_body(span: &SourceSpan, body: &str) -> Result<()
     Ok(())
 }
 
+/// v1.0.0 R22 (#1947) — namespaces that are WRITE-RESERVED for a substrate
+/// internal lane and refused for a normal caller memory write.
+///
+/// There is no general namespace-reservation mechanism (the `_`-prefix is
+/// only a curator/autonomy sweep skip, not a write refusal), so this is the
+/// minimal, documented validate-layer refusal for the ONE reserved name the
+/// equivocation-proof lane owns. It mirrors the system-only
+/// [`validate_lifecycle_state`] refusal: the value round-trips on reads but a
+/// caller may never author it. The entanglement records that live under this
+/// namespace are resolved-checkpoint rows the (deferred) federation runtime
+/// writes, never caller memories.
+///
+/// # Errors
+///
+/// Returns an error when `namespace` (trimmed) equals a reserved name.
+pub fn reject_reserved_write_namespace(namespace: &str) -> Result<()> {
+    if namespace.trim() == crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE {
+        bail!(
+            "namespace '{}' is reserved for substrate peer-head-entanglement records \
+             and cannot be written by a caller",
+            crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE
+        );
+    }
+    Ok(())
+}
+
 /// Validate a full `CreateMemory` before insert.
 pub fn validate_create(mem: &CreateMemory) -> Result<()> {
     validate_title(&mem.title)?;
     validate_content(&mem.content)?;
     validate_namespace(&mem.namespace)?;
+    reject_reserved_write_namespace(&mem.namespace)?;
     validate_source(&mem.source)?;
     validate_tags(&mem.tags)?;
     validate_priority(mem.priority)?;
@@ -2405,6 +2432,41 @@ mod tests {
         let mut m = cm_valid();
         m.source = "bogus".to_string();
         assert!(validate_create(&m).is_err());
+    }
+
+    // --- v1.0.0 R22 (#1947) — reserved-namespace write refusal (CI-pinned) --
+
+    /// A normal caller memory write to the reserved
+    /// `_peer_head_entanglement` namespace is REFUSED (the entanglement lane
+    /// owns it; a caller may never author rows under it). This is the
+    /// mechanical pin for the spec §5.2 "reserved namespace write-reserved
+    /// (CI-pinned)" requirement.
+    #[test]
+    fn validate_create_refuses_reserved_entanglement_namespace() {
+        let mut m = cm_valid();
+        m.namespace = crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE.to_string();
+        let err = validate_create(&m).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reserved") && msg.contains("_peer_head_entanglement"),
+            "refusal must name the reserved namespace; got: {msg}"
+        );
+    }
+
+    /// The refusal is exact — a namespace that merely CONTAINS the reserved
+    /// name (as a sub-segment) is a distinct namespace and still writable.
+    #[test]
+    fn validate_create_allows_similar_non_reserved_namespace() {
+        let mut m = cm_valid();
+        m.namespace = "team/_peer_head_entanglement_notes".to_string();
+        assert!(validate_create(&m).is_ok());
+    }
+
+    #[test]
+    fn reject_reserved_write_namespace_trims_before_compare() {
+        // Leading/trailing whitespace around the reserved name is still refused.
+        assert!(reject_reserved_write_namespace("  _peer_head_entanglement  ").is_err());
+        assert!(reject_reserved_write_namespace("global").is_ok());
     }
 
     // --- v0.7.0 #1467 — Form-6 `kind` strict validation ------------------

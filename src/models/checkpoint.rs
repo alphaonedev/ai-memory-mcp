@@ -68,6 +68,16 @@ pub enum ConditionType {
     /// Free-TEXT condition type — no schema migration (the SAL enforces
     /// the closed set; the `GovernanceVerdict` precedent).
     EpochAdvance,
+    /// v1.0.0 R22 (#1947) — a peer-head ENTANGLEMENT anchor: a
+    /// resolved-checkpoint usage recording that this node cross-checked a
+    /// peer's signed head at a `(subject, epoch, head_sequence)` divergence
+    /// key (spec §5.2). Its `resolution` carries the entanglement evidence
+    /// (e.g. an [`crate::identity::equivocation::EquivocationProof`] byte
+    /// blob when a divergence is observed). Free-TEXT condition type — no
+    /// schema migration (the SAL enforces the closed set; the
+    /// `GovernanceVerdict` precedent). Lives under the reserved
+    /// [`crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE`].
+    PeerHeadEntanglement,
 }
 
 impl ConditionType {
@@ -83,6 +93,7 @@ impl ConditionType {
             Self::GovernanceVerdict => "governance_verdict",
             Self::GovernanceEnforcement => "governance_enforcement",
             Self::EpochAdvance => "epoch_advance",
+            Self::PeerHeadEntanglement => "peer_head_entanglement",
         }
     }
 
@@ -98,6 +109,7 @@ impl ConditionType {
             "governance_verdict" => Some(Self::GovernanceVerdict),
             "governance_enforcement" => Some(Self::GovernanceEnforcement),
             "epoch_advance" => Some(Self::EpochAdvance),
+            "peer_head_entanglement" => Some(Self::PeerHeadEntanglement),
             _ => None,
         }
     }
@@ -191,6 +203,7 @@ mod tests {
             ConditionType::GovernanceVerdict,
             ConditionType::GovernanceEnforcement,
             ConditionType::EpochAdvance,
+            ConditionType::PeerHeadEntanglement,
         ] {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }
