@@ -68,6 +68,14 @@ pub const INGESTION_V1_DOMAIN: &str = "ingestion-v1";
 /// DEFERRED post-v1.0 — recorded here so the registry is complete and the
 /// tag is reserved against collision).
 pub const RECALL_ATTESTATION_V1_DOMAIN: &str = "ai-memory/recall-attestation/v1";
+/// PQ re-anchor ceremony discriminator (spec §5.3, decision `129ca73f` R75).
+///
+/// A brand-NEW record type (per the Appendix A.5 rule "a brand-new record
+/// type allocates a new tag"): the current-strength (new-suite) key
+/// countersigns the prior chain head at checkpoint granularity so a
+/// stronger / PQ suite can be enabled on a live corpus with zero write
+/// failures and zero record rewrites. See [`crate::identity::re_anchor`].
+pub const RE_ANCHOR_V1_DOMAIN: &str = "ai-memory/re-anchor/v1";
 
 // ---------------------------------------------------------------------------
 // CBOR head encoding (RFC 8949 §3, shortest-form only).
