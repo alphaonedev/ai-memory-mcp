@@ -858,6 +858,22 @@ mod tests {
     /// of `f`, then restores the original stdin. Unix-only (the
     /// playbook explicitly forbids modifying the CLI surface, so we
     /// stretch the test harness instead).
+    ///
+    /// #1989 — every test that drives `run()` (which reads the
+    /// process-global `std::io::stdin()`) MUST go through this helper:
+    /// it guarantees the read sees a pipe whose write end is already
+    /// closed (data + immediate EOF), and `STDIN_LOCK` serialises the
+    /// process-global fd-0 mutation across the test threads. A `run()`
+    /// invocation OUTSIDE this helper reads the REAL inherited stdin —
+    /// which under CI runners / agent harnesses is a live pipe/socket
+    /// that never yields EOF, so `read_line` blocks forever while
+    /// HOLDING the global `Stdin` handle lock, wedging every other
+    /// stdin-reading test and (with fd 0 already dup2'd by a sibling)
+    /// the whole parallel suite. That was the #1989 full-suite wedge.
+    ///
+    /// The fd-0 restore is panic-safe (Drop guard): an assertion
+    /// failure inside `f` must not leave the process-global fd 0
+    /// pointing at a drained test pipe for every later test.
     #[cfg(unix)]
     fn with_stdin_lines<R>(lines: &str, f: impl FnOnce() -> R) -> R {
         use std::os::unix::io::AsRawFd;
@@ -890,14 +906,23 @@ mod tests {
             libc::close(read_fd);
         }
 
-        let r = f();
-
-        // Restore stdin.
-        unsafe {
-            libc::dup2(saved, stdin_fd);
-            libc::close(saved);
+        // #1989 — restore-on-drop so a panicking `f` (failed assert)
+        // cannot leak the test pipe as the process-global fd 0.
+        struct RestoreStdin {
+            stdin_fd: libc::c_int,
+            saved: libc::c_int,
         }
-        r
+        impl Drop for RestoreStdin {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::dup2(self.saved, self.stdin_fd);
+                    libc::close(self.saved);
+                }
+            }
+        }
+        let _restore = RestoreStdin { stdin_fd, saved };
+
+        f()
     }
 
     #[cfg(unix)]
@@ -925,33 +950,38 @@ mod tests {
         assert!(r.is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_run_with_eof_stdin_returns_cleanly() {
-        // The outer REPL `run()` reads from process stdin. Under
-        // `cargo test`, stdin is connected to `/dev/null` (which yields
-        // EOF on first read) on every host this codebase is tested on
-        // (macOS, Linux CI), so the read_line loop short-circuits to
-        // `Ok(())` without ever blocking.
+        // #1989 ROOT CAUSE FIX — this test previously called
+        // `run(&env.db_path)` directly, reading the REAL process
+        // stdin on the assumption that "under cargo test, stdin is
+        // /dev/null which yields EOF immediately". That assumption is
+        // FALSE under CI runners and agent harnesses, where the test
+        // binary inherits a live pipe/socket stdin that NEVER yields
+        // EOF. The blocking `read_line` then parks forever in
+        // `anon_pipe_read`/`unix_stream_data_wait` while HOLDING the
+        // process-global `std::io::Stdin` handle lock — deadlocking
+        // the two `with_stdin_lines` sibling tests (blocked on that
+        // lock, one with fd 0 already dup2'd to its drained pipe and
+        // unable to restore it) and wedging the entire parallel lib
+        // suite until the #1492 CI watchdog killed it at 1500s. The
+        // only reason the suite EVER passed in such environments was
+        // a timing race: this test's read occasionally landed while
+        // fd 0 was a sibling's dup2'd pipe and stole its EOF.
         //
-        // This is the only viable unit-test path for `run()`: the
-        // function's I/O contract is hard-wired to `std::io::stdin()`
-        // / `std::io::stdout()` / `std::io::stderr()` and we are not
-        // allowed to refactor it for testability (see playbook §1
-        // "do not modify CLI clap definitions").
-        //
-        // If a future CI introduces a stdin that does not yield EOF
-        // (e.g. an interactive harness) this test will hang. The fix
-        // is to gate it behind `#[cfg(target_family = "unix")]` and
-        // pipe `/dev/null` to stdin explicitly via `nix::dup2`.
+        // The fix is the remediation the original comment prescribed:
+        // drive the EXACT same `run()` EOF path (`read_line` returns
+        // `Ok(0)` → break → `Ok(())`) through `with_stdin_lines` with
+        // an EMPTY payload — the pipe's write end is closed before
+        // `run()` starts, so the first read is a deterministic EOF —
+        // and take `STDIN_LOCK` so the three real-stdin tests are
+        // mutually serialised. Unix-gated like its two siblings.
         let env = TestEnv::fresh();
         // Seed first so db::open finds an existing schema.
         seed_memory(&env.db_path, "shell-run-ns", "seed", "content");
-        // We can't capture stdout/stderr from `println!`/`eprint!` here,
-        // and `run()` blocks if stdin doesn't EOF. Under cargo test,
-        // stdin is /dev/null which yields EOF immediately. If this
-        // test hangs in CI, mark it with `#[ignore]` and exercise the
-        // REPL via an integration test that spawns the binary.
-        let r = run(&env.db_path);
+        let db = env.db_path.clone();
+        let r = with_stdin_lines("", || run(&db));
         assert!(r.is_ok());
     }
 
