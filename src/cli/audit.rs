@@ -52,6 +52,13 @@ pub enum AuditAction {
     /// audit_log table; orthogonal to the file-based hash-chained
     /// trail surfaced by `tail` / `verify`.
     Show(ShowArgs),
+    /// v1.0.0 #1946 (A1) — the SANCTIONED-RESTORE ceremony. Emit ONE
+    /// operator-signed `audit.restore_sanctioned` event committing
+    /// `{old_head, new_head, gap, timestamp}` so a legitimate DR
+    /// snapshot-restore is distinguishable from an attack rollback at
+    /// the next `db::open`. The operator signature is the ONLY
+    /// discriminator (at the byte level a DR restore IS a rollback).
+    RestoreAttest(RestoreAttestArgs),
 }
 
 #[derive(Args)]
@@ -120,6 +127,24 @@ pub struct TailArgs {
     pub format: String,
 }
 
+/// v1.0.0 #1946 (A1) — arguments for `ai-memory audit restore-attest`.
+#[derive(Args)]
+pub struct RestoreAttestArgs {
+    /// Actually SIGN + emit the sanction. Without `--sign` this is a
+    /// dry-run that prints the `{old_head, new_head, gap}` it WOULD
+    /// attest so an operator can review before committing.
+    #[arg(long)]
+    pub sign: bool,
+    /// Operator key directory (holds `operator.key`/`operator.priv`).
+    /// Defaults to the resolved key dir (`AI_MEMORY_KEY_DIR` → platform
+    /// default). The operator key's private half signs the sanction.
+    #[arg(long, value_name = "PATH")]
+    pub key_dir: Option<std::path::PathBuf>,
+    /// Emit a JSON summary instead of the human-readable line.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `ai-memory audit` entry point. Returns the desired process exit
 /// code so the caller can surface a non-zero status from the top-level
 /// dispatch without panicking.
@@ -130,7 +155,96 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
         AuditAction::Tail(t) => run_tail(&t, audit_dir.as_deref(), app_config, out),
         AuditAction::Path => run_path(audit_dir.as_deref(), app_config, out),
         AuditAction::Show(s) => run_show(&s, app_config, out),
+        AuditAction::RestoreAttest(r) => run_restore_attest(&r, app_config, out),
     }
+}
+
+/// v1.0.0 #1946 (A1) — the sanctioned-restore ceremony. Reads the
+/// off-table witness anchor high-water (`old_head`) + the surviving in-DB
+/// head (`new_head`); with `--sign` it signs a `{old_head, new_head, gap,
+/// timestamp}` record under the OPERATOR key and appends it to the
+/// off-table sanction log so the open-time check clears the rollback
+/// evidence for that DR window.
+fn run_restore_attest(
+    args: &RestoreAttestArgs,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    use anyhow::{Context, bail};
+    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let conn = crate::db::open(&db_path)
+        .with_context(|| format!("audit restore-attest: open db at {}", db_path.display()))?;
+    let db_head: i64 = conn
+        .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
+        .unwrap_or(0);
+    let Some(old_head) = crate::governance::audit::read_head_anchor_high_water() else {
+        bail!(
+            "no pinnable off-table head anchor to attest against — enrol a witness key \
+             (AI_MEMORY_WITNESS_KEY_DIR + AI_MEMORY_WITNESS_PUBKEY) and let the daemon anchor a head first"
+        );
+    };
+    let new_head = db_head;
+    let gap = old_head.saturating_sub(new_head);
+    if gap <= 0 {
+        writeln!(
+            out.stderr,
+            "restore-attest: in-DB head ({new_head}) is not below the anchor ({old_head}) — \
+             there is no rollback to sanction"
+        )?;
+        return Ok(0);
+    }
+    if !args.sign {
+        if args.json {
+            writeln!(
+                out.stdout,
+                "{}",
+                serde_json::json!({
+                    "status": "dry_run",
+                    "old_head": old_head,
+                    "new_head": new_head,
+                    "gap": gap,
+                })
+            )?;
+        } else {
+            writeln!(
+                out.stdout,
+                "restore-attest (dry-run): would sanction restore old_head={old_head} \
+                 new_head={new_head} gap={gap} — re-run with --sign to emit"
+            )?;
+        }
+        return Ok(0);
+    }
+    let key_dir = match &args.key_dir {
+        Some(p) => p.clone(),
+        None => crate::identity::keypair::default_key_dir().context("resolve operator key dir")?,
+    };
+    let signing = crate::cli::rules::load_operator_signing_key_from_dir(&key_dir)
+        .context("load operator signing key for restore-attest")?;
+    let now = chrono::Utc::now().timestamp();
+    let line = crate::governance::audit::sign_restore_sanction(old_head, new_head, now, &signing)
+        .context("sign restore sanction")?;
+    crate::governance::audit::append_restore_sanction(&line)
+        .context("append restore sanction to off-table log")?;
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "old_head": old_head,
+                "new_head": new_head,
+                "gap": gap,
+                "timestamp": now,
+            })
+        )?;
+    } else {
+        writeln!(
+            out.stdout,
+            "restore-attest OK: operator-signed sanction recorded — restore {old_head} -> \
+             {new_head} (gap {gap}); the open-time rollback check will treat this DR window as cleared"
+        )?;
+    }
+    Ok(0)
 }
 
 /// v0.6.4-009 — print rows from the `audit_log` SQLite table.

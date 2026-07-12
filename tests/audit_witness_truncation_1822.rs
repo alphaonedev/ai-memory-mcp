@@ -214,6 +214,12 @@ fn delete_both_under_require_flips_unknown_to_dirty() {
         [],
     )
     .expect("delete witness cp");
+    // v1.0.0 #1946 — this test isolates the WITNESS tier ("no anchor ⇒
+    // Unknown"). force_emit also wrote the OFF-TABLE #1946 head-anchor log,
+    // which independently catches this rollback (RollbackCheck::Evidence). To
+    // model the "no anchor at all" scope this witness test asserts, wipe the
+    // off-table anchor too (its dedicated teeth are in `rollback_evidence_1946`).
+    std::fs::remove_file(kdir.path().join(witness::HEAD_ANCHOR_LOG_FILENAME)).ok();
 
     // Without require-mode: no witness anchor ⇒ Unknown ⇒ withheld (clean).
     let report = verify_audit_trail(&conn, None).expect("verify permissive");
@@ -279,6 +285,7 @@ fn head_resigned_under_daemon_key_is_forged_by_the_pin() {
     };
     let forged = witness::build_signed_witness_checkpoint(
         &forged_dual,
+        None,
         chrono::Utc::now().timestamp() + 10, // ensure it is the "latest"
         &daemon_kp,
     )

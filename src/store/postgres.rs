@@ -10021,7 +10021,10 @@ async fn pg_emit_audit_head_witness_in_tx(
         revisions_head_hash: mem_hash_hex,
     };
     let now = chrono::Utc::now().timestamp();
-    let cp = witness::build_signed_witness_checkpoint(&dual, now, &keypair)
+    // v1.0.0 #1946 A — bind the OSS rollback counter so the pg twin emits the
+    // same `v: 2` witness records as sqlite (K3 parity).
+    let rollback = Some(witness::rollback_counter_for(signed_head_seq));
+    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, now, &keypair)
         .map_err(|e| sqlx::Error::Encode(format!("audit-witness sign: {e:#}").into()))?;
     sqlx::query(
         "INSERT INTO checkpoints \
@@ -10048,6 +10051,9 @@ async fn pg_emit_audit_head_witness_in_tx(
     .bind(cp.metadata.to_string())
     .execute(&mut **tx)
     .await?;
+    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
+    // the pg-backed daemon also seeds the open-time rollback high-water mark.
+    witness::append_head_anchor(&cp);
     Ok(())
 }
 
@@ -10156,12 +10162,10 @@ impl PostgresStore {
         use sha2::{Digest, Sha256};
 
         // Chain head (whole table, independent of the window).
-        let head_sequence: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), 0) FROM signed_events WHERE sequence IS NOT NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| to_store_err("verify_audit_trail.head", e))?;
+        let head_sequence: i64 = sqlx::query_scalar(crate::signed_events::CHAIN_HEAD_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("verify_audit_trail.head", e))?;
 
         // Off-table tail-truncation verdict — the SAME shared forensic reader
         // the sqlite path uses (item 7 wired the pg chokepoint to stamp it).
@@ -10437,6 +10441,11 @@ impl PostgresStore {
         let lineage =
             crate::identity::lineage::compute_lineage_check(&lineage_outcomes, require_lineage);
 
+        // v1.0.0 #1946 D — rollback-evidence verdict from the SHARED off-table
+        // anchor reader (backend-agnostic file logic), so the pg twin surfaces
+        // an IDENTICAL verdict to sqlite (K3 parity).
+        let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
+
         Ok(crate::signed_events::AuditTrailReport {
             total_events,
             chain_intact,
@@ -10450,6 +10459,7 @@ impl PostgresStore {
             signature_failures,
             role_separation,
             lineage,
+            rollback,
         })
     }
 
