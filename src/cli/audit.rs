@@ -1387,3 +1387,237 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("parsing --since"));
     }
 }
+
+#[cfg(test)]
+mod restore_attest_1946_tests {
+    //! #1946 CLI-verb coverage: every arm of `run_restore_attest`.
+    //! Witness env vars are process-global → serialised on the crate's
+    //! key-dir env lock (the `governance::audit` test convention) and
+    //! cleared before release.
+    use super::*;
+    use crate::cli::test_utils::TestEnv;
+    use crate::governance::audit as witness;
+
+    fn cfg_for(env: &TestEnv) -> AppConfig {
+        AppConfig {
+            db: Some(env.db_path.display().to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn args(sign: bool, json: bool, key_dir: Option<std::path::PathBuf>) -> RestoreAttestArgs {
+        RestoreAttestArgs {
+            sign,
+            key_dir,
+            json,
+        }
+    }
+
+    fn clear_witness_env() {
+        unsafe {
+            std::env::remove_var(witness::WITNESS_KEY_DIR_ENV);
+            std::env::remove_var(witness::WITNESS_PUBKEY_ENV);
+        }
+    }
+
+    /// Seed the off-table anchor ABOVE the (empty) DB head by enrolling a
+    /// witness key, appending rows, forcing an anchor emission, then
+    /// re-opening a FRESH empty db path so `db_head < anchor`.
+    fn seed_anchor_above_head(env: &TestEnv, witness_dir: &std::path::Path) {
+        let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
+        crate::identity::keypair::save(&kp, witness_dir).expect("save");
+        unsafe {
+            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, witness_dir);
+            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
+        }
+        // Anchor from a THROWAWAY db that has rows; the TestEnv db stays empty.
+        let anchor_db = witness_dir.join("anchor-seed.db");
+        let conn = crate::db::open(&anchor_db).expect("open");
+        for i in 0..3 {
+            let ev = crate::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "alice".to_string(),
+                event_type: "memory_link.created".to_string(),
+                payload_hash: crate::signed_events::payload_hash(format!("p-{i}").as_bytes()),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..crate::signed_events::SignedEvent::default()
+            };
+            crate::signed_events::append_signed_event(&conn, &ev).expect("append");
+        }
+        crate::signed_events::force_emit_audit_head_witness(&conn);
+        let _ = env; // db_path deliberately untouched (head 0 < anchor)
+    }
+
+    #[test]
+    fn no_anchor_bails_with_enrolment_hint() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let mut env = TestEnv::fresh();
+        let cfg = cfg_for(&env);
+        let mut out = env.output();
+        let err = run_restore_attest(&args(false, false, None), &cfg, &mut out)
+            .expect_err("must bail without an anchor");
+        assert!(
+            err.to_string()
+                .contains("no pinnable off-table head anchor"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn gap_zero_reports_no_rollback_and_exits_zero() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut env = TestEnv::fresh();
+        // Anchor from the SAME db the CLI will read → head == anchor → gap 0.
+        let kp = crate::identity::keypair::generate(witness::WITNESS_KEY_LABEL).expect("gen");
+        crate::identity::keypair::save(&kp, tmp.path()).expect("save");
+        unsafe {
+            std::env::set_var(witness::WITNESS_KEY_DIR_ENV, tmp.path());
+            std::env::set_var(witness::WITNESS_PUBKEY_ENV, kp.public_base64());
+        }
+        {
+            let conn = crate::db::open(&env.db_path).expect("open");
+            let ev = crate::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: "alice".to_string(),
+                event_type: "memory_link.created".to_string(),
+                payload_hash: crate::signed_events::payload_hash(b"p"),
+                signature: None,
+                attest_level: "unsigned".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..crate::signed_events::SignedEvent::default()
+            };
+            crate::signed_events::append_signed_event(&conn, &ev).expect("append");
+            crate::signed_events::force_emit_audit_head_witness(&conn);
+        }
+        let cfg = cfg_for(&env);
+        let mut out = env.output();
+        let code = run_restore_attest(&args(false, false, None), &cfg, &mut out).expect("ok");
+        assert_eq!(code, 0);
+        drop(out);
+        assert!(
+            env.stderr_str().contains("no rollback to sanction"),
+            "got: {}",
+            env.stderr_str()
+        );
+        clear_witness_env();
+    }
+
+    #[test]
+    fn dry_run_prints_gap_text_and_json_without_signing() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut env = TestEnv::fresh();
+        seed_anchor_above_head(&env, tmp.path());
+        let cfg = cfg_for(&env);
+        {
+            let mut out = env.output();
+            let code = run_restore_attest(&args(false, false, None), &cfg, &mut out).expect("ok");
+            assert_eq!(code, 0);
+        }
+        assert!(
+            env.stdout_str().contains("dry-run") && env.stdout_str().contains("gap=3"),
+            "got: {}",
+            env.stdout_str()
+        );
+        env.stdout.clear();
+        {
+            let mut out = env.output();
+            let code = run_restore_attest(&args(false, true, None), &cfg, &mut out).expect("ok");
+            assert_eq!(code, 0);
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(v["status"], "dry_run");
+        assert_eq!(v["old_head"], 3);
+        assert_eq!(v["new_head"], 0);
+        assert_eq!(v["gap"], 3);
+        // Dry-run must NOT create a sanction log.
+        assert!(
+            !tmp.path().join("restore-sanctions.log").exists()
+                || std::fs::read_to_string(tmp.path().join("restore-sanctions.log"))
+                    .unwrap_or_default()
+                    .is_empty(),
+            "dry-run must not append a sanction"
+        );
+        clear_witness_env();
+    }
+
+    #[test]
+    fn sign_missing_operator_key_errors() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut env = TestEnv::fresh();
+        seed_anchor_above_head(&env, tmp.path());
+        let cfg = cfg_for(&env);
+        let empty_keys = tempfile::tempdir().expect("tmp2");
+        let mut out = env.output();
+        let err = run_restore_attest(
+            &args(true, false, Some(empty_keys.path().to_path_buf())),
+            &cfg,
+            &mut out,
+        )
+        .expect_err("must fail without operator key");
+        assert!(err.to_string().contains("operator"), "got: {err:#}");
+        clear_witness_env();
+    }
+
+    #[test]
+    fn sign_happy_path_appends_sanction_text_and_json() {
+        let _g = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_witness_env();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let mut env = TestEnv::fresh();
+        seed_anchor_above_head(&env, tmp.path());
+        let op_dir = tempfile::tempdir().expect("tmp2");
+        let op = crate::identity::keypair::generate(crate::cli::rules::OPERATOR_KEY_ID)
+            .expect("gen operator");
+        crate::identity::keypair::save(&op, op_dir.path()).expect("save operator");
+        let cfg = cfg_for(&env);
+        {
+            let mut out = env.output();
+            let code = run_restore_attest(
+                &args(true, false, Some(op_dir.path().to_path_buf())),
+                &cfg,
+                &mut out,
+            )
+            .expect("sign ok");
+            assert_eq!(code, 0);
+        }
+        assert!(
+            env.stdout_str().contains("restore-attest OK"),
+            "got: {}",
+            env.stdout_str()
+        );
+        env.stdout.clear();
+        {
+            let mut out = env.output();
+            let code = run_restore_attest(
+                &args(true, true, Some(op_dir.path().to_path_buf())),
+                &cfg,
+                &mut out,
+            )
+            .expect("sign ok json");
+            assert_eq!(code, 0);
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).expect("json");
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["gap"], 3);
+        clear_witness_env();
+    }
+}
