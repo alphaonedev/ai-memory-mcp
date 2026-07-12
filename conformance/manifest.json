@@ -1,0 +1,102 @@
+{
+  "domain_tags": {
+    "equivocation_proof": "ai-memory/equivocation-proof/v1",
+    "peer_head_attestation": "ai-memory/peer-head-attestation-v1",
+    "signable_write_v2": "ai-memory/write/v2",
+    "subkey_cert": "ai-memory/subkey-cert/v1"
+  },
+  "format_freeze_doc": "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
+  "generator": "tests/conformance_corpus.rs",
+  "license": "CC0-1.0",
+  "schema_version": 80,
+  "spec": "ai-memory/portability/v2",
+  "spec_doc": "docs/spec/PORTABILITY-V2.md",
+  "vectors": [
+    {
+      "domain_tag": "ai-memory/write/v2",
+      "elements": 11,
+      "file": "vectors/signable_write_v2/a4_worked_example.hex",
+      "length_bytes": 181,
+      "name": "signable_write_v2/a4_worked_example",
+      "record_type": "signable_write_v2",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/write/v2",
+      "elements": 11,
+      "file": "vectors/signable_write_v2/session_present.hex",
+      "length_bytes": 193,
+      "name": "signable_write_v2/session_present",
+      "record_type": "signable_write_v2",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/write/v2",
+      "elements": 11,
+      "file": "vectors/signable_write_v2/blake3_digest_variant.hex",
+      "length_bytes": 244,
+      "name": "signable_write_v2/blake3_digest_variant",
+      "record_type": "signable_write_v2",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/subkey-cert/v1",
+      "elements": 6,
+      "file": "vectors/subkey_cert/worked_cert.hex",
+      "length_bytes": 159,
+      "name": "subkey_cert/worked_cert",
+      "record_type": "subkey_cert",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/peer-head-attestation-v1",
+      "elements": 6,
+      "file": "vectors/peer_head_attestation/worked_attestation.hex",
+      "length_bytes": 117,
+      "name": "peer_head_attestation/worked_attestation",
+      "record_type": "peer_head_attestation",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/peer-head-attestation-v1",
+      "elements": 6,
+      "file": "vectors/peer_head_attestation/large_counters_variant.hex",
+      "length_bytes": 151,
+      "name": "peer_head_attestation/large_counters_variant",
+      "record_type": "peer_head_attestation",
+      "verdict": "reencode-match"
+    },
+    {
+      "domain_tag": "ai-memory/write/v2",
+      "elements": 11,
+      "file": "vectors/signed/write_v2_signed.hex",
+      "length_bytes": 181,
+      "name": "signed/write_v2_signed",
+      "pubkey": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "record_type": "signable_write_v2",
+      "signature": "24883e8c07e3d05ba84b153c0e46a574251310a604661b860b4bd7ddd5dabd3512610bcb294a9f2862295c6600e1cd8d9731ed40e004a0ab58f7bf4a40dc0f0d",
+      "verdict": "signature-valid"
+    },
+    {
+      "domain_tag": "ai-memory/write/v2",
+      "elements": 11,
+      "file": "vectors/signed/write_v2_tampered.hex",
+      "length_bytes": 181,
+      "name": "signed/write_v2_tampered",
+      "pubkey": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "record_type": "signable_write_v2",
+      "signature": "25883e8c07e3d05ba84b153c0e46a574251310a604661b860b4bd7ddd5dabd3512610bcb294a9f2862295c6600e1cd8d9731ed40e004a0ab58f7bf4a40dc0f0d",
+      "verdict": "signature-invalid"
+    },
+    {
+      "domain_tag": "ai-memory/equivocation-proof/v1",
+      "elements": 4,
+      "file": "vectors/signed/equivocation_proof_real.hex",
+      "length_bytes": 362,
+      "name": "signed/equivocation_proof_real",
+      "pubkey": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+      "record_type": "equivocation_proof",
+      "verdict": "equivocation-proven"
+    }
+  ]
+}
