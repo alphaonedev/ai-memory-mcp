@@ -3563,6 +3563,20 @@ fn purge_and_tombstone_forget(
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, ns, now, agent_id, signature],
         )?;
+        // #1956 [R56] — CRYPTO-ERASE + erasure attestation IN THIS tx, BEFORE
+        // the forget DELETE. For an encrypted per-record (0x03) row this
+        // DESTROYS the per-record envelope key so the ciphertext is
+        // cryptographically unrecoverable even by a KEK holder (belt-and-
+        // suspenders on top of the row delete); for a plaintext / legacy-0x02
+        // row it records the honest `row-deleted-tombstoned` kind. The signed
+        // `substrate.crypto_erase` event lands on the audit chain either way.
+        // Actor = the forgetting caller, else the victim owner, else substrate.
+        let erase_actor = caller
+            .filter(|s| !s.is_empty())
+            .or(agent_id.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(CRYPTO_ERASE_ACTOR_FORGET);
+        crypto_erase_and_attest(conn, id, erase_actor, now)?;
         // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact: append
         // ONE identity-only FORGET leaf per victim IN THIS tx, BEFORE the
         // forget DELETE. Reuses the same victim set as the W2.3 tombstone
@@ -3669,6 +3683,210 @@ pub fn forget_scrub_cid_genesis(conn: &Connection, id: &str) -> Result<()> {
         "UPDATE memories SET cid_genesis = NULL WHERE id = ?1 AND cid_genesis IS NOT NULL",
         params![id],
     )?;
+    Ok(())
+}
+
+/// v1.0.0 (#1956 [P1][R56]) — the kind of erasure an erasure attestation
+/// commits to, and the honest crypto-erase-vs-delete boundary.
+///
+/// * [`KeyDestroyed`](ErasureKind::KeyDestroyed) — the row carried an
+///   encrypted per-record (`0x03`) envelope whose wrapped DEK was DESTROYED
+///   before deletion, so the ciphertext is cryptographically unrecoverable
+///   even by a holder of the master KEK. This is the ATTESTABLE guarantee
+///   (conditional on at-rest encryption having been enabled when the row was
+///   written) — labelled ESTIMABLE at the operational level because it
+///   depends on master-key custody being the trust root.
+/// * [`RowDeletedTombstoned`](ErasureKind::RowDeletedTombstoned) — the row was
+///   plaintext-at-rest (or a legacy `0x02` per-agent envelope with no
+///   per-record key to destroy), so it could only be ROW-DELETED + tombstoned.
+///   NOT crypto-erased — the honest limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasureKind {
+    /// Encrypted per-record row: the envelope key was destroyed.
+    KeyDestroyed,
+    /// Plaintext / legacy-encrypted row: row-deleted + tombstoned only.
+    RowDeletedTombstoned,
+}
+
+impl ErasureKind {
+    /// The canonical wire/attestation string for this erasure kind.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KeyDestroyed => "key-destroyed",
+            Self::RowDeletedTombstoned => "row-deleted-tombstoned",
+        }
+    }
+}
+
+/// #1956 [R56] — actor recorded on an erasure attestation when an autonomous
+/// substrate eviction (TTL / byte-cap) drove the delete, with no human/agent
+/// caller in scope.
+const CRYPTO_ERASE_ACTOR_SUBSTRATE: &str = "substrate:eviction";
+
+/// #1956 [R56] — actor recorded on an erasure attestation for a `forget` with
+/// no identifiable caller/owner (both backends share this fallback).
+pub const CRYPTO_ERASE_ACTOR_FORGET: &str = "substrate:forget";
+
+/// #1956 [R56] — canonical signable bytes for a `substrate.crypto_erase`
+/// erasure attestation. Identity + erasure-kind + actor + time ONLY (NEVER
+/// content — a content fingerprint would re-leak the erased row). Versioned
+/// domain-separation prefix so a future shape change cannot collide with v1.
+#[must_use]
+pub fn crypto_erase_signable_bytes(
+    memory_id: &str,
+    kind: ErasureKind,
+    actor: &str,
+    erased_at: &str,
+) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"crypto-erase-v1\x00";
+    let kind_str = kind.as_str();
+    let mut bytes = Vec::with_capacity(
+        DOMAIN.len() + memory_id.len() + kind_str.len() + actor.len() + erased_at.len() + 3,
+    );
+    bytes.extend_from_slice(DOMAIN);
+    bytes.extend_from_slice(memory_id.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(kind_str.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(actor.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(erased_at.as_bytes());
+    bytes
+}
+
+/// #1956 [R56] — CRYPTO-ERASE an encrypted record's per-record envelope key.
+///
+/// Reads the row's `encrypted_envelope`; when it is a per-record (`0x03`)
+/// envelope, OVERWRITES it with the destroy marker (`crate::encryption::crypto_erase_marker`),
+/// destroying the embedded wrapped DEK so the ciphertext is permanently
+/// unrecoverable. Returns `true` when a key was destroyed, `false` when the
+/// row is plaintext (NULL envelope) or a legacy `0x02` per-agent envelope
+/// (no per-record key to destroy — the honest limit). Idempotent: an
+/// already-erased (`0x04`) row returns `false`.
+///
+/// MUST run BEFORE the row's `DELETE` (belt-and-suspenders: the erasure
+/// propagates to replicas / WAL as an UPDATE before the tombstoning delete).
+///
+/// # Errors
+///
+/// Propagates the SELECT / UPDATE error.
+pub fn crypto_erase_record_envelope(conn: &Connection, id: &str) -> Result<bool> {
+    use rusqlite::OptionalExtension;
+    let env: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT encrypted_envelope FROM memories WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(bytes) = env {
+        if crate::encryption::envelope_is_crypto_erasable(&bytes) {
+            conn.execute(
+                "UPDATE memories SET encrypted_envelope = ?2 WHERE id = ?1",
+                params![id, crate::encryption::crypto_erase_marker()],
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// #1956 [R56] — emit a signed `substrate.crypto_erase` erasure attestation
+/// on the append-only `signed_events` chain, using the caller's already-open
+/// transaction. Commits `{id, erasure-kind, actor, timestamp}`. Signed with
+/// the daemon audit key when installed (unsigned otherwise — same posture as
+/// every other `signed_events` writer). Chained + verified by
+/// `verify_audit_trail`.
+///
+/// # Errors
+///
+/// Propagates the chain-append error (callers MUST rollback their tx).
+pub fn emit_crypto_erase_attestation(
+    conn: &Connection,
+    memory_id: &str,
+    kind: ErasureKind,
+    actor: &str,
+    erased_at: &str,
+) -> Result<()> {
+    let signable = crypto_erase_signable_bytes(memory_id, kind, actor, erased_at);
+    let payload_hash = crate::signed_events::payload_hash(&signable);
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        payload_hash,
+        actor.to_string(),
+        crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
+        erased_at.to_string(),
+        None,
+    );
+    crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    Ok(())
+}
+
+/// #1956 [R56] — the combined erase primitive every hard-delete path runs
+/// per victim BEFORE the `DELETE`: crypto-erase the per-record envelope key
+/// (when encrypted), classify the [`ErasureKind`], and emit the signed
+/// erasure attestation. Returns the classified kind. Runs inside the caller's
+/// transaction so the erase + attestation + delete commit or roll back atomically.
+///
+/// # Errors
+///
+/// Propagates the crypto-erase UPDATE or the attestation-append error.
+pub fn crypto_erase_and_attest(
+    conn: &Connection,
+    id: &str,
+    actor: &str,
+    now: &str,
+) -> Result<ErasureKind> {
+    let key_destroyed = crypto_erase_record_envelope(conn, id)?;
+    let kind = if key_destroyed {
+        ErasureKind::KeyDestroyed
+    } else {
+        ErasureKind::RowDeletedTombstoned
+    };
+    emit_crypto_erase_attestation(conn, id, kind, actor, now)?;
+    Ok(kind)
+}
+
+/// #1956 [R56] — record a mandatory tombstone for an EVICTED row (TTL / byte-cap
+/// hard-delete via [`gc`] / [`size_gc`]) and emit its crypto-erase attestation,
+/// inside the caller's transaction, BEFORE the `DELETE`. Reuses the v71
+/// `forget_tombstones` machinery so an evicted row cannot be resurrected via
+/// federation LWW, closing the "a delete that leaves no tombstone" defect on
+/// the eviction paths (the forget paths already tombstone via
+/// [`purge_and_tombstone_forget`]).
+///
+/// `INSERT OR IGNORE` keeps it idempotent. The tombstone carries identity +
+/// time + owner ONLY (never content). The erasure attestation records whether
+/// the row was crypto-erased (encrypted) or merely deleted (plaintext).
+///
+/// # Errors
+///
+/// Propagates the crypto-erase / tombstone-insert / attestation error.
+pub fn evict_tombstone_and_erase(
+    conn: &Connection,
+    id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    now: &str,
+) -> Result<()> {
+    // Crypto-erase the per-record key (if encrypted) + classify + attest.
+    let actor = agent_id
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CRYPTO_ERASE_ACTOR_SUBSTRATE);
+    crypto_erase_and_attest(conn, id, actor, now)?;
+    // Mandatory signed tombstone (federation resurrection guard).
+    let signable = forget_tombstone_signable_bytes(id, namespace, now);
+    let signature: Option<Vec<u8>> =
+        crate::governance::audit::try_sign_audit_payload(&signable).map(|(sig, _)| sig);
+    conn.execute(
+        "INSERT OR IGNORE INTO forget_tombstones \
+             (memory_id, namespace, forgotten_at, agent_id, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, namespace, now, agent_id, signature],
+    )?;
+    // Erasure invariant: scrub the cid_genesis pre-image (parity with forget).
+    forget_scrub_cid_genesis(conn, id)?;
     Ok(())
 }
 
@@ -10128,6 +10346,26 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                     )?;
                 }
             }
+            // #1956 [R56] — mandatory tombstone + crypto-erase on the HARD-DELETE
+            // (non-archive) eviction path, BEFORE the DELETE. When `archive` is
+            // true the row is copied to `archived_memories` (recoverable — a
+            // MOVE, not an erasure), so no tombstone/erase there; the archive
+            // reaper is the erasure point for archived rows. A hard delete that
+            // left no tombstone was the #1956 defect on this path — close it.
+            if !archive {
+                let mut evict_stmt = conn.prepare_cached(&format!(
+                    "SELECT id, namespace, json_extract(metadata,'$.agent_id') \
+                     FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
+                ))?;
+                let evicted: Vec<(String, String, Option<String>)> = evict_stmt
+                    .query_map(params![now, GC_CHUNK_ROWS], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                for (eid, ens, eagent) in &evicted {
+                    evict_tombstone_and_erase(conn, eid, ens, eagent.as_deref(), &now)?;
+                }
+            }
             let mut delete_stmt = conn.prepare_cached(&format!(
                 "DELETE FROM memories WHERE id IN ({SQL_GC_EXPIRED_CHUNK_IDS})"
             ))?;
@@ -10270,6 +10508,27 @@ pub fn size_gc(
                         &Utc::now().to_rfc3339(),
                     )?;
                 }
+                // #1956 [R56] — mandatory tombstone + crypto-erase on the
+                // byte-cap HARD-DELETE eviction, BEFORE the DELETE. (The
+                // `archive` branch above routes through archive_memory_no_tx,
+                // a recoverable MOVE — no tombstone there.) Closes the
+                // "delete with no tombstone" defect on size_gc.
+                let evict_agent: Option<String> = conn
+                    .query_row(
+                        "SELECT json_extract(metadata,'$.agent_id') FROM memories WHERE id = ?1",
+                        params![id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let evict_now = Utc::now().to_rfc3339();
+                evict_tombstone_and_erase(
+                    conn,
+                    &id,
+                    namespace,
+                    evict_agent.as_deref(),
+                    &evict_now,
+                )?;
                 conn.execute(SQL_DELETE_MEMORY_BY_ID, params![id])?;
             }
             Ok(())

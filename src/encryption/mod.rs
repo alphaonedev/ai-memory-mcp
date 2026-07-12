@@ -86,6 +86,51 @@ use zeroize::Zeroize;
 /// the raw X25519 output directly with empty AAD).
 pub const ENVELOPE_VERSION: u8 = 0x02;
 
+/// v1.0.0 (#1956 [P1][R56]) — the per-record ENVELOPE-KEY scheme marker.
+///
+/// A `0x03` `encrypted_envelope` carries a per-record Data Encryption Key
+/// (DEK) instead of sealing the content directly to the per-agent key. The
+/// content is encrypted under a random per-record DEK; the DEK is then
+/// WRAPPED (via the `0x02` ECDH scheme) under the per-agent X25519 key —
+/// which serves as the master Key-Encryption-Key (KEK) — and the wrapped
+/// DEK is embedded in the same `encrypted_envelope` BLOB. The wire layout
+/// is:
+///
+/// ```text
+/// version         (1 byte  = 0x03)
+/// wrapped_dek_len (2 bytes — u16 big-endian)
+/// wrapped_dek     (wrapped_dek_len bytes — a 0x02 [`Envelope`] of the 32-byte DEK)
+/// inner_nonce     (12 bytes — ChaCha20-Poly1305 nonce for the content)
+/// inner_ciphertext(variable — AEAD ciphertext + 16-byte tag over the content)
+/// ```
+///
+/// This makes CRYPTO-ERASE real at record granularity: destroying the
+/// wrapped DEK (rewriting the envelope to [`ERASED_ENVELOPE_VERSION`])
+/// renders the inner ciphertext permanently unrecoverable — the random
+/// DEK existed ONLY in wrapped form, so even a holder of the master KEK
+/// cannot recover it. The legacy `0x02` per-agent scheme has NO per-record
+/// key to destroy, so `0x02` rows are NOT crypto-erasable (they can only
+/// be row-deleted + tombstoned — the honest boundary documented on
+/// [`envelope_is_crypto_erasable`]).
+pub const RECORD_ENVELOPE_VERSION: u8 = 0x03;
+
+/// v1.0.0 (#1956 [P1][R56]) — the CRYPTO-ERASED tombstone marker. A
+/// `crypto_erase` rewrites a per-record (`0x03`) `encrypted_envelope` to
+/// the single byte `[0x04]`: the wrapped DEK is destroyed, so the prior
+/// ciphertext is unrecoverable. A read of a `0x04` envelope fails-closed
+/// with a clear "crypto-erased" error rather than a generic decrypt
+/// failure. Distinct from a NULL envelope (never-encrypted / plaintext row).
+pub const ERASED_ENVELOPE_VERSION: u8 = 0x04;
+
+/// v1.0.0 (#1956) — per-record DEK length in bytes (a ChaCha20-Poly1305
+/// key). Random per record; only ever persisted WRAPPED under the KEK.
+const RECORD_DEK_LEN: usize = 32;
+
+/// v1.0.0 (#1956) — AEAD associated data for the per-record inner content
+/// seal: the single scheme-version byte, so an inner ciphertext cannot be
+/// reinterpreted under a different envelope version without failing the tag.
+const RECORD_INNER_AAD: &[u8] = &[RECORD_ENVELOPE_VERSION];
+
 /// X25519 pubkey length in bytes.
 pub const PUBKEY_LEN: usize = 32;
 
@@ -426,6 +471,17 @@ fn envelope_aad(ephemeral_pub: &[u8; PUBKEY_LEN]) -> [u8; 1 + PUBKEY_LEN] {
 ///   not happen in practice for in-memory inputs of any size; rusqlite
 ///   already bounds content length).
 pub fn encrypt(content: &str, recipient_pk: &PublicKey) -> Result<Envelope> {
+    encrypt_bytes(content.as_bytes(), recipient_pk)
+}
+
+/// Byte-oriented core of [`encrypt`]. Seals arbitrary `plaintext` bytes to
+/// `recipient_pk` under the `0x02` ECDH+HKDF envelope scheme. Shared by
+/// [`encrypt`] (content sealing) and the #1956 per-record DEK wrap in
+/// [`seal_content_per_record`] (wrapping a DEK under the per-agent master KEK).
+///
+/// # Errors
+/// * Returns `Err` when the underlying AEAD encrypt call fails.
+pub(crate) fn encrypt_bytes(plaintext: &[u8], recipient_pk: &PublicKey) -> Result<Envelope> {
     let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
     let shared = ephemeral_secret.diffie_hellman(recipient_pk);
@@ -444,7 +500,7 @@ pub fn encrypt(content: &str, recipient_pk: &PublicKey) -> Result<Envelope> {
         .encrypt(
             nonce,
             Payload {
-                msg: content.as_bytes(),
+                msg: plaintext,
                 aad: &aad,
             },
         )
@@ -472,6 +528,18 @@ pub fn encrypt(content: &str, recipient_pk: &PublicKey) -> Result<Envelope> {
 ///   write path always feeds `&str`, so a UTF-8 failure on read is a
 ///   corruption signal.
 pub fn decrypt(envelope: &Envelope, my_sk: &StaticSecret) -> Result<String> {
+    let plaintext = decrypt_bytes(envelope, my_sk)?;
+    String::from_utf8(plaintext).context("decrypted plaintext is not valid UTF-8")
+}
+
+/// Byte-oriented core of [`decrypt`]. Recovers the raw plaintext bytes from
+/// an `0x02` envelope. Shared by [`decrypt`] (content, which then enforces
+/// UTF-8) and the #1956 [`unwrap_record_key`] (recovering a per-record DEK,
+/// which is raw key bytes, not UTF-8).
+///
+/// # Errors
+/// * Returns `Err` when AEAD authentication / decryption fails.
+pub(crate) fn decrypt_bytes(envelope: &Envelope, my_sk: &StaticSecret) -> Result<Vec<u8>> {
     let ephemeral_public = PublicKey::from(envelope.ephemeral_pub);
     let shared = my_sk.diffie_hellman(&ephemeral_public);
 
@@ -481,7 +549,7 @@ pub fn decrypt(envelope: &Envelope, my_sk: &StaticSecret) -> Result<String> {
 
     let nonce = Nonce::from_slice(&envelope.nonce);
     let aad = envelope_aad(&envelope.ephemeral_pub);
-    let plaintext = cipher
+    cipher
         .decrypt(
             nonce,
             Payload {
@@ -489,9 +557,7 @@ pub fn decrypt(envelope: &Envelope, my_sk: &StaticSecret) -> Result<String> {
                 aad: &aad,
             },
         )
-        .map_err(|e| anyhow!("ChaCha20-Poly1305 decrypt failed (authentication): {e}"))?;
-
-    String::from_utf8(plaintext).context("decrypted plaintext is not valid UTF-8")
+        .map_err(|e| anyhow!("ChaCha20-Poly1305 decrypt failed (authentication): {e}"))
 }
 
 /// Consult the [encryption].at_rest config flag OR the
@@ -549,9 +615,85 @@ pub(crate) fn seal_content(content: &str, agent_id: &str) -> Result<Option<(Vec<
             "at-rest encryption enabled but memory has no agent_id to key encryption to (fail-closed)"
         ));
     }
+    // #1956 [R56] — seal under a per-record DEK wrapped by the per-agent
+    // master KEK (envelope version 0x03) so the record is CRYPTO-ERASABLE
+    // (destroy the wrapped DEK → ciphertext permanently unrecoverable).
     let kp = get_or_create_keypair(agent_id)?;
-    let env = encrypt(content, &kp.public)?;
-    Ok(Some((env.to_bytes(), String::new())))
+    let sealed = seal_content_per_record(content, &kp.public)?;
+    Ok(Some((sealed, String::new())))
+}
+
+/// #1956 [R56] — seal `content` under a fresh random per-record DEK, wrap
+/// the DEK under the recipient master KEK, and return the self-describing
+/// `0x03` [`RECORD_ENVELOPE_VERSION`] envelope bytes for `encrypted_envelope`.
+/// See [`RECORD_ENVELOPE_VERSION`] for the wire layout.
+///
+/// # Errors
+/// * Returns `Err` when the inner AEAD seal or the DEK-wrap fails.
+pub fn seal_content_per_record(content: &str, recipient_pk: &PublicKey) -> Result<Vec<u8>> {
+    // 1. Fresh random per-record DEK.
+    let mut dek = [0u8; RECORD_DEK_LEN];
+    OsRng.fill_bytes(&mut dek);
+
+    // 2. Seal the content under the DEK (ChaCha20-Poly1305, random nonce,
+    //    scheme-version AAD).
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&dek));
+    let mut inner_nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut inner_nonce);
+    let inner_ct = cipher
+        .encrypt(
+            Nonce::from_slice(&inner_nonce),
+            Payload {
+                msg: content.as_bytes(),
+                aad: RECORD_INNER_AAD,
+            },
+        )
+        .map_err(|e| anyhow!("per-record content seal failed: {e}"))?;
+
+    // 3. Wrap the DEK under the recipient master KEK (reuse the 0x02 scheme).
+    let wrapped = encrypt_bytes(&dek, recipient_pk)?.to_bytes();
+    dek.zeroize();
+
+    // 4. Assemble the 0x03 envelope: [ver][wrapped_len u16 BE][wrapped][nonce][ct].
+    let wrapped_len = u16::try_from(wrapped.len())
+        .map_err(|_| anyhow!("wrapped DEK length {} exceeds u16", wrapped.len()))?;
+    let mut out = Vec::with_capacity(1 + 2 + wrapped.len() + NONCE_LEN + inner_ct.len());
+    out.push(RECORD_ENVELOPE_VERSION);
+    out.extend_from_slice(&wrapped_len.to_be_bytes());
+    out.extend_from_slice(&wrapped);
+    out.extend_from_slice(&inner_nonce);
+    out.extend_from_slice(&inner_ct);
+    Ok(out)
+}
+
+/// #1956 [R56] — the CRYPTO-ERASED envelope marker (`[0x04]`). Overwriting
+/// a record's `encrypted_envelope` with these bytes DESTROYS the embedded
+/// wrapped DEK, so the prior ciphertext is permanently unrecoverable even by
+/// a holder of the master KEK. Reads of an erased envelope fail-closed via
+/// [`open_content`].
+#[must_use]
+pub fn crypto_erase_marker() -> Vec<u8> {
+    vec![ERASED_ENVELOPE_VERSION]
+}
+
+/// #1956 [R56] — is this `encrypted_envelope` a per-record (`0x03`) envelope
+/// whose embedded wrapped DEK can be DESTROYED to crypto-erase the record?
+///
+/// `true` ONLY for the `0x03` per-record scheme. Legacy `0x02` per-agent rows
+/// (content sealed directly to the shared agent key — no per-record key to
+/// destroy) return `false`: they are the HONEST-LIMIT case (row-delete +
+/// tombstone only, NOT crypto-erasable). An empty / already-erased (`0x04`)
+/// envelope also returns `false`.
+#[must_use]
+pub fn envelope_is_crypto_erasable(envelope_bytes: &[u8]) -> bool {
+    envelope_bytes.first() == Some(&RECORD_ENVELOPE_VERSION)
+}
+
+/// #1956 [R56] — has this `encrypted_envelope` already been crypto-erased
+/// (rewritten to the `0x04` marker)? A read of such a row fails-closed.
+#[must_use]
+pub fn envelope_is_erased(envelope_bytes: &[u8]) -> bool {
+    envelope_bytes.first() == Some(&ERASED_ENVELOPE_VERSION)
 }
 
 /// #228 Commit B — decrypt an at-rest envelope back to plaintext content.
@@ -569,9 +711,72 @@ pub(crate) fn seal_content(content: &str, agent_id: &str) -> Result<Option<(Vec<
 ///   caller maps this to a fail-closed read error — never substitutes
 ///   the placeholder for the plaintext.
 pub(crate) fn open_content(envelope_bytes: &[u8], agent_id: &str) -> Result<String> {
-    let env = Envelope::from_bytes(envelope_bytes)?;
+    // #1956 [R56] — dispatch on the leading scheme-version byte.
+    match envelope_bytes.first() {
+        Some(&ERASED_ENVELOPE_VERSION) => Err(anyhow!(
+            "record has been crypto-erased (envelope key destroyed); content is unrecoverable"
+        )),
+        Some(&RECORD_ENVELOPE_VERSION) => open_content_per_record(envelope_bytes, agent_id),
+        // 0x02 legacy per-agent scheme (and any other value → Envelope::from_bytes
+        // rejects unknown versions with a typed error).
+        _ => {
+            let env = Envelope::from_bytes(envelope_bytes)?;
+            let kp = get_or_create_keypair(agent_id)?;
+            decrypt(&env, &kp.secret)
+        }
+    }
+}
+
+/// #1956 [R56] — recover plaintext from a per-record (`0x03`) envelope: unwrap
+/// the embedded DEK with the agent master KEK, then decrypt the inner content.
+fn open_content_per_record(envelope_bytes: &[u8], agent_id: &str) -> Result<String> {
+    // Parse [ver][wrapped_len u16 BE][wrapped][nonce 12][ct].
+    let header = 1 + 2;
+    if envelope_bytes.len() < header {
+        return Err(anyhow!("per-record envelope too short for header"));
+    }
+    let wrapped_len = usize::from(u16::from_be_bytes([envelope_bytes[1], envelope_bytes[2]]));
+    let wrapped_end = header + wrapped_len;
+    let nonce_end = wrapped_end + NONCE_LEN;
+    if envelope_bytes.len() < nonce_end + TAG_LEN {
+        return Err(anyhow!(
+            "per-record envelope too short: len {} < {}",
+            envelope_bytes.len(),
+            nonce_end + TAG_LEN
+        ));
+    }
+    let wrapped = &envelope_bytes[header..wrapped_end];
+    let inner_nonce = &envelope_bytes[wrapped_end..nonce_end];
+    let inner_ct = &envelope_bytes[nonce_end..];
+
+    // Unwrap the DEK under the per-agent master KEK.
     let kp = get_or_create_keypair(agent_id)?;
-    decrypt(&env, &kp.secret)
+    let mut dek = unwrap_record_key(wrapped, &kp.secret)?;
+    if dek.len() != RECORD_DEK_LEN {
+        dek.zeroize();
+        return Err(anyhow!("unwrapped DEK has wrong length"));
+    }
+
+    // Decrypt the inner content under the DEK.
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&dek));
+    dek.zeroize();
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(inner_nonce),
+            Payload {
+                msg: inner_ct,
+                aad: RECORD_INNER_AAD,
+            },
+        )
+        .map_err(|e| anyhow!("per-record content decrypt failed (authentication): {e}"))?;
+    String::from_utf8(plaintext).context("decrypted plaintext is not valid UTF-8")
+}
+
+/// #1956 [R56] — unwrap a per-record DEK from its `0x02` wrapping envelope
+/// bytes using the recipient master KEK secret.
+fn unwrap_record_key(wrapped: &[u8], my_sk: &StaticSecret) -> Result<Vec<u8>> {
+    let env = Envelope::from_bytes(wrapped).context("parse wrapped DEK envelope")?;
+    decrypt_bytes(&env, my_sk)
 }
 
 #[cfg(test)]
@@ -824,5 +1029,91 @@ mod tests {
         let bytes = env.to_bytes();
         let recovered = open_content(&bytes, agent).expect("open_content");
         assert_eq!(recovered, plaintext);
+    }
+
+    // --- #1956 [R56] — per-record DEK envelope + crypto-erase ---
+
+    #[test]
+    fn per_record_envelope_round_trips_via_open_content() {
+        // #1956 — a 0x03 per-record envelope decrypts back to the plaintext
+        // via the agent master KEK (open_content dispatches on the version byte).
+        let agent = "r56-per-record-roundtrip";
+        let kp = get_or_create_keypair(agent).expect("keypair");
+        let plaintext = "per-record DEK sealed content — #1956";
+        let sealed = seal_content_per_record(plaintext, &kp.public).expect("seal");
+        assert_eq!(
+            sealed[0], RECORD_ENVELOPE_VERSION,
+            "must be a 0x03 envelope"
+        );
+        assert!(envelope_is_crypto_erasable(&sealed));
+        let recovered = open_content(&sealed, agent).expect("open");
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn crypto_erase_makes_per_record_ciphertext_unrecoverable() {
+        // #1956 CORE PROPERTY — destroying the wrapped DEK (rewriting the
+        // envelope to the 0x04 marker) makes the prior ciphertext permanently
+        // unrecoverable, even with the correct agent master KEK in hand.
+        let agent = "r56-crypto-erase";
+        let kp = get_or_create_keypair(agent).expect("keypair");
+        let sealed = seal_content_per_record("secret to be shredded", &kp.public).expect("seal");
+        // Pre-erase: readable.
+        assert!(open_content(&sealed, agent).is_ok());
+        // Erase: overwrite with the destroy marker.
+        let erased = crypto_erase_marker();
+        assert!(envelope_is_erased(&erased));
+        assert!(!envelope_is_crypto_erasable(&erased));
+        // Post-erase: fail-closed, unrecoverable — even the KEK holder cannot read it.
+        let err = open_content(&erased, agent).expect_err("erased envelope must not open");
+        assert!(
+            format!("{err}").contains("crypto-erased"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_v2_envelope_is_not_crypto_erasable_but_still_readable() {
+        // #1956 HONEST-LIMIT — a legacy 0x02 per-agent envelope has NO
+        // per-record key to destroy, so it is NOT crypto-erasable; it stays
+        // readable (open_content routes it through the legacy path).
+        let agent = "r56-legacy-v2";
+        let kp = get_or_create_keypair(agent).expect("keypair");
+        let legacy = encrypt("legacy per-agent sealed", &kp.public)
+            .expect("encrypt")
+            .to_bytes();
+        assert_eq!(legacy[0], ENVELOPE_VERSION);
+        assert!(
+            !envelope_is_crypto_erasable(&legacy),
+            "0x02 legacy rows are NOT per-record crypto-erasable"
+        );
+        let recovered = open_content(&legacy, agent).expect("legacy still opens");
+        assert_eq!(recovered, "legacy per-agent sealed");
+    }
+
+    #[test]
+    fn crypto_erasable_predicate_rejects_empty_and_erased() {
+        assert!(!envelope_is_crypto_erasable(&[]));
+        assert!(!envelope_is_crypto_erasable(&crypto_erase_marker()));
+        assert!(!envelope_is_erased(&[]));
+    }
+
+    #[test]
+    fn seal_content_produces_per_record_envelope_when_enabled() {
+        // #1956 — the storage-facing seal_content helper now emits 0x03
+        // envelopes when at-rest encryption is enabled.
+        let prev = std::env::var("AI_MEMORY_ENCRYPT_AT_REST").ok();
+        // SAFETY: single-threaded test env mutation with restore below.
+        unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
+        let sealed = seal_content("hello per-record", "r56-seal-enabled").expect("seal");
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", v) };
+        } else {
+            unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+        }
+        let (bytes, placeholder) = sealed.expect("encryption enabled => Some");
+        assert_eq!(placeholder, "");
+        assert_eq!(bytes[0], RECORD_ENVELOPE_VERSION);
+        assert!(envelope_is_crypto_erasable(&bytes));
     }
 }

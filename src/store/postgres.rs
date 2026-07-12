@@ -16849,6 +16849,39 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("forget scrub cid_genesis", e))?;
 
+        // #1956 [R56] — CRYPTO-ERASE the per-record envelope key for every
+        // encrypted (0x03) row this forget will reap, BEFORE the delete
+        // (postgres parity with the sqlite `crypto_erase_record_envelope`).
+        // Overwriting the envelope with the destroy marker destroys the
+        // embedded wrapped DEK so the ciphertext is cryptographically
+        // unrecoverable even by a holder of the master KEK; the marker
+        // propagates to replicas / WAL as an UPDATE ahead of the tombstoning
+        // delete. `get_byte(...,0) = 3` selects only per-record envelopes —
+        // legacy 0x02 per-agent rows have no per-record key to destroy (the
+        // honest limit) and are left for row-delete + tombstone only. The
+        // predicate matches the DELETE's victim set EXACTLY. RETURNING id so
+        // the erasure-kind of each victim is known for the attestation below.
+        let erased_ids: Vec<(String,)> = sqlx::query_as(
+            "UPDATE memories SET encrypted_envelope = $4
+             WHERE encrypted_envelope IS NOT NULL
+               AND get_byte(encrypted_envelope, 0) = 3
+               AND ($1::text IS NULL OR namespace = $1)
+               AND ($2::text IS NULL OR tier = $2)
+               AND ($3::text IS NULL
+                    OR title ILIKE $3
+                    OR content ILIKE $3)
+             RETURNING id",
+        )
+        .bind(namespace)
+        .bind(tier_str.as_deref())
+        .bind(pattern_like.as_deref())
+        .bind(crate::encryption::crypto_erase_marker())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("forget crypto-erase envelope", e))?;
+        let erased_set: std::collections::HashSet<String> =
+            erased_ids.into_iter().map(|(id,)| id).collect();
+
         // #1783 — RETURNING id so the deleted set is known for AGE
         // unprojection in THIS tx (the projection commits atomically with
         // the cascade delete; ghost edges never appear).
@@ -16922,6 +16955,52 @@ impl MemoryStore for PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("forget record tombstones", e))?;
+
+            // #1956 [R56] — signed `substrate.crypto_erase` erasure attestation
+            // per victim IN THIS tx (postgres parity with the sqlite
+            // `emit_crypto_erase_attestation`). Commits {id, erasure-kind,
+            // actor, timestamp}: `key-destroyed` when the row's per-record
+            // envelope key was destroyed above, else `row-deleted-tombstoned`
+            // (the honest plaintext / legacy-0x02 limit). Chained + verified by
+            // `verify_audit_trail` like every other signed event.
+            let erase_ts = chrono::Utc::now();
+            let erase_ts_str = erase_ts.to_rfc3339();
+            for (id, _ns, agent) in &deleted {
+                let kind = if erased_set.contains(id) {
+                    crate::storage::ErasureKind::KeyDestroyed
+                } else {
+                    crate::storage::ErasureKind::RowDeletedTombstoned
+                };
+                let actor = agent
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(crate::storage::CRYPTO_ERASE_ACTOR_FORGET);
+                let signable =
+                    crate::storage::crypto_erase_signable_bytes(id, kind, actor, &erase_ts_str);
+                let ph = crate::signed_events::payload_hash(&signable);
+                let event = crate::signed_events::SignedEvent::with_daemon_signature(
+                    ph,
+                    actor.to_string(),
+                    crate::signed_events::event_types::SUBSTRATE_CRYPTO_ERASE.to_string(),
+                    erase_ts_str.clone(),
+                    None,
+                );
+                pg_append_signed_event_with_chain_in_tx(
+                    &mut tx,
+                    PgSignedEventInsert {
+                        id: &event.id,
+                        agent_id: &event.agent_id,
+                        event_type: &event.event_type,
+                        payload_hash: &event.payload_hash,
+                        signature: event.signature.as_deref(),
+                        attest_level: &event.attest_level,
+                        timestamp: erase_ts,
+                        cause_hash: None,
+                    },
+                )
+                .await
+                .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
+            }
 
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
             // append ONE identity-only FORGET leaf per deleted id IN THIS
