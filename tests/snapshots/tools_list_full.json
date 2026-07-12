@@ -2403,7 +2403,31 @@
     {
       "description": "Approve a pending action",
       "inputSchema": {
+        "definitions": {
+          "ApproverSignatureArg": {
+            "properties": {
+              "pubkey": {
+                "default": "",
+                "type": "string"
+              },
+              "signature": {
+                "default": "",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
         "properties": {
+          "approvals": {
+            "items": {
+              "$ref": "#/definitions/ApproverSignatureArg"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
