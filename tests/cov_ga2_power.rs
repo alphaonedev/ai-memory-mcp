@@ -1,7 +1,7 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! cov_ga2_power — CodeGraph-directed coverage backfill for the three
+//! `cov_ga2_power` — CodeGraph-directed coverage backfill for the three
 //! "power" surfaces below 90% line coverage at the GA-2 measurement
 //! (`.local-runs/ga-session-0611/gaps/`):
 //!
