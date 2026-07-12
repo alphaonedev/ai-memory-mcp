@@ -34,7 +34,7 @@ The Fable window was spent on decisions-over-code: every signed-bytes/persisted-
 
 ### 1.3 Specs committed to main (your implementation targets)
 - [`docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md`](format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md) — the R24 verifier target consolidating all 8 format decisions; ATTESTABLE/ESTIMABLE tagged. **Build against this, not the memories.**
-- [`docs/spec/v2-draft.md`](../spec/v2-draft.md) — Portability Spec v2 @ v78 (L1/L2/L3 conformance; ≥2 non-Rust verifying readers).
+- [`docs/spec/PORTABILITY-V2.md`](../spec/PORTABILITY-V2.md) — Portability Spec v2, finalized @ v80 from the v78 draft (L1/L2/L3 conformance; ≥2 non-Rust verifying readers shipped under `conformance/readers/`).
 
 ---
 
