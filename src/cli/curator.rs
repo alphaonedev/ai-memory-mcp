@@ -815,6 +815,11 @@ async fn run_reflect(
         || crate::identity::sentinels::AI_CURATOR.to_string(),
         |k| k.agent_id.clone(),
     );
+    // v0.10.0 Gate-1' (#1952 / #1972) — one-shot advisory when the probe mode
+    // is unset/off: v1.0.0 defaults the decorrelation probe to advisory (per
+    // D3-021) and enforce-as-default is the tracked v1.x lane. No behaviour
+    // change; the probe step below still early-returns when the mode is off.
+    config::warn_reflect_decorrelation_default_once();
     run_decorrelation_probe_step(
         store.as_ref(),
         &decorrelation_agent_id,

@@ -4238,6 +4238,15 @@ pub async fn bootstrap_serve(
         }
     }
 
+    // v0.10.0 Gate-1' WARN carriers (#1972): the deprecation / secure-default
+    // -flip boot WARNs. Each is a one-shot that self-suppresses unless its
+    // condition holds — the RECALL_TOUCH_SYNC removal WARN fires only when the
+    // deprecated knob is set (#1953); the federation write-sig / signal-sig
+    // flip WARNs fire only when their knobs are UNSET (#1954). Neither flips
+    // any default this release.
+    crate::config::warn_recall_touch_sync_deprecation_once();
+    crate::federation::receive_auth::warn_fed_sig_default_flip_once();
+
     let resolved_ttl = app_config.effective_ttl();
     let archive_on_gc = app_config.effective_archive_on_gc();
     let conn = db::open(db_path)?;
