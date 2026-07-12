@@ -610,6 +610,53 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
+/// v1.0.0 G28 (#1838) — fail-closed forbidden-export-class filter for the
+/// corpus-export egress. Drops any memory whose serialized row is classified
+/// into a [`crate::export_taxonomy::ForbiddenExportClass`] (private key
+/// material / master-threshold secret / governance signing key / a
+/// producer-tagged biometric embedding) so it never leaves in the clear.
+/// When `audit_conn` is `Some` (the sqlite export path) each drop emits a
+/// signed `export.forbidden_class_refused` row; the postgres path has no
+/// rusqlite handle and WARN-only skips the audit row (documented honest
+/// boundary) — the DROP itself always holds.
+fn screen_exported_memories(
+    memories: Vec<crate::models::Memory>,
+    audit_conn: Option<&rusqlite::Connection>,
+) -> Vec<crate::models::Memory> {
+    memories
+        .into_iter()
+        .filter(|m| {
+            let Some(class) = crate::export_taxonomy::classify_memory(m) else {
+                return true;
+            };
+            let path = format!("memories/{}.json", m.id);
+            let reason = format!(
+                "export refused: memory classified {} ({}) — dropped from export artifact",
+                class.as_str(),
+                class.description()
+            );
+            if let Some(conn) = audit_conn {
+                if let Err(e) = crate::export_taxonomy::emit_export_refusal(
+                    conn,
+                    class,
+                    &path,
+                    crate::identity::sentinels::DAEMON_PRINCIPAL,
+                    &reason,
+                ) {
+                    tracing::warn!(
+                        "forbidden-export-class signed refusal NOT recorded for {path}: {e}"
+                    );
+                }
+            }
+            tracing::warn!(
+                "export boundary dropped a {} memory — {path} withheld fail-closed",
+                class.as_str()
+            );
+            false
+        })
+        .collect()
+}
+
 pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     // #957 (security-critical, 2026-05-20) — admin-role gate.
     // Pre-#957 the handler took NO headers, accepted no caller, and
@@ -655,6 +702,11 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
         };
+        // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed).
+        // The postgres export has no rusqlite audit handle, so the signed
+        // refusal is skipped with a WARN (documented honest boundary); the
+        // fail-closed DROP still holds so a forbidden-class row never leaves.
+        let mems = screen_exported_memories(mems, None);
         let links = match app.store.export_links().await {
             Ok(v) => v,
             Err(e) => return store_err_to_response(e),
@@ -674,6 +726,10 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
     let lock = app.db.lock().await;
     match (db::export_all(&lock.0), db::export_links(&lock.0)) {
         (Ok(memories), Ok(links)) => {
+            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed);
+            // sqlite path holds the audit connection so a drop emits a signed
+            // `export.forbidden_class_refused` row.
+            let memories = screen_exported_memories(memories, Some(&lock.0));
             let count = memories.len();
             Json(json!({"memories": memories, "links": links, "count": count, (field_names::EXPORTED_AT): Utc::now().to_rfc3339()})).into_response()
         }
@@ -979,4 +1035,130 @@ pub async fn tools_list(State(app): State<AppState>) -> impl IntoResponse {
     // MCP JSON-RPC payload exactly.
     let defs = crate::mcp::tool_definitions_for_profile(app.profile.as_ref());
     (StatusCode::OK, Json(defs)).into_response()
+}
+
+// v1.0.0 G28 (#1838) — direct unit coverage for the fail-closed
+// `screen_exported_memories` corpus-export filter. These exercise the
+// helper's branches that the HTTP export path cannot reach without a live
+// backend — in particular the `audit_conn = None` arm the postgres SAL
+// export path takes (WARN-only, no rusqlite handle). test-cfg-test-module
+// (co-located `#[cfg(test)] mod`), test-use-super (parent-item access),
+// test-descriptive-names, test-arrange-act-assert.
+#[cfg(test)]
+mod g28_export_screen_tests {
+    use super::*;
+    use crate::models::Memory;
+    use crate::signed_events::event_types::EXPORT_FORBIDDEN_CLASS_REFUSED;
+
+    /// A benign row that classifies clean under the export taxonomy.
+    fn clean_memory(id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            content: "an ordinary memory about a standup".to_string(),
+            ..Memory::default()
+        }
+    }
+
+    /// A row that classifies `PrivateKeyMaterial` (PEM armor mis-stored in
+    /// content — the belt-and-suspenders case the gate exists for).
+    fn pem_key_memory(id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            content: "leaked:\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END".to_string(),
+            ..Memory::default()
+        }
+    }
+
+    /// A row tagged `BiometricBehavioralEmbedding` by the producer-side
+    /// metadata tag.
+    fn biometric_memory(id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            metadata: serde_json::json!({"scope": "collective", "embedding_class": "biometric"}),
+            ..Memory::default()
+        }
+    }
+
+    fn refusal_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            rusqlite::params![EXPORT_FORBIDDEN_CLASS_REFUSED],
+            |r| r.get(0),
+        )
+        .expect("count refusal rows")
+    }
+
+    #[test]
+    fn clean_corpus_is_a_no_op_and_emits_no_refusal() {
+        // Arrange: all-clean corpus + an audit connection.
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
+        let corpus = vec![clean_memory("a"), clean_memory("b")];
+
+        // Act.
+        let kept = screen_exported_memories(corpus, Some(&conn));
+
+        // Assert: every row survives; no refusal row appended.
+        assert_eq!(kept.len(), 2, "clean rows must all pass the screen");
+        assert_eq!(refusal_count(&conn), 0, "no refusal row for a clean corpus");
+    }
+
+    #[test]
+    fn sqlite_branch_screens_forbidden_row_and_emits_signed_refusal() {
+        // Arrange: two clean rows + one PEM-key row; audit conn present
+        // (the sqlite export path).
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
+        let corpus = vec![
+            clean_memory("keep-1"),
+            pem_key_memory("forbidden"),
+            clean_memory("keep-2"),
+        ];
+
+        // Act.
+        let kept = screen_exported_memories(corpus, Some(&conn));
+
+        // Assert: the forbidden row is dropped, the clean rows remain, and
+        // exactly one signed refusal row witnesses the redaction.
+        assert_eq!(kept.len(), 2, "forbidden row must be screened out");
+        assert!(
+            kept.iter().all(|m| m.id != "forbidden"),
+            "the PEM-key row must be absent from the export set"
+        );
+        assert_eq!(refusal_count(&conn), 1, "one signed refusal emitted");
+    }
+
+    #[test]
+    fn postgres_branch_none_audit_conn_still_screens_without_a_refusal_row() {
+        // Arrange: the postgres SAL export path calls the helper with
+        // `audit_conn = None` (no rusqlite handle). A biometric-tagged row
+        // must STILL be screened out; the signed refusal is WARN-only
+        // skipped (honest-boundary note). A separate conn only lets us
+        // prove no row leaked onto a chain.
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
+        let corpus = vec![clean_memory("ok"), biometric_memory("bio")];
+
+        // Act: None audit conn — the postgres arm.
+        let kept = screen_exported_memories(corpus, None);
+
+        // Assert: fail-closed drop still holds with no audit connection.
+        assert_eq!(kept.len(), 1, "biometric row screened out even on pg path");
+        assert_eq!(kept[0].id, "ok");
+        assert_eq!(
+            refusal_count(&conn),
+            0,
+            "None audit conn writes no refusal row anywhere"
+        );
+    }
+
+    #[test]
+    fn most_severe_forbidden_class_is_dropped_when_row_matches_several() {
+        // A row carrying BOTH a biometric tag and PEM key material is still
+        // a single drop (defense-in-depth): the row never exports.
+        let conn = crate::storage::open(std::path::Path::new(":memory:")).expect("open");
+        let mut both = pem_key_memory("both");
+        both.metadata = serde_json::json!({"embedding_class": "biometric"});
+        let kept = screen_exported_memories(vec![clean_memory("x"), both], Some(&conn));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, "x");
+        assert_eq!(refusal_count(&conn), 1);
+    }
 }

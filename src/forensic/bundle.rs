@@ -479,7 +479,28 @@ pub fn build_files(
                 confidence_decayed_at: mem.confidence_decayed_at.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&env).context("serialise MemoryEnvelope")?;
-            files.insert(format!("memories/{}.json", mem.id), bytes);
+            let path = format!("memories/{}.json", mem.id);
+            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed).
+            // The secret-screen above masks CREDENTIAL content; this class
+            // gate refuses a whole envelope whose content/metadata is
+            // classified private key material / master-threshold secret /
+            // governance signing key / a producer-tagged biometric embedding.
+            // Structurally these live in the key-dir, not the DB, so a hit
+            // means a mis-stored secret rode a memory row — it is SKIPPED
+            // (never bundled in the clear) and a signed refusal is emitted.
+            let record = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!(null));
+            if crate::export_taxonomy::screen_export_value_audited(
+                conn,
+                &path,
+                crate::identity::sentinels::DAEMON_PRINCIPAL,
+                &record,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            files.insert(path, bytes);
         }
     }
 
