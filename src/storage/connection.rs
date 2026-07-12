@@ -94,6 +94,15 @@ pub fn open(path: &Path) -> Result<Connection> {
     migrate(&conn)?;
     apply_check_constraint_triggers(&conn)
         .context("failed to apply R1-M2 CHECK-constraint triggers")?;
+    // v1.0.0 #1946 (A1) — OPEN-TIME rollback-evidence head check. `db::open`
+    // is the funnel every interface (CLI per-command, HTTP daemon, MCP stdio)
+    // crosses; `open_read_only` is exempt (the writer's open already checked).
+    // DEFAULT: emit evidence + WARN and CONTINUE (no self-DOS on legit DR).
+    // REQUIRE-MODE (`AI_MEMORY_REQUIRE_ROLLBACK_CHECK`): refuse the open. A
+    // deployment with no enrolled witness key has no off-table anchor → the
+    // check withholds (Unknown) and this is a silent no-op.
+    crate::governance::audit::enforce_rollback_check_at_open(&conn)
+        .context("open-time rollback-evidence check")?;
     Ok(conn)
 }
 

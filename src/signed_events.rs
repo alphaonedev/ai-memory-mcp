@@ -445,6 +445,14 @@ impl SignedEvent {
 /// All-zeros 32-byte digest used as `prev_hash` for the first row.
 pub const ZERO_HASH: [u8; 32] = [0u8; 32];
 
+/// SQL that reads the `signed_events` chain HEAD — the highest surviving
+/// `sequence` in the whole table (`NULL`/empty → 0). Shared SSOT so the
+/// sqlite `verify_audit_trail`, the postgres twin, the #1946 open-time
+/// rollback check, and the `audit restore-attest` CLI all read the head
+/// identically (pm-v3.1 literal de-dup). Bind-parameter-free (no `?`/`$1`).
+pub const CHAIN_HEAD_SQL: &str =
+    "SELECT COALESCE(MAX(sequence), 0) FROM signed_events WHERE sequence IS NOT NULL";
+
 /// Field separator formerly used by [`canonical_chain_bytes`]. ASCII 0x1F
 /// ("Unit Separator"). RETAINED as the delimiter of the v73 cause pre-image
 /// ([`compute_cause_hash`] / [`signing_input_bytes`]), where every joined
@@ -1217,6 +1225,89 @@ pub enum CauseBinding {
     },
 }
 
+/// v1.0.0 #1946 (A1 · §5.1) — verdict of the OFF-TABLE rollback-evidence
+/// check: the surviving `signed_events` head vs the witness-signed off-table
+/// head-anchor high-water, computed by [`compute_rollback_verdict`].
+///
+/// - [`Unknown`](RollbackCheck::Unknown) — no pinnable off-table anchor (no
+///   witness key enrolled, no anchor log, or an unpinnable one): verdict
+///   withheld (default posture — never a false all-clear).
+/// - [`NotDetected`](RollbackCheck::NotDetected) — the anchor was pinned and
+///   the DB head is `>=` the anchored high-water: no rollback evidence.
+/// - [`Evidence`](RollbackCheck::Evidence) — the DB head is strictly BELOW the
+///   anchored high-water and NO operator sanction explains it: the DB file was
+///   rolled back (or a whole-host snapshot restore that was not attested).
+/// - [`Sanctioned`](RollbackCheck::Sanctioned) — the DB head is below the
+///   anchor but a valid OPERATOR-signed restore sanction attests it (a
+///   legitimate DR restore): cleared, NOT dirty.
+/// - [`Missing`](RollbackCheck::Missing) — require-mode
+///   ([`crate::governance::audit::REQUIRE_ROLLBACK_CHECK_ENV`]) is on but no
+///   pinnable anchor is available: fail-closed (dirty).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RollbackCheck {
+    /// No pinnable off-table anchor — verdict withheld (default posture).
+    Unknown,
+    /// Anchor pinned; DB head `>=` anchored high-water — no rollback evidence.
+    NotDetected,
+    /// DB head below the anchor with no operator sanction — rollback evidence.
+    Evidence {
+        /// Highest witness-signed head anchored off-table.
+        anchored_head: i64,
+        /// Surviving `signed_events` head in the DB.
+        db_head: i64,
+    },
+    /// DB head below the anchor but OPERATOR-sanctioned (attested DR restore).
+    Sanctioned {
+        /// Off-table anchor high-water the sanction attests a restore FROM.
+        anchored_head: i64,
+        /// Surviving DB head inside the operator-attested restore window.
+        db_head: i64,
+    },
+    /// Require-mode on but no pinnable off-table anchor (fail-closed).
+    Missing,
+}
+
+/// v1.0.0 #1946 — compute the [`RollbackCheck`] verdict from the surviving
+/// `db_head`, the pinned off-table `anchored_head` (`None` = absent /
+/// unpinnable), whether an operator sanction clears a below-anchor head, and
+/// the require-mode flag. Pure (no I/O) so the refuse-vs-continue policy is
+/// unit-testable; the I/O wrapper is
+/// [`crate::governance::audit::compute_rollback_verdict_for_report`]. SHARED by
+/// both backends' `verify_audit_trail` (K3 parity) and the open-time check.
+#[must_use]
+pub fn compute_rollback_verdict(
+    db_head: i64,
+    anchored_head: Option<i64>,
+    sanctioned: bool,
+    require: bool,
+) -> RollbackCheck {
+    match anchored_head {
+        None => {
+            if require {
+                RollbackCheck::Missing
+            } else {
+                RollbackCheck::Unknown
+            }
+        }
+        Some(anchored) => {
+            if db_head >= anchored {
+                RollbackCheck::NotDetected
+            } else if sanctioned {
+                RollbackCheck::Sanctioned {
+                    anchored_head: anchored,
+                    db_head,
+                }
+            } else {
+                RollbackCheck::Evidence {
+                    anchored_head: anchored,
+                    db_head,
+                }
+            }
+        }
+    }
+}
+
 /// v0.9.0 G9 (#1826) — verdict of the three-key Recorder/Judge/Stopper
 /// signing-layer SEPARATION check, computed by
 /// [`compute_role_separation_verdict`]. Additive/opt-in: with no role keys
@@ -1513,6 +1604,13 @@ pub struct AuditTrailReport {
     /// IDENTICALLY by both backends via
     /// [`crate::identity::lineage::compute_lineage_check`].
     pub lineage: crate::identity::lineage::LineageCheck,
+    /// v1.0.0 #1946 (A1) — OFF-TABLE rollback-evidence verdict: the surviving
+    /// `signed_events` head vs the witness-signed off-table head-anchor
+    /// high-water. `Unknown` withholds (default — no anchor / no witness key,
+    /// byte-identical legacy); `Evidence` / `Missing` (require-mode) are dirty;
+    /// `Sanctioned` (operator-attested DR) and `NotDetected` are clean. SHARED
+    /// off-table reader on both backends (K3 parity). See [`RollbackCheck`].
+    pub rollback: RollbackCheck,
 }
 
 impl AuditTrailReport {
@@ -1554,6 +1652,13 @@ impl AuditTrailReport {
                 self.lineage,
                 crate::identity::lineage::LineageCheck::Forged { .. }
                     | crate::identity::lineage::LineageCheck::Missing
+            )
+            // v1.0.0 #1946 (A1) — rollback Evidence/Missing (require-mode) are
+            // dirty; Sanctioned (operator-attested DR) / Unknown / NotDetected
+            // keep an otherwise-clean report clean (no anchor = legacy-identical).
+            && !matches!(
+                self.rollback,
+                RollbackCheck::Evidence { .. } | RollbackCheck::Missing
             )
     }
 }
@@ -1642,11 +1747,7 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
     // Chain head — highest sequence in the WHOLE table (independent of
     // the window). `MAX(sequence)` is NULL on an empty table → 0.
     let head_sequence: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM signed_events WHERE sequence IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )
+        .query_row(CHAIN_HEAD_SQL, [], |row| row.get(0))
         .context("verify_audit_trail: read chain head sequence")?;
 
     // v0.8.1 #1850 (CWE-354) — off-table tail-truncation check. The in-DB
@@ -1810,6 +1911,10 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
     let require_lineage = crate::identity::lineage::require_identity_lineage_enabled();
     let lineage = compute_identity_lineage_verdict(conn, require_lineage);
 
+    // v1.0.0 #1946 D — rollback-evidence verdict from the SHARED off-table
+    // anchor reader (identical verdict on the postgres twin, K3 parity).
+    let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
+
     Ok(AuditTrailReport {
         total_events: usize::try_from(report.rows_checked).unwrap_or(usize::MAX),
         chain_intact: report.chain_holds(),
@@ -1823,6 +1928,7 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
         signature_failures: report.signature_failures.clone(),
         role_separation,
         lineage,
+        rollback,
     })
 }
 
@@ -2157,8 +2263,14 @@ fn try_emit_audit_head_witness(
         revisions_head_hash: hex_lower(&mem_hash),
     };
     let now = chrono::Utc::now().timestamp();
-    let cp = witness::build_signed_witness_checkpoint(&dual, now, &keypair)?;
+    // v1.0.0 #1946 A — bind the OSS rollback counter (head sequence) so every
+    // v1.0 witness is a `v: 2` record.
+    let rollback = Some(witness::rollback_counter_for(signed_head_seq));
+    let cp = witness::build_signed_witness_checkpoint(&dual, rollback, now, &keypair)?;
     crate::checkpoints::insert(conn, &cp).context("witness: insert checkpoint")?;
+    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
+    // a whole-DB-file rollback is detectable at the next `db::open`.
+    witness::append_head_anchor(&cp);
     Ok(())
 }
 
@@ -2981,8 +3093,8 @@ mod tests {
             revisions_head_sequence: 3,
             revisions_head_hash: "bb".to_string(),
         };
-        let mut cp =
-            build_signed_witness_checkpoint(&dual, 1_900_000_000, &kp).expect("build witness cp");
+        let mut cp = build_signed_witness_checkpoint(&dual, None, 1_900_000_000, &kp)
+            .expect("build witness cp");
 
         // Positive control: valid, pinned witness whose heads match the DB →
         // NotDetected (no truncation).

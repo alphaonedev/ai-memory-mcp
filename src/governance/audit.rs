@@ -1085,6 +1085,13 @@ pub const WITNESS_RESOLVED_BY: &str = "audit:witness";
 /// Schema version embedded in the witness `resolution` JSON (`"v": N`).
 const WITNESS_RESOLUTION_VERSION: i64 = 1;
 
+/// v1.0.0 #1946 A (§5.1) — schema version stamped when the witness
+/// `resolution` carries the present-only [`RollbackWire`] sub-object. A v1
+/// record (rollback absent) serialises to the EXACT v1 byte layout — its
+/// signature keeps verifying unchanged — while a v2-aware reader
+/// ([`parse_witness_dual_head`]) accepts BOTH `v: 1` and `v: 2`.
+const WITNESS_RESOLUTION_VERSION_V2: i64 = 2;
+
 /// Env that flips the witness verdict to FAIL-CLOSED (require-mode, K2):
 /// when set truthy, a missing / unpinnable witness anchor makes
 /// `verify_audit_trail` dirty instead of withholding judgement (`Unknown`).
@@ -1759,6 +1766,21 @@ struct WitnessHeadWire {
     head_hash: String,
 }
 
+/// v1.0.0 #1946 A (§5.1) — the additive PRESENT-ONLY rollback counter
+/// sub-object bound into [`WitnessResolutionWire`] v2. `value` is the
+/// monotonic counter the witness attests at emission (the `signed_events`
+/// head sequence under the OSS source); `source` names WHERE the
+/// authoritative counter lives, always a named const on the wire
+/// ([`ROLLBACK_SOURCE_WITNESS_LOG`] for the OSS off-table head-anchor log,
+/// [`ROLLBACK_SOURCE_TPM2_NV`] RESERVED-when-present — format only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollbackWire {
+    /// Monotonic counter value at witness emission (OSS: `signed_events` head).
+    pub value: i64,
+    /// Named-const counter source (never a free-form string on the wire).
+    pub source: String,
+}
+
 /// The versioned witness `resolution` wire shape (both chain heads). Field
 /// order = declaration order → deterministic serialisation, so the signature
 /// commits to a stable byte layout.
@@ -1767,13 +1789,28 @@ struct WitnessResolutionWire {
     v: i64,
     signed_events: WitnessHeadWire,
     memory_revisions: WitnessHeadWire,
+    /// v1.0.0 #1946 A (§5.1) — present-only rollback counter sub-object.
+    /// `skip_serializing_if`/`default` keep v1 records BYTE-IDENTICAL: a
+    /// `None` serialises to the exact three-field v1 layout, so an on-disk v1
+    /// witness checkpoint keeps verifying under its original signature. Only a
+    /// v2 emission (rollback present) adds the trailing `rollback` key.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    rollback: Option<RollbackWire>,
 }
 
 /// Serialise a [`WitnessDualHead`] into the versioned `resolution` JSON the
 /// witness signature commits to (via `SignableCheckpointResolution`).
-fn witness_resolution_json(dual: &WitnessDualHead) -> String {
+///
+/// `rollback` present → `v: 2` with the trailing sub-object (§5.1 A); absent
+/// → `v: 1`, byte-identical to every pre-#1946 witness record.
+fn witness_resolution_json(dual: &WitnessDualHead, rollback: Option<RollbackWire>) -> String {
+    let v = if rollback.is_some() {
+        WITNESS_RESOLUTION_VERSION_V2
+    } else {
+        WITNESS_RESOLUTION_VERSION
+    };
     let wire = WitnessResolutionWire {
-        v: WITNESS_RESOLUTION_VERSION,
+        v,
         signed_events: WitnessHeadWire {
             head_sequence: dual.signed_head_sequence,
             head_hash: dual.signed_head_hash.clone(),
@@ -1782,6 +1819,7 @@ fn witness_resolution_json(dual: &WitnessDualHead) -> String {
             head_sequence: dual.revisions_head_sequence,
             head_hash: dual.revisions_head_hash.clone(),
         },
+        rollback,
     };
     // to_string on a fixed-shape struct is infallible in practice.
     serde_json::to_string(&wire).unwrap_or_default()
@@ -1798,7 +1836,9 @@ pub fn parse_witness_dual_head(cp: &crate::models::Checkpoint) -> Option<Witness
     }
     let res = cp.resolution.as_deref()?;
     let wire: WitnessResolutionWire = serde_json::from_str(res).ok()?;
-    if wire.v != WITNESS_RESOLUTION_VERSION {
+    // v1.0.0 #1946 A — a v2-aware reader accepts BOTH the legacy v1 and the
+    // rollback-carrying v2 shape (the dual-head fields are identical).
+    if wire.v != WITNESS_RESOLUTION_VERSION && wire.v != WITNESS_RESOLUTION_VERSION_V2 {
         return None;
     }
     Some(WitnessDualHead {
@@ -1814,11 +1854,16 @@ pub fn parse_witness_dual_head(cp: &crate::models::Checkpoint) -> Option<Witness
 /// `keypair` (the witness signer). The returned checkpoint is ready to
 /// `checkpoints::insert` into either backend.
 ///
+/// `rollback` (v1.0.0 #1946 A, §5.1) binds the present-only monotonic
+/// counter sub-object into the signed resolution (`v: 2`). Pass `None` for
+/// the legacy `v: 1` byte layout (used by the wire byte-compat pin).
+///
 /// # Errors
 /// Propagates the [`crate::checkpoints::sign_resolution_into`] error (a
 /// public-only keypair or a CBOR-encode fault).
 pub fn build_signed_witness_checkpoint(
     dual: &WitnessDualHead,
+    rollback: Option<RollbackWire>,
     now: i64,
     keypair: &crate::identity::keypair::AgentKeypair,
 ) -> Result<crate::models::Checkpoint> {
@@ -1832,7 +1877,7 @@ pub fn build_signed_witness_checkpoint(
         state: CheckpointState::Resolved,
         created_by: WITNESS_RESOLVED_BY.to_string(),
         resolved_by: Some(WITNESS_RESOLVED_BY.to_string()),
-        resolution: Some(witness_resolution_json(dual)),
+        resolution: Some(witness_resolution_json(dual, rollback)),
         resolution_note: None,
         signature: Vec::new(),
         resolver_pubkey: Vec::new(),
@@ -1844,6 +1889,432 @@ pub fn build_signed_witness_checkpoint(
     crate::checkpoints::sign_resolution_into(&mut cp, keypair)
         .context("sign audit-head witness resolution")?;
     Ok(cp)
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.0 #1946 (A1 · decision 5 · `aeb891a4`) — ROLLBACK-EVIDENCE ANCHOR
+// ---------------------------------------------------------------------------
+//
+// The #1822 witness anchor above lives IN the DB (`checkpoints` table), so a
+// whole-DB-FILE rollback rolls the anchor back in lockstep with the head it
+// binds — an in-table anchor structurally cannot witness its own DB's
+// rollback. The net-new control (spec §5.1) is an OFF-TABLE, witness-signed
+// head-anchor log on the [`WITNESS_KEY_DIR_ENV`] mount (a location the daemon
+// can READ but a compromised daemon should not overwrite) plus an OPEN-TIME
+// head check (`db::open`) that compares the DB's surviving head against the
+// off-table high-water mark.
+//
+// HONEST POSTURE (ESTIMABLE, not ATTESTABLE): in the OSS build this is
+// tamper-EVIDENCE, not tamper-PROOF. An imaged-disk attacker who snapshots
+// the whole host (DB file + the sibling anchor log together) rolls both back
+// in lockstep and wins — genuine whole-host resistance needs TPM2 NV or an
+// off-host anchor. So every verdict degrades to WITHHOLD/Unknown rather than
+// ever emitting a false all-clear.
+//
+// DISPOSITION (configurable-both): DEFAULT flag-fork-emit-evidence (never a
+// self-DOS on a legitimate DR restore); REQUIRE-MODE
+// ([`REQUIRE_ROLLBACK_CHECK_ENV`]) refuses to open. A sanctioned-restore
+// ceremony (`ai-memory restore-attest --sign`) records an operator-signed
+// event — the operator signature is the ONLY discriminator between a
+// legitimate DR restore and an attack rollback (at the byte level DR *is* a
+// rollback).
+
+/// v1.0.0 #1946 A — OSS default rollback-counter source: the witness-signed
+/// off-table head-anchor log on the [`WITNESS_KEY_DIR_ENV`] mount. This is the
+/// only source the OSS build emits.
+pub const ROLLBACK_SOURCE_WITNESS_LOG: &str = "witness-head-anchor-log";
+
+/// v1.0.0 #1946 A — RESERVED-when-present rollback-counter source (format
+/// only): a hardware-monotonic TPM2 NV counter. The OSS build never emits or
+/// trusts this value; it is frozen in the wire vocab so a future commercial
+/// build can populate it without a format break.
+pub const ROLLBACK_SOURCE_TPM2_NV: &str = "tpm2-nv";
+
+/// File name of the off-table, append-only, witness-signed head-anchor log
+/// (one serialised [`crate::models::ConditionType::AuditHeadWitness`]
+/// checkpoint per line) on the [`WITNESS_KEY_DIR_ENV`] mount.
+pub const HEAD_ANCHOR_LOG_FILENAME: &str = "head-anchor.log";
+
+/// File name of the off-table, append-only, OPERATOR-signed sanctioned-restore
+/// log on the [`WITNESS_KEY_DIR_ENV`] mount (one [`SanctionedRestoreWire`]
+/// record per line — the DR-vs-attack discriminator).
+pub const RESTORE_SANCTION_LOG_FILENAME: &str = "restore-sanctions.log";
+
+/// Env that flips the open-time rollback check to FAIL-CLOSED (require-mode):
+/// when set truthy, a rollback EVIDENCE verdict — or an unpinnable/absent
+/// off-table anchor — refuses `db::open` instead of emitting evidence and
+/// continuing. Default `false` (emit-evidence-and-continue; no self-DOS on a
+/// legitimate DR). Mirrors [`REQUIRE_WITNESS_ENV`].
+pub const REQUIRE_ROLLBACK_CHECK_ENV: &str = "AI_MEMORY_REQUIRE_ROLLBACK_CHECK";
+
+/// Domain-separation tag committed inside the operator-signed
+/// [`SanctionedRestoreWire`] pre-image (a leading `_dst`-style prefix so the
+/// bytes can never be reinterpreted under another protocol).
+pub const RESTORE_SANCTION_DOMAIN: &str = "ai-memory/audit-restore-sanction/v1";
+
+/// Schema version embedded in the sanctioned-restore record (`"v": N`).
+const RESTORE_SANCTION_VERSION: i64 = 1;
+
+/// `ForensicDecision.kind` for the #1946 open-time rollback-evidence event.
+pub const AUDIT_ROLLBACK_EVIDENCE_KIND: &str = "audit.rollback_evidence";
+
+/// `ForensicDecision.actor` stamped on rollback-evidence rows (a reserved
+/// pseudo-actor so an auditor can grep them apart from governance decisions).
+const AUDIT_ROLLBACK_EVIDENCE_ACTOR: &str = "audit:rollback";
+
+/// `ForensicDecision.decision` slot for rollback-evidence rows (informational).
+const AUDIT_ROLLBACK_EVIDENCE_DECISION: &str = "rollback_evidence";
+
+/// K2 — `true` when [`REQUIRE_ROLLBACK_CHECK_ENV`] is set truthy (fail-closed:
+/// a rollback EVIDENCE verdict or an unpinnable anchor refuses `db::open`).
+/// Default `false` (emit-evidence-and-continue).
+#[must_use]
+pub fn require_rollback_check_enabled() -> bool {
+    env_flag_enabled(REQUIRE_ROLLBACK_CHECK_ENV)
+}
+
+/// v1.0.0 #1946 A — the OSS rollback-counter binding for a witness emission at
+/// `signed_head_sequence`: `value` = the head sequence, `source` = the
+/// off-table head-anchor log. Threaded into [`build_signed_witness_checkpoint`]
+/// so every v1.0 witness is a `v: 2` record.
+#[must_use]
+pub fn rollback_counter_for(signed_head_sequence: i64) -> RollbackWire {
+    RollbackWire {
+        value: signed_head_sequence,
+        source: ROLLBACK_SOURCE_WITNESS_LOG.to_string(),
+    }
+}
+
+/// v1.0.0 #1946 B — append a signed witness checkpoint to the OFF-TABLE
+/// head-anchor log (fire-and-forget). One JSON line per emission on the
+/// [`WITNESS_KEY_DIR_ENV`] mount; a naive `DELETE FROM …` / DB-file rollback
+/// does not touch it, so `db::open` can later read the high-water head back.
+///
+/// A no-op (Ok) when the witness custody dir cannot be resolved or does not
+/// exist (opt-in: a deployment with no enrolled witness key never emits a
+/// witness in the first place). Errors are logged + swallowed by the caller.
+pub fn append_head_anchor(cp: &crate::models::Checkpoint) {
+    if let Err(e) = try_append_head_anchor(cp) {
+        tracing::warn!(
+            target: AUDIT_TRACE_TARGET,
+            "off-table head-anchor append failed (swallowed): {e:#}"
+        );
+    }
+}
+
+fn try_append_head_anchor(cp: &crate::models::Checkpoint) -> Result<()> {
+    let dir = witness_key_dir()?;
+    if !dir.exists() {
+        return Ok(());
+    }
+    let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
+    let line = serde_json::to_string(cp).context("serialise head-anchor checkpoint")?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open head-anchor log at {}", path.display()))?;
+    writeln!(f, "{line}").context("append head-anchor line")?;
+    Ok(())
+}
+
+/// v1.0.0 #1946 B — read the highest witness-signed head anchored in the
+/// OFF-TABLE head-anchor log, K1-pinned against the enrolled witness pubkey.
+///
+/// Returns `None` — anchor ABSENT or UNPINNABLE → the safe WITHHOLD posture —
+/// when: the custody dir / log file is missing, no witness pubkey is enrolled
+/// out-of-band (K1 pin authority unavailable), or no line both K1-pins AND
+/// signature-verifies. Every non-pinning / non-verifying line is skipped
+/// (never trusted), so a forged anchor line cannot lower the high-water mark.
+#[must_use]
+pub fn read_head_anchor_high_water() -> Option<i64> {
+    let dir = witness_key_dir().ok()?;
+    let path = dir.join(HEAD_ANCHOR_LOG_FILENAME);
+    // K1 pin authority — no enrolled witness pubkey ⇒ unpinnable ⇒ withhold.
+    let enrolled = load_enrolled_witness_pubkey().ok().flatten()?;
+    let enrolled_bytes = enrolled.to_bytes();
+    let f = File::open(&path).ok()?;
+    let mut high: Option<i64> = None;
+    for line in BufReader::new(f).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(cp) = serde_json::from_str::<crate::models::Checkpoint>(&line) else {
+            continue;
+        };
+        // K1 pin: the anchor's resolver_pubkey MUST be the enrolled witness.
+        if cp.resolver_pubkey.as_slice() != enrolled_bytes.as_slice() {
+            continue;
+        }
+        // Signature must verify against the pinned pubkey (re-derive bytes).
+        if !crate::checkpoints::verify(&cp) {
+            continue;
+        }
+        if let Some(dual) = parse_witness_dual_head(&cp) {
+            let seq = dual.signed_head_sequence;
+            high = Some(high.map_or(seq, |h| h.max(seq)));
+        }
+    }
+    high
+}
+
+/// v1.0.0 #1946 A — the OPERATOR-signed sanctioned-restore record. Committed
+/// off-table on the witness mount; the operator signature is the ONLY
+/// discriminator between a legitimate DR restore and an attack rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SanctionedRestoreWire {
+    /// Leading domain/version discriminator (committed inside the signed bytes).
+    dst: String,
+    /// Schema version (`RESTORE_SANCTION_VERSION`).
+    v: i64,
+    /// Off-table anchor high-water head BEFORE the restore (the rollback-from).
+    old_head: i64,
+    /// In-DB head AFTER the restore (the rollback-to).
+    new_head: i64,
+    /// `old_head - new_head` (the sanctioned gap; committed for the readout).
+    gap: i64,
+    /// Wall-clock epoch seconds of the ceremony.
+    timestamp: i64,
+}
+
+/// v1.0.0 #1946 C — sign a sanctioned-restore record with the OPERATOR key.
+/// Returns the JSON log line (`{record, sig, pubkey}`) ready to append to the
+/// off-table [`RESTORE_SANCTION_LOG_FILENAME`].
+///
+/// # Errors
+/// The record cannot be canonically encoded (a serialization bug in practice).
+pub fn sign_restore_sanction(
+    old_head: i64,
+    new_head: i64,
+    now: i64,
+    operator: &SigningKey,
+) -> Result<String> {
+    let record = SanctionedRestoreWire {
+        dst: RESTORE_SANCTION_DOMAIN.to_string(),
+        v: RESTORE_SANCTION_VERSION,
+        old_head,
+        new_head,
+        gap: old_head.saturating_sub(new_head),
+        timestamp: now,
+    };
+    let canon = serde_json::to_vec(&record).context("encode sanctioned-restore pre-image")?;
+    let sig = operator.sign(&canon);
+    let line = serde_json::json!({
+        "record": record,
+        "sig": B64.encode(sig.to_bytes()),
+        "pubkey": B64.encode(operator.verifying_key().to_bytes()),
+    });
+    Ok(line.to_string())
+}
+
+/// v1.0.0 #1946 C — append an operator-signed sanctioned-restore line to the
+/// off-table log on the witness mount. The operator ceremony has write
+/// authority to this mount (unlike the daemon), so `create_dir_all` is safe.
+///
+/// # Errors
+/// The witness custody dir cannot be resolved / created, or the append fails.
+pub fn append_restore_sanction(line: &str) -> Result<()> {
+    let dir = witness_key_dir()?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create witness mount dir {}", dir.display()))?;
+    let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open restore-sanction log at {}", path.display()))?;
+    writeln!(f, "{line}").context("append restore-sanction line")?;
+    Ok(())
+}
+
+/// v1.0.0 #1946 C — does an operator-signed sanction CLEAR the rollback
+/// evidence for `(anchored_head, db_head)`?
+///
+/// `true` iff the off-table sanction log carries a record that (a)
+/// operator-signature-verifies under the enrolled operator pubkey (the K1 pin
+/// — no enrolled operator key ⇒ never clears, so an attacker cannot forge a
+/// sanction) AND (b) attests `old_head == anchored_head` and
+/// `new_head <= db_head` (the current head is inside the operator-attested DR
+/// window). Every non-verifying / non-matching line is ignored.
+#[must_use]
+fn restore_sanction_clears(anchored_head: i64, db_head: i64) -> bool {
+    let Some(operator_pubkey) = crate::governance::rules_store::resolve_operator_pubkey() else {
+        return false; // no operator pin ⇒ cannot distinguish DR from attack.
+    };
+    let Ok(dir) = witness_key_dir() else {
+        return false;
+    };
+    let path = dir.join(RESTORE_SANCTION_LOG_FILENAME);
+    let Ok(f) = File::open(&path) else {
+        return false;
+    };
+    for line in BufReader::new(f).lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(record_val) = val.get("record") else {
+            continue;
+        };
+        let Ok(wire) = serde_json::from_value::<SanctionedRestoreWire>(record_val.clone()) else {
+            continue;
+        };
+        if wire.dst != RESTORE_SANCTION_DOMAIN || wire.v != RESTORE_SANCTION_VERSION {
+            continue;
+        }
+        let Some(sig_b64) = val.get("sig").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Ok(sig_bytes) = B64.decode(sig_b64) else {
+            continue;
+        };
+        let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let sig = Signature::from_bytes(&sig_arr);
+        let Ok(canon) = serde_json::to_vec(&wire) else {
+            continue;
+        };
+        // #1808 strict verification — reject malleable signatures.
+        if operator_pubkey.verify_strict(&canon, &sig).is_err() {
+            continue;
+        }
+        if wire.old_head == anchored_head && wire.new_head <= db_head {
+            return true;
+        }
+    }
+    false
+}
+
+/// v1.0.0 #1946 B/D — compute the [`crate::signed_events::RollbackCheck`]
+/// verdict for `db_head` from the off-table anchor + operator sanctions. SHARED
+/// by the sqlite + postgres `verify_audit_trail` twins (K3 parity) and the
+/// open-time check, so every surface returns an IDENTICAL verdict.
+#[must_use]
+pub fn compute_rollback_verdict_for_report(db_head: i64) -> crate::signed_events::RollbackCheck {
+    let require = require_rollback_check_enabled();
+    let anchored = read_head_anchor_high_water();
+    let sanctioned = match anchored {
+        Some(anchor) => anchor > db_head && restore_sanction_clears(anchor, db_head),
+        None => false,
+    };
+    crate::signed_events::compute_rollback_verdict(db_head, anchored, sanctioned, require)
+}
+
+/// v1.0.0 #1946 B — the OPEN-TIME head check run from `db::open` (the funnel
+/// all three interfaces cross). Reads the surviving `signed_events` head, then
+/// applies the [`compute_rollback_verdict_for_report`] verdict via
+/// [`apply_rollback_disposition_at_open`].
+///
+/// # Errors
+/// Under REQUIRE-MODE ([`REQUIRE_ROLLBACK_CHECK_ENV`]) returns `Err` — refusing
+/// the open — on a rollback EVIDENCE verdict or an unpinnable/absent anchor.
+/// In the default posture it NEVER errors (emit-evidence-and-continue).
+pub fn enforce_rollback_check_at_open(conn: &rusqlite::Connection) -> Result<()> {
+    // Surviving in-DB head — 0 when the table is absent (legacy schema) or
+    // empty, which can never exceed a positive anchor ⇒ NotDetected/Unknown.
+    let db_head: i64 = conn
+        .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
+        .unwrap_or(0);
+    let verdict = compute_rollback_verdict_for_report(db_head);
+    apply_rollback_disposition_at_open(&verdict)
+}
+
+/// v1.0.0 #1946 B — the PURE refuse decision for a computed rollback
+/// `verdict` under an explicit `require` flag. `Some(reason)` = refuse the
+/// open; `None` = continue. Env-free so the refuse-vs-continue policy is
+/// unit-testable without setting the process-global require env (which would
+/// race every parallel `db::open`). `Missing` inherently implies require-mode
+/// (it is only produced by [`crate::signed_events::compute_rollback_verdict`]
+/// under `require`), so it always refuses.
+#[must_use]
+pub fn rollback_refuse_reason(
+    verdict: &crate::signed_events::RollbackCheck,
+    require: bool,
+) -> Option<String> {
+    use crate::signed_events::RollbackCheck;
+    match verdict {
+        RollbackCheck::Evidence {
+            anchored_head,
+            db_head,
+        } if require => {
+            let gap = anchored_head.saturating_sub(*db_head);
+            Some(format!(
+                "rollback-evidence refuse-open ({REQUIRE_ROLLBACK_CHECK_ENV}): surviving head \
+                 {db_head} is {gap} below the off-table anchor {anchored_head}"
+            ))
+        }
+        RollbackCheck::Missing => Some(format!(
+            "rollback-check refuse-open ({REQUIRE_ROLLBACK_CHECK_ENV}): no pinnable off-table head \
+             anchor available to check the DB head against"
+        )),
+        _ => None,
+    }
+}
+
+/// v1.0.0 #1946 B — apply the open-time disposition for a computed rollback
+/// `verdict`: emit the loud WARN + best-effort forensic evidence row on
+/// `Evidence`, then refuse (under require-mode) per [`rollback_refuse_reason`].
+///
+/// # Errors
+/// Returns `Err` (refuse open) only under REQUIRE-MODE on `Evidence`/`Missing`.
+pub fn apply_rollback_disposition_at_open(
+    verdict: &crate::signed_events::RollbackCheck,
+) -> Result<()> {
+    use crate::signed_events::RollbackCheck;
+    match verdict {
+        RollbackCheck::Evidence {
+            anchored_head,
+            db_head,
+        } => {
+            let gap = anchored_head.saturating_sub(*db_head);
+            tracing::warn!(
+                target: AUDIT_TRACE_TARGET,
+                anchored_head = *anchored_head,
+                db_head = *db_head,
+                gap,
+                "AUDIT ROLLBACK EVIDENCE at open: surviving signed_events head ({db_head}) is \
+                 BELOW the off-table witness anchor high-water ({anchored_head}) — {gap} head(s) \
+                 rolled back. If this was a sanctioned DR restore, run \
+                 `ai-memory audit restore-attest --sign` to attest it; otherwise the DB file was \
+                 rolled back (investigate + ship the forensic log off-host)."
+            );
+            // Best-effort forensic evidence row (no-op when the sink is down).
+            record_decision(
+                AUDIT_ROLLBACK_EVIDENCE_ACTOR,
+                AUDIT_ROLLBACK_EVIDENCE_DECISION,
+                AUDIT_ROLLBACK_EVIDENCE_KIND,
+                "",
+                serde_json::json!({
+                    "anchored_head": anchored_head,
+                    "db_head": db_head,
+                    "gap": gap,
+                }),
+            );
+        }
+        RollbackCheck::Sanctioned {
+            anchored_head,
+            db_head,
+        } => {
+            tracing::info!(
+                target: AUDIT_TRACE_TARGET,
+                anchored_head = *anchored_head,
+                db_head = *db_head,
+                "rollback below the off-table anchor is OPERATOR-SANCTIONED (attested DR restore) \
+                 — cleared, opening normally"
+            );
+        }
+        RollbackCheck::Unknown | RollbackCheck::NotDetected | RollbackCheck::Missing => {}
+    }
+    match rollback_refuse_reason(verdict, require_rollback_check_enabled()) {
+        Some(reason) => Err(anyhow!(reason)),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2954,7 +3425,7 @@ mod tests {
             revisions_head_sequence: 64,
             revisions_head_hash: "bb".repeat(32),
         };
-        let cp = build_signed_witness_checkpoint(&dual, 1_700_000_200, &kp)
+        let cp = build_signed_witness_checkpoint(&dual, None, 1_700_000_200, &kp)
             .expect("build audit-head witness checkpoint");
         assert_eq!(
             cp.condition_type,
@@ -2966,6 +3437,64 @@ mod tests {
             parsed, dual,
             "both chain heads survive the resolution round-trip"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.0.0 #1946 A — WitnessResolutionWire v1↔v2 additive-format tests.
+    // -----------------------------------------------------------------------
+
+    /// The v1 byte-compat PIN: a `None` rollback MUST serialise to the exact
+    /// pre-#1946 three-field layout so every on-disk v1 witness keeps
+    /// verifying under its original signature (§5.1 A).
+    #[test]
+    fn witness_resolution_v1_bytes_are_byte_identical_without_rollback() {
+        let dual = WitnessDualHead {
+            signed_head_sequence: 7,
+            signed_head_hash: "aa".to_string(),
+            revisions_head_sequence: 3,
+            revisions_head_hash: "bb".to_string(),
+        };
+        let json = witness_resolution_json(&dual, None);
+        // Frozen v1 byte layout (declaration-order serde) — no `rollback` key,
+        // `v: 1`. A change here would break signature verification of every
+        // pre-#1946 witness record.
+        assert_eq!(
+            json,
+            "{\"v\":1,\"signed_events\":{\"head_sequence\":7,\"head_hash\":\"aa\"},\
+             \"memory_revisions\":{\"head_sequence\":3,\"head_hash\":\"bb\"}}"
+        );
+    }
+
+    /// A v2 emission carries the present-only rollback sub-object + `v: 2`, and
+    /// still round-trips the dual head (v2-aware reader accepts it).
+    #[test]
+    fn witness_resolution_v2_carries_rollback_and_bumps_version() {
+        let dual = WitnessDualHead {
+            signed_head_sequence: 128,
+            signed_head_hash: "aa".to_string(),
+            revisions_head_sequence: 64,
+            revisions_head_hash: "bb".to_string(),
+        };
+        let json = witness_resolution_json(&dual, Some(rollback_counter_for(128)));
+        assert!(
+            json.contains("\"v\":2"),
+            "v2 emission bumps the version: {json}"
+        );
+        assert!(
+            json.contains("\"rollback\":{\"value\":128,\"source\":\"witness-head-anchor-log\"}"),
+            "v2 carries the present-only rollback sub-object: {json}"
+        );
+        let kp = cov_role_keypair();
+        let cp = build_signed_witness_checkpoint(
+            &dual,
+            Some(rollback_counter_for(128)),
+            1_700_000_300,
+            &kp,
+        )
+        .expect("build v2 witness checkpoint");
+        assert!(crate::checkpoints::verify(&cp), "v2 witness verifies");
+        let parsed = parse_witness_dual_head(&cp).expect("v2-aware reader accepts v: 2");
+        assert_eq!(parsed, dual, "dual head survives the v2 round-trip");
     }
 
     #[test]

@@ -108,6 +108,21 @@ Each event captures:
 | Local attacker truncates the tail | The chain is consistent up to truncation, but periodic `CHECKPOINT.sig` markers (every `attestation_cadence_minutes`) bound rollback when paired with off-host attestation |
 | Root attacker rewrites the entire file | **Not defended.** Ship the lines off-host to an immutable SIEM in real time. The on-host chain still cross-checks the SIEM record. |
 | Process crashes mid-write | The `O_APPEND` write is atomic at the line level; partial writes never produce a malformed event. The chain may stop mid-stream but `audit verify` surfaces the cleanly-truncated tail without a false positive. |
+| Attacker rolls back the whole DB **file** to an earlier snapshot | **[#1946 A1, v1.0.0]** Detected at the next `db::open` by the OPEN-TIME rollback-evidence head check: the surviving `signed_events` head is compared against the witness-signed OFF-TABLE `head-anchor.log` high-water on the `AI_MEMORY_WITNESS_KEY_DIR` mount (an on-host sibling the DB rollback does not touch). A head below the K1-pinned anchor high-water, with no operator sanction, is a `RollbackCheck::Evidence` verdict (loud WARN + signed `audit.rollback_evidence` row; refuses the open under `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`). A legitimate DR restore is distinguished from an attack ONLY by an operator-signed `audit restore-attest --sign` sanction. ⚠️ **tamper-EVIDENCE, not tamper-PROOF** — see the honest-limit note below. |
+
+> **⚠️ Honest limit of the rollback-evidence anchor (#1946 A1, ESTIMABLE not
+> ATTESTABLE).** In the OSS build the off-table head-anchor lives on the same
+> host as the DB. An **imaged-disk attacker** who snapshots the whole host —
+> DB file *and* the sibling `head-anchor.log` together — rolls both back in
+> lockstep and defeats the check with zero evidence. The control is
+> tamper-**evidence** against a DB-file-only rollback (a naive
+> `DELETE`/restore-just-the-`.db`), **not** tamper-**proof** against a
+> whole-host snapshot. Genuine whole-host resistance requires a hardware
+> monotonic counter (TPM2 NV — the `tpm2-nv` rollback-counter source is
+> reserved-when-present in the wire format, format only in OSS) or an
+> **off-host** anchor. Every verdict degrades to `Unknown` (WITHHOLD) rather
+> than ever emitting a false all-clear, and the default posture emits evidence
+> and continues (no self-DOS on a legitimate DR restore).
 
 The append-only OS flag (`chflags +UF_APPEND` on BSD/macOS,
 `FS_IOC_SETFLAGS +FS_APPEND_FL` on Linux) is **best-effort defense in
@@ -289,6 +304,31 @@ ad-hoc location for one-off inspection:
 
 ```bash
 ai-memory audit --audit-dir /var/lib/forensics/2026-04-30 path
+```
+
+### `ai-memory audit restore-attest [--sign]`
+
+**[#1946 A1, v1.0.0]** The **sanctioned-restore ceremony**. After a
+legitimate disaster-recovery restore of the DB from an earlier snapshot,
+the surviving `signed_events` head is BELOW the witness-signed off-table
+`head-anchor.log` high-water — byte-identical to an attack rollback, so
+the open-time rollback check would flag `RollbackCheck::Evidence`. This
+command records ONE **operator-signed** `audit.restore_sanctioned` event
+committing `{old_head, new_head, gap, timestamp}` to the off-table
+sanction log on the `AI_MEMORY_WITNESS_KEY_DIR` mount. The open-time
+check treats a matching, operator-signature-verified sanction as
+**clearing** the evidence for that DR window. The operator signature
+(custody-separate from the daemon and witness keys, never on
+DB-writable disk) is the **only** discriminator between a sanctioned DR
+restore and an attack.
+
+```bash
+# Dry-run: preview the {old_head, new_head, gap} it WOULD attest.
+ai-memory audit restore-attest
+
+# Emit the operator-signed sanction (loads the operator key from
+# --key-dir / AI_MEMORY_KEY_DIR).
+ai-memory audit restore-attest --sign
 ```
 
 ### `ai-memory logs tail [--follow]`

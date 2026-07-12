@@ -179,6 +179,37 @@ pub fn run(db_path: &Path, args: &VerifyAuditTrailArgs, out: &mut CliOutput<'_>)
             crate::identity::lineage::LineageCheck::Unknown
             | crate::identity::lineage::LineageCheck::NotDetected => {}
         }
+        // v1.0.0 #1946 (A1) — surface the OFF-TABLE rollback-evidence verdict.
+        match &report.rollback {
+            crate::signed_events::RollbackCheck::Evidence {
+                anchored_head,
+                db_head,
+            } => writeln!(
+                out.stdout,
+                "  ROLLBACK EVIDENCE (off-table anchor): witness-anchored head={anchored_head} \
+                 but surviving in-DB head={db_head} ({} head(s) rolled back) — attest a \
+                 sanctioned DR restore with `ai-memory restore-attest --sign`, else investigate",
+                anchored_head - db_head,
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::RollbackCheck::Missing => writeln!(
+                out.stdout,
+                "  rollback check: no pinnable off-table anchor but \
+                 AI_MEMORY_REQUIRE_ROLLBACK_CHECK is set (fail-closed)",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::RollbackCheck::Sanctioned {
+                anchored_head,
+                db_head,
+            } => writeln!(
+                out.stdout,
+                "  rollback below the off-table anchor (head={anchored_head}, in-DB={db_head}) is \
+                 OPERATOR-SANCTIONED (attested DR restore) — not dirty",
+            )
+            .context(CTX_WRITE_AUDIT_REPORT)?,
+            crate::signed_events::RollbackCheck::Unknown
+            | crate::signed_events::RollbackCheck::NotDetected => {}
+        }
         // #1822 G5b — surface a require-mode cause-binding coverage failure.
         if let crate::signed_events::CauseBinding::Detected { rows_without_cause } =
             report.cause_binding
