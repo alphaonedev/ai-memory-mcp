@@ -85,7 +85,7 @@ use crate::{bench, cli, db, embeddings, federation, hnsw, llm, mcp, tls};
 #[cfg(feature = "sal")]
 use crate::migrate;
 
-const DEFAULT_DB: &str = "ai-memory.db";
+pub(crate) const DEFAULT_DB: &str = "ai-memory.db";
 const DEFAULT_PORT: u16 = 9077;
 const GC_INTERVAL_SECS: u64 = 30 * crate::SECS_PER_MINUTE as u64;
 /// WAL auto-checkpoint cadence in the HTTP daemon. Bounds `*-wal`
@@ -2676,6 +2676,39 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
         );
         return None;
     };
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
+    // backends (the ones that POST memory content to an embedding vendor).
+    // The local in-process embedder never egresses and is NOT gated.
+    // Default `allow` → no-op. ENFORCED here (no embedder → semantic recall
+    // degrades to keyword, the existing #1593 fail-closed path); the
+    // signed-refusal audit is best-effort.
+    if crate::config::is_api_embed_backend(&resolved_embeddings.backend) {
+        use crate::egress::{
+            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+        };
+        let mode = InferenceEgressMode::resolve();
+        if let EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } = evaluate_inference_egress(
+            mode,
+            EgressClass::InferenceEmbedding,
+            &resolved_embeddings.url,
+        ) {
+            tracing::warn!(
+                "embedder DISABLED by inference-plane egress gate \
+                 (tier={} backend={} target={target} mode={}); {reason} \
+                 — semantic recall degrades to keyword (#1963)",
+                feature_tier.as_str(),
+                resolved_embeddings.backend,
+                mode.as_str()
+            );
+            let db_path = app_config.effective_db(std::path::Path::new(DEFAULT_DB));
+            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+            return None;
+        }
+    }
     // The HF-Hub sync API and candle model-load are blocking CPU work that
     // internally spin their own tokio runtime. Running them directly in this
     // async context panics with "Cannot drop a runtime in a context where
@@ -2802,6 +2835,35 @@ pub async fn build_llm_client(
     let source = resolved.source.as_str().to_string();
     let key_source = resolved.api_key_source.as_str().to_string();
     let tier_str = feature_tier.as_str().to_string();
+
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate. When the
+    // operator has selected AI_MEMORY_INFERENCE_EGRESS=deny (or
+    // loopback-only against an external vendor), refuse to construct the
+    // outbound LLM client so no memory content can be POSTed to the vendor,
+    // and emit a best-effort signed refusal. Default `allow` → no-op
+    // (byte-identical legacy). ENFORCED here (no client → no egress);
+    // the signed-refusal audit is best-effort (opens a fresh conn).
+    {
+        use crate::egress::{
+            EgressClass, EgressDecision, InferenceEgressMode, evaluate_inference_egress,
+        };
+        let mode = InferenceEgressMode::resolve();
+        if let EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } = evaluate_inference_egress(mode, EgressClass::InferenceLlm, &resolved.base_url)
+        {
+            tracing::warn!(
+                "L5: LLM client DISABLED by inference-plane egress gate \
+                 (tier={tier_str} backend={backend} target={target} mode={}); {reason} (#1963)",
+                mode.as_str()
+            );
+            let db_path = app_config.effective_db(std::path::Path::new(DEFAULT_DB));
+            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+            return None;
+        }
+    }
 
     // FX-D1 (2026-05-27): call the async constructor directly. The
     // pre-FX-D1 `spawn_blocking` wrapper drove the sync constructor

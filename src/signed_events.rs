@@ -343,6 +343,20 @@ pub mod event_types {
     /// `"epoch.manifest_applied"` is gate-clean because the `.` separator
     /// breaks the banned pattern.
     pub const EPOCH_APPLIED: &str = "epoch.manifest_applied";
+
+    /// v1.0.0 #1963 (R68/D14) — `signed_events.event_type` for an
+    /// INFERENCE-PLANE egress refusal: the substrate refused to construct
+    /// an outbound LLM / embedding client because the resolved target was
+    /// disallowed by the [`crate::egress::InferenceEgressMode`] posture
+    /// (`AI_MEMORY_INFERENCE_EGRESS=deny` or `loopback-only` against an
+    /// external vendor). `payload_hash` = SHA-256 over the canonical
+    /// pre-image of the (non-secret) egress class + target base URL +
+    /// reason; substrate-emitted (`daemon_signed` when a key is enrolled,
+    /// else `unsigned`), the same posture as
+    /// [`REFLECTION_DECORRELATION_REFUSED`]. The refused client is never
+    /// constructed, so no memory content ever leaves the host for the
+    /// refused vendor — this row is the audit witness of that refusal.
+    pub const EGRESS_INFERENCE_REFUSED: &str = "egress.inference_refused";
 }
 
 /// v0.9.0 G13 (#1828) + v1.0.0 #1949 — the `identity.lineage.*` witness

@@ -3576,10 +3576,38 @@ pub fn run_mcp_server(
     // `api_key_source`) surface in the startup banner so the operator
     // can see WHICH layer won.
     let resolved_llm = app_config.resolve_llm(None, None, None);
-    let llm: Option<Arc<OllamaClient>> = if tier_config.llm_model.is_none()
-        && resolved_llm.source == crate::config::ConfigSource::CompiledDefault
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate. When the
+    // operator selected AI_MEMORY_INFERENCE_EGRESS=deny (or loopback-only
+    // against an external vendor), refuse to construct the outbound LLM
+    // client so no memory content can be POSTed to the vendor, and emit a
+    // best-effort signed refusal. Default `allow` → no-op.
+    let llm_egress_refused = match crate::egress::evaluate_inference_egress(
+        crate::egress::InferenceEgressMode::resolve(),
+        crate::egress::EgressClass::InferenceLlm,
+        &resolved_llm.base_url,
+    ) {
+        crate::egress::EgressDecision::Refuse {
+            class,
+            target,
+            reason,
+        } => {
+            eprintln!(
+                "ai-memory: LLM DISABLED by inference-plane egress gate \
+                 (target={target}); {reason} (#1963)"
+            );
+            let db_path =
+                app_config.effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
+            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+            true
+        }
+        crate::egress::EgressDecision::Allow => false,
+    };
+    let llm: Option<Arc<OllamaClient>> = if llm_egress_refused
+        || (tier_config.llm_model.is_none()
+            && resolved_llm.source == crate::config::ConfigSource::CompiledDefault)
     {
-        // Keyword tier with no operator config: LLM intentionally disabled.
+        // Keyword tier with no operator config, OR the egress gate refused
+        // the outbound target: LLM intentionally disabled.
         None
     } else {
         match OllamaClient::build_from_resolved(&resolved_llm) {
@@ -3645,43 +3673,71 @@ pub fn run_mcp_server(
     // breadcrumb — it NEVER routes embedding requests through the
     // chat LLM client (the pre-#1143 silent-wrong-wire-shape trap).
     let resolved_embeddings = app_config.resolve_embeddings();
-    let embedder = match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model)
-    {
-        Ok(Some(emb)) => {
-            eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
-            // Backfill embeddings for memories that don't have them.
-            // v0.7.0 Wave-2 A5 (issue #853): scan all unembedded rows
-            // in a single query, then chunk into fixed-size batches
-            // and call `embed_batch` + `set_embeddings_batch` per
-            // chunk. This collapses N per-row UPDATE round-trips into
-            // ceil(N/B) transaction commits and creates the surface
-            // for a vectorised embedder backend to land later.
-            //
-            // v0.7.0 issue #1260 — batch size from the canonical #1146
-            // precedence ladder (AI_MEMORY_EMBED_BACKFILL_BATCH env >
-            // [embeddings].backfill_batch config > compiled default
-            // 100), via the same resolver output the embedder was
-            // built from.
-            let embed_batch_size = resolved_embeddings.backfill_batch as usize;
-            if let Err(e) =
-                run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
-            {
-                eprintln!("ai-memory: backfill failed: {e}");
+    // v1.0.0 #1963 (R68/D14) — inference-plane egress gate for API embed
+    // backends (the ones that POST memory content to an embedding vendor);
+    // the local in-process embedder never egresses and is NOT gated.
+    let embed_egress_refused = crate::config::is_api_embed_backend(&resolved_embeddings.backend)
+        && match crate::egress::evaluate_inference_egress(
+            crate::egress::InferenceEgressMode::resolve(),
+            crate::egress::EgressClass::InferenceEmbedding,
+            &resolved_embeddings.url,
+        ) {
+            crate::egress::EgressDecision::Refuse {
+                class,
+                target,
+                reason,
+            } => {
+                eprintln!(
+                    "ai-memory: embedder DISABLED by inference-plane egress gate \
+                     (target={target}); {reason} — semantic recall degrades to keyword (#1963)"
+                );
+                let db_path = app_config
+                    .effective_db(std::path::Path::new(crate::daemon_runtime::DEFAULT_DB));
+                crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+                true
             }
-            Some(emb)
-        }
-        Ok(None) => None,
-        Err(e) => {
-            eprintln!(
-                "ai-memory: embedder init failed (backend={}, model={}, url={}, \
+            crate::egress::EgressDecision::Allow => false,
+        };
+    let embedder = if embed_egress_refused {
+        None
+    } else {
+        match Embedder::from_resolved(&resolved_embeddings, tier_config.embedding_model) {
+            Ok(Some(emb)) => {
+                eprintln!("ai-memory: embedder loaded ({})", emb.model_description());
+                // Backfill embeddings for memories that don't have them.
+                // v0.7.0 Wave-2 A5 (issue #853): scan all unembedded rows
+                // in a single query, then chunk into fixed-size batches
+                // and call `embed_batch` + `set_embeddings_batch` per
+                // chunk. This collapses N per-row UPDATE round-trips into
+                // ceil(N/B) transaction commits and creates the surface
+                // for a vectorised embedder backend to land later.
+                //
+                // v0.7.0 issue #1260 — batch size from the canonical #1146
+                // precedence ladder (AI_MEMORY_EMBED_BACKFILL_BATCH env >
+                // [embeddings].backfill_batch config > compiled default
+                // 100), via the same resolver output the embedder was
+                // built from.
+                let embed_batch_size = resolved_embeddings.backfill_batch as usize;
+                if let Err(e) =
+                    run_embedding_backfill_with_batch_size(&mut conn, &emb, embed_batch_size)
+                {
+                    eprintln!("ai-memory: backfill failed: {e}");
+                }
+                Some(emb)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!(
+                    "ai-memory: embedder init failed (backend={}, model={}, url={}, \
                  source={}): {e:#} — semantic recall DEGRADED to keyword \
                  (#1143, #1593, #1598)",
-                resolved_embeddings.backend,
-                resolved_embeddings.model,
-                resolved_embeddings.url,
-                resolved_embeddings.source.as_str(),
-            );
-            None
+                    resolved_embeddings.backend,
+                    resolved_embeddings.model,
+                    resolved_embeddings.url,
+                    resolved_embeddings.source.as_str(),
+                );
+                None
+            }
         }
     };
 
