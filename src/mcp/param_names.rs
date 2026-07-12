@@ -44,6 +44,7 @@ pub const AGENT_TYPE: &str = crate::models::field_names::AGENT_TYPE;
 pub const ALIAS: &str = "alias";
 pub const ALIASES: &str = "aliases";
 pub const ALLOWED_AGENTS: &str = "allowed_agents";
+pub const APPROVALS: &str = "approvals";
 pub const ARGUMENTS: &str = "arguments";
 pub const AS_AGENT: &str = "as_agent";
 pub const BODY: &str = "body";
@@ -193,6 +194,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     ALIAS,
     ALIASES,
     ALLOWED_AGENTS,
+    APPROVALS,
     ARGUMENTS,
     AS_AGENT,
     BY_SOURCE_URI,

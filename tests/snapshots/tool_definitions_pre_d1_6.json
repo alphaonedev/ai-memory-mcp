@@ -123,11 +123,11 @@
             "type": "string"
           },
           "lifecycle_state": {
-            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
+            "description": "v0.8.0 Pillar-2 (#1709) — initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
             "type": "string"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this store to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this store to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -391,11 +391,11 @@
     },
     {
       "description": "Load top-k recent + high-priority memories from a Family.",
-      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 \u2014 `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
+      "docs": "B1: top-k by metadata.family. Always-on; alternative to memory_recall when family is known. Issue #864 — `family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
       "inputSchema": {
         "properties": {
           "family": {
-            "description": "MCP tool family (8 groups) \u2014 NOT the memory_kind taxonomy. See #864.",
+            "description": "MCP tool family (8 groups) — NOT the memory_kind taxonomy. See #864.",
             "enum": [
               "core",
               "lifecycle",
@@ -429,7 +429,7 @@
     },
     {
       "description": "Intent-routed loader: free-text intent picks the best Family.",
-      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 \u2014 `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
+      "docs": "B2: pick best Family from free-text intent, then forward to memory_load_family. Issue #864 — `Family` here is the MCP tool family (8 groups: core/lifecycle/graph/governance/power/meta/archive/other), NOT the memory_kind taxonomy (Observation/Reflection/Decision/Event/etc).",
       "inputSchema": {
         "properties": {
           "intent": {
@@ -774,7 +774,7 @@
             "type": "string"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this delete to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this delete to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -806,7 +806,7 @@
             "type": "string"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this promote to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this promote to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -842,7 +842,7 @@
             "type": "string"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this bulk forget to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this bulk forget to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -883,7 +883,7 @@
             "type": "string"
           },
           "expected_version": {
-            "description": "#884 If-Match; mismatch \u2192 409 envelope.",
+            "description": "#884 If-Match; mismatch → 409 envelope.",
             "type": "integer"
           },
           "expires_at": {
@@ -928,11 +928,11 @@
             "type": "string"
           },
           "lifecycle_state": {
-            "description": "v0.8.0 Pillar-2 (#1709) \u2014 initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
+            "description": "v0.8.0 Pillar-2 (#1709) — initial lifecycle state (open/active/blocked/done/abandoned); defaults to open.",
             "type": "string"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this update to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this update to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -1046,7 +1046,7 @@
     },
     {
       "description": "Reconstruct the conversation transcript chain that produced a memory. Returns 0 transcripts until an operator wires the R5 `pre_store` extraction hook.",
-      "docs": "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only). OPERATOR CONFIG REQUIRED (#1324): the v0.7.0 substrate ships the storage + replay primitives, but no production write path auto-links transcripts. `memory_replay` returns `count: 0` for any memory until the operator wires the R5 reference `pre_store` hook (`tools/transcript-extractor/`) or calls `transcripts::store` + `transcripts::link_transcript` directly. The `memory_capabilities.transcripts.enabled` flag flips to `true` once at least one row lands in `memory_transcripts` \u2014 use it as the operator-facing indicator that the extraction pipeline is wired. See `docs/sidechain-transcripts.md` \u00a7'Operator workflow' for the setup steps.",
+      "docs": "I4: transcript chain (text + span metadata). verbose=false (default) truncates >100KB entries. L2-4 (#669): for reflections, walks reflects_on edges for transcript UNION; cap via depth (null=full, 0=self only). OPERATOR CONFIG REQUIRED (#1324): the v0.7.0 substrate ships the storage + replay primitives, but no production write path auto-links transcripts. `memory_replay` returns `count: 0` for any memory until the operator wires the R5 reference `pre_store` hook (`tools/transcript-extractor/`) or calls `transcripts::store` + `transcripts::link_transcript` directly. The `memory_capabilities.transcripts.enabled` flag flips to `true` once at least one row lands in `memory_transcripts` — use it as the operator-facing indicator that the extraction pipeline is wired. See `docs/sidechain-transcripts.md` §'Operator workflow' for the setup steps.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1081,7 +1081,7 @@
     },
     {
       "description": "Persist a reflection memory plus reflects_on provenance links to each source.",
-      "docs": "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) \u2014 refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn.",
+      "docs": "Task 4/8 (#655): substrate-native recursive-learning primitive. reflection_depth = max(source_depths)+1; gated by namespace governance.max_reflection_depth (Task 2/8) — refusal returns REFLECTION_DEPTH_EXCEEDED. New memory + N reflects_on links land in one atomic txn.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -1099,7 +1099,7 @@
             "type": "string"
           },
           "depth": {
-            "description": "v0.7.0 #1325 \u2014 caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
+            "description": "v0.7.0 #1325 — caller-asserted reflection depth (cap-style). When set, MUST equal max(source_depths)+1 or the call is refused with `CALLER_DEPTH_MISMATCH`. Omit to defer to the substrate-computed value (backward-compatible).",
             "type": "integer"
           },
           "metadata": {
@@ -1160,7 +1160,7 @@
     },
     {
       "description": "Render a single reflection memory as markdown or JSON (no filesystem write).",
-      "docs": "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write \u2014 harness owns disk I/O.",
+      "docs": "QW-1: render reflection + reflects_on provenance as YAML-frontmatter md (default) or JSON envelope. Returns {content, suggested_filename}. No FS write — harness owns disk I/O.",
       "inputSchema": {
         "properties": {
           "format": {
@@ -1207,7 +1207,7 @@
     },
     {
       "description": "Generate/regen a Persona artefact for an entity.",
-      "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 \u2014 persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
+      "docs": "QW-2 / #848: synthesise MemoryKind::Persona from top-K Reflection memories. Omit namespace (or pass null) for cross-namespace aggregation (#848 — persona lands in 'global'); pass a namespace string for single-namespace scope. Response includes namespace_scope=single|cross_namespace.",
       "inputSchema": {
         "properties": {
           "entity_id": {
@@ -1215,7 +1215,7 @@
             "type": "string"
           },
           "namespace": {
-            "description": "Omit/null \u2192 cross-namespace (#848); string \u2192 single-namespace.",
+            "description": "Omit/null → cross-namespace (#848); string → single-namespace.",
             "type": [
               "string",
               "null"
@@ -1248,7 +1248,7 @@
     },
     {
       "description": "List dependents flagged by the L2-3 invalidation walker.",
-      "docs": "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade \u2014 dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty.",
+      "docs": "L2-3 (#668): read-only list of memories with reflects_on->memory_id. Notification, NOT cascade — dependents are flagged for curator review. Returns {memory_id, count, dependents:[{id, namespace}]}. Unknown ids => empty.",
       "inputSchema": {
         "properties": {
           "memory_id": {
@@ -1366,8 +1366,8 @@
       "name": "memory_atomise"
     },
     {
-      "description": "Share a memory with another agent (copy into _shared/<from>\u2192<to>/).",
-      "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>\u2192<to>/` with provenance.",
+      "description": "Share a memory with another agent (copy into _shared/<from>→<to>/).",
+      "docs": "#224/#311 MVP: point-to-point copy into `_shared/<from>→<to>/` with provenance.",
       "inputSchema": {
         "properties": {
           "source_memory_id": {
@@ -1389,7 +1389,7 @@
     },
     {
       "description": "Scan confidence_shadow_observations and emit per-source baselines (Form 5).",
-      "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power \u2014 refuses on keyword tier.",
+      "docs": "Form 5 (#758): read-only calibration sweep over shadow-mode observations (AI_MEMORY_CONFIDENCE_SHADOW=1). Returns CalibrationReport {window_days, total_observations, baselines:[{namespace, source, count, median, mean, buckets}]}. Default window 30d. Family::Power — refuses on keyword tier.",
       "inputSchema": {
         "properties": {
           "days": {
@@ -1764,12 +1764,36 @@
               "forever"
             ],
             "type": "string"
+          },
+          "approvals": {
+            "items": {
+              "$ref": "#/definitions/ApproverSignatureArg"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "required": [
           "id"
         ],
-        "type": "object"
+        "type": "object",
+        "definitions": {
+          "ApproverSignatureArg": {
+            "properties": {
+              "pubkey": {
+                "default": "",
+                "type": "string"
+              },
+              "signature": {
+                "default": "",
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        }
       },
       "name": "memory_pending_approve"
     },
@@ -1802,7 +1826,7 @@
     },
     {
       "description": "Register an agent in the reserved _agents namespace.",
-      "docs": "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested \u2014 pair with attestation for security boundary.",
+      "docs": "Register agent (agent_type, capabilities) in _agents. Refreshes last_seen_at; preserves registered_at. agent_id is CLAIMED, not attested — pair with attestation for security boundary.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2024,7 +2048,7 @@
             "type": "string"
           },
           "namespace": {
-            "description": "Restrict to one namespace (v0.7.0 #1156 \u2014 per-namespace K8 dimension). When supplied with `agent_id`, returns the single (agent_id, namespace) row. When supplied without `agent_id`, returns every agent's row in that namespace. When omitted, the aggregate view is returned for an agent_id or the full substrate listing otherwise.",
+            "description": "Restrict to one namespace (v0.7.0 #1156 — per-namespace K8 dimension). When supplied with `agent_id`, returns the single (agent_id, namespace) row. When supplied without `agent_id`, returns every agent's row in that namespace. When omitted, the aggregate view is returned for an agent_id or the full substrate listing otherwise.",
             "type": "string"
           }
         },
@@ -2034,7 +2058,7 @@
     },
     {
       "description": "Check action vs governance_rules (#691); Allow/Refuse/Warn.",
-      "docs": "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled \u2014 use `ai-memory rules --sign` CLI or signed HTTP admin endpoints.",
+      "docs": "#691: read-only rule check. Harness PreToolUse hook calls on every Bash/Write/Edit. Rule MUTATION over MCP is disabled — use `ai-memory rules --sign` CLI or signed HTTP admin endpoints.",
       "inputSchema": {
         "properties": {
           "agent_id": {
@@ -2235,7 +2259,7 @@
             "type": "string"
           },
           "skill_name": {
-            "description": "agentskills.io \u00a73.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.",
+            "description": "agentskills.io §3.1 name: ^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$, 1-64.",
             "type": "string"
           }
         },
@@ -2354,7 +2378,7 @@
             "type": "string"
           },
           "role": {
-            "description": "Speaker classification \u2014 `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
+            "description": "Speaker classification — `user` / `assistant` / `tool_use` / `tool_result` / `system` / `other`. Drives downstream memory_kind assignment in the v0.8 decision-detector classifier.",
             "type": "string"
           },
           "timestamp_iso": {
@@ -2366,7 +2390,7 @@
             "type": "array"
           },
           "capability": {
-            "description": "#1827 capability token (cap1:..) \u2014 may flip a governance Deny/Pending on this turn capture to Allow within its caveats.",
+            "description": "#1827 capability token (cap1:..) — may flip a governance Deny/Pending on this turn capture to Allow within its caveats.",
             "type": "string"
           }
         },
@@ -2385,7 +2409,7 @@
       "docs": "Pillar 1 (#1709): insert a pending coordination action into the action DAG.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_create`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_create`.",
         "properties": {
           "agent_id": {
             "default": null,
@@ -2430,7 +2454,7 @@
       "docs": "Pillar 1 (#1709): return one coordination action by id, or null when absent.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_get`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_get`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2449,7 +2473,7 @@
       "docs": "Pillar 1 (#1709): move an action to a new state if the transition is legal.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_transition`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_transition`.",
         "properties": {
           "claimed_by": {
             "default": null,
@@ -2480,7 +2504,7 @@
       "docs": "Pillar 1 (#1709): query the action DAG, filtered by namespace/state, newest-first.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_list`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_list`.",
         "properties": {
           "limit": {
             "default": null,
@@ -2516,7 +2540,7 @@
       "docs": "Pillar 1 (#1709): insert a typed dependency edge into the action DAG.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_add_edge`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_add_edge`.",
         "properties": {
           "edge_type": {
             "description": "Edge kind (`requires` / `unlocks` / `blocks` / `gated_by` / `sibling`).",
@@ -2544,7 +2568,7 @@
       "docs": "Pillar 1 (#1709): return every typed edge touching an action.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_action_edges`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_action_edges`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2563,7 +2587,7 @@
       "docs": "Pillar 1 (#1709): take an exclusive, TTL-bounded lease on an action; conflicts if held.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_acquire`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_acquire`.",
         "properties": {
           "action_id": {
             "type": "string"
@@ -2595,7 +2619,7 @@
       "docs": "Pillar 1 (#1709): extend an owned lease's TTL; errors if no lease is held by the caller.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_renew`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_renew`.",
         "properties": {
           "action_id": {
             "type": "string"
@@ -2627,7 +2651,7 @@
       "docs": "Pillar 1 (#1709): release an owned lease; reports whether a row was removed.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_release`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_release`.",
         "properties": {
           "action_id": {
             "type": "string"
@@ -2650,7 +2674,7 @@
       "docs": "Pillar 1 (#1709): return the lease on an action, or null when none is held.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_lease_get`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_lease_get`.",
         "properties": {
           "action_id": {
             "type": "string"
@@ -2669,7 +2693,7 @@
       "docs": "Pillar 1 (#1709): create a signal; self-signed when a signing keypair is available.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_send`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_send`.",
         "properties": {
           "body": {
             "default": null
@@ -2735,7 +2759,7 @@
       "docs": "Pillar 1 (#1709): fetch a signal, stamp read_at, and verify its Ed25519 signature.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_read`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_read`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2750,11 +2774,11 @@
       "name": "memory_signal_read"
     },
     {
-      "description": "List signals for a namespace/recipient \u2014 direct + broadcast (#1709).",
-      "docs": "Pillar 1 (#1709): the recipient inbox \u2014 direct messages plus namespace broadcasts, newest-first.",
+      "description": "List signals for a namespace/recipient — direct + broadcast (#1709).",
+      "docs": "Pillar 1 (#1709): the recipient inbox — direct messages plus namespace broadcasts, newest-first.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_inbox`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_inbox`.",
         "properties": {
           "limit": {
             "default": null,
@@ -2789,7 +2813,7 @@
       "docs": "Pillar 1 (#1709): return every signal sharing a correlation_id in thread order.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_thread`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_thread`.",
         "properties": {
           "correlation_id": {
             "type": "string"
@@ -2808,7 +2832,7 @@
       "docs": "Pillar 1 (#1709): stamp acknowledged_at on a signal; reports whether this call set it.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_signal_ack`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_signal_ack`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2827,7 +2851,7 @@
       "docs": "Pillar 1 (#1709): create a checkpoint in the pending state, gated on an external condition.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_create`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_checkpoint_create`.",
         "properties": {
           "condition": {
             "default": null,
@@ -2883,7 +2907,7 @@
       "docs": "Pillar 1 (#1709): resolve a checkpoint; the resolution self-signs when a signing keypair is available.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_resolve`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_checkpoint_resolve`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2908,7 +2932,7 @@
             "type": "string"
           },
           "state": {
-            "description": "Resolution state \u2014 one of `resolved` / `rejected`.",
+            "description": "Resolution state — one of `resolved` / `rejected`.",
             "type": "string"
           }
         },
@@ -2927,7 +2951,7 @@
       "docs": "Pillar 1 (#1709): list a namespace's checkpoints, optionally narrowed by condition_type and state.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_query`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_checkpoint_query`.",
         "properties": {
           "condition_type": {
             "default": null,
@@ -2970,7 +2994,7 @@
       "docs": "Pillar 1 (#1709): fetch a checkpoint and verify its Ed25519 attested-resolution signature.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_checkpoint_verify`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_checkpoint_verify`.",
         "properties": {
           "id": {
             "type": "string"
@@ -2985,11 +3009,11 @@
       "name": "memory_checkpoint_verify"
     },
     {
-      "description": "Create a draft routine \u2014 a parameterised action+edge template (#1709).",
+      "description": "Create a draft routine — a parameterised action+edge template (#1709).",
       "docs": "Pillar 1 (#1709): create a routine in the draft state from a JSON template with `{{parameter}}` placeholders; freeze it before it can be run.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_create`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_create`.",
         "properties": {
           "created_by": {
             "default": null,
@@ -3032,7 +3056,7 @@
       "docs": "Pillar 1 (#1709): freeze a routine into its immutable regulatory-hold form; the frozen template self-signs when a signing keypair is available.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_freeze`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_freeze`.",
         "properties": {
           "id": {
             "type": "string"
@@ -3047,11 +3071,11 @@
       "name": "memory_routine_freeze"
     },
     {
-      "description": "Run a frozen routine \u2014 materialise its template into action rows (#1709).",
+      "description": "Run a frozen routine — materialise its template into action rows (#1709).",
       "docs": "Pillar 1 (#1709): materialise a frozen routine under a concrete argument binding into first-class action+edge rows; a malformed template records the run as failed rather than panicking.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_run`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_run`.",
         "properties": {
           "arguments": {
             "description": "Concrete `{{param}} -> value` bindings substituted into the template."
@@ -3074,7 +3098,7 @@
       "docs": "Pillar 1 (#1709): fetch a routine run by id; the run field is null when no row matches.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_status`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_status`.",
         "properties": {
           "run_id": {
             "type": "string"
@@ -3093,7 +3117,7 @@
       "docs": "Pillar 1 (#1709): list a namespace's routines, optionally narrowed by lifecycle state, newest-first.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709) \u2014 request body for `memory_routine_list`.",
+        "description": "v0.8.0 Pillar 1 (#1709) — request body for `memory_routine_list`.",
         "properties": {
           "limit": {
             "default": null,
@@ -3125,10 +3149,10 @@
     },
     {
       "description": "Rank the UNBLOCKED coordination-action frontier (#1709).",
-      "docs": "Pillar 1 (#1709 \u00a711.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds.",
+      "docs": "Pillar 1 (#1709 §11.4): the ranked frontier of pending actions whose prerequisites/gates are done and that no active blocker holds.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_frontier`.",
+        "description": "v0.8.0 Pillar 1 (#1709 §11.4) — request body for `memory_action_frontier`.",
         "properties": {
           "limit": {
             "default": null,
@@ -3153,10 +3177,10 @@
     },
     {
       "description": "Return the top UNBLOCKED coordination action to do next (#1709).",
-      "docs": "Pillar 1 (#1709 \u00a711.4): the single highest-ranked unblocked action; optionally narrowed to the caller's owned/unowned work.",
+      "docs": "Pillar 1 (#1709 §11.4): the single highest-ranked unblocked action; optionally narrowed to the caller's owned/unowned work.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "description": "v0.8.0 Pillar 1 (#1709 \u00a711.4) \u2014 request body for `memory_action_next`.",
+        "description": "v0.8.0 Pillar 1 (#1709 §11.4) — request body for `memory_action_next`.",
         "properties": {
           "agent_id": {
             "default": null,
