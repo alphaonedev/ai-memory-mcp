@@ -57,11 +57,47 @@ pub fn handle_dependents_of_invalidated(
             })
         })
         .collect();
-    Ok(json!({
+    let mut out = json!({
         "memory_id": memory_id,
         "count": rendered.len(),
         "dependents": rendered,
-    }))
+    });
+
+    // v1.0.0 R55 (#1959) — opt-in TRANSITIVE suspect set. The legacy
+    // `dependents` list above is the DIRECT inbound `reflects_on` hop only;
+    // when `transitive` is requested, additionally walk the FULL provenance
+    // DAG (P = derived_from/reflects_on/derives_from) DOWNSTREAM so a suspect
+    // source taints every record derived from it, transitively. Lazy /
+    // computed (cycle-safe, depth-bounded) — the direct default stays
+    // byte-identical.
+    if params["transitive"].as_bool().unwrap_or(false) {
+        let suspects =
+            crate::db::transitive_suspects(conn, memory_id, crate::db::LINEAGE_MAX_DEPTH)
+                .map_err(|e| format!("transitive_suspects substrate error: {e}"))?;
+        let rendered_suspects: Vec<Value> = suspects
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": n.id,
+                    "cid": n.cid,
+                    "relation": n.relation,
+                    "depth": n.depth,
+                })
+            })
+            .collect();
+        if let Value::Object(map) = &mut out {
+            map.insert(
+                "transitive_count".to_string(),
+                json!(rendered_suspects.len()),
+            );
+            map.insert(
+                "transitive_suspects".to_string(),
+                Value::Array(rendered_suspects),
+            );
+        }
+    }
+
+    Ok(out)
 }
 
 // --- D1.5 (#986): per-tool McpTool impl for memory_dependents_of_invalidated ---
@@ -77,6 +113,13 @@ use serde::Deserialize;
 pub struct DependentsOfInvalidatedRequest {
     /// Invalidated reflection id.
     pub memory_id: String,
+
+    /// v1.0.0 R55 (#1959) — when true, also return `transitive_suspects`:
+    /// every record derived (transitively) from `memory_id` over the
+    /// provenance DAG (derived_from/reflects_on/derives_from). Default false
+    /// (direct reflects_on dependents only).
+    #[serde(default)]
+    pub transitive: bool,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for
