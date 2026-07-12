@@ -613,8 +613,8 @@ mod postgres_parity {
             revisions_head_sequence: 0,
             revisions_head_hash: "00".to_string(),
         };
-        let cp =
-            witness::build_signed_witness_checkpoint(&dual, ts.timestamp(), &kp).expect("build cp");
+        let cp = witness::build_signed_witness_checkpoint(&dual, None, ts.timestamp(), &kp)
+            .expect("build cp");
         sqlx::query(
             "INSERT INTO checkpoints \
                 (id, namespace, title, condition_type, condition, state, created_by, \
