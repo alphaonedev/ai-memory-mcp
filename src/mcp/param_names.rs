@@ -161,6 +161,7 @@ pub const TARGET_ID: &str = "target_id";
 pub const TARGET_TIER: &str = "target_tier";
 pub const TEMPLATE: &str = "template";
 pub const THRESHOLD: &str = "threshold";
+pub const TRANSITIVE: &str = "transitive";
 pub const TIER: &str = "tier";
 pub const TITLE: &str = "title";
 pub const TO: &str = "to";
@@ -301,6 +302,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     THRESHOLD,
     TIER,
     TITLE,
+    TRANSITIVE,
     TO,
     TO_ACTION,
     TO_NAMESPACE,
