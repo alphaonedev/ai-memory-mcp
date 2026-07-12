@@ -722,6 +722,15 @@ pub struct BenchArgs {
     /// Clamped to `[1, 1_000_000]`.
     #[arg(long, value_name = "ROWS")]
     pub scale: Option<usize>,
+    /// #1961 (R23/R7) — additionally run the VERIFIED/attested write+recall
+    /// path (Ed25519 `sign_write` on store, `verify_write` on each recalled
+    /// candidate) so the p95 gate covers the attestation crypto cost. Adds
+    /// two operations to the result set; omitting it keeps the legacy
+    /// 8-operation workload. Combine with `--scale 1000000` for the
+    /// verified-path 1M-row benchmark (see `PERFORMANCE.md`
+    /// §"Verified-path benchmarks").
+    #[arg(long)]
+    pub verified: bool,
 }
 
 /// Default `--batch` page-size hint for `ai-memory migrate`. Currently
@@ -957,6 +966,32 @@ async fn dispatch_recover_previous_session(
 #[allow(clippy::too_many_lines)]
 pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     let db_path = app_config.effective_db(&cli.db);
+    // v1.0.0 #1961 (R23/R7) — resolve + enforce the security posture FIRST,
+    // before any knob is read or the DB is opened. Under the default
+    // `standard` posture this is a no-op; under `asi-hard` it PINS the
+    // fail-closed security knobs ON (so every downstream read site honours
+    // the hard posture) and REFUSES to boot if an operator tried to loosen
+    // any of them. Fail-closed: a loosening override or a garbage posture
+    // token aborts the boot here.
+    {
+        let (posture, pins) = crate::security_profile::enforce_at_boot()?;
+        if posture == crate::security_profile::SecurityPosture::AsiHard {
+            for pin in &pins {
+                tracing::info!(
+                    target: "security.posture",
+                    knob = pin.env,
+                    effective = pin.effective,
+                    action = ?pin.action,
+                    "asi-hard: pinned security knob"
+                );
+            }
+            tracing::warn!(
+                target: "security.posture",
+                pinned = pins.len(),
+                "asi-hard security posture ENGAGED — fail-closed knobs pinned, loosening refused"
+            );
+        }
+    }
     // Seed the process-wide per-agent quota defaults from the resolved
     // `[limits]` config (env `AI_MEMORY_MAX_*` > `[limits]` > compiled
     // default). `ensure_row` / the Postgres quota-row auto-inserts read
@@ -4300,11 +4335,15 @@ pub async fn bootstrap_serve(
     let pubkey_resolved = crate::governance::rules_store::resolve_operator_pubkey().is_some();
     if enabled_rule_count > 0 && !pubkey_resolved {
         crate::governance::rules_store::log_missing_operator_pubkey_once(enabled_rule_count);
-        if app_config
+        // v1.0.0 #1961 (R23/R7) — the `asi-hard` posture forces this
+        // config-backed governance knob to `true` (it is not env-backed, so
+        // the boot pin-set cannot carry it — the posture bridges it here).
+        let require_operator_pubkey = app_config
             .governance
             .as_ref()
             .is_some_and(|g| g.require_operator_pubkey)
-        {
+            || crate::security_profile::is_asi_hard();
+        if require_operator_pubkey {
             anyhow::bail!(
                 "SEC-2 fail-closed: `[governance] require_operator_pubkey = true` is set but \
                  `governance_rules` contains {enabled_rule_count} enabled row(s) AND no \
@@ -5562,6 +5601,8 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
         warmup,
         namespace: bench::BENCH_NAMESPACE.to_string(),
         scale,
+        // #1961 (R23/R7) — opt-in verified/attested path.
+        verified: args.verified,
     };
     let results = bench::run(&conn, &config)?;
 
@@ -5583,6 +5624,7 @@ fn cmd_bench(args: &BenchArgs) -> Result<()> {
                 "iterations": iterations,
                 "warmup": warmup,
                 "scale": scale,
+                "verified": args.verified,
                 "results": results,
                 "regressions": regressions,
             }))?

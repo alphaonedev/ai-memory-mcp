@@ -161,6 +161,149 @@ default-workload gate) and uploads `bench-results-10k.json` with the
 artifact set. The run fails when any operation's measured p95 exceeds
 its scale budget by more than the published 10% tolerance.
 
+## Verified-path benchmarks (#1961 / R23-R7)
+
+The default bench workload times the *plain* hot paths — `memory_store`
+with **no** attestation and `memory_recall` with **no** verify stage.
+The `--verified` flag closes that gap: it appends two operations that
+exercise the VERIFIED/attested write+recall path so the p95 gate covers
+the Ed25519 attestation crypto cost, not just the SQL path.
+
+```bash
+# Verified path at the CI-affordable scale gate:
+ai-memory bench --scale 10000 --verified --json
+
+# Verified path at 1,000,000 rows (the R23 target; SLOW — see methodology):
+ai-memory bench --scale 1000000 --verified --json
+```
+
+Appended operations (SSOT: `src/bench.rs::Operation::{VerifiedStore,VerifiedRecall}`):
+
+| Operation | Timed path | Budget derivation |
+|---|---|---|
+| `memory_store` (verified/attested) | `sha256(content)` → six-field `SignableWrite` envelope → Ed25519 `sign_write` → `db::insert` | plain store budget **+ `VERIFIED_SIGN_HEADROOM_MS` (10 ms)** |
+| `memory_recall` (verified/attested) | keyword `db::recall` → Ed25519 `verify_write` per returned candidate | plain recall budget **+ `VERIFIED_VERIFY_HEADROOM_MS` (20 ms)** |
+
+The crypto headroom is a **fixed addend**, not a corpus-scale factor:
+the signed surface is the bounded `SignableWrite` envelope (over
+`sha256(content)`, not the raw content), and verify runs once per
+returned candidate (bounded by the recall `limit`), so the crypto cost
+is corpus-scale-INVARIANT. At scale the verified budget therefore
+carries the same corpus sensitivity as its plain sibling (store/recall
+portion) PLUS the constant crypto headroom.
+
+### 1M-row methodology (reproducible, NOT fabricated)
+
+A true 1,000,000-row verified run seeds ~1M rows into the disposable
+in-memory DB before timing — that seeding alone is minutes of wall
+clock and several GB of RAM, so it is **not** a per-PR CI gate. The
+honest posture, per the #1961 acceptance criteria:
+
+- **Harness — SHIPPED + tested.** `ai-memory bench --scale 1000000
+  --verified` runs the full verified path at 1M rows today; `MAX_SCALE`
+  already admits 1,000,000. The two verified operations + their
+  budgets are unit-tested (`src/bench.rs` `verified_run_appends_*`,
+  `verified_scale_budgets_add_crypto_headroom`).
+- **CI-gated scale — SHIPPED.** The `--scale 10000` gate (above) runs
+  every PR; adding `--verified` to it exercises the attested path at
+  the CI-affordable scale.
+- **1M numbers — REPRODUCIBLE-METHODOLOGY, not pinned.** This document
+  deliberately does **not** pin fabricated 1M p95 budgets. Beyond the
+  largest pinned `SCALE_BUDGETS` row (10k) the resolver reuses that
+  row's budgets best-effort (`scale_budgets_for`); an operator running
+  the 1M methodology on their reference hardware records the measured
+  p99 and pins a new `SCALE_BUDGETS` row (change `src/bench.rs` +
+  this table together — the `operation_scale_targets_match_performance_md`
+  test enforces the pairing). Reproduce with:
+
+  ```bash
+  ai-memory bench --scale 1000000 --verified --iterations 200 \
+      --history .local-runs/bench-1m-verified.jsonl --json \
+      > .local-runs/bench-1m-verified.json
+  ```
+
+  Record the host (CPU / RAM / disk), then pin the observed p99 (with
+  ≥50% headroom, as the 10k row was pinned) before gating 1M in CI.
+
+This is the deliberate honesty boundary the issue asked for: a REAL
+harness + a REAL CI-gated smaller scale + a DOCUMENTED, reproducible 1M
+methodology — with the 1M budgets left ESTIMABLE (operator-measured)
+rather than invented.
+
+## Power-loss durability (#1961 / R23-R7)
+
+By default the SQLite substrate opens with `PRAGMA synchronous=NORMAL`
+(the #1579 B7 performance posture). Under WAL, `NORMAL` fsyncs at each
+*checkpoint*, not at each *commit*, so a **power loss** (not merely a
+process crash) can lose the tail of acknowledged commits that were in
+the WAL but not yet checkpoint-fsync'd.
+
+**Durability mode.** Set `AI_MEMORY_DB_SYNCHRONOUS=FULL` (or the harder
+`EXTRA`) to fsync the WAL at **every commit**, so an acknowledged
+(`Ok`-returning) write survives a power cut — at a throughput cost.
+Ladder: `AI_MEMORY_DB_SYNCHRONOUS` env > compiled default `NORMAL`
+(SSOT: `src/storage/connection.rs::db_synchronous`). The `asi-hard`
+hardened profile (below) pins this to `FULL`.
+
+**What the harness proves.** `tests/power_loss_durability.rs` spawns a
+child process that opens the DB under `synchronous=FULL`, commits a
+batch of writes, and is HARD-ABORTED (`std::process::abort()`, the
+software analogue of a power cut / SIGKILL) after a chosen committed
+write via the fault-injection knob `AI_MEMORY_TEST_ABORT_AFTER_COMMIT`
+(SSOT: `src/recover/durability.rs`). The parent then re-opens the
+crashed DB and asserts:
+
+- **no corruption** — `PRAGMA integrity_check` returns `ok`; and
+- **no lost acknowledged write** — every fsync'd (`Ok`-returning) commit
+  in the acknowledged prefix survives the abort.
+
+**Proven vs unproven boundary (honest scope).**
+
+- **PROVEN in software:** SQLite WAL crash-consistency across an
+  unclean process exit (a killed process loses no committed row, torn
+  transactions roll back), plus the deferred-audit journal's
+  torn-trailing-record discard on replay (#1732).
+- **NOT proven (out of scope — needs a hardware power-cut rig):** that
+  a consumer SSD / OS honours fsync under a REAL power cut (the "fsync
+  lie"). `abort()`/SIGKILL do not drop the OS page cache the way a
+  power cut does; `synchronous=FULL` is what *upgrades* the
+  process-death guarantee to real-power-loss durability on honest
+  hardware. Verifying honest-fsync hardware requires a physical
+  power-cut rig and is out of scope for a software test suite.
+
+## Hardened `asi-hard` security posture (#1961 / R23-R7)
+
+`AI_MEMORY_SECURITY_PROFILE=asi-hard` selects a single named posture
+that PINS the substrate's fail-closed security knobs ON and REFUSES to
+boot if an operator tries to loosen any of them (the "no-disable"
+contract). Under the default `standard` posture every knob keeps its
+own default (byte-identical legacy). SSOT: `src/security_profile.rs`.
+
+Pinned knobs (unset → pinned to the hard value; already-compliant →
+accepted; set-below-floor → boot REFUSED):
+
+| Env knob | Hard floor |
+|---|---|
+| `AI_MEMORY_SECRET_SCREEN_MODE` | `refuse` |
+| `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` | `1` |
+| `AI_MEMORY_FED_REQUIRE_WRITE_SIG` | `1` |
+| `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` | `1` |
+| `AI_MEMORY_FED_REQUIRE_TRANSITION_SIG` | `1` |
+| `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` | `1` |
+| `AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED` | `1` |
+| `AI_MEMORY_CID_ENFORCE` | `1` |
+| `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` | `1` |
+| `AI_MEMORY_REQUIRE_WITNESS` | `1` |
+| `AI_MEMORY_REQUIRE_CAUSE_BINDING` | `1` |
+| `AI_MEMORY_REQUIRE_ROLE_SEPARATION` | `1` |
+| `AI_MEMORY_REQUIRE_IDENTITY_LINEAGE` | `1` |
+| `AI_MEMORY_DB_SYNCHRONOUS` | `FULL` (power-loss durability, above) |
+
+In addition, `asi-hard` forces the config-backed governance knob
+`[governance].require_operator_pubkey` to `true` at the governance boot
+check. A loosening override (e.g. `AI_MEMORY_SECRET_SCREEN_MODE=off`
+under `asi-hard`) aborts boot with a clear error naming the knob.
+
 ## Autonomous-Tier Latency Tax — Batman-Active Write Path
 
 > **v0.7.0 Gap #4 (issue #805) attack plan.** Cross-refs #654 (distilled
