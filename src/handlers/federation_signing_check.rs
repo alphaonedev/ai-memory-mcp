@@ -79,6 +79,8 @@ pub(super) async fn sync_push_via_store(
         || body.signals.len() > cap
         // #1718 — action_transitions subcollection (sqlite-twin parity).
         || body.action_transitions.len() > cap
+        // FED-RQ-01 (#1936) — checkpoints subcollection (sqlite-twin parity).
+        || body.checkpoints.len() > cap
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -523,12 +525,22 @@ pub(super) async fn sync_push_via_store(
     // pending_actions, namespace_meta) not yet trait-covered. Surface
     // them with the same noop posture sqlite uses on missing rows so
     // a heterogeneous federation reports an honest count.
+    //
+    // FED-RQ-01 (#1936) — commit-checkpoint RESOLUTIONS are counted here too:
+    // the checkpoints table is not yet MemoryStore-trait-covered for a
+    // federated verbatim-resolution write (the `checkpoint_resolve` trait method
+    // re-signs, which the receiver must NOT do), so the postgres funnel reports
+    // them as unsupported rather than silently dropping. The sqlite funnel (the
+    // MCP/epoch-apply-native checkpoint path) applies them fully. Full
+    // postgres-backed checkpoint-resolution federation is a tracked follow-up
+    // (a new `apply_remote_checkpoint_resolution` trait method).
     unsupported_on_postgres += body.archives.len()
         + body.restores.len()
         + body.pendings.len()
         + body.pending_decisions.len()
         + body.namespace_meta.len()
-        + body.namespace_meta_clears.len();
+        + body.namespace_meta_clears.len()
+        + body.checkpoints.len();
 
     // #1718 — signals round-trip via the SAL trait (`apply_remote_signal`:
     // accept-and-flag-unsigned, idempotent on the UUID, forged-sig refused) —
@@ -729,8 +741,9 @@ pub(super) async fn sync_push_via_store(
             "dry_run": body.dry_run,
             "receiver_agent_id": body.sender_agent_id,
             (field_names::STORAGE_BACKEND): "postgres",
-            "note": "pendings / archives / restores / namespace_meta are sqlite-only \
-                     in v0.7.0; memories / deletions / links round-trip via the SAL trait",
+            "note": "pendings / archives / restores / namespace_meta / checkpoints are \
+                     sqlite-only in this funnel; memories / deletions / links / signals / \
+                     action_transitions round-trip via the SAL trait",
         })),
     )
         .into_response()

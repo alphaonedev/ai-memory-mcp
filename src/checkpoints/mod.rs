@@ -29,7 +29,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// [`verify`] (inbound) so both commit to byte-identical canonical bytes —
 /// the same shared-view discipline [`crate::signals::signable`] uses for the
 /// signed-signal surface.
-fn resolution_signable(cp: &Checkpoint) -> SignableCheckpointResolution<'_> {
+///
+/// FED-RQ-01 (#1936) — also consumed by the federation receive funnel to
+/// re-derive the canonical bytes an inbound resolution's attestation must
+/// verify against the resolver's ENROLLED key, so `pub(crate)`.
+pub(crate) fn resolution_signable(cp: &Checkpoint) -> SignableCheckpointResolution<'_> {
     SignableCheckpointResolution {
         checkpoint_id: &cp.id,
         namespace: &cp.namespace,
@@ -307,6 +311,92 @@ pub fn resolve(
     Ok(Some(row))
 }
 
+/// Outcome of applying an inbound federated checkpoint RESOLUTION via
+/// [`apply_inbound_resolution`] — the FED-RQ-01 (#1936) receive-side CRDT apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundResolutionOutcome {
+    /// The resolution was newly applied — either the resolved checkpoint was
+    /// inserted verbatim (no local row existed) or a locally-PENDING checkpoint
+    /// transitioned to carry the inbound resolution + attestation.
+    Applied,
+    /// Idempotent replay — the checkpoint is already resolved locally with the
+    /// byte-identical resolution tuple. No write performed.
+    Noop,
+    /// The checkpoint is already resolved locally with a DIFFERENT resolution.
+    /// Under the substrate's first-resolution-wins rule the LOCAL resolution is
+    /// kept and the inbound one refused. No write performed.
+    Conflict,
+}
+
+/// Whether two checkpoints carry the identical resolution tuple — the
+/// idempotency key for [`apply_inbound_resolution`]: same terminal `state`,
+/// same `resolved_by`, same `resolution` verdict. A byte-identical replay is a
+/// no-op; any divergence is a first-resolution-wins conflict. (`resolution_note`
+/// is advisory prose and deliberately excluded from the conflict key, matching
+/// the fields the [`resolution_signable`] attestation binds.)
+fn resolutions_match(local: &Checkpoint, incoming: &Checkpoint) -> bool {
+    local.state == incoming.state
+        && local.resolved_by == incoming.resolved_by
+        && local.resolution == incoming.resolution
+}
+
+/// Apply an inbound FEDERATED checkpoint resolution under the checkpoint
+/// substrate's **first-resolution-wins** rule (FED-RQ-01, #1936).
+///
+/// `incoming` MUST be a resolved (non-[`CheckpointState::Pending`]) checkpoint
+/// — the federation receive funnel filters out unresolved rows before calling
+/// this (an unresolved checkpoint carries no attestation). Disposition:
+///
+/// - **No local row** → the resolution is the first to land: INSERT `incoming`
+///   verbatim (subject + resolution arrive together). → [`InboundResolutionOutcome::Applied`].
+/// - **Local row is `Pending`** → first resolution: UPDATE the resolution +
+///   attestation fields verbatim. → `Applied`.
+/// - **Local row already resolved, identical tuple** ([`resolutions_match`]) →
+///   idempotent replay. → [`InboundResolutionOutcome::Noop`].
+/// - **Local row already resolved, DIFFERENT tuple** → first-resolution-wins:
+///   keep the local resolution, refuse the inbound. → [`InboundResolutionOutcome::Conflict`].
+///
+/// The receiver **NEVER re-signs**: the resolver's Ed25519 attestation
+/// (`signature` / `resolver_pubkey`) travels on `incoming` and is persisted
+/// verbatim (the v0.8.0 local-substrate rule — a node stamps only its OWN
+/// writes). Authorization (verifying that attestation against the resolver's
+/// locally-ENROLLED key) is the caller's responsibility; this function is the
+/// idempotent CRDT apply once the verdict is `Accept`.
+///
+/// # Errors
+/// Propagates the `rusqlite` read/write error.
+pub fn apply_inbound_resolution(
+    conn: &Connection,
+    incoming: &Checkpoint,
+) -> rusqlite::Result<InboundResolutionOutcome> {
+    match get(conn, &incoming.id)? {
+        None => {
+            insert(conn, incoming)?;
+            Ok(InboundResolutionOutcome::Applied)
+        }
+        Some(local) if local.state == CheckpointState::Pending => {
+            conn.execute(
+                "UPDATE checkpoints SET state = ?1, resolved_by = ?2, resolution = ?3, \
+                    resolution_note = ?4, resolved_at = ?5, signature = ?6, \
+                    resolver_pubkey = ?7 WHERE id = ?8",
+                params![
+                    incoming.state.as_str(),
+                    incoming.resolved_by,
+                    incoming.resolution,
+                    incoming.resolution_note,
+                    incoming.resolved_at,
+                    incoming.signature,
+                    incoming.resolver_pubkey,
+                    incoming.id,
+                ],
+            )?;
+            Ok(InboundResolutionOutcome::Applied)
+        }
+        Some(local) if resolutions_match(&local, incoming) => Ok(InboundResolutionOutcome::Noop),
+        Some(_) => Ok(InboundResolutionOutcome::Conflict),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +631,100 @@ mod tests {
         assert!(resolved.signature.is_empty());
         assert!(resolved.resolver_pubkey.is_empty());
         assert!(!verify(&resolved), "an unsigned resolution must not verify");
+    }
+
+    // -----------------------------------------------------------------
+    // FED-RQ-01 (#1936) — inbound federated resolution apply (CRDT,
+    // first-resolution-wins). See `federation::receive_auth` for the
+    // authority-lane signature verification that precedes this apply.
+    // -----------------------------------------------------------------
+
+    /// A fully-resolved, attested checkpoint as it would arrive on the wire.
+    fn resolved_remote(id: &str, verdict: &str) -> Checkpoint {
+        let kp = crate::identity::keypair::generate("agent-resolver").expect("generate");
+        let mut cp = sample(id);
+        cp.state = CheckpointState::Resolved;
+        cp.resolved_by = Some("agent-resolver".to_string());
+        cp.resolution = Some(verdict.to_string());
+        cp.resolved_at = Some(1_700_000_900);
+        sign_resolution_into(&mut cp, &kp).expect("sign");
+        cp
+    }
+
+    #[test]
+    fn apply_inbound_resolution_inserts_when_absent() {
+        let conn = fresh();
+        let remote = resolved_remote("fed-absent", "approved");
+        assert_eq!(
+            apply_inbound_resolution(&conn, &remote).unwrap(),
+            InboundResolutionOutcome::Applied
+        );
+        // Persisted verbatim — attestation preserved (receiver did NOT re-sign).
+        let got = get(&conn, "fed-absent").unwrap().expect("present");
+        assert_eq!(got.state, CheckpointState::Resolved);
+        assert_eq!(got.resolution.as_deref(), Some("approved"));
+        assert_eq!(got.signature, remote.signature);
+        assert_eq!(got.resolver_pubkey, remote.resolver_pubkey);
+        assert!(
+            verify(&got),
+            "verbatim-persisted attestation still verifies"
+        );
+    }
+
+    #[test]
+    fn apply_inbound_resolution_resolves_local_pending() {
+        let conn = fresh();
+        // A locally-created PENDING checkpoint with the SAME id.
+        insert(&conn, &sample("fed-pending")).unwrap();
+        let remote = resolved_remote("fed-pending", "approved");
+        assert_eq!(
+            apply_inbound_resolution(&conn, &remote).unwrap(),
+            InboundResolutionOutcome::Applied
+        );
+        let got = get(&conn, "fed-pending").unwrap().expect("present");
+        assert_eq!(got.state, CheckpointState::Resolved);
+        assert_eq!(got.resolved_by.as_deref(), Some("agent-resolver"));
+        assert_eq!(got.signature, remote.signature);
+        assert!(verify(&got));
+    }
+
+    #[test]
+    fn apply_inbound_resolution_idempotent_replay_is_noop() {
+        let conn = fresh();
+        let remote = resolved_remote("fed-replay", "approved");
+        assert_eq!(
+            apply_inbound_resolution(&conn, &remote).unwrap(),
+            InboundResolutionOutcome::Applied
+        );
+        // Byte-identical replay → Noop, no second write.
+        assert_eq!(
+            apply_inbound_resolution(&conn, &remote).unwrap(),
+            InboundResolutionOutcome::Noop
+        );
+    }
+
+    #[test]
+    fn apply_inbound_resolution_divergent_is_conflict_first_wins() {
+        let conn = fresh();
+        let first = resolved_remote("fed-conflict", "approved");
+        assert_eq!(
+            apply_inbound_resolution(&conn, &first).unwrap(),
+            InboundResolutionOutcome::Applied
+        );
+        // A DIFFERENT resolution for the same id → Conflict; local kept.
+        let mut second = resolved_remote("fed-conflict", "rejected");
+        second.state = CheckpointState::Rejected;
+        assert_eq!(
+            apply_inbound_resolution(&conn, &second).unwrap(),
+            InboundResolutionOutcome::Conflict
+        );
+        let got = get(&conn, "fed-conflict").unwrap().expect("present");
+        assert_eq!(
+            got.state,
+            CheckpointState::Resolved,
+            "first resolution wins"
+        );
+        assert_eq!(got.resolution.as_deref(), Some("approved"));
     }
 
     #[test]
