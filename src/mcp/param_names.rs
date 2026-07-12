@@ -302,10 +302,10 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     THRESHOLD,
     TIER,
     TITLE,
-    TRANSITIVE,
     TO,
     TO_ACTION,
     TO_NAMESPACE,
+    TRANSITIVE,
     TTL_SECONDS,
     TTL_SECS,
     UNREAD_ONLY,
@@ -331,9 +331,11 @@ mod tests {
         // `memory_lineage` walk direction.
         // v0.9.0 G10.1 (#1827) — 122 → 123: `CAPABILITY` for the macaroon
         // capability token on the governed mutation tools.
+        // v1.0.0 #1957 R40 — 123 -> 124: APPROVALS (pending-approve m-of-n).
+        // v1.0.0 #1959 R55 — 124 -> 125: TRANSITIVE (dependents transitive walk).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            123,
+            125,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
