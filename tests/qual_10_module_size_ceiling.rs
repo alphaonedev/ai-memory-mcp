@@ -305,7 +305,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // at 23_527; ceiling 23_600 (+73 headroom). 2026-07-11 (#1949): the
     // v80 lineage custody/revocation storage arm merged on top lands the
     // file at 23_646; ceiling 23_700 (+54 headroom).
-    ("src/storage/mod.rs", 23_700),
+    // 2026-07-12 (#1956 crypto-erase): envelope-key destruction + tombstone
+    // fanout on the forget/gc/size_gc delete paths land storage/mod.rs at
+    // 23_932; ceiling 24_050 (+118).
+    ("src/storage/mod.rs", 24_050),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress

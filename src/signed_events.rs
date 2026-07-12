@@ -248,6 +248,17 @@ pub mod event_types {
     /// sibling of [`SUBSTRATE_RECORD_STOP`].
     pub const SUBSTRATE_RECORD_RESUME: &str = "substrate.record_resume";
 
+    /// #1956 [P1][R56] — `signed_events.event_type` for the ERASURE
+    /// ATTESTATION emitted on every delete/erase path. Commits
+    /// `{record id, erasure-kind, actor, timestamp}` where erasure-kind is
+    /// `key-destroyed` (an encrypted per-record row whose envelope DEK was
+    /// destroyed → ciphertext cryptographically unrecoverable) or
+    /// `row-deleted-tombstoned` (a plaintext / legacy-encrypted row that
+    /// could only be row-deleted + tombstoned). Chained + verified by
+    /// `verify_audit_trail` like every other signed event; the honest
+    /// crypto-erase-vs-delete boundary lives in the erasure-kind field.
+    pub const SUBSTRATE_CRYPTO_ERASE: &str = "substrate.crypto_erase";
+
     /// v0.9.0 §25.3 S3 (F-40, #1853) — `signed_events.event_type` for an
     /// operator-authorized governance-rule DISABLE via
     /// `ai-memory rules disable --sign`
