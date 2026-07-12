@@ -1265,4 +1265,439 @@ mod tests {
     ) -> String {
         crate::cli::test_utils::seed_memory(db_path, ns, title, content)
     }
+
+    // ---- v1.0.0 crypto-core stage-3 (#1942): enroll-subkey-cert +
+    //      subkey-certs CLI verbs. Fixtures mint a REAL root keypair, a
+    //      sub-key, and a root-signed SubkeyCert via the crate's own
+    //      identity APIs, then exercise the CLI against the artifact. -----
+
+    /// Wide validity window — the enroll path (`verify_and_record_cert`)
+    /// signature-verifies the cert but does NOT check the window (that is a
+    /// write-time gate), so the exact bounds are immaterial for enrollment;
+    /// a wide window keeps the fixture unambiguously well-formed.
+    const CERT_NOT_BEFORE: &str = "2020-01-01T00:00:00Z";
+    const CERT_NOT_AFTER: &str = "2030-01-01T00:00:00Z";
+
+    /// Register `principal` then bind a freshly-generated Ed25519 root key,
+    /// returning the root **signing** key so a test can mint a root-signed
+    /// cert under it.
+    fn register_and_bind_root(
+        env: &mut TestEnv,
+        db: &std::path::Path,
+        principal: &str,
+    ) -> ed25519_dalek::SigningKey {
+        let reg = AgentsArgs {
+            action: Some(AgentsAction::Register {
+                agent_id: principal.to_string(),
+                agent_type: "ai:claude-opus-4.7".to_string(),
+                capabilities: String::new(),
+            }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(db, reg, false, &mut out).expect("register");
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        let root_kp = crate::identity::keypair::generate(principal).expect("gen root");
+        {
+            let conn = db::open(db).unwrap();
+            db::bind_agent_pubkey(&conn, principal, &root_kp.public_base64()).expect("bind");
+        }
+        root_kp
+            .private
+            .expect("generated keypair carries a private key")
+    }
+
+    /// Build a cert-envelope JSON `Value` (the shape the CLI file carries),
+    /// signed by `signer` over the frozen bound fields for `principal`.
+    fn build_cert_json(
+        signer: &ed25519_dalek::SigningKey,
+        principal: &str,
+        not_before: &str,
+        not_after: &str,
+    ) -> serde_json::Value {
+        use base64::Engine as _;
+        use ed25519_dalek::SigningKey;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let sub = SigningKey::from_bytes(&[0x22u8; 32]);
+        let instance_key_id = sub.verifying_key().to_bytes().to_vec();
+        let model_version_ref = vec![0xabu8; 32];
+        let cert = crate::identity::subkey_cert::SubkeyCert {
+            principal,
+            instance_key_id: &instance_key_id,
+            model_version_ref: &model_version_ref,
+            not_before,
+            not_after,
+        };
+        let sig = crate::identity::subkey_cert::sign_subkey_cert(signer, &cert);
+        serde_json::json!({
+            "principal": principal,
+            "instance_key_id": b64.encode(&instance_key_id),
+            "model_version_ref": b64.encode(&model_version_ref),
+            "not_before": not_before,
+            "not_after": not_after,
+            "cert_signature": b64.encode(sig),
+        })
+    }
+
+    /// Persist a cert file next to the test DB (inside the fixture tempdir)
+    /// and return its path.
+    fn write_cert_file(env: &TestEnv, name: &str, json: &serde_json::Value) -> std::path::PathBuf {
+        let path = env.db_path.parent().expect("db has parent dir").join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_string(json).expect("serialize cert json"),
+        )
+        .expect("write cert file");
+        path
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_happy_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-happy.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        assert!(
+            env.stdout_str().contains("enrolled sub-key cert"),
+            "expected enrolled line, got: {}",
+            env.stdout_str()
+        );
+        assert!(env.stdout_str().contains("ai:curator"));
+        // Observable persistence: exactly one row for the principal.
+        let conn = db::open(&db).unwrap();
+        let certs = db::list_subkey_certs(&conn, Some("ai:curator")).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].principal, "ai:curator");
+        assert!(!certs[0].revoked);
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_happy_json() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-happy-json.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["enrolled"].as_bool().unwrap(), true);
+        assert_eq!(v["principal"].as_str().unwrap(), "ai:curator");
+        assert!(v["id"].as_str().unwrap().starts_with("b3:"));
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_wrong_root_rejected_and_not_persisted() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Bind the real root, but sign the cert with an UNRELATED key.
+        let _real_root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[0x99u8; 32]);
+        let json = build_cert_json(&attacker, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-wrong-root.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("cert verification failed"),
+            "expected verification failure, got: {err}"
+        );
+        // Nothing persisted on a rejected cert.
+        let conn = db::open(&db).unwrap();
+        assert!(db::list_subkey_certs(&conn, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_missing_root_binding_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Principal is a valid id but has NO bound root key (never bound).
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let json = build_cert_json(&signer, "ai:unbound", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-unbound.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("no bound root key"),
+            "expected no-bound-root-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_malformed_bound_root_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // Register, then bind a base64 string that decodes to the WRONG
+        // length (not a 32-byte Ed25519 key) directly via db — bypasses the
+        // CLI's bind-key validation so we can drive the decode-failure arm.
+        let signer = register_and_bind_root(&mut env, &db, "ai:curator");
+        {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let conn = db::open(&db).unwrap();
+            db::bind_agent_pubkey(&conn, "ai:curator", &b64.encode([0u8; 10])).unwrap();
+        }
+        let json = build_cert_json(&signer, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-malformed-root.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("is malformed"),
+            "expected malformed-root-key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_invalid_principal_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        // A principal with a space fails `validate_agent_id` BEFORE any db
+        // lookup, so no registration is needed.
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x44u8; 32]);
+        let json = build_cert_json(&signer, "bad principal!", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-bad-principal.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        assert!(res.is_err());
+        // Nothing persisted.
+        let conn = db::open(&db).unwrap();
+        assert!(db::list_subkey_certs(&conn, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_missing_file_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let missing = env.db_path.parent().unwrap().join("does-not-exist.json");
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file: missing }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("read cert file"),
+            "expected read-cert-file error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_bad_json_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let path = env.db_path.parent().unwrap().join("cert-bad-json.json");
+        std::fs::write(&path, "{ this is not valid json ").unwrap();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file: path }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("parse cert JSON"),
+            "expected parse-json error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_missing_field_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let mut json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        // Drop a required string field.
+        json.as_object_mut().unwrap().remove("model_version_ref");
+        let file = write_cert_file(&env, "cert-missing-field.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("missing string field") && err.contains("model_version_ref"),
+            "expected missing-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_enroll_subkey_cert_field_not_base64_rejected() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let mut json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        // Replace a base64 field with a non-base64 string.
+        json["instance_key_id"] = serde_json::Value::String("%%%%not-base64%%%%".to_string());
+        let file = write_cert_file(&env, "cert-not-b64.json", &json);
+        let args = AgentsArgs {
+            action: Some(AgentsAction::EnrollSubkeyCert { file }),
+        };
+        let res = {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out)
+        };
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("not base64"),
+            "expected not-base64 error, got: {err}"
+        );
+    }
+
+    // ---- subkey-certs list/inspect verb --------------------------------
+
+    #[test]
+    fn test_subkey_certs_empty_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, false, &mut out).unwrap();
+        }
+        assert!(env.stdout_str().contains("no sub-key certificates"));
+    }
+
+    #[test]
+    fn test_subkey_certs_empty_json() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = AgentsArgs {
+            action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+        };
+        {
+            let mut out = env.output();
+            run_agents(&db, args, true, &mut out).unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["count"].as_u64().unwrap(), 0);
+        assert!(v["subkey_certs"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_subkey_certs_populated_text() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-list-text.json", &json);
+        {
+            let mut out = env.output();
+            run_agents(
+                &db,
+                AgentsArgs {
+                    action: Some(AgentsAction::EnrollSubkeyCert { file }),
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run_agents(
+                &db,
+                AgentsArgs {
+                    action: Some(AgentsAction::SubkeyCerts { agent_id: None }),
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("principal=ai:curator"), "got: {s}");
+        assert!(s.contains("1 sub-key certificate(s)"), "got: {s}");
+    }
+
+    #[test]
+    fn test_subkey_certs_populated_json_filtered_by_principal() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let root = register_and_bind_root(&mut env, &db, "ai:curator");
+        let json = build_cert_json(&root, "ai:curator", CERT_NOT_BEFORE, CERT_NOT_AFTER);
+        let file = write_cert_file(&env, "cert-list-json.json", &json);
+        {
+            let mut out = env.output();
+            run_agents(
+                &db,
+                AgentsArgs {
+                    action: Some(AgentsAction::EnrollSubkeyCert { file }),
+                },
+                false,
+                &mut out,
+            )
+            .unwrap();
+        }
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run_agents(
+                &db,
+                AgentsArgs {
+                    action: Some(AgentsAction::SubkeyCerts {
+                        agent_id: Some("ai:curator".to_string()),
+                    }),
+                },
+                true,
+                &mut out,
+            )
+            .unwrap();
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["count"].as_u64().unwrap(), 1);
+        let cert0 = &v["subkey_certs"][0];
+        assert_eq!(cert0["principal"].as_str().unwrap(), "ai:curator");
+        assert_eq!(cert0["revoked"].as_bool().unwrap(), false);
+        // The instance_key_id round-trips as a base64 string.
+        assert!(cert0["instance_key_id"].as_str().is_some());
+        assert!(cert0["id"].as_str().unwrap().starts_with("b3:"));
+    }
 }
