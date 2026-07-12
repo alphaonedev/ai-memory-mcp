@@ -20,3 +20,12 @@ name = "fuzz_namespace"
 path = "fuzz_targets/fuzz_namespace.rs"
 test = false
 doc = false
+
+# R9 (#1960) capability/governance token fuzz target. Budget (ESTIMABLE):
+# 15 min CPU/target on the CI fuzz lane; 1 core-hour local soak before any
+# change to src/governance/capability.rs.
+[[bin]]
+name = "fuzz_capability"
+path = "fuzz_targets/fuzz_capability.rs"
+test = false
+doc = false

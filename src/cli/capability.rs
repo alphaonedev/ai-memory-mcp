@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `ai-memory capability` subcommand — macaroon capability-token
-//! lifecycle (v0.9.0 G10.1, #1827).
+//! lifecycle (v0.9.0 G10.1, #1827; R9 zero-config owner mint, #1960).
 //!
-//! Five verbs over the stateless primitive in
+//! Six verbs over the stateless primitive in
 //! [`crate::governance::capability`]:
 //!
+//! - `init`      — R9 (#1960) zero-config OWNER mint: idempotently create the
+//!   reserved `owner` keypair (`owner.priv`/`owner.pub`) + `owner.caproot`
+//!   mint secret, so the owner can mint attenuated tokens with NO
+//!   `[capabilities.issuers]` config. Custody follows the key-dir discipline
+//!   (0o600 private material). Re-running is a no-op.
 //! - `keygen`    — generate the issuer's 32-byte HMAC mint secret
 //!   (`<key_dir>/<issuer>.caproot`, mode `0o600`). Refuses to overwrite:
 //!   rotation is an explicit delete-then-keygen (which consciously
@@ -30,8 +35,8 @@ use clap::{Args, Subcommand};
 
 use crate::cli::CliOutput;
 use crate::governance::capability::{
-    CapRequest, CapabilityToken, Caveat, OpLevel, attenuate, caveats_have_expiry, mint_with_secret,
-    read_root_secret, verify, write_root_secret,
+    CapRequest, CapabilityToken, Caveat, OWNER_ISSUER, OpLevel, attenuate, caveats_have_expiry,
+    mint_with_secret, read_root_secret, verify, write_root_secret,
 };
 use crate::identity::keypair;
 
@@ -115,6 +120,11 @@ pub struct CapabilityArgs {
 
 #[derive(Subcommand)]
 pub enum CapabilityAction {
+    /// Zero-config owner mint (R9, #1960): idempotently create the reserved
+    /// `owner` capability keypair + `.caproot` mint secret in the key dir,
+    /// so the owner can immediately mint attenuated tokens WITHOUT editing
+    /// `config.toml`. Re-running is a no-op (custody already present).
+    Init,
     /// Generate the issuer's `.caproot` mint secret (mode 0o600).
     Keygen {
         /// Issuer id (must also be listed under `[capabilities.issuers]`).
@@ -170,6 +180,56 @@ fn resolve_key_dir(flag: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// What an idempotent `capability init` (R9, #1960) actually did.
+struct OwnerInitOutcome {
+    /// A fresh `owner.priv`/`owner.pub` keypair was generated this call.
+    created_keypair: bool,
+    /// A fresh `owner.caproot` mint secret was written this call.
+    created_root_secret: bool,
+}
+
+impl OwnerInitOutcome {
+    /// True when both halves already existed (the call was a pure no-op).
+    fn already_initialized(&self) -> bool {
+        !self.created_keypair && !self.created_root_secret
+    }
+}
+
+/// Idempotently establish the zero-config OWNER capability custody in `dir`
+/// (R9, #1960): the `owner.priv`/`owner.pub` keypair (attribution) + the
+/// `owner.caproot` mint secret (mode `0o600`). Re-running when both halves
+/// already exist is a no-op; a partial state (one half missing) is repaired.
+/// Custody follows the existing key-dir discipline (0o600 private material).
+fn init_owner(dir: &std::path::Path) -> Result<OwnerInitOutcome> {
+    // Keypair — considered present iff a loadable PRIVATE key exists (a
+    // public-only file cannot mint).
+    let has_keypair = keypair::load(OWNER_ISSUER, dir)
+        .map(|kp| kp.private.is_some())
+        .unwrap_or(false);
+    let created_keypair = if has_keypair {
+        false
+    } else {
+        let kp = keypair::generate(OWNER_ISSUER).context("generating owner capability keypair")?;
+        keypair::save(&kp, dir).context("saving owner capability keypair")?;
+        true
+    };
+
+    // Caproot mint secret — present iff it loads cleanly (right length +
+    // secure mode).
+    let has_caproot = read_root_secret(dir, OWNER_ISSUER).is_ok();
+    let created_root_secret = if has_caproot {
+        false
+    } else {
+        write_root_secret(dir, OWNER_ISSUER).context("writing owner root secret")?;
+        true
+    };
+
+    Ok(OwnerInitOutcome {
+        created_keypair,
+        created_root_secret,
+    })
+}
+
 /// Render a token summary for `inspect` / post-mint output.
 fn token_summary(tok: &CapabilityToken) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
@@ -202,6 +262,41 @@ pub fn run(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     match args.action {
+        CapabilityAction::Init => {
+            let dir = resolve_key_dir(args.key_dir)?;
+            let outcome = init_owner(&dir)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "issuer": OWNER_ISSUER,
+                        "key_dir": dir.display().to_string(),
+                        "created_keypair": outcome.created_keypair,
+                        "created_root_secret": outcome.created_root_secret,
+                        "already_initialized": outcome.already_initialized(),
+                    })
+                )?;
+            } else if outcome.already_initialized() {
+                writeln!(
+                    out.stdout,
+                    "owner capability key already initialized in {} (no-op)",
+                    dir.display()
+                )?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "owner capability key initialized in {}",
+                    dir.display()
+                )?;
+                writeln!(
+                    out.stdout,
+                    "mint attenuated tokens with: ai-memory capability mint {OWNER_ISSUER} \
+                     --op-ceiling read --expires-in-secs 3600 [--namespace-prefix <ns>]"
+                )?;
+            }
+            Ok(())
+        }
         CapabilityAction::Keygen { issuer } => {
             let dir = resolve_key_dir(args.key_dir)?;
             let path = write_root_secret(&dir, &issuer)?;
@@ -392,6 +487,80 @@ mod tests {
         let token = env.stdout_str().trim().to_string();
         assert!(token.starts_with("cap1:"), "got: {token}");
         token
+    }
+
+    #[test]
+    fn init_creates_owner_custody_is_idempotent_and_owner_can_mint() {
+        // R9 (#1960) zero-config owner mint: init establishes the owner
+        // keypair + caproot, is idempotent, and the owner can immediately
+        // mint an attenuated token with NO [capabilities.issuers] config.
+        let mut env = TestEnv::fresh();
+        let dir = key_dir(&env);
+        {
+            let mut out = env.output();
+            run(
+                args(dir.clone(), CapabilityAction::Init),
+                true,
+                &AppConfig::default(),
+                &mut out,
+            )
+            .expect("init ok");
+        }
+        let v: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v["issuer"].as_str(), Some(OWNER_ISSUER));
+        assert_eq!(v["created_keypair"].as_bool(), Some(true));
+        assert_eq!(v["created_root_secret"].as_bool(), Some(true));
+        assert_eq!(v["already_initialized"].as_bool(), Some(false));
+        assert!(dir.join("owner.priv").exists(), "owner.priv written");
+        assert!(dir.join("owner.pub").exists(), "owner.pub written");
+        assert!(dir.join("owner.caproot").exists(), "owner.caproot written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(dir.join("owner.caproot"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(m, 0o600, "caproot must be 0600");
+        }
+
+        // Second init is a pure no-op (idempotent).
+        env.stdout.clear();
+        env.stderr.clear();
+        {
+            let mut out = env.output();
+            run(
+                args(dir.clone(), CapabilityAction::Init),
+                true,
+                &AppConfig::default(),
+                &mut out,
+            )
+            .expect("re-init ok");
+        }
+        let v2: serde_json::Value = serde_json::from_str(env.stdout_str().trim()).unwrap();
+        assert_eq!(v2["created_keypair"].as_bool(), Some(false));
+        assert_eq!(v2["created_root_secret"].as_bool(), Some(false));
+        assert_eq!(v2["already_initialized"].as_bool(), Some(true));
+
+        // The owner can mint an attenuated token straight away (zero config).
+        env.stdout.clear();
+        env.stderr.clear();
+        let token = run_expect_token(
+            &mut env,
+            args(
+                dir,
+                CapabilityAction::Mint {
+                    issuer: OWNER_ISSUER.to_string(),
+                    caveats: CaveatFlags {
+                        op_ceiling: Some("read".to_string()),
+                        expires_at: Some(9_999_999_999),
+                        ..CaveatFlags::default()
+                    },
+                },
+            ),
+        );
+        assert!(token.starts_with("cap1:"));
     }
 
     #[test]

@@ -5877,17 +5877,25 @@ pub fn lock_permissions_mode_for_test() -> std::sync::MutexGuard<'static, ()> {
 // v0.9.0 G10.1 (#1827) — [capabilities] block + process-wide handle
 // ---------------------------------------------------------------------------
 
-/// `[capabilities]` — the macaroon capability-token layer (G10.1, #1827).
+/// `[capabilities]` — the macaroon capability-token layer (G10.1, #1827;
+/// R9 default-on + zero-config owner, #1960).
 ///
-/// `enabled` defaults to **false** (compiled GA posture: the wrapper at the
-/// governance gates is a pure identity function and no edge parses tokens —
-/// byte-identical to a legacy deployment). `issuers` is the CLOSED
-/// allowlist; there are NO implicit issuers and the resolver NEVER falls
-/// through to the broad `db::agent_pubkey` registry.
+/// `enabled` compiled default is **true** at v1.0.0 (R9 #1960 —
+/// [`crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED`]; was
+/// `false` through v0.9.0). Default-on is ADDITIVE-ONLY: a capability-less
+/// caller is byte-identical to the legacy inert posture, and the grant path
+/// can only WIDEN (`Deny`/`Ask` → `Allow`) for a caller presenting a valid
+/// token — it never adds a new denial. `issuers` is the CLOSED allowlist;
+/// there are NO implicit issuers and the resolver NEVER falls through to the
+/// broad `db::agent_pubkey` registry — EXCEPT the reserved zero-config
+/// `owner` issuer (#1960), which is auto-enrolled from on-disk custody
+/// (`owner.priv`/`.pub` + `owner.caproot`) with an Admin ceiling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapabilitiesConfig {
-    /// Master switch. `None`/absent ⇒ false. Env override:
-    /// `AI_MEMORY_CAPABILITIES=on|off` wins over this field.
+    /// Master switch. `None`/absent ⇒ the compiled default
+    /// [`crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED`] (true
+    /// at v1.0.0). Env override: `AI_MEMORY_CAPABILITIES=on|off` wins over
+    /// this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Closed issuer allowlist keyed by issuer id
@@ -5911,6 +5919,33 @@ pub struct CapabilityIssuerEntry {
     /// Optional namespace-prefix ceiling (`/`-segment semantics).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace_prefix: Option<String>,
+}
+
+/// v1.0.0 R9 (#1960) — build the zero-config OWNER
+/// [`crate::governance::capability::IssuerConfig`] from on-disk custody in
+/// `key_dir`, or `None` when the custody is absent (the owner has not been
+/// initialised).
+///
+/// Requires BOTH halves: the `owner.pub` attribution key (via the keypair
+/// store) AND the `owner.caproot` mint secret (mode `0o600`). Either missing
+/// ⇒ `None` ⇒ no owner issuer (byte-identical to a pre-R9 / un-initialised
+/// deployment). The ceiling is [`cap::OWNER_MAX_OP`] (Admin) — the owner key
+/// is the local root of trust, so its tokens can only DELEGATE an attenuated
+/// slice of that authority.
+fn load_owner_issuer_config(
+    key_dir: &std::path::Path,
+) -> Option<crate::governance::capability::IssuerConfig> {
+    use crate::governance::capability as cap;
+    let pubkey = crate::identity::keypair::load(cap::OWNER_ISSUER, key_dir)
+        .ok()
+        .map(|kp| kp.public)?;
+    let root_secret = cap::read_root_secret(key_dir, cap::OWNER_ISSUER).ok()?;
+    Some(cap::IssuerConfig {
+        pubkey,
+        root_secret,
+        max_op: cap::OWNER_MAX_OP,
+        namespace_prefix: None,
+    })
 }
 
 /// Process-wide loaded capability config, mirroring the
@@ -7289,11 +7324,20 @@ impl AppConfig {
             .unwrap_or(SecretScreenMode::Refuse)
     }
 
-    /// v0.9.0 G10.1 (#1827) — resolve the capability-token master switch.
-    /// Ladder: `AI_MEMORY_CAPABILITIES` env (`on`/`off`, case-insensitive;
-    /// unrecognised values fall through) > `[capabilities].enabled` >
-    /// compiled default **false** (inert — byte-identical legacy). Mirrors
-    /// [`Self::resolve_secret_screen_mode`].
+    /// v0.9.0 G10.1 (#1827); v1.0.0 R9 (#1960) — resolve the capability-token
+    /// master switch. Ladder: `AI_MEMORY_CAPABILITIES` env (`on`/`off`,
+    /// case-insensitive; unrecognised values fall through) >
+    /// `[capabilities].enabled` > compiled default
+    /// [`crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED`].
+    ///
+    /// **R9 flipped the compiled default `false` → `true` (default-ON).** This
+    /// is additive-only: a capability-LESS caller is byte-identical to the
+    /// legacy inert posture (the gate hook short-circuits a token-less request
+    /// before it ever consults `enabled`), and the grant path can only WIDEN
+    /// (`Deny`/`Ask` → `Allow`) for a caller that presents a valid token —
+    /// never add a new denial. See `DEFAULT_CAPABILITIES_ENABLED` for the full
+    /// argument. Operators restore the fully-inert posture with
+    /// `AI_MEMORY_CAPABILITIES=off` or `[capabilities].enabled = false`.
     #[must_use]
     pub fn resolve_capabilities_enabled(&self) -> bool {
         if let Some(v) = crate::governance::capability::capabilities_env_override() {
@@ -7302,40 +7346,69 @@ impl AppConfig {
         self.capabilities
             .as_ref()
             .and_then(|c| c.enabled)
-            .unwrap_or(false)
+            .unwrap_or(crate::governance::capability::DEFAULT_CAPABILITIES_ENABLED)
     }
 
-    /// v0.9.0 G10.1 (#1827) — build the runtime
-    /// [`crate::governance::capability::CapabilityConfig`] from the
-    /// `[capabilities]` block: for every listed issuer, resolve the
+    /// v1.0.0 R9 (#1960) — whether the resolved [`Self::resolve_capabilities_enabled`]
+    /// value came from the compiled default (neither the env override nor the
+    /// `[capabilities].enabled` config field set it). Used only to gate the
+    /// one-shot default-on boot note in [`Self::load_capability_config`].
+    fn capabilities_enabled_is_compiled_default(&self) -> bool {
+        crate::governance::capability::capabilities_env_override().is_none()
+            && self.capabilities.as_ref().and_then(|c| c.enabled).is_none()
+    }
+
+    /// v0.9.0 G10.1 (#1827); v1.0.0 R9 (#1960) — build the runtime
+    /// [`crate::governance::capability::CapabilityConfig`].
+    ///
+    /// For every issuer listed under `[capabilities.issuers]`, resolve the
     /// attribution pubkey (keypair store `<id>.pub`, or the narrow operator
     /// key for the reserved id `operator`), load the `<id>.caproot` mint
     /// secret (mode 0o600), and parse the REQUIRED `max_op` ceiling. Any
-    /// failure skips that issuer with an operator-visible warning — the
-    /// closed allowlist only ever SHRINKS on misconfiguration (fail
-    /// closed), and it NEVER consults the broad `db::agent_pubkey`
-    /// registry.
+    /// failure skips that issuer with an operator-visible warning — the closed
+    /// allowlist only ever SHRINKS on misconfiguration (fail closed), and it
+    /// NEVER consults the broad `db::agent_pubkey` registry.
+    ///
+    /// **R9 zero-config owner (#1960).** In ADDITION to the config-listed
+    /// issuers, the reserved [`cap::OWNER_ISSUER`] is AUTO-ENROLLED (with an
+    /// Admin ceiling, [`cap::OWNER_MAX_OP`]) whenever its on-disk custody
+    /// exists — `owner.priv`/`owner.pub` (attribution) + `owner.caproot` (mint
+    /// secret) in the key dir — and it is not already explicitly configured.
+    /// This needs NO `[capabilities.issuers.owner]` entry: `ai-memory
+    /// capability init` writes the custody, and the owner can then mint
+    /// attenuated tokens with zero config. Enrolling the owner adds no new
+    /// denial (it only makes the owner's own attenuated tokens verifiable).
     #[must_use]
     pub fn load_capability_config(&self) -> crate::governance::capability::CapabilityConfig {
         use crate::governance::capability as cap;
         let enabled = self.resolve_capabilities_enabled();
         let mut issuers = std::collections::BTreeMap::new();
+
         let entries = self
             .capabilities
             .as_ref()
             .map(|c| &c.issuers)
             .filter(|m| !m.is_empty());
-        if let Some(entries) = entries {
-            let key_dir = match crate::identity::keypair::default_key_dir() {
-                Ok(d) => d,
-                Err(e) => {
+
+        // Resolve the key dir ONCE; both the config-issuer loop and the R9
+        // owner auto-enroll consume it. A failure here fail-closes (no
+        // issuers), but only warns when `[capabilities.issuers]` was actually
+        // configured (an unresolvable key dir with no config is silent — the
+        // owner just stays un-enrolled).
+        let key_dir = match crate::identity::keypair::default_key_dir() {
+            Ok(d) => Some(d),
+            Err(e) => {
+                if entries.is_some() {
                     eprintln!(
                         "ai-memory: [capabilities.issuers] configured but the key dir is \
                          unresolvable ({e}); NO issuers loaded (fail closed)"
                     );
-                    return cap::CapabilityConfig { enabled, issuers };
                 }
-            };
+                None
+            }
+        };
+
+        if let Some(key_dir) = key_dir.as_deref() {
             // Single warn site so the skip message exists exactly once
             // (pm-v3.1 no-hardcoded-literal discipline).
             let skip = |issuer: &str, why: &str| {
@@ -7344,58 +7417,92 @@ impl AppConfig {
                      skipping issuer (fail closed)"
                 );
             };
-            for (issuer, entry) in entries {
-                let Some(max_op) = cap::OpLevel::parse(&entry.max_op) else {
-                    skip(
-                        issuer,
-                        &format!(
-                            "max_op = {:?} is not one of none/read/write/admin",
-                            entry.max_op
-                        ),
-                    );
-                    continue;
-                };
-                let pubkey = if issuer == cap::OPERATOR_ISSUER {
-                    crate::governance::rules_store::resolve_operator_pubkey()
-                } else {
-                    crate::identity::keypair::load(issuer, &key_dir)
-                        .ok()
-                        .map(|kp| kp.public)
-                };
-                let Some(pubkey) = pubkey else {
-                    skip(
-                        issuer,
-                        &format!(
-                            "has no resolvable attribution pubkey (expected {issuer}.pub \
-                             in the key dir, or the operator key for \"operator\")"
-                        ),
-                    );
-                    continue;
-                };
-                let root_secret = match cap::read_root_secret(&key_dir, issuer) {
-                    Ok(s) => s,
-                    Err(e) => {
+            if let Some(entries) = entries {
+                for (issuer, entry) in entries {
+                    let Some(max_op) = cap::OpLevel::parse(&entry.max_op) else {
                         skip(
                             issuer,
                             &format!(
-                                "root secret unavailable ({e}). Generate with: \
-                                 ai-memory capability keygen {issuer}"
+                                "max_op = {:?} is not one of none/read/write/admin",
+                                entry.max_op
                             ),
                         );
                         continue;
-                    }
-                };
-                issuers.insert(
-                    issuer.clone(),
-                    cap::IssuerConfig {
-                        pubkey,
-                        root_secret,
-                        max_op,
-                        namespace_prefix: entry.namespace_prefix.clone(),
-                    },
-                );
+                    };
+                    let pubkey = if issuer == cap::OPERATOR_ISSUER {
+                        crate::governance::rules_store::resolve_operator_pubkey()
+                    } else {
+                        crate::identity::keypair::load(issuer, key_dir)
+                            .ok()
+                            .map(|kp| kp.public)
+                    };
+                    let Some(pubkey) = pubkey else {
+                        skip(
+                            issuer,
+                            &format!(
+                                "has no resolvable attribution pubkey (expected {issuer}.pub \
+                                 in the key dir, or the operator key for \"operator\")"
+                            ),
+                        );
+                        continue;
+                    };
+                    let root_secret = match cap::read_root_secret(key_dir, issuer) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            skip(
+                                issuer,
+                                &format!(
+                                    "root secret unavailable ({e}). Generate with: \
+                                     ai-memory capability keygen {issuer}"
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    issuers.insert(
+                        issuer.clone(),
+                        cap::IssuerConfig {
+                            pubkey,
+                            root_secret,
+                            max_op,
+                            namespace_prefix: entry.namespace_prefix.clone(),
+                        },
+                    );
+                }
+            }
+
+            // R9 (#1960) zero-config owner auto-enroll: only when the owner
+            // custody exists on disk AND the operator did not already list an
+            // explicit `owner` issuer (an explicit entry wins). Absent custody
+            // ⇒ no owner issuer ⇒ byte-identical to a pre-R9 deployment.
+            if !issuers.contains_key(cap::OWNER_ISSUER) {
+                if let Some(owner) = load_owner_issuer_config(key_dir) {
+                    issuers.insert(cap::OWNER_ISSUER.to_string(), owner);
+                }
             }
         }
+
+        // R9 (#1960) one-shot boot note when the default-ON posture is in
+        // effect purely from the compiled default (operator set neither env
+        // nor config). This documents that default-on is ADDITIVE-ONLY and
+        // that the issue's "deny-semantics" reading is deliberately NOT
+        // flipped here — a gate-tightening flip rides the v0.10.0 WARN cycle.
+        if enabled && self.capabilities_enabled_is_compiled_default() {
+            static DEFAULT_ON_NOTE_ONCE: std::sync::Once = std::sync::Once::new();
+            DEFAULT_ON_NOTE_ONCE.call_once(|| {
+                tracing::warn!(
+                    target: crate::governance::GOVERNANCE_TRACE_TARGET,
+                    issuer_count = issuers.len(),
+                    "capabilities are ON by default (R9 #1960): the macaroon grant layer is \
+                     available and additive-only (attenuation widening; a capability-less \
+                     caller is byte-identical to the legacy inert posture — ZERO new denials). \
+                     Deny-semantics (refusing a capability-less caller by default) is a \
+                     gate-tightening flip and is deliberately NOT enabled; it rides the v0.10.0 \
+                     WARN cycle. Set AI_MEMORY_CAPABILITIES=off to restore the fully-inert posture."
+                );
+            });
+        }
+
         cap::CapabilityConfig { enabled, issuers }
     }
 
@@ -10129,8 +10236,9 @@ legacy_scoring = false
 
     #[test]
     fn capabilities_enabled_resolution_ladder() {
-        // v0.9.0 G10.1 (#1827) — env `AI_MEMORY_CAPABILITIES` >
-        // `[capabilities].enabled` > compiled default false. The
+        // v0.9.0 G10.1 (#1827); v1.0.0 R9 (#1960) — env
+        // `AI_MEMORY_CAPABILITIES` > `[capabilities].enabled` > compiled
+        // default TRUE (R9 default-on; was false through v0.9.0). The
         // capability lock doubles as the env-var serializer for this
         // knob (the only tests touching it hold this guard).
         let _guard = lock_capability_config_for_test();
@@ -10140,39 +10248,144 @@ legacy_scoring = false
         }
         let mut cfg = AppConfig::default();
         assert!(
-            !cfg.resolve_capabilities_enabled(),
-            "compiled default must be FALSE (inert GA posture)"
+            cfg.resolve_capabilities_enabled(),
+            "R9 (#1960): compiled default must be TRUE (default-on, additive-only)"
         );
+        assert!(
+            cfg.capabilities_enabled_is_compiled_default(),
+            "no env + no config => the value came from the compiled default"
+        );
+        // Explicit config false wins over the compiled default (restore inert).
         cfg.capabilities = Some(CapabilitiesConfig {
-            enabled: Some(true),
+            enabled: Some(false),
             issuers: std::collections::BTreeMap::new(),
         });
-        assert!(cfg.resolve_capabilities_enabled(), "config true wins");
-        unsafe {
-            std::env::set_var(env, "off");
-        }
         assert!(
             !cfg.resolve_capabilities_enabled(),
-            "env off overrides config true"
+            "config false overrides the compiled default true"
         );
+        assert!(
+            !cfg.capabilities_enabled_is_compiled_default(),
+            "an explicit config value is NOT the compiled default"
+        );
+        // Env on overrides config false.
         unsafe {
             std::env::set_var(env, "on");
         }
-        cfg.capabilities = None;
         assert!(
             cfg.resolve_capabilities_enabled(),
-            "env on overrides absent config"
+            "env on overrides config false"
         );
+        // Env off overrides absent config (still off).
+        unsafe {
+            std::env::set_var(env, "off");
+        }
+        cfg.capabilities = None;
+        assert!(
+            !cfg.resolve_capabilities_enabled(),
+            "env off overrides absent config"
+        );
+        // Unrecognised env falls through to config (absent) => compiled
+        // default TRUE at v1.0.0.
         unsafe {
             std::env::set_var(env, "bogus");
         }
         assert!(
-            !cfg.resolve_capabilities_enabled(),
-            "unrecognised env falls through to config (absent => false)"
+            cfg.resolve_capabilities_enabled(),
+            "unrecognised env falls through to the compiled default (true at v1.0.0)"
         );
         unsafe {
             std::env::remove_var(env);
         }
+    }
+
+    #[test]
+    fn r9_owner_issuer_auto_enroll_is_zero_config() {
+        // #1960 R9 — the reserved `owner` issuer enrolls from on-disk custody
+        // with NO `[capabilities.issuers]` config. Absent custody ⇒ None
+        // (byte-identical to a pre-R9 deployment); present custody ⇒ an
+        // Admin-ceiling issuer.
+        use crate::governance::capability as cap;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert!(
+            load_owner_issuer_config(dir).is_none(),
+            "no owner custody ⇒ no owner issuer (no new behaviour)"
+        );
+        // Establish custody exactly as `ai-memory capability init` does.
+        let kp = crate::identity::keypair::generate(cap::OWNER_ISSUER).unwrap();
+        crate::identity::keypair::save(&kp, dir).unwrap();
+        cap::write_root_secret(dir, cap::OWNER_ISSUER).unwrap();
+        let owner = load_owner_issuer_config(dir).expect("owner enrolls from disk");
+        assert_eq!(owner.max_op, cap::OWNER_MAX_OP, "owner ceiling is Admin");
+    }
+
+    #[test]
+    fn r9_default_on_is_additive_owner_token_widens_but_adds_no_denial() {
+        // #1960 R9 — with capabilities ON and the zero-config owner enrolled:
+        // (1) a valid owner token WIDENS a Deny → Allow (attenuation grant);
+        // (2) a capability-LESS caller's Deny is UNCHANGED (zero new denial);
+        // (3) an owner token attenuated to Read cannot widen a Write.
+        use crate::governance::capability as cap;
+        use crate::models::{GovernanceDecision, GovernanceLevel, GovernedAction};
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let kp = crate::identity::keypair::generate(cap::OWNER_ISSUER).unwrap();
+        crate::identity::keypair::save(&kp, dir).unwrap();
+        cap::write_root_secret(dir, cap::OWNER_ISSUER).unwrap();
+        let owner = load_owner_issuer_config(dir).unwrap();
+        let mut issuers = std::collections::BTreeMap::new();
+        issuers.insert(cap::OWNER_ISSUER.to_string(), owner);
+        let cfg = cap::CapabilityConfig {
+            enabled: true,
+            issuers,
+        };
+
+        // Mint an owner token (needs owner.priv + owner.caproot).
+        let secret = cap::read_root_secret(dir, cap::OWNER_ISSUER).unwrap();
+        let priv_key = kp.private.clone().unwrap();
+        let tok = cap::mint_with_secret(
+            &priv_key,
+            &secret,
+            cap::OWNER_ISSUER,
+            "root-1",
+            vec![
+                cap::Caveat::OpCeiling(cap::OpLevel::Write),
+                cap::Caveat::ExpiresAt(9_999_999_999),
+            ],
+        )
+        .unwrap();
+
+        let req = cap::CapRequest {
+            action: "Store".to_string(),
+            namespace: "team/x".to_string(),
+            agent_id: "ai:a".to_string(),
+            now: 100,
+        };
+        let deny = || {
+            GovernanceDecision::Deny(crate::governance::GovernanceRefusal::new(
+                GovernedAction::Store,
+                GovernanceLevel::Owner,
+                "ai:a",
+                "nope",
+            ))
+        };
+
+        // (1) owner token widens Deny → Allow.
+        let (d1, o1) = cap::apply_capability_grant_gov(deny(), &cfg, true, Some(&tok), &req);
+        assert_eq!(d1, GovernanceDecision::Allow);
+        assert!(matches!(o1, cap::GrantOutcome::Granted { .. }));
+
+        // (2) capability-LESS caller: Deny is unchanged, NoOp (no new denial).
+        let (d2, o2) = cap::apply_capability_grant_gov(deny(), &cfg, true, None, &req);
+        assert!(matches!(d2, GovernanceDecision::Deny(_)));
+        assert_eq!(o2, cap::GrantOutcome::NoOp);
+
+        // (3) attenuated-to-Read owner token cannot cover a Write.
+        let narrowed = cap::attenuate(&tok, cap::Caveat::OpCeiling(cap::OpLevel::Read)).unwrap();
+        let (d3, o3) = cap::apply_capability_grant_gov(deny(), &cfg, true, Some(&narrowed), &req);
+        assert!(matches!(d3, GovernanceDecision::Deny(_)));
+        assert!(matches!(o3, cap::GrantOutcome::Rejected(_)));
     }
 
     #[test]

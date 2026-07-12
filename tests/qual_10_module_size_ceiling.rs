@@ -844,7 +844,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // since — invisible to push CI because impact-selection never
     // dispatches qual_10. Actual LOC at the bump: 12_401.
     // 12_500 = 12_401 + 99 headroom.
-    ("src/config.rs", 12_500),
+    // 2026-07-12 — bumped 12_500 → 12_700 by #1960 (v1.0.0 Gate-2 R9
+    // default-on capabilities + zero-config owner mint): the
+    // `resolve_capabilities_enabled` default-on flip doc, the
+    // `capabilities_enabled_is_compiled_default` provenance helper, the
+    // `load_capability_config` owner auto-enroll + one-shot boot note, the
+    // `load_owner_issuer_config` free fn, and the two R9 regression tests
+    // pushed config.rs from 12_401 to 12_614. 12_700 = 12_614 + 86 headroom.
+    ("src/config.rs", 12_700),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the

@@ -74,6 +74,33 @@ pub const MAX_TOKEN_B64_LEN: usize = 8 * 1024;
 /// insensitive); anything else is ignored (config value stands).
 pub const ENV_CAPABILITIES: &str = "AI_MEMORY_CAPABILITIES";
 
+/// Compiled default for `[capabilities].enabled` — the R9 (#1960)
+/// **default-ON** posture for v1.0.0 (was `false`, the GA-inert G10.1
+/// posture, through v0.9.0).
+///
+/// # Why default-on is additive-only (adds ZERO new denials)
+///
+/// Turning the capability grant layer on by default does NOT tighten any
+/// gate. The wiring is deliberately asymmetric:
+///
+/// - [`apply_at_gate`] short-circuits `token.is_none() || base == Allow`
+///   **before** it ever consults `enabled`, so a caller that presents NO
+///   capability token is byte-identical whether the layer is on or off.
+/// - [`parse_presented_token`] only does extra work for a caller that
+///   *actively presents* a token (an opt-in act); an invalid token still
+///   yields `None` and the request proceeds on the bare ACL.
+/// - The grant path ([`apply_capability_grant`]) only ever flips a
+///   `Deny`/`Ask` base to `Allow` (attenuation-only widening); it can
+///   never turn an `Allow` into a denial.
+///
+/// So default-on WIDENS what a capability-bearing owner can delegate (via
+/// attenuated tokens) and adds no new denial to any pre-capability flow.
+/// The "deny-semantics" reading of R9 — where a *capability-less* caller
+/// would be refused by default — is a gate-TIGHTENING breaking flip and is
+/// intentionally NOT enabled here; it rides the shipped v0.10.0 WARN cycle
+/// (see the one-shot boot note in `AppConfig::load_capability_config`).
+pub const DEFAULT_CAPABILITIES_ENABLED: bool = true;
+
 // Domain-separation discriminator baked into the RootBlock CBOR. The key set
 // below ({dom, v, issuer, root_id, caveats}) is DISTINCT from SignableLink
 // ({src_id,dst_id,relation,observed_by,valid_from,valid_until}), the Write
@@ -867,6 +894,30 @@ pub const ROOT_SECRET_LEN: usize = 32;
 /// `[capabilities.issuers]` and hold a `.caproot` — there are NO implicit
 /// issuers (closed allowlist).
 pub const OPERATOR_ISSUER: &str = "operator";
+
+/// The reserved issuer id for the R9 (#1960) **zero-config owner** capability
+/// key. Unlike [`OPERATOR_ISSUER`] (which requires an explicit
+/// `[capabilities.issuers.operator]` config entry + the governance operator
+/// key), the owner issuer is AUTO-ENROLLED from on-disk custody with NO
+/// operator config: once `ai-memory capability init` (or the owner-mint
+/// path) has written `owner.priv`/`owner.pub` + `owner.caproot` into the key
+/// dir, [`AppConfig::load_capability_config`] injects it into the closed
+/// allowlist so the owner can immediately mint attenuated tokens.
+///
+/// Auto-enrollment is SAFE (adds no new denial): it only makes an owner's own
+/// attenuated tokens *verifiable*; a token-less caller is unaffected (see
+/// [`DEFAULT_CAPABILITIES_ENABLED`]).
+pub const OWNER_ISSUER: &str = "owner";
+
+/// The authority ceiling granted to the auto-enrolled [`OWNER_ISSUER`].
+///
+/// [`OpLevel::Admin`] is correct and safe: the holder of `owner.priv` +
+/// `owner.caproot` in the (mode-`0o600`) key dir already IS the operator, so
+/// the owner key is the local root of trust. A capability token minted under
+/// it can therefore only ever be used to DELEGATE an ATTENUATED (strictly
+/// narrower) slice of that authority to a sub-agent — never to widen past
+/// Admin (the caveat chain is non-escalating; see the module docs).
+pub const OWNER_MAX_OP: OpLevel = OpLevel::Admin;
 
 impl OpLevel {
     /// Parse the config-file spelling (`none`/`read`/`write`/`admin`,
