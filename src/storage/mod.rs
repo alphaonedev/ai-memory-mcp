@@ -9721,7 +9721,7 @@ pub fn append_lineage_record(
     record: &crate::identity::lineage::LineageRecord,
     signature: &[u8],
 ) -> Result<()> {
-    use crate::identity::lineage::{LineageReason, verify_succession};
+    use crate::identity::lineage::{LineageReason, RecoveryPolicy, verify_succession};
 
     if record.agent_id != agent_id {
         anyhow::bail!(
@@ -9729,12 +9729,10 @@ pub fn append_lineage_record(
             record.agent_id
         );
     }
-    if record.reason == LineageReason::Recovery {
-        anyhow::bail!(
-            "recovery lineage records cannot be minted in v0.9.0 — the recovery VERIFY \
-             path (and its same-epoch fork tie-break) lands in v1.0"
-        );
-    }
+    // v1.0.0 #1831 (G17) — recovery records ARE now mintable: they are
+    // attested by an M-of-N guardian quorum (verified below) instead of a
+    // single predecessor signature. The recovery VERIFY path landed in v1.0
+    // (the key-LOSS half of gap G13).
     // v1.0.0 #1949 — the CODE refuse-guard: the OSS build STRUCTURALLY
     // REFUSES to mint any non-`software-file` custody class (the reserved
     // hardware classes are verify-only this train). Fail-closed BEFORE
@@ -9774,13 +9772,31 @@ pub fn append_lineage_record(
             }
         }
     }
-    // The signature must already verify under the predecessor key —
-    // never persist a record the walk would reject.
-    let predecessor =
-        crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
-            .context("decoding lineage predecessor pubkey")?;
-    verify_succession(record, signature, &predecessor)
-        .map_err(|e| anyhow::anyhow!("refusing to persist unverifiable lineage record: {e}"))?;
+    // The signature must already verify — never persist a record the walk
+    // would reject. Recovery (#1831 G17) is authorized by the M-of-N
+    // guardian quorum (the stored `signature` blob is the CBOR quorum, NOT
+    // a single Ed25519 sig); every other reason is a single predecessor
+    // signature.
+    if record.reason == LineageReason::Recovery {
+        let policy = RecoveryPolicy::from_env().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot mint a recovery record — no recovery guardians enrolled \
+                 (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
+            )
+        })?;
+        // Verification reads the trust bar (threshold + guardian-set id)
+        // from the record's SIGNED body, not `policy` — `policy` supplies
+        // only the guardian KEY MATERIAL (#1831 ratification delta A).
+        crate::identity::lineage::verify_recovery_record(record, signature, &policy).map_err(
+            |e| anyhow::anyhow!("refusing to persist unverifiable recovery record: {e}"),
+        )?;
+    } else {
+        let predecessor =
+            crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
+                .context("decoding lineage predecessor pubkey")?;
+        verify_succession(record, signature, &predecessor)
+            .map_err(|e| anyhow::anyhow!("refusing to persist unverifiable lineage record: {e}"))?;
+    }
 
     let record_bytes = record.canonical_bytes()?;
     let witness_hash = record.witness_payload_hash()?;
@@ -9795,8 +9811,9 @@ pub fn append_lineage_record(
             "INSERT INTO agent_lineage \
                 (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                  recovery_pubkey, not_before, prev_record_hash, signature, \
-                 record_bytes, created_at, custody_class, suspected_compromise_from_seq) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 record_bytes, created_at, custody_class, suspected_compromise_from_seq, \
+                 guardian_set_id, recovery_threshold) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 record.agent_id,
                 i64::try_from(record.epoch).context("lineage epoch exceeds i64")?,
@@ -9813,6 +9830,12 @@ pub fn append_lineage_record(
                 record
                     .suspected_compromise_from_seq
                     .map(|s| i64::try_from(s).unwrap_or(i64::MAX)),
+                // v1.0.0 #1831 (G17) — committed recovery trust anchor
+                // (NULL on every non-recovery record).
+                record.guardian_set_id.as_deref(),
+                record
+                    .recovery_threshold
+                    .map(|m| i64::try_from(m).unwrap_or(i64::MAX)),
             ],
         )
         .context("append_lineage_record: insert body (duplicate epoch is refused by the C5 PK)")?;
@@ -9885,7 +9908,8 @@ pub fn read_lineage(
         .prepare_cached(
             "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                     recovery_pubkey, not_before, prev_record_hash, signature, \
-                    custody_class, suspected_compromise_from_seq \
+                    custody_class, suspected_compromise_from_seq, \
+                    guardian_set_id, recovery_threshold \
              FROM agent_lineage WHERE agent_id = ?1 ORDER BY epoch ASC",
         )
         .context("read_lineage: prepare")?;
@@ -9903,6 +9927,8 @@ pub fn read_lineage(
                 row.get::<_, Vec<u8>>(8)?,
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<Vec<u8>>>(11)?,
+                row.get::<_, Option<i64>>(12)?,
             ))
         })
         .context("read_lineage: query")?;
@@ -9921,6 +9947,8 @@ pub fn read_lineage(
             sig,
             custody,
             from_seq,
+            guardian_set_id,
+            recovery_threshold,
         ) = row.context("read_lineage: row decode")?;
         let reason = LineageReason::from_str(&reason)
             .with_context(|| format!("unknown lineage reason '{reason}' for '{aid}'"))?;
@@ -9945,6 +9973,8 @@ pub fn read_lineage(
                 prev_record_hash: prev_hash,
                 custody_class,
                 suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
+                guardian_set_id,
+                recovery_threshold: recovery_threshold.map(|m| u64::try_from(m).unwrap_or(0)),
             },
             sig,
         ));
@@ -10026,10 +10056,16 @@ pub fn verify_agent_lineage(
     let records = read_lineage(conn, agent_id)?;
     let witnesses = lineage_witness_hashes(conn, agent_id)?;
     let bound = agent_pubkey(conn, agent_id)?;
-    Ok(crate::identity::lineage::verify_lineage(
+    // v1.0.0 #1831 (G17) — resolve the M-of-N recovery guardian policy from
+    // the environment so a chain whose head arrived via a valid guardian
+    // quorum verifies. `None` (no guardians enrolled) fail-closes any
+    // recovery record, preserving the v0.9.0 posture.
+    let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
+    Ok(crate::identity::lineage::verify_lineage_with_recovery(
         &records,
         &witnesses,
         bound.as_deref(),
+        recovery_policy.as_ref(),
     ))
 }
 
@@ -10067,7 +10103,14 @@ pub fn current_authoritative_key(
     }
     let witnesses = lineage_witness_hashes(conn, agent_id)?;
     let bound = agent_pubkey(conn, agent_id)?;
-    match crate::identity::lineage::verify_lineage(&records, &witnesses, bound.as_deref()) {
+    // v1.0.0 #1831 (G17) — recovery-aware resolution (see `verify_agent_lineage`).
+    let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
+    match crate::identity::lineage::verify_lineage_with_recovery(
+        &records,
+        &witnesses,
+        bound.as_deref(),
+        recovery_policy.as_ref(),
+    ) {
         Ok(verified) => Ok(Some(verified.head_key)),
         Err(e) => {
             tracing::warn!(
@@ -10260,6 +10303,136 @@ pub fn append_revocation(
     )?;
     let sig = crate::identity::sign::sign_succession(k_old, &record.to_signable())?;
     append_lineage_record(conn, agent_id, &record, &sig)?;
+    Ok(record)
+}
+
+/// v1.0.0 #1831 (G17) — deterministically mint the recovery record that
+/// succeeds the current head, WITHOUT signing/persisting it. Shared by the
+/// two-phase recovery ceremony so the record the guardians sign
+/// (`prepare_recovery_challenge`) is byte-identical to the one persisted
+/// (`append_recovery`).
+///
+/// The committed trust anchor — the SHA-256 `guardian_set_id` over the
+/// SORTED enrolled guardians and the M-of-N threshold — rides the SIGNED
+/// body (#1831 ratification delta A), so `mint_recovery_record` resolves the
+/// [`RecoveryPolicy`] from env: env is the guardian KEY-MATERIAL + the
+/// EXPLICIT mint threshold source (delta C — a mint with guardians enrolled
+/// but no explicit `AI_MEMORY_RECOVERY_THRESHOLD` is REFUSED, never
+/// defaulted to `M = 1`).
+///
+/// # Errors
+/// No enrolled lineage, no enrolled guardians, no explicit threshold, an
+/// undecodable successor / recovery key, or a CBOR hashing failure.
+fn mint_recovery_record(
+    conn: &Connection,
+    agent_id: &str,
+    successor_pubkey_b64: &str,
+    suspected_compromise_from_seq: Option<u64>,
+    recovery_pubkey_b64: Option<&str>,
+    not_before: &str,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    let Some((head, _)) = lineage_head(conn, agent_id)? else {
+        anyhow::bail!("no lineage enrolled for '{agent_id}' — nothing to recover");
+    };
+    crate::identity::keypair::decode_public_base64(successor_pubkey_b64)
+        .context("decoding recovery successor pubkey")?;
+    if let Some(rec) = recovery_pubkey_b64 {
+        crate::identity::keypair::decode_public_base64(rec).context(CTX_DECODE_RECOVERY_PUBKEY)?;
+    }
+    let policy = crate::identity::lineage::RecoveryPolicy::from_env().ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot mint a recovery record — no recovery guardians enrolled \
+             (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
+        )
+    })?;
+    let threshold = policy.threshold.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot mint a recovery record — AI_MEMORY_RECOVERY_THRESHOLD is unset; \
+             set an explicit M-of-N threshold (a key-takeover primitive never defaults to 1)"
+        )
+    })?;
+    let guardian_set_id = policy.guardian_set_id();
+    let threshold_u64 = u64::try_from(threshold).unwrap_or(u64::MAX);
+    // None carries the existing recovery commitment forward.
+    let recovery = recovery_pubkey_b64
+        .map(str::to_string)
+        .or_else(|| head.recovery_pubkey_b64.clone());
+    crate::identity::lineage::LineageRecord::recovery(
+        &head,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
+        recovery,
+        guardian_set_id,
+        threshold_u64,
+        not_before,
+    )
+}
+
+/// v1.0.0 #1831 (G17) — phase 1 of the recovery ceremony: mint the
+/// prospective recovery record and return it PLUS the exact
+/// `LINEAGE_DOMAIN`-tagged bytes each guardian must sign (the "recovery
+/// challenge"). The caller distributes the challenge to the guardians; each
+/// signs it offline and returns a `{guardian_pubkey, signature}` pair.
+///
+/// The `not_before` MUST be reused verbatim in [`append_recovery`] so the
+/// re-minted record is byte-identical to the one the guardians signed.
+///
+/// # Errors
+/// Propagates [`mint_recovery_record`] + the (unreachable) CBOR-encode
+/// failure of the signing input.
+pub fn prepare_recovery_challenge(
+    conn: &Connection,
+    agent_id: &str,
+    successor_pubkey_b64: &str,
+    suspected_compromise_from_seq: Option<u64>,
+    recovery_pubkey_b64: Option<&str>,
+    not_before: &str,
+) -> Result<(crate::identity::lineage::LineageRecord, Vec<u8>)> {
+    let record = mint_recovery_record(
+        conn,
+        agent_id,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
+        recovery_pubkey_b64,
+        not_before,
+    )?;
+    let challenge = record.signing_input()?;
+    Ok((record, challenge))
+}
+
+/// v1.0.0 #1831 (G17) — phase 2 of the recovery ceremony: re-mint the SAME
+/// recovery record (from `not_before` echoed out of
+/// [`prepare_recovery_challenge`]), assemble the collected M-of-N guardian
+/// attestations into the quorum blob, and persist it via
+/// [`append_lineage_record`] — which verifies the quorum against the
+/// env-enrolled guardian set (M-of-N) + the dead-man gate BEFORE anything
+/// is written. On success the fresh `successor_pubkey_b64` is the new head
+/// and the identity has survived key LOSS.
+///
+/// # Errors
+/// No enrolled lineage, an undecodable key, a quorum that fails to meet the
+/// M-of-N threshold (or a forged / unenrolled / stale signature), a
+/// dead-man window not yet elapsed, or any [`append_lineage_record`]
+/// failure. Nothing is persisted on any failure.
+pub fn append_recovery(
+    conn: &Connection,
+    agent_id: &str,
+    successor_pubkey_b64: &str,
+    quorum: &[crate::identity::lineage::RecoveryAttestation],
+    suspected_compromise_from_seq: Option<u64>,
+    recovery_pubkey_b64: Option<&str>,
+    not_before: &str,
+) -> Result<crate::identity::lineage::LineageRecord> {
+    let record = mint_recovery_record(
+        conn,
+        agent_id,
+        successor_pubkey_b64,
+        suspected_compromise_from_seq,
+        recovery_pubkey_b64,
+        not_before,
+    )?;
+    let quorum_blob = crate::identity::lineage::encode_recovery_quorum(quorum)?;
+    append_lineage_record(conn, agent_id, &record, &quorum_blob)?;
     Ok(record)
 }
 
@@ -16182,6 +16355,170 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// v1.0.0 #1831 (G17) — end-to-end persisted M-of-N key-loss recovery:
+    /// enroll a lineage, "lose" the head key, then RECOVER to a fresh
+    /// primary via a 2-of-3 guardian quorum through the real persistence
+    /// path (`prepare_recovery_challenge` → guardian sign →
+    /// `append_recovery` → `verify_agent_lineage`). Proves the recovery
+    /// record lands the witness + flat-key sync in one tx and the walk
+    /// resolves the fresh head as authoritative.
+    #[test]
+    fn recovery_1831_ceremony_persists_and_verifies() {
+        use crate::identity::keypair;
+        use crate::identity::lineage::{
+            RECOVERY_GUARDIAN_PUBKEYS_ENV, RECOVERY_THRESHOLD_ENV, RecoveryAttestation,
+        };
+        use ed25519_dalek::Signer;
+
+        // Serialize the guardian-env mutation against EVERY other test that
+        // touches AI_MEMORY_RECOVERY_* — the CLI recovery ceremony uses the
+        // same `key_dir_env_lock`, so both must grab it (a different lock
+        // would race on the shared guardian env vars).
+        let _envg = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conn = test_db();
+        register_agent(&conn, "rec-agent", "ai:test", &[]).expect("register");
+
+        let k0 = keypair::generate("rec-agent").expect("k0");
+        let cold_recovery = keypair::generate("rec-agent-cold").expect("cold");
+        enroll_lineage(
+            &conn,
+            "rec-agent",
+            &k0,
+            Some(&cold_recovery.public_base64()),
+        )
+        .expect("enroll genesis");
+
+        // K0 is LOST. A fresh primary + 3 guardians (enroll 2-of-3).
+        let k_new = keypair::generate("rec-agent").expect("k_new");
+        let guardians: Vec<_> = (0..3)
+            .map(|_| keypair::generate("guardian").expect("guardian"))
+            .collect();
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe {
+            std::env::set_var(
+                RECOVERY_GUARDIAN_PUBKEYS_ENV,
+                format!(
+                    "{},{},{}",
+                    guardians[0].public_base64(),
+                    guardians[1].public_base64(),
+                    guardians[2].public_base64()
+                ),
+            );
+            std::env::set_var(RECOVERY_THRESHOLD_ENV, "2");
+        }
+
+        // Phase 1 — mint the challenge.
+        let not_before = Utc::now().to_rfc3339();
+        let (record, challenge) = prepare_recovery_challenge(
+            &conn,
+            "rec-agent",
+            &k_new.public_base64(),
+            None,
+            None,
+            &not_before,
+        )
+        .expect("prepare challenge");
+        assert_eq!(record.epoch, 1);
+
+        // Phase 1.5 — two guardians sign the challenge offline.
+        let quorum: Vec<RecoveryAttestation> = [&guardians[0], &guardians[1]]
+            .iter()
+            .map(|g| RecoveryAttestation {
+                guardian_pubkey_b64: g.public_base64(),
+                signature: g
+                    .private
+                    .as_ref()
+                    .unwrap()
+                    .sign(&challenge)
+                    .to_bytes()
+                    .to_vec(),
+            })
+            .collect();
+
+        // Phase 2 — persist the recovery (verifies the quorum first).
+        append_recovery(
+            &conn,
+            "rec-agent",
+            &k_new.public_base64(),
+            &quorum,
+            None,
+            None,
+            &not_before,
+        )
+        .expect("append recovery");
+
+        // The chain now verifies to the FRESH head via the guardian quorum.
+        let verified = verify_agent_lineage(&conn, "rec-agent")
+            .expect("infra ok")
+            .expect("chain verifies");
+        assert_eq!(verified.epoch, 1);
+        assert_eq!(verified.head_key.to_bytes(), k_new.public.to_bytes());
+        assert_eq!(verified.recovered_at_epoch, Some(1));
+        // The flat binding was synced to the fresh head in the same tx.
+        assert_eq!(
+            agent_pubkey(&conn, "rec-agent").unwrap().as_deref(),
+            Some(k_new.public_base64().as_str())
+        );
+
+        // A quorum of ONE (below threshold 2) is refused — nothing persists.
+        let conn2 = test_db();
+        register_agent(&conn2, "rec-agent", "ai:test", &[]).unwrap();
+        enroll_lineage(
+            &conn2,
+            "rec-agent",
+            &k0,
+            Some(&cold_recovery.public_base64()),
+        )
+        .unwrap();
+        let nb2 = Utc::now().to_rfc3339();
+        let (_r2, ch2) = prepare_recovery_challenge(
+            &conn2,
+            "rec-agent",
+            &k_new.public_base64(),
+            None,
+            None,
+            &nb2,
+        )
+        .unwrap();
+        let single = vec![RecoveryAttestation {
+            guardian_pubkey_b64: guardians[0].public_base64(),
+            signature: guardians[0]
+                .private
+                .as_ref()
+                .unwrap()
+                .sign(&ch2)
+                .to_bytes()
+                .to_vec(),
+        }];
+        let err = append_recovery(
+            &conn2,
+            "rec-agent",
+            &k_new.public_base64(),
+            &single,
+            None,
+            None,
+            &nb2,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("recovery"),
+            "under-threshold recovery must be refused, got: {err:#}"
+        );
+        // The head is still K0 (nothing persisted).
+        assert_eq!(
+            agent_pubkey(&conn2, "rec-agent").unwrap().as_deref(),
+            Some(k0.public_base64().as_str())
+        );
+
+        // SAFETY: test-only env cleanup serialised by the lock above.
+        unsafe {
+            std::env::remove_var(RECOVERY_GUARDIAN_PUBKEYS_ENV);
+            std::env::remove_var(RECOVERY_THRESHOLD_ENV);
+        }
     }
 
     /// Insert a minimal memory row with an explicit `updated_at` so the

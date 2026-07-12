@@ -301,6 +301,14 @@ const MIGRATION_V79_CRYPTO_CORE: &str =
 const MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION: &str =
     include_str!("../../migrations/postgres/0039_v80_lineage_custody_revocation.sql");
 
+/// v81 (#1831 G17) — M-of-N threshold key recovery (postgres twin of the
+/// sqlite v81 arm). Purely additive: ADD COLUMN IF NOT EXISTS for
+/// `guardian_set_id` (BYTEA — committed SHA-256 over the sorted guardian
+/// pubkeys) + `recovery_threshold` (BIGINT — committed M-of-N threshold).
+/// No CHECK change (the v80 reason CHECK already admits 'recovery').
+const MIGRATION_V81_LINEAGE_RECOVERY_QUORUM: &str =
+    include_str!("../../migrations/postgres/0040_v81_lineage_recovery_quorum.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -659,7 +667,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 80;
+const CURRENT_SCHEMA_VERSION: i32 = 81;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1553,8 +1561,11 @@ impl PostgresStore {
         if current_version < 79 {
             self.migrate_v79().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 80 {
             self.migrate_v80().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v81().await?;
         }
 
         Ok(())
@@ -3911,7 +3922,7 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v80 lineage custody+revocation", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 80).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v80 ddl", e))?;
@@ -3920,6 +3931,39 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v80 applied (#1949: agent_lineage custody_class + \
              suspected_compromise_from_seq + revocation reason)"
+        );
+        Ok(())
+    }
+
+    /// v81 (#1831 G17) — M-of-N threshold key recovery (postgres twin of the
+    /// sqlite v81 arm). Adds the two additive recovery-only columns
+    /// `guardian_set_id` (BYTEA) + `recovery_threshold` (BIGINT) — the
+    /// committed trust anchor a persisted recovery is re-verified against.
+    /// Purely additive (no CHECK change, no rewrite). Stamps
+    /// `CURRENT_SCHEMA_VERSION` as the new ladder head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a DDL / stamp failure.
+    async fn migrate_v81(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v81 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V81_LINEAGE_RECOVERY_QUORUM)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v81 lineage recovery quorum", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v81 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v81 applied (#1831 G17: agent_lineage guardian_set_id + \
+             recovery_threshold)"
         );
         Ok(())
     }
@@ -16483,12 +16527,18 @@ impl MemoryStore for PostgresStore {
         let from_seq_i64 = record
             .suspected_compromise_from_seq
             .map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+        // v1.0.0 #1831 (G17) — committed recovery trust anchor (NULL on
+        // every non-recovery record).
+        let recovery_threshold_i64 = record
+            .recovery_threshold
+            .map(|m| i64::try_from(m).unwrap_or(i64::MAX));
         sqlx::query(
             "INSERT INTO agent_lineage \
                 (agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                  recovery_pubkey, not_before, prev_record_hash, signature, \
-                 record_bytes, created_at, custody_class, suspected_compromise_from_seq) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                 record_bytes, created_at, custody_class, suspected_compromise_from_seq, \
+                 guardian_set_id, recovery_threshold) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&record.agent_id)
         .bind(epoch_i64)
@@ -16503,6 +16553,8 @@ impl MemoryStore for PostgresStore {
         .bind(&now_rfc)
         .bind(record.custody_class.as_str())
         .bind(from_seq_i64)
+        .bind(&record.guardian_set_id)
+        .bind(recovery_threshold_i64)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -16603,10 +16655,13 @@ impl MemoryStore for PostgresStore {
             Vec<u8>,
             Option<String>,
             Option<i64>,
+            Option<Vec<u8>>,
+            Option<i64>,
         )> = sqlx::query_as(
             "SELECT agent_id, epoch, reason, predecessor_pubkey, successor_pubkey, \
                     recovery_pubkey, not_before, prev_record_hash, signature, \
-                    custody_class, suspected_compromise_from_seq \
+                    custody_class, suspected_compromise_from_seq, \
+                    guardian_set_id, recovery_threshold \
              FROM agent_lineage WHERE agent_id = $1 ORDER BY epoch ASC",
         )
         .bind(agent_id)
@@ -16627,6 +16682,8 @@ impl MemoryStore for PostgresStore {
             sig,
             custody,
             from_seq,
+            guardian_set_id,
+            recovery_threshold,
         ) in rows
         {
             let reason =
@@ -16658,6 +16715,8 @@ impl MemoryStore for PostgresStore {
                     prev_record_hash: prev_hash,
                     custody_class,
                     suspected_compromise_from_seq: from_seq.map(|s| u64::try_from(s).unwrap_or(0)),
+                    guardian_set_id,
+                    recovery_threshold: recovery_threshold.map(|m| u64::try_from(m).unwrap_or(0)),
                 },
                 sig,
             ));
