@@ -74,6 +74,13 @@ pub mod error_codes {
     pub const STORE_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
     pub const STORE_GOVERNANCE_REFUSED: &str = "GOVERNANCE_REFUSED";
     pub const STORE_VERSION_CONFLICT: &str = "VERSION_CONFLICT";
+
+    /// #1955 [P1][R45] — a mutating write refused because the substrate
+    /// record-stop actuator is engaged. Shared slug for the SAL
+    /// [`crate::store::StoreError::Stopped`] and the `db::`-funnel
+    /// [`crate::storage::StorageError::RecordStopped`] so the HTTP / MCP /
+    /// CLI surfaces emit one canonical code.
+    pub const RECORD_STOPPED: &str = "RECORD_STOPPED";
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +334,10 @@ mod arch_9_slug_tests {
             },
             StoreError::IntegrityFailed { detail: "d".into() },
             StoreError::InvalidTransition { detail: "d".into() },
+            StoreError::Stopped {
+                issued_by: "ai:operator".into(),
+                scope: "record-plane".into(),
+            },
             StoreError::Backend(BoxBackendError::new("boom")),
         ];
         let expected = [
@@ -339,6 +350,7 @@ mod arch_9_slug_tests {
             STORE_UNSUPPORTED_CAPABILITY,
             STORE_OPERATION_FAILED,
             CONFLICT,
+            RECORD_STOPPED,
             DATABASE_ERROR,
         ];
         for (got, want) in variants.iter().zip(expected.iter()) {
@@ -388,6 +400,10 @@ mod arch_9_slug_tests {
                 archived_id: "x".into(),
             },
             StorageError::SqlcipherMissingPassphrase,
+            StorageError::RecordStopped {
+                issued_by: "ai:operator".into(),
+                scope: "record-plane".into(),
+            },
         ];
         let expected = [
             NOT_FOUND,
@@ -403,6 +419,7 @@ mod arch_9_slug_tests {
             ARCHIVE_RESTORE_COLLISION,
             ARCHIVE_SUPERSEDE_FAILED,
             SQLCIPHER_MISSING_PASSPHRASE,
+            RECORD_STOPPED,
         ];
         for (got, want) in variants.iter().zip(expected.iter()) {
             assert_eq!(got.code(), *want, "ARCH-9 StorageError code drift");
@@ -647,9 +664,13 @@ impl From<anyhow::Error> for MemoryError {
                 | SE::UniqueConflict { .. }
                 | SE::ArchiveRestoreCollision { .. }
                 | SE::LinkReflectionCycle { .. } => Self::Conflict(se.to_string()),
-                SE::LinkPermissionDenied { .. } | SE::ApproverLaundering { .. } => {
-                    Self::RefusedByGovernance(se.to_string())
-                }
+                SE::LinkPermissionDenied { .. }
+                | SE::ApproverLaundering { .. }
+                // #1955 R45 — a record-stop refusal is a substrate
+                // refusal (the Stopper role froze the record plane); it
+                // surfaces in the governance-refusal family (403 +
+                // clear "record plane stopped" message).
+                | SE::RecordStopped { .. } => Self::RefusedByGovernance(se.to_string()),
                 SE::ArchiveSupersedeFailed { .. } | SE::SqlcipherMissingPassphrase => {
                     Self::DatabaseError(se.to_string())
                 }

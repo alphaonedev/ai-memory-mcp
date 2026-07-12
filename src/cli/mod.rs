@@ -86,6 +86,7 @@ pub mod serve_banner;
 /// (`crate::mcp::tools::share::handle_share`).
 pub mod share;
 pub mod shell;
+pub mod stop;
 pub mod store;
 pub mod sync;
 pub mod update;

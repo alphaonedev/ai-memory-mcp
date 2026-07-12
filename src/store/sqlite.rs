@@ -40,6 +40,10 @@ impl SqliteStore {
     pub fn open(path: impl Into<PathBuf>) -> StoreResult<Self> {
         let path = path.into();
         let conn = db::open(&path).map_err(box_err)?;
+        // #1955 R45 — seed the per-DB record-stop flag from the audit
+        // chain so a stop persisted before this open survives a restart.
+        // A read hiccup is non-fatal (leaves the plane RUNNING).
+        let _ = crate::store::record_stop::seed_from_conn(&conn);
         Ok(Self {
             state: Arc::new(Mutex::new(conn)),
             path,
@@ -51,6 +55,14 @@ impl SqliteStore {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// #1955 R45 — SAL write-funnel gate. Returns
+    /// [`StoreError::Stopped`] when the record plane is stopped so the
+    /// SAL surface refuses with the typed error (503) rather than the
+    /// `db::`-layer `Backend`-wrapped one.
+    fn gate_record_stop(&self) -> StoreResult<()> {
+        crate::store::record_stop::gate_sqlite_path(&self.path)
     }
 }
 
@@ -115,7 +127,30 @@ impl MemoryStore for SqliteStore {
         Ok(v)
     }
 
+    /// #1955 R45 — engage/release the record-stop: append the signed
+    /// attestation to the chain + flip the per-DB cache.
+    async fn record_stop(
+        &self,
+        _ctx: &CallerContext,
+        engage: bool,
+        issued_by: &str,
+        scope: &str,
+    ) -> StoreResult<bool> {
+        let conn = self.state.lock().await;
+        crate::store::record_stop::actuate_sqlite(&conn, engage, issued_by, scope).map_err(box_err)
+    }
+
+    /// #1955 R45 — current record-stop status, derived from the chain.
+    async fn record_stop_status(
+        &self,
+        _ctx: &CallerContext,
+    ) -> StoreResult<crate::store::record_stop::RecordStopStatus> {
+        let conn = self.state.lock().await;
+        crate::store::record_stop::status_sqlite(&conn).map_err(box_err)
+    }
+
     async fn store(&self, _ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::insert(&conn, memory).map_err(box_err)
     }
@@ -129,6 +164,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::capture_turn_idempotent(&conn, write).map_err(box_err)
     }
@@ -142,6 +178,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::recover_turn_idempotent(&conn, write).map_err(box_err)
     }
@@ -181,6 +218,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn update(&self, _ctx: &CallerContext, id: &str, patch: UpdatePatch) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         // v0.7.0 Provenance Gap 2 (#906) — thread the patch's
         // `source_uri` slot into `update_with_expected_version` so the
@@ -238,6 +276,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn delete(&self, _ctx: &CallerContext, id: &str) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         let removed = db::delete(&conn, id).map_err(box_err)?;
         if removed {
@@ -417,6 +456,7 @@ impl MemoryStore for SqliteStore {
     }
 
     async fn link(&self, _ctx: &CallerContext, link: &MemoryLink) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::create_link(
             &conn,
@@ -453,6 +493,7 @@ impl MemoryStore for SqliteStore {
         link: &MemoryLink,
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
+        self.gate_record_stop()?;
         // F6 Gap 3 (v0.7.0) — route the SAL trait's signed-link surface
         // through SQLite's existing `db::create_link_signed`. Resolves
         // the same `attest_level` literal the Postgres adapter returns
@@ -628,11 +669,13 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         memory: &Memory,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::insert_if_newer(&conn, memory).map_err(box_err)
     }
 
     async fn merge_inbound(&self, _ctx: &CallerContext, inbound: &Memory) -> StoreResult<String> {
+        self.gate_record_stop()?;
         // v0.8.0 Pillar-3 (#1709 / #224) — delegate to the sqlite
         // free-fn, which does the atomic read-by-id → `merge_memory` →
         // full-row write (else `insert_if_newer` fall-through).
@@ -646,11 +689,13 @@ impl MemoryStore for SqliteStore {
         link: &MemoryLink,
         attest_level: &str,
     ) -> StoreResult<()> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::create_link_inbound(&conn, link, attest_level).map_err(box_err)
     }
 
     async fn apply_remote_deletion(&self, _ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::delete(&conn, id).map_err(box_err)
     }
@@ -945,6 +990,7 @@ impl MemoryStore for SqliteStore {
         source: &str,
         consolidator_agent_id: &str,
     ) -> StoreResult<String> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::consolidate(
             &conn,
@@ -1051,6 +1097,7 @@ impl MemoryStore for SqliteStore {
         claim_unowned: bool,
         dry_run: bool,
     ) -> StoreResult<crate::storage::ReownReport> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         crate::storage::reown(&conn, namespace, to_id, claim_unowned, dry_run).map_err(box_err)
     }
@@ -1918,6 +1965,7 @@ impl MemoryStore for SqliteStore {
         id: &str,
         new_kind: crate::models::MemoryKind,
     ) -> StoreResult<bool> {
+        self.gate_record_stop()?;
         let mut conn = self.state.lock().await;
         let tx = conn.transaction().map_err(box_err)?;
         let old_kind: Option<String> = tx
@@ -1993,6 +2041,7 @@ impl MemoryStore for SqliteStore {
         id: &str,
         dry_run: bool,
     ) -> StoreResult<crate::store::UndoOutcome> {
+        self.gate_record_stop()?;
         let caller = if ctx.bypass_visibility {
             None
         } else {
@@ -2171,6 +2220,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         pending_id: &str,
     ) -> StoreResult<Option<String>> {
+        self.gate_record_stop()?;
         let conn = self.state.lock().await;
         db::execute_pending_action(&conn, pending_id).map_err(box_err)
     }

@@ -118,6 +118,12 @@ pub enum StorageError {
     /// SQLCipher build started without `AI_MEMORY_DB_PASSPHRASE`.
     /// Fatal at boot; surfaces as an `apply_sqlcipher_key` refusal.
     SqlcipherMissingPassphrase,
+
+    /// #1955 [P1][R45] — a mutating `db::` write refused because the
+    /// substrate record-stop actuator is engaged (the bare-`Connection`
+    /// funnel the MCP stdio write path uses). Mirrors the SAL
+    /// [`crate::store::StoreError::Stopped`]; reads are unaffected.
+    RecordStopped { issued_by: String, scope: String },
 }
 
 impl std::fmt::Display for StorageError {
@@ -178,6 +184,11 @@ impl std::fmt::Display for StorageError {
                 "sqlcipher build requires AI_MEMORY_DB_PASSPHRASE \
                  (set via --db-passphrase-file <path>)",
             ),
+            Self::RecordStopped { issued_by, scope } => write!(
+                f,
+                "substrate record plane stopped by {issued_by} (scope={scope}); \
+                 mutating operations refused until resume",
+            ),
         }
     }
 }
@@ -222,6 +233,7 @@ impl StorageError {
             Self::SqlcipherMissingPassphrase => {
                 crate::errors::error_codes::SQLCIPHER_MISSING_PASSPHRASE
             }
+            Self::RecordStopped { .. } => crate::errors::error_codes::RECORD_STOPPED,
         }
     }
 }

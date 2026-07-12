@@ -235,6 +235,19 @@ pub mod event_types {
     /// Ed25519 signature over that hash.
     pub const GOVERNANCE_RULE_REMOVED: &str = "governance.rule_removed";
 
+    /// #1955 [P1][R45] — `signed_events.event_type` for the substrate
+    /// record-stop actuation (`ai-memory stop`). The append-only chain
+    /// IS the persisted stop flag: the latest of this event and
+    /// [`SUBSTRATE_RECORD_RESUME`] (by `sequence`) determines whether the
+    /// record plane is stopped. `agent_id` = the issuer; `payload_hash`
+    /// commits `{action, issued_by, timestamp, scope}`.
+    pub const SUBSTRATE_RECORD_STOP: &str = "substrate.record_stop";
+
+    /// #1955 [P1][R45] — `signed_events.event_type` for releasing the
+    /// substrate record-stop (`ai-memory stop --resume`). The un-stop
+    /// sibling of [`SUBSTRATE_RECORD_STOP`].
+    pub const SUBSTRATE_RECORD_RESUME: &str = "substrate.record_resume";
+
     /// v0.9.0 §25.3 S3 (F-40, #1853) — `signed_events.event_type` for an
     /// operator-authorized governance-rule DISABLE via
     /// `ai-memory rules disable --sign`

@@ -54,6 +54,11 @@ pub mod sqlite;
 #[cfg(feature = "sal-postgres")]
 pub mod postgres;
 
+/// #1955 [P1][R45] — substrate record-stop actuator + signed
+/// stop-attestation. Backend-agnostic flag/attestation logic + the
+/// per-DB sqlite flag registry.
+pub mod record_stop;
+
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
@@ -318,6 +323,18 @@ pub enum StoreError {
         max: i64,
     },
 
+    /// #1955 [P1][R45] — the substrate's record plane is STOPPED (the
+    /// record-stop actuator is engaged). Every mutating record-plane
+    /// operation refuses with this typed error until `ai-memory stop
+    /// --resume`; reads stay live so the record remains auditable. This
+    /// stops THIS substrate's record plane ONLY — it is NOT behavioral
+    /// control of any cognition (the §2.3 honest ceiling).
+    #[error(
+        "substrate record plane stopped by {issued_by} (scope={scope}); \
+         mutating operations refused until resume"
+    )]
+    Stopped { issued_by: String, scope: String },
+
     #[error("underlying backend error: {0}")]
     Backend(#[from] BoxBackendError),
 }
@@ -354,6 +371,7 @@ impl StoreError {
             // #1795 — over-quota tenant write → 429 QUOTA_EXCEEDED, byte-equal
             // slug with the sqlite handler path's quota breach.
             Self::QuotaExceeded { .. } => error_codes::QUOTA_EXCEEDED,
+            Self::Stopped { .. } => error_codes::RECORD_STOPPED,
             Self::Backend(_) => error_codes::DATABASE_ERROR,
         }
     }
@@ -1311,6 +1329,46 @@ pub trait MemoryStore: Send + Sync {
     async fn current_authoritative_key(&self, _agent_id: &str) -> StoreResult<Option<String>> {
         Err(StoreError::UnsupportedCapability {
             capability: "CURRENT_AUTHORITATIVE_KEY".to_string(),
+        })
+    }
+
+    /// #1955 [P1][R45] — engage (`engage=true`) or release
+    /// (`engage=false`) the substrate record-stop. Emits ONE signed
+    /// `substrate.record_stop` / `substrate.record_resume` attestation
+    /// (the persisted flag) and flips the in-process cache so the next
+    /// write refuses / proceeds. Returns `true` when the state changed
+    /// (a no-op re-stop / re-resume returns `false` and emits nothing).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] on adapters that do not
+    /// implement the actuator; else propagates the attestation-append
+    /// error.
+    async fn record_stop(
+        &self,
+        _ctx: &CallerContext,
+        _engage: bool,
+        _issued_by: &str,
+        _scope: &str,
+    ) -> StoreResult<bool> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECORD_STOP".to_string(),
+        })
+    }
+
+    /// #1955 [P1][R45] — current record-stop status (stopped?, who,
+    /// scope), derived from the audit chain.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnsupportedCapability`] on adapters that do not
+    /// implement the actuator; else propagates the read error.
+    async fn record_stop_status(
+        &self,
+        _ctx: &CallerContext,
+    ) -> StoreResult<record_stop::RecordStopStatus> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "RECORD_STOP".to_string(),
         })
     }
 
