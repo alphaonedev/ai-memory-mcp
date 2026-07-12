@@ -12480,6 +12480,99 @@ async fn http_export_memories_with_data_returns_count() {
     assert!(v["exported_at"].is_string());
 }
 
+/// v1.0.0 G28 (#1838) — insert a fixture row with caller-chosen metadata,
+/// bypassing the write-path secret screen (direct `db::insert`) so a
+/// forbidden-export-CLASS row (e.g. a producer-tagged biometric embedding)
+/// can be planted in the corpus to exercise the export-egress gate.
+async fn insert_test_memory_with_metadata(
+    state: &Db,
+    namespace: &str,
+    title: &str,
+    metadata: serde_json::Value,
+) -> String {
+    let lock = state.lock().await;
+    let now = Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: namespace.into(),
+        title: title.into(),
+        content: format!("content for {title}"),
+        source: "test".into(),
+        created_at: now.clone(),
+        updated_at: now,
+        metadata,
+        ..Memory::default()
+    };
+    db::insert(&lock.0, &mem).unwrap()
+}
+
+#[tokio::test]
+async fn http_export_memories_screens_forbidden_class_row() {
+    // v1.0.0 G28 (#1838) — the sqlite `export_memories` branch must run the
+    // corpus through `screen_exported_memories`: a producer-tagged biometric
+    // embedding row is DROPPED from the export artifact, a signed
+    // `export.forbidden_class_refused` row is emitted (sqlite path holds the
+    // audit connection), and the clean rows still export.
+    let state = test_state();
+    let _ = insert_test_memory(&state, "ns-g28", "clean-1").await;
+    let _ = insert_test_memory(&state, "ns-g28", "clean-2").await;
+    let forbidden_id = insert_test_memory_with_metadata(
+        &state,
+        "ns-g28",
+        "biometric-row",
+        serde_json::json!({"scope": "collective", "embedding_class": "biometric"}),
+    )
+    .await;
+
+    let app = Router::new()
+        .route("/api/v1/export", axum_get(export_memories))
+        .with_state(test_app_state_with_admin(state.clone(), "ops:admin"));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/export")
+                .header("x-agent-id", "ops:admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    // Only the two clean rows survive the screen.
+    assert_eq!(
+        v["count"], 2,
+        "the forbidden-class row must be screened out"
+    );
+    let exported_ids: Vec<&str> = v["memories"]
+        .as_array()
+        .expect("memories array")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        !exported_ids.contains(&forbidden_id.as_str()),
+        "the biometric-tagged row must be absent from the export artifact"
+    );
+
+    // The sqlite path emitted a signed refusal witnessing the redaction.
+    let lock = state.lock().await;
+    let refusals: i64 = lock
+        .0
+        .query_row(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1",
+            rusqlite::params![crate::signed_events::event_types::EXPORT_FORBIDDEN_CLASS_REFUSED],
+            |r| r.get(0),
+        )
+        .expect("count refusal rows");
+    assert_eq!(refusals, 1, "one signed export refusal row emitted");
+}
+
 // ---- import_memories happy path ----
 
 #[tokio::test]

@@ -1,0 +1,163 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #1961 (R23/R7) — subprocess coverage for the `asi-hard` security-posture
+//! enforcement ARM at the very top of `src/daemon_runtime.rs::run` (the
+//! `crate::security_profile::enforce_at_boot()?` block that every CLI
+//! subcommand hits before the DB is opened). Driven through the real binary
+//! (`CARGO_BIN_EXE_ai-memory`) because the boot seam — posture resolve, the
+//! `posture == AsiHard` pin-logging loop, and the fail-closed `?`
+//! error-propagation on a loosening / garbage posture — is integration-only
+//! (see `coverage/policy.md` for the `daemon_runtime.rs` exception) and is
+//! reached ONLY when `AI_MEMORY_SECURITY_PROFILE` is set in the process
+//! environment. No existing subprocess test sets that env, so the entire
+//! `AsiHard` branch (the net-new #1961 lines) is otherwise uncovered.
+//!
+//! The pure posture-parse + knob-pin table is unit-tested in
+//! `src/security_profile.rs::tests`; the shipped `asi-hard` config/env
+//! TEMPLATES are pinned by `tests/deploy_templates.rs`. This file pins the
+//! CLI dispatch seam that neither of those exercises.
+//!
+//! NOT feature-gated: the `enforce_at_boot()` block is in the default-build
+//! dispatch path (not behind `--features sal`).
+//!
+//! Ground truth is the process EXIT CODE + the stderr error text, which the
+//! CLI's top-level error handler prints (the boot posture refusals surface as
+//! `Err(..)` propagated out of `run` — distinct from the tracing WARN/INFO
+//! the pin-logging loop emits, which CLI one-shots do NOT render because they
+//! install no subscriber; see `src/main.rs`'s COVERAGE NOTE).
+
+use std::path::{Path, PathBuf};
+use std::process::Output;
+
+/// Run `ai-memory --db <db> <args...>` with `AI_MEMORY_NO_CONFIG=1` plus the
+/// caller-supplied env overrides (the posture knobs). Returns the captured
+/// [`Output`].
+fn run_ai_memory(db_path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd.arg("--db").arg(db_path);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.env("AI_MEMORY_NO_CONFIG", "1");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn ai-memory")
+}
+
+/// A fresh temp DB path under `.local-runs/` (project no-`/tmp` HARD RULE),
+/// mirroring `tests/record_stop_cli_dispatch_1955.rs::fresh_db`.
+fn fresh_db(label: &str) -> (tempfile::TempDir, PathBuf) {
+    let root = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".local-runs")
+        .join("issue-1961-security-profile-dispatch");
+    std::fs::create_dir_all(&root).ok();
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("{label}-"))
+        .tempdir_in(&root)
+        .expect("tempdir under .local-runs");
+    let db = dir.path().join("ai-memory.db");
+    (dir, db)
+}
+
+/// Control: with NO posture set (the compiled-default `standard`), the
+/// `enforce_at_boot()` block is a no-op — `posture == Standard` short-circuits
+/// past the `AsiHard` pin-logging loop and the command proceeds normally.
+/// Pins the negative half of the boot branch so a future refactor that made
+/// `standard` accidentally fail-closed would trip here.
+#[test]
+fn standard_posture_is_a_noop_and_command_proceeds() {
+    let (_dir, db) = fresh_db("standard-noop");
+    let out = run_ai_memory(&db, &["stats", "--json"], &[]);
+    assert!(
+        out.status.success(),
+        "standard posture must be a boot no-op; exit={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stats --json parses under standard posture");
+    assert_eq!(v["total"], 0, "fresh db has zero memories; got: {v}");
+}
+
+/// `asi-hard` ENGAGED: the `posture == AsiHard` pin-logging branch runs and
+/// PINS the fail-closed knob set ON — including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`
+/// (#124), which then refuses to open a fresh DB that has no off-table witness
+/// head anchor. The refusal at the db-open seam is the observable PROOF that
+/// the asi-hard branch executed and its pins took effect (the pin loop runs
+/// BEFORE the db is opened). Exercises the net-new #1961 `AsiHard` arm.
+#[test]
+fn asi_hard_engaged_pins_rollback_check_and_refuses_open_on_fresh_db() {
+    let (_dir, db) = fresh_db("asi-hard-engaged");
+    let out = run_ai_memory(
+        &db,
+        &["stats", "--json"],
+        &[("AI_MEMORY_SECURITY_PROFILE", "asi-hard")],
+    );
+    assert!(
+        !out.status.success(),
+        "asi-hard pins require_rollback_check=1 → fresh-db open must be refused; \
+         exit={:?} stdout={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("rollback-check refuse-open")
+            || stderr.contains("AI_MEMORY_REQUIRE_ROLLBACK_CHECK"),
+        "expected the asi-hard-pinned rollback-check refusal; stderr={stderr}"
+    );
+}
+
+/// `asi-hard` + an operator LOOSENING override below the hard floor: boot is
+/// REFUSED by `enforce_at_boot`, which propagates `Err(..)` out through the
+/// `?` in `run`. Exercises the fail-closed error-propagation arm distinct from
+/// the successful-pin arm above.
+#[test]
+fn asi_hard_refuses_boot_when_operator_loosens_a_pinned_knob() {
+    let (_dir, db) = fresh_db("asi-hard-loosen");
+    let out = run_ai_memory(
+        &db,
+        &["stats", "--json"],
+        &[
+            ("AI_MEMORY_SECURITY_PROFILE", "asi-hard"),
+            ("AI_MEMORY_SECRET_SCREEN_MODE", "off"),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "asi-hard must refuse to boot when a pinned knob is loosened; exit={:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("AI_MEMORY_SECRET_SCREEN_MODE")
+            && (stderr.contains("refuses to disable") || stderr.contains("hard floor")),
+        "expected the asi-hard loosening refusal naming the knob; stderr={stderr}"
+    );
+}
+
+/// A garbage `AI_MEMORY_SECURITY_PROFILE` token aborts the boot (fail-LOUD,
+/// never silent-standard) — the parse-error arm of `SecurityPosture::resolve`
+/// propagated through `enforce_at_boot()?` in `run`.
+#[test]
+fn unrecognised_security_profile_token_aborts_boot() {
+    let (_dir, db) = fresh_db("bogus-token");
+    let out = run_ai_memory(
+        &db,
+        &["stats", "--json"],
+        &[("AI_MEMORY_SECURITY_PROFILE", "bogus-not-a-posture")],
+    );
+    assert!(
+        !out.status.success(),
+        "an unrecognised security-profile token must abort the boot; exit={:?}",
+        out.status.code()
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("AI_MEMORY_SECURITY_PROFILE") && stderr.contains("unrecognised"),
+        "expected the unrecognised-posture boot error; stderr={stderr}"
+    );
+}
