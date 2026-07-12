@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-12 — `warn-carrier` (deprecation-WARN cycle for the v1.0.0 secure-default flips, [#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972))
+
 ### Deprecated
 
 - **v0.10.0 WARN-carrier release — deprecation WARNs ahead of the v1.0.0 fail-open → fail-closed flips** ([#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972)). Every v1.0.0 secure-default flip rides the one-cycle-deprecation pattern: v0.10.0 EMITS the WARN, v1.0.0 flips. This release flips **no** default — it only adds the WARN machinery and the flip-ready code paths behind the existing env knobs.
