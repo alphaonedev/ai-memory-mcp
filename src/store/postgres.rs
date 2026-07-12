@@ -12453,7 +12453,7 @@ async fn record_memory_quota_batch_in_tx(
 impl PostgresStore {
     /// #1955 R45 — SAL write-funnel gate (one atomic load).
     fn gate_record_stop(&self) -> StoreResult<()> {
-        self.record_stop.gate()
+        crate::store::record_stop::gate_flag(&self.record_stop)
     }
 
     /// #1955 R45 — derive the record-stop state from the pg
