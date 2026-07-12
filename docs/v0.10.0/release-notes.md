@@ -2,15 +2,17 @@
 layout: doc
 ---
 {% raw %}
-# ai-memory v0.10.0 — `warn-carrier` (release notes — SKELETON)
+# ai-memory v0.10.0 — `warn-carrier`
 
-> **Status: DRAFT SKELETON (not yet cut).** v0.10.0 is the planned
-> WARN-carrier release ([#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972))
-> ahead of the v1.0.0 secure-default flips. This file is the structural
-> skeleton mirroring the v0.9.0 template; sections are filled in during the
-> release-cut, which is a separate operator-gated step. **No manifest versions
-> are bumped by the WARN-carrier work** — the version bump + channel publish
-> is the release-cut concern.
+> **Cut 2026-07-12** under the v1.0.0 epic (#1940, ruling wf_0e1aaeac 10/10)
+> as the WARN-carrier release ([#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972))
+> ahead of the v1.0.0 secure-default flips. **Scope is deliberately narrow and
+> honest: deprecation WARNs only — zero default flips, zero schema change
+> (v80, unchanged from post-v0.9.0 main), zero behavior change for any
+> correctly-configured deployment.** Everything landed on main since v0.9.0
+> (the Gate-0/Gate-1 v1.0.0 format spine, schema v79/v80) rides along and is
+> documented in the CHANGELOG; the v1.0.0 release notes will present that
+> spine properly — this release exists to start the one-cycle WARN clock.
 
 ## Release procedure (operator-gated)
 
