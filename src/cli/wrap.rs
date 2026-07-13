@@ -289,7 +289,11 @@ fn build_command_for_strategy(
     system_msg: &str,
     trailing: &[String],
 ) -> Result<(Command, Option<tempfile::NamedTempFile>)> {
-    let mut cmd = Command::new(agent);
+    // #1937 V08-PE-3 — audited chokepoint: emit a signed `process.spawn_audited`
+    // row (argv0 = wrapped agent, caller = this builder) as the wrapped-agent
+    // `Command` is minted. Best-effort; the audit never blocks the launch.
+    let mut cmd =
+        crate::spawn_audit::audited_command(agent, crate::spawn_audit::CALLER_CLI_WRAP_AGENT);
     let mut tempfile_handle: Option<tempfile::NamedTempFile> = None;
     match strategy {
         WrapStrategy::SystemFlag { flag } => {

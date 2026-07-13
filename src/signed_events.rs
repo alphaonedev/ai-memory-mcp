@@ -358,6 +358,26 @@ pub mod event_types {
     /// refused vendor — this row is the audit witness of that refusal.
     pub const EGRESS_INFERENCE_REFUSED: &str = "egress.inference_refused";
 
+    /// v1.0.0 V08-PE-3 (#1937, ratified spec — the `4d3ea1c5` minimal
+    /// shape recorded in #1840's closing 2×5 vote) —
+    /// `signed_events.event_type` for a MINIMAL signed spawn-audit row:
+    /// exactly ONE row per PRODUCTION `Command` spawn, emitted by the
+    /// [`crate::spawn_audit`] chokepoint the moment a production spawn
+    /// site launches a subprocess. `payload_hash` = SHA-256 over the
+    /// canonical, secret-free pre-image
+    /// [`crate::spawn_audit::spawn_audit_preimage`] carrying ONLY
+    /// `argv0` (the spawned program) + `caller` (the spawn-site
+    /// identity) — never the full argv, which may carry secrets.
+    /// Substrate-emitted (`daemon_signed` when an audit key is enrolled,
+    /// else `unsigned`), the same posture as [`EGRESS_INFERENCE_REFUSED`]
+    /// / [`REFLECTION_DECORRELATION_REFUSED`]. Chained + walked +
+    /// verified by [`verify_audit_trail`] as a FIRST-CLASS signed event
+    /// like every other row (the chain walk is event-type-agnostic, so a
+    /// spawn row participates in the same cross-row hash chain + per-row
+    /// signature verdict). The substrate attests its OWN spawns — this is
+    /// deliberately NOT eBPF / dtrace kernel process-tree tracing.
+    pub const PROCESS_SPAWN_AUDITED: &str = "process.spawn_audited";
+
     /// v1.0.0 G28 (#1838) — `signed_events.event_type` for a forbidden
     /// export-class refusal at an export boundary (forensic bundle,
     /// memory export). Emitted by
