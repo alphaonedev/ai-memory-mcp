@@ -485,9 +485,10 @@ pub fn reflect_with_hooks(
 
     // ─── 5.6 Write-time attested-family decorrelation gate (§25.3 S2) ─
     //
-    // Compiled default OFF (G5b inert-until-enabled): when
-    // AI_MEMORY_REFLECT_DECORRELATION_MODE is unset/`off` this is an
-    // early return and the write is byte-identical. `advisory` warns;
+    // Compiled default ADVISORY at v1.0.0 (#1952 flipped Off->Advisory): ONLY
+    // an explicit AI_MEMORY_REFLECT_DECORRELATION_MODE=off early-returns
+    // byte-identical — an UNSET env now resolves ACTIVE (Advisory), so the gate
+    // runs. `advisory` WARNs only on an actual attested decorrelation signal;
     // `enforce` refuses ONLY on attested evidence (signed
     // `reflection.decorrelation_refused` row + DecorrelationRefused).
     run_decorrelation_write_gate(
@@ -832,10 +833,14 @@ const DECORRELATION_ADVISORY_TARGET: &str = "reflection.decorrelation.advisory";
 /// decorrelation gate, run at the sqlite reflect chokepoint BETWEEN
 /// validation/cap and the atomic insert.
 ///
-/// Posture (compiled default OFF — G5b inert-until-enabled):
-/// - `off` (default): early return; the write is byte-identical.
-/// - `advisory`: WARN (`reflection.decorrelation.advisory`) on an
-///   attested monoculture / insufficient attested evidence, then proceed.
+/// Posture (compiled default ADVISORY at v1.0.0 — #1952 flipped Off->Advisory;
+/// the postgres twin carries the matching "ADVISORY at v1.0.0" note):
+/// - `off`: early return; the write is byte-identical. This is the ONLY
+///   byte-identical posture — an UNSET env resolves to Advisory, not Off.
+/// - `advisory` (default): WARN (`reflection.decorrelation.advisory`) ONLY on
+///   an actual attested decorrelation signal (an attested monoculture, or a
+///   partial below-floor attested corpus). A zero-attestation corpus — the
+///   common deployment — is SILENT (no per-write WARN), then proceed.
 /// - `enforce`: REFUSE **only on attested evidence** (attested rows
 ///   `>= MIN_REFLECTIONS_FLOOR` AND distinct attested families
 ///   `< quorum_n`) with a signed `reflection.decorrelation_refused` row;
@@ -864,18 +869,25 @@ fn run_decorrelation_write_gate(
     }
     let quorum_n = crate::config::reflect_decorrelation_quorum_n();
 
-    // Direct namespace-scoped corpus read (NOT recall).
+    // Direct namespace-scoped corpus read (NOT recall). Bounded by the SSOT
+    // `crate::storage::LIST_MAX_LIMIT` (the same window the visibility probe's
+    // `PROBE_SCAN_LIMIT` reuses) so this per-write scan on the reflect hot path
+    // can never grow unbounded with the namespace's reflection count.
+    let scan_limit = i64::try_from(crate::storage::LIST_MAX_LIMIT).unwrap_or(i64::MAX);
     let mut corpus_attested: Vec<String> = Vec::new();
     let mut total_reflections: usize = 0;
     {
         let mut stmt = conn
             .prepare(
                 "SELECT metadata FROM memories \
-                 WHERE namespace = ?1 AND memory_kind = 'reflection'",
+                 WHERE namespace = ?1 AND memory_kind = 'reflection' \
+                 LIMIT ?2",
             )
             .map_err(|e| ReflectError::Database(e.to_string()))?;
         let rows = stmt
-            .query_map([target_namespace], |row| row.get::<_, String>(0))
+            .query_map((target_namespace, scan_limit), |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| ReflectError::Database(e.to_string()))?;
         for r in rows {
             let raw = r.map_err(|e| ReflectError::Database(e.to_string()))?;

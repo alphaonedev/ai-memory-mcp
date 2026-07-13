@@ -11,30 +11,29 @@
 //! model-family-distinct quorum that REFUSES a bias-displaced reflection unless
 //! N≥3 attestation-passing, model-family-DISTINCT reflections agree.
 //!
-//! ## Why this module is VISIBILITY-only (not enforcement)
+//! ## Why THIS module is VISIBILITY-only (enforcement lives at the write gate)
 //!
-//! The 5-agent adversarial vote (memory `4d3ea1c5`; synthesis `4a5c041f`) found
-//! unanimously that the full N≥3 REFUSAL cannot honestly ship at v0.8.0:
+//! This module is the background `curator --reflect` corpus sweep. It is
+//! deliberately read-only and never refuses — it surfaces CLAIMED producer
+//! dominance for operator visibility, carrying a first-class caveat that
+//! distinctness measured HERE is CLAIMED, not ATTESTED (`agent_id`/`source`/
+//! `metadata` free strings).
 //!
-//! * There is **no model-family provenance primitive** — a reflection's only
-//!   producer signals (`agent_id`, `source`, `metadata`) are caller-CLAIMED
-//!   free strings, and the attestation surface binds an Ed25519 signature to an
-//!   AGENT IDENTITY, never to a model family (#1719 / #1171 are unbuilt).
-//! * At present single-operator swarm scale there is typically ONE model family,
-//!   so an N≥3-distinct REFUSE default would either brick every reflection write
-//!   (self-DOS) or — worse — stamp a false "decorrelated" badge on a monoculture
-//!   (the very laundering vector the audit fears: security theater).
-//!
-//! So the v0.8.0 slice ships the **honest** increment: make the EXISTING latent
-//! producer-correlation in the Reflection corpus *visible* (what an auditor
-//! actually wants from a pre-enforcement substrate), carrying a first-class
-//! caveat that distinctness here is CLAIMED, not ATTESTED. The binding write-time
-//! REFUSAL is a separate, tracked v0.9 issue gated on attested model-family
-//! provenance (#1719) + the heterogeneous evaluator panel (#1171).
+//! The binding write-time N≥3 attested-model-family REFUSAL is a SEPARATE,
+//! SHIPPED surface: `db::run_decorrelation_write_gate` (sqlite) /
+//! `PostgresStore::decorrelation_write_gate_pg` (postgres), added in #1767 and
+//! backed by the `model_attestations` provenance substrate (#1870). The refusal
+//! fires ONLY on ATTESTED evidence (attested rows `>= MIN_REFLECTIONS_FLOOR`
+//! AND distinct attested families `< quorum_n`), so a CLAIMED-only corpus is
+//! never laundered into a "decorrelated" badge NOR weaponized into a refusal
+//! (anti-theater — the 5-agent finding, memory `4d3ea1c5`). This sweep and the
+//! write gate share the pure decision core ([`evaluate_write_quorum`] /
+//! [`decorrelation_write_action`]) so their attested-family semantics never drift.
 //!
 //! Read-only and `sal`-gated (operates through the [`MemoryStore`] trait, SQLite
-//! *or* Postgres). Opt-in via `AI_MEMORY_REFLECT_DECORRELATION_MODE` (default
-//! `off`) at the CLI wiring layer (`src/cli/curator.rs`).
+//! *or* Postgres). `AI_MEMORY_REFLECT_DECORRELATION_MODE` compiled default is
+//! `advisory` at v1.0.0 (#1952 flipped it Off→Advisory), wired at the CLI layer
+//! (`src/cli/curator.rs`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -285,11 +284,14 @@ pub enum WriteGateAction {
 /// v0.9.0 §25.3 S2 (D3-021, #1767) — PURE mapping from
 /// `(mode, outcome)` to the write-gate action. The ONLY outcome an
 /// `enforce` mode refuses on is [`QuorumOutcome::AttestedMonoculture`]
-/// (attested evidence of monoculture); a CLAIMED-only / below-floor
-/// corpus ([`QuorumOutcome::InsufficientAttested`]) is advised, never
-/// refused (anti-theater). `total_reflections` is the full corpus size
-/// (attested + claimed) reported in the advisory payload for honest
-/// coverage.
+/// (attested evidence of monoculture); a below-floor corpus
+/// ([`QuorumOutcome::InsufficientAttested`]) is NEVER refused (anti-theater).
+/// A zero-attestation corpus (the common posture) yields
+/// [`WriteGateAction::Proceed`] SILENTLY — a per-write advisory on every
+/// reflection write would be pure noise with no decorrelation signal (#2007);
+/// only a partial below-floor attested corpus (`attested_rows > 0`) is advised.
+/// `total_reflections` is the full corpus size (attested + claimed) reported in
+/// the advisory payload for honest coverage.
 #[must_use]
 pub fn decorrelation_write_action(
     mode: crate::config::ReflectDecorrelationMode,
@@ -303,6 +305,15 @@ pub fn decorrelation_write_action(
     }
     match *outcome {
         QuorumOutcome::MeetsQuorum { .. } => WriteGateAction::Proceed,
+        // #2007 Gate-3 cleanup — in the DEFAULT zero-attestation posture (no
+        // `model_attestations` enrolled) EVERY reflection write would otherwise
+        // fire a per-write advisory WARN that carries no actual decorrelation
+        // signal (you cannot observe a monoculture without attestation). Stay
+        // SILENT when there is zero attested evidence (`obs-levels-filter`); only
+        // surface an advisory once SOME attested rows exist but the corpus is
+        // still below the floor (a genuine partial-attestation signal). The
+        // enforce-mode refusal path (`AttestedMonoculture`) is UNCHANGED.
+        QuorumOutcome::InsufficientAttested { attested_rows: 0 } => WriteGateAction::Proceed,
         QuorumOutcome::InsufficientAttested { attested_rows } => WriteGateAction::Advise(format!(
             "reflection decorrelation: only {attested_rows} ATTESTED of {total_reflections} \
              corpus reflections (quorum_n={quorum_n}); insufficient attested evidence — \
@@ -438,9 +449,12 @@ const PROBE_SCAN_LIMIT: usize = crate::storage::LIST_MAX_LIMIT;
 /// each corpus dominated past `threshold`.
 ///
 /// `mode` MUST be active ([`ReflectDecorrelationMode::is_active`]); `Off` returns
-/// an empty report. `Enforce` is INERT at v0.8.0 and runs as advisory (with a
-/// one-shot WARN) because binding REFUSAL needs attested provenance (v0.9
-/// #1719 / #1171). `agent_id` is the curator's identity (operator-class read so
+/// an empty report. This background sweep is VISIBILITY-only on EVERY active
+/// mode — under `Enforce` it still runs as advisory (with a one-shot WARN)
+/// because the binding write-time REFUSAL is enforced at the reflect WRITE
+/// chokepoint (`db::run_decorrelation_write_gate`, #1767, backed by the
+/// `model_attestations` substrate #1870), NOT in this read-only corpus sweep.
+/// `agent_id` is the curator's identity (operator-class read so
 /// the sweep sees every row regardless of `metadata.scope`, mirroring the
 /// reflection / transcript-classify passes).
 ///
@@ -474,10 +488,11 @@ pub async fn run_decorrelation_probe(
         report.enforce_degraded_to_advisory = true;
         tracing::warn!(
             target: TRACE_TARGET,
-            "AI_MEMORY_REFLECT_DECORRELATION_MODE=enforce is INERT at v0.8.0 — running \
-             ADVISORY. Write-time N≥3 model-family-distinct REFUSAL is gated on attested \
-             model-family provenance (v0.9 #1719/#1171); CLAIMED distinctness cannot bind \
-             a refusal without becoming security theater (5-agent vote 4d3ea1c5)."
+            "AI_MEMORY_REFLECT_DECORRELATION_MODE=enforce runs this background VISIBILITY \
+             sweep as ADVISORY — the binding write-time N>=3 attested-model-family REFUSAL is \
+             enforced at the reflect WRITE chokepoint (db::run_decorrelation_write_gate, #1767, \
+             backed by the model_attestations substrate #1870), NOT in this read-only corpus \
+             sweep, which only surfaces CLAIMED producer dominance for operator visibility."
         );
     }
 
@@ -606,6 +621,55 @@ mod tests {
         assert_eq!(
             out,
             QuorumOutcome::InsufficientAttested { attested_rows: 0 }
+        );
+    }
+
+    #[test]
+    fn zero_attested_advisory_proceeds_silently() {
+        // #2007 Gate-3 — the DEFAULT zero-attestation posture must NOT fire a
+        // per-write advisory WARN. Advisory mode + no attested evidence =
+        // Proceed (silent), NOT Advise.
+        use crate::config::ReflectDecorrelationMode as Mode;
+        let outcome = QuorumOutcome::InsufficientAttested { attested_rows: 0 };
+        assert_eq!(
+            decorrelation_write_action(Mode::Advisory, &outcome, 3, 42),
+            WriteGateAction::Proceed,
+            "zero attested rows must proceed silently (no per-write WARN)"
+        );
+    }
+
+    #[test]
+    fn partial_below_floor_attested_still_advises() {
+        // A genuine partial-attestation signal (some attested rows, still below
+        // the floor) is surfaced as an advisory — only the zero-attested common
+        // case is silenced.
+        use crate::config::ReflectDecorrelationMode as Mode;
+        let outcome = QuorumOutcome::InsufficientAttested { attested_rows: 2 };
+        assert!(
+            matches!(
+                decorrelation_write_action(Mode::Advisory, &outcome, 3, 42),
+                WriteGateAction::Advise(_)
+            ),
+            "partial attested evidence must still advise"
+        );
+    }
+
+    #[test]
+    fn enforce_still_refuses_attested_monoculture() {
+        // Guard the UNCHANGED enforce-mode refusal semantics through the #2007
+        // WARN-gating change.
+        use crate::config::ReflectDecorrelationMode as Mode;
+        let outcome = QuorumOutcome::AttestedMonoculture {
+            distinct_attested_families: 1,
+            attested_rows: 3,
+        };
+        assert_eq!(
+            decorrelation_write_action(Mode::Enforce, &outcome, 3, 3),
+            WriteGateAction::Refuse {
+                distinct_attested_families: 1,
+                attested_rows: 3,
+            },
+            "enforce mode must still refuse an attested monoculture"
         );
     }
 
