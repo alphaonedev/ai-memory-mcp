@@ -9864,6 +9864,42 @@ impl PostgresStore {
             );
         }
     }
+
+    /// v1.0.0 V08-PE-3 (#1937) — append a signed `process.spawn_audited` row
+    /// to `signed_events` on the postgres backend (the backend-parity twin of
+    /// the sqlite `crate::spawn_audit::emit_spawn_audit`). Builds the row from
+    /// the SAME [`crate::spawn_audit::spawn_audit_payload_hash`] pre-image
+    /// (argv0 + caller, secret-free) and the SAME `with_daemon_signature`
+    /// idiom, so the row persists + verifies identically on both backends
+    /// (K3 parity). Best-effort: a failure is WARN-logged and swallowed — the
+    /// spawn is never blocked on the audit (M-PANIC-IS-STOP).
+    pub async fn emit_spawn_audit(&self, argv0: &str, caller: &str) {
+        let ts = Utc::now();
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            crate::spawn_audit::spawn_audit_payload_hash(argv0, caller),
+            crate::identity::sentinels::DAEMON_PRINCIPAL.to_string(),
+            crate::signed_events::event_types::PROCESS_SPAWN_AUDITED.to_string(),
+            ts.to_rfc3339(),
+            None,
+        );
+        let insert_row = PgSignedEventInsert {
+            id: &event.id,
+            agent_id: &event.agent_id,
+            event_type: &event.event_type,
+            payload_hash: &event.payload_hash,
+            signature: event.signature.as_deref(),
+            attest_level: &event.attest_level,
+            timestamp: ts,
+            cause_hash: None,
+        };
+        if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
+            tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                argv0, caller,
+                "failed to append process.spawn_audited audit row: {e}"
+            );
+        }
+    }
 }
 
 /// Caller-supplied fields for [`pg_append_signed_event_with_chain`].

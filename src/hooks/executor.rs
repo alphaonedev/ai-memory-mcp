@@ -92,7 +92,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -694,19 +694,26 @@ impl ExecExecutor {
         //     caller, `FailMode::Open` masked it as `ChainResult::Allow`,
         //     and the child never actually ran.
         let command_path = self.config.command.clone();
-        let child = spawn_with_transient_retry(|| {
-            Command::new(&command_path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-        })
-        .await
-        .map_err(|source| ExecutorError::Spawn {
-            command: self.config.command.display().to_string(),
-            source,
-        })?;
+        // #1937 V08-PE-3 — audited chokepoint. Mint the tokio `Command` via the
+        // audited helper (which emits ONE signed `process.spawn_audited` row:
+        // argv0 + caller) ONCE, then re-`spawn()` it across the transient-errno
+        // retry ladder — `tokio::process::Command::spawn` is `&mut self`, so a
+        // single built command is reused per attempt and the audit row is
+        // emitted exactly once per logical spawn (not per retry).
+        let mut cmd = crate::spawn_audit::audited_tokio_command(
+            &command_path,
+            crate::spawn_audit::CALLER_HOOK_EXEC,
+        );
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = spawn_with_transient_retry(|| cmd.spawn())
+            .await
+            .map_err(|source| ExecutorError::Spawn {
+                command: self.config.command.display().to_string(),
+                source,
+            })?;
 
         let started = Instant::now();
         let deadline = Duration::from_millis(u64::from(self.config.timeout_ms));
@@ -1048,18 +1055,21 @@ impl DaemonExecutor {
         // catches the narrow transient-errno class first so a brief
         // fork-pressure window doesn't even consume a reconnect slot.
         let command_path = self.config.command.clone();
-        let mut child = spawn_with_transient_retry(|| {
-            Command::new(&command_path)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        })
-        .await
-        .map_err(|source| ExecutorError::Spawn {
-            command: self.config.command.display().to_string(),
-            source,
-        })?;
+        // #1937 V08-PE-3 — audited chokepoint (once per logical daemon-mode
+        // spawn, not per retry). Same rationale as the exec path above.
+        let mut cmd = crate::spawn_audit::audited_tokio_command(
+            &command_path,
+            crate::spawn_audit::CALLER_HOOK_DAEMON,
+        );
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_with_transient_retry(|| cmd.spawn())
+            .await
+            .map_err(|source| ExecutorError::Spawn {
+                command: self.config.command.display().to_string(),
+                source,
+            })?;
         let stdin = child.stdin.take().ok_or_else(|| {
             ExecutorError::Io(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -1224,6 +1234,10 @@ impl Default for ExecutorRegistry {
 mod tests {
     use super::*;
     use crate::hooks::config::HookMode;
+    // #1937 — production spawns now route through `crate::spawn_audit`, so
+    // `Command` is no longer referenced in non-test module code; the unit
+    // tests below that spawn real subprocesses import it directly.
+    use tokio::process::Command;
 
     fn cfg(mode: HookMode) -> HookConfig {
         HookConfig {

@@ -966,6 +966,13 @@ async fn dispatch_recover_previous_session(
 #[allow(clippy::too_many_lines)]
 pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
     let db_path = app_config.effective_db(&cli.db);
+    // #1937 V08-PE-3 — seed the process-wide audit DB path for the best-effort
+    // spawn-audit chokepoint (`crate::spawn_audit`). Every serve / mcp / CLI
+    // subcommand dispatches through this fn, so every production `Command`
+    // spawn downstream (git namespace probe, nvidia-smi GPU probe, `wrap`
+    // agent launch, hook exec) has a live audit target. Idempotent; a spawn
+    // that fires before any seed (none do on this path) skips gracefully.
+    crate::spawn_audit::seed_spawn_audit_db_path(&db_path);
     // v1.0.0 #1961 (R23/R7) — resolve + enforce the security posture FIRST,
     // before any knob is read or the DB is opened. Under the default
     // `standard` posture this is a no-op; under `asi-hard` it PINS the
