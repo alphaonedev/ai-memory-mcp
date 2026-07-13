@@ -9,7 +9,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 rc=0
 echo "############ gen-certs ############"; ./gen-certs.sh >/dev/null && echo "certs OK" || { echo "cert-gen FAILED"; exit 1; }
-for leg in test-api-mtls.sh test-federation-mtls.sh test-pg-verifyfull.sh test-attestation.sh test-semantic-recall.sh; do
+for leg in test-api-mtls.sh test-federation-mtls.sh test-pg-verifyfull.sh test-attestation.sh test-fed-write-sig-attestation.sh test-semantic-recall.sh; do
   echo; echo "############ $leg ############"
   ./"$leg" || rc=1
 done
