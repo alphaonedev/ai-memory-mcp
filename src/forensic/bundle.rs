@@ -441,6 +441,38 @@ pub fn build_files(
     };
     for mid in &memory_ids_to_emit {
         if let Some(mem) = crate::db::get(conn, mid).context("db::get for bundle")? {
+            let path = format!("memories/{}.json", mem.id);
+            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed),
+            // FIRST + on the UN-redacted row so a class hit is always a DROP
+            // (never softened to a mask by the secret screen redacting a PEM
+            // block out first), unified with the CLI + HTTP export siblings.
+            // A whole envelope whose content/metadata classifies as private
+            // key material / master-threshold secret / governance signing key
+            // / a producer-tagged biometric embedding is SKIPPED (never
+            // bundled in the clear) and a signed refusal is emitted.
+            // Structurally these live in the key-dir, not the DB, so a hit
+            // means a mis-stored secret rode a memory row.
+            let record = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
+            if crate::export_taxonomy::screen_export_value_audited(
+                conn,
+                &path,
+                crate::identity::sentinels::DAEMON_PRINCIPAL,
+                &record,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            // v0.8.1 W1.3 (#1821 / gap G29) → v1.0.0 Gate-3 (#1844) — egress
+            // credential screen (defense-in-depth) on the SURVIVOR. A secret
+            // that PRE-DATES the write screen must not leak through a forensic
+            // export; mask credential VALUES on the way out across EVERY
+            // cleartext field — `content` AND `title` AND `tags` AND
+            // non-carve-out `metadata` leaves — not `content` alone (the
+            // pre-#1844 gap that cloned title/metadata verbatim). One
+            // `redact_memory_for_storage` call = the same helper the CLI/HTTP
+            // corpus screen uses. No-op unless screening was seeded non-`off`.
+            let mem = crate::secret_screen::redact_memory_for_storage(&mem).unwrap_or(mem);
             let atomisation = if args.include_atomisation_chain {
                 build_atomisation_envelope(conn, &mem)?
             } else {
@@ -450,12 +482,7 @@ pub fn build_files(
                 id: mem.id.clone(),
                 namespace: mem.namespace.clone(),
                 title: mem.title.clone(),
-                // v0.8.1 W1.3 (#1821 / gap G29) — egress credential screen
-                // (defense-in-depth). A secret that PRE-DATES the write screen
-                // must not leak through a forensic export; mask it on the way
-                // out. No-op unless screening was seeded non-`off`.
-                content: crate::secret_screen::redact_for_storage(&mem.content)
-                    .unwrap_or_else(|| mem.content.clone()),
+                content: mem.content.clone(),
                 tier: mem.tier.as_str().to_string(),
                 memory_kind: format!("{:?}", mem.memory_kind).to_ascii_lowercase(),
                 reflection_depth: mem.reflection_depth,
@@ -479,27 +506,6 @@ pub fn build_files(
                 confidence_decayed_at: mem.confidence_decayed_at.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&env).context("serialise MemoryEnvelope")?;
-            let path = format!("memories/{}.json", mem.id);
-            // v1.0.0 G28 (#1838) — forbidden-export-class gate (fail-closed).
-            // The secret-screen above masks CREDENTIAL content; this class
-            // gate refuses a whole envelope whose content/metadata is
-            // classified private key material / master-threshold secret /
-            // governance signing key / a producer-tagged biometric embedding.
-            // Structurally these live in the key-dir, not the DB, so a hit
-            // means a mis-stored secret rode a memory row — it is SKIPPED
-            // (never bundled in the clear) and a signed refusal is emitted.
-            let record = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .unwrap_or_else(|_| serde_json::json!(null));
-            if crate::export_taxonomy::screen_export_value_audited(
-                conn,
-                &path,
-                crate::identity::sentinels::DAEMON_PRINCIPAL,
-                &record,
-            )
-            .is_some()
-            {
-                continue;
-            }
             files.insert(path, bytes);
         }
     }

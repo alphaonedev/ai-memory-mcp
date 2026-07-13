@@ -610,8 +610,12 @@ pub async fn run_gc(State(app): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
-/// v1.0.0 G28 (#1838) — fail-closed forbidden-export-class filter for the
-/// corpus-export egress. Drops any memory whose serialized row is classified
+/// v1.0.0 G28 (#1838) + Gate-3 unification (#1844) — the corpus-export egress
+/// screen. Thin delegator to the shared SSOT
+/// [`crate::export_taxonomy::screen_memories_for_export`] so the HTTP admin
+/// export, the CLI `export`, and the forensic bundle apply the SAME two
+/// guards and cannot drift: (1) secret-screen content/title/tags/metadata
+/// credential VALUES (#1844), then (2) fail-closed DROP any memory classified
 /// into a [`crate::export_taxonomy::ForbiddenExportClass`] (private key
 /// material / master-threshold secret / governance signing key / a
 /// producer-tagged biometric embedding) so it never leaves in the clear.
@@ -623,38 +627,7 @@ fn screen_exported_memories(
     memories: Vec<crate::models::Memory>,
     audit_conn: Option<&rusqlite::Connection>,
 ) -> Vec<crate::models::Memory> {
-    memories
-        .into_iter()
-        .filter(|m| {
-            let Some(class) = crate::export_taxonomy::classify_memory(m) else {
-                return true;
-            };
-            let path = format!("memories/{}.json", m.id);
-            let reason = format!(
-                "export refused: memory classified {} ({}) — dropped from export artifact",
-                class.as_str(),
-                class.description()
-            );
-            if let Some(conn) = audit_conn {
-                if let Err(e) = crate::export_taxonomy::emit_export_refusal(
-                    conn,
-                    class,
-                    &path,
-                    crate::identity::sentinels::DAEMON_PRINCIPAL,
-                    &reason,
-                ) {
-                    tracing::warn!(
-                        "forbidden-export-class signed refusal NOT recorded for {path}: {e}"
-                    );
-                }
-            }
-            tracing::warn!(
-                "export boundary dropped a {} memory — {path} withheld fail-closed",
-                class.as_str()
-            );
-            false
-        })
-        .collect()
+    crate::export_taxonomy::screen_memories_for_export(memories, audit_conn)
 }
 
 pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

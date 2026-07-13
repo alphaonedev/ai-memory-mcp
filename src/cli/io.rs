@@ -112,6 +112,20 @@ pub fn export(db_path: &Path, out: &mut CliOutput<'_>) -> Result<()> {
     use crate::models::field_names;
     let conn = db::open(db_path)?;
     let memories = db::export_all(&conn)?;
+    // v1.0.0 Gate-3 (#1838/G28 + #1844) — unify the export confidentiality
+    // boundary with the HTTP admin sibling (`handlers::admin::export_memories`).
+    // This CLI path is the documented operator backup surface
+    // (`ai-memory export > backup.json`) and historically serialized every row
+    // VERBATIM — bypassing BOTH the fail-closed forbidden-class gate and the
+    // secret screen — so a PEM private key / `threshold_share` /
+    // `operator_signing_key` / `metadata.embedding_class="biometric"` /
+    // metadata- or title-stashed credential rode the export in the clear.
+    // Screen BEFORE the pretty-print (drop forbidden-class rows + emit the
+    // signed `export.forbidden_class_refused` audit row via the local conn,
+    // and mask credential VALUES in content/title/tags/metadata); the surviving
+    // rows keep the #1944 in-band scope markers below and stdout stays valid
+    // JSON.
+    let memories = crate::export_taxonomy::screen_memories_for_export(memories, Some(&conn));
     let links = db::export_links(&conn)?;
     // In-band, additive, non-breaking scope markers (critical: the stderr
     // WARN below is invisible to a pipe-to-file consumer).
