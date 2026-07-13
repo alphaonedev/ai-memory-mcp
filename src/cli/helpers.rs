@@ -58,10 +58,14 @@ pub fn resolve_namespace(explicit: Option<String>) -> String {
 /// 2. `current_dir`'s file_name component
 /// 3. The literal "global" fallback
 pub fn auto_namespace() -> String {
-    if let Ok(out) = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .stderr(std::process::Stdio::null())
-        .output()
+    // #1937 V08-PE-3 — route the production `git` spawn through the audited
+    // chokepoint so it emits a signed `process.spawn_audited` row (argv0 +
+    // caller). Best-effort: the audit never blocks namespace resolution.
+    if let Ok(out) =
+        crate::spawn_audit::audited_command("git", crate::spawn_audit::CALLER_CLI_NAMESPACE_GIT)
+            .args(["remote", "get-url", "origin"])
+            .stderr(std::process::Stdio::null())
+            .output()
     {
         let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !url.is_empty()

@@ -1276,7 +1276,9 @@ fn gpu_policy_warn_applicable(backend: &str, gpu_detected: bool) -> bool {
 /// non-zero exit) is treated as no-GPU. Deliberately simple — the
 /// GPU-policy WARN is advisory, not load-bearing.
 fn nvidia_gpu_detected() -> bool {
-    std::process::Command::new("nvidia-smi")
+    // #1937 V08-PE-3 — audited chokepoint: emits a signed `process.spawn_audited`
+    // row (argv0 + caller) before the best-effort `nvidia-smi` probe spawns.
+    crate::spawn_audit::audited_command("nvidia-smi", crate::spawn_audit::CALLER_CLI_DOCTOR_GPU)
         .arg("-L")
         .output()
         .map(|out| out.status.success())
