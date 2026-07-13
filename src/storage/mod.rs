@@ -10404,15 +10404,19 @@ pub fn prepare_recovery_challenge(
 /// [`prepare_recovery_challenge`]), assemble the collected M-of-N guardian
 /// attestations into the quorum blob, and persist it via
 /// [`append_lineage_record`] — which verifies the quorum against the
-/// env-enrolled guardian set (M-of-N) + the dead-man gate BEFORE anything
-/// is written. On success the fresh `successor_pubkey_b64` is the new head
-/// and the identity has survived key LOSS.
+/// env-enrolled guardian set (M-of-N) + the committed trust bar (threshold
+/// + guardian-set id, read from the SIGNED record body) BEFORE anything is
+/// written. Ordering is pure `not_before` anti-rollback monotonicity; there
+/// is NO wall-clock / liveness / dead-man silence-window check — that
+/// time-windowed resolution is deferred to a future release (see the
+/// honest-scope note in [`crate::identity::lineage`]). On success the fresh
+/// `successor_pubkey_b64` is the new head and the identity has survived key LOSS.
 ///
 /// # Errors
 /// No enrolled lineage, an undecodable key, a quorum that fails to meet the
-/// M-of-N threshold (or a forged / unenrolled / stale signature), a
-/// dead-man window not yet elapsed, or any [`append_lineage_record`]
-/// failure. Nothing is persisted on any failure.
+/// committed M-of-N threshold (or a forged / unenrolled / stale signature),
+/// a `not_before` that violates the anti-rollback ordering, or any
+/// [`append_lineage_record`] failure. Nothing is persisted on any failure.
 pub fn append_recovery(
     conn: &Connection,
     agent_id: &str,
