@@ -10,10 +10,11 @@
 //! neither silent nor memory state.
 //!
 //! Covered here:
-//! * pure default (`AI_MEMORY_RECALL_TOUCH_SYNC` unset) across EVERY
-//!   sqlite entry path — `db::recall`, `db::recall_hybrid`, the MCP
-//!   dispatcher (`mcp::handle_recall`), the HTTP handler (real axum
-//!   router via `build_router`), the CLI recall path
+//! * pure default (recall is unconditionally pure as of v1.0.0 #1953 —
+//!   the legacy `AI_MEMORY_RECALL_TOUCH_SYNC` opt-back-in was removed)
+//!   across EVERY sqlite entry path — `db::recall`, `db::recall_hybrid`,
+//!   the MCP dispatcher (`mcp::handle_recall`), the HTTP handler (real
+//!   axum router via `build_router`), the CLI recall path
 //!   (`cli::recall::run`), the shell REPL, and (under `--features
 //!   sal`) the SAL `SqliteStore::recall_hybrid` path — via
 //!   full-database dump-compare over every table except the ledger;
@@ -21,9 +22,6 @@
 //! * exact ledger growth per entry path;
 //! * the `AI_MEMORY_CONFIDENCE_DECAY=1` variant (no confidence writes
 //!   on recall in the pure default; the decay stamp moves to the fold);
-//! * the sync companion (`AI_MEMORY_RECALL_TOUCH_SYNC=1`): legacy bump
-//!   still works AND the fold never double-counts (rows pre-marked
-//!   `folded = 1` — the #1869 vote's unanimous condition);
 //! * fold semantics: ladders applied exactly once, idempotence,
 //!   twin-DB equivalence vs `touch_many`, promotion/priority/cap
 //!   edges, chunk-boundary (> `FOLD_CHUNK_MEMORIES`) correctness, the
@@ -45,10 +43,8 @@ use rusqlite::Connection;
 use serde_json::json;
 
 /// Process-global env serialization: every test in this binary that
-/// reads OR writes `AI_MEMORY_RECALL_TOUCH_SYNC` /
-/// `AI_MEMORY_CONFIDENCE_DECAY` / `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS`
-/// takes this lock (recall paths read the sync flag internally, so
-/// even "pure" tests must hold it against the sync companion).
+/// reads OR writes `AI_MEMORY_CONFIDENCE_DECAY` /
+/// `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS` takes this lock.
 fn env_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -56,11 +52,10 @@ fn env_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Clear both behavior flags (pure default). Callers hold `env_lock`.
+/// Clear behavior flags (pure default). Callers hold `env_lock`.
 fn clear_flags() {
     // SAFETY: serialized via env_lock; no unsynchronized reader.
     unsafe {
-        std::env::remove_var("AI_MEMORY_RECALL_TOUCH_SYNC");
         std::env::remove_var("AI_MEMORY_CONFIDENCE_DECAY");
     }
 }
@@ -597,60 +592,6 @@ fn purity_decay_variant_confidence_untouched_on_recall_then_stamped_by_fold() {
     );
     assert!(folded_stamp.is_some());
     assert_eq!(source, "decayed");
-    clear_flags();
-}
-
-// =====================================================================
-// D — sync companion: legacy bump works; fold never double-counts.
-// =====================================================================
-
-#[test]
-fn sync_mode_legacy_bump_then_fold_is_noop_no_double_count() {
-    let _g = env_lock();
-    clear_flags();
-    // SAFETY: serialized via env_lock.
-    unsafe { std::env::set_var("AI_MEMORY_RECALL_TOUCH_SYNC", "1") };
-    let (conn, _dir) = fresh_db();
-    let m = mem("syncfox row", "syncfox content", Tier::Long, "sync-ns");
-    let id = db::insert(&conn, &m).expect("insert");
-
-    let ttl = ttl();
-    let scoring = scoring();
-    let resp = ai_memory::mcp::handle_recall(
-        &conn,
-        &json!({"context": "syncfox", "namespace": "sync-ns"}),
-        None,
-        None,
-        None,
-        false,
-        &ttl,
-        &scoring,
-        None,
-    )
-    .expect("mcp recall");
-    assert!(!resp["memories"].as_array().unwrap().is_empty());
-
-    assert_eq!(
-        access_count(&conn, &id),
-        1,
-        "sync mode restores the legacy synchronous bump"
-    );
-    // The ledger row landed pre-marked folded = 1 (the chief vote
-    // condition) …
-    assert_eq!(unfolded_count(&conn), 0, "sync-mode rows land folded = 1");
-    assert!(
-        ledger_count(&conn) >= 1,
-        "ledger append stays unconditional"
-    );
-    // … so the always-running fold is a no-op: exactly +1 total.
-    let folded =
-        db::fold_recall_accesses(&conn, ttl.short_extend_secs, ttl.mid_extend_secs).unwrap();
-    assert_eq!(folded, 0, "fold must not re-apply sync-touched accesses");
-    assert_eq!(
-        access_count(&conn, &id),
-        1,
-        "sync recall once → exactly +1 total after a fold pass (no double-count)"
-    );
     clear_flags();
 }
 

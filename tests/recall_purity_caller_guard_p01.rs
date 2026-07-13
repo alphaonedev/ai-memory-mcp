@@ -3,15 +3,16 @@
 
 //! v0.9.0 P0-1 (#1869, T11) — caller-completeness regression guard.
 //!
-//! Recall is PURE by default: the only production call sites of the
-//! explicit touch verbs (`touch_many` / `touch_after_recall`) that sit
-//! on a RECALL path are gated behind the deprecated
-//! `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag. A NEW caller of either
-//! verb on a recall path would silently reopen the purity hole the
-//! kill-test (`tests/recall_purity_p01.rs`) closed — so this guard
-//! pins the per-file call-site census. Adding a caller is allowed ONLY
-//! after review: either it is flag-gated (extend the pin) or it is a
-//! legitimate explicit-verb consumer (extend the pin with a comment).
+//! Recall is UNCONDITIONALLY pure as of v1.0.0 (#1953 removed the
+//! deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag along with
+//! every production call site of the explicit touch verbs
+//! (`touch_many` / `touch_after_recall`) that used to sit on a RECALL
+//! path). A NEW caller of either verb on a recall path would silently
+//! reopen the purity hole the kill-test (`tests/recall_purity_p01.rs`)
+//! closed — so this guard pins the per-file call-site census. Adding a
+//! caller is allowed ONLY after review: either it stays off any recall
+//! path, or it is a legitimate explicit-verb consumer (extend the pin
+//! with a comment).
 //!
 //! The census counts textual invocations `touch_many(` /
 //! `.touch_after_recall(` per production source file, excluding the
@@ -65,22 +66,19 @@ fn census(pattern: &str, defs: &[&str]) -> BTreeMap<String, usize> {
 fn touch_many_call_sites_are_pinned() {
     let got = census("touch_many(", &["pub fn touch_many("]);
     let expected: BTreeMap<String, usize> = [
-        // handlers/recall.rs:~809 — sqlite HTTP phase-2 writer, gated
-        // on recall_touch_sync_enabled() (evaluated once per recall).
-        ("src/handlers/recall.rs".to_string(), 1),
-        // storage/mod.rs — the two internal recall touches
-        // (db::recall + apply_recall_post_ops), BOTH flag-gated.
-        ("src/storage/mod.rs".to_string(), 2),
         // store/sqlite.rs — inside the ungated EXPLICIT verb
-        // SqliteStore::touch_after_recall (not a recall path; its
-        // recall-path caller handlers/recall.rs:~527 is flag-gated).
+        // SqliteStore::touch_after_recall. v1.0.0 (#1953) removed the
+        // ONLY recall-path callers (handlers/recall.rs sqlite HTTP
+        // phase-2 writer + storage/mod.rs's db::recall /
+        // apply_recall_post_ops), which were gated on the
+        // now-deleted recall_touch_sync_enabled().
         ("src/store/sqlite.rs".to_string(), 1),
     ]
     .into();
     assert_eq!(
         got, expected,
         "touch_many call-site census drifted — a NEW caller on a recall path reopens \
-         the #1869 purity hole. Review the new site: flag-gate it (recall path) or \
+         the #1869 purity hole. Review the new site: keep it off any recall path, or \
          extend this pin with a comment (explicit verb)."
     );
 }
@@ -89,9 +87,6 @@ fn touch_many_call_sites_are_pinned() {
 fn touch_after_recall_call_sites_are_pinned() {
     let got = census(".touch_after_recall(", &["async fn touch_after_recall("]);
     let expected: BTreeMap<String, usize> = [
-        // handlers/recall.rs:~527 — postgres HTTP branch, gated on
-        // recall_touch_sync_enabled().
-        ("src/handlers/recall.rs".to_string(), 1),
         // store/mod.rs — trait-default unit test.
         ("src/store/mod.rs".to_string(), 1),
         // store/postgres.rs — live_ explicit-verb tests (4 calls).
@@ -100,6 +95,9 @@ fn touch_after_recall_call_sites_are_pinned() {
         ("src/store/sqlite.rs".to_string(), 2),
     ]
     .into();
+    // v1.0.0 (#1953) removed the ONLY recall-path caller
+    // (handlers/recall.rs postgres HTTP branch, gated on the
+    // now-deleted recall_touch_sync_enabled()) — no entry remains.
     assert_eq!(
         got, expected,
         "touch_after_recall call-site census drifted — a NEW caller on a recall path \

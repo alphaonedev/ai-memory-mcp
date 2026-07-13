@@ -53,7 +53,6 @@ fn env_lock() -> MutexGuard<'static, ()> {
 fn clear_flags() {
     // SAFETY: serialized via env_lock.
     unsafe {
-        std::env::remove_var("AI_MEMORY_RECALL_TOUCH_SYNC");
         std::env::remove_var("AI_MEMORY_CONFIDENCE_DECAY");
     }
 }

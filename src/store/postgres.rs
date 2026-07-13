@@ -5071,14 +5071,13 @@ impl PostgresStore {
         if candidates.is_empty() {
             return Ok(0);
         }
-        // v0.9.0 P0-1 (#1869) — sync-mode double-count guard: rows
-        // written while the deprecated AI_MEMORY_RECALL_TOUCH_SYNC=1
-        // legacy flag is ON are inserted pre-marked `folded = TRUE`
-        // (the recall already touched synchronously), so the
-        // always-running fold never re-applies them. Pure default
-        // inserts `FALSE` and the fold applies the ladders exactly
-        // once. Flag evaluated once per batch, never per row.
-        let folded = crate::config::recall_touch_sync_enabled();
+        // v1.0.0 (#1953) — recall is unconditionally pure: the
+        // deprecated AI_MEMORY_RECALL_TOUCH_SYNC=1 legacy flag (which
+        // used to pre-mark rows `folded = TRUE` when the recall had
+        // already touched synchronously) was removed. Every inserted
+        // row now lands `folded = FALSE` and the always-running fold
+        // applies the ladders exactly once.
+        let folded = false;
         let mut tx = self
             .pool
             .begin()
