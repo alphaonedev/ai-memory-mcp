@@ -898,6 +898,17 @@ async fn run_decorrelation_probe_step(
     )
     .await;
     match probe_result {
+        // In `--json` mode stdout is reserved for the caller's PRIMARY report
+        // (e.g. the `curator --reflect` JSON): now that decorrelation defaults to
+        // Advisory (#1952), emitting the probe report to stdout too would make
+        // `--reflect --json` a concatenation of two JSON documents (unparseable).
+        // The advisory VISIBILITY signal is the probe's `tracing::warn`; the
+        // structured report is a diagnostic, so route it to stderr in json mode
+        // (mirrors the probe-error path below). Text mode keeps stdout (a
+        // human-readable addendum concatenates cleanly).
+        Ok(probe) if json => {
+            writeln!(out.stderr, "{}", serde_json::to_string_pretty(&probe)?)?;
+        }
         Ok(probe) => print_decorrelation_report(&probe, json, out)?,
         Err(e) => writeln!(out.stderr, "decorrelation-probe error: {e}")?,
     }
