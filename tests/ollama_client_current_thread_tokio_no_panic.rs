@@ -227,7 +227,12 @@ fn build_llm_client_known_callsite_does_not_panic() {
             ollama_url: Some(url),
             ..AppConfig::default()
         };
-        build_llm_client(FeatureTier::Smart, &cfg).await
+        build_llm_client(
+            FeatureTier::Smart,
+            &cfg,
+            std::path::Path::new("ai-memory.db"),
+        )
+        .await
     });
 
     // `build_llm_client` returns `Option<OllamaClient>` and never
