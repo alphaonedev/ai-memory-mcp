@@ -1655,10 +1655,11 @@ pub trait MemoryStore: Send + Sync {
     /// Default returns `Ok(())` — adapters that wire touch ops override.
     ///
     /// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
-    /// ungated; the recall paths call it only under the deprecated
-    /// `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag. The pure-default
-    /// access signal flows through the `recall_observations` ledger
-    /// and [`Self::fold_recall_accesses`].
+    /// ungated. v1.0.0 (#1953): the recall paths no longer call it at
+    /// all — recall is unconditionally pure now that the deprecated
+    /// `AI_MEMORY_RECALL_TOUCH_SYNC` legacy flag was removed. The
+    /// pure-default access signal flows through the
+    /// `recall_observations` ledger and [`Self::fold_recall_accesses`].
     async fn touch_after_recall(&self, _ids: &[String]) -> StoreResult<()> {
         Ok(())
     }

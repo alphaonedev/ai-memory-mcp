@@ -1611,11 +1611,11 @@ pub fn touch(conn: &Connection, id: &str, short_extend: i64, mid_extend: i64) ->
 /// changes.
 ///
 /// v0.9.0 P0-1 (#1869) — this is the EXPLICIT touch verb and stays
-/// ungated. The RECALL paths no longer call it by default (recall is
-/// pure); they call it only under the deprecated
-/// `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag. The pure-default
-/// access signal flows through the `recall_observations` ledger and
-/// is applied by [`fold_recall_accesses`].
+/// ungated. v1.0.0 (#1953): the RECALL paths no longer call it at
+/// all — recall is unconditionally pure now that the deprecated
+/// `AI_MEMORY_RECALL_TOUCH_SYNC` legacy flag was removed. The
+/// pure-default access signal flows through the `recall_observations`
+/// ledger and is applied by [`fold_recall_accesses`].
 ///
 /// A failure mid-batch rolls back the entire transaction (no partial
 /// touches survive) and surfaces a single error to the caller — which
@@ -1636,15 +1636,13 @@ pub fn touch_many(
     // #1580 — the WAL read-pool opens its connections with
     // `PRAGMA query_only = ON`. `touch_many` is best-effort access
     // bookkeeping (access_count bump / TTL extend / promotion), so on a
-    // read-only pool connection it no-ops. #1869 note: in the pure
-    // default the recall paths never reach this function at all; under
-    // `AI_MEMORY_RECALL_TOUCH_SYNC=1` the legacy split applies — the
-    // read phase no-ops here and the authoritative touch runs on the
-    // writer connection (see `handlers::recall`). Without this guard a
-    // sync-mode recall SELECT dispatched through the read-pool would
-    // hit a guaranteed `BEGIN IMMEDIATE` failure + a WARN per request.
-    // The pragma read is one cheap round-trip; on the writer connection
-    // `query_only` is `0` and the touch proceeds normally.
+    // read-only pool connection it no-ops. v1.0.0 (#1953) note: recall
+    // paths never reach this function at all now (the sync-touch
+    // opt-back-in was removed) — this guard remains for the EXPLICIT
+    // touch verb's own callers, which may legitimately run against a
+    // read-pool connection. The pragma read is one cheap round-trip;
+    // on the writer connection `query_only` is `0` and the touch
+    // proceeds normally.
     let query_only: i64 = conn
         .query_row("PRAGMA query_only", [], |r| r.get(0))
         .unwrap_or(0);
@@ -1711,8 +1709,9 @@ pub fn touch_many(
 /// v0.9.0 P0-1 (#1869) — FOLD maintenance verb: batch-apply the legacy
 /// recall-touch ladders from unfolded `recall_observations` ledger rows.
 ///
-/// With recall pure by default (`AI_MEMORY_RECALL_TOUCH_SYNC` unset),
-/// this is the ONLY writer of recall-driven access state. Per unfolded
+/// With recall unconditionally pure (v1.0.0 #1953 removed the legacy
+/// `AI_MEMORY_RECALL_TOUCH_SYNC` synchronous-touch opt-back-in), this
+/// is the ONLY writer of recall-driven access state. Per unfolded
 /// `(memory_id, n = COUNT(*), t_max = MAX(observed_at))` aggregate it
 /// applies exactly the [`touch_many`] ladders, equivalence-exact:
 ///
@@ -1733,9 +1732,11 @@ pub fn touch_many(
 ///   recall path onto the fold
 ///
 /// Consumed ledger rows are marked `folded = 1` in the same
-/// transaction. Rows inserted pre-marked `folded = 1` (sync-mode
-/// recalls — see [`crate::config::recall_touch_sync_enabled`]) are
-/// never re-applied, so sync-touched accesses cannot double-count.
+/// transaction. Rows pre-marked `folded = 1` at write time (the v77
+/// migration's one-time backfill of pre-existing sync-touched rows —
+/// see the migration doc comment; the runtime sync-touch opt-back-in
+/// that used to also pre-mark rows was removed at v1.0.0) are never
+/// re-applied, so those historical rows cannot double-count.
 ///
 /// Chunked: at most [`FOLD_CHUNK_MEMORIES`] distinct memories' worth
 /// of ledger rows per `BEGIN IMMEDIATE` transaction, looping until
@@ -5327,8 +5328,13 @@ pub fn recall(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
-    short_extend: i64,
-    mid_extend: i64,
+    // v1.0.0 (#1953): recall is unconditionally pure now — these were
+    // only consumed by the removed sync-touch branch below. Kept as
+    // parameters (every call site still threads real TTL values
+    // through) so this stays a purely additive, non-breaking removal;
+    // prefixed to silence the now-legitimate unused-variable lint.
+    _short_extend: i64,
+    _mid_extend: i64,
     as_agent: Option<&str>,
     budget_tokens: Option<usize>,
     // v0.7.0 WT-1-E — see [`recall_with_telemetry`] for the
@@ -5491,20 +5497,13 @@ pub fn recall(
     // (AFTER proximity). Returns BudgetOutcome with all R1 meta fields.
     let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
 
-    // v0.9.0 P0-1 (#1869) — recall is PURE by default: the legacy
+    // v1.0.0 (#1953) — recall is unconditionally pure: the legacy
     // synchronous touch (access bump, TTL extend, promotion, priority
-    // ladder — Cluster-F PERF-6 batched form) fires ONLY under the
-    // deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` opt-back-in. In the
-    // pure default the access signal is preserved by the append-only
+    // ladder — Cluster-F PERF-6 batched form) was removed along with
+    // the deprecated `AI_MEMORY_RECALL_TOUCH_SYNC` opt-back-in. The
+    // access signal is preserved by the append-only
     // `recall_observations` ledger (written by the MCP/HTTP/CLI/SAL
     // entry layers) and applied in batch by [`fold_recall_accesses`].
-    // The flag is evaluated once per recall, never per row.
-    if crate::config::recall_touch_sync_enabled() {
-        let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
-        if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
-            tracing::warn!("touch_many failed for recall set: {}", e);
-        }
-    }
     Ok((budgeted, outcome))
 }
 
@@ -13616,36 +13615,31 @@ fn blend_and_rank(
 }
 
 /// #871 stage 5 — post-fusion ops: proximity boost (when hierarchy
-/// expansion is active) and token-budget application. v0.9.0 P0-1
-/// (#1869): the batched `touch_many` write that used to bump
-/// `access_count` + slide the per-tier expiry here is now gated on the
-/// deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag — the pure
-/// default performs ZERO writes; [`fold_recall_accesses`] applies the
-/// ladders from the `recall_observations` ledger instead.
+/// expansion is active) and token-budget application. v1.0.0 (#1953):
+/// the batched `touch_many` write that used to bump `access_count` +
+/// slide the per-tier expiry here was removed along with the
+/// deprecated `AI_MEMORY_RECALL_TOUCH_SYNC` legacy flag — recall now
+/// unconditionally performs ZERO writes here; [`fold_recall_accesses`]
+/// applies the ladders from the `recall_observations` ledger instead.
 fn apply_recall_post_ops(
-    conn: &Connection,
+    // v1.0.0 (#1953): `conn`/`short_extend`/`mid_extend` were only
+    // consumed by the removed sync-touch `touch_many` call. Kept as
+    // parameters (every call site still threads them through) so this
+    // stays a purely additive, non-breaking removal.
+    _conn: &Connection,
     results: Vec<(Memory, f64)>,
     hierarchy_active: bool,
     namespace: Option<&str>,
     budget_tokens: Option<usize>,
-    short_extend: i64,
-    mid_extend: i64,
+    _short_extend: i64,
+    _mid_extend: i64,
 ) -> (Vec<(Memory, f64)>, BudgetOutcome) {
     let boosted = if let (true, Some(anchor)) = (hierarchy_active, namespace) {
         apply_proximity_boost(results, anchor)
     } else {
         results
     };
-    let (budgeted, outcome) = apply_token_budget(boosted, budget_tokens);
-    // #1869 — flag evaluated once per recall; see [`recall`] for the
-    // pure-default contract.
-    if crate::config::recall_touch_sync_enabled() {
-        let touch_ids: Vec<&str> = budgeted.iter().map(|(mem, _)| mem.id.as_str()).collect();
-        if let Err(e) = touch_many(conn, &touch_ids, short_extend, mid_extend) {
-            tracing::warn!("touch_many failed for hybrid recall set: {}", e);
-        }
-    }
-    (budgeted, outcome)
+    apply_token_budget(boosted, budget_tokens)
 }
 
 /// #871 stage 6 — telemetry assembly. Aggregates the per-stage

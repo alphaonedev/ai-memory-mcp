@@ -4461,19 +4461,6 @@ pub const ENV_EMBED_API_KEY: &str = "AI_MEMORY_EMBED_API_KEY";
 /// resolver per the no-hardcoded-literals discipline (#1598).
 pub const ENV_EMBED_BACKFILL_BATCH: &str = "AI_MEMORY_EMBED_BACKFILL_BATCH";
 
-/// v0.9.0 P0-1 (#1869) — legacy opt-back-in for the synchronous
-/// recall-time touch. Default OFF: recall is PURE (zero writes to
-/// `memories` or any other table except the append-only
-/// `recall_observations` audit ledger); the access ladders
-/// (access_count bump, `last_accessed_at`, per-tier TTL floor-extend,
-/// mid→long promotion, priority decade ladder) are applied by the
-/// periodic FOLD maintenance job from unfolded ledger rows. `"1"`
-/// restores the pre-v0.9 strict-legacy synchronous touch on every
-/// recall path — deprecated at birth, removal targeted v1.0. When the
-/// flag is ON, every recall-path ledger insert is written pre-marked
-/// `folded = 1` so the always-running fold never double-applies a
-/// sync-touched access (the #1869 vote's unanimous condition).
-pub const ENV_RECALL_TOUCH_SYNC: &str = "AI_MEMORY_RECALL_TOUCH_SYNC";
 /// v0.9.0 P0-1 (#1869) — cadence (whole seconds) of the dedicated
 /// recall-access FOLD loop. Default `60`. `0` disables the dedicated
 /// loop — the fold then rides the gc tick only (every
@@ -4487,9 +4474,11 @@ pub const ENV_ACCESS_FOLD_INTERVAL_SECS: &str = "AI_MEMORY_ACCESS_FOLD_INTERVAL_
 pub const DEFAULT_ACCESS_FOLD_INTERVAL_SECS: u64 = 60;
 
 /// One-shot latch primitive backing the v0.10.0 WARN-carrier release
-/// (Gate-1', #1972): the deprecation / secure-default-flip WARNs for
-/// [`ENV_RECALL_TOUCH_SYNC`] (#1953), the federation fed-sig defaults
-/// (#1954), and the decorrelation advisory (#1952).
+/// (Gate-1', #1972): the secure-default-flip WARNs for the federation
+/// fed-sig defaults (#1954) and the decorrelation advisory (#1952).
+/// (The #1953 `AI_MEMORY_RECALL_TOUCH_SYNC` deprecation WARN this
+/// latch also carried was removed at v1.0.0 along with the knob
+/// itself — recall is now unconditionally pure.)
 ///
 /// Returns `true` on the FIRST call for a given `latch` and `false` on
 /// every subsequent call, so a WARN fires once per process rather than
@@ -4498,54 +4487,6 @@ pub const DEFAULT_ACCESS_FOLD_INTERVAL_SECS: u64 = 60;
 /// to any other state.
 pub(crate) fn one_shot_latch_take(latch: &std::sync::atomic::AtomicBool) -> bool {
     !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// v0.10.0 Gate-1' (#1953) — one-cycle deprecation notice for the legacy
-/// synchronous recall-touch knob. Removal is targeted v1.0.0; the migration
-/// is to rely on the pure-recall fold ledger. Cites the #1869 vote that made
-/// recall pure and deprecated this knob at birth.
-pub const RECALL_TOUCH_SYNC_DEPRECATION_WARNING: &str = "AI_MEMORY_RECALL_TOUCH_SYNC=1 is DEPRECATED and will be REMOVED in v1.0.0 (#1869). \
-     The legacy synchronous recall-time touch is superseded by pure recall plus the \
-     periodic access-fold ledger — unset this knob and rely on the fold ledger \
-     (recall_observations rows folded by the access-fold loop) for the access-count, \
-     last_accessed_at, TTL-floor, and promotion ladders. One-cycle v0.10.0 deprecation \
-     WARN; the knob still works this release.";
-
-/// Raw env read for [`ENV_RECALL_TOUCH_SYNC`] with NO side effects — the
-/// pure predicate the one-shot WARN gate and [`recall_touch_sync_enabled`]
-/// both build on.
-fn recall_touch_sync_raw() -> bool {
-    std::env::var(ENV_RECALL_TOUCH_SYNC).is_ok_and(|v| v == "1")
-}
-
-/// Emit [`RECALL_TOUCH_SYNC_DEPRECATION_WARNING`] at most once per process,
-/// and only when the deprecated knob is actually set. Called from BOTH the
-/// daemon boot path ([`crate::daemon_runtime::bootstrap_serve`]) and the
-/// first recall-path use of [`recall_touch_sync_enabled`] (#1953).
-pub fn warn_recall_touch_sync_deprecation_once() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if recall_touch_sync_raw() && one_shot_latch_take(&WARNED) {
-        tracing::warn!("{RECALL_TOUCH_SYNC_DEPRECATION_WARNING}");
-    }
-}
-
-/// Returns `true` when [`ENV_RECALL_TOUCH_SYNC`] is set to `"1"` —
-/// the legacy synchronous recall-touch posture. Pattern mirrors
-/// [`crate::confidence::decay::decay_enabled`]. Callers on the recall
-/// path MUST evaluate this ONCE per recall (never per row) and only
-/// on write paths.
-///
-/// Side effect (#1953): on the first call in a process where the knob is
-/// set, emits the one-shot v0.10.0 removal-deprecation WARN. The emission
-/// is latched, so the hot fold path pays only a relaxed atomic load after
-/// the first recall.
-#[must_use]
-pub fn recall_touch_sync_enabled() -> bool {
-    let enabled = recall_touch_sync_raw();
-    if enabled {
-        warn_recall_touch_sync_deprecation_once();
-    }
-    enabled
 }
 
 /// Resolve the fold-loop cadence from [`ENV_ACCESS_FOLD_INTERVAL_SECS`].
@@ -4567,26 +4508,6 @@ mod recall_purity_flag_tests {
     //! test covering unset → set → reset (the `decay_env_gating`
     //! precedent in `src/confidence/decay.rs`).
     use super::*;
-
-    #[test]
-    fn recall_touch_sync_default_off_and_opt_in() {
-        // SAFETY: single test owns this var; no concurrent reader in
-        // this binary mutates it. (#1953 removal-readiness assertions are
-        // folded in here so exactly ONE test mutates this process-global var.)
-        unsafe { std::env::remove_var(ENV_RECALL_TOUCH_SYNC) };
-        assert!(!recall_touch_sync_enabled(), "default is pure (OFF)");
-        assert!(!recall_touch_sync_raw(), "unset → no deprecation WARN gate");
-        unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "1") };
-        assert!(recall_touch_sync_enabled());
-        // #1953: the knob STILL works this release; the WARN gate is armed
-        // only when opted in. The one-shot emitter is panic-free either way.
-        assert!(recall_touch_sync_raw(), "opted-in → WARN gate armed");
-        warn_recall_touch_sync_deprecation_once();
-        // Only the exact "1" spelling opts in — a typo stays pure.
-        unsafe { std::env::set_var(ENV_RECALL_TOUCH_SYNC, "true") };
-        assert!(!recall_touch_sync_enabled());
-        unsafe { std::env::remove_var(ENV_RECALL_TOUCH_SYNC) };
-    }
 
     #[test]
     fn access_fold_interval_default_zero_and_garbage() {
@@ -4620,15 +4541,6 @@ mod recall_purity_flag_tests {
         assert!(one_shot_latch_take(&latch), "first take fires");
         assert!(!one_shot_latch_take(&latch), "second take is suppressed");
         assert!(!one_shot_latch_take(&latch), "and stays suppressed");
-    }
-
-    #[test]
-    fn recall_touch_sync_deprecation_message_cites_removal_and_1869() {
-        // The named-const message must carry the load-bearing facts:
-        // removal version + the #1869 provenance + the fold-ledger migration.
-        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("v1.0.0"));
-        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("#1869"));
-        assert!(RECALL_TOUCH_SYNC_DEPRECATION_WARNING.contains("fold ledger"));
     }
 
     #[test]

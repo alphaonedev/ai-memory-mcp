@@ -91,19 +91,17 @@ pub fn record_recall(
     Ok(written)
 }
 
-/// v0.9.0 P0-1 (#1869) — `folded` stamp for recall-path ledger inserts.
+/// v1.0.0 (#1953) — `folded` stamp for recall-path ledger inserts.
 ///
-/// Pure default (`AI_MEMORY_RECALL_TOUCH_SYNC` unset): rows land
-/// `folded = 0` and the periodic FOLD job
-/// ([`crate::storage::fold_recall_accesses`]) later applies the access
-/// ladders exactly once. Legacy sync mode (`=1`): the recall path
-/// already touched the rows synchronously, so the ledger rows are
-/// written PRE-MARKED `folded = 1` — the always-running fold must
-/// never re-apply a sync-touched access (the #1869 vote's unanimous
-/// double-count condition). Every recall-path ledger writer (HTTP both
-/// backends, MCP, CLI, shell, SAL) routes through this stamp.
+/// Recall is now UNCONDITIONALLY pure (the deprecated
+/// `AI_MEMORY_RECALL_TOUCH_SYNC` synchronous-touch opt-back-in was
+/// removed): every inserted row lands `folded = 0`, and the periodic
+/// FOLD job ([`crate::storage::fold_recall_accesses`]) later applies
+/// the access ladders exactly once. Every recall-path ledger writer
+/// (HTTP both backends, MCP, CLI, shell, SAL) routes through this
+/// stamp.
 fn folded_stamp_for_insert() -> i64 {
-    i64::from(crate::config::recall_touch_sync_enabled())
+    0
 }
 
 /// Flip the `consumed` flag (and capture `consumed_at` +
