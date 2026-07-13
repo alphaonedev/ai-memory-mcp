@@ -458,8 +458,6 @@ async fn recall_response(
                     session_id,
                     session_tracker,
                 );
-                let touch_ids: Vec<String> =
-                    scored_pairs.iter().map(|(m, _)| m.id.clone()).collect();
                 // #869 — `serde_json::to_value(m).unwrap_or_default()`
                 // would have surfaced a `Value::Null` row in the recall
                 // payload on a Memory-serialise failure, which the
@@ -511,23 +509,14 @@ async fn recall_response(
                         }
                     })
                     .collect();
-                // v0.9.0 P0-1 (#1869) — recall is PURE by default: the
-                // legacy synchronous touch fires ONLY under the
-                // deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` flag
-                // (evaluated once per recall). In the pure default the
-                // access ladders are applied by the periodic FOLD job
-                // (`MemoryStore::fold_recall_accesses`) from the
-                // unfolded `recall_observations` ledger rows written
+                // v1.0.0 (#1953) — recall is now UNCONDITIONALLY pure: the
+                // deprecated `AI_MEMORY_RECALL_TOUCH_SYNC` synchronous-touch
+                // opt-back-in was removed (deprecated at birth by the #1869
+                // pure-recall vote; one-cycle v0.10.0 deprecation WARN
+                // shipped per CHANGELOG.md). The access ladders are applied
+                // by the periodic FOLD job (`MemoryStore::fold_recall_accesses`)
+                // from the unfolded `recall_observations` ledger rows written
                 // just below.
-                if crate::config::recall_touch_sync_enabled() {
-                    // Touch ops AFTER assembling the response payload so
-                    // the observable response is what the caller wanted
-                    // (access_count pre-touch); the touch fires inside
-                    // the trait call's own transaction.
-                    if let Err(e) = app.store.touch_after_recall(&touch_ids).await {
-                        tracing::warn!("recall (postgres): touch_after_recall failed: {e}");
-                    }
-                }
                 // #1705 — populate the recall_observations ledger via the
                 // SAL trait so postgres-backed daemons record recalls (the
                 // write side was sqlite/MCP-only pre-#1705, so a postgres
@@ -686,35 +675,27 @@ async fn recall_response(
     // so no second lock is ever taken. Recorded INSIDE the lock block,
     // before the guard drops at the end of the block.
     let recall_id = uuid::Uuid::new_v4().to_string();
-    // #1580 / v0.9.0 P0-1 (#1869) — recall is split across the WAL
-    // read-pool and the writer, and is PURE by default:
+    // #1580 / v1.0.0 (#1953) — recall is split across the WAL read-pool
+    // and the writer, and is now UNCONDITIONALLY pure:
     //
     //   PHASE 1 (read-pool, `db_read_op`): the FTS5 query + `get_many`
     //   for the pre-computed HNSW hits + scoring run on a read-only pool
     //   connection so concurrent recalls overlap instead of serializing
     //   on the single writer mutex. The internal touch inside
-    //   `recall_hybrid_precomputed_hnsw` / `recall` is legacy-flag-gated
-    //   (#1869) AND no-ops on a read-only connection (`PRAGMA
-    //   query_only = ON`) — the read phase performs ZERO writes (the
+    //   `recall_hybrid_precomputed_hnsw` / `recall` is unreachable on
+    //   this path (the sync-touch opt-back-in was removed) AND would
+    //   no-op on a read-only connection (`PRAGMA query_only = ON`)
+    //   regardless — the read phase performs ZERO writes (the
     //   `short_extend`/`mid_extend` arguments are inert here). The
     //   returned `Memory` rows carry pre-touch `access_count`.
     //
     //   PHASE 2 (writer, `db_op`): ONLY the #1710 recall_observations
-    //   ledger append runs by default — the append-only audit ledger is
-    //   the single sanctioned recall-time write, and the periodic FOLD
-    //   job (`db::fold_recall_accesses`) later applies the access
-    //   ladders (access bump / TTL floor-extend / promotion / priority)
-    //   from the unfolded rows. Under the deprecated
-    //   `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag the authoritative
-    //   `touch_many` also fires here, and the ledger rows are written
-    //   pre-marked `folded = 1` so the fold never double-applies a
-    //   sync-touched access. Both writes are best-effort: a failure
-    //   logs at warn and never reshapes the response.
-    //
-    // RYW (sync mode): `touch_many` is a blind relative UPDATE under
-    // `BEGIN IMMEDIATE` (`access_count + 1`, `MAX(expires_at, …)`,
-    // promotion gated by `WHERE access_count >= …`), so splitting the
-    // SELECT off the writer introduces no read-modify-write race.
+    //   ledger append runs — the append-only audit ledger is the single
+    //   sanctioned recall-time write, and the periodic FOLD job
+    //   (`db::fold_recall_accesses`) later applies the access ladders
+    //   (access bump / TTL floor-extend / promotion / priority) from the
+    //   unfolded rows. The write is best-effort: a failure logs at warn
+    //   and never reshapes the response.
     let ctx_owned = context.to_string();
     let ns_owned = namespace.map(str::to_string);
     let tags_owned = tags.map(str::to_string);
@@ -800,21 +781,7 @@ async fn recall_response(
         // + `namespace` stamping.
         let agent_for_ledger = as_agent.or(caller_principal).map(str::to_string);
         let ns_for_ledger = namespace.map(str::to_string);
-        // #1869 — flag evaluated ONCE per recall, outside the writer
-        // closure (never per row, never on the phase-1 read path).
-        let sync_touch = crate::config::recall_touch_sync_enabled();
         super::db_op(app.db.clone(), move |guard| {
-            if sync_touch {
-                let id_refs: Vec<&str> = recorded.iter().map(|(id, _, _)| id.as_str()).collect();
-                if let Err(e) = db::touch_many(
-                    &guard.0,
-                    &id_refs,
-                    guard.2.short_extend_secs,
-                    guard.2.mid_extend_secs,
-                ) {
-                    tracing::warn!("recall (sqlite-http): touch_many failed (non-fatal): {e}");
-                }
-            }
             // #1710 — record the recalled set into the ledger on the
             // writer connection (no second lock; mirrors the MCP free-fn).
             if crate::observations::table_exists(&guard.0) {

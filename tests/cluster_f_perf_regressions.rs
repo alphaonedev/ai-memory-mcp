@@ -18,9 +18,11 @@
 //!   captured via `Connection::trace`. Asserts zero such queries fire.
 //!
 //! * **PERF-6** — `recall_touch_uses_single_transaction_per_call`:
-//!   the touch fan-out collapses K rows into ONE `BEGIN IMMEDIATE`.
-//!   Asserts exactly one `BEGIN` (and one `COMMIT`) fires regardless
-//!   of how many rows the recall surfaces.
+//!   recall is unconditionally pure (v1.0.0 #1953 removed the legacy
+//!   `AI_MEMORY_RECALL_TOUCH_SYNC` sync-touch opt-back-in this test
+//!   used to also exercise). Asserts recall issues ZERO write
+//!   transactions (no `BEGIN`/`COMMIT`) regardless of how many rows
+//!   the recall surfaces.
 //!
 //! * **PERF-1** — `pre_store_hooks_share_caller_connection`: the
 //!   synchronous `maybe_enqueue_auto_atomise` path no longer opens a
@@ -245,18 +247,16 @@ fn recall_hybrid_loop_does_not_call_get_embedding_per_row() {
 // PERF-6 — recall touch collapses to a SINGLE transaction
 // ---------------------------------------------------------------------------
 
-/// v0.9.0 P0-1 (#1869) — converted to the sync-flag expectation: the
-/// PERF-6 single-transaction contract now applies ONLY under the
-/// deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1` legacy flag (the pure
-/// default performs ZERO write transactions on recall, pinned by the
-/// trailing pure-default section below and by
-/// `tests/recall_purity_p01.rs`).
+/// v1.0.0 (#1953) — the deprecated `AI_MEMORY_RECALL_TOUCH_SYNC=1`
+/// legacy flag (and the PERF-6 single-transaction contract it used to
+/// gate) was removed: recall is now UNCONDITIONALLY pure and must
+/// issue ZERO write transactions, on every call, with no opt-back-in.
+/// This test used to also exercise the sync-mode single-BEGIN/COMMIT
+/// contract (pre-#1953); that half was removed along with the flag.
+/// Pinned alongside `tests/recall_purity_p01.rs`.
 #[test]
 fn recall_touch_uses_single_transaction_per_call() {
     let _g = TRACE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-    // SAFETY: serialized via TRACE_GUARD (every recall-tracing test in
-    // this binary takes it); removed before the guard drops.
-    unsafe { std::env::set_var("AI_MEMORY_RECALL_TOUCH_SYNC", "1") };
     let (mut conn, _path) = open_db("perf6");
     let ns = "perf6/ns".to_string();
     // Seed 4 memories so K > 1.
@@ -309,31 +309,13 @@ fn recall_touch_uses_single_transaction_per_call() {
     };
     let (begin_count, commit_count) = count_tx(&log);
 
-    // Cluster-F PERF-6 (sync mode) — exactly one BEGIN / COMMIT pair
-    // for the entire touch fan-out, regardless of K.
+    // #1953 purity — recall issues ZERO write transactions (the
+    // internal touch was removed entirely, not merely flag-gated off).
     assert_eq!(
-        begin_count, 1,
-        "PERF-6 regression: expected exactly 1 BEGIN IMMEDIATE in the sync-mode recall trace, got {begin_count}. Log: {log:#?}"
-    );
-    assert_eq!(
-        commit_count, 1,
-        "PERF-6 regression: expected exactly 1 COMMIT in the sync-mode recall trace, got {commit_count}. Log: {log:#?}"
-    );
-
-    // #1869 pure default — the same recall issues ZERO write
-    // transactions (the internal touch is flag-gated off).
-    // SAFETY: serialized via TRACE_GUARD.
-    unsafe { std::env::remove_var("AI_MEMORY_RECALL_TOUCH_SYNC") };
-    install_trace(&mut conn);
-    let _ = recall(&conn).expect("pure recall ok");
-    conn.trace(None);
-    let pure_log = snapshot_trace();
-    let (pure_begin, pure_commit) = count_tx(&pure_log);
-    assert_eq!(
-        (pure_begin, pure_commit),
+        (begin_count, commit_count),
         (0, 0),
-        "#1869 purity regression: pure-default recall must issue zero write \
-         transactions. Log: {pure_log:#?}"
+        "#1953 purity regression: recall must issue zero write \
+         transactions. Log: {log:#?}"
     );
 }
 
