@@ -611,6 +611,10 @@ pub mod egress;
 // secrets / governance signing keys / biometric-behavioral embeddings must
 // never cross the export boundary in the clear).
 pub mod export_taxonomy;
+// #1944 (B_WARN de-silencing) — SSOT for the `ai-memory export` scope
+// markers (stderr WARN + additive in-payload `export_scope` / `excludes`
+// fields) so the CLI + HTTP export surfaces cannot drift.
+pub mod export_scope;
 pub mod hooks;
 pub mod identity;
 // v0.7.0 L1-2 — knowledge-graph substrate helpers (anti-cycle check).

@@ -39,25 +39,29 @@
 //! evaluated false and control fell through to actual client
 //! construction, without any network dependency or hang risk.
 //!
-//! ## A load-bearing wrinkle discovered while writing this test
+//! ## A wrinkle these tests originally worked around — FIXED by #1991
 //!
-//! `build_llm_client` / `build_embedder` do NOT thread the resolved
-//! `db_path` in from their caller for the audit write — they each
-//! independently recompute `app_config.effective_db(Path::new(DEFAULT_DB))`
-//! (`DEFAULT_DB` = the literal `"ai-memory.db"`). `AppConfig::effective_db`
-//! only honours its `cli_db` argument when it differs from the literal
-//! default (`"ai-memory.db"`); since the call site always passes that
-//! same literal, the operator's real `--db <path>` / `AI_MEMORY_DB` is
-//! NEVER reflected here — the audit row always lands in `ai-memory.db`
-//! relative to the process's CWD (or `[storage].db` from `config.toml`
-//! when one is loaded), regardless of what the command's OWN db-open
-//! path used. This is a real, observable quirk of the shipped #1963
-//! code, not a test artifact; the harness below pins each subprocess's
-//! CWD to a fresh per-test directory and names the `--db` target
-//! `ai-memory.db` inside that SAME directory so the command's
-//! functional db and the audit db resolve to the identical file,
-//! keeping the assertions both correct and hermetic (no shared mutable
-//! state with the repo root or with other tests).
+//! At the time this file was written, `build_llm_client` / `build_embedder`
+//! did NOT thread the resolved `db_path` in from their caller for the audit
+//! write — each independently recomputed
+//! `app_config.effective_db(Path::new(DEFAULT_DB))` (`DEFAULT_DB` = the
+//! literal `"ai-memory.db"`). Because `AppConfig::effective_db` only honours
+//! its `cli_db` argument when it differs from that literal default, the call
+//! site always passing the same literal meant the operator's real
+//! `--db <path>` / `AI_MEMORY_DB` was NEVER reflected — the audit row landed
+//! in CWD `ai-memory.db` regardless of the command's OWN db-open path.
+//!
+//! **#1991 fixed this:** the resolved `db_path` is now threaded from boot
+//! (`run()`'s `effective_db(&cli.db)`) into both builders, so the
+//! `egress.inference_refused` row lands in the operator's `--db` file. These
+//! tests still pass unchanged because their harness pins each subprocess's
+//! CWD to a fresh per-test directory AND names the `--db` target
+//! `ai-memory.db` inside that SAME directory — so the command's functional db
+//! and the audit db resolve to the identical file under BOTH the old
+//! (CWD-relative) and the new (`--db`-honouring) resolution. The dedicated
+//! #1991 regression (`tests/egress_audit_honors_db_1991.rs`) is the one that
+//! discriminates the fix: it names `--db` OUTSIDE the CWD default so the row
+//! can only land correctly when the path is actually threaded.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
