@@ -1058,11 +1058,11 @@ CREATE TABLE IF NOT EXISTS recall_observations (
     agent_id               TEXT        NULL,
     namespace              TEXT        NULL,
     -- v0.9.0 P0-1 (#1869, schema v77) — fold-state marker. FALSE =
-    -- access not yet applied to `memories` (recall is pure by default;
-    -- the periodic fold job applies the touch ladders and flips this
-    -- TRUE). Rows written under the deprecated
-    -- AI_MEMORY_RECALL_TOUCH_SYNC=1 legacy flag are inserted TRUE
-    -- (already sync-touched — never double-count). Existing schemas
+    -- access not yet applied to `memories` (recall is unconditionally
+    -- pure as of v1.0.0 #1953; the periodic fold job applies the
+    -- touch ladders and flips this TRUE). The deprecated
+    -- AI_MEMORY_RECALL_TOUCH_SYNC=1 legacy flag that used to insert
+    -- rows pre-marked TRUE was removed at v1.0.0. Existing schemas
     -- pick this up via migrate_v77().
     folded                 BOOLEAN     NOT NULL DEFAULT FALSE,
     PRIMARY KEY (recall_id, memory_id)

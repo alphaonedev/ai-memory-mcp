@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`AI_MEMORY_RECALL_TOUCH_SYNC` removed** ([#1953](https://github.com/alphaonedev/ai-memory-mcp/issues/1953)). The legacy synchronous recall-time touch opt-back-in — deprecated at birth by the [#1869](https://github.com/alphaonedev/ai-memory-mcp/issues/1869) pure-recall vote, with its one-cycle v0.10.0 deprecation WARN already shipped (see the `[0.10.0]` entry below) — is gone: the env knob, `crate::config::recall_touch_sync_enabled` / `ENV_RECALL_TOUCH_SYNC` / `RECALL_TOUCH_SYNC_DEPRECATION_WARNING` / `warn_recall_touch_sync_deprecation_once`, and every recall-path caller of the explicit touch verbs (the sqlite HTTP + postgres HTTP branches in `src/handlers/recall.rs`, and `db::recall` / `apply_recall_post_ops` in `src/storage/mod.rs`) are removed. Recall is now **unconditionally pure** on every surface (HTTP/MCP/CLI/shell/SAL, both backends) — the periodic fold job (`db::fold_recall_accesses` / `MemoryStore::fold_recall_accesses`) is the sole applier of the access ladders from the `recall_observations` ledger. No migration is needed for operators who were already relying on the pure default (unset is byte-identical); operators who had set `AI_MEMORY_RECALL_TOUCH_SYNC=1` must remove it — the value is now silently ignored rather than restoring the legacy synchronous touch.
+
 ## [0.10.0] — 2026-07-12 — `warn-carrier` (deprecation-WARN cycle for the v1.0.0 secure-default flips, [#1972](https://github.com/alphaonedev/ai-memory-mcp/issues/1972))
 
 ### Deprecated
