@@ -1069,6 +1069,21 @@ pub struct SignableSuccession<'a> {
     /// (genesis/rotation) is OMITTED from the canonical CBOR (legacy
     /// byte-compat); `Some(seq)` is committed as a CBOR integer.
     pub suspected_compromise_from_seq: Option<u64>,
+    /// v1.0.0 #1831 (G17) — for a `"recovery"` record ONLY, the SHA-256
+    /// digest over the SORTED enrolled recovery-guardian public keys that
+    /// the recovery quorum was minted against (the committed trust-anchor
+    /// so a persisted recovery is re-verified against the guardian set at
+    /// MINT time, NOT the verifier's current env — the #1831 ratification
+    /// killer-finding fix). `None` (every non-recovery record) is OMITTED
+    /// from the canonical CBOR so legacy v76/v80 records re-encode
+    /// byte-identically; `Some(digest)` is committed as CBOR `bytes`.
+    pub guardian_set_id: Option<&'a [u8]>,
+    /// v1.0.0 #1831 (G17) — for a `"recovery"` record ONLY, the M-of-N
+    /// threshold the quorum was minted against, committed so the verifier
+    /// enforces the THRESHOLD-AT-MINT (never a later-lowered env value).
+    /// `None` (every non-recovery record) is OMITTED from the canonical
+    /// CBOR (legacy byte-compat); `Some(m)` is committed as a CBOR integer.
+    pub recovery_threshold: Option<u64>,
 }
 
 /// RFC 8949 §4.2.1 deterministic CBOR encoding of the eight signable
@@ -1135,6 +1150,19 @@ pub fn canonical_cbor_succession(s: &SignableSuccession<'_>) -> Result<Vec<u8>> 
         entries.push((
             "suspected_compromise_from_seq",
             ciborium::Value::Integer(ciborium::value::Integer::from(seq)),
+        ));
+    }
+    // v1.0.0 #1831 (G17) — recovery-only trust-anchor commitment. Present
+    // ONLY on a recovery record (None on every other reason → OMITTED →
+    // legacy byte-compat). `canonical_cbor_map` re-sorts the full key set,
+    // so append order is irrelevant to the output bytes.
+    if let Some(gid) = s.guardian_set_id {
+        entries.push(("guardian_set_id", ciborium::Value::Bytes(gid.to_vec())));
+    }
+    if let Some(m) = s.recovery_threshold {
+        entries.push((
+            "recovery_threshold",
+            ciborium::Value::Integer(ciborium::value::Integer::from(m)),
         ));
     }
     let value = canonical_cbor_map(entries);
@@ -2528,6 +2556,8 @@ mod tests {
             prev_record_hash: prev_hash,
             custody_class: crate::identity::lineage::CUSTODY_CLASS_SOFTWARE_FILE,
             suspected_compromise_from_seq: None,
+            guardian_set_id: None,
+            recovery_threshold: None,
         }
     }
 
@@ -2558,6 +2588,8 @@ mod tests {
             prev_record_hash: &prev,
             custody_class,
             suspected_compromise_from_seq,
+            guardian_set_id: None,
+            recovery_threshold: None,
         };
         let perm2 = SignableSuccession {
             prev_record_hash: &prev,
@@ -2570,6 +2602,8 @@ mod tests {
             agent_id,
             custody_class,
             suspected_compromise_from_seq,
+            guardian_set_id: None,
+            recovery_threshold: None,
         };
         let perm3 = SignableSuccession {
             reason,
@@ -2582,6 +2616,8 @@ mod tests {
             recovery_pubkey,
             custody_class,
             suspected_compromise_from_seq,
+            guardian_set_id: None,
+            recovery_threshold: None,
         };
 
         let b1 = canonical_cbor_succession(&perm1).expect("encode perm1");

@@ -310,7 +310,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 23_932; ceiling 24_050 (+118).
     // 2026-07-12 (#1965/#1964): lifecycle-classify + index-coverage query
     // land storage/mod.rs at 24_119; ceiling 24_250 (+131).
-    ("src/storage/mod.rs", 24_250),
+    // 2026-07-12 (#1831 G17): M-of-N key-recovery persistence
+    // (mint_recovery_record + prepare_recovery_challenge + append_recovery)
+    // + the recovery-branch in append_lineage_record + the persisted-recovery
+    // ceremony test land storage/mod.rs at 24_421; ceiling 24_500 (+79).
+    ("src/storage/mod.rs", 24_500),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -711,7 +715,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // SAL surface land the file at 26_215; ceiling 26_300 (+85 headroom).
     // 2026-07-12 (#1955 record-stop): the SAL record_stop methods +
     // gate wiring land postgres.rs at 26_352; ceiling 26_450 (+98).
-    ("src/store/postgres.rs", 26_450),
+    // 2026-07-12 (#1831 G17): the v81 migrate arm + the guardian_set_id /
+    // recovery_threshold columns threaded through the lineage INSERT + read
+    // land postgres.rs at 26_503; ceiling 26_600 (+97).
+    ("src/store/postgres.rs", 26_600),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
