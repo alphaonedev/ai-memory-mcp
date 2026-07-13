@@ -76,6 +76,16 @@ done
 echo "INFO: alice pubkey $ALICE_PUB bound on a.db + b.db (cross-peer enrollment)"
 echo "INFO: mallory (negative author) is deliberately NOT enrolled anywhere"
 
+# The two daemons exercise ONLY the attestation + mTLS lanes — they need NO
+# embedder. Boot them at tier=keyword via an ISOLATED XDG config so a fresh
+# cloud host with no MiniLM cache neither logs EMBEDDER LOAD FAILED nor pays a
+# semantic-tier boot delay (that delay raced the POS poll window on the DO run).
+# The isolated XDG_CONFIG_HOME/HOME keep the host config.toml from leaking —
+# same isolation AI_MEMORY_NO_CONFIG gives the CLI ops above, but WITH a tier
+# override (serve has no --tier flag; tier resolves from config.toml only).
+CFG="$WORK/xdg"; mkdir -p "$CFG/ai-memory"
+printf 'schema_version = 2\ntier = "keyword"\n' > "$CFG/ai-memory/config.toml"
+
 # ---------------------------------------------------------------------------
 # 2. Launch the 2-node mTLS quorum mesh. Transport gates left at v1.0.0
 #    defaults (SIG/NONCE/PEER_ENROLLMENT all ON) — satisfied by the cross
@@ -83,7 +93,7 @@ echo "INFO: mallory (negative author) is deliberately NOT enrolled anywhere"
 # ---------------------------------------------------------------------------
 # peerA: permissive store (models an upstream relay that accepts an unsigned
 # third-party write) but still verifies + persists a presented signature.
-AI_MEMORY_NO_CONFIG=1 AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
+XDG_CONFIG_HOME="$CFG" HOME="$WORK" AI_MEMORY_REQUIRE_AGENT_ATTESTATION=0 \
 AI_MEMORY_KEY_DIR="$KA" AI_MEMORY_FED_IDENTITY=ai:peerA \
 RUST_LOG="ai_memory=info,federation=debug" \
 "$BIN" serve --host 127.0.0.1 --port "$PA" --db "$ADB" \
@@ -94,7 +104,7 @@ RUST_LOG="ai_memory=info,federation=debug" \
 A=$!
 # peerB: write-sig STRICT is the v1.0.0 compiled default (env left unset on
 # purpose to prove the DEFAULT-ON posture; setting =1 would be redundant).
-AI_MEMORY_NO_CONFIG=1 \
+XDG_CONFIG_HOME="$CFG" HOME="$WORK" \
 AI_MEMORY_KEY_DIR="$KB" AI_MEMORY_FED_IDENTITY=ai:peerB \
 RUST_LOG="ai_memory=info,federation=debug" \
 "$BIN" serve --host 127.0.0.1 --port "$PB" --db "$BDB" \
