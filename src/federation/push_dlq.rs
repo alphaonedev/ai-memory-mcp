@@ -290,13 +290,13 @@ fn dlq_depth_warn_threshold() -> i64 {
 /// drown the very signal it is meant to be. `0` = below, `1` = at/over.
 static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 
+use crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT;
+
 /// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
 /// cause label so the Prometheus label cardinality is bounded by
 /// construction (never the raw string). `quota` is operator-actionable
 /// (raise `AI_MEMORY_MAX_MEMORIES_PER_DAY` / wait for the daily reset);
 /// `permanent` is a broken row needing a manual drain.
-use crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT;
-
 fn classify_quarantine_cause(last_error: &str) -> &'static str {
     if last_error.contains("429") {
         "quota"
