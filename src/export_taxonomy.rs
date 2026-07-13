@@ -386,6 +386,73 @@ pub fn screen_export_value_audited(
     Some(class)
 }
 
+/// Unified export-egress screen for a corpus of memory ROWS — the single
+/// SSOT the CLI `export`, the HTTP admin `export_memories`, and (row-wise)
+/// the forensic bundle share so the three egress paths cannot drift (M2:
+/// three parallel egress paths previously gated inconsistently). Applies
+/// BOTH guards the confidentiality invariant requires, per row, in THIS
+/// order (order is load-bearing — see below):
+///
+/// 1. **Forbidden-class drop** ([`classify_memory`], #1838/G28): a row that
+///    classifies into a [`ForbiddenExportClass`] (private-key material /
+///    master-threshold secret / governance signing key / producer-tagged
+///    biometric embedding) is DROPPED — never emitted in the clear — and a
+///    signed `export.forbidden_class_refused` row is emitted when
+///    `audit_conn` is `Some` (the sqlite path holds the audit handle; the
+///    postgres SAL path passes `None` and WARN-only skips the audit row — the
+///    DROP itself always holds). This runs on the UN-redacted row and is
+///    INDEPENDENT of the secret-screen mode, so the fail-closed drop cannot be
+///    softened into a mere mask by the secret screen having already redacted a
+///    PEM block out of `content` (which would otherwise flip a `DROP + audit`
+///    into a silent `keep-redacted`, weakening the pre-existing HTTP gate).
+/// 2. **Secret redaction** ([`crate::secret_screen::redact_memory_for_storage`]),
+///    on the SURVIVORS only: masks credential VALUES (AWS `AKIA…` / GitHub
+///    `ghp_` / OpenAI `sk-` / xAI `xai-` keys, `Bearer` tokens, JWTs) in
+///    EVERY cleartext-indexed field — `content`, `title`, `tags`, and
+///    non-carve-out `metadata` string leaves — so a credential stashed in a
+///    metadata field or the title is masked too, not just one in `content`
+///    (#1844). No-op unless screening was seeded non-`off`.
+#[must_use]
+pub fn screen_memories_for_export(
+    memories: Vec<crate::models::Memory>,
+    audit_conn: Option<&Connection>,
+) -> Vec<crate::models::Memory> {
+    memories
+        .into_iter()
+        .filter_map(|m| {
+            // (1) forbidden-class fail-closed drop (+ signed refusal, #1838).
+            if let Some(class) = classify_memory(&m) {
+                let path = format!("memories/{}.json", m.id);
+                let reason = format!(
+                    "export refused: memory classified {} ({}) — dropped from export artifact",
+                    class.as_str(),
+                    class.description()
+                );
+                if let Some(conn) = audit_conn {
+                    if let Err(e) = emit_export_refusal(
+                        conn,
+                        class,
+                        &path,
+                        crate::identity::sentinels::DAEMON_PRINCIPAL,
+                        &reason,
+                    ) {
+                        tracing::warn!(
+                            "forbidden-export-class signed refusal NOT recorded for {path}: {e}"
+                        );
+                    }
+                }
+                tracing::warn!(
+                    "export boundary dropped a {} memory — {path} withheld fail-closed",
+                    class.as_str()
+                );
+                return None;
+            }
+            // (2) secret-screen the survivor: content + title + tags + metadata.
+            Some(crate::secret_screen::redact_memory_for_storage(&m).unwrap_or(m))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
