@@ -4410,12 +4410,12 @@ pub const ENV_HOOKS_ENFORCE_MODE: &str = "AI_MEMORY_HOOKS_ENFORCE_MODE";
 /// VISIBILITY probe (DeepMind From-AGI-to-ASI audit rec #1; 5-agent vote
 /// `4d3ea1c5`). A valid `off` / `advisory` / `enforce` token (case-insensitive)
 /// selects the mode; anything else (incl. unset) falls through to the compiled
-/// default [`ReflectDecorrelationMode::Off`]. Env-only direct-read (no
+/// default [`ReflectDecorrelationMode::Advisory`] (**v1.0.0**, #1952 — the probe
+/// runs + WARNs by default; set `=off` to opt out). Env-only direct-read (no
 /// `[curator]` field, mirroring #1718/#1765) — no `config_precedence` entry.
-/// At v0.8.0 `enforce` is documented-but-INERT: it degrades to advisory with a
-/// one-shot WARN because binding N≥3 model-family-distinct REFUSAL is gated on
-/// the unbuilt attested-provenance primitive (#1719 / #1171), deferred to v0.9.
-/// See [`reflect_decorrelation_mode`].
+/// `enforce` is the opt-in write-time attested-monoculture REFUSAL (shipped
+/// D3-021/#1767, v0.9.0); enforce-**as-default** is the tracked v1.x lane
+/// (D3-021 → D3-031 → D3-060). See [`reflect_decorrelation_mode`].
 pub const ENV_REFLECT_DECORRELATION_MODE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE";
 
 /// v0.8.0 #1764 — env-only override for the producer-dominance threshold above
@@ -4643,13 +4643,24 @@ mod recall_purity_flag_tests {
 
     #[test]
     fn decorrelation_advisory_gate_tracks_mode() {
-        // The advisory fires only when the mode is inactive (unset/off);
-        // an explicit advisory/enforce mode suppresses it.
+        // Post-#1952 the compiled default is Advisory, so UNSET resolves ACTIVE
+        // (the probe runs by default — "defaults stop lying"). The opt-out
+        // advisory notice fires only when the mode is explicitly inactive (`off`).
         // SAFETY: single test owns this var.
         unsafe { std::env::remove_var(ENV_REFLECT_DECORRELATION_MODE) };
+        assert_eq!(
+            reflect_decorrelation_mode(),
+            ReflectDecorrelationMode::Advisory,
+            "unset → Advisory (v1.0.0 default, #1952)"
+        );
+        assert!(
+            reflect_decorrelation_mode().is_active(),
+            "unset → Advisory → active by default"
+        );
+        unsafe { std::env::set_var(ENV_REFLECT_DECORRELATION_MODE, "off") };
         assert!(
             !reflect_decorrelation_mode().is_active(),
-            "unset → inactive → advisory gate armed"
+            "explicit off → inactive → opt-out advisory gate armed"
         );
         warn_reflect_decorrelation_default_once(); // panic-free no-op path
         unsafe { std::env::set_var(ENV_REFLECT_DECORRELATION_MODE, "advisory") };
@@ -5359,24 +5370,33 @@ impl AgeProjectionMode {
 /// VISIBILITY probe (DeepMind audit rec #1; 5-agent vote `4d3ea1c5`). Mirrors
 /// [`crate::hooks::HookEnforceMode`] / [`AgeProjectionMode`].
 ///
-/// `Off` (default) = no probe (byte-identical to pre-#1764). `Advisory` = scan
-/// the Reflection corpus, compute single-producer dominance, and emit a
-/// structured WARN + advisory report when dominance crosses the threshold —
-/// the safe visibility rung. `Enforce` is RESERVED for the v0.9 write-time N≥3
-/// model-family-distinct REFUSAL: at v0.8.0 it is **inert** and degrades to
-/// `Advisory` (with a one-shot WARN) because binding "distinct" requires
-/// attested model-family provenance that does not exist yet (#1719 / #1171) —
-/// so a probe that refused on CLAIMED distinctness would be security theater
-/// (the unanimous 5-agent finding). Distinctness measured here is therefore
-/// CLAIMED, not ATTESTED.
+/// `Advisory` (**v1.0.0 compiled default**, #1952) = scan the Reflection
+/// corpus, compute single-producer dominance, and emit a structured WARN +
+/// advisory report when dominance crosses the threshold — the safe visibility
+/// rung; distinctness measured is CLAIMED, not ATTESTED. `Off` = no probe
+/// (opt-out; byte-identical to pre-#1764). `Enforce` = opt-in write-time
+/// attested-monoculture REFUSAL (shipped D3-021/#1767, v0.9.0); enforce-**as-
+/// default** is deferred to the v1.x lane (D3-021 → D3-031 → D3-060) — it has no
+/// published deprecation-WARN cycle yet and depends on attested model-family
+/// provenance (#1870) whose loader coverage is still capped (~40%), so an
+/// enforce default now would refuse rarely (near-theater) while adding a
+/// write-path behavior change at GA. Scope adjudicated by the 5-agent vote
+/// (memory `wxixg2xpq` → `4d3ea1c5`): ADVISORY 9/9.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ReflectDecorrelationMode {
-    /// No probe (default).
-    #[default]
+    /// No probe (opt-out; byte-identical to pre-#1764). NOT the default at
+    /// v1.0.0 — set `AI_MEMORY_REFLECT_DECORRELATION_MODE=off` to restore it.
     Off,
-    /// Scan + WARN on producer dominance; never refuse. The visibility rung.
+    /// Scan + WARN on producer dominance; never refuse. The visibility rung and
+    /// the **v1.0.0 compiled default** (#1952 "defaults stop lying": the probe
+    /// runs + WARNs by default instead of being silently `Off`). Distinctness
+    /// measured is CLAIMED, not ATTESTED.
+    #[default]
     Advisory,
-    /// RESERVED for v0.9 write-time refusal; INERT at v0.8.0 (→ `Advisory`).
+    /// Opt-in write-time attested-monoculture REFUSAL (shipped D3-021/#1767,
+    /// v0.9.0). Enforce-**as-default** is deferred to the v1.x lane
+    /// (D3-021 → D3-031 → D3-060) — it needs its own one-cycle deprecation-WARN
+    /// and higher attested model-family coverage first.
     Enforce,
 }
 
@@ -5412,11 +5432,13 @@ impl ReflectDecorrelationMode {
     }
 }
 
-/// v0.8.0 #1764 — resolve the reflection-decorrelation probe mode. Env-only
-/// direct-read (`AI_MEMORY_REFLECT_DECORRELATION_MODE` > compiled
-/// [`ReflectDecorrelationMode::Off`]); a valid `off`/`advisory`/`enforce` token
-/// wins, anything else (incl. unset) yields `Off`. Mirrors the
-/// [`age_projection_mode`] env-only reader convention.
+/// v0.8.0 #1764; v1.0.0 default flipped by #1952 — resolve the reflection-
+/// decorrelation probe mode. Env-only direct-read
+/// (`AI_MEMORY_REFLECT_DECORRELATION_MODE` > compiled
+/// [`ReflectDecorrelationMode::Advisory`]); a valid `off`/`advisory`/`enforce`
+/// token wins, anything else (incl. unset) yields `Advisory` (the v1.0.0
+/// "defaults stop lying" default). Mirrors the [`age_projection_mode`] env-only
+/// reader convention.
 #[must_use]
 pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
     std::env::var(ENV_REFLECT_DECORRELATION_MODE)
@@ -5425,23 +5447,26 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
         .unwrap_or_default()
 }
 
-/// v0.10.0 Gate-1' (#1952) — advisory notice emitted once per curator
-/// `--reflect` run when the reflection-corpus decorrelation probe mode is
-/// unset / `off`. States that v1.0.0 keeps the probe defaulting to ADVISORY
-/// (visibility-on, per D3-021) and names the tracked v1.x enforce-as-default
-/// plan (D3-021 → D3-031 → D3-060). No behaviour change: the anti-theater
-/// refusal rules are unchanged and enforce stays opt-in this release.
-pub const REFLECT_DECORRELATION_ADVISORY_NOTICE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE is unset/off: the reflection-corpus \
-     decorrelation probe is INACTIVE this run. v1.0.0 defaults this probe to \
-     ADVISORY (visibility-on-by-default, per D3-021); enforce-as-default is the \
-     tracked v1.x lane (D3-021 -> D3-031 -> D3-060, #1952). Set \
-     AI_MEMORY_REFLECT_DECORRELATION_MODE=advisory now to adopt the v1.0.0 default \
-     early. One-shot advisory; no behaviour changes this release.";
+/// v1.0.0 Gate-1' (#1952) — opt-out notice emitted once per curator
+/// `--reflect` run when the operator has EXPLICITLY set the reflection-corpus
+/// decorrelation probe mode to `off`, opting OUT of the v1.0.0 ADVISORY default
+/// (visibility-on, per D3-021). Names the tracked v1.x enforce-as-default plan
+/// (D3-021 → D3-031 → D3-060). No behaviour change: the anti-theater refusal
+/// rules are unchanged and enforce stays opt-in this release.
+pub const REFLECT_DECORRELATION_ADVISORY_NOTICE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE=off: the reflection-corpus \
+     decorrelation probe is INACTIVE this run — you have opted OUT of the v1.0.0 \
+     ADVISORY default (visibility-on-by-default, per D3-021). Unset the variable \
+     (or set AI_MEMORY_REFLECT_DECORRELATION_MODE=advisory) to re-enable the \
+     probe. Enforce-as-default remains the tracked v1.x lane \
+     (D3-021 -> D3-031 -> D3-060, #1952). One-shot advisory; no behaviour \
+     changes this release.";
 
 /// Emit [`REFLECT_DECORRELATION_ADVISORY_NOTICE`] at most once per process,
-/// and only when [`reflect_decorrelation_mode`] resolves INACTIVE (unset /
-/// `off`). Called from the curator `--reflect` run (#1952); an explicit
-/// `advisory`/`enforce` mode suppresses the notice (the operator has chosen).
+/// and only when [`reflect_decorrelation_mode`] resolves INACTIVE — which,
+/// post-#1952 (compiled default is now `Advisory`), means the operator has
+/// EXPLICITLY set `off`. Called from the curator `--reflect` run (#1952); an
+/// unset var (→ `Advisory`) or an explicit `advisory`/`enforce` mode suppresses
+/// the notice (the probe is active / the operator has chosen).
 pub fn warn_reflect_decorrelation_default_once() {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !reflect_decorrelation_mode().is_active() && one_shot_latch_take(&WARNED) {
