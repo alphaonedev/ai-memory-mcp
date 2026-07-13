@@ -9705,8 +9705,8 @@ impl PostgresStore {
     }
 
     /// v0.9.0 §25.3 S2 (D3-021, #1767) — postgres twin of
-    /// `db::run_decorrelation_write_gate`. Compiled default OFF
-    /// (byte-identical when the mode is unset/`off`). Corpus =
+    /// `db::run_decorrelation_write_gate`. Compiled default ADVISORY at v1.0.0
+    /// (#1952; this write-gate is only consulted under opt-in `enforce`). Corpus =
     /// reflection-kind memories in `target_namespace` read by a DIRECT
     /// namespace-scoped SQL query (never recall); attested families use
     /// the shared S1 candidate + a postgres `model_attestations` row
