@@ -9390,7 +9390,8 @@ impl PostgresStore {
 
         // ─── 5.6 Write-time attested-family decorrelation gate (§25.3 S2) ─
         // Postgres twin of `db::run_decorrelation_write_gate`. Compiled
-        // default OFF (byte-identical when the mode is unset/`off`).
+        // default ADVISORY at v1.0.0 (#1952 flipped Off->Advisory) — ONLY an
+        // explicit mode=off is byte-identical; unset now resolves ACTIVE.
         self.decorrelation_write_gate_pg(
             &target_namespace,
             &input.metadata,
@@ -9729,12 +9730,18 @@ impl PostgresStore {
         }
         let quorum_n = crate::config::reflect_decorrelation_quorum_n();
 
-        // Direct namespace-scoped corpus read (NOT recall).
+        // Direct namespace-scoped corpus read (NOT recall). Bounded by the SSOT
+        // `crate::storage::LIST_MAX_LIMIT` (sqlite-twin parity — the same window
+        // the visibility probe's `PROBE_SCAN_LIMIT` reuses) so this per-write
+        // scan on the reflect hot path can never grow unbounded.
+        let scan_limit = i64::try_from(crate::storage::LIST_MAX_LIMIT).unwrap_or(i64::MAX);
         let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
             "SELECT metadata FROM memories \
-             WHERE namespace = $1 AND memory_kind = 'reflection'",
+             WHERE namespace = $1 AND memory_kind = 'reflection' \
+             LIMIT $2",
         )
         .bind(target_namespace)
+        .bind(scan_limit)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| {
@@ -10571,10 +10578,16 @@ impl PostgresStore {
         let records = self.read_lineage(agent_id).await?;
         let witnesses = self.lineage_witness_hashes(agent_id).await?;
         let bound = self.agent_pubkey(agent_id).await?;
-        Ok(crate::identity::lineage::verify_lineage(
+        // v1.0.0 #1831 (G17) — recovery-aware resolution (K3 parity with the
+        // sqlite SSOT `crate::storage::verify_agent_lineage`): a head that
+        // arrived via a valid M-of-N guardian quorum must verify. `None`
+        // (no guardians enrolled) fail-closes any recovery record.
+        let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
+        Ok(crate::identity::lineage::verify_lineage_with_recovery(
             &records,
             &witnesses,
             bound.as_deref(),
+            recovery_policy.as_ref(),
         ))
     }
 
@@ -16452,13 +16465,10 @@ impl MemoryStore for PostgresStore {
                 record.agent_id
             )));
         }
-        if record.reason == LineageReason::Recovery {
-            return Err(invalid(
-                "recovery lineage records cannot be minted in v0.9.0 — the recovery \
-                 VERIFY path lands in v1.0"
-                    .to_string(),
-            ));
-        }
+        // v1.0.0 #1831 (G17) — recovery records ARE now mintable on postgres too
+        // (K3 parity with the sqlite SSOT `crate::storage::append_lineage_record`):
+        // authorized by an M-of-N guardian quorum (verified below via
+        // `verify_recovery_record`) instead of a single predecessor signature.
         // v1.0.0 #1949 — CODE refuse-guard: the OSS build STRUCTURALLY
         // REFUSES to mint any non-`software-file` custody class
         // (fail-closed BEFORE any write). Identical to the sqlite SSOT.
@@ -16500,15 +16510,35 @@ impl MemoryStore for PostgresStore {
                 }
             }
         }
-        // Never persist a record the walk would reject.
-        let predecessor =
-            crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
-                .map_err(|e| invalid(format!("lineage predecessor pubkey: {e:#}")))?;
-        verify_succession(record, signature, &predecessor).map_err(|e| {
-            invalid(format!(
-                "refusing to persist unverifiable lineage record: {e}"
-            ))
-        })?;
+        // Never persist a record the walk would reject. Recovery (#1831 G17) is
+        // authorized by the M-of-N guardian quorum (the stored `signature` blob
+        // is the CBOR quorum, NOT a single Ed25519 sig); every other reason is a
+        // single predecessor signature. Mirrors the sqlite SSOT branch.
+        if record.reason == LineageReason::Recovery {
+            let policy = crate::identity::lineage::RecoveryPolicy::from_env().ok_or_else(|| {
+                invalid(
+                    "cannot mint a recovery record — no recovery guardians enrolled \
+                     (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
+                        .to_string(),
+                )
+            })?;
+            crate::identity::lineage::verify_recovery_record(record, signature, &policy).map_err(
+                |e| {
+                    invalid(format!(
+                        "refusing to persist unverifiable recovery record: {e}"
+                    ))
+                },
+            )?;
+        } else {
+            let predecessor =
+                crate::identity::keypair::decode_public_base64(&record.predecessor_pubkey_b64)
+                    .map_err(|e| invalid(format!("lineage predecessor pubkey: {e:#}")))?;
+            verify_succession(record, signature, &predecessor).map_err(|e| {
+                invalid(format!(
+                    "refusing to persist unverifiable lineage record: {e}"
+                ))
+            })?;
+        }
 
         let record_bytes = record
             .canonical_bytes()
@@ -16786,7 +16816,15 @@ impl MemoryStore for PostgresStore {
         }
         let witnesses = self.lineage_witness_hashes(agent_id).await?;
         let bound = self.agent_pubkey(agent_id).await?;
-        match crate::identity::lineage::verify_lineage(&records, &witnesses, bound.as_deref()) {
+        // v1.0.0 #1831 (G17) — recovery-aware resolution (K3 parity with the
+        // sqlite SSOT `crate::storage::current_authoritative_key`).
+        let recovery_policy = crate::identity::lineage::RecoveryPolicy::from_env();
+        match crate::identity::lineage::verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            bound.as_deref(),
+            recovery_policy.as_ref(),
+        ) {
             Ok(verified) => Ok(Some(crate::identity::lineage::pubkey_b64(
                 &verified.head_key,
             ))),
