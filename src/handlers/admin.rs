@@ -712,12 +712,18 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             Err(e) => return store_err_to_response(e),
         };
         let count = mems.len();
+        // #1944 (B_WARN de-silencing) — additive, non-breaking scope
+        // markers so the HTTP export is not a silent-lossy sibling of the
+        // CLI. Shape of the pre-existing fields is unchanged.
         return Json(json!({
             "memories": mems,
             "links": links,
             "count": count,
             (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
             (field_names::STORAGE_BACKEND): "postgres",
+            (field_names::EXPORT_SCOPE): crate::export_scope::SCOPE_MEMORIES_LINKS,
+            (field_names::PORTABILITY_COMPLETE): crate::export_scope::PORTABILITY_COMPLETE,
+            (field_names::EXCLUDES): crate::export_scope::OMITTED_SIGNED_CLASSES,
         }))
         .into_response();
     }
@@ -731,7 +737,19 @@ pub async fn export_memories(State(app): State<AppState>, headers: HeaderMap) ->
             // `export.forbidden_class_refused` row.
             let memories = screen_exported_memories(memories, Some(&lock.0));
             let count = memories.len();
-            Json(json!({"memories": memories, "links": links, "count": count, (field_names::EXPORTED_AT): Utc::now().to_rfc3339()})).into_response()
+            // #1944 (B_WARN de-silencing) — additive scope markers; the
+            // pre-existing `{memories, links, count, exported_at}` shape is
+            // unchanged so downstream consumers keep parsing.
+            Json(json!({
+                "memories": memories,
+                "links": links,
+                "count": count,
+                (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
+                (field_names::EXPORT_SCOPE): crate::export_scope::SCOPE_MEMORIES_LINKS,
+                (field_names::PORTABILITY_COMPLETE): crate::export_scope::PORTABILITY_COMPLETE,
+                (field_names::EXCLUDES): crate::export_scope::OMITTED_SIGNED_CLASSES,
+            }))
+            .into_response()
         }
         (Err(e), _) | (_, Err(e)) => {
             tracing::error!("export error: {e}");

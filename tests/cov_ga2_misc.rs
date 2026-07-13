@@ -393,7 +393,12 @@ fn reranker_pool_over_cap_keeps_every_candidate() {
 #[tokio::test]
 async fn daemon_build_embedder_keyword_tier_disabled() {
     let cfg = AppConfig::default();
-    let emb = ai_memory::daemon_runtime::build_embedder(FeatureTier::Keyword, &cfg).await;
+    let emb = ai_memory::daemon_runtime::build_embedder(
+        FeatureTier::Keyword,
+        &cfg,
+        std::path::Path::new("ai-memory.db"),
+    )
+    .await;
     assert!(
         emb.is_none(),
         "keyword tier has no embedding model preset → embedder disabled"
@@ -409,7 +414,12 @@ async fn daemon_build_embedder_invalid_override_falls_back() {
         embedding_model: Some("not-a-real-model-cov-ga2-2026".to_string()),
         ..AppConfig::default()
     };
-    let emb = ai_memory::daemon_runtime::build_embedder(FeatureTier::Keyword, &cfg).await;
+    let emb = ai_memory::daemon_runtime::build_embedder(
+        FeatureTier::Keyword,
+        &cfg,
+        std::path::Path::new("ai-memory.db"),
+    )
+    .await;
     assert!(
         emb.is_none(),
         "unparseable override on keyword tier resolves to None"

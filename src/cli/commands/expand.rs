@@ -88,10 +88,13 @@ pub struct ExpandArgs {
 pub async fn cmd_expand(
     args: &ExpandArgs,
     app_config: &AppConfig,
+    db_path: &std::path::Path,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     let feature_tier = app_config.effective_tier(None);
-    let llm = crate::daemon_runtime::build_llm_client(feature_tier, app_config).await;
+    // #1991 — thread the operator-resolved db path so an inference-egress
+    // refusal audit row lands in the caller's `--db`, not CWD `ai-memory.db`.
+    let llm = crate::daemon_runtime::build_llm_client(feature_tier, app_config, db_path).await;
     let key_source = app_config
         .resolve_llm(None, None, None)
         .api_key_source

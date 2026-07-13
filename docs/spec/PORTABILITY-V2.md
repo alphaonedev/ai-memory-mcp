@@ -141,13 +141,13 @@ This spec is normative for v1.0; the shipping exporter is not yet fully v2-produ
 
 | Surface | Status |
 |---|---|
-| `ai-memory export` (CLI) | Emits `{memories, links, count, exported_at}` pretty JSON (`src/cli/io.rs::export`) — the memories carry all 28 struct fields, but the envelope lacks `spec_version`, the v1 metadata members, and every §V2-2 signed array |
+| `ai-memory export` (CLI) | Emits `{memories, links, count, exported_at}` pretty JSON (`src/cli/io.rs::export`) — the memories carry all 28 struct fields, but the envelope lacks `spec_version`, the v1 metadata members, and every §V2-2 signed array. **`export` does NOT round-trip the integrity spine and is NOT the portability path** — it is a memories + links CONVENIENCE view. As of #1944 (B_WARN de-silencing) it emits a stderr WARN plus additive in-payload markers (`export_scope="memories+links"`, `portability_complete=false`, `excludes=[governance, revisions, tombstones, lineage, attestations, signed_events]`) so a pipe-to-file consumer learns the scope; the `{memories, links, count, exported_at}` shape is unchanged. |
 | `ai-memory import` | L1-grade: memories + links with validation, conflict disposition, agent-id restamping |
 | Forensic bundle (`export-forensic-bundle`) | Carries the crypto spine (signed events et al.) as a separate signed tar — the §V2-2 classes exist on disk but not yet in the portability envelope |
 | Signed-record byte family | FROZEN + corpus-gated (this spec §V2-2, format spec, `conformance/`) |
 | Non-Rust readers | SHIPPED (2: python3 + node, `conformance/readers/`) |
 
-Closing the exporter gap (emitting the full v2 envelope from one verb) is #1944 follow-through work; the FORMAT is what freezes at v1.0, and it is frozen here.
+Closing the exporter gap (emitting the full v2 envelope from one verb) is #1944 follow-through work deferred to v1.x; the FORMAT is what freezes at v1.0, and it is frozen here. The #1944 GA slice is a **de-silencing hedge**, not the full exporter: `ai-memory export` now announces its memories + links convenience scope (stderr WARN + additive payload markers) instead of silently dropping the spine. **The GA portability claim rests on Portability Spec v2 + the CC0 conformance corpus (#1837) + the two non-Rust readers + `ai-memory backup` (lossless SQLite `VACUUM INTO`) — NOT on `ai-memory export`.** Do not claim "export round-trips the integrity spine" or "export is portability-mature": both are false at v1.0.
 
 ---
 
