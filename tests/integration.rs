@@ -75,6 +75,20 @@ fn cmd(binary: &str) -> std::process::Command {
     // in their own test binaries.
     c.env("AI_MEMORY_FED_REQUIRE_SIG", "0");
     c.env("AI_MEMORY_FED_REQUIRE_NONCE", "0");
+    // #1801→#1954 — the per-write CONTENT and per-signal AUTHOR signature
+    // defaults flipped strict at v1.0.0. The leader daemons here fan out
+    // client-authored rows (metadata.agent_id = the caller, e.g. `ai:s40`)
+    // under the LEADER's own federation sender_agent_id, so every fanned-out
+    // memory is an UNSIGNED honored third-party relay that the strict default
+    // now refuses at the receiving peer — starving the propagation asserts
+    // (`http_bulk_create_fans_out_*`, `http_notify_fans_out_*`, …). This suite
+    // pre-dates per-write signing and exercises fanout/quorum semantics, not
+    // the content-attestation gate, so opt the spawned daemons back into the
+    // permissive accept-and-flag posture via the `=0` escape hatch (the same
+    // suite-level opt-out shape as REQUIRE_SIG/REQUIRE_NONCE above). The strict
+    // default is pinned in its own binaries (tests/federation_write_sig_emit_1801.rs).
+    c.env("AI_MEMORY_FED_REQUIRE_WRITE_SIG", "0");
+    c.env("AI_MEMORY_FED_REQUIRE_SIGNAL_SIG", "0");
     // #976 (2026-05-20) — every integration-test daemon needs admin
     // role for the test caller. The admin-gate tightening cluster
     // (#943 / #946 / #949 / #957 / #960) added `require_admin` to
