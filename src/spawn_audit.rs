@@ -246,7 +246,23 @@ pub fn audited_command<S: AsRef<OsStr>>(program: S, caller: &str) -> std::proces
 /// logical spawn (not per retry).
 #[must_use]
 pub fn audited_tokio_command<S: AsRef<OsStr>>(program: S, caller: &str) -> tokio::process::Command {
-    emit_spawn_audit_best_effort(&argv0_lossy(program.as_ref()), caller);
+    // M4 / rust `M-BLOCKING-IN-ASYNC` / `async-spawn-blocking` (#2007): the
+    // best-effort emit opens a sqlite connection via `crate::db::open` — the full
+    // schema/migrate/rollback-check funnel, SYNCHRONOUS I/O. This chokepoint fires
+    // on the async hook-executor path (`hooks::executor`), so an inline emit would
+    // block a tokio worker per hook-fired spawn. Route the blocking open+append
+    // onto the blocking pool (fire-and-forget — the spawn NEVER waits;
+    // M-PANIC-IS-STOP: audit never gates a spawn). With no runtime present (a
+    // non-async caller / unit test) fall back to a synchronous emit so the
+    // seeded-path / no-key skip semantics are byte-identical either way.
+    let argv0 = argv0_lossy(program.as_ref());
+    let caller_owned = caller.to_string();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || emit_spawn_audit_best_effort(&argv0, &caller_owned));
+        }
+        Err(_) => emit_spawn_audit_best_effort(&argv0, &caller_owned),
+    }
     tokio::process::Command::new(program)
 }
 
@@ -308,6 +324,23 @@ mod tests {
         cmd.arg("--version");
         let program = cmd.get_program().to_string_lossy().into_owned();
         assert_eq!(program, "true");
+    }
+
+    #[tokio::test]
+    async fn tokio_chokepoint_returns_usable_command_off_reactor() {
+        // #2007 — inside a tokio runtime the audit emit is routed onto the
+        // blocking pool (the `Handle::try_current().Ok` arm), so the chokepoint
+        // returns a configurable Command WITHOUT running the synchronous
+        // `db::open` funnel on the reactor thread. No seeded audit DB here, so
+        // the off-reactor emit is itself a graceful no-op; the point is that the
+        // call returns a usable Command and never panics/blocks.
+        let mut cmd = audited_tokio_command("true", CALLER_HOOK_EXEC);
+        cmd.arg("--version");
+        let program = cmd.as_std().get_program().to_string_lossy().into_owned();
+        assert_eq!(program, "true");
+        // Yield so any spawned blocking task can run to completion (no assertion
+        // on its result — it is best-effort observability).
+        tokio::task::yield_now().await;
     }
 
     #[test]
