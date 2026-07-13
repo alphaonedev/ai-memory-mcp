@@ -25,6 +25,7 @@ decision memory travel with the document.
 | ADR | Title | Status |
 |-----|-------|--------|
 | [ADR-001](ADR-001-uuid-cid-dual-identity.md) | UUID / cid dual identity (C dual-binding) — `uuid` = storage/FK/LWW authority, `cid` = signed content-identity; the v2 envelope signs the cid-genesis six-tuple, never the `uuid` | **ACCEPTED + IMPLEMENTED** |
+| [ADR-002](ADR-002-fed-rq-02-equivocation-runtime-deferral.md) | FED-RQ-02 equivocation runtime + epoch-manifest-doc federation deferred to v1.x — ship the frozen format + offline verifier only; FED-RQ-03 policy refuse-stale is green; no "federation mature" / "equivocation shipped" claim (C8) | **ACCEPTED** |
 
 ## Statuses
 
