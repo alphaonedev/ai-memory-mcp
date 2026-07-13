@@ -177,8 +177,11 @@ pub enum IdentityAction {
     /// `recover-prepare`), assemble the collected guardian attestations, and
     /// persist it — verifying the M-of-N quorum against the enrolled
     /// guardian set (`AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS` /
-    /// `AI_MEMORY_RECOVERY_THRESHOLD`) + the optional dead-man window BEFORE
-    /// any write. On success the fresh key is the new authoritative head.
+    /// `AI_MEMORY_RECOVERY_THRESHOLD`) + the committed trust bar in the signed
+    /// record body, ordered by `not_before` anti-rollback monotonicity, BEFORE
+    /// any write. There is NO wall-clock / liveness / dead-man silence-window
+    /// gate (that time-windowed resolution is deferred to a future release).
+    /// On success the fresh key is the new authoritative head.
     Recover {
         /// Agent identifier whose identity is being recovered.
         #[arg(long)]

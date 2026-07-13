@@ -210,14 +210,50 @@ pub(super) async fn sync_push_via_store(
             bound_pubkey.as_deref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            tracing::warn!(
-                target: ATTESTATION_TRACE_TARGET,
-                memory_id = %to_insert.id,
-                attribute_agent = %attribute_agent,
-                sender = %body.sender_agent_id,
-                error = %e,
-                "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
-            );
+            // #1801→#1954 item 7 (postgres twin of `federation_receive.rs`) —
+            // split the generic AttestationRequired refusal into the SAME three
+            // actionable causes the sqlite path emits, so an operator gets a
+            // precise signal + the closed-set DLQ cause token. `bound_pubkey`
+            // was already hoisted above for the attestation lookup.
+            let has_write_sig = to_insert
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if bound_pubkey.is_none() {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT,
+                    error = %e,
+                    "sync_push (postgres): honored third-party relay refused — ORIGIN author has no \
+                     locally-enrolled key to verify the propagated write_signature against; \
+                     enroll author {attribute_agent}'s Ed25519 key at this node (unenrolled_author_strict, #1464/#1801→#1954)"
+                );
+            } else if !has_write_sig {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = "missing_signature",
+                    error = %e,
+                    "sync_push (postgres): honored third-party relay refused — no metadata.write_signature \
+                     present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
+                );
+            } else {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = "forged_or_malformed",
+                    error = %e,
+                    "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
+                );
+            }
             skipped += 1;
             continue;
         }
