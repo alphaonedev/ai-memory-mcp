@@ -163,6 +163,7 @@ fn clear_fed_env() {
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_NONCE_ENV);
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV);
         std::env::remove_var("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT");
         // #1789 — also clear the v0.8 escape hatch so a prior test's
         // AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS=1 cannot leak into the next.
@@ -273,6 +274,13 @@ async fn sync_push_applies_signals_sqlite() {
             ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
             "1",
         );
+        // #1801→#1954 item 5 — the signal-sig default flipped ON at v1.0.0;
+        // this test asserts the accept-and-flag posture (unsigned applies) for
+        // an UNENROLLED signer, which is now the explicit `=0` opt-out.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+            "0",
+        );
     }
     let (r, _t) = sqlite_router();
     let peer = "ai:cov-ga2-sigpeer";
@@ -322,6 +330,7 @@ async fn sync_push_applies_signals_sqlite() {
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV);
     }
     assert!(
         status.is_success(),

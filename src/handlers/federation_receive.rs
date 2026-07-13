@@ -1129,25 +1129,62 @@ pub async fn sync_push(
         // author's enrolled key → upgrade to `agent_attested` (vs `claimed`);
         // reject a forged signature, or (strict, opt-in) an unsigned honored
         // third-party relayed claim. Skips re-attributed rows internally.
+        // Hoist the author's bound key so the refusal WARN can distinguish
+        // missing-author-key from missing-signature (item 7 observability —
+        // the manual substitute for the deferred TOFU key distribution).
+        let author_bound_key = db::agent_pubkey(&lock.0, &attribute_agent).ok().flatten();
         if let Err(e) = apply_inbound_write_attestation(
             &mut to_insert,
             &attribute_agent,
             &body.sender_agent_id,
             original_claim.as_deref(),
-            db::agent_pubkey(&lock.0, &attribute_agent)
-                .ok()
-                .flatten()
-                .as_deref(),
+            author_bound_key.as_deref(),
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
-            tracing::warn!(
-                target: ATTESTATION_TRACE_TARGET,
-                memory_id = %to_insert.id,
-                attribute_agent = %attribute_agent,
-                sender = %body.sender_agent_id,
-                error = %e,
-                "sync_push: per-write content attestation failed; rejecting memory (#1464)"
-            );
+            // #1801→#1954 item 7 — split the generic AttestationRequired WARN
+            // into two actionable causes so an operator gets a precise signal.
+            // A missing/unenrolled author key under the strict flip carries the
+            // closed-set DLQ cause token `unenrolled_author_strict`
+            // (`push_dlq::classify_quarantine_cause`).
+            let has_write_sig = to_insert
+                .metadata
+                .get(crate::models::field_names::WRITE_SIGNATURE)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if author_bound_key.is_none() {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT,
+                    error = %e,
+                    "sync_push: honored third-party relay refused — ORIGIN author has no \
+                     locally-enrolled key to verify the propagated write_signature against; \
+                     enroll author {attribute_agent}'s Ed25519 key at this node (unenrolled_author_strict, #1464/#1801→#1954)"
+                );
+            } else if !has_write_sig {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = "missing_signature",
+                    error = %e,
+                    "sync_push: honored third-party relay refused — no metadata.write_signature \
+                     present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
+                );
+            } else {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    memory_id = %to_insert.id,
+                    attribute_agent = %attribute_agent,
+                    sender = %body.sender_agent_id,
+                    cause = "forged_or_malformed",
+                    error = %e,
+                    "sync_push: per-write content attestation failed; rejecting memory (#1464)"
+                );
+            }
             skipped += 1;
             continue;
         }
@@ -2296,6 +2333,112 @@ mod tests {
         // original_claim "bob" != attribute "ai:relay" → re-attributed → skip.
         apply_inbound_write_attestation(&mut mem, "ai:relay", "ai:relay", Some("bob"), None, true)
             .expect("re-attributed row must be skipped, not rejected");
+        assert_eq!(mem.metadata["attest_level"], "claimed");
+    }
+
+    // ── #1801→#1954 sender-EMIT regression tests (item 8) ────────────────────
+
+    /// (a) The store-time EMIT helper [`attest::persist_write_signature`]
+    /// produces a `metadata.write_signature` that BYTE-ALIGNS with the
+    /// receiver: a honored third-party relayed write carrying the propagated
+    /// origin signature + an enrolled author key upgrades to `agent_attested`
+    /// under the strict flip (`require = true`).
+    #[test]
+    fn emit_signature_verifies_at_receiver_agent_attested_1801() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        // Author node: sign then EMIT (the real store-path helper, not the
+        // test's put_write_sig) so this test pins the EMIT encoding itself.
+        let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        attest::persist_write_signature(&mut mem, &sig);
+        // Relayed as a third-party (attribute author != sender relay), strict.
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            true,
+        )
+        .expect("propagated origin signature must attest under the strict flip");
+        assert_eq!(mem.metadata["attest_level"], "agent_attested");
+    }
+
+    /// (e, part 1) EMIT is NON-CLOBBERING: an intermediate relay MUST NOT
+    /// overwrite a propagated third-party origin signature with its own key
+    /// (item 3). A second `persist_write_signature` with different bytes is a
+    /// no-op while the field is present.
+    #[test]
+    fn emit_never_overwrites_propagated_origin_signature_1801() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        let origin_sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        attest::persist_write_signature(&mut mem, &origin_sig);
+        let origin_b64 = mem.metadata[crate::models::field_names::WRITE_SIGNATURE]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A relay tries to (re)emit with a different signature — must be a no-op.
+        let relay_kp = keypair::generate("ai:relay").unwrap();
+        let relay_sig = attest::sign_memory_write(&relay_kp, &mem, "ai:relay").unwrap();
+        attest::persist_write_signature(&mut mem, &relay_sig);
+        assert_eq!(
+            mem.metadata[crate::models::field_names::WRITE_SIGNATURE]
+                .as_str()
+                .unwrap(),
+            origin_b64,
+            "the propagated origin signature must be preserved verbatim"
+        );
+    }
+
+    /// (e, part 2) Two-hop A→B→C: an origin-stamped signature survives the
+    /// intermediate relay B (verbatim metadata forwarding + non-clobber) and
+    /// verifies at hop-2 (C) against the origin author's enrolled key.
+    #[test]
+    fn two_hop_origin_signature_verifies_at_hop2_1801() {
+        let author = "ai:alpha";
+        let kp = keypair::generate(author).unwrap();
+        // Hop A (author): store + EMIT.
+        let mut mem = wsig_mem(author);
+        let sig = attest::sign_memory_write(&kp, &mem, author).unwrap();
+        attest::persist_write_signature(&mut mem, &sig);
+        // Hop B (relay "ai:beta"): forwards verbatim. B is NOT the author, so
+        // it never re-emits; even a stray emit is a non-clobbering no-op.
+        attest::persist_write_signature(&mut mem, b"not-a-real-signature-bytes-ignored");
+        // Hop C (final receiver): verify against the ORIGIN author's key.
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:beta",
+            Some(author),
+            Some(&pk_b64(&kp)),
+            true,
+        )
+        .expect("origin signature must verify at hop-2 after relay through B");
+        assert_eq!(mem.metadata["attest_level"], "agent_attested");
+    }
+
+    /// (d) Explicit opt-out: with the requirement resolved permissive
+    /// (`AI_MEMORY_FED_REQUIRE_WRITE_SIG=0` → `require = false`), a honored
+    /// third-party UNSIGNED relay is byte-identical to the pre-flip posture —
+    /// accepted and stamped `claimed`, never refused. (The env→bool resolution
+    /// itself is pinned in `receive_auth::tests`.)
+    #[test]
+    fn opt_out_permissive_third_party_unsigned_stays_claimed_1801() {
+        let author = "ai:curator";
+        let kp = keypair::generate(author).unwrap();
+        let mut mem = wsig_mem(author);
+        apply_inbound_write_attestation(
+            &mut mem,
+            author,
+            "ai:relay", // third-party (attribute author != sender)
+            Some(author),
+            Some(&pk_b64(&kp)),
+            false, // == AI_MEMORY_FED_REQUIRE_WRITE_SIG=0
+        )
+        .expect("permissive opt-out must accept an unsigned third-party relay");
         assert_eq!(mem.metadata["attest_level"], "claimed");
     }
 

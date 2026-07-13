@@ -385,6 +385,10 @@ pub(crate) fn handle_store(
             // the identical envelope. `created_at` is the only signed time
             // field; `updated_at` stays at the server's persist time.
             mem.created_at = signed_created_at.to_string();
+            // #1801→#1954 item 4 — redact to storage form BEFORE the gate
+            // verifies (and before EMIT) so the signed bytes equal the
+            // persisted bytes; `db::insert` re-redacts idempotently.
+            crate::identity::attest::redact_before_sign(&mut mem);
             // #1985 — MCP is the operator-as-actor surface: classify by API
             // surface (Mcp), never transport. The require value is moot on
             // the signed branch (a valid sig attests, a forged one rejects,
@@ -397,6 +401,9 @@ pub(crate) fn handle_store(
                 crate::identity::attest::WriteSurface::Mcp,
             )
             .map_err(|e| e.to_string())?;
+            // #1801→#1954 item 2 — sender EMIT: persist the author's presented
+            // signature so it propagates verbatim across federation relay hops.
+            crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
         } else if crate::identity::attest::require_agent_attestation_for(
             crate::identity::attest::WriteSurface::Mcp,
         ) {

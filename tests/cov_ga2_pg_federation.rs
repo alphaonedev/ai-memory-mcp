@@ -178,6 +178,7 @@ fn clear_fed_env() {
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_NONCE_ENV);
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
         std::env::remove_var(ai_memory::identity::keypair::KEY_DIR_ENV);
     }
@@ -285,6 +286,13 @@ async fn pg_sync_push_via_store_applies_signal() {
         std::env::set_var(
             ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
             "1",
+        );
+        // #1801→#1954 item 5 — the signal-sig default flipped ON at v1.0.0;
+        // this test asserts accept-and-flag (unsigned applies) for an UNENROLLED
+        // signer, which is now the explicit `=0` opt-out.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+            "0",
         );
     }
     let r = pg_router(&url).await;
