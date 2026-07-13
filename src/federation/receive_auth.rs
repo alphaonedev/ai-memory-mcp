@@ -224,31 +224,53 @@ pub fn env_flag_default_on(name: &str) -> bool {
         .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no" | "off"))
 }
 
-/// **Flip-ready secure default (Gate-1', #1954) for the federation DATA-lane
-/// signature requirements** — shared by [`require_write_sig_enabled`] (#1464,
-/// env-table row 94) and [`require_signal_sig_enabled`] (#1843, row 96).
-///
-/// This SINGLE const IS the entire v1.0.0 flip: v0.10.0 ships it `false`
-/// (permissive accept-and-flag, UNCHANGED from #1464/#1843) and v1.0.0 will
-/// flip it to `true` — required-per-surface, because **federation inbound IS
-/// the network surface** per ruling `9e9c3cf2` condition (7). The v0.10.0
-/// WARN-carrier release only EMITS the deprecation WARNs
-/// ([`warn_fed_sig_default_flip_once`]); it flips nothing. Routing both
-/// resolvers through one named const makes the flip a one-line diff — and the
-/// opt-out `AI_MEMORY_FED_REQUIRE_{WRITE,SIGNAL}_SIG=0` keeps working post-flip
+/// **Secure default for the federation per-write CONTENT-signature lane**
+/// (#1464, env-table row 94), flipped `false → true` at v1.0.0 (#1801→#1954,
+/// 5-agent vote `w9mr01vi8`). v0.10.0 shipped the one-cycle deprecation WARN
+/// ([`warn_fed_sig_default_flip_once`]); v1.0.0 lands the flip because
+/// **federation inbound IS the network surface** per ruling `9e9c3cf2`
+/// condition (7). Split out of the former single `FED_REQUIRE_SIG_DEFAULT`
+/// (item 5) so the write and signal lanes flip — and revert — independently.
+/// The opt-out `AI_MEMORY_FED_REQUIRE_WRITE_SIG=0` keeps working post-flip
 /// because an explicit env value always wins over this default.
-pub const FED_REQUIRE_SIG_DEFAULT: bool = false;
+pub const FED_REQUIRE_WRITE_SIG_DEFAULT: bool = true;
 
-/// Resolve a DATA-lane fed-sig requirement: an explicit env token wins
-/// (`1`/`true`/`yes`/`on` ⇒ required; any other set value ⇒ permissive
-/// opt-out), and UNSET falls through to the flip-ready
-/// [`FED_REQUIRE_SIG_DEFAULT`]. The set-value semantics are byte-identical to
-/// the pre-#1954 `is_some_and(matches!(…))` form; only the unset arm is now
-/// the named flip-ready const (currently `false`, so behaviour is unchanged).
-fn resolve_fed_sig_flag(name: &str) -> bool {
+/// **Secure default for the federation per-signal AUTHOR-signature lane**
+/// (#1843, env-table row 96), flipped `false → true` at v1.0.0 (#1801→#1954,
+/// item 5). The signal sibling of [`FED_REQUIRE_WRITE_SIG_DEFAULT`]; kept a
+/// distinct const so the two lanes are independently revertable.
+pub const FED_REQUIRE_SIGNAL_SIG_DEFAULT: bool = true;
+
+/// #1801→#1954 item 7 — closed-set skip/DLQ cause label for a HONORED
+/// third-party relayed write refused under the write-sig flip because the
+/// ORIGIN author has no locally-enrolled key. Distinct from `unenrolled_peer`
+/// (the transport peer IS enrolled; the attributed AUTHOR is not). Emitted in
+/// the receiver's structured WARN `cause` field and recognized by the
+/// (sal-gated) `push_dlq::classify_quarantine_cause` taxonomy. Lives here (not
+/// in the sal-gated `push_dlq`) so the always-compiled receive WARN can name it.
+/// Operator remedy: enroll the author's Ed25519 key at the receiving node — the
+/// manual substitute for the deferred TOFU key distribution.
+pub const CAUSE_UNENROLLED_AUTHOR_STRICT: &str = "unenrolled_author_strict";
+
+/// Resolve a DATA-lane fed-sig requirement against its (flip-ready) default:
+///
+/// - an explicit FALSY token (`0`/`false`/`no`/`off`, trimmed) is the
+///   escape-hatch opt-out (permissive) — this is the `=0` bridge named in the
+///   flip WARN and the docs;
+/// - an explicit TRUTHY token (`1`/`true`/`yes`/`on`) opts in (required);
+/// - any OTHER set value, or UNSET, falls through to `default_on` — so a typo
+///   never silently WEAKENS a fail-closed default below its floor.
+///
+/// Explicit env always wins over the default (precedence intact, item 6);
+/// under the v1.0.0 flip `default_on = true`, so unset ⇒ required.
+fn resolve_fed_sig_flag(name: &str, default_on: bool) -> bool {
     match std::env::var(name) {
-        Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
-        Err(_) => FED_REQUIRE_SIG_DEFAULT,
+        Ok(v) => match v.trim() {
+            "0" | "false" | "no" | "off" => false,
+            "1" | "true" | "yes" | "on" => true,
+            _ => default_on,
+        },
+        Err(_) => default_on,
     }
 }
 
@@ -280,7 +302,7 @@ pub const REQUIRE_WRITE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG";
 /// federation knob deliberately keeps its own permissive opt-in default).
 #[must_use]
 pub fn require_write_sig_enabled() -> bool {
-    resolve_fed_sig_flag(REQUIRE_WRITE_SIG_ENV)
+    resolve_fed_sig_flag(REQUIRE_WRITE_SIG_ENV, FED_REQUIRE_WRITE_SIG_DEFAULT)
 }
 
 /// Env knob gating the inbound per-signal AUTHOR-signature requirement on
@@ -311,32 +333,32 @@ pub const REQUIRE_SIGNAL_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG";
 /// secure-opt-in shape of [`require_write_sig_enabled`] (#1464).
 #[must_use]
 pub fn require_signal_sig_enabled() -> bool {
-    resolve_fed_sig_flag(REQUIRE_SIGNAL_SIG_ENV)
+    resolve_fed_sig_flag(REQUIRE_SIGNAL_SIG_ENV, FED_REQUIRE_SIGNAL_SIG_DEFAULT)
 }
 
-/// v0.10.0 Gate-1' (#1954) — one-shot boot WARN emitted when
-/// `AI_MEMORY_FED_REQUIRE_WRITE_SIG` is UNSET, announcing the v1.0.0 flip of
-/// [`FED_REQUIRE_SIG_DEFAULT`] to required-per-surface for the #1464 memory
-/// data lane. Federation inbound IS the network surface (ruling `9e9c3cf2`
-/// condition 7). Names the opt-out so an operator can keep the permissive
-/// posture explicitly past the flip.
-pub const FED_REQUIRE_WRITE_SIG_FLIP_WARNING: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG is UNSET: inbound relayed per-write content \
-     signatures are currently accept-and-flag (permissive, #1464). In v1.0.0 the \
-     default flips to REQUIRED for this surface — federation inbound IS the network \
-     surface (ruling 9e9c3cf2 condition 7). Set AI_MEMORY_FED_REQUIRE_WRITE_SIG=1 now \
-     to adopt the v1.0.0 posture early, or =0 to explicitly keep the permissive opt-out \
-     past the flip. One-shot v0.10.0 WARN; no behaviour change this release.";
+/// v1.0.0 Gate-1' (#1954, #1801→#1954) — one-shot boot NOTICE emitted when
+/// `AI_MEMORY_FED_REQUIRE_WRITE_SIG` is UNSET, announcing that the v1.0.0
+/// default flip of [`FED_REQUIRE_WRITE_SIG_DEFAULT`] (`false → true`) is now
+/// ACTIVE for the #1464 memory data lane. Federation inbound IS the network
+/// surface (ruling `9e9c3cf2` condition 7). Names the `=0` opt-out so an
+/// operator staging peer key-enrollment can keep the permissive posture
+/// explicitly during rollout.
+pub const FED_REQUIRE_WRITE_SIG_FLIP_WARNING: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG is UNSET: as of the v1.0.0 flip the default \
+     for inbound relayed per-write content signatures is now REQUIRED (#1464/#1801→#1954) \
+     — federation inbound IS the network surface (ruling 9e9c3cf2 condition 7). An honored \
+     third-party relayed write whose ORIGIN author has no locally-enrolled key is refused. \
+     Set AI_MEMORY_FED_REQUIRE_WRITE_SIG=0 to keep the permissive accept-and-flag opt-out \
+     during peer key-enrollment rollout, or enroll each author's key at every receiving node.";
 
-/// v0.10.0 Gate-1' (#1954) — one-shot boot WARN emitted when
-/// `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` is UNSET, announcing the v1.0.0 flip of
-/// [`FED_REQUIRE_SIG_DEFAULT`] to required-per-surface for the #1843 signal
-/// data lane.
-pub const FED_REQUIRE_SIGNAL_SIG_FLIP_WARNING: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG is UNSET: inbound relayed signals are currently \
-     accept-and-flag (permissive, #1843). In v1.0.0 the default flips to REQUIRED for \
-     this surface — federation inbound IS the network surface (ruling 9e9c3cf2 \
-     condition 7). Set AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=1 now to adopt the v1.0.0 \
-     posture early, or =0 to explicitly keep the permissive opt-out past the flip. \
-     One-shot v0.10.0 WARN; no behaviour change this release.";
+/// v1.0.0 Gate-1' (#1954, #1801→#1954) — one-shot boot NOTICE emitted when
+/// `AI_MEMORY_FED_REQUIRE_SIGNAL_SIG` is UNSET, announcing that the v1.0.0
+/// default flip of [`FED_REQUIRE_SIGNAL_SIG_DEFAULT`] (`false → true`) is now
+/// ACTIVE for the #1843 signal data lane.
+pub const FED_REQUIRE_SIGNAL_SIG_FLIP_WARNING: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG is UNSET: as of the v1.0.0 flip the default \
+     for inbound relayed signals is now REQUIRED (#1843/#1801→#1954) — federation inbound \
+     IS the network surface (ruling 9e9c3cf2 condition 7). A relayed signal whose from_agent \
+     has no locally-enrolled key is skipped. Set AI_MEMORY_FED_REQUIRE_SIGNAL_SIG=0 to keep \
+     the permissive opt-out during peer key-enrollment rollout.";
 
 /// Notice gate for [`FED_REQUIRE_WRITE_SIG_FLIP_WARNING`]: `Some` iff the env
 /// knob is UNSET. An explicit opt-in OR opt-out suppresses the flip WARN — the
@@ -497,70 +519,89 @@ mod tests {
     }
 
     #[test]
-    fn require_signal_sig_default_permissive_and_truthy_opts_in() {
-        // #1843 — mirrors the #1464 write-sig knob: default OFF (permissive),
-        // truthy (`1`/`true`/`yes`/`on`) opts in. The var is unique to this
-        // test so the process-global env mutation cannot race another test.
+    fn require_signal_sig_default_strict_and_falsy_opts_out() {
+        // #1801→#1954 item 5 — the signal lane flipped `false → true` at
+        // v1.0.0: UNSET now resolves STRICT; an explicit FALSY token is the
+        // `=0` escape-hatch opt-out; truthy opts in. Any other set value falls
+        // through to the (now strict) default — a typo never weakens it.
         // SAFETY: single-threaded mutation of a var no other test reads.
         unsafe { std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV) };
-        assert!(!require_signal_sig_enabled(), "unset → permissive default");
-        // #1954: unset → flip WARN armed; the one-shot emitter is panic-free.
+        assert!(require_signal_sig_enabled(), "unset → strict (v1.0.0 flip)");
+        // Unset → the boot notice still fires (now announcing the ACTIVE flip).
         assert!(
             signal_sig_flip_notice().is_some(),
-            "unset → flip WARN armed"
+            "unset → flip notice armed"
         );
         warn_fed_sig_default_flip_once();
         for truthy in ["1", "true", "yes", "on", "  on  "] {
             unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, truthy) };
             assert!(require_signal_sig_enabled(), "{truthy:?} → strict");
         }
-        for falsy in ["0", "false", "no", "off", ""] {
+        for falsy in ["0", "false", "no", "off"] {
             unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, falsy) };
-            assert!(!require_signal_sig_enabled(), "{falsy:?} → permissive");
-            // #1954: any explicit set value (opt-in OR opt-out) suppresses
-            // the flip WARN — the operator has chosen.
+            assert!(
+                !require_signal_sig_enabled(),
+                "{falsy:?} → permissive opt-out"
+            );
+            // Any explicit set value (opt-in OR opt-out) suppresses the notice.
             assert!(signal_sig_flip_notice().is_none(), "{falsy:?} → suppressed");
         }
+        // An unrecognized set value falls through to the strict default.
+        unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "garbage") };
+        assert!(
+            require_signal_sig_enabled(),
+            "garbage → strict default (fail-closed)"
+        );
         unsafe { std::env::remove_var(REQUIRE_SIGNAL_SIG_ENV) };
     }
 
     #[test]
-    fn require_write_sig_default_permissive_and_truthy_opts_in() {
-        // #1464 — the resolve_fed_sig_flag rewrite (#1954) preserves the
-        // set-value + unset semantics byte-for-byte: default OFF (permissive
-        // = FED_REQUIRE_SIG_DEFAULT), truthy opts in, any other set value is
-        // the explicit permissive opt-out. SAFETY: single-threaded mutation
-        // of a var no other test reads.
+    fn require_write_sig_default_strict_and_falsy_opts_out() {
+        // #1801→#1954 item 5/6 — the write lane flipped `false → true` at
+        // v1.0.0: UNSET now resolves STRICT; `AI_MEMORY_FED_REQUIRE_WRITE_SIG=0`
+        // (or any falsy token) is the byte-identical pre-flip permissive
+        // opt-out (regression test (d)); truthy opts in. SAFETY: single-
+        // threaded mutation of a var no other test reads.
         unsafe { std::env::remove_var(REQUIRE_WRITE_SIG_ENV) };
-        assert!(!require_write_sig_enabled(), "unset → permissive default");
-        // #1954: unset → flip WARN armed (this test is the sole owner of the
-        // write-sig var, so the flip-notice gating is asserted here).
-        assert!(write_sig_flip_notice().is_some(), "unset → flip WARN armed");
+        assert!(require_write_sig_enabled(), "unset → strict (v1.0.0 flip)");
+        assert!(
+            write_sig_flip_notice().is_some(),
+            "unset → flip notice armed"
+        );
         for truthy in ["1", "true", "yes", "on", "  on  "] {
             unsafe { std::env::set_var(REQUIRE_WRITE_SIG_ENV, truthy) };
             assert!(require_write_sig_enabled(), "{truthy:?} → strict");
         }
-        for falsy in ["0", "false", "no", "off", ""] {
+        for falsy in ["0", "false", "no", "off"] {
             unsafe { std::env::set_var(REQUIRE_WRITE_SIG_ENV, falsy) };
-            assert!(!require_write_sig_enabled(), "{falsy:?} → permissive");
-            // #1954: any explicit set value suppresses the flip WARN.
+            assert!(
+                !require_write_sig_enabled(),
+                "{falsy:?} → permissive opt-out"
+            );
             assert!(write_sig_flip_notice().is_none(), "{falsy:?} → suppressed");
         }
+        unsafe { std::env::set_var(REQUIRE_WRITE_SIG_ENV, "garbage") };
+        assert!(
+            require_write_sig_enabled(),
+            "garbage → strict default (fail-closed)"
+        );
         unsafe { std::env::remove_var(REQUIRE_WRITE_SIG_ENV) };
     }
 
     #[test]
-    fn fed_require_sig_default_is_permissive_at_v0_10_0() {
-        // #1954 flip-ready const pin (#1972 E): v0.10.0 ships the compiled
-        // default STILL permissive; the flip lands in v1.0.0. The v1.0.0
-        // INTENDED VALUE is documented here but NOT enforced now — flipping
-        // this one const (false -> true) is the entire v1.0.0 flip.
+    fn fed_require_sig_defaults_flipped_strict_at_v1_0_0() {
+        // #1801→#1954 item 5 — the v1.0.0 flip: BOTH lane consts are now `true`
+        // (required), split out of the former single `FED_REQUIRE_SIG_DEFAULT`
+        // so each lane is independently revertable (set its const back to
+        // `false`). Federation inbound IS the network surface (ruling 9e9c3cf2).
         assert!(
-            !FED_REQUIRE_SIG_DEFAULT,
-            "v0.10.0 is a WARN-carrier: no default flip yet"
+            FED_REQUIRE_WRITE_SIG_DEFAULT,
+            "v1.0.0 flips the write-sig lane to required"
         );
-        // v1.0.0 intended value (do NOT enforce until the flip cut):
-        //   assert!(FED_REQUIRE_SIG_DEFAULT, "v1.0.0 flips fed-sig to required");
+        assert!(
+            FED_REQUIRE_SIGNAL_SIG_DEFAULT,
+            "v1.0.0 flips the signal-sig lane to required"
+        );
     }
 
     #[test]

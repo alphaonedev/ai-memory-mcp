@@ -254,6 +254,66 @@ pub fn sign_memory_write(
     crate::identity::sign::sign_write(keypair, &write)
 }
 
+/// Persist the author's detached Ed25519 write-signature into
+/// `metadata.write_signature` (standard base64) at STORE time so it
+/// propagates verbatim across every federation relay hop and re-verifies at
+/// [`crate::handlers::federation_receive::apply_inbound_write_attestation`].
+///
+/// This is the sender-EMIT half of #1801→#1954 (ratified MINIMAL scope,
+/// 5-agent vote `w9mr01vi8`): the signature MUST be minted+persisted at the
+/// AUTHORING node, never re-minted on a relay hop (a relayer signing over a
+/// third-party attribution yields a signature that fails verification against
+/// the author's enrolled key — Forged, strictly worse than absent). The
+/// standard-base64 encoding byte-matches the receiver's decode
+/// (`general_purpose::STANDARD` in `apply_inbound_write_attestation`).
+///
+/// Idempotent and non-clobbering: an EXISTING `metadata.write_signature`
+/// (a relayed third-party row carrying the origin author's signature) is left
+/// UNTOUCHED, so an intermediate relay never overwrites a propagated origin
+/// signature (item 3). Only self-authored rows that do not already carry a
+/// signature get stamped.
+//
+// M-STRONG-TYPES-GUARD: the field-name is the single `field_names` SSOT const,
+// never a scattered literal (pm-v3.1 no-hardcoded-literals). num-* n/a — no
+// lossy casts. err-* n/a — infallible (a non-object metadata simply no-ops;
+// every write path builds `metadata` as a JSON object).
+pub fn persist_write_signature(mem: &mut Memory, signature: &[u8]) {
+    use base64::Engine as _;
+    let Some(obj) = mem.metadata.as_object_mut() else {
+        return;
+    };
+    // Never clobber a propagated origin signature (item 3).
+    if obj.contains_key(crate::models::field_names::WRITE_SIGNATURE) {
+        return;
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(signature);
+    obj.insert(
+        crate::models::field_names::WRITE_SIGNATURE.to_string(),
+        serde_json::Value::String(b64),
+    );
+}
+
+/// Fold the storage-funnel credential redaction into `mem` BEFORE the write is
+/// signed, so the signed [`SignableWrite`] envelope commits to the SAME
+/// `title`/`content` bytes the storage layer will persist.
+///
+/// Item 4 of the #1801→#1954 corrected design (5-agent vote `w9mr01vi8`): the
+/// secret-screen redact (`db::insert` → [`crate::secret_screen::redact_memory_for_storage`])
+/// mutates `content` (and `title`/`tags`) AFTER a naive sign, so the signature
+/// (over `sha256(content)`) would become UNCONDITIONALLY Forged at every
+/// receiver once the stored bytes diverge from the signed bytes. Redacting
+/// FIRST guarantees `signed bytes == persisted bytes`; the storage funnel then
+/// re-redacts idempotently (a no-op on already-clean bytes).
+///
+/// Zero-copy on the overwhelmingly common clean path:
+/// [`crate::secret_screen::redact_memory_for_storage`] returns `None` (no
+/// credential detected, or screening `Off`) and `mem` is left untouched.
+pub fn redact_before_sign(mem: &mut Memory) {
+    if let Some(redacted) = crate::secret_screen::redact_memory_for_storage(mem) {
+        *mem = redacted;
+    }
+}
+
 /// I/O-free core: resolve the [`AttestLevel`] for `mem` written by
 /// `agent_id` (given the agent's bound key + an optional presented
 /// signature) and, on success, stamp `metadata.attest_level`.
@@ -573,5 +633,56 @@ mod tests {
                 .expect_err("out-of-window created_at must error");
             assert!(err.contains("freshness window"), "got: {err}");
         }
+    }
+
+    // ── #1801→#1954 sender-EMIT helper unit tests ────────────────────────────
+
+    /// The store-time EMIT persists the detached signature under the canonical
+    /// `write_signature` key as STANDARD base64 — the exact encoding the
+    /// receiver decodes — and it round-trips back to the signed bytes.
+    #[test]
+    fn persist_write_signature_encodes_standard_base64_1801() {
+        use base64::Engine as _;
+        let kp = keypair::generate("ai:curator").unwrap();
+        let mem = make_memory("scale the deployment");
+        let sig = sign_memory_write(&kp, &mem, "ai:curator").unwrap();
+        let mut m = mem.clone();
+        persist_write_signature(&mut m, &sig);
+        let stored = m.metadata[crate::models::field_names::WRITE_SIGNATURE]
+            .as_str()
+            .expect("write_signature is a string leaf");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(stored)
+            .expect("standard base64");
+        assert_eq!(decoded, sig, "persisted signature must round-trip");
+    }
+
+    /// EMIT is non-clobbering: an already-present signature (a propagated
+    /// origin signature on a relayed row) is never overwritten (item 3).
+    #[test]
+    fn persist_write_signature_never_clobbers_existing_1801() {
+        let kp = keypair::generate("ai:curator").unwrap();
+        let mem = make_memory("scale the deployment");
+        let origin = sign_memory_write(&kp, &mem, "ai:curator").unwrap();
+        let mut m = mem.clone();
+        persist_write_signature(&mut m, &origin);
+        let first = m.metadata[crate::models::field_names::WRITE_SIGNATURE].clone();
+        persist_write_signature(&mut m, b"different-bytes-must-be-ignored");
+        assert_eq!(
+            m.metadata[crate::models::field_names::WRITE_SIGNATURE],
+            first,
+            "existing signature must be preserved verbatim"
+        );
+    }
+
+    /// `redact_before_sign` is a no-op (zero-copy) on clean content, so the
+    /// signature commits to the unchanged bytes in the common case.
+    #[test]
+    fn redact_before_sign_is_noop_on_clean_content_1801() {
+        let mem = make_memory("perfectly clean content, no secrets here");
+        let mut m = mem.clone();
+        redact_before_sign(&mut m);
+        assert_eq!(m.content, mem.content, "clean content is left untouched");
+        assert_eq!(m.title, mem.title);
     }
 }

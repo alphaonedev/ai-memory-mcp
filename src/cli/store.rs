@@ -311,6 +311,12 @@ pub fn run(
             let kp = identity::keypair::load(&agent_id, &dir).map_err(|e| {
                 anyhow::anyhow!("--sign requires a local keypair for agent '{agent_id}': {e:#}")
             })?;
+            // #1801→#1954 item 4 — redact to storage form BEFORE signing so the
+            // signed envelope commits to the persisted bytes (`db::insert`
+            // re-redacts idempotently). Without this a `redact`-mode secret
+            // would mutate content after signing → the propagated signature is
+            // unconditionally Forged at every receiver (5-agent vote w9mr01vi8).
+            identity::attest::redact_before_sign(&mut mem);
             Some(identity::attest::sign_memory_write(&kp, &mem, &agent_id)?)
         } else {
             None
@@ -330,6 +336,12 @@ pub fn run(
                 signature.as_deref(),
                 identity::attest::WriteSurface::Cli,
             )?;
+        }
+        // #1801→#1954 item 2 — sender EMIT: persist the author's detached
+        // signature into `metadata.write_signature` so it propagates verbatim
+        // across every federation relay hop. Self-authored + non-clobbering.
+        if let Some(sig) = signature.as_deref() {
+            identity::attest::persist_write_signature(&mut mem, sig);
         }
     }
 

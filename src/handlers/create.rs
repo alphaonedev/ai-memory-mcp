@@ -847,6 +847,10 @@ async fn create_memory_postgres(
                 }
             };
             mem.created_at = signed_created_at.to_string();
+            // #1801→#1954 item 4 — redact to storage form BEFORE the gate
+            // verifies (and before EMIT) so the signed bytes equal the
+            // persisted bytes; the SAL store re-redacts idempotently.
+            crate::identity::attest::redact_before_sign(&mut mem);
             // #1985 — HTTP direct-write is the network surface (HttpDirect):
             // required by default.
             if let Err(e) = crate::identity::attest::stamp_attestation_async(
@@ -867,6 +871,9 @@ async fn create_memory_postgres(
                 )
                     .into_response();
             }
+            // #1801→#1954 item 2 — sender EMIT: persist the author's presented
+            // signature so it propagates verbatim across federation relay hops.
+            crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
         } else if crate::identity::attest::require_agent_attestation_for(
             crate::identity::attest::WriteSurface::HttpDirect,
         ) && let Err(e) = crate::identity::attest::stamp_attestation_async(
@@ -1344,6 +1351,10 @@ pub async fn create_memory(
                 }
             };
             mem.created_at = signed_created_at.to_string();
+            // #1801→#1954 item 4 — redact to storage form BEFORE the gate
+            // verifies (and before EMIT) so the signed bytes equal the
+            // persisted bytes; `db::insert` re-redacts idempotently.
+            crate::identity::attest::redact_before_sign(&mut mem);
             // #1985 — HTTP direct-write is the network surface (HttpDirect):
             // required by default.
             if let Err(e) = crate::identity::attest::stamp_attestation_sync(
@@ -1362,6 +1373,9 @@ pub async fn create_memory(
                 )
                     .into_response();
             }
+            // #1801→#1954 item 2 — sender EMIT: persist the author's presented
+            // signature so it propagates verbatim across federation relay hops.
+            crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
         } else if crate::identity::attest::require_agent_attestation_for(
             crate::identity::attest::WriteSurface::HttpDirect,
         ) && let Err(e) = crate::identity::attest::stamp_attestation_sync(
