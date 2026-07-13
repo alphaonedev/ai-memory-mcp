@@ -204,6 +204,15 @@ pub const EXPIRED_DELETED: &str = "expired_deleted";
 pub const EXPIRES_AT: &str = "expires_at";
 /// `exported_at` — wire/row field name.
 pub const EXPORTED_AT: &str = "exported_at";
+/// `export_scope` — additive `ai-memory export` marker (#1944): names the
+/// record scope the JSON convenience export actually carries.
+pub const EXPORT_SCOPE: &str = "export_scope";
+/// `portability_complete` — additive `ai-memory export` marker (#1944):
+/// `false` because the JSON export omits the tamper-evidence spine.
+pub const PORTABILITY_COMPLETE: &str = "portability_complete";
+/// `excludes` — additive `ai-memory export` marker (#1944): the signed
+/// record classes the JSON convenience export omits.
+pub const EXCLUDES: &str = "excludes";
 /// `from_agent_id` — wire/row field name.
 pub const FROM_AGENT_ID: &str = "from_agent_id";
 /// `generated_at` — wire/row field name.

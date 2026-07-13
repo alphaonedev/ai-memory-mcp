@@ -239,7 +239,19 @@ pub enum Command {
     /// `mcpServers.<*>.env` block from `~/.claude.json` after the
     /// operator has verified the new config.
     Config(crate::cli::commands::config::ConfigCliArgs),
-    /// Export all memories as JSON
+    /// Export memories + links as JSON (convenience view, NOT the portability path)
+    ///
+    /// Emits `{memories, links, count, exported_at}` pretty JSON to stdout —
+    /// a memories + links CONVENIENCE view. It does NOT round-trip the
+    /// tamper-evidence + governance spine (governance rules, the append-only
+    /// revision log, forget tombstones, derivation lineage, per-write
+    /// attestations, the signed-events audit chain), so it is NOT the
+    /// portability path (#1944). For integrity-preserving, lossless
+    /// portability use `ai-memory backup` (SQLite VACUUM INTO); the signed
+    /// crypto spine is separately exportable via
+    /// `ai-memory export-forensic-bundle`. The export payload carries
+    /// additive `export_scope` / `portability_complete` / `excludes` markers
+    /// and a stderr WARN naming this scope.
     Export,
     /// Import memories from JSON (stdin)
     Import(ImportArgs),
