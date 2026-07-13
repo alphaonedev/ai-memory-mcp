@@ -351,7 +351,10 @@ fn forged_succession_rejected() {
         .unwrap();
     assert_eq!(count, 1, "only the genesis row exists");
 
-    // Recovery records are refused this train (verify path = v1.0).
+    // Recovery mint is refused without an enrolled guardian quorum. #1831
+    // shipped M-of-N threshold recovery (G17); a mint now needs an enrolled
+    // guardian set, and none is enrolled in this test — so the refusal reason
+    // changed from the pre-#1831 "verify path = v1.0" to the guardian check.
     let mut recovery = LineageRecord::rotation(
         &head,
         &kx.public_base64(),
@@ -362,8 +365,11 @@ fn forged_succession_rejected() {
     recovery.reason = ai_memory::identity::lineage::LineageReason::Recovery;
     let sig = sign_succession(&k0, &recovery.to_signable()).expect("sign");
     let err = db::append_lineage_record(&conn, "forge-agent", &recovery, &sig)
-        .expect_err("recovery mint must be refused in v0.9.0");
-    assert!(format!("{err:#}").contains("v1.0"), "got: {err:#}");
+        .expect_err("recovery mint must be refused without enrolled guardians (#1831)");
+    assert!(
+        format!("{err:#}").contains("no recovery guardians enrolled"),
+        "got: {err:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------
