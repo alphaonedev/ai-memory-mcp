@@ -213,7 +213,11 @@ pub fn run(
                         .enable_all()
                         .build()
                         .map(|rt| {
-                            rt.block_on(daemon_runtime::build_embedder(feature_tier, app_config))
+                            rt.block_on(daemon_runtime::build_embedder(
+                                feature_tier,
+                                app_config,
+                                db_path,
+                            ))
                         })
                 })
                 .join()
@@ -959,7 +963,12 @@ mod tests {
         // tier short-circuit still yields `None` (no model load attempt,
         // no panic).
         let cfg = AppConfig::default();
-        let res = daemon_runtime::build_embedder(FeatureTier::Keyword, &cfg).await;
+        let res = daemon_runtime::build_embedder(
+            FeatureTier::Keyword,
+            &cfg,
+            std::path::Path::new(crate::daemon_runtime::DEFAULT_DB),
+        )
+        .await;
         assert!(res.is_none(), "keyword tier must not build an embedder");
     }
 

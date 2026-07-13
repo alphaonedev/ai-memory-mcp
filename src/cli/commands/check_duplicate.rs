@@ -76,7 +76,7 @@ pub async fn cmd_check_duplicate(
     let conn = db::open(db_path)?;
 
     let feature_tier = app_config.effective_tier(None);
-    let embedder = crate::daemon_runtime::build_embedder(feature_tier, app_config).await;
+    let embedder = crate::daemon_runtime::build_embedder(feature_tier, app_config, db_path).await;
 
     run_with_embedder(
         &conn,

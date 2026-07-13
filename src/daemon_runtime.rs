@@ -1992,7 +1992,7 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             let mut so = stdout.lock();
             let mut se = stderr.lock();
             let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-            match cli::commands::expand::cmd_expand(&a, app_config, &mut out).await? {
+            match cli::commands::expand::cmd_expand(&a, app_config, &db_path, &mut out).await? {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
@@ -2668,7 +2668,11 @@ pub(crate) fn resolve_embedder_model(
 /// each call site had its own copy, with subtly different fallback
 /// shapes — the bug at issue #322 was a direct consequence.
 #[allow(deprecated)]
-pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -> Option<Embedder> {
+pub async fn build_embedder(
+    feature_tier: FeatureTier,
+    app_config: &AppConfig,
+    db_path: &std::path::Path,
+) -> Option<Embedder> {
     let tier_config = feature_tier.config();
     // #1521: consume the canonical embeddings resolver so the sectioned
     // `[embeddings]` block (#1146) drives the daemon embedder, not just
@@ -2723,8 +2727,11 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
                 resolved_embeddings.backend,
                 mode.as_str()
             );
-            let db_path = app_config.effective_db(std::path::Path::new(DEFAULT_DB));
-            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+            // #1991 — audit the refusal against the operator-resolved
+            // `db_path` threaded from boot (honours `--db` / `AI_MEMORY_DB`),
+            // NOT a recomputed `effective_db(DEFAULT_DB)` which ignored a
+            // non-default `--db` and misfiled the row to CWD `ai-memory.db`.
+            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
             return None;
         }
     }
@@ -2815,6 +2822,7 @@ pub async fn build_embedder(feature_tier: FeatureTier, app_config: &AppConfig) -
 pub async fn build_llm_client(
     feature_tier: FeatureTier,
     app_config: &AppConfig,
+    db_path: &std::path::Path,
 ) -> Option<llm::OllamaClient> {
     // v0.7.x (#1146) — single canonical entry through the resolver.
     // The resolver folds CLI flags (none here — `ai-memory serve`
@@ -2878,8 +2886,11 @@ pub async fn build_llm_client(
                  (tier={tier_str} backend={backend} target={target} mode={}); {reason} (#1963)",
                 mode.as_str()
             );
-            let db_path = app_config.effective_db(std::path::Path::new(DEFAULT_DB));
-            crate::egress::refuse_inference_egress_audited(&db_path, class, &target, &reason);
+            // #1991 — audit against the operator-resolved `db_path` threaded
+            // from boot (honours `--db` / `AI_MEMORY_DB`) instead of a
+            // recomputed `effective_db(DEFAULT_DB)` that misfiled the row to
+            // CWD `ai-memory.db` under a non-default `--db`.
+            crate::egress::refuse_inference_egress_audited(db_path, class, &target, &reason);
             return None;
         }
     }
@@ -4582,7 +4593,7 @@ pub async fn bootstrap_serve(
     // Daemon has no per-invocation tier override; honour the config tier.
     let feature_tier = app_config.effective_tier(None);
     let tier_config = feature_tier.config();
-    let embedder = build_embedder(feature_tier, app_config).await;
+    let embedder = build_embedder(feature_tier, app_config, db_path).await;
     // #1579 B3 — async boot HNSW. The daemon binds with an EMPTY
     // index and becomes ready immediately; a background loader
     // (`spawn_vector_index_boot_load`) reads the stored embeddings
@@ -4618,7 +4629,7 @@ pub async fn bootstrap_serve(
     // `llm_model` (keyword/semantic) or the Ollama endpoint is
     // unreachable, the client stays `None` and the hook silently
     // degrades to operator-supplied tags only.
-    let llm = build_llm_client(feature_tier, app_config).await;
+    let llm = build_llm_client(feature_tier, app_config, db_path).await;
 
     let db_state: Db = Arc::new(Mutex::new((
         conn,
@@ -6976,7 +6987,8 @@ mod tests {
     #[tokio::test]
     async fn test_build_embedder_keyword_tier_returns_none() {
         let cfg = AppConfig::default();
-        let emb = build_embedder(FeatureTier::Keyword, &cfg).await;
+        let emb =
+            build_embedder(FeatureTier::Keyword, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         assert!(emb.is_none());
     }
 
@@ -7003,7 +7015,8 @@ mod tests {
         cfg.embedding_model = Some("not-a-real-embedding-model-2026".to_string());
         // Keyword tier preset is None; override parse fails → falls back
         // to preset None → returns None without touching HF-hub.
-        let emb = build_embedder(FeatureTier::Keyword, &cfg).await;
+        let emb =
+            build_embedder(FeatureTier::Keyword, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         assert!(
             emb.is_none(),
             "unparseable override + keyword tier must return None"
@@ -9089,7 +9102,8 @@ decision = "allow"
         let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let cfg = AppConfig::default();
-        let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
+        let res =
+            build_llm_client(FeatureTier::Keyword, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         assert!(res.is_none(), "keyword tier must not build an LLM client");
     }
 
@@ -9101,7 +9115,8 @@ decision = "allow"
         fx_f1_clear_llm_env();
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
-        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        let res =
+            build_llm_client(FeatureTier::Smart, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         // Either Some (constructor still returns Ok if it doesn't ping)
         // or None — both are valid: the assert proves the function does
         // not panic on an unreachable URL.
@@ -9359,7 +9374,12 @@ decision = "allow"
         let _guard = env_var_lock();
         fx_f1_clear_llm_env();
         let cfg = AppConfig::default();
-        let res = build_llm_client(FeatureTier::Semantic, &cfg).await;
+        let res = build_llm_client(
+            FeatureTier::Semantic,
+            &cfg,
+            std::path::Path::new(DEFAULT_DB),
+        )
+        .await;
         assert!(
             res.is_none(),
             "semantic tier with no operator config must short-circuit to None"
@@ -9377,7 +9397,12 @@ decision = "allow"
         fx_f1_clear_llm_env();
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some("http://127.0.0.1:1".to_string());
-        let res = build_llm_client(FeatureTier::Autonomous, &cfg).await;
+        let res = build_llm_client(
+            FeatureTier::Autonomous,
+            &cfg,
+            std::path::Path::new(DEFAULT_DB),
+        )
+        .await;
         // Unreachable endpoint → Err from new_with_url_async → None.
         assert!(
             res.is_none(),
@@ -9402,7 +9427,8 @@ decision = "allow"
             api_key_env: Some("AI_MEMORY_FX_F1_NEVER_SET_XAI_KEY".to_string()),
             ..LlmSection::default()
         });
-        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        let res =
+            build_llm_client(FeatureTier::Smart, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         assert!(
             res.is_none(),
             "xai backend without API key MUST map to None (Err path)"
@@ -9431,7 +9457,8 @@ decision = "allow"
         let mut cfg = AppConfig::default();
         cfg.ollama_url = Some(server.uri());
         cfg.llm_model = Some("test-model".to_string());
-        let res = build_llm_client(FeatureTier::Smart, &cfg).await;
+        let res =
+            build_llm_client(FeatureTier::Smart, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         assert!(
             res.is_some(),
             "wiremock-backed /api/tags must drive build_llm_client to Some"
@@ -9566,7 +9593,8 @@ decision = "allow"
             std::env::set_var("AI_MEMORY_LLM_BASE_URL", "http://127.0.0.1:1");
         }
         let cfg = AppConfig::default();
-        let res = build_llm_client(FeatureTier::Keyword, &cfg).await;
+        let res =
+            build_llm_client(FeatureTier::Keyword, &cfg, std::path::Path::new(DEFAULT_DB)).await;
         unsafe {
             std::env::remove_var("AI_MEMORY_LLM_BACKEND");
             std::env::remove_var("AI_MEMORY_LLM_BASE_URL");
