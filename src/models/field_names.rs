@@ -308,6 +308,14 @@ pub const SCHEMA_VERSION: &str = "schema_version";
 pub const SCOPE_STATUS: &str = "scope_status";
 /// `sender_agent_id` — wire/row field name.
 pub const SENDER_AGENT_ID: &str = "sender_agent_id";
+/// `sender_policy_digest_hex` — FED-RQ-03 (#1947) federation `/sync/push`
+/// wire field: the lowercase-hex whole-ruleset governance policy digest the
+/// sender was governed by at push time (paired with `sender_policy_seq`).
+pub const SENDER_POLICY_DIGEST_HEX: &str = "sender_policy_digest_hex";
+/// `sender_policy_seq` — FED-RQ-03 (#1947) federation `/sync/push` wire
+/// field: the sender's committed governance `policy_version` sequence at push
+/// time. ADDITIVE + backward-compatible (absent on pre-#1947 peers).
+pub const SENDER_POLICY_SEQ: &str = "sender_policy_seq";
 /// `signing_agent` — wire/row field name.
 pub const SIGNING_AGENT: &str = "signing_agent";
 /// `similarity` — wire/row field name.

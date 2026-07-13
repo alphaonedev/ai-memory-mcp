@@ -426,6 +426,129 @@ pub fn quarantine_unattributed_enabled() -> bool {
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
+// ---------------------------------------------------------------------------
+// FED-RQ-03 (#1947) — cross-node governance policy_version REFUSE-STALE gate.
+//
+// A federated push is *governed* by the sender's committed governance
+// `policy_version` at push time. When that version is STALE — strictly behind
+// the RECEIVER's committed governance policy — accepting the push would apply
+// a write under an outdated governance regime the receiver has already moved
+// past. This is a receive-path REFUSAL (reject-before-apply): it is decided at
+// the push boundary and never reaches any MemoryStore apply path, so it stays
+// postgres-clean and backend-identical.
+//
+// Wire mechanism (design gap, ratified minimal — vote wd8wtmg0n): the
+// AUTHORITATIVE, attested source of a peer's policy epoch is the *signed*
+// `SignableEpochManifest` (`policy_seq`/`policy_digest_hex`), but
+// epoch-manifest-DOC federation is DEFERRED to v1.x (see ADR-002). The
+// federated `EpochAdvance` checkpoint that rides the #1936 transport carries
+// only `content_hash` on the wire — no policy epoch to derive from today. So
+// the minimal correct mechanism is a single ADDITIVE, backward-compatible
+// `/sync/push` wire field (`sender_policy_seq`, `#[serde(default)]` → `None`
+// on pre-#1947 peers). Attested advertising rides the deferred manifest
+// federation; this gate refuses an HONEST peer that advertises a stale epoch.
+//
+// ROLLOUT SAFETY (there is NO prior v0.10.0 WARN carrier for this gate):
+// "fail-closed" means refuse ONLY a DETECTED-stale value. An ABSENT /
+// undeterminable epoch is fail-OPEN (accept — staleness cannot be determined),
+// so a peer that does not (yet) advertise a policy_version is NEVER hard-
+// refused and existing federation is not broken by an un-warned flip. The
+// DETECTED-stale refusal itself defaults ON (this is the GA-hard requirement)
+// and is gated behind `AI_MEMORY_FED_REQUIRE_POLICY_CURRENT` (default ON, the
+// receive_auth knob precedent) so an operator can opt out for a deliberate
+// heterogeneous-policy rollout window.
+// ---------------------------------------------------------------------------
+
+/// FED-RQ-03 (#1947) — env knob gating the cross-node governance
+/// policy_version REFUSE-STALE gate. Default **ON** (fail-closed for a
+/// DETECTED-stale value) via the shared [`env_flag_default_on`] grammar,
+/// mirroring [`REQUIRE_TRANSITION_SIG_ENV`] / [`REQUIRE_CHECKPOINT_SIG_ENV`].
+pub const REQUIRE_POLICY_CURRENT_ENV: &str = "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT";
+
+/// Whether an inbound federated push governed by a DETECTED-stale governance
+/// `policy_version` is refused.
+///
+/// **Default ON (fail-closed for the detected-stale case)** — this is the
+/// GA-hard FED-RQ-03 requirement (T3 security/governance posture). It does NOT
+/// mean absent→refuse: [`evaluate_inbound_policy_freshness`] reserves refusal
+/// for a sender epoch STRICTLY BEHIND local, and an absent epoch is always
+/// fail-OPEN. An operator running a deliberate heterogeneous-policy rollout
+/// window opts out with a falsy token (`0`/`false`/`no`/`off`), mirroring the
+/// escape-hatch shape of [`require_checkpoint_sig_enabled`] (#1936).
+#[must_use]
+pub fn require_policy_current_enabled() -> bool {
+    env_flag_default_on(REQUIRE_POLICY_CURRENT_ENV)
+}
+
+/// FED-RQ-03 (#1947) — closed-set error tag rendered in the receive-path
+/// refusal envelope (and asserted by the invariant tests) so the string is
+/// single-sourced (pm-v3.1 hardcoded-literal discipline).
+pub const STALE_POLICY_ERROR_TAG: &str = "stale_policy_version";
+
+/// FED-RQ-03 (#1947) — verdict for the cross-node governance policy_version
+/// staleness gate. A typed verdict (rust-microsoft **M-STRONG-TYPES-GUARD**)
+/// so the HTTP layer maps exactly one refusal shape and the decision is
+/// unit-testable without any I/O — the same pure-decision discipline as
+/// [`TransitionAuthz`] / [`CheckpointResolutionAuthz`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyFreshnessVerdict {
+    /// Accept — the push is not detectably stale: the sender is at or ahead of
+    /// the local committed policy, did NOT advertise a policy epoch (fail-open,
+    /// undeterminable), or the gate is opted out.
+    Accept,
+    /// Refuse — the sender advertised a governance policy_version STRICTLY
+    /// behind the local committed policy (DETECTED-stale, fail-closed).
+    RefuseStale {
+        /// The sender's advertised committed policy sequence.
+        sender_seq: i64,
+        /// The receiver's local committed policy sequence.
+        local_seq: i64,
+    },
+}
+
+/// FED-RQ-03 (#1947) — pure decision for the cross-node policy_version
+/// staleness gate. Reuses the `SignableEpochManifest` comparison surface —
+/// the monotonic append-only `PolicyVersion.seq` that `epoch-apply` binds
+/// against ([`crate::governance::policy_version::current_policy_version`]) —
+/// differing only in comparison operator: `epoch-apply` requires `==` (a
+/// manifest must bind the CURRENT policy), while a cross-node peer at an EQUAL
+/// or HIGHER seq is legitimately not stale, so staleness is `<` (strictly
+/// behind), never `!=`.
+///
+/// Rollout-safety ordering (both branches deliberately accept BEFORE the
+/// staleness compare):
+/// 1. `sender_policy_seq == None` → **fail-OPEN** (`Accept`). Staleness cannot
+///    be determined for a peer that does not advertise; never hard-refuse it.
+/// 2. `!require_policy_current` → **opt-out** (`Accept`), the heterogeneous-
+///    policy rollout escape hatch.
+/// 3. `sender_seq < local_seq` → **RefuseStale** (the sole refusal).
+#[must_use]
+pub fn evaluate_inbound_policy_freshness(
+    sender_policy_seq: Option<i64>,
+    local_seq: i64,
+    require_policy_current: bool,
+) -> PolicyFreshnessVerdict {
+    // (1) Absent / undeterminable → fail-OPEN. Reserve refusal for a DETECTED
+    // value so a non-advertising peer is never hard-refused (rollout safety).
+    let Some(sender_seq) = sender_policy_seq else {
+        return PolicyFreshnessVerdict::Accept;
+    };
+    // (2) Operator opt-out for a deliberate heterogeneous-policy rollout.
+    if !require_policy_current {
+        return PolicyFreshnessVerdict::Accept;
+    }
+    // (3) The sole refusal: the sender is governed by a policy STRICTLY behind
+    // the receiver's committed policy.
+    if sender_seq < local_seq {
+        PolicyFreshnessVerdict::RefuseStale {
+            sender_seq,
+            local_seq,
+        }
+    } else {
+        PolicyFreshnessVerdict::Accept
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +863,73 @@ mod tests {
             authorize_remote_checkpoint_resolution(&tampered, &sig, Some(&kp.public), true),
             CheckpointResolutionAuthz::RejectForged
         );
+    }
+
+    // ---- FED-RQ-03 (#1947) — policy_version REFUSE-STALE gate ----
+
+    #[test]
+    fn policy_freshness_refuses_only_detected_stale() {
+        use PolicyFreshnessVerdict::{Accept, RefuseStale};
+        // Absent sender epoch → fail-OPEN regardless of local seq or require.
+        assert_eq!(
+            evaluate_inbound_policy_freshness(None, 5, true),
+            Accept,
+            "absent epoch → fail-open (undeterminable, rollout safety)"
+        );
+        // Stale (strictly behind) + required → the sole refusal.
+        assert_eq!(
+            evaluate_inbound_policy_freshness(Some(3), 5, true),
+            RefuseStale {
+                sender_seq: 3,
+                local_seq: 5
+            },
+            "sender behind local + required → RefuseStale"
+        );
+        // Equal → not stale → accept (contrast epoch-apply's `==`-bind).
+        assert_eq!(
+            evaluate_inbound_policy_freshness(Some(5), 5, true),
+            Accept,
+            "sender == local → not stale"
+        );
+        // Ahead → not stale → accept.
+        assert_eq!(
+            evaluate_inbound_policy_freshness(Some(9), 5, true),
+            Accept,
+            "sender ahead of local → not stale"
+        );
+        // Opt-out: even a stale sender is accepted when the gate is disabled.
+        assert_eq!(
+            evaluate_inbound_policy_freshness(Some(3), 5, false),
+            Accept,
+            "opt-out accepts even a DETECTED-stale sender"
+        );
+        // Genesis receiver (local seq 0) can never see a strictly-lower seq.
+        assert_eq!(
+            evaluate_inbound_policy_freshness(Some(0), 0, true),
+            Accept,
+            "seq 0 vs seq 0 → not stale (genesis, fail-open floor)"
+        );
+    }
+
+    #[test]
+    fn require_policy_current_default_on_and_falsy_opts_out() {
+        // Mirrors the #1936 checkpoint knob: default ON (fail-closed for the
+        // detected-stale case), falsy opts out. SAFETY: single-threaded
+        // mutation of a var no other test reads.
+        unsafe { std::env::remove_var(REQUIRE_POLICY_CURRENT_ENV) };
+        assert!(
+            require_policy_current_enabled(),
+            "unset → fail-closed default (GA-hard FED-RQ-03)"
+        );
+        for falsy in ["0", "false", "no", "off", "  off  "] {
+            unsafe { std::env::set_var(REQUIRE_POLICY_CURRENT_ENV, falsy) };
+            assert!(!require_policy_current_enabled(), "{falsy:?} → opt-out");
+        }
+        for truthy in ["1", "true", "yes", "on", ""] {
+            unsafe { std::env::set_var(REQUIRE_POLICY_CURRENT_ENV, truthy) };
+            assert!(require_policy_current_enabled(), "{truthy:?} → strict");
+        }
+        unsafe { std::env::remove_var(REQUIRE_POLICY_CURRENT_ENV) };
     }
 
     #[test]

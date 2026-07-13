@@ -84,6 +84,86 @@ fn attestation_refusal_response(err: &AttestError) -> Response {
         .into_response()
 }
 
+/// FED-RQ-03 (#1947, 5-agent vote wd8wtmg0n) — render the receive-path refusal
+/// for a push governed by a STALE governance `policy_version`. A `409 CONFLICT`
+/// (the sender's governance state conflicts with / is behind the receiver's
+/// committed policy) with a typed error tag + the two sequences so the peer
+/// can see exactly how far behind it is, plus the `=0` opt-out for a
+/// deliberate heterogeneous-policy rollout window.
+fn stale_policy_refusal_response(sender_seq: i64, local_seq: i64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": crate::federation::receive_auth::STALE_POLICY_ERROR_TAG,
+            (crate::models::field_names::SENDER_POLICY_SEQ): sender_seq,
+            "local_policy_seq": local_seq,
+            "note": "FED-RQ-03 (#1947): this push is governed by a governance policy_version \
+                     behind the receiver's committed policy; advance the sender's governance \
+                     policy (ai-memory rules … --sign) to the current version and retry. Set \
+                     AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=0 to accept stale-policy pushes during \
+                     a heterogeneous-policy rollout window.",
+        })),
+    )
+        .into_response()
+}
+
+/// FED-RQ-03 (#1947) — the cross-node policy_version REFUSE-STALE gate, shared
+/// by BOTH backends (invoked before the postgres dispatch in [`sync_push`], so
+/// a stale push is refused reject-before-apply on sqlite AND postgres and
+/// never touches any `MemoryStore` apply path — postgres-clean, independent of
+/// #1990). Returns `Some(response)` to refuse, `None` to continue.
+///
+/// The local committed policy is read from the sqlite governance connection
+/// (`app.db`) — the sole rules store on every backend (amendment 7); on a node
+/// with no governance tables `current_policy_version` degrades to the `seq=0`
+/// sentinel, under which nothing is ever strictly-lower, so the gate is a
+/// natural no-op (fail-OPEN). A policy-read ERROR is also fail-OPEN: staleness
+/// is undeterminable and a transient governance-read fault must not hard-refuse
+/// a peer (rust-skills `err-*`: the fallible read is deliberately swallowed to
+/// ACCEPT, never surfaced to the peer as a refusal).
+async fn refuse_if_stale_policy(app: &AppState, body: &SyncPushBody) -> Option<Response> {
+    use crate::federation::receive_auth::{
+        PolicyFreshnessVerdict, evaluate_inbound_policy_freshness, require_policy_current_enabled,
+    };
+    let require = require_policy_current_enabled();
+    // Short-lived lock: read the local committed governance policy version,
+    // then release before the (independently-locked) apply loops run.
+    let local = {
+        let lock = app.db.lock().await;
+        match crate::governance::policy_version::current_policy_version(&lock.0) {
+            Ok(pv) => pv,
+            Err(e) => {
+                tracing::warn!(
+                    target: ATTESTATION_TRACE_TARGET,
+                    error = %e,
+                    "sync_push: FED-RQ-03 local policy read failed — accepting (fail-open; \
+                     staleness undeterminable, never hard-refuse on a transient read fault)"
+                );
+                return None;
+            }
+        }
+    };
+    match evaluate_inbound_policy_freshness(body.sender_policy_seq, local.seq, require) {
+        PolicyFreshnessVerdict::Accept => None,
+        PolicyFreshnessVerdict::RefuseStale {
+            sender_seq,
+            local_seq,
+        } => {
+            tracing::warn!(
+                target: ATTESTATION_TRACE_TARGET,
+                sender = %body.sender_agent_id,
+                sender_policy_seq = sender_seq,
+                local_policy_seq = local_seq,
+                local_policy_digest = %local.digest_hex(),
+                sender_policy_digest = %body.sender_policy_digest_hex.as_deref().unwrap_or(""),
+                "sync_push: refusing inbound push governed by a STALE governance policy_version \
+                 (FED-RQ-03 #1947) — advance the sender's governance policy to the current version"
+            );
+            Some(stale_policy_refusal_response(sender_seq, local_seq))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3 foundation (issue #224) — HTTP sync endpoints.
 //
@@ -593,6 +673,28 @@ pub struct SyncPushBody {
     /// never enforced.
     #[serde(default)]
     pub sender_wall_clock: Option<String>,
+    /// FED-RQ-03 (#1947) — the sender's committed governance `policy_version`
+    /// sequence at push time
+    /// (`crate::governance::policy_version::current_policy_version().seq`).
+    /// ADDITIVE + backward-compatible: `#[serde(default)]` so pre-#1947 peers
+    /// (which never advertise it) decode byte-identically to `None`. The
+    /// receiver's FED-RQ-03 gate refuses a push whose advertised seq is
+    /// STRICTLY BEHIND the local committed policy (a DETECTED-stale value);
+    /// `None` is fail-OPEN (undeterminable → accept). Decision surface:
+    /// `crate::federation::receive_auth::evaluate_inbound_policy_freshness`.
+    /// Send-side advertising rides the DEFERRED epoch-manifest federation
+    /// (ADR-002) — the authoritative attested epoch is the signed
+    /// `SignableEpochManifest`; this unsigned field is the minimal receive
+    /// gate for an HONEST stale peer that opts to advertise.
+    #[serde(default)]
+    pub sender_policy_seq: Option<i64>,
+    /// FED-RQ-03 (#1947) — the lowercase-hex whole-ruleset governance policy
+    /// digest paired with `sender_policy_seq` (mirrors the
+    /// `SignableEpochManifest` `(policy_seq, policy_digest_hex)` pair).
+    /// Diagnostic only in the MINIMAL gate (staleness is seq-ordered); carried
+    /// so a same-seq policy DIVERGENCE is observable in the refusal WARN.
+    #[serde(default)]
+    pub sender_policy_digest_hex: Option<String>,
     /// Memories the sender is offering. Applied via the v0.8.0 Pillar-3
     /// (#1709 / #224) field-level CRDT-lite merge (`db::merge_inbound`):
     /// a divergent same-`id` inbound row is field-merged via
@@ -822,6 +924,19 @@ pub async fn sync_push(
             "sync_push: AI_MEMORY_FED_TRUST_BODY_AGENT_ID=1 — bypassing #238 \
              sender_agent_id attestation (legacy compat)"
         );
+    }
+
+    // FED-RQ-03 (#1947, 5-agent vote wd8wtmg0n) — cross-node governance
+    // policy_version REFUSE-STALE gate. Runs BEFORE the postgres-dispatch
+    // branch (and before any apply loop) so a push governed by a stale
+    // governance policy is refused reject-before-apply IDENTICALLY on sqlite
+    // and postgres, never reaching a `MemoryStore` verbatim-apply path
+    // (postgres-clean, independent of #1990). Fail-OPEN on absent / opt-out /
+    // read-error; refuses only a DETECTED-stale sender epoch (see
+    // `receive_auth::evaluate_inbound_policy_freshness` for the rollout-safety
+    // ordering).
+    if let Some(refusal) = refuse_if_stale_policy(&app, &body).await {
+        return refusal;
     }
 
     // v0.7.0 Wave-3 Continuation 2 — postgres-backed federation
