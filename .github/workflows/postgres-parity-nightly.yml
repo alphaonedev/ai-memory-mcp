@@ -9,9 +9,17 @@
 # CI; this job exercises them for real against a live PostgreSQL + pgvector
 # instance, on a nightly schedule (kept off the PR critical path) plus on-demand.
 #
-# Service image mirrors `ci.yml`'s `postgres-feature` job exactly
-# (`pgvector/pgvector:pg16`, same creds/port); the three binaries here do not
-# depend on the AGE extension, so no AGE build is required.
+# The `postgres-parity` job's service image mirrors `ci.yml`'s `postgres-feature`
+# job exactly (`pgvector/pgvector:pg16`, same creds/port); those binaries do not
+# depend on the AGE extension.
+#
+# The `postgres-age` job (added for v1.0.0, #2012) closes the gap that Apache AGE
+# — a first-class ai-memory backend (Cypher `kg_query`/`find_paths`/graph
+# projection) — was previously exercised ONLY in the manual `deploy/docker-1461`
+# campaign harness + DO ship-gate, never in an automated gate. It builds the
+# SSOT-pinned certified stack (PostgreSQL 18.4 + Apache AGE 1.7.0 + pgvector 0.8.5
+# from `deploy/docker-1461/provision/lib.sh`), asserts the live extension versions
+# match the pins, and runs the `AI_MEMORY_TEST_AGE_URL`-gated Cypher/KG suites.
 name: Postgres parity (nightly)
 
 on:
@@ -91,3 +99,87 @@ jobs:
             --test erasure_fanout_postgres_g30 \
             --test recall_purity_p01_postgres \
             -- --include-ignored --test-threads=1
+
+  postgres-age:
+    name: Postgres + Apache AGE + pgvector (certified stack, live)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      AI_MEMORY_TEST_POSTGRES_URL: postgres://ai_memory:ai_memory_ci@localhost:5432/ai_memory_ci
+      AI_MEMORY_TEST_AGE_URL: postgres://ai_memory:ai_memory_ci@localhost:5432/ai_memory_ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build SSOT-pinned certified PG+AGE+pgvector image
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source deploy/docker-1461/provision/lib.sh
+          echo "::notice::building certified stack PG=${EXPECTED_PG_VERSION} AGE=${EXPECTED_AGE_VERSION} pgvector(apt)=${PGVECTOR_APT_VERSION}"
+          docker build \
+            --build-arg AGE_BASE_IMAGE="${AGE_BASE_IMAGE}" \
+            --build-arg PG_MAJOR="${PG_MAJOR}" \
+            --build-arg PG_APT_VERSION="${PG_APT_VERSION}" \
+            --build-arg PGVECTOR_APT_VERSION="${PGVECTOR_APT_VERSION}" \
+            -t aim-pg-age-vector:ci \
+            -f deploy/docker-1461/Dockerfile.pg-age-vector deploy/docker-1461
+
+      - name: Start certified stack + create extensions
+        run: |
+          set -euo pipefail
+          docker run -d --name aim-pg -p 5432:5432 \
+            -e POSTGRES_USER=ai_memory -e POSTGRES_PASSWORD=ai_memory_ci -e POSTGRES_DB=ai_memory_ci \
+            aim-pg-age-vector:ci
+          for i in $(seq 1 30); do
+            docker exec aim-pg pg_isready -U ai_memory -d ai_memory_ci >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec aim-pg psql -U ai_memory -d ai_memory_ci \
+            -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS age;"
+
+      - name: Assert live versions match the SSOT pins (fail-closed)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source deploy/docker-1461/provision/lib.sh
+          pg=$(docker exec aim-pg psql -U ai_memory -d ai_memory_ci -tAc "select split_part(current_setting('server_version'),' ',1)" | tr -d '[:space:]')
+          age=$(docker exec aim-pg psql -U ai_memory -d ai_memory_ci -tAc "select extversion from pg_extension where extname='age'" | tr -d '[:space:]')
+          vec=$(docker exec aim-pg psql -U ai_memory -d ai_memory_ci -tAc "select extversion from pg_extension where extname='vector'" | tr -d '[:space:]')
+          echo "::notice::live versions PG=${pg} AGE=${age} pgvector=${vec}"
+          [ "${pg}" = "${EXPECTED_PG_VERSION}" ]  || { echo "::error::PG ${pg} != pinned ${EXPECTED_PG_VERSION}"; exit 1; }
+          [ "${age}" = "${EXPECTED_AGE_VERSION}" ] || { echo "::error::AGE ${age} != pinned ${EXPECTED_AGE_VERSION}"; exit 1; }
+          case "${PGVECTOR_APT_VERSION}" in
+            "${vec}-"*) : ;;  # pgvector extversion (0.8.5) is the leading field of the apt pin (0.8.5-1.pgdg13+1)
+            *) echo "::error::pgvector ${vec} not the leading field of pinned ${PGVECTOR_APT_VERSION}"; exit 1 ;;
+          esac
+
+      - name: Install Rust 1.96.0 (matches rust-toolchain.toml pin)
+        uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+
+      - name: Install mold linker (#1148)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+          mold --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run AGE-gated Cypher/KG + pgvector suites (live certified stack)
+        run: |
+          cargo test --features sal,sal-postgres \
+            --test age_cte_equivalence \
+            --test g2_postgres_find_paths_age_param_binding \
+            --test g4_postgres_link_projects_into_age_graph \
+            --test cov_postgres_kg \
+            --test issue_1482_age_cypher_persistent \
+            --test kg_age_fallback \
+            --test recall_purity_p01_postgres \
+            -- --include-ignored --test-threads=1
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f aim-pg 2>/dev/null || true
