@@ -200,6 +200,14 @@ pub fn emit_spawn_audit_best_effort(argv0: &str, caller: &str) {
     };
     match crate::db::open(db_path) {
         Ok(conn) => {
+            // #1937 — the spawn-audit is best-effort observability on the spawn
+            // HOT PATH; cap the WAL write-lock wait (default open path uses 5s,
+            // `storage::connection`) so a contended audit write can never add
+            // meaningful latency to — let alone block — the child spawn. On
+            // BUSY it errors fast and the WARN arm below records the miss; the
+            // spawn proceeds regardless (M-PANIC-IS-STOP: audit never gates a
+            // spawn).
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(250));
             if let Err(e) = emit_spawn_audit(&conn, argv0, caller) {
                 tracing::warn!(
                     target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
