@@ -869,6 +869,24 @@ fn run_decorrelation_write_gate(
     }
     let quorum_n = crate::config::reflect_decorrelation_quorum_n();
 
+    // Empty-attestation short-circuit (M-THROUGHPUT): the write-gate can only
+    // ever REFUSE/ADVISE on an ATTESTED-family signal, and `attested_family_of`
+    // resolves a family ONLY from a `model_attestations` row. With that table
+    // empty (the default posture), every row's attested lookup is `None`, so
+    // `attested_rows == 0` and `decorrelation_write_action` returns `Proceed`
+    // UNCONDITIONALLY (decorrelation_probe.rs — `InsufficientAttested { 0 } =>
+    // Proceed`, silent, mode-independent). Skip the up-to-`LIST_MAX_LIMIT`
+    // corpus scan + per-row JSON parse in that case — provably the same
+    // observable outcome (a bare `Ok(())`, no advisory emitted) at O(1).
+    let any_attested: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM model_attestations)", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| ReflectError::Database(e.to_string()))?;
+    if !any_attested {
+        return Ok(());
+    }
+
     // Direct namespace-scoped corpus read (NOT recall). Bounded by the SSOT
     // `crate::storage::LIST_MAX_LIMIT` (the same window the visibility probe's
     // `PROBE_SCAN_LIMIT` reuses) so this per-write scan on the reflect hot path

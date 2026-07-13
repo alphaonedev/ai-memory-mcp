@@ -1257,7 +1257,8 @@ pub async fn sync_push(
             crate::federation::receive_auth::require_write_sig_enabled(),
         ) {
             // #1801→#1954 item 7 — split the generic AttestationRequired WARN
-            // into two actionable causes so an operator gets a precise signal.
+            // into three actionable causes (unenrolled-author / missing-signature
+            // / forged-or-malformed) so an operator gets a precise signal.
             // A missing/unenrolled author key under the strict flip carries the
             // closed-set DLQ cause token `unenrolled_author_strict`
             // (`push_dlq::classify_quarantine_cause`).
@@ -1284,7 +1285,7 @@ pub async fn sync_push(
                     memory_id = %to_insert.id,
                     attribute_agent = %attribute_agent,
                     sender = %body.sender_agent_id,
-                    cause = "missing_signature",
+                    cause = crate::federation::receive_auth::CAUSE_MISSING_SIGNATURE,
                     error = %e,
                     "sync_push: honored third-party relay refused — no metadata.write_signature \
                      present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
@@ -1295,7 +1296,7 @@ pub async fn sync_push(
                     memory_id = %to_insert.id,
                     attribute_agent = %attribute_agent,
                     sender = %body.sender_agent_id,
-                    cause = "forged_or_malformed",
+                    cause = crate::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
                     error = %e,
                     "sync_push: per-write content attestation failed; rejecting memory (#1464)"
                 );
