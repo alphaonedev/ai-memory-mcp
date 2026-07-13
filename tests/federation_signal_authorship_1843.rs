@@ -298,6 +298,12 @@ async fn self_relay_and_allowlisted_author_accepted_1843() {
             PEER_ATTESTATION_ENV,
             r#"{"relay-peer": {"allowed_sender_agent_ids": ["alice"], "allowed_namespaces": ["sig-test/**"]}}"#,
         );
+        // #1801→#1954 item 5 — this test isolates Layer-1 (authorship
+        // allowlist) acceptance. Post-v1.0.0-flip, Layer-2 (`require_signal_sig`)
+        // defaults ON and additionally demands each `from_agent`'s ENROLLED key
+        // (which this fixture does not provision), so opt Layer-2 out explicitly
+        // to pin the Layer-1 behavior unchanged (the `=0` staged-rollout bridge).
+        std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "0");
     }
     let (router, _db) = setup_router();
 
@@ -328,6 +334,12 @@ async fn zero_config_accepts_any_author_1843() {
     let _g = env_lock();
     clear_all_env();
     relax_orthogonal_gates(); // no PEER_ATTESTATION_ENV → has_allowlist()==false
+    // #1801→#1954 item 5 — the signal-sig default flipped `false → true` at
+    // v1.0.0, so an UNSET knob now resolves STRICT (an unenrolled `from_agent`
+    // would be skipped). The permissive "zero-config faith-based" posture this
+    // test documents is now the EXPLICIT `=0` opt-out (the staged-rollout
+    // bridge); pin the byte-identical pre-flip behavior under that opt-out.
+    unsafe { std::env::set_var(REQUIRE_SIGNAL_SIG_ENV, "0") };
     let (router, _db) = setup_router();
 
     let sig = signed_signal("ai:anyone", "sig-test/d");

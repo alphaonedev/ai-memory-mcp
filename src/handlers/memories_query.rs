@@ -872,6 +872,11 @@ pub async fn bulk_create(
                 ) {
                     Ok((sig_bytes, signed_created_at)) => {
                         mem.created_at = signed_created_at.to_string();
+                        // #1801→#1954 item 4 — redact to storage form BEFORE the
+                        // gate verifies (and before EMIT) so the signed bytes
+                        // equal the persisted bytes; the SAL store re-redacts
+                        // idempotently.
+                        crate::identity::attest::redact_before_sign(&mut mem);
                         if let Err(e) = crate::identity::attest::stamp_attestation_async(
                             app.store.as_ref(),
                             &mut mem,
@@ -885,6 +890,13 @@ pub async fn bulk_create(
                             errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
                             continue;
                         }
+                        // #1801→#1954 item 2 — sender EMIT: persist the author's
+                        // presented signature so it propagates verbatim across
+                        // federation relay hops. Bulk is a HttpDirect signed-store
+                        // authoring path with quorum fanout (Stage 2 below), same
+                        // as single-create — without this, bulk-authored content
+                        // fails multi-hop third-party relay under the strict flip.
+                        crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
                     }
                     Err(msg) => {
                         errors.push(super::sanitize_bulk_row_error(&msg).to_string());
@@ -1122,6 +1134,11 @@ pub async fn bulk_create(
                 ) {
                     Ok((sig_bytes, signed_created_at)) => {
                         mem.created_at = signed_created_at.to_string();
+                        // #1801→#1954 item 4 — redact to storage form BEFORE the
+                        // gate verifies (and before EMIT) so the signed bytes
+                        // equal the persisted bytes; `db::insert` re-redacts
+                        // idempotently.
+                        crate::identity::attest::redact_before_sign(&mut mem);
                         if let Err(e) = crate::identity::attest::stamp_attestation_sync(
                             &lock.0,
                             &mut mem,
@@ -1133,6 +1150,13 @@ pub async fn bulk_create(
                             errors.push(super::sanitize_bulk_row_error(&e.to_string()).to_string());
                             continue;
                         }
+                        // #1801→#1954 item 2 — sender EMIT: persist the author's
+                        // presented signature so it propagates verbatim across
+                        // federation relay hops. Bulk is a HttpDirect signed-store
+                        // authoring path with quorum fanout (Stage 2 below), same
+                        // as single-create — without this, bulk-authored content
+                        // fails multi-hop third-party relay under the strict flip.
+                        crate::identity::attest::persist_write_signature(&mut mem, &sig_bytes);
                     }
                     Err(msg) => {
                         errors.push(super::sanitize_bulk_row_error(&msg).to_string());

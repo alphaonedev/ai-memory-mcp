@@ -139,6 +139,19 @@ fn relax_fed_gates() {
             ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
             "1",
         );
+        // #1801→#1954 — the per-write CONTENT and per-signal AUTHOR signature
+        // defaults flipped strict at v1.0.0; this zero-config merge test pushes
+        // UNSIGNED bodies to reach the reconciliation step, so opt back into the
+        // permissive accept-and-flag posture (`=0` escape hatch) — the test
+        // exercises sync-state merge semantics, not the content-attestation gate.
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_WRITE_SIG_ENV,
+            "0",
+        );
+        std::env::set_var(
+            ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV,
+            "0",
+        );
     }
 }
 
@@ -146,6 +159,8 @@ fn clear_fed_gates() {
     unsafe {
         std::env::remove_var(ai_memory::federation::signing::REQUIRE_SIG_ENV);
         std::env::remove_var(ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV);
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_WRITE_SIG_ENV);
+        std::env::remove_var(ai_memory::federation::receive_auth::REQUIRE_SIGNAL_SIG_ENV);
     }
 }
 

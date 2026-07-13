@@ -218,23 +218,38 @@ independently — these are layered on top.
   op) is not gated. Wired on both the sqlite inline and postgres
   `/sync/push` paths.
 
-- **Per-write content attestation
-  ([#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464)).**
-  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` (default `0`, **permissive**) gates
-  the *data* lane — relayed memories. A relayed memory is replication,
-  not authority, so it keeps the accept-and-flag posture by default: an
-  unsigned write lands `attest_level=claimed`. When a memory carries a
-  base64 detached Ed25519 signature in `metadata.write_signature` over
-  the #626 `SignableWrite` envelope
-  (`agent_id + namespace + title + kind + created_at + sha256(content)`),
-  the receive path verifies it against the attributed author's
-  locally-**enrolled** key and upgrades the row to
-  `attest_level=agent_attested`. A **forged** signature is rejected
-  unconditionally. When truthy (`1`/`true`/`yes`/`on`), a HONORED
-  third-party relayed claim (`attribute_agent != sender`) without a
-  valid signature is refused; self-authored relays stay faith-based.
-  Gate: [`src/federation/receive_auth.rs::require_write_sig_enabled`](../src/federation/receive_auth.rs)
-  + `src/handlers/federation_receive.rs::apply_inbound_write_attestation`.
+- **Per-write content attestation + sender EMIT
+  ([#1464](https://github.com/alphaonedev/ai-memory-mcp/issues/1464),
+  [#1801→#1954](https://github.com/alphaonedev/ai-memory-mcp/issues/1954)).**
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG` gates the *data* lane — relayed
+  memories. **As of v1.0.0 the secure default is `1` (REQUIRED)** — the
+  compiled const `FED_REQUIRE_WRITE_SIG_DEFAULT` flipped `false → true`
+  (federation inbound is the network surface, ruling `9e9c3cf2`
+  condition 7; the v0.10.0 WARN cycle shipped the heads-up). An explicit
+  `AI_MEMORY_FED_REQUIRE_WRITE_SIG=0` (or any falsy token) is the
+  **staged-rollout bridge** back to the permissive accept-and-flag
+  posture (unsigned relayed write → `attest_level=claimed`) while peers
+  enroll author keys. The author's signature is **EMITTED at STORE
+  time**: the authoring node persists the detached Ed25519 signature into
+  `metadata.write_signature` over the #626 `SignableWrite` envelope
+  (`agent_id + namespace + title + kind + created_at + sha256(content)`) —
+  a relaying node NEVER re-signs a third-party attribution (that would
+  forge a signature that fails against the author's enrolled key), so the
+  origin signature propagates verbatim across every hop and re-verifies
+  at the receiver, upgrading the row to `attest_level=agent_attested`. A
+  **forged** signature is rejected unconditionally. Under the flip a
+  HONORED third-party relayed claim (`attribute_agent != sender`) without
+  a valid signature is refused; self-authored relays stay faith-based.
+  **Multi-hop propagation of third-party content therefore requires the
+  ORIGIN author's Ed25519 key enrolled at EACH receiving node** (TOFU key
+  distribution + a promoted typed wire field are DEFERRED to v1.x); a
+  refusal for a missing/unenrolled author key emits an actionable WARN
+  plus the DLQ cause `unenrolled_author_strict`. The secret-screen redact
+  is folded in BEFORE signing so the signed bytes equal the persisted
+  bytes. Gate + EMIT:
+  [`src/federation/receive_auth.rs::require_write_sig_enabled`](../src/federation/receive_auth.rs),
+  `src/identity/attest.rs::persist_write_signature`,
+  `src/handlers/federation_receive.rs::apply_inbound_write_attestation`.
 
 - **Outbound peer server-cert pinning
   ([#1678](https://github.com/alphaonedev/ai-memory-mcp/issues/1678)).**

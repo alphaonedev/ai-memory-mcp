@@ -290,6 +290,8 @@ fn dlq_depth_warn_threshold() -> i64 {
 /// drown the very signal it is meant to be. `0` = below, `1` = at/over.
 static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 
+use crate::federation::receive_auth::CAUSE_UNENROLLED_AUTHOR_STRICT;
+
 /// #1544 — map a free-text DLQ `last_error` to a CLOSED-set quarantine
 /// cause label so the Prometheus label cardinality is bounded by
 /// construction (never the raw string). `quota` is operator-actionable
@@ -298,6 +300,14 @@ static DLQ_DEPTH_OVER_THRESHOLD: AtomicI64 = AtomicI64::new(0);
 fn classify_quarantine_cause(last_error: &str) -> &'static str {
     if last_error.contains("429") {
         "quota"
+    } else if last_error.contains(CAUSE_UNENROLLED_AUTHOR_STRICT) {
+        // #1801→#1954 item 7 — a honored third-party relayed write refused
+        // under the v1.0.0 write-sig flip because the ORIGIN author has no
+        // locally-enrolled key. Distinct from `unenrolled_peer` (the transport
+        // peer): here the PEER is enrolled but the attributed AUTHOR is not.
+        // Operator-actionable — enroll the author's key at the receiving node
+        // (the manual substitute for the deferred TOFU key distribution).
+        CAUSE_UNENROLLED_AUTHOR_STRICT
     } else if last_error.contains("401") || last_error.contains("403") {
         // The replay last_error is the `http {status}` shape, so 401/403
         // is the enrolment/auth signal (the peer's JSON `peer_not_enrolled`
@@ -919,9 +929,9 @@ mod replay_arm_tests {
     //! the worker at a peer URL that refuses TCP.
 
     use super::{
-        DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH, FederationDlqSink,
-        FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE, classify_quarantine_cause,
-        replay_max_batch, replay_once,
+        CAUSE_UNENROLLED_AUTHOR_STRICT, DEFAULT_REPLAY_MAX_BATCH, ENV_FED_DLQ_REPLAY_MAX_BATCH,
+        FederationDlqSink, FederationPushDlqRow, MAX_REPLAY_ATTEMPTS, REPLAY_BATCH_SIZE,
+        classify_quarantine_cause, replay_max_batch, replay_once,
     };
     use crate::federation::{FederationConfig, PeerEndpoint};
     use crate::replication::QuorumPolicy;
@@ -1275,6 +1285,14 @@ mod replay_arm_tests {
         assert_eq!(
             classify_quarantine_cause("peer no longer in FederationConfig"),
             "peer_removed"
+        );
+        // #1801→#1954 item 7 — the honored-third-party unenrolled-author cause
+        // is its own closed-set label, distinct from `unenrolled_peer`.
+        assert_eq!(
+            classify_quarantine_cause(
+                "sync_push: honored third-party relay refused (unenrolled_author_strict)"
+            ),
+            CAUSE_UNENROLLED_AUTHOR_STRICT
         );
         assert_eq!(
             classify_quarantine_cause("connection reset by peer"),
