@@ -72,7 +72,7 @@ right when a constraint listed in the "use case" column is breached.
 |---|---|---|---|---|---|---|---|---|---|
 | **T1 — Singleton** | Solo developer; 1 NHI experimentation; offline | SQLite (WAL) | One process; one host | 1 | 1 | <10 ms | none | none | `ai-memory backup --keep 48` |
 | **T2 — Multi-agent / single server** | Engineering team (≤5 agents) on a shared workstation or single VM | SQLite (WAL) shared | Many agents → one daemon | 2–10 | 1 | <15 ms | none (local mTLS optional) | none | hourly local + weekly off-host |
-| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.4 + AGE 1.7.0 + pgvector 0.8.2 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
+| **T3 — Single-rack / same DC** | Team or small product cluster; HA pair or 3-node | Postgres 18.4 + AGE 1.7.0 + pgvector 0.8.5 (single primary) | Hub-spoke OR W-of-N (3 peers) | 5–50 | 2–5 | <30 ms (LAN RTT-bound) | mandatory between peers | hub-spoke or W-of-N | pg_basebackup + WAL archive |
 | **T4 — Multi-rack / same DC** | Production cluster with rack-affinity routing | Postgres primary + ≥1 streaming replicas; AGE on primary | Rack-affinity W-of-N; per-rack ai-memory replicas | 50–250 | 5–15 | <50 ms (cross-rack RTT) | mandatory | rack-aware W-of-N | pg_basebackup + WAL archive + rack-tagged snapshots |
 | **T5 — Multi-DC / same region** | Multi-AZ within a region; DR ready | Postgres primary + sync replica in second DC (or async-with-RPO) + AGE | Cross-DC federation peers; quorum spans DCs | 250–1000 | 15–50 | 50–150 ms (intra-region WAN) | mandatory | cross-DC W-of-N with quorum tuned for partition | pg_basebackup + WAL ship + off-region | 
 | **T6 — Multi-region / global** | Global product; data-residency requirements | Postgres + AGE **per region**; federation peers between regions | Regional clusters federate; local-first recall | 1000+ | 50–500 | <30 ms local recall; 150–500 ms global propagation | mandatory; per-region CA | regional clusters peer via signed `X-Memory-Sig` + `X-Memory-Nonce` | regional pg snapshots + cross-region object store |
@@ -363,7 +363,7 @@ production Dockerfile. Quick summary:
 |---|---|
 | PostgreSQL | **18.4** (canonical; SSOT `deploy/docker-1461/provision/lib.sh`). PG 16.x + AGE 1.6.0 is a tested alternate matrix (`infra/lan-parity-test/`). |
 | Apache AGE | **1.7.0** (targets PG 18; bundled `deploy/docker-1461/Dockerfile.pg-age-vector`) |
-| pgvector | **0.8.2** (`PGVECTOR_APT_VERSION=0.8.2-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
+| pgvector | **0.8.5** (`PGVECTOR_APT_VERSION=0.8.5-1.pgdg13+1`; Rust binding crate `pgvector = "0.4"`) |
 | ai-memory build | `cargo build --release --features sal-postgres` |
 
 Bootstrap a fresh postgres backend with:
@@ -1297,7 +1297,7 @@ build time and `hnsw.ef_search=80` at query time
 See [`postgres-age-guide.md §"Install — Ubuntu 24.04 example"`](postgres-age-guide.html)
 for the AGE 1.7.0-from-source recipe. The bundled
 `deploy/docker-1461/Dockerfile.pg-age-vector` (#1065) stacks
-pgvector 0.8.2 on top of `apache/age:release_PG18_1.7.0` so K8s / ECS /
+pgvector 0.8.5 on top of `apache/age:release_PG18_1.7.0` so K8s / ECS /
 Cloud Run users don't have to build AGE themselves.
 
 Permissions:
@@ -1349,7 +1349,7 @@ Retention sizing reference:
 ### 10.6 Upgrade path — AGE minor version pinning
 
 **Pin AGE to a specific minor.** The v0.7.0 reference is
-`apache/age:release_PG18_1.7.0` (with the bundled pgvector 0.8.2 layer).
+`apache/age:release_PG18_1.7.0` (with the bundled pgvector 0.8.5 layer).
 Do not let your Postgres host's apt-update silently upgrade AGE
 across a minor — the Cypher binding semantics have changed between AGE
 minors historically, and the v0.7.0 canonical substrate targets 1.7.0.
