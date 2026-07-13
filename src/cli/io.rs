@@ -95,18 +95,39 @@ pub struct MineArgs {
 }
 
 /// `export` handler. Dumps every memory + link as pretty JSON.
+///
+/// #1944 (`B_WARN` de-silencing, 2×5 vote `woaiwndla` / `4d3ea1c5`): this is
+/// a **memories + links convenience view**, NOT the portability path — it
+/// silently omitted the tamper-evidence + governance spine
+/// ([`crate::export_scope::OMITTED_SIGNED_CLASSES`]). The de-silencing hedge
+/// is two-fold and additive (the `{memories, links, count, exported_at}`
+/// shape is unchanged): a prominent stderr WARN (NEVER stdout — a piped
+/// `export > x.json` must stay valid JSON) and in-band scope markers so a
+/// pipe-to-file consumer that never sees the WARN still learns the scope.
+/// The full integrity-complete exporter defers to v1.x (see
+/// `docs/spec/PORTABILITY-V2.md` §V2-7). The serialization core
+/// (`db::export_all` / `db::export_links`) is deliberately untouched.
 pub fn export(db_path: &Path, out: &mut CliOutput<'_>) -> Result<()> {
+    use crate::export_scope;
+    use crate::models::field_names;
     let conn = db::open(db_path)?;
     let memories = db::export_all(&conn)?;
     let links = db::export_links(&conn)?;
+    // In-band, additive, non-breaking scope markers (critical: the stderr
+    // WARN below is invisible to a pipe-to-file consumer).
     writeln!(
         out.stdout,
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "memories": memories, "links": links, "count": memories.len(),
-            (crate::models::field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
+            (field_names::EXPORTED_AT): Utc::now().to_rfc3339(),
+            (field_names::EXPORT_SCOPE): export_scope::SCOPE_MEMORIES_LINKS,
+            (field_names::PORTABILITY_COMPLETE): export_scope::PORTABILITY_COMPLETE,
+            (field_names::EXCLUDES): export_scope::OMITTED_SIGNED_CLASSES,
         }))?
     )?;
+    // Prominent WARN to STDERR only, so the stdout JSON stays pipeline-valid.
+    writeln!(out.stderr, "{}", export_scope::export_scope_warn())?;
     Ok(())
 }
 
