@@ -562,9 +562,19 @@ its own history has *equivocated* — told two nodes two incompatible stories.
 v1.0.0 freezes the two byte shapes that make such a contradiction into a
 **self-contained, offline-verifiable proof** any third peer can check with
 ZERO shared state (no DB, no network). This lane ships the **format + the
-offline verifier only**; the transport that carries proofs between peers
-(#1936) and the automatic-eviction runtime (FED-RQ-02/03) are separate,
-later carriers.
+offline verifier only**. The equivocation **runtime** — peer-head recording,
+on-line detection, proof transport, `PeerHeadEntanglement` bookkeeping, and
+auto-eviction (**FED-RQ-02**) — is **DEFERRED to v1.x** (ADR-002): operators
+detect equivocation **out-of-band today** by feeding the shipped offline
+verifier two conflicting signed head attestations gathered manually. Do NOT
+claim "federation mature" or "equivocation shipped/enforced" until FED-RQ-02
+lands. What IS live: the equivocation FORMAT + offline verifier (frozen,
+permanent back-compat), FED-RQ-01 checkpoint federation (#1936), and the
+**FED-RQ-03 cross-node `policy_version` REFUSE-STALE** gate (#1947) — the
+receive path refuses a push governed by a governance policy strictly behind
+the receiver's committed policy (typed `409 stale_policy_version`; fail-open
+on an absent/undeterminable epoch; env opt-out
+`AI_MEMORY_FED_REQUIRE_POLICY_CURRENT`).
 
 - **`SignableHeadAttestation`** (`"ai-memory/peer-head-attestation-v1"`) — a
   subject-signed claim committing `{subject_agent_id, epoch, head_sequence,
