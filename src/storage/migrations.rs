@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 80).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 81).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -390,6 +390,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_revisions_sequence
 -- v80 (#1949) widens the reason CHECK to include 'revocation' and adds
 -- the two additive columns `custody_class` (NULL = legacy software-file)
 -- + `suspected_compromise_from_seq` (revocation-only witness sequence).
+-- v81 (#1831 G17) adds the two additive recovery-only columns
+-- `guardian_set_id` (SHA-256 over the sorted enrolled recovery-guardian
+-- pubkeys the quorum was minted against) + `recovery_threshold` (the
+-- committed M-of-N threshold); both NULL on every non-recovery record.
 CREATE TABLE IF NOT EXISTS agent_lineage (
     agent_id            TEXT    NOT NULL,
     epoch               INTEGER NOT NULL,
@@ -405,6 +409,8 @@ CREATE TABLE IF NOT EXISTS agent_lineage (
     created_at          TEXT    NOT NULL,
     custody_class       TEXT,
     suspected_compromise_from_seq INTEGER,
+    guardian_set_id     BLOB,
+    recovery_threshold  INTEGER,
     PRIMARY KEY (agent_id, epoch)
 );
 
@@ -850,7 +856,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 80;
+const CURRENT_SCHEMA_VERSION: i64 = 81;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1464,6 +1470,17 @@ const MIGRATION_V79_SQLITE: &str = include_str!("../../migrations/sqlite/0063_v7
 // column-existence probe (the v77/v79 pattern) — a fresh install skips it.
 const MIGRATION_V80_SQLITE: &str =
     include_str!("../../migrations/sqlite/0064_v80_lineage_custody_revocation.sql");
+// v81 (#1831 G17) — M-of-N threshold key recovery. Adds the two additive
+// recovery-only columns `agent_lineage.guardian_set_id` (the committed
+// SHA-256 over the sorted enrolled recovery-guardian pubkeys) +
+// `agent_lineage.recovery_threshold` (the committed M-of-N threshold). PURE
+// additive ALTER ADD COLUMN — NO CHECK change and NO full-table rebuild (the
+// reason CHECK already admits 'recovery' since v80), so the v63/v65
+// trigger-drop hazard does not arise. Runs behind a `guardian_set_id`
+// column-existence probe (the v77/v79/v80 pattern) — a fresh install (whose
+// bootstrap SCHEMA already ships the widened table) skips it.
+const MIGRATION_V81_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0065_v81_lineage_recovery_quorum.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3475,6 +3492,28 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 );
             } else if !lineage_cols.contains("custody_class") {
                 conn.execute_batch(MIGRATION_V80_SQLITE)?;
+            }
+        }
+
+        if version < 81 {
+            // v81 (#1831 G17) — additive recovery-quorum columns on
+            // `agent_lineage`. Pure ALTER ADD COLUMN (no CHECK change / no
+            // rebuild). Probe `guardian_set_id` (SQLite has no ADD COLUMN IF
+            // NOT EXISTS) AND the table's presence (a synthetic fixture may
+            // stamp a version without the v76 table — the v58/v77/v80
+            // precedent).
+            let lineage_cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(agent_lineage)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if lineage_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v81: agent_lineage table absent (test fixture); skipping \
+                     recovery-quorum column add"
+                );
+            } else if !lineage_cols.contains("guardian_set_id") {
+                conn.execute_batch(MIGRATION_V81_SQLITE)?;
             }
         }
 

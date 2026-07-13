@@ -338,6 +338,19 @@ pub struct LineageRecord {
     /// (omitted from the canonical CBOR → legacy byte-compat). The
     /// ordering authority for the Suspect window (never wall-clock).
     pub suspected_compromise_from_seq: Option<u64>,
+    /// v1.0.0 #1831 (G17) — for a [`LineageReason::Recovery`] record ONLY,
+    /// the SHA-256 digest over the SORTED enrolled recovery-guardian public
+    /// keys the quorum was minted against. Committed inside the signed
+    /// bytes so the verifier re-checks against the guardian set AT MINT
+    /// time (never its own current env). `None` for every non-recovery
+    /// record (omitted from the canonical CBOR → legacy byte-compat).
+    pub guardian_set_id: Option<Vec<u8>>,
+    /// v1.0.0 #1831 (G17) — for a [`LineageReason::Recovery`] record ONLY,
+    /// the M-of-N threshold the quorum was minted against, committed so
+    /// verification enforces the threshold-at-mint (never a later-lowered
+    /// env value). `None` for every non-recovery record (omitted → legacy
+    /// byte-compat).
+    pub recovery_threshold: Option<u64>,
 }
 
 impl LineageRecord {
@@ -362,6 +375,8 @@ impl LineageRecord {
             prev_record_hash: ZERO_PREV_HASH.to_vec(),
             custody_class: CustodyClass::SoftwareFile,
             suspected_compromise_from_seq: None,
+            guardian_set_id: None,
+            recovery_threshold: None,
         }
     }
 
@@ -398,6 +413,8 @@ impl LineageRecord {
             prev_record_hash: prev.record_hash()?.to_vec(),
             custody_class: CustodyClass::SoftwareFile,
             suspected_compromise_from_seq: None,
+            guardian_set_id: None,
+            recovery_threshold: None,
         })
     }
 
@@ -438,6 +455,73 @@ impl LineageRecord {
             prev_record_hash: prev.record_hash()?.to_vec(),
             custody_class: CustodyClass::SoftwareFile,
             suspected_compromise_from_seq: Some(suspected_compromise_from_seq),
+            guardian_set_id: None,
+            recovery_threshold: None,
+        })
+    }
+
+    /// v1.0.0 #1831 (G17) — mint a [`LineageReason::Recovery`] record that
+    /// succeeds `prev` and hands off to `successor_pubkey_b64` (a FRESH
+    /// primary key), attested NOT by the prior head key (which is LOST)
+    /// but by an M-of-N quorum of enrolled recovery guardians
+    /// ([`RecoveryPolicy`]). This is the key-LOSS half of G13: losing the
+    /// primary key no longer orphans the identity — a guardian quorum can
+    /// mint a fresh head.
+    ///
+    /// `predecessor_pubkey` is pinned to `prev.successor` (the LOST head)
+    /// so the record still names the key it recovers FROM and the single
+    /// [`verify_lineage`] walk keeps its contiguity + hash-link
+    /// invariants; the difference from a rotation is that the stored
+    /// `signature` blob is a quorum attestation
+    /// ([`encode_recovery_quorum`]) verified against the guardian set, not
+    /// a single predecessor Ed25519 signature.
+    ///
+    /// `suspected_compromise_from_seq` doubles the recovery as a
+    /// revocation — this is the OPT-IN "recovery signs both fresh head +
+    /// revocation" path (#1831 ratification delta F): when `Some(seq)`,
+    /// entries in `[seq, recovery)` are surfaced as SUSPECT (the lost key
+    /// may have been stolen AND lost); when `None` the recovery is PURE and
+    /// the predecessor's prior entries stay fully trusted. Callers that
+    /// suspect the lost key was compromised MUST pass `Some(seq)`.
+    ///
+    /// `guardian_set_id` + `recovery_threshold` are the committed trust
+    /// anchor (#1831 ratification delta A): the SHA-256 over the SORTED
+    /// enrolled guardian pubkeys and the M-of-N threshold the quorum was
+    /// minted against. They ride the signed CBOR body so a persisted
+    /// recovery is re-verified against the guardian set + threshold AT MINT
+    /// time, never the verifier's later env.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the (in practice unreachable) CBOR-encode failure from
+    /// hashing `prev`.
+    pub fn recovery(
+        prev: &LineageRecord,
+        successor_pubkey_b64: &str,
+        suspected_compromise_from_seq: Option<u64>,
+        recovery_pubkey_b64: Option<String>,
+        guardian_set_id: Vec<u8>,
+        recovery_threshold: u64,
+        not_before: &str,
+    ) -> anyhow::Result<Self> {
+        let clamped = if not_before < prev.not_before.as_str() {
+            prev.not_before.clone()
+        } else {
+            not_before.to_string()
+        };
+        Ok(Self {
+            agent_id: prev.agent_id.clone(),
+            epoch: prev.epoch + 1,
+            reason: LineageReason::Recovery,
+            predecessor_pubkey_b64: prev.successor_pubkey_b64.clone(),
+            successor_pubkey_b64: successor_pubkey_b64.to_string(),
+            recovery_pubkey_b64,
+            not_before: clamped,
+            prev_record_hash: prev.record_hash()?.to_vec(),
+            custody_class: CustodyClass::SoftwareFile,
+            suspected_compromise_from_seq,
+            guardian_set_id: Some(guardian_set_id),
+            recovery_threshold: Some(recovery_threshold),
         })
     }
 
@@ -455,6 +539,8 @@ impl LineageRecord {
             prev_record_hash: &self.prev_record_hash,
             custody_class: self.custody_class.as_str(),
             suspected_compromise_from_seq: self.suspected_compromise_from_seq,
+            guardian_set_id: self.guardian_set_id.as_deref(),
+            recovery_threshold: self.recovery_threshold,
         }
     }
 
@@ -562,6 +648,35 @@ pub enum LineageError {
         /// Lineage witness rows present in `signed_events`.
         witnesses: u64,
     },
+    /// v1.0.0 #1831 (G17) — a [`LineageReason::Recovery`] record was
+    /// encountered but no [`RecoveryPolicy`] was supplied (no recovery
+    /// guardians enrolled), so the M-of-N recovery quorum can never be
+    /// checked. Fail-closed: a recovery is trusted ONLY under an enrolled
+    /// guardian set. (`verify_lineage` with no policy always lands here.)
+    RecoveryNotEnrolled {
+        /// Epoch of the offending recovery record.
+        epoch: u64,
+    },
+    /// v1.0.0 #1831 (G17) — a [`LineageReason::Recovery`] record's stored
+    /// quorum attestation is malformed / undecodable, or a presented
+    /// guardian signature did not `verify_strict` (or the signer is not an
+    /// enrolled guardian). The recovery is not cryptographically
+    /// authorized.
+    RecoveryQuorumInvalid {
+        /// Epoch of the offending recovery record.
+        epoch: u64,
+    },
+    /// v1.0.0 #1831 (G17) — a [`LineageReason::Recovery`] record's quorum
+    /// carried fewer DISTINCT valid enrolled guardian signatures than the
+    /// configured threshold `M`. The recovery is under-attested.
+    RecoveryQuorumNotMet {
+        /// Epoch of the offending recovery record.
+        epoch: u64,
+        /// Distinct valid enrolled guardian signers presented.
+        distinct: usize,
+        /// The M-of-N threshold in force.
+        threshold: usize,
+    },
 }
 
 impl std::fmt::Display for LineageError {
@@ -602,6 +717,25 @@ impl std::fmt::Display for LineageError {
                 "lineage truncation/rollback: {records} stored record(s) but {witnesses} \
                  append-only witness row(s) (C3)"
             ),
+            Self::RecoveryNotEnrolled { epoch } => write!(
+                f,
+                "recovery record at epoch {epoch} cannot be verified — no recovery guardians \
+                 are enrolled (set AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS)"
+            ),
+            Self::RecoveryQuorumInvalid { epoch } => write!(
+                f,
+                "recovery record at epoch {epoch} carries a malformed or unverifiable \
+                 guardian-quorum attestation"
+            ),
+            Self::RecoveryQuorumNotMet {
+                epoch,
+                distinct,
+                threshold,
+            } => write!(
+                f,
+                "recovery record at epoch {epoch} met only {distinct} of {threshold} distinct \
+                 enrolled recovery guardians"
+            ),
         }
     }
 }
@@ -626,6 +760,21 @@ pub struct VerifiedLineage {
     /// `[from_seq, revocation)` are SUSPECT (R13) — surfaced as
     /// [`LineageCheck::Revoked`], the chain itself still verifies.
     pub revoked_from_seq: Option<u64>,
+    /// v1.0.0 #1831 (G17) — epoch of the most-recent
+    /// [`LineageReason::Recovery`] record on the chain, or `None` if the
+    /// chain carries no recovery. When `Some(epoch)`, the head at (or
+    /// after) that epoch is authoritative BECAUSE a valid M-of-N recovery
+    /// quorum ([`RecoveryPolicy`]) attested it — the key-LOSS half of G13
+    /// (a lost primary key was replaced by a fresh one via a guardian
+    /// quorum, not a predecessor signature).
+    pub recovered_at_epoch: Option<u64>,
+    /// v1.0.0 #1831 (G17) — `true` when a verified recovery on the chain
+    /// was minted against a guardian set whose committed `guardian_set_id`
+    /// differs from a digest over the verifier's CURRENTLY-enrolled set (the
+    /// roster drifted since mint). Advisory only — the chain still verifies
+    /// (the COMMITTED threshold was met by currently-enrolled valid
+    /// signers); surfaced so an operator notices roster drift.
+    pub recovery_guardian_set_drift: bool,
 }
 
 /// Verify ONE succession record's Ed25519 signature under
@@ -653,6 +802,341 @@ pub fn verify_succession(
         .map_err(|_| invalid())
 }
 
+// ---------------------------------------------------------------------------
+// v1.0.0 #1831 (G17) — M-of-N threshold key recovery.
+//
+// The key-LOSS half of gap G13 (v0.9.0 shipped only key-ROTATION survival).
+// Losing the current head key no longer orphans the identity: a quorum of
+// M-of-N enrolled recovery GUARDIAN keys can attest a `recovery` succession
+// record that mints a FRESH primary key on the same v76 lineage chain, and
+// `verify_lineage_with_recovery` accepts a head reachable via that valid
+// quorum.
+//
+// # Honest scope boundary (label ATTESTABLE vs ESTIMABLE)
+//
+// - **ATTESTABLE** — the M-of-N recovery-quorum Ed25519 signatures over the
+//   domain-tagged succession bytes ([`crate::identity::sign::LINEAGE_DOMAIN`])
+//   + the append-only `signed_events` witness anchor (C1) + the hash-linked
+//   chain (C3/C5). A recovery head that verifies is cryptographically bound
+//   to a threshold of the enrolled guardian set.
+// - **ESTIMABLE / operational** — WHO the guardians are (custody + enrollment
+//   of `AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS`) is an operational trust input,
+//   NOT a cryptographic one, exactly like the #1957 approver-quorum
+//   (`AI_MEMORY_APPROVER_PUBKEYS`) and the operator-key custody. An adversary
+//   who controls the guardian env AND holds M guardian private keys AND has
+//   DB-write access can mint a recovery to a key they hold — a full
+//   single-node custody compromise, out of scope for the single-node threat
+//   model.
+//
+// SINGLE-NODE only: like the rest of the lineage layer, a recovery survived
+// locally is invisible cross-host (federation peers resolve via
+// `lookup_peer_public_key`, not this chain). Cross-host recovery propagation
+// stays deferred.
+
+/// Env var holding the comma-separated base64 (standard OR url-safe-no-pad)
+/// Ed25519 PUBLIC keys enrolled as M-of-N recovery guardians (#1831 G17).
+/// Mirrors the #1957 [`crate::approvals::signed::APPROVER_PUBKEYS_ENV`]
+/// enrollment shape.
+pub const RECOVERY_GUARDIAN_PUBKEYS_ENV: &str = "AI_MEMORY_RECOVERY_GUARDIAN_PUBKEYS";
+
+/// Env var holding the M-of-N recovery threshold — the minimum count of
+/// DISTINCT valid enrolled guardian signatures a recovery record must carry
+/// (#1831 G17). Consulted ONLY when MINTING a recovery; it has NO default
+/// (ratification delta C — a key-takeover primitive never silently defaults
+/// to `M = 1`), so a mint with guardians enrolled but this var unset is
+/// REFUSED. Verification uses the value COMMITTED in the record, never this.
+pub const RECOVERY_THRESHOLD_ENV: &str = "AI_MEMORY_RECOVERY_THRESHOLD";
+
+/// v1.0.0 #1831 (G17) — the leading integer version element of the
+/// recovery-quorum CBOR blob (ratification delta B). Committed so the
+/// attestation wire format can evolve past `2-of-N Ed25519` after records
+/// exist on disk — a `decode` of an unknown version fails closed.
+// M-DOCUMENTED-MAGIC: versioned so a future quorum-suite change is a
+// distinct format rather than a silent reinterpretation.
+pub const RECOVERY_QUORUM_FORMAT_V1: u64 = 1;
+
+/// One guardian's detached attestation over a recovery record's signing
+/// input (`LINEAGE_DOMAIN ∥ canonical_bytes`), stored inside the recovery
+/// record's `signature` blob as a version-tagged CBOR array (#1831 G17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryAttestation {
+    /// URL-safe-no-pad base64 of the guardian's Ed25519 PUBLIC key.
+    pub guardian_pubkey_b64: String,
+    /// The 64-byte Ed25519 signature over the recovery signing input.
+    pub signature: Vec<u8>,
+}
+
+/// The DISTINCT-signer count + guardian-set-drift flag returned by a
+/// successful [`verify_recovery_record`] (#1831 G17 ratification delta A).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryVerification {
+    /// Distinct valid enrolled guardian signers that satisfied the
+    /// COMMITTED threshold.
+    pub distinct_signers: usize,
+    /// `true` when the record's COMMITTED `guardian_set_id` differs from a
+    /// digest over the verifier's CURRENTLY-enrolled guardian set — the
+    /// guardian roster drifted since mint. The recovery still VERIFIES (the
+    /// committed threshold was met by currently-enrolled valid signers);
+    /// drift is surfaced as an advisory, never a silent re-derivation of
+    /// the trust bar from the verifier's env.
+    pub guardian_set_drift: bool,
+}
+
+/// The resolved M-of-N recovery policy: the enrolled guardian KEY MATERIAL
+/// and the MINT-time threshold (#1831 G17). A pure carrier so
+/// [`verify_lineage_with_recovery`] stays env-free and unit-testable;
+/// [`RecoveryPolicy::from_env`] resolves it at the storage boundary.
+///
+/// The guardians here are the verifier's KEY-MATERIAL source (used to
+/// verify each attestation signature); the TRUST BAR (threshold +
+/// guardian-set identity) a persisted recovery is judged against is the
+/// value COMMITTED in the signed record, NOT `threshold` here — `threshold`
+/// is consulted ONLY when MINTING (ratification delta A/C).
+#[derive(Debug, Clone)]
+pub struct RecoveryPolicy {
+    /// The enrolled recovery guardian PUBLIC keys (verification key
+    /// material + the mint-time `guardian_set_id` pre-image).
+    pub guardians: Vec<VerifyingKey>,
+    /// The M-of-N threshold to MINT with — `None` when
+    /// [`RECOVERY_THRESHOLD_ENV`] is unset (a mint is then REFUSED; a
+    /// key-takeover primitive never silently defaults to `M = 1`,
+    /// ratification delta C). Ignored at verification time (the committed
+    /// threshold rules there).
+    pub threshold: Option<usize>,
+}
+
+impl RecoveryPolicy {
+    /// Resolve the recovery policy from the environment (#1831 G17):
+    /// [`RECOVERY_GUARDIAN_PUBKEYS_ENV`] (key material) +
+    /// [`RECOVERY_THRESHOLD_ENV`] (mint threshold; `None` when unset).
+    ///
+    /// Returns `None` when NO guardians are enrolled — the fail-closed
+    /// signal that a recovery record cannot be verified (there is no
+    /// key material to check its quorum against).
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let guardians = enrolled_recovery_guardians();
+        if guardians.is_empty() {
+            return None;
+        }
+        Some(Self {
+            guardians,
+            threshold: recovery_threshold_explicit(),
+        })
+    }
+
+    /// The SHA-256 digest over this policy's SORTED guardian public keys —
+    /// the value a recovery mints into `guardian_set_id`, and the value a
+    /// verifier compares the committed digest against to detect drift.
+    #[must_use]
+    pub fn guardian_set_id(&self) -> Vec<u8> {
+        guardian_set_id_digest(&self.guardians)
+    }
+}
+
+/// SHA-256 over the SORTED raw bytes of `guardians` (#1831 G17). Sorting
+/// makes the digest order-independent so the same guardian SET always mints
+/// the same id regardless of enrollment order.
+// M-STRONG-TYPES-GUARD: the digest is the committed trust anchor that guards
+// "this recovery was minted against exactly this guardian set".
+#[must_use]
+pub fn guardian_set_id_digest(guardians: &[VerifyingKey]) -> Vec<u8> {
+    let mut keys: Vec<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH]> =
+        guardians.iter().map(VerifyingKey::to_bytes).collect();
+    keys.sort_unstable();
+    let mut hasher = Sha256::new();
+    for k in &keys {
+        hasher.update(k);
+    }
+    hasher.finalize().to_vec()
+}
+
+/// Resolve the enrolled recovery-guardian key set from
+/// [`RECOVERY_GUARDIAN_PUBKEYS_ENV`] (#1831 G17). Duplicate keys collapse;
+/// un-decodable tokens are skipped with a WARN. Mirrors
+/// [`crate::approvals::signed::enrolled_approver_keys`].
+#[must_use]
+pub fn enrolled_recovery_guardians() -> Vec<VerifyingKey> {
+    let mut keys: Vec<VerifyingKey> = Vec::new();
+    let mut seen: std::collections::HashSet<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH]> =
+        std::collections::HashSet::new();
+    if let Ok(v) = std::env::var(RECOVERY_GUARDIAN_PUBKEYS_ENV) {
+        for tok in v.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            match keypair::decode_public_base64(tok) {
+                Ok(pk) => {
+                    if seen.insert(pk.to_bytes()) {
+                        keys.push(pk);
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    target: "identity.lineage.recovery",
+                    "ignoring un-decodable recovery guardian pubkey in {RECOVERY_GUARDIAN_PUBKEYS_ENV}"
+                ),
+            }
+        }
+    }
+    keys
+}
+
+/// Resolve the EXPLICIT M-of-N recovery threshold from
+/// [`RECOVERY_THRESHOLD_ENV`] (#1831 G17 ratification delta C). Returns
+/// `None` when the var is unset / unparseable / below `1` — a recovery mint
+/// then REFUSES rather than silently defaulting a key-takeover primitive to
+/// `M = 1`. (Verification never consults this — the committed threshold
+/// rules there.)
+#[must_use]
+pub fn recovery_threshold_explicit() -> Option<usize> {
+    std::env::var(RECOVERY_THRESHOLD_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+}
+
+/// Encode an M-of-N recovery quorum as the version-tagged CBOR blob stored
+/// in a recovery record's `signature` column (#1831 G17): the CBOR array
+/// `[RECOVERY_QUORUM_FORMAT_V1, [[guardian_pubkey_b64, signature_bytes], …]]`.
+///
+/// # Errors
+/// CBOR-encode failure (in practice unreachable for the fixed shape).
+pub fn encode_recovery_quorum(quorum: &[RecoveryAttestation]) -> anyhow::Result<Vec<u8>> {
+    let pairs = ciborium::Value::Array(
+        quorum
+            .iter()
+            .map(|att| {
+                ciborium::Value::Array(vec![
+                    ciborium::Value::Text(att.guardian_pubkey_b64.clone()),
+                    ciborium::Value::Bytes(att.signature.clone()),
+                ])
+            })
+            .collect(),
+    );
+    let value = ciborium::Value::Array(vec![
+        ciborium::Value::Integer(ciborium::value::Integer::from(RECOVERY_QUORUM_FORMAT_V1)),
+        pairs,
+    ]);
+    let mut out: Vec<u8> = Vec::with_capacity(128 * quorum.len().max(1));
+    ciborium::ser::into_writer(&value, &mut out)
+        .map_err(|e| anyhow::anyhow!("CBOR encode recovery quorum: {e}"))?;
+    Ok(out)
+}
+
+/// Decode the version-tagged recovery-quorum CBOR blob (#1831 G17). `None`
+/// on any malformed shape OR an unrecognised leading format version
+/// (fail-closed so a future format is never mis-read as v1).
+#[must_use]
+pub fn decode_recovery_quorum(blob: &[u8]) -> Option<Vec<RecoveryAttestation>> {
+    let value: ciborium::Value = ciborium::de::from_reader(blob).ok()?;
+    let mut outer = value.into_array().ok()?;
+    if outer.len() != 2 {
+        return None;
+    }
+    let pairs = outer.pop()?.into_array().ok()?;
+    let version = u64::try_from(outer.pop()?.into_integer().ok()?).ok()?;
+    if version != RECOVERY_QUORUM_FORMAT_V1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pairs.len());
+    for entry in pairs {
+        let mut pair = entry.into_array().ok()?;
+        if pair.len() != 2 {
+            return None;
+        }
+        // pair = [Text pubkey_b64, Bytes signature]
+        let sig = pair.pop()?.into_bytes().ok()?;
+        let pubkey_b64 = pair.pop()?.into_text().ok()?;
+        out.push(RecoveryAttestation {
+            guardian_pubkey_b64: pubkey_b64,
+            signature: sig,
+        });
+    }
+    Some(out)
+}
+
+/// Verify ONE recovery record against its COMMITTED trust bar (#1831 G17
+/// ratification delta A). Shared by the storage append pre-flight and the
+/// [`verify_lineage_with_recovery`] walk so the two can never drift.
+///
+/// The threshold + guardian-set identity are read from the record's SIGNED
+/// body (`recovery_threshold` + `guardian_set_id`), NOT re-derived from
+/// `policy` — so rotating a guardian env or lowering the env threshold can
+/// never retroactively re-judge a persisted recovery's trust bar. `policy`
+/// supplies only the guardian KEY MATERIAL used to verify each signature; a
+/// mismatch between the committed `guardian_set_id` and a digest over the
+/// currently-enrolled set is FLAGGED (`guardian_set_drift`), not silently
+/// substituted.
+///
+/// Signature counting is skip-tolerant (aligns with the #1957 approver
+/// discipline): an attestation whose signer is not currently enrolled, or
+/// whose signature does not verify, is SKIPPED (not a hard failure) — only
+/// DISTINCT enrolled-and-valid signers count toward the committed threshold.
+///
+/// # Errors
+///
+/// [`LineageError::RecoveryQuorumInvalid`] (malformed / unversioned blob, or
+/// a recovery record missing its committed threshold / guardian-set id) or
+/// [`LineageError::RecoveryQuorumNotMet`] (fewer distinct enrolled-valid
+/// signers than the COMMITTED threshold).
+pub fn verify_recovery_record(
+    record: &LineageRecord,
+    quorum_blob: &[u8],
+    policy: &RecoveryPolicy,
+) -> Result<RecoveryVerification, LineageError> {
+    let epoch = record.epoch;
+    let invalid = || LineageError::RecoveryQuorumInvalid { epoch };
+
+    // The trust bar comes from the SIGNED body, never the verifier's env.
+    let committed_threshold =
+        usize::try_from(record.recovery_threshold.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    if committed_threshold < 1 {
+        return Err(invalid());
+    }
+    let committed_gid = record.guardian_set_id.as_deref().ok_or_else(invalid)?;
+    let current_gid = policy.guardian_set_id();
+    let guardian_set_drift = committed_gid != current_gid.as_slice();
+
+    let quorum = decode_recovery_quorum(quorum_blob).ok_or_else(invalid)?;
+    let signing_input = record.signing_input().map_err(|_| invalid())?;
+    let enrolled: std::collections::HashSet<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH]> = policy
+        .guardians
+        .iter()
+        .map(VerifyingKey::to_bytes)
+        .collect();
+    let mut distinct: std::collections::BTreeSet<[u8; ed25519_dalek::PUBLIC_KEY_LENGTH]> =
+        std::collections::BTreeSet::new();
+    for att in &quorum {
+        // Skip-tolerant: an un-decodable / unenrolled / non-verifying
+        // attestation simply does not count (it never hard-fails the walk).
+        let Ok(pk) = keypair::decode_public_base64(&att.guardian_pubkey_b64) else {
+            continue;
+        };
+        if !enrolled.contains(&pk.to_bytes()) {
+            continue;
+        }
+        let Ok(sig_arr) = <[u8; SIGNATURE_LEN]>::try_from(att.signature.as_slice()) else {
+            continue;
+        };
+        let sig = Signature::from_bytes(&sig_arr);
+        if pk.verify_strict(&signing_input, &sig).is_ok() {
+            distinct.insert(pk.to_bytes());
+        }
+    }
+    if distinct.len() < committed_threshold {
+        return Err(LineageError::RecoveryQuorumNotMet {
+            epoch,
+            distinct: distinct.len(),
+            threshold: committed_threshold,
+        });
+    }
+    Ok(RecoveryVerification {
+        distinct_signers: distinct.len(),
+        guardian_set_drift,
+    })
+}
+
 /// Walk genesis → head and return the authoritative head key.
 ///
 /// `records` are `(record, signature)` pairs in ascending-epoch order
@@ -678,6 +1162,38 @@ pub fn verify_lineage(
     records: &[(LineageRecord, Vec<u8>)],
     witness_hashes: &[Vec<u8>],
     bound_pubkey_b64: Option<&str>,
+) -> Result<VerifiedLineage, LineageError> {
+    // No recovery policy → a `recovery` record is fail-closed (its quorum
+    // can never be checked). The OBSERVABLE verdict is preserved vs v0.9.0
+    // (a recovery chain is rejected, an enrolled non-recovery chain verifies
+    // identically) — NOT byte-identical output: the no-policy recovery
+    // rejection is now the specific `RecoveryNotEnrolled` where v0.9.0
+    // produced `PredecessorMismatch` (its unit test was updated). That
+    // difference is unobservable in practice only because v0.9.0 could never
+    // PERSIST a recovery record (`append_lineage_record` bailed on it), so no
+    // v0.9.0 chain carries one to re-verify.
+    verify_lineage_with_recovery(records, witness_hashes, bound_pubkey_b64, None)
+}
+
+/// v1.0.0 #1831 (G17) — the recovery-aware genesis → head walk.
+///
+/// Identical to [`verify_lineage`] for genesis / rotation / revocation
+/// records; additionally, when `recovery_policy` is `Some`, a
+/// [`LineageReason::Recovery`] record verifies iff a valid M-of-N recovery
+/// quorum ([`verify_recovery_record`]) attests it (the key-LOSS half of
+/// G13). When `recovery_policy` is `None`, a recovery record is
+/// [`LineageError::RecoveryNotEnrolled`] (fail-closed — no guardian set to
+/// check against), preserving the v0.9.0 behaviour.
+///
+/// # Errors
+///
+/// The first [`LineageError`] encountered — fail-closed, never a fallback
+/// to a partially-verified head.
+pub fn verify_lineage_with_recovery(
+    records: &[(LineageRecord, Vec<u8>)],
+    witness_hashes: &[Vec<u8>],
+    bound_pubkey_b64: Option<&str>,
+    recovery_policy: Option<&RecoveryPolicy>,
 ) -> Result<VerifiedLineage, LineageError> {
     // Genesis shape — epoch 0, self-anchored, zero prev-hash.
     let Some((genesis, _)) = records.first() else {
@@ -713,7 +1229,13 @@ pub fn verify_lineage(
     let mut prev: Option<&LineageRecord> = None;
     // v1.0.0 #1949 — the newest revocation's compromise-from sequence
     // (verdict-surface-only; the chain still verifies past a revocation).
+    // A #1831 recovery that carries `suspected_compromise_from_seq` doubles
+    // as a revocation and feeds this window too.
     let mut revoked_from_seq: Option<u64> = None;
+    // v1.0.0 #1831 — epoch of the newest recovery on the chain + whether any
+    // verified recovery was minted against a since-drifted guardian roster.
+    let mut recovered_at_epoch: Option<u64> = None;
+    let mut recovery_guardian_set_drift = false;
     for (record, signature) in records {
         if let Some(prior) = prev {
             // Contiguity (anti-reorder / anti-drop).
@@ -741,26 +1263,51 @@ pub fn verify_lineage(
                     });
                 }
             }
-            // Authorized predecessor. Rotation AND Revocation (#1949)
-            // both hand off from the prior head key; Recovery stays
-            // fail-closed this train (verify path + fork tie-break land
-            // in v1.0).
+            // Authorized predecessor. Rotation AND Revocation (#1949) both
+            // hand off from the prior head key under a single predecessor
+            // signature. Recovery (#1831 G17) also names the prior head as
+            // `predecessor` (the LOST key it recovers FROM) but is attested
+            // by the M-of-N guardian quorum instead — its cryptographic
+            // check runs in the signature branch below.
             let hands_off_from_head = record.predecessor_pubkey_b64 == prior.successor_pubkey_b64;
-            let authorized = matches!(
-                record.reason,
-                LineageReason::Rotation | LineageReason::Revocation
-            ) && hands_off_from_head;
-            if !authorized {
-                return Err(LineageError::PredecessorMismatch {
-                    epoch: record.epoch,
-                });
+            match record.reason {
+                LineageReason::Rotation | LineageReason::Revocation => {
+                    if !hands_off_from_head {
+                        return Err(LineageError::PredecessorMismatch {
+                            epoch: record.epoch,
+                        });
+                    }
+                }
+                LineageReason::Recovery => {
+                    if !hands_off_from_head {
+                        return Err(LineageError::PredecessorMismatch {
+                            epoch: record.epoch,
+                        });
+                    }
+                    // Fail-closed with no enrolled guardian set — the
+                    // v0.9.0 posture is preserved when no policy is passed.
+                    if recovery_policy.is_none() {
+                        return Err(LineageError::RecoveryNotEnrolled {
+                            epoch: record.epoch,
+                        });
+                    }
+                }
+                // Genesis is only valid at epoch 0 (the prev == None path).
+                LineageReason::Genesis => {
+                    return Err(LineageError::PredecessorMismatch {
+                        epoch: record.epoch,
+                    });
+                }
             }
         }
 
-        // v1.0.0 #1949 — a revocation carries the compromise-from
-        // witness sequence forward; the newest revocation on the chain
-        // wins the Suspect-window report.
-        if record.reason == LineageReason::Revocation {
+        // v1.0.0 #1949/#1831 — a revocation OR a recovery may carry the
+        // compromise-from witness sequence forward; the newest wins the
+        // Suspect-window report.
+        if matches!(
+            record.reason,
+            LineageReason::Revocation | LineageReason::Recovery
+        ) {
             if let Some(from_seq) = record.suspected_compromise_from_seq {
                 revoked_from_seq = Some(from_seq);
             }
@@ -770,14 +1317,31 @@ pub fn verify_lineage(
         // append-only witness before its signature buys any trust.
         consume_witness(record)?;
 
-        // Strict Ed25519 under the (chain-authorized) predecessor key.
-        let predecessor =
-            keypair::decode_public_base64(&record.predecessor_pubkey_b64).map_err(|_| {
-                LineageError::SignatureInvalid {
+        // Cryptographic authorization — branch on reason.
+        match record.reason {
+            LineageReason::Recovery => {
+                // The M-of-N guardian quorum (against the COMMITTED threshold
+                // + guardian-set id) authorizes the fresh head. `prev` is
+                // Some here: a recovery is never the genesis record (genesis
+                // fixes epoch 0 / reason Genesis above).
+                let policy = recovery_policy.ok_or(LineageError::RecoveryNotEnrolled {
                     epoch: record.epoch,
-                }
-            })?;
-        verify_succession(record, signature, &predecessor)?;
+                })?;
+                let verified = verify_recovery_record(record, signature, policy)?;
+                recovered_at_epoch = Some(record.epoch);
+                recovery_guardian_set_drift |= verified.guardian_set_drift;
+            }
+            _ => {
+                // Strict Ed25519 under the (chain-authorized) predecessor
+                // key — genesis self-signs, rotation/revocation are signed
+                // by the prior head.
+                let predecessor = keypair::decode_public_base64(&record.predecessor_pubkey_b64)
+                    .map_err(|_| LineageError::SignatureInvalid {
+                        epoch: record.epoch,
+                    })?;
+                verify_succession(record, signature, &predecessor)?;
+            }
+        }
 
         prev = Some(record);
     }
@@ -819,6 +1383,8 @@ pub fn verify_lineage(
         records_checked: u64::try_from(records.len()).unwrap_or(u64::MAX),
         head_custody_class: head.custody_class,
         revoked_from_seq,
+        recovered_at_epoch,
+        recovery_guardian_set_drift,
     })
 }
 
@@ -1160,9 +1726,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_record_fail_closes_this_train() {
-        // The recovery VERIFY path is v1.0 — a reason=recovery record
-        // in the chain must be rejected, never trusted.
+    fn recovery_record_fail_closes_without_policy() {
+        // v1.0.0 #1831 — with NO enrolled recovery guardians (the plain
+        // `verify_lineage` no-policy path, byte-identical to v0.9.0's
+        // posture), a reason=recovery record must be rejected — never
+        // trusted. The verdict is the specific RecoveryNotEnrolled (a
+        // recovery cannot be checked without a guardian set to check it
+        // against).
         let (records, _w, _k0, k1, k2) = chain_fixture();
         let r1 = &records[1].0;
         let mut rec =
@@ -1175,6 +1745,421 @@ mod tests {
             .map(|(r, _)| r.witness_payload_hash().unwrap())
             .collect();
         let err = verify_lineage(&rebuilt, &witnesses, Some(&k2.public_base64())).unwrap_err();
+        assert_eq!(err, LineageError::RecoveryNotEnrolled { epoch: 2 });
+    }
+
+    // ------------------------------------------------------------------
+    // v1.0.0 #1831 (G17) — M-of-N threshold key recovery.
+    // ------------------------------------------------------------------
+
+    /// A guardian signs a recovery record's signing input.
+    fn guardian_sign(record: &LineageRecord, guardian: &AgentKeypair) -> RecoveryAttestation {
+        use ed25519_dalek::Signer;
+        let input = record.signing_input().expect("signing input");
+        let sig = guardian
+            .private
+            .as_ref()
+            .expect("guardian can sign")
+            .sign(&input);
+        RecoveryAttestation {
+            guardian_pubkey_b64: guardian.public_base64(),
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
+
+    fn policy(guardians: &[&AgentKeypair], threshold: usize) -> RecoveryPolicy {
+        RecoveryPolicy {
+            guardians: guardians.iter().map(|g| g.public).collect(),
+            threshold: Some(threshold),
+        }
+    }
+
+    /// Build a K0→K1 (rotation) chain whose head is then RECOVERED to a
+    /// fresh key `k_new` via an M-of-N guardian quorum. The recovery record
+    /// COMMITS `guardian_set_id` (digest over the 3-guardian set) +
+    /// `recovery_threshold` into its signed body (#1831 ratification delta
+    /// A). Returns the signed records + witnesses + the fresh head + the
+    /// guardian keypairs + a matching (no-drift) policy.
+    fn recovery_fixture(
+        committed_threshold: u64,
+        signers: usize,
+    ) -> (
+        Vec<(LineageRecord, Vec<u8>)>,
+        Vec<Vec<u8>>,
+        AgentKeypair,
+        Vec<AgentKeypair>,
+        RecoveryPolicy,
+    ) {
+        let k0 = kp("agent-a");
+        let k1 = kp("agent-a");
+        let k_new = kp("agent-a");
+        let guardians: Vec<AgentKeypair> = (0..3).map(|_| kp("guardian")).collect();
+        let guardian_keys: Vec<VerifyingKey> = guardians.iter().map(|g| g.public).collect();
+        let gid = guardian_set_id_digest(&guardian_keys);
+        let genesis = LineageRecord::genesis(
+            "agent-a",
+            &k0.public_base64(),
+            None,
+            "2026-06-01T00:00:00+00:00",
+        );
+        let r1 = LineageRecord::rotation(
+            &genesis,
+            &k1.public_base64(),
+            None,
+            "2026-06-02T00:00:00+00:00",
+        )
+        .expect("rotation r1");
+        // K1 is LOST — recover to k_new via the guardian quorum, committing
+        // the guardian-set id + threshold into the signed body.
+        let recovery = LineageRecord::recovery(
+            &r1,
+            &k_new.public_base64(),
+            None,
+            None,
+            gid,
+            committed_threshold,
+            "2026-06-10T00:00:00+00:00",
+        )
+        .expect("recovery record");
+        let quorum: Vec<RecoveryAttestation> = guardians
+            .iter()
+            .take(signers)
+            .map(|g| guardian_sign(&recovery, g))
+            .collect();
+        let quorum_blob = encode_recovery_quorum(&quorum).expect("encode quorum");
+        let records = vec![
+            signed(&genesis, &k0),
+            signed(&r1, &k0),
+            (recovery, quorum_blob),
+        ];
+        let witnesses = records
+            .iter()
+            .map(|(r, _)| r.witness_payload_hash().expect("hash"))
+            .collect();
+        // The verify policy's env threshold is deliberately DIFFERENT from
+        // the committed one (7) to prove verification ignores it.
+        let pol = policy(&guardians.iter().collect::<Vec<_>>(), 7);
+        (records, witnesses, k_new, guardians, pol)
+    }
+
+    #[test]
+    fn m_of_n_recovery_verifies_to_fresh_head() {
+        // 2-of-3 guardians recover a LOST head key to a fresh primary; the
+        // guardian roster matches the committed set → no drift.
+        let (records, witnesses, k_new, _guardians, pol) = recovery_fixture(2, 2);
+        let v = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .expect("m-of-n recovery verifies");
+        assert_eq!(v.epoch, 2);
+        assert_eq!(v.head_key.to_bytes(), k_new.public.to_bytes());
+        assert_eq!(v.recovered_at_epoch, Some(2));
+        assert!(
+            !v.recovery_guardian_set_drift,
+            "roster matches committed set"
+        );
+    }
+
+    #[test]
+    fn recovery_verify_uses_committed_threshold_not_env() {
+        // The record COMMITS threshold 2 but only 1 signer is presented;
+        // the env policy's threshold is 7 (fixture) — verification enforces
+        // the COMMITTED 2 (never the env), so 1 < 2 is under-attested. This
+        // proves a lowered env threshold can never retroactively re-judge a
+        // persisted recovery (#1831 ratification delta A killer-finding).
+        let (records, witnesses, k_new, _guardians, pol) = recovery_fixture(2, 1);
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LineageError::RecoveryQuorumNotMet {
+                epoch: 2,
+                distinct: 1,
+                threshold: 2, // the COMMITTED value, not the env's 7
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_duplicate_signer_collapses_to_one() {
+        // Present the SAME guardian twice — distinct count is 1, below the
+        // committed threshold of 2 (a duplicate never inflates the quorum).
+        let (mut records, mut witnesses, k_new, guardians, pol) = recovery_fixture(2, 0);
+        let recovery = &records[2].0;
+        let att = guardian_sign(recovery, &guardians[0]);
+        let quorum = vec![att.clone(), att];
+        records[2].1 = encode_recovery_quorum(&quorum).unwrap();
+        witnesses[2] = records[2].0.witness_payload_hash().unwrap();
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LineageError::RecoveryQuorumNotMet {
+                epoch: 2,
+                distinct: 1,
+                threshold: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_unenrolled_signer_is_skipped_not_counted() {
+        // Skip-tolerant (aligns with #1957): a signer NOT in the enrolled
+        // set does not count and does not hard-fail — the quorum simply
+        // falls short of the committed threshold (distinct 0 of 1).
+        let (mut records, mut witnesses, k_new, _guardians, pol) = recovery_fixture(1, 0);
+        let stranger = kp("stranger");
+        let recovery = &records[2].0;
+        let quorum = vec![guardian_sign(recovery, &stranger)];
+        records[2].1 = encode_recovery_quorum(&quorum).unwrap();
+        witnesses[2] = records[2].0.witness_payload_hash().unwrap();
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LineageError::RecoveryQuorumNotMet {
+                epoch: 2,
+                distinct: 0,
+                threshold: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_forged_signature_is_skipped_not_counted() {
+        // An ENROLLED guardian's slot carries a signature that does not
+        // verify (the bytes were tampered) — skipped, not counted, so the
+        // committed threshold is not met.
+        let (mut records, mut witnesses, k_new, guardians, pol) = recovery_fixture(1, 0);
+        let recovery = &records[2].0;
+        let mut att = guardian_sign(recovery, &guardians[0]);
+        att.signature[0] ^= 0xFF; // corrupt one byte
+        records[2].1 = encode_recovery_quorum(&[att]).unwrap();
+        witnesses[2] = records[2].0.witness_payload_hash().unwrap();
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LineageError::RecoveryQuorumNotMet {
+                epoch: 2,
+                distinct: 0,
+                threshold: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_malformed_or_unversioned_blob_is_invalid() {
+        // A blob that does not decode (wrong CBOR shape / unknown version)
+        // is a hard RecoveryQuorumInvalid.
+        let (mut records, mut witnesses, k_new, _guardians, pol) = recovery_fixture(1, 1);
+        records[2].1 = vec![0xFF, 0x00, 0x13]; // garbage
+        witnesses[2] = records[2].0.witness_payload_hash().unwrap();
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
+        assert_eq!(err, LineageError::RecoveryQuorumInvalid { epoch: 2 });
+    }
+
+    #[test]
+    fn recovery_guardian_set_drift_is_flagged_but_still_verifies() {
+        // The recovery commits guardian_set_id = digest{g0,g1,g2}; the
+        // verifier's enrolled set adds a 4th guardian, so the digest drifts.
+        // g0+g1 are still enrolled+valid → committed threshold 2 is met, so
+        // the chain VERIFIES with the drift ADVISORY flagged (never a silent
+        // re-derivation of the trust bar).
+        let (records, witnesses, k_new, guardians, _pol) = recovery_fixture(2, 2);
+        let extra = kp("guardian-4");
+        let mut drifted: Vec<VerifyingKey> = guardians.iter().map(|g| g.public).collect();
+        drifted.push(extra.public);
+        let pol = RecoveryPolicy {
+            guardians: drifted,
+            threshold: Some(2),
+        };
+        let v = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .expect("recovery still verifies under a drifted (superset) roster");
+        assert_eq!(v.recovered_at_epoch, Some(2));
+        assert!(
+            v.recovery_guardian_set_drift,
+            "an added guardian must flag guardian-set drift"
+        );
+    }
+
+    #[test]
+    fn recovery_carries_compromise_window_like_a_revocation_opt_in() {
+        // OPT-IN "recovery signs both fresh head + revocation" — a recovery
+        // with a suspected_compromise_from_seq surfaces the Suspect window;
+        // a pure recovery (None) leaves the predecessor's entries trusted.
+        let (records, witnesses, k_new, _guardians, pol) = recovery_fixture(2, 2);
+        // The fixture minted a PURE recovery (None) → no Suspect window.
+        let v = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap();
+        assert_eq!(v.revoked_from_seq, None, "a pure recovery revokes nothing");
+
+        // Now mint the compromise-windowed variant.
+        let k0 = kp("agent-a");
+        let k1 = kp("agent-a");
+        let k_new2 = kp("agent-a");
+        let guardians: Vec<AgentKeypair> = (0..2).map(|_| kp("guardian")).collect();
+        let gid = guardian_set_id_digest(&guardians.iter().map(|g| g.public).collect::<Vec<_>>());
+        let genesis = LineageRecord::genesis(
+            "agent-a",
+            &k0.public_base64(),
+            None,
+            "2026-06-01T00:00:00+00:00",
+        );
+        let r1 = LineageRecord::rotation(
+            &genesis,
+            &k1.public_base64(),
+            None,
+            "2026-06-02T00:00:00+00:00",
+        )
+        .unwrap();
+        let recovery = LineageRecord::recovery(
+            &r1,
+            &k_new2.public_base64(),
+            Some(77),
+            None,
+            gid,
+            2,
+            "2026-06-10T00:00:00+00:00",
+        )
+        .unwrap();
+        assert_eq!(recovery.suspected_compromise_from_seq, Some(77));
+        let quorum: Vec<RecoveryAttestation> = guardians
+            .iter()
+            .map(|g| guardian_sign(&recovery, g))
+            .collect();
+        let records = vec![
+            signed(&genesis, &k0),
+            signed(&r1, &k0),
+            (recovery, encode_recovery_quorum(&quorum).unwrap()),
+        ];
+        let witnesses: Vec<Vec<u8>> = records
+            .iter()
+            .map(|(r, _)| r.witness_payload_hash().unwrap())
+            .collect();
+        let pol = policy(&guardians.iter().collect::<Vec<_>>(), 2);
+        let v = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new2.public_base64()),
+            Some(&pol),
+        )
+        .unwrap();
+        assert_eq!(v.recovered_at_epoch, Some(2));
+        assert_eq!(v.revoked_from_seq, Some(77));
+    }
+
+    #[test]
+    fn recovery_quorum_blob_version_tag_round_trips() {
+        let g = kp("guardian");
+        let genesis = LineageRecord::genesis(
+            "agent-a",
+            &kp("agent-a").public_base64(),
+            None,
+            "2026-06-01T00:00:00+00:00",
+        );
+        let att = guardian_sign(&genesis, &g);
+        let blob = encode_recovery_quorum(std::slice::from_ref(&att)).unwrap();
+        let decoded = decode_recovery_quorum(&blob).expect("decode");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0], att);
+
+        // A blob carrying an UNKNOWN leading version fails closed.
+        let wrong_version = ciborium::Value::Array(vec![
+            ciborium::Value::Integer(ciborium::value::Integer::from(99u64)),
+            ciborium::Value::Array(vec![]),
+        ]);
+        let mut wv = Vec::new();
+        ciborium::ser::into_writer(&wrong_version, &mut wv).unwrap();
+        assert!(
+            decode_recovery_quorum(&wv).is_none(),
+            "an unrecognised quorum format version must fail closed"
+        );
+
+        // A garbage blob decodes to None (fail-closed).
+        assert!(decode_recovery_quorum(&[0xFF, 0x00, 0x13]).is_none());
+    }
+
+    #[test]
+    fn recovery_threshold_explicit_is_none_when_unset() {
+        // Ratification delta C — a mint refuses to default M to 1; the
+        // resolver returns None when the var is unset / below 1.
+        let _guard = crate::identity::keypair::key_dir_env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe { std::env::remove_var(RECOVERY_THRESHOLD_ENV) };
+        assert_eq!(recovery_threshold_explicit(), None);
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe { std::env::set_var(RECOVERY_THRESHOLD_ENV, "0") };
+        assert_eq!(recovery_threshold_explicit(), None, "0 is below the floor");
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe { std::env::set_var(RECOVERY_THRESHOLD_ENV, "3") };
+        assert_eq!(recovery_threshold_explicit(), Some(3));
+        // SAFETY: test-only env mutation serialised by the lock above.
+        unsafe { std::env::remove_var(RECOVERY_THRESHOLD_ENV) };
+    }
+
+    #[test]
+    fn recovery_wrong_predecessor_is_predecessor_mismatch() {
+        // A recovery record that does NOT name the prior head as its
+        // predecessor is rejected on the chain-shape check BEFORE the
+        // quorum is consulted (a recovery still recovers FROM the head).
+        let (mut records, mut witnesses, k_new, guardians, pol) = recovery_fixture(2, 0);
+        records[2].0.predecessor_pubkey_b64 = kp("agent-a").public_base64();
+        let quorum: Vec<RecoveryAttestation> = guardians
+            .iter()
+            .take(2)
+            .map(|g| guardian_sign(&records[2].0, g))
+            .collect();
+        records[2].1 = encode_recovery_quorum(&quorum).unwrap();
+        witnesses[2] = records[2].0.witness_payload_hash().unwrap();
+        let err = verify_lineage_with_recovery(
+            &records,
+            &witnesses,
+            Some(&k_new.public_base64()),
+            Some(&pol),
+        )
+        .unwrap_err();
         assert_eq!(err, LineageError::PredecessorMismatch { epoch: 2 });
     }
 

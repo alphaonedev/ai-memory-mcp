@@ -8,7 +8,7 @@
   "format_freeze_doc": "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
   "generator": "tests/conformance_corpus.rs",
   "license": "CC0-1.0",
-  "schema_version": 80,
+  "schema_version": 81,
   "spec": "ai-memory/portability/v2",
   "spec_doc": "docs/spec/PORTABILITY-V2.md",
   "vectors": [

@@ -85,6 +85,9 @@ pub const WRITE_SIGNATURE: &str = "write_signature";
 pub const CERT_SIGNATURE: &str = "cert_signature";
 /// `not_before` — sub-key cert validity-window start (RFC3339).
 pub const NOT_BEFORE: &str = "not_before";
+/// `signature_b64` — base64 detached-signature JSON output field (shared by
+/// the rules + #1831 recovery-guardian CLI/MCP surfaces).
+pub const SIGNATURE_B64: &str = "signature_b64";
 /// `not_after` — sub-key cert validity-window end (RFC3339).
 pub const NOT_AFTER: &str = "not_after";
 /// `instance_key_id` — certified per-instance sub-key id (base64 bytes).
