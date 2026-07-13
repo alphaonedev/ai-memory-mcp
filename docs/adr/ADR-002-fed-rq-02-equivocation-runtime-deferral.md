@@ -126,6 +126,38 @@ until FED-RQ-02 **and** FED-RQ-03 are both green with the runtime landed:
   compatible wire field (`sender_policy_seq`, `#[serde(default)]`) and a
   receive-path gate that is fail-open on absence, so pre-#1947 peers are
   byte-identical.
+- **The receive gate ships ACTIVE-but-INERT between stock daemons (honest
+  status).** The gate is wired, typed, tested, and backend-identical, but
+  **no stock daemon yet advertises `sender_policy_seq`**, so between two
+  unmodified nodes the fail-open-on-absence rule means the live T3 refusal
+  ("silent authority-under-old-rules") is **not exercised** until send-side
+  advertising lands. Send-side emission is deferred WITH the attested-manifest
+  work (not merely for convenience) because **no clean ≤3-site outbound
+  chokepoint exists**: there are **13 distinct `SyncPushBody` builders**
+  across the `broadcast_*_quorum` family + the catch-up push
+  (`src/federation/sync.rs`), `FederationConfig` carries **no db/governance
+  handle** (and `FederationConfig::build` is a boot-time constructor with no
+  governance connection in scope), and the async broadcasters hold no lock —
+  so a *live* (footgun-free) `current_policy_version()` read would require
+  either an `app.db` async lock on the **hot replication fanout** at all 13
+  sites, or a process-global seq counter bumped after every
+  `append_policy_advance` **commit** (which is `no_tx`, so the commit — and
+  thus a correct post-commit bump — lives in each *caller*: `remove_signed`,
+  `set_enabled_signed`, CLI `rules add --sign`, re-scattering the change).
+  Both exceed the A_MINIMAL blast radius and belong with the attested
+  advertising below. A boot **snapshot** was rejected outright: it goes stale
+  on a post-boot policy advance and would make a node **self-refuse** at
+  peers once it advances its own policy.
+- **The unsigned field is peer-spoofable — by design, and only in the
+  permissive direction.** `sender_policy_seq` is not signed, so a malicious
+  peer can forge a **higher** seq to EVADE the gate (claim currency it does
+  not hold). It has no incentive to forge a **lower** seq (self-refusal), so
+  the gate reliably catches an **HONEST** stale peer today. The
+  attack-resistant form is the **signed `SignableEpochManifest`**
+  `(policy_seq, policy_digest_hex)` binding (the epoch-manifest-doc
+  federation deferred above): that is the only version that resists a peer
+  lying about its governance epoch, and it is the correct home for the
+  send-side advertising.
 
 ## Alternatives rejected
 
