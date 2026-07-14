@@ -449,11 +449,15 @@ mod tests {
     /// Serialise the `$HOME`-mutating `run`/`migrate` tests — env
     /// mutation is process-global, so two of these running concurrently
     /// would race on `AppConfig::config_path()`.
+    ///
+    /// #1998: delegates to the single crate-canonical
+    /// [`crate::config::test_env_lock`]. These tests mutate `HOME`, and the
+    /// `config::tests` filter runs this module alongside `config::tests`;
+    /// a private per-module mutex here let a `HOME` restore land inside a
+    /// `config::tests` critical section (which then read the real
+    /// `~/.config/ai-memory/config.toml`). One shared lock closes the race.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::config::test_env_lock()
     }
 
     /// Run `migrate` against a `config.toml` materialised under a
