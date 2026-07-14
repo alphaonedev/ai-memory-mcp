@@ -4511,7 +4511,10 @@ mod recall_purity_flag_tests {
 
     #[test]
     fn access_fold_interval_default_zero_and_garbage() {
-        // SAFETY: single test owns this var (see above).
+        // #1998: serialise on the crate-canonical env lock so a concurrent
+        // env-mutating test in another module cannot race this var.
+        let _guard = super::test_env_lock();
+        // SAFETY: env mutation serialised by `_guard`; restored on exit.
         unsafe { std::env::remove_var(ENV_ACCESS_FOLD_INTERVAL_SECS) };
         assert_eq!(
             access_fold_interval_secs(),
@@ -4558,7 +4561,9 @@ mod recall_purity_flag_tests {
         // Post-#1952 the compiled default is Advisory, so UNSET resolves ACTIVE
         // (the probe runs by default — "defaults stop lying"). The opt-out
         // advisory notice fires only when the mode is explicitly inactive (`off`).
-        // SAFETY: single test owns this var.
+        // #1998: serialise on the crate-canonical env lock.
+        let _guard = super::test_env_lock();
+        // SAFETY: env mutation serialised by `_guard`; restored on exit.
         unsafe { std::env::remove_var(ENV_REFLECT_DECORRELATION_MODE) };
         assert_eq!(
             reflect_decorrelation_mode(),
@@ -8696,6 +8701,38 @@ impl AppConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Test-only process-global env serializer (issue #1998)
+// ---------------------------------------------------------------------------
+
+/// The ONE canonical process-global mutex serialising every test in this
+/// crate that mutates a process-global `AI_MEMORY_*` / `HOME` env var.
+///
+/// Env mutation is process-global, so two tests touching the same key under
+/// the default multi-threaded runner (`cargo test`) race non-deterministically
+/// (issue #1998). Before this existed, `config::tests`,
+/// `recall_purity_flag_tests`, and `cli::commands::config::tests` each guarded
+/// `HOME` with a *different* module-local mutex — so a `cli::commands::config`
+/// test could restore `HOME` to the real value mid-critical-section of a
+/// `config::tests` scenario, which then read the operator's real
+/// `~/.config/ai-memory/config.toml`. All three modules now funnel through this
+/// single lock so the guarantee is a genuine process-wide critical section, not
+/// a per-module one.
+///
+/// Poison-OK (rust-skills `err-no-unwrap-prod`): a scenario that panics while
+/// holding the guard still hands the next caller a usable lock, so one failing
+/// test does not cascade. Callers bind the returned guard to a
+/// `let _guard = ...` local (test-fixture-raii) — never `let _ = ...`, which
+/// would drop it immediately and defeat the serialization.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -8711,15 +8748,13 @@ mod tests {
     /// non-deterministically. Every test in this module that flips an
     /// env var MUST hold this mutex for the duration of its body.
     ///
-    /// Poison-OK: a panicking scenario that drops the guard mid-mutation
-    /// still hands the next caller a usable lock. Subsequent tests
-    /// re-establish the env state they need on entry.
+    /// #1998: this delegates to the single crate-canonical
+    /// [`super::test_env_lock`] so `config::tests`,
+    /// `recall_purity_flag_tests`, and `cli::commands::config::tests` all
+    /// serialise on ONE process-global mutex instead of three per-module
+    /// mutexes that raced on `HOME`. Poison-OK; bind to `let _guard = ...`.
     fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::test_env_lock()
     }
 
     #[test]
@@ -10681,6 +10716,15 @@ legacy_scoring = false
     #[test]
     fn default_capability_governance_helper_returns_current() {
         // Lines 1125-1127.
+        // #1998: `CapabilityGovernance::current()` reads `l1_6_attest` from
+        // the on-disk operator pubkey (a HOME/`AI_MEMORY_KEY_DIR`-derived
+        // path). Under the default multi-threaded runner a sibling test that
+        // mutates HOME / `AI_MEMORY_KEY_DIR` can flip that global BETWEEN the
+        // two `current()` reads below, so `helper != current` non-
+        // deterministically. Pin the thread's pubkey resolution to `None`
+        // (the crate-wide clean-CI escape hatch) so both reads observe the
+        // same `l1_6_attest=false` regardless of any concurrent env mutation.
+        let _no_pubkey = crate::governance::rules_store::force_no_operator_pubkey_for_test();
         let helper = default_capability_governance();
         let current = CapabilityGovernance::current();
         assert_eq!(helper, current);
