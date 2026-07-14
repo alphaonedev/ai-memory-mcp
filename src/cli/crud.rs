@@ -110,6 +110,10 @@ pub fn cmd_list(
     if let Some(ref aid) = args.agent_id {
         validate::validate_agent_id(aid)?;
     }
+    // v1.0.0 #1834 — RFC3339-validate --valid-at at the CLI entry.
+    if let Some(ref v) = args.valid_at {
+        validate::validate_valid_at(v)?;
+    }
     let conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
     let tier = args.tier.as_deref().and_then(Tier::from_str);

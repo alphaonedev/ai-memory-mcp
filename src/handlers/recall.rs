@@ -123,6 +123,19 @@ pub async fn recall_memories_get(
         )
             .into_response();
     }
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at the entry
+    // handler (recall_response returns a tuple and cannot surface a 400, so the
+    // guard belongs here). A malformed value would otherwise mis-filter via the
+    // lexicographic SQL compare.
+    if let Some(ref v) = req.valid_at
+        && let Err(e) = validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
+        )
+            .into_response();
+    }
     // #1579 B4 — negotiate the response format BEFORE doing any work.
     // `json` (default) keeps the legacy envelope; `toon` /
     // `toon_compact` reuse the MCP TOON encoder; anything else is a
@@ -194,6 +207,16 @@ pub async fn recall_memories_post(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": crate::errors::msg::invalid("as_agent", e)})),
+        )
+            .into_response();
+    }
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF (see GET path).
+    if let Some(ref v) = req.valid_at
+        && let Err(e) = validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
         )
             .into_response();
     }

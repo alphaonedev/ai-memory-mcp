@@ -184,6 +184,10 @@ pub fn run(
     if let Some(ref a) = args.as_agent {
         validate::validate_namespace(a)?;
     }
+    // v1.0.0 #1834 — RFC3339-validate --valid-at at the CLI entry.
+    if let Some(ref v) = args.valid_at {
+        validate::validate_valid_at(v)?;
+    }
     let mut conn = db::open(db_path)?;
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 

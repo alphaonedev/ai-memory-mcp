@@ -1023,6 +1023,11 @@ pub fn handle_recall_dto(
     let since: Option<&str> = explicit_since.or(scope_since.as_deref());
     let until = req.until.as_deref();
     let valid_at = req.valid_at.as_deref();
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at this entry
+    // surface so a malformed value errors instead of mis-filtering.
+    if let Some(v) = valid_at {
+        validate::validate_valid_at(v).map_err(|e| e.to_string())?;
+    }
     // #151 visibility
     let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
