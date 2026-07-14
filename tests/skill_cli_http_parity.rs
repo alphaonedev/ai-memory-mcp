@@ -36,11 +36,13 @@
 //!   POST /api/v1/skill/{id}/export      → memory_skill_export
 //!   POST /api/v1/skill/{id}/promote     → memory_skill_promote_from_reflection
 //!   POST /api/v1/skill/{id}/compose     → memory_skill_compositional_context
+//!   POST /api/v1/skill/{id}/retire      → memory_skill_retire
+//!   DELETE /api/v1/skill/{id}           → memory_skill_delete
 
 use ai_memory::cli::CliOutput;
 use ai_memory::cli::commands::skill::{
-    ComposeArgs, ExportArgs, GetArgs, ListArgs, PromoteArgs, RegisterArgs, ResourceArgs,
-    SkillAction, SkillArgs,
+    ComposeArgs, DeleteArgs, ExportArgs, GetArgs, ListArgs, PromoteArgs, RegisterArgs,
+    ResourceArgs, RetireArgs, SkillAction, SkillArgs,
 };
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
@@ -328,6 +330,168 @@ async fn http_skill_promote_route_rejects_non_reflection_400() {
 }
 
 // ---------------------------------------------------------------------------
+// #2024 — retire HTTP admin gate + CLI parity
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn http_skill_retire_by_id_200_for_admin() {
+    let (_dir, db_path) = fresh_db();
+    let id = seed_skill(&db_path, "http-retire-id");
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/skill/{id}/retire"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
+        .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, v) = read_body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "got body: {v}");
+    assert_eq!(v["retired"], json!(true));
+    assert_eq!(v["affected"], json!(1));
+}
+
+#[tokio::test]
+async fn http_skill_retire_403_for_non_admin() {
+    let (_dir, db_path) = fresh_db();
+    let id = seed_skill(&db_path, "http-retire-403");
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/v1/skill/{id}/retire"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "not-an-admin")
+        .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _v) = read_body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin retire must be 403"
+    );
+}
+
+#[test]
+fn cli_skill_retire_and_unretire_smoke() {
+    let (_dir, db_path) = fresh_db();
+    let _id = seed_skill(&db_path, "cli-retire");
+    let run = |args: SkillArgs| -> (i32, String) {
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+        let code = ai_memory::cli::commands::skill::run(&db_path, &args, None, &mut out).unwrap();
+        drop(out);
+        (code, String::from_utf8(stdout).unwrap())
+    };
+
+    let (code, text) = run(SkillArgs {
+        action: SkillAction::Retire(RetireArgs {
+            id: None,
+            name: Some("cli-retire".to_string()),
+            namespace: Some("testns".to_string()),
+            unretire: false,
+            reason: Some("obsolete".to_string()),
+            json: true,
+        }),
+    });
+    assert_eq!(code, 0);
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["retired"], json!(true));
+    assert_eq!(v["affected"], json!(1));
+
+    let (code, text) = run(SkillArgs {
+        action: SkillAction::Retire(RetireArgs {
+            id: None,
+            name: Some("cli-retire".to_string()),
+            namespace: Some("testns".to_string()),
+            unretire: true,
+            reason: None,
+            json: true,
+        }),
+    });
+    assert_eq!(code, 0);
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["unretired"], json!(true));
+    assert_eq!(v["affected"], json!(1));
+}
+
+#[tokio::test]
+async fn http_skill_delete_200_admin() {
+    let (_dir, db_path) = fresh_db();
+    let id = seed_skill(&db_path, "http-delete");
+    // Retire first (the substrate's safety gate) via the MCP handler.
+    {
+        let conn = ai_memory::db::open(&db_path).unwrap();
+        ai_memory::mcp::handle_skill_retire(
+            &conn,
+            &json!({"namespace": "testns", "name": "http-delete"}),
+            None,
+        )
+        .unwrap();
+    }
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/api/v1/skill/{id}"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "ops:admin")
+        .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, v) = read_body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "got body: {v}");
+    assert_eq!(v["purged"], json!(true));
+    assert_eq!(v["affected"], json!(1));
+}
+
+#[tokio::test]
+async fn http_skill_delete_403_non_admin() {
+    let (_dir, db_path) = fresh_db();
+    let id = seed_skill(&db_path, "http-delete-403");
+    let (router, _db) = build_router_with_db_path(&db_path);
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/api/v1/skill/{id}"))
+        .header("content-type", "application/json")
+        .header("x-agent-id", "not-an-admin")
+        .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let (status, _v) = read_body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin delete must be 403"
+    );
+}
+
+#[test]
+fn cli_skill_delete_with_confirm_smoke() {
+    let (_dir, db_path) = fresh_db();
+    let _id = seed_skill(&db_path, "cli-delete");
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut out = CliOutput::from_std(&mut stdout, &mut stderr);
+    let args = SkillArgs {
+        action: SkillAction::Delete(DeleteArgs {
+            id: None,
+            name: Some("cli-delete".to_string()),
+            namespace: Some("testns".to_string()),
+            confirm: true,
+            json: true,
+        }),
+    };
+    let code = ai_memory::cli::commands::skill::run(&db_path, &args, None, &mut out).unwrap();
+    assert_eq!(code, 0);
+    drop(out);
+    let v: Value = serde_json::from_str(&String::from_utf8(stdout).unwrap()).unwrap();
+    assert_eq!(v["purged"], json!(true));
+    assert_eq!(v["affected"], json!(1));
+}
+
+// ---------------------------------------------------------------------------
 // CLI tests — complement the in-module unit suite by covering verbs the
 // unit tests don't (resource, promote happy-path is hard without a real
 // reflection chain; cover error paths and list output here).
@@ -384,6 +548,7 @@ fn cli_skill_list_with_namespace_filter_smoke() {
         action: SkillAction::List(ListArgs {
             namespace: Some("testns".to_string()),
             filter: None,
+            include_retired: false,
             json: true,
         }),
     };

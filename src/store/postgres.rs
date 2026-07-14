@@ -667,7 +667,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 81;
+const CURRENT_SCHEMA_VERSION: i32 = 82;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1564,8 +1564,11 @@ impl PostgresStore {
         if current_version < 80 {
             self.migrate_v80().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 81 {
             self.migrate_v81().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v82().await?;
         }
 
         Ok(())
@@ -3955,7 +3958,9 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("apply v81 lineage recovery quorum", e))?;
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v82
+        // now sits at the ladder head, so v81 must record exactly 81.
+        record_schema_version(&mut tx, 81).await?;
         tx.commit()
             .await
             .map_err(|e| to_store_err("commit v81 ddl", e))?;
@@ -3964,6 +3969,39 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v81 applied (#1831 G17: agent_lineage guardian_set_id + \
              recovery_threshold)"
+        );
+        Ok(())
+    }
+
+    /// v82 (#2024, v1.0.0) — operator-authorized skill retire/unretire
+    /// lifecycle. The `skills` table is SQLite-only (the L1-5 Agent
+    /// Skills substrate never landed on the postgres backend), so there
+    /// is nothing to apply here — this arm is a version-stamp no-op
+    /// (the v51 / v55 / v65 / v66 / v69 precedent), keeping
+    /// `CURRENT_SCHEMA_VERSION` in lockstep so `postgres_schema_parity`
+    /// stays green. Stamps `CURRENT_SCHEMA_VERSION` as the new ladder
+    /// head.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Backend` on a stamp failure.
+    async fn migrate_v82(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v82 tx", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v82 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v82 applied (#2024: skill retire/unretire columns \
+             are sqlite-only; postgres ships no skills table — version-stamp no-op)"
         );
         Ok(())
     }

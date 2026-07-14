@@ -2831,6 +2831,12 @@
               "null"
             ]
           },
+          "include_retired": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "namespace": {
             "type": [
               "string",
@@ -2918,6 +2924,86 @@
         "type": "object"
       },
       "name": "memory_skill_promote_from_reflection"
+    },
+    {
+      "description": "Retire (hide + block",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unretire": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_retire"
+    },
+    {
+      "description": "Hard-purge an entire skill",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "force": {
+            "default": false,
+            "type": "boolean"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_delete"
     },
     {
       "description": "Skill body +",
