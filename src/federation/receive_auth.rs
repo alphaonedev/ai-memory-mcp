@@ -252,6 +252,21 @@ pub const FED_REQUIRE_SIGNAL_SIG_DEFAULT: bool = true;
 /// manual substitute for the deferred TOFU key distribution.
 pub const CAUSE_UNENROLLED_AUTHOR_STRICT: &str = "unenrolled_author_strict";
 
+/// Closed-set attestation-refusal cause label: an HONORED third-party relay
+/// under the strict write-sig flip carried no `metadata.write_signature`.
+/// Observability-only (a `tracing` field, NOT matched by
+/// [`crate::federation::push_dlq::classify_quarantine_cause`]); the
+/// SSOT-shared sibling of [`CAUSE_UNENROLLED_AUTHOR_STRICT`] so the two
+/// receive twins (`federation_receive.rs` sqlite + `federation_signing_check.rs`
+/// postgres) cannot drift the token.
+pub const CAUSE_MISSING_SIGNATURE: &str = "missing_signature";
+
+/// Closed-set attestation-refusal cause label: a `write_signature` was present
+/// but failed verification (forged / malformed) against the enrolled key.
+/// Observability-only; SSOT-shared across the two receive twins (see
+/// [`CAUSE_MISSING_SIGNATURE`]).
+pub const CAUSE_FORGED_OR_MALFORMED: &str = "forged_or_malformed";
+
 /// Resolve a DATA-lane fed-sig requirement against its (flip-ready) default:
 ///
 /// - an explicit FALSY token (`0`/`false`/`no`/`off`, trimmed) is the
@@ -282,24 +297,22 @@ pub const REQUIRE_WRITE_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_WRITE_SIG";
 /// Whether HONORED third-party relayed memory writes must carry a valid
 /// per-write content signature.
 ///
-/// **Default permissive (`false`)** per the #1464 5-agent vote (`4d3ea1c5`):
-/// a relayed memory is *data* (replication), not an authority-granting write,
-/// so it keeps the documented accept-and-flag posture — an unsigned relayed
-/// write lands `attest_level=claimed` rather than being refused (contrast the
-/// authority lane [`require_transition_sig_enabled`], default fail-closed).
-/// Defaulting this ON would self-DOS a heterogeneous mesh whose authors do
-/// not yet emit per-write signatures.
-///
-/// When the operator opts in (`1`/`true`/`yes`/`on`), a HONORED third-party
-/// relayed claim (`attribute_agent != sender`) without a valid signature is
-/// refused; self-authored relays (`attribute_agent == sender`, already gated
-/// by the #238 envelope attestation + #29 signature + #30 nonce + #43
-/// enrollment) stay faith-based. A *forged* signature is rejected
-/// unconditionally regardless of this knob (the [`crate::identity::verify::attest_write`]
-/// gate). Mirrors the pre-v0.9 secure-opt-in shape of
-/// `AI_MEMORY_REQUIRE_AGENT_ATTESTATION` (#48, the local-write sibling,
-/// whose store-path default flipped to required in v0.9 per #1751 — this
-/// federation knob deliberately keeps its own permissive opt-in default).
+/// **Default fail-closed (`true`)** as of the v1.0.0 flip
+/// ([`FED_REQUIRE_WRITE_SIG_DEFAULT`], #1801→#1954, 5-agent vote `w9mr01vi8`):
+/// federation inbound IS the network surface (ruling `9e9c3cf2` condition 7),
+/// so an UNSET env resolves STRICT (v0.10.0 shipped the one-cycle deprecation
+/// WARN via [`FED_REQUIRE_WRITE_SIG_FLIP_WARNING`]). Under the flip a HONORED
+/// third-party relayed claim (`attribute_agent != sender`) without a valid
+/// signature is refused; the staged-rollout opt-out
+/// `AI_MEMORY_FED_REQUIRE_WRITE_SIG=0` reverts to the permissive
+/// accept-and-flag posture (`attest_level=claimed`) during peer key-enrollment.
+/// Self-authored relays (`attribute_agent == sender`, already gated by the
+/// #238 envelope attestation + #29 signature + #30 nonce + #43 enrollment)
+/// stay faith-based, so the flip never bricks self-authored replication. A
+/// *forged* signature is rejected unconditionally regardless of this knob (the
+/// [`crate::identity::verify::attest_write`] gate). Contrast the authority lane
+/// [`require_transition_sig_enabled`] (also fail-closed); the signal sibling is
+/// [`require_signal_sig_enabled`].
 #[must_use]
 pub fn require_write_sig_enabled() -> bool {
     resolve_fed_sig_flag(REQUIRE_WRITE_SIG_ENV, FED_REQUIRE_WRITE_SIG_DEFAULT)
@@ -313,16 +326,16 @@ pub const REQUIRE_SIGNAL_SIG_ENV: &str = "AI_MEMORY_FED_REQUIRE_SIGNAL_SIG";
 /// Whether an inbound relayed signal must be cryptographically signed by its
 /// `from_agent`'s locally-**enrolled** key.
 ///
-/// **Default permissive (`false`)** per the #1843 5-agent vote (`4d3ea1c5`):
-/// a relayed signal is *data* (a message), not an authority-granting write, so
-/// it keeps the documented accept-and-flag posture (contrast the authority lane
-/// [`require_transition_sig_enabled`], default fail-closed). The always-on base
-/// gate (Layer 1, in the `/sync/push` signal loop) already binds `from_agent`
-/// to the enrolled peer's authorship allowlist under an enrolled posture;
-/// defaulting this ON would self-DOS a heterogeneous mesh whose signal authors
-/// are not yet key-enrolled locally.
+/// **Default fail-closed (`true`)** as of the v1.0.0 flip
+/// ([`FED_REQUIRE_SIGNAL_SIG_DEFAULT`], #1801→#1954 item 5): an UNSET env
+/// resolves STRICT and an explicit `=0`/falsy token is the staged-rollout
+/// opt-out during peer key-enrollment. The always-on base gate (Layer 1, in
+/// the `/sync/push` signal loop) already binds `from_agent` to the enrolled
+/// peer's authorship allowlist under an enrolled posture; this knob adds the
+/// per-signal enrolled-key verification. Contrast the authority lane
+/// [`require_transition_sig_enabled`] (also fail-closed).
 ///
-/// When the operator opts in (`1`/`true`/`yes`/`on`), an inbound signal is
+/// When enabled (the v1.0.0 default; or an explicit `1`/`true`/`yes`/`on`), an inbound signal is
 /// applied only when `signal.signature` verifies against `from_agent`'s
 /// locally-enrolled Ed25519 key (binds `from_agent → enrolled key`; the wire
 /// `sender_pubkey` is NOT trusted for this check — verifying against it would
