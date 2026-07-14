@@ -226,6 +226,12 @@ jobs:
           key: hf-models-minilm-l6-v2-marco-l6-v2-v1
 
       - name: Pre-stage HF models with retry (#2019)
+        env:
+          # #2019b — bypass the HF Xet CAS backend (cas-server.xethub.hf.co),
+          # which intermittently returns 401 on the reconstruction endpoint and
+          # failed the pre-stage on 2026-07-14. The Rust hf-hub the tests use is
+          # classic (non-Xet), so the staged classic cache is what they read.
+          HF_HUB_DISABLE_XET: "1"
         run: |
           set -euo pipefail
           python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
