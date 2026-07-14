@@ -722,7 +722,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // attested-CANDIDATE set (uncapped COUNT(*) + marker-scoped query) to fix
     // the enforce-bypass; +~30 lines land postgres.rs at 26_603; ceiling
     // 26_650 (+47).
-    ("src/store/postgres.rs", 26_650),
+    // 2026-07-14 (#1873): the pg verify_audit_trail twin's head-hash recompute
+    // (audit-head hash-anchor check, K3 parity) lands postgres.rs at 26_661;
+    // ceiling 26_720 (+59).
+    ("src/store/postgres.rs", 26_720),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

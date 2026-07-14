@@ -10571,6 +10571,63 @@ impl PostgresStore {
         // an IDENTICAL verdict to sqlite (K3 parity).
         let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
 
+        // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check (postgres twin
+        // of the sqlite `head_hash`). Recompute the surviving signed_events head
+        // row's canonical hash (mirrors the append-time head_view at ~10076 +
+        // sqlite `read_chain_head`, so the pg watermark anchor and this
+        // recompute agree) and feed it to the SHARED `compute_head_hash_verdict`
+        // under the SAME equal-sequence gate → IDENTICAL verdict to sqlite (K3).
+        let recomputed_head_hex: Option<String> = {
+            type HeadRow = (
+                String,
+                String,
+                String,
+                Vec<u8>,
+                Option<Vec<u8>>,
+                String,
+                chrono::DateTime<chrono::Utc>,
+                Option<i64>,
+                Option<Vec<u8>>,
+            );
+            let row: Option<HeadRow> = sqlx::query_as(
+                "SELECT id, agent_id, event_type, payload_hash, signature, attest_level, \
+                        timestamp, sequence, cause_hash \
+                 FROM signed_events ORDER BY COALESCE(sequence, 0) DESC, ctid DESC LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+            row.map(|(id, agent, ty, payload, sig, attest, ts, seq, cause)| {
+                use sha2::{Digest, Sha256};
+                let event = crate::signed_events::SignedEvent {
+                    id,
+                    agent_id: agent,
+                    event_type: ty,
+                    payload_hash: payload,
+                    signature: sig,
+                    attest_level: attest,
+                    timestamp: ts.to_rfc3339(),
+                    prev_hash: Vec::new(),
+                    sequence: seq.unwrap_or(0),
+                    cause_hash: cause,
+                };
+                let mut h = Sha256::new();
+                h.update(crate::signed_events::canonical_chain_bytes(&event));
+                crate::signed_events::hex_lower(h.finalize().as_slice())
+            })
+        };
+        let head_hash = match crate::governance::audit::last_audit_watermark() {
+            Some((anchored_head, anchored_hash)) if head_sequence == anchored_head => {
+                crate::signed_events::compute_head_hash_verdict(
+                    Some(&anchored_hash),
+                    recomputed_head_hex.as_deref(),
+                    "signed_events",
+                )
+            }
+            _ => crate::signed_events::HeadHashCheck::Unknown,
+        };
+
         Ok(crate::signed_events::AuditTrailReport {
             total_events,
             chain_intact,
@@ -10580,6 +10637,7 @@ impl PostgresStore {
             since: since.map(ToString::to_string),
             truncation,
             witness,
+            head_hash,
             cause_binding,
             signature_failures,
             role_separation,
