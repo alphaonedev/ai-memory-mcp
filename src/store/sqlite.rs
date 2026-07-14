@@ -295,7 +295,15 @@ impl MemoryStore for SqliteStore {
             &conn,
             filter.namespace.as_deref(),
             filter.tier.as_ref(),
-            if filter.limit == 0 { 100 } else { filter.limit },
+            // #1877 — clamp to `LIST_MAX_LIMIT` for SAL parity with
+            // `PostgresStore::list` (which clamps to the same cap). Without this
+            // a caller with `limit > 1000` read a different window per backend.
+            // Paging past the first window rides #1876 (a `Filter` offset).
+            if filter.limit == 0 {
+                100
+            } else {
+                filter.limit.min(crate::storage::LIST_MAX_LIMIT)
+            },
             0,
             None,
             since.as_deref(),
