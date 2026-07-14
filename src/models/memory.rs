@@ -1581,6 +1581,14 @@ pub struct UpdateMemory {
     /// Validated by `validate::validate_source_uri` before reaching
     /// storage.
     pub source_uri: Option<String>,
+    /// v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None`
+    /// leaves the stored value alone (COALESCE at the SQL layer); `Some(v)`
+    /// closes or moves the claim's VALID interval. `valid_from` is IMMUTABLE
+    /// (the genesis assertion instant) and is deliberately absent from this
+    /// patch — it is never updatable. Validated by `validate::validate_valid_at`
+    /// before reaching storage.
+    #[serde(default)]
+    pub valid_until: Option<String>,
     /// v0.7.0 #930 SECURITY-high (Track A P9, 2026-05-20) — optional
     /// caller-asserted `agent_id` for body/header parity. When set,
     /// MUST match the resolved `X-Agent-Id` header (Full-Measure-A

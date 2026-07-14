@@ -4528,6 +4528,10 @@ impl PostgresStore {
                     ))
                 END,
                 source_uri = COALESCE($10, source_uri),
+                -- v1.0.0 #1834 — opt-in claim-bitemporal valid_until patch
+                -- ($14). valid_from is IMMUTABLE (absent from this SET), so the
+                -- genesis assertion instant is always preserved. TEXT RFC3339.
+                valid_until = COALESCE($14, valid_until),
                 -- #1628/#1626 — If-Match PUTs route through this method
                 -- on postgres, so it must mirror the trait `update`'s
                 -- expires_at semantics including the #1626 tier→long
@@ -4576,6 +4580,8 @@ impl PostgresStore {
         // #228 Commit B — encrypted_envelope ($13): sealed ciphertext when
         // encryption is on, NULL when off (paired with the $3 content).
         .bind(upd_encrypted_envelope)
+        // v1.0.0 #1834 — valid_until COALESCE slot ($14); TEXT RFC3339.
+        .bind(patch.valid_until)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("update_with_expected_version", e))?
@@ -21435,6 +21441,9 @@ impl MemoryStore for PostgresStore {
             confidence: Some(snap_confidence),
             metadata: Some(snap_meta),
             source_uri: snap_source_uri,
+            // v1.0.0 #1834 — undo-edit path; valid_until not yet snapshotted on
+            // postgres archive (tracked separately), so leave it untouched.
+            valid_until: None,
             expires_at: snap_expires_at,
             lifecycle_state: None,
         };

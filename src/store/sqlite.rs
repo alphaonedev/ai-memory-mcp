@@ -243,6 +243,8 @@ impl MemoryStore for SqliteStore {
             patch.metadata.as_ref(),
             patch.source_uri.as_deref(),
             None,
+            // v1.0.0 #1834 — thread the patch's valid_until (valid_from immutable).
+            patch.valid_until.as_deref(),
         )
         .map_err(box_err)?;
         if !found {

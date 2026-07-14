@@ -268,6 +268,7 @@ fn content_update_writes_one_identity_only_supersede_leaf() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("content update");
     assert!(found && content_changed, "the content update must land");
@@ -475,6 +476,7 @@ fn run_convergence_case(flag: bool) -> (String, String, i64) {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("supersede local head");
     assert!(found && changed);
@@ -631,6 +633,7 @@ fn flag_off_writes_no_revision_leaves() {
         None,
         None,
         Some(1),
+        None, // #1834 valid_until
     )
     .expect("update");
 

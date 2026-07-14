@@ -2070,7 +2070,7 @@ pub fn update(
 ) -> Result<(bool, bool)> {
     update_with_expected_version(
         conn, id, title, content, tier, namespace, tags, priority, confidence, expires_at,
-        metadata, None, None,
+        metadata, None, None, None,
     )
 }
 
@@ -2103,6 +2103,11 @@ pub fn update_with_expected_version(
     metadata: Option<&serde_json::Value>,
     source_uri: Option<&str>,
     expected_version: Option<i64>,
+    // v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None` leaves
+    // the stored value alone (COALESCE at the SQL layer); `Some(v)` closes/moves
+    // the claim's valid interval. `valid_from` is IMMUTABLE — it is never in the
+    // UPDATE SET list, so it is always preserved (the genesis assertion instant).
+    valid_until: Option<&str>,
 ) -> Result<(bool, bool)> {
     // #1955 R45 — record-stop fence for the update funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -2175,6 +2180,11 @@ pub fn update_with_expected_version(
         source_uri: source_uri
             .map(str::to_string)
             .or_else(|| existing.source_uri.clone()),
+        // v1.0.0 #1834 — reflect the post-merge valid_until for governance
+        // (valid_from is carried immutably by the `..existing` spread).
+        valid_until: valid_until
+            .map(str::to_string)
+            .or_else(|| existing.valid_until.clone()),
         ..existing.clone()
     };
     consult_governance_pre_write(&governed)?;
@@ -2256,9 +2266,9 @@ pub fn update_with_expected_version(
             )?;
         }
         let update_res = conn.execute(
-            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, valid_until = COALESCE(?15, valid_until), version = version + 1
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
-            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope],
+            params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope, valid_until],
         );
         match update_res {
             Ok(0) => {
@@ -3247,6 +3257,10 @@ pub fn undo_in_place_edit(
         Some(&snap.metadata),
         snap.source_uri.as_deref(),
         Some(live.version),
+        // v1.0.0 #1834 — undo-edit path; UndoSnapshot does not yet carry
+        // valid_until (tracked with the archive-columns work), so leave the
+        // live value untouched (valid_from is immutable regardless).
+        None,
     )?;
     if !found {
         // Row vanished between our read and the update (or version

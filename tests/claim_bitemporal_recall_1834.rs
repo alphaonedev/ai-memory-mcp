@@ -42,6 +42,7 @@ const TERM: &str = "bitemporal";
 // Interval endpoints used across the scenarios.
 const T_JAN: &str = "2026-01-01T00:00:00+00:00";
 const T_JUN: &str = "2026-06-01T00:00:00+00:00";
+const T_SEP: &str = "2026-09-01T00:00:00+00:00";
 
 fn mem(title: &str, valid_from: Option<&str>, valid_until: Option<&str>) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
@@ -169,6 +170,56 @@ fn list_surface_applies_valid_at_with_the_same_half_open_contract() {
         titles_list(&conn, Some("2025-12-01T00:00:00+00:00")),
         vec!["alpha"]
     );
+}
+
+#[test]
+fn update_closes_valid_until_while_valid_from_stays_immutable() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_tmp, conn) = fresh_db();
+    // Charlie is open-ended [JUN, ∞): visible at every instant >= JUN.
+    let id = storage::insert(&conn, &mem("charlie", Some(T_JUN), None)).expect("insert");
+    assert!(titles_keyword(&conn, Some("2026-10-01T00:00:00+00:00")).contains(&"charlie".into()));
+
+    // Close the claim at SEP via an in-place update (valid_from is IMMUTABLE —
+    // there is no update param for it; only valid_until moves).
+    let (found, _) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None, // title
+        None, // content
+        None, // tier
+        None, // namespace
+        None, // tags
+        None, // priority
+        None, // confidence
+        None, // expires_at
+        None, // metadata
+        None, // source_uri
+        None, // expected_version
+        Some(T_SEP),
+    )
+    .expect("update valid_until");
+    assert!(found);
+
+    let row = storage::get(&conn, &id).expect("get").expect("present");
+    assert_eq!(
+        row.valid_from.as_deref(),
+        Some(T_JUN),
+        "valid_from must stay immutable across a valid_until update"
+    );
+    assert_eq!(
+        row.valid_until.as_deref(),
+        Some(T_SEP),
+        "valid_until must be updated to the new close instant"
+    );
+
+    // The closed interval is now [JUN, SEP): visible in JUL, hidden in OCT
+    // (end-exclusive), and at exactly SEP (end-exclusive) charlie is gone.
+    assert!(titles_keyword(&conn, Some("2026-07-01T00:00:00+00:00")).contains(&"charlie".into()));
+    assert!(!titles_keyword(&conn, Some("2026-10-01T00:00:00+00:00")).contains(&"charlie".into()));
+    assert!(!titles_keyword(&conn, Some(T_SEP)).contains(&"charlie".into()));
 }
 
 #[test]

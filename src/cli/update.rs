@@ -39,6 +39,10 @@ pub struct UpdateArgs {
     /// `crate::validate::validate_source_uri`.
     #[arg(long)]
     pub source_uri: Option<String>,
+    /// #1834 claim-bitemporal: close/move the claim's valid_until (RFC3339).
+    /// valid_from is immutable (the genesis assertion instant).
+    #[arg(long)]
+    pub valid_until: Option<String>,
     /// v0.7.0 F2.4 (#1428) — optimistic-concurrency gate per #884.
     /// When set, the update only proceeds if the row's current
     /// `version` field matches; mismatch returns VERSION_CONFLICT.
@@ -95,6 +99,10 @@ pub fn run(
     {
         validate::validate_expires_at_format(ts)?;
     }
+    // v1.0.0 #1834 — RFC3339-validate --valid-until at the CLI entry.
+    if let Some(ref v) = args.valid_until {
+        validate::validate_valid_at(v)?;
+    }
     // v0.7.0 F2.4 (#1428) — validate the new metadata / source_uri /
     // expected_version flags before issuing the update.
     let metadata_patch: Option<serde_json::Value> = match args.metadata.as_deref() {
@@ -141,6 +149,8 @@ pub fn run(
         metadata_patch.as_ref(),
         args.source_uri.as_deref(),
         args.expected_version,
+        // v1.0.0 #1834 — opt-in valid_until patch (valid_from immutable).
+        args.valid_until.as_deref(),
     )?;
     if !found {
         writeln!(out.stderr, "{}", crate::errors::msg::not_found(&args.id))?;
@@ -194,6 +204,7 @@ mod tests {
             // v0.7.0 F2.4 (#1428) — new CLI flags
             metadata: None,
             source_uri: None,
+            valid_until: None,
             expected_version: None,
         }
     }

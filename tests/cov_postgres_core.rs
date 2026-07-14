@@ -212,6 +212,7 @@ async fn update_all_patch_fields() {
         confidence: Some(0.5),
         metadata: Some(serde_json::json!({"agent_id":"ai:cov4","note":"x"})),
         source_uri: Some("doc:cov4".to_string()),
+        valid_until: None,
         expires_at: None,
         namespace: None,
         lifecycle_state: None,

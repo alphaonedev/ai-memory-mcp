@@ -3432,6 +3432,12 @@ pub struct UpdatePatch {
     /// before reaching the storage layer; the storage layer trusts the
     /// patch as already-validated.
     pub source_uri: Option<String>,
+    /// v1.0.0 #1834 — opt-in claim-bitemporal `valid_until` patch. `None`
+    /// leaves the stored value untouched (COALESCE on the SQL layer); `Some(v)`
+    /// closes or moves the claim's VALID interval. `valid_from` is IMMUTABLE
+    /// (never in this patch — the genesis assertion instant). Validated via
+    /// `crate::validate::validate_valid_at` before reaching storage.
+    pub valid_until: Option<String>,
     /// v0.7.0 #1423 — opt-in expires_at patch. Pre-#1423 the postgres
     /// PUT handler silently dropped `body.expires_at` because this
     /// field didn't exist on the patch — `UpdateMemory.expires_at`
