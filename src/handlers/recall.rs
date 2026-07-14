@@ -327,6 +327,10 @@ async fn recall_response(
     let tags = req.tags.as_deref();
     let since = req.since.as_deref();
     let until = req.until.as_deref();
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. RFC3339 shape is validated at the
+    // entry handlers (GET/POST/MCP/CLI); here it is threaded into the recall
+    // SQL where it filters `valid_from`/`valid_until` (end-exclusive).
+    let valid_at = req.valid_at.as_deref();
     let as_agent = req.as_agent.as_deref();
     let budget_tokens = req.resolved_budget_tokens();
     let has_citations = req.has_citations.unwrap_or(false);
@@ -701,6 +705,7 @@ async fn recall_response(
     let tags_owned = tags.map(str::to_string);
     let since_owned = since.map(str::to_string);
     let until_owned = until.map(str::to_string);
+    let valid_at_owned = valid_at.map(str::to_string);
     let source_uri_owned = source_uri_prefix.map(str::to_string);
     let agent_owned = as_agent.or(caller_principal).map(str::to_string);
     let caller_owned = caller_principal.map(str::to_string);
@@ -758,6 +763,7 @@ async fn recall_response(
                 false,
                 source_uri_owned.as_deref(),
                 caller_owned.as_deref(),
+                valid_at_owned.as_deref(),
             );
             (r, "keyword")
         }

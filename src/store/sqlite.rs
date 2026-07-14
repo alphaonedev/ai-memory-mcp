@@ -784,6 +784,10 @@ impl MemoryStore for SqliteStore {
                 false,
                 None,
                 vis_caller,
+                // v1.0.0 #1834 — TODO(next): thread `Filter.valid_at` here + into
+                // db::recall_hybrid so the SAL recall path filters by valid-time.
+                // The direct HTTP/MCP db::recall path already honours valid_at.
+                None,
             )
             .map_err(box_err)?
             .0

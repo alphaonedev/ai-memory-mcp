@@ -5315,6 +5315,8 @@ pub fn recall_with_telemetry(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF, threaded to `recall`.
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -5335,6 +5337,7 @@ pub fn recall_with_telemetry(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )?;
     let telemetry = crate::models::RecallTelemetry {
         fts_candidates: results.len(),
@@ -5381,6 +5384,9 @@ pub fn recall(
     // ownership, not namespace. DISTINCT from `as_agent` (the
     // namespace). `None` = fail-closed (no private rows).
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    // `None` = no valid-time filter (bound to ?13, NULL-guarded in the SQL).
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let now = Utc::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
@@ -5409,9 +5415,11 @@ pub fn recall(
     // #1720 A3 — `source_uri` renumbered ?12 → ?13: the caller
     // placeholder (?12) binds right after the visibility prefixes
     // (?8..?11), so the trailing source_uri LIKE filter shifts up one.
+    // #1834 — the claim-bitemporal AS-OF param takes ?13 (always bound,
+    // NULL-guarded), so the conditional source_uri LIKE filter shifts to ?14.
     let (source_uri_fragment, source_uri_param): (&str, Option<String>) = match source_uri_prefix {
         Some(prefix) if !prefix.is_empty() => (
-            "AND m.source_uri LIKE ?13 ESCAPE '\\'",
+            "AND m.source_uri LIKE ?14 ESCAPE '\\'",
             Some(format!("{}%", escape_like_pattern(prefix))),
         ),
         _ => ("", None),
@@ -5445,6 +5453,13 @@ pub fn recall(
            AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ?4))
            AND (?5 IS NULL OR m.created_at >= ?5)
            AND (?6 IS NULL OR m.created_at <= ?6)
+           -- #1834 claim-bitemporal AS-OF (?13): return only claims asserted to
+           -- hold at valid_at — half-open [valid_from, valid_until), END-
+           -- EXCLUSIVE, symmetric NULL=unbounded. NULL-guarded so `None`
+           -- (?13 IS NULL) is a no-op, byte-identical to the pre-#1834 result.
+           -- DISTINCT from since/until (?5/?6) which bound created_at.
+           AND (?13 IS NULL OR ((m.valid_from IS NULL OR m.valid_from <= ?13)
+                                AND (m.valid_until IS NULL OR m.valid_until > ?13)))
            {archived_fragment}
            {source_uri_fragment}
            {vis}
@@ -5485,7 +5500,8 @@ pub fn recall(
                 vis_u,
                 vis_o,
                 caller,    // ?12
-                uri_param, // ?13
+                valid_at,  // ?13
+                uri_param, // ?14
             ],
             row_handler,
         )?;
@@ -5504,7 +5520,8 @@ pub fn recall(
                 vis_t,
                 vis_u,
                 vis_o,
-                caller, // ?12
+                caller,   // ?12
+                valid_at, // ?13
             ],
             row_handler,
         )?;

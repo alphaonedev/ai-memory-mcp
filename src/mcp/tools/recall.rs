@@ -1022,6 +1022,7 @@ pub fn handle_recall_dto(
     let tags = req.tags.as_deref();
     let since: Option<&str> = explicit_since.or(scope_since.as_deref());
     let until = req.until.as_deref();
+    let valid_at = req.valid_at.as_deref();
     // #151 visibility
     let as_agent = req.as_agent.as_deref();
     if let Some(a) = as_agent {
@@ -1331,6 +1332,7 @@ pub fn handle_recall_dto(
         source_uri_prefix.as_deref(),
         // v0.8.0 #1720 A3 — owner-keyed visibility caller.
         caller,
+        valid_at,
     )
     .map_err(|e| e.to_string())?;
     let results = crate::cli::recall::apply_form4_recall_filters(

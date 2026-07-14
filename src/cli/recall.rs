@@ -465,6 +465,7 @@ pub(crate) fn run_with_embedder(
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
                     vis_caller.as_deref(),
+                    args.valid_at.as_deref(),
                 )?;
                 (results, outcome, "keyword")
             }
@@ -485,6 +486,7 @@ pub(crate) fn run_with_embedder(
             args.include_archived,
             args.source_uri_prefix.as_deref(),
             vis_caller.as_deref(),
+            args.valid_at.as_deref(),
         )?;
         (results, outcome, "keyword")
     };
