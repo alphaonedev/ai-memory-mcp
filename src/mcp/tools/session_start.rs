@@ -72,6 +72,7 @@ pub(crate) fn handle_session_start(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .map_err(|e| e.to_string())?;
 

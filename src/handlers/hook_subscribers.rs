@@ -575,6 +575,7 @@ async fn set_namespace_standard_inner(
             None,
             Some(NAMESPACE_STANDARD_TAG),
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .ok()
         .and_then(|v| v.into_iter().next());

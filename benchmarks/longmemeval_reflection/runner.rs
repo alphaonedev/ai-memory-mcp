@@ -657,6 +657,7 @@ where
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     let reflections: Vec<&Memory> = all_in_ns
         .iter()

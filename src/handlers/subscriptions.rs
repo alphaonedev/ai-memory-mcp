@@ -528,6 +528,7 @@ pub async fn subscribe(
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .ok()
         .and_then(|rows| {

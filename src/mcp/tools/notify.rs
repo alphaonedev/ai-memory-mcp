@@ -143,6 +143,7 @@ pub fn handle_inbox(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .map_err(|e| e.to_string())?;
     let filtered: Vec<&Memory> = items

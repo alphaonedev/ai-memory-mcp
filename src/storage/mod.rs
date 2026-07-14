@@ -4650,6 +4650,10 @@ pub fn build_list_query(
     until: Option<&str>,
     tags_filter: Option<&str>,
     agent_id: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF (RFC3339). When set, restrict to
+    // rows whose half-open [valid_from, valid_until) window (END-EXCLUSIVE;
+    // NULL bounds = unbounded) contains the instant. `None` = no filter.
+    valid_at: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
@@ -4685,6 +4689,14 @@ pub fn build_list_query(
         sql.push_str(" AND agent_id_idx = ?");
         params_vec.push(Box::new(a.to_string()));
     }
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. Half-open [valid_from, valid_until)
+    // END-EXCLUSIVE; NULL bounds unbounded. Bound twice (one per placeholder)
+    // in the dynamic sequential param order.
+    if let Some(v) = valid_at {
+        sql.push_str(" AND (valid_from IS NULL OR valid_from <= ?) AND (valid_until IS NULL OR valid_until > ?)");
+        params_vec.push(Box::new(v.to_string()));
+        params_vec.push(Box::new(v.to_string()));
+    }
     // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list hides
     // Tombstoned/Quarantined (and any unknown state) from list. No alias in
     // SQL_LIST_BASE, so the unqualified column is used.
@@ -4708,6 +4720,8 @@ pub fn list(
     until: Option<&str>,
     tags_filter: Option<&str>,
     agent_id: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF. See [`build_list_query`].
+    valid_at: Option<&str>,
 ) -> Result<Vec<Memory>> {
     let now = Utc::now().to_rfc3339();
     let (sql, params_vec) = build_list_query(
@@ -4719,6 +4733,7 @@ pub fn list(
         until,
         tags_filter,
         agent_id,
+        valid_at,
         limit,
         offset,
     );
@@ -17586,6 +17601,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 2);
@@ -17608,6 +17624,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
@@ -17624,7 +17641,7 @@ mod tests {
             )
             .unwrap();
         }
-        let results = list(&conn, None, None, 3, 0, None, None, None, None, None).unwrap();
+        let results = list(&conn, None, None, 3, 0, None, None, None, None, None, None).unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -18814,7 +18831,10 @@ mod tests {
 
         let deleted = forget(&conn, Some("delete-me"), None, None, false).unwrap();
         assert_eq!(deleted, 2);
-        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        let remaining = list(
+            &conn, None, None, 100, 0, None, None, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -18835,7 +18855,10 @@ mod tests {
         assert_eq!(deleted, 2, "both forget-ns rows deleted");
 
         // Deleted from live `memories` (only keep-ns remains).
-        let remaining = list(&conn, None, None, 100, 0, None, None, None, None, None).unwrap();
+        let remaining = list(
+            &conn, None, None, 100, 0, None, None, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].namespace, "keep-ns");
 
@@ -19861,6 +19884,7 @@ mod tests {
             None,
             10,
             0,
+            None,
             None,
             None,
             None,
@@ -24409,6 +24433,7 @@ mod tests {
             None,
             50,
             0,
+            None,
             None,
             None,
             None,

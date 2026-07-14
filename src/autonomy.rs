@@ -1030,6 +1030,7 @@ fn check_no_collision(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )?;
     for row in rows {
         if row.namespace == namespace && row.title == title && row.id != expected_id {
@@ -1655,6 +1656,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert!(!log.is_empty(), "rollback log should be populated");
@@ -1683,6 +1685,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(reports.len(), 1);
@@ -1805,6 +1808,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(log.len(), 1);
@@ -1874,6 +1878,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap()
         .len();
@@ -1893,6 +1898,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap()
         .len();
@@ -2208,6 +2214,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert!(log.is_empty(), "dry-run must not persist rollback memories");

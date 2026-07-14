@@ -1564,6 +1564,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // #1834 valid_at (no as-of)
             )
             .unwrap();
             let refl = listed
@@ -1931,6 +1932,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // #1834 valid_at (no as-of)
             )
             .unwrap();
             let refl_id = listed

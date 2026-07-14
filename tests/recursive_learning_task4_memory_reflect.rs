@@ -398,8 +398,10 @@ fn empty_source_list_returns_validation_error() {
         "error must name the offending field; got {msg}"
     );
     // No memory must have landed.
-    let memories: Vec<_> =
-        db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let memories: Vec<_> = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert!(memories.is_empty(), "no memory must be created");
 }
 
@@ -430,7 +432,10 @@ fn missing_source_id_returns_not_found_error() {
     // never written, and no links survived. We assert by enumerating
     // every link in the database (a fresh in-memory DB is tiny enough
     // to make this exhaustive).
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].id, real_id);
     let links = db::get_links(&conn, &real_id).unwrap();
@@ -474,7 +479,10 @@ fn duplicate_source_id_is_rejected_with_no_partial_write() {
     );
     let err = db::reflect(&conn, &input).expect_err("duplicate src must be rejected");
     assert!(matches!(err, ReflectError::Validation(_)));
-    let all = db::list(&conn, None, None, 1000, 0, None, None, None, None, None).unwrap();
+    let all = db::list(
+        &conn, None, None, 1000, 0, None, None, None, None, None, None,
+    )
+    .unwrap();
     assert_eq!(all.len(), 1, "no half-written reflection survives");
 }
 

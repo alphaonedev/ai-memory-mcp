@@ -14581,6 +14581,11 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'target_agent_id' = $6
                )
                AND ($7::text IS NULL OR metadata->>'agent_id' = $7)
+               AND (
+                   $8::text IS NULL
+                   OR ((valid_from IS NULL OR valid_from <= $8)
+                       AND (valid_until IS NULL OR valid_until > $8))
+               )
                {lifecycle_vis}
              ORDER BY priority DESC, updated_at DESC
              LIMIT $5",
@@ -14596,6 +14601,9 @@ impl MemoryStore for PostgresStore {
             .bind(limit)
             .bind(caller_opt)
             .bind(filter.agent_id.as_ref())
+            // v1.0.0 #1834 — claim-bitemporal AS-OF ($8); TEXT RFC3339, half-open
+            // [valid_from, valid_until) END-EXCLUSIVE; NULL bounds = unbounded.
+            .bind(filter.valid_at.as_deref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("list", e))?;

@@ -977,9 +977,20 @@ mod tests {
             );
             pass.persist(&summary, &[id1, id2]).await.unwrap();
             // Verify the consolidated row is queryable in the namespace.
-            let by_title =
-                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
-                    .unwrap();
+            let by_title = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             let titles: Vec<&str> = by_title.iter().map(|m| m.title.as_str()).collect();
             assert!(titles.iter().any(|t| t.contains("[consolidated]")));
         }
@@ -1074,11 +1085,23 @@ mod tests {
 
         /// First memory id in `ns` (helper for the get_embedding round-trip).
         fn candidates_first_id(conn: &rusqlite::Connection) -> String {
-            crate::db::list(conn, Some("ns"), None, 1, 0, None, None, None, None, None)
-                .unwrap()
-                .first()
-                .map(|m| m.id.clone())
-                .expect("at least one row")
+            crate::db::list(
+                conn,
+                Some("ns"),
+                None,
+                1,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+            .first()
+            .map(|m| m.id.clone())
+            .expect("at least one row")
         }
 
         #[tokio::test]
@@ -1152,9 +1175,20 @@ mod tests {
                 "dry-run skips summarize"
             );
             // No `[consolidated]` row was written; both sources still live.
-            let rows =
-                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
-                    .unwrap();
+            let rows = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             assert!(
                 !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "dry-run must not write a consolidated row"
@@ -1180,9 +1214,20 @@ mod tests {
                 out.errors
             );
             // The `[consolidated]` row landed and the sources were soft-deleted.
-            let rows =
-                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
-                    .unwrap();
+            let rows = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             assert!(
                 rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "a consolidated row must exist"
@@ -1220,6 +1265,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // #1834 valid_at (no as-of)
             )
             .unwrap();
             assert_eq!(log.len(), 1, "exactly one rollback entry written");
@@ -1239,9 +1285,20 @@ mod tests {
                     m.id
                 );
             }
-            let rows =
-                crate::db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None)
-                    .unwrap();
+            let rows = crate::db::list(
+                &conn,
+                Some("ns"),
+                None,
+                16,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             assert!(
                 !rows.iter().any(|m| m.title.starts_with("[consolidated]")),
                 "consolidated summary removed by rollback"

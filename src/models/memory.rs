@@ -1667,6 +1667,11 @@ pub struct ListQuery {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    /// Returns only claims asserted to hold at this instant (their half-open
+    /// `[valid_from, valid_until)` window contains it). Omit for no filter.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     #[serde(default)]
     pub tags: Option<String>,
     /// Filter by `metadata.agent_id` (exact match).

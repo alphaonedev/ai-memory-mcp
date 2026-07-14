@@ -310,6 +310,8 @@ impl MemoryStore for SqliteStore {
             until.as_deref(),
             tags_first,
             filter.agent_id.as_deref(),
+            // v1.0.0 #1834 — claim-bitemporal AS-OF from the SAL Filter.
+            filter.valid_at.as_deref(),
         )
         .map_err(box_err)?;
         // #910 SAL-level scope=private gate (see `is_visible_to_caller`
@@ -347,6 +349,7 @@ impl MemoryStore for SqliteStore {
         loop {
             let rows = db::list(
                 &conn, None, None, PAGE, offset, None, None, None, None, None,
+                None, // #1834 valid_at (no as-of)
             )
             .map_err(box_err)?;
             let page_len = rows.len();

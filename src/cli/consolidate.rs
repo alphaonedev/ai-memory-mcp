@@ -127,6 +127,7 @@ pub fn run_auto(
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )?;
         if memories.len() < args.min_count {
             continue;

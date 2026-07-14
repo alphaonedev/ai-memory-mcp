@@ -38,6 +38,10 @@ pub struct ListArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only
+    /// claims asserted to hold at this instant (valid_from/valid_until window).
+    #[arg(long)]
+    pub valid_at: Option<String>,
     #[arg(long)]
     pub tags: Option<String>,
     #[arg(long, default_value_t = 0)]
@@ -120,6 +124,8 @@ pub fn cmd_list(
         args.until.as_deref(),
         args.tags.as_deref(),
         args.agent_id.as_deref(),
+        // v1.0.0 #1834 — claim-bitemporal AS-OF.
+        args.valid_at.as_deref(),
     )?;
     if json_out {
         writeln!(
@@ -252,6 +258,7 @@ mod tests {
             limit: 20,
             since: None,
             until: None,
+            valid_at: None,
             tags: None,
             offset: 0,
             agent_id: None,

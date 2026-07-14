@@ -1673,6 +1673,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert!(reports.is_empty(), "dry-run must not persist self-report");
@@ -1870,6 +1871,7 @@ mod tests {
             None,
             None,
             None,
+            None, // #1834 valid_at (no as-of)
         )
         .unwrap();
         assert_eq!(reports.len(), 1);
@@ -2399,7 +2401,8 @@ fn apply_rollback_handles_storage_error() {
     match persist_auto_tags(&conn, &mem, &tags) {
         Ok(_) => {
             // Verify the update succeeded by reading it back
-            let batch = db::list(&conn, None, None, 10, 0, None, None, None, None, None).unwrap();
+            let batch =
+                db::list(&conn, None, None, 10, 0, None, None, None, None, None, None).unwrap();
             let updated = batch.iter().find(|m| m.id == mem.id).unwrap();
             assert!(updated.metadata.get("auto_tags").is_some());
         }
@@ -2660,7 +2663,20 @@ mod consolidation_pass_tests_1746 {
             *llm.summarize_calls.lock().unwrap() >= 1,
             "real mode summarises via the LLM"
         );
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             rows.iter().any(|m| m.title.starts_with("[consolidated]")),
             "the live pass writes a consolidated row"
@@ -2707,7 +2723,20 @@ mod consolidation_pass_tests_1746 {
             0,
             "dry-run skips the LLM"
         );
-        let rows = db::list(&conn, Some("ns"), None, 16, 0, None, None, None, None, None).unwrap();
+        let rows = db::list(
+            &conn,
+            Some("ns"),
+            None,
+            16,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(rows.len(), 2, "both source rows remain live");
     }
 

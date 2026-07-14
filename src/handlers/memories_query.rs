@@ -84,6 +84,20 @@ pub async fn list_memories(
         }
     };
 
+    // v1.0.0 #1834 — RFC3339-validate the claim-bitemporal AS-OF at the entry
+    // surface. `valid_at` is compared lexicographically against stored bounds,
+    // so a malformed value would silently mis-filter — reject it as a 400
+    // instead. Covers both the SAL (postgres) and direct (sqlite) branches.
+    if let Some(v) = p.valid_at.as_deref()
+        && let Err(e) = crate::validate::validate_valid_at(v)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::errors::msg::invalid("valid_at", e)})),
+        )
+            .into_response();
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The trait's `Filter` shape carries
     // `(namespace, tier, tags_any, agent_id, since, until, limit)`,
@@ -131,10 +145,9 @@ pub async fn list_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
-            // v1.0.0 #1834 — list/query path does not yet surface valid_at
-            // (recall is the primary as-of surface); wired when the list DTO
-            // gains the param.
-            valid_at: None,
+            // v1.0.0 #1834 — claim-bitemporal AS-OF from the list DTO (RFC3339
+            // validated at the entry guard above).
+            valid_at: p.valid_at.clone(),
             limit,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
@@ -182,6 +195,8 @@ pub async fn list_memories(
             p.until.as_deref(),
             p.tags.as_deref(),
             p.agent_id.as_deref(),
+            // v1.0.0 #1834 — claim-bitemporal AS-OF (validated at entry).
+            p.valid_at.as_deref(),
         )
     })
     .await;
@@ -312,9 +327,9 @@ pub async fn search_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
-            // v1.0.0 #1834 — list/query path does not yet surface valid_at
-            // (recall is the primary as-of surface); wired when the list DTO
-            // gains the param.
+            // v1.0.0 #1834 — the claim-bitemporal AS-OF is scoped to the
+            // recall + list surfaces (design 591608d4); the keyword-search
+            // surface does not expose it, so no as-of filter applies here.
             valid_at: None,
             limit,
         };

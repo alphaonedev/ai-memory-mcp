@@ -128,6 +128,69 @@ fn titles_hybrid(conn: &rusqlite::Connection, valid_at: Option<&str>) -> Vec<Str
     t
 }
 
+fn titles_list(conn: &rusqlite::Connection, valid_at: Option<&str>) -> Vec<String> {
+    let rows = db::list(
+        conn,
+        Some(NS),
+        None, // tier
+        50,   // limit
+        0,    // offset
+        None, // min_priority
+        None, // since
+        None, // until
+        None, // tags
+        None, // agent_id
+        valid_at,
+    )
+    .expect("list");
+    let mut t: Vec<String> = rows.into_iter().map(|m| m.title).collect();
+    t.sort();
+    t
+}
+
+#[test]
+fn list_surface_applies_valid_at_with_the_same_half_open_contract() {
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_tmp, conn) = fresh_db();
+    seed(&conn);
+
+    // Omitted → all; legacy NULL/NULL always visible; inside-window selects
+    // the bounded claim; boundary is start-inclusive / end-exclusive at T_JUN.
+    assert_eq!(titles_list(&conn, None), vec!["alpha", "bravo", "charlie"]);
+    assert!(titles_list(&conn, Some("2099-01-01T00:00:00+00:00")).contains(&"alpha".to_string()));
+    assert_eq!(
+        titles_list(&conn, Some("2026-03-01T00:00:00+00:00")),
+        vec!["alpha", "bravo"]
+    );
+    assert_eq!(titles_list(&conn, Some(T_JUN)), vec!["alpha", "charlie"]);
+    assert_eq!(
+        titles_list(&conn, Some("2025-12-01T00:00:00+00:00")),
+        vec!["alpha"]
+    );
+}
+
+#[test]
+fn validate_valid_at_rejects_non_rfc3339() {
+    // The entry surfaces (HTTP recall/list, MCP list, CLI) reject a malformed
+    // as-of so it never reaches the lexicographic SQL comparison.
+    assert!(ai_memory::validate::validate_valid_at("2026-01-01T00:00:00Z").is_ok());
+    assert!(ai_memory::validate::validate_valid_at("2026-01-01T00:00:00+00:00").is_ok());
+    for bad in [
+        "not-a-date",
+        "2026-13-01T00:00:00Z",
+        "2026-01-01",
+        "",
+        "yesterday",
+    ] {
+        assert!(
+            ai_memory::validate::validate_valid_at(bad).is_err(),
+            "expected reject: {bad:?}"
+        );
+    }
+}
+
 #[test]
 fn omitted_valid_at_returns_every_row_on_both_paths() {
     let _g = test_serial()

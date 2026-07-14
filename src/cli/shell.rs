@@ -155,7 +155,7 @@ pub fn handle_command(parts: &[&str], conn: &Connection, out: &mut CliOutput<'_>
         }
         "list" | "ls" => {
             let ns = parts.get(1).copied();
-            match db::list(conn, ns, None, 20, 0, None, None, None, None, None) {
+            match db::list(conn, ns, None, 20, 0, None, None, None, None, None, None) {
                 Ok(results) => {
                     for mem in &results {
                         let age = human_age(&mem.updated_at);

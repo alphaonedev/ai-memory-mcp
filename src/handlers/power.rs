@@ -242,6 +242,7 @@ pub async fn detect_contradictions(
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     ) {
         Ok(v) => v,
         Err(e) => {

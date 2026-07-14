@@ -302,6 +302,7 @@ async fn list_empty_namespace() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert!(results.is_empty());
@@ -526,6 +527,7 @@ async fn http_create_memory_uses_appstate_and_persists() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert!(!rows.is_empty(), "HTTP-authored memory must be persisted");
@@ -602,6 +604,7 @@ async fn http_create_memory_succeeds_when_llm_is_absent_l5() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 1, "L5: row must be persisted");
@@ -874,6 +877,7 @@ async fn http_sync_push_applies_and_advances_clock() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
@@ -1242,6 +1246,7 @@ async fn http_bulk_create_uses_appstate_and_persists() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 5, "bulk rows must persist via AppState");
@@ -1559,6 +1564,7 @@ async fn http_sync_push_dry_run_applies_nothing() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert!(rows.is_empty(), "dry_run must not write rows");
@@ -4018,6 +4024,7 @@ async fn http_bulk_create_partial_success_collects_errors() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
@@ -7482,6 +7489,7 @@ async fn http_forget_memories_no_match_returns_zero_deleted() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 3);
@@ -8113,6 +8121,7 @@ async fn h8b_notify_happy_path_creates_message() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows.len(), 1);
@@ -9642,6 +9651,7 @@ async fn http_reject_pending_happy_path_marks_rejected_no_execution() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert!(
@@ -14483,6 +14493,7 @@ async fn http_create_memory_clamps_extreme_priority_to_range() {
         None,
         None,
         None,
+        None, // #1834 valid_at (no as-of)
     )
     .unwrap();
     assert_eq!(rows[0].priority, 10);
