@@ -1697,6 +1697,9 @@ pub struct RecallQuery {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     /// Task 1.5 visibility filtering.
     #[serde(default)]
     pub as_agent: Option<String>,
@@ -1789,6 +1792,9 @@ pub struct RecallBody {
     pub since: Option<String>,
     #[serde(default)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time.
+    #[serde(default)]
+    pub valid_at: Option<String>,
     /// Task 1.5 visibility filtering.
     #[serde(default)]
     pub as_agent: Option<String>,

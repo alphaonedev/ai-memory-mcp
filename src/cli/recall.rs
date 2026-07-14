@@ -35,6 +35,10 @@ pub struct RecallArgs {
     pub since: Option<String>,
     #[arg(long)]
     pub until: Option<String>,
+    /// #1834 claim-bitemporal as-of: RFC3339 point in valid-time. Returns only
+    /// claims asserted to hold at this instant (valid_from/valid_until window).
+    #[arg(long)]
+    pub valid_at: Option<String>,
     /// Feature tier for recall: keyword, semantic, smart, autonomous
     #[arg(long, short = 'T')]
     pub tier: Option<String>,

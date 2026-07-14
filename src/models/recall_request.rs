@@ -134,6 +134,16 @@ pub struct RecallRequest {
     #[serde(default)]
     pub until: Option<String>,
 
+    /// #1834 claim-bitemporal AS-OF: RFC3339 point in VALID-time. Returns only
+    /// claims asserted to hold at this instant — `valid_from <= valid_at` AND
+    /// (`valid_until` is unset OR `valid_until > valid_at`), half-open
+    /// end-exclusive. DISTINCT from `since`/`until` (which bound `created_at`,
+    /// transaction-time). `None` = no valid-time filter. Rows with NULL bounds
+    /// are unbounded and always match.
+    #[serde(default)]
+    #[schemars(description = "#1834 claim-bitemporal as-of: RFC3339 point in valid-time.")]
+    pub valid_at: Option<String>,
+
     #[serde(default)]
     #[schemars(description = "#151 scope-visibility agent.")]
     pub as_agent: Option<String>,
@@ -258,6 +268,7 @@ impl RecallRequest {
             tags: q.tags.clone(),
             since: q.since.clone(),
             until: q.until.clone(),
+            valid_at: q.valid_at.clone(),
             as_agent: q.as_agent.clone(),
             budget_tokens: q.budget_tokens.and_then(|v| i64::try_from(v).ok()),
             // #1622 — CSV on the GET surface (`context_tokens=a,b`),
@@ -313,6 +324,7 @@ impl RecallRequest {
             tags: body.tags.clone(),
             since: body.since.clone(),
             until: body.until.clone(),
+            valid_at: body.valid_at.clone(),
             as_agent: body.as_agent.clone(),
             budget_tokens: body.budget_tokens.and_then(|v| i64::try_from(v).ok()),
             // #1622 — wired through from RecallBody; pre-#1622 this was
@@ -344,6 +356,7 @@ impl RecallRequest {
             tags: args.tags.clone(),
             since: args.since.clone(),
             until: args.until.clone(),
+            valid_at: args.valid_at.clone(),
             as_agent: args.as_agent.clone(),
             budget_tokens: args.budget_tokens.and_then(|v| i64::try_from(v).ok()),
             context_tokens: args.context_tokens.clone(),
