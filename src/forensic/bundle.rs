@@ -452,7 +452,25 @@ pub fn build_files(
             // bundled in the clear) and a signed refusal is emitted.
             // Structurally these live in the key-dir, not the DB, so a hit
             // means a mis-stored secret rode a memory row.
-            let record = serde_json::to_value(&mem).unwrap_or(serde_json::Value::Null);
+            // Fail-CLOSED on a serialize failure, mirroring `classify_memory`'s
+            // `Err => PrivateKeyMaterial` DROP disposition in the CLI/HTTP
+            // corpus screen (#2008 unification): an un-serializable row cannot
+            // be screened for a forbidden export class, so it must never be
+            // bundled in the clear. Practically unreachable (`Memory` carries no
+            // fallible serializers — a non-finite f64 confidence serializes to
+            // `null`, not an error), but the prior `unwrap_or(Null)` fail-OPENED
+            // (Null classifies as clean → bundled), the opposite of both siblings.
+            let record = match serde_json::to_value(&mem) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        memory_id = %mem.id,
+                        error = %e,
+                        "forensic export: row failed to serialize for export-class screening — dropping (fail-closed)"
+                    );
+                    continue;
+                }
+            };
             if crate::export_taxonomy::screen_export_value_audited(
                 conn,
                 &path,

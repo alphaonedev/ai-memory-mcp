@@ -238,7 +238,7 @@ pub(super) async fn sync_push_via_store(
                     memory_id = %to_insert.id,
                     attribute_agent = %attribute_agent,
                     sender = %body.sender_agent_id,
-                    cause = "missing_signature",
+                    cause = crate::federation::receive_auth::CAUSE_MISSING_SIGNATURE,
                     error = %e,
                     "sync_push (postgres): honored third-party relay refused — no metadata.write_signature \
                      present under the strict flip (author must EMIT the signature at store time, #1801→#1954)"
@@ -249,7 +249,7 @@ pub(super) async fn sync_push_via_store(
                     memory_id = %to_insert.id,
                     attribute_agent = %attribute_agent,
                     sender = %body.sender_agent_id,
-                    cause = "forged_or_malformed",
+                    cause = crate::federation::receive_auth::CAUSE_FORGED_OR_MALFORMED,
                     error = %e,
                     "sync_push (postgres): per-write content attestation failed; rejecting memory (#1464)"
                 );
