@@ -523,12 +523,16 @@ fn purge_emits_skill_purged_event_before_delete_and_chain_holds() {
     let (_d, conn) = open_db();
     let id = register(&conn, "purge-audit");
     let digest_hex: String = {
+        use std::fmt::Write as _;
         let d: Vec<u8> = conn
             .query_row("SELECT digest FROM skills WHERE id = ?1", [&id], |r| {
                 r.get(0)
             })
             .unwrap();
-        d.iter().map(|b| format!("{b:02x}")).collect()
+        d.iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
     };
 
     handle_skill_delete(

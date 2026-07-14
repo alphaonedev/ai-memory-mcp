@@ -125,6 +125,7 @@ pub const PIPELINE_OVERRIDE: &str = "pipeline_override";
 pub const PARAMETERS: &str = "parameters";
 pub const PRIORITY: &str = "priority";
 pub const QUERY: &str = "query";
+pub const REASON: &str = "reason";
 pub const REFERENCE_IDS: &str = "reference_ids";
 pub const REFLECTION_ID: &str = "reflection_id";
 pub const RELATION: &str = "relation";
@@ -171,6 +172,7 @@ pub const TO_NAMESPACE: &str = "to_namespace";
 pub const TTL_SECONDS: &str = "ttl_seconds";
 pub const TTL_SECS: &str = "ttl_secs";
 pub const UNREAD_ONLY: &str = "unread_only";
+pub const UNRETIRE: &str = "unretire";
 pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
 pub const VALID_AT: &str = "valid_at";
@@ -267,6 +269,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     PIPELINE_OVERRIDE,
     PRIORITY,
     QUERY,
+    REASON,
     REFLECTION_ID,
     RELATION,
     REMEMBER,
@@ -309,6 +312,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     TTL_SECONDS,
     TTL_SECS,
     UNREAD_ONLY,
+    UNRETIRE,
     UNTIL,
     URL,
     VALID_AT,
