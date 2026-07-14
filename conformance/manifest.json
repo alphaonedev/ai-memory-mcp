@@ -194,6 +194,100 @@
       ],
       "name": "lineage/equivocation_fork",
       "verdict": "lineage-resolve"
+    },
+    {
+      "expected": {
+        "break_kind": "none",
+        "outcome": "intact"
+      },
+      "members": [
+        {
+          "file": "vectors/chain/intact/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/intact/row_1.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "record_type": "signed_events_chain_row",
+          "role": "row_1",
+          "sequence": 2
+        },
+        {
+          "file": "vectors/chain/intact/row_2.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "record_type": "signed_events_chain_row",
+          "role": "row_2",
+          "sequence": 3
+        }
+      ],
+      "name": "chain/intact",
+      "verdict": "chain-verify"
+    },
+    {
+      "expected": {
+        "break_kind": "midchain-deletion",
+        "outcome": "broken"
+      },
+      "members": [
+        {
+          "file": "vectors/chain/midchain_deletion/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/midchain_deletion/row_2.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "record_type": "signed_events_chain_row",
+          "role": "row_2",
+          "sequence": 3
+        }
+      ],
+      "name": "chain/midchain_deletion",
+      "verdict": "chain-verify"
+    },
+    {
+      "expected": {
+        "break_kind": "tail-truncation",
+        "outcome": "broken",
+        "witness_head_sequence": 3
+      },
+      "members": [
+        {
+          "file": "vectors/chain/tail_truncation/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/tail_truncation/row_1.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "record_type": "signed_events_chain_row",
+          "role": "row_1",
+          "sequence": 2
+        }
+      ],
+      "name": "chain/tail_truncation",
+      "verdict": "chain-verify"
     }
   ],
   "license": "CC0-1.0",

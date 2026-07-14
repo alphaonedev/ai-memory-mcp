@@ -57,6 +57,7 @@ use ai_memory::identity::sign::{
 use ai_memory::identity::subkey_cert::{
     SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert, sign_subkey_cert,
 };
+use ai_memory::signed_events::{SignedEvent, canonical_chain_bytes};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
@@ -125,6 +126,14 @@ enum Verdict {
     /// byte-forceable EQUIVOCATION FORK (two successors at the same epoch under
     /// the same predecessor), never a reader-cache "stale view".
     LineageResolve,
+    /// #1837 obl.2 — a V-4 `signed_events` hash chain (a fixture GROUP). The
+    /// reader walks the ordered rows checking `prev_hash[i] ==
+    /// SHA-256(canonical_chain_bytes(row[i-1]))` + monotonic `sequence`, and —
+    /// with the group's `witness_head_sequence` off-table watermark — detects
+    /// tail-truncation. Resolves `intact` vs `broken`; on a break the manifest
+    /// `break_kind` (`none` | `midchain-deletion` | `tail-truncation`) is the
+    /// EXACT detection the reader must reproduce.
+    ChainVerify,
 }
 
 impl Verdict {
@@ -136,6 +145,7 @@ impl Verdict {
             Verdict::EquivocationProven => "equivocation-proven",
             Verdict::SubkeyChainVerify => "subkey-chain-verify",
             Verdict::LineageResolve => "lineage-resolve",
+            Verdict::ChainVerify => "chain-verify",
         }
     }
 }
@@ -184,6 +194,7 @@ struct Vector {
 /// CBOR map, so a reader dispatches its re-encode / verify path on this.
 const GRAMMAR_ARRAY_V2: &str = "array-v2";
 const GRAMMAR_LINEAGE_SUCCESSION_V1: &str = "lineage-succession-v1";
+const GRAMMAR_SIGNED_EVENTS_CHAIN_V1: &str = "signed-events-chain-v1";
 
 /// One record inside a multi-record fixture [`Group`]. Its `bytes` are still
 /// frozen-encoder output written as an ordinary hex vector under
@@ -236,6 +247,10 @@ struct Expected {
     /// `lineage-resolve`: the corpus-fixed INDETERMINATE/INVALID partition the
     /// reader must adopt so the three-valued boundary is not reader-chosen.
     resolution_policy: Option<&'static [(&'static str, &'static str)]>,
+    /// `chain-verify`: the off-table witness watermark head `sequence`. When the
+    /// surviving rows' `MAX(sequence)` is below this, the reader MUST detect a
+    /// tail-truncation (the break a bare in-chain walk cannot see).
+    witness_head_sequence: Option<u64>,
 }
 
 impl Expected {
@@ -259,6 +274,9 @@ impl Expected {
                 p.insert((*k).into(), (*val).into());
             }
             obj.insert("resolution_policy".into(), serde_json::Value::Object(p));
+        }
+        if let Some(seq) = self.witness_head_sequence {
+            obj.insert("witness_head_sequence".into(), seq.into());
         }
         serde_json::Value::Object(obj)
     }
@@ -751,10 +769,119 @@ fn build_lineage_groups() -> Vec<Group> {
     ]
 }
 
+const CHAIN_AGENT_ID: &str = "ai:claude-code@pop-os";
+
+/// Build one V-4 `signed_events` chain row and its canonical bytes. `prev_bytes`
+/// is the prior row's canonical bytes (`None` for the genesis row → 32 zero
+/// bytes). The rows are UNSIGNED (the V-4 tamper-evidence is the cross-row hash
+/// chain, independent of per-row signatures), so `chain-verify` walks
+/// `prev_hash` + `sequence` alone. `prev_hash` is NOT part of
+/// `canonical_chain_bytes` — it is stored beside the row (and in the manifest).
+fn chain_row(seq: i64, prev_bytes: Option<&[u8]>) -> (SignedEvent, Vec<u8>) {
+    let prev_hash = match prev_bytes {
+        Some(b) => Sha256::digest(b).to_vec(),
+        None => vec![0u8; 32],
+    };
+    let payload_hash = Sha256::digest(format!("chain-row-{seq}-payload").as_bytes()).to_vec();
+    let row = SignedEvent {
+        id: format!("00000000-0000-4000-8000-{seq:012}"),
+        agent_id: CHAIN_AGENT_ID.to_string(),
+        event_type: "memory.stored".to_string(),
+        payload_hash,
+        signature: None,
+        attest_level: "unsigned".to_string(),
+        timestamp: format!("2026-07-11T0{seq}:00:00Z"),
+        prev_hash,
+        sequence: seq,
+        cause_hash: None,
+    };
+    let bytes = canonical_chain_bytes(&row);
+    (row, bytes)
+}
+
+/// A `chain-verify` group member: the row's canonical bytes plus the `sequence`
+/// and `prev_hash` the reader needs to walk the chain (`prev_hash` is not part
+/// of the canonical bytes, so it is carried in `attrs`).
+fn chain_member(role: &'static str, row: &SignedEvent, bytes: Vec<u8>) -> GroupMember {
+    GroupMember {
+        role,
+        record_type: "signed_events_chain_row",
+        grammar: GRAMMAR_SIGNED_EVENTS_CHAIN_V1,
+        bytes,
+        pubkey: None,
+        signature: None,
+        attrs: vec![
+            ("sequence", row.sequence.into()),
+            ("prev_hash", hex::encode(&row.prev_hash).into()),
+        ],
+    }
+}
+
+/// #1837 obl.2 — the V-4 `signed_events` hash-chain fixture groups (spec §7
+/// step 2). A well-formed 3-row chain is `intact`; deleting the middle row
+/// breaks the `prev_hash` link + leaves a `sequence` gap (`midchain-deletion`);
+/// truncating the tail leaves `MAX(sequence)` below the off-table witness
+/// watermark (`tail-truncation`, undetectable from the surviving rows alone).
+fn build_chain_groups() -> Vec<Group> {
+    let (row1, bytes1) = chain_row(1, None);
+    let (row2, bytes2) = chain_row(2, Some(&bytes1));
+    let (row3, bytes3) = chain_row(3, Some(&bytes2));
+
+    vec![
+        Group {
+            name: "chain/intact",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("intact"),
+                break_kind: Some("none"),
+                ..Default::default()
+            },
+            members: vec![
+                chain_member("row_0", &row1, bytes1.clone()),
+                chain_member("row_1", &row2, bytes2.clone()),
+                chain_member("row_2", &row3, bytes3),
+            ],
+        },
+        Group {
+            name: "chain/midchain_deletion",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("broken"),
+                break_kind: Some("midchain-deletion"),
+                ..Default::default()
+            },
+            // Row 2 removed: row 3's `prev_hash` (= SHA-256 of row 2) no longer
+            // matches SHA-256(row 1), and the `sequence` jumps 1 -> 3.
+            members: vec![
+                chain_member("row_0", &row1, bytes1.clone()),
+                chain_member("row_2", &row3, canonical_chain_bytes(&row3)),
+            ],
+        },
+        Group {
+            name: "chain/tail_truncation",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("broken"),
+                break_kind: Some("tail-truncation"),
+                witness_head_sequence: Some(3),
+                ..Default::default()
+            },
+            // Rows 1-2 survive, row 3 truncated: the surviving `MAX(sequence)`
+            // (2) is below the witness watermark head (3). Undetectable without
+            // the off-table watermark — that is exactly obligation 2's point.
+            members: vec![
+                chain_member("row_0", &row1, bytes1),
+                chain_member("row_1", &row2, bytes2),
+            ],
+        },
+    ]
+}
+
 /// Assemble the multi-record fixture groups (#1837 obl.2/3/5) in a stable order.
 fn build_groups() -> Vec<Group> {
     let mut groups = build_subkey_chain_groups();
     groups.extend(build_lineage_groups());
+    groups.extend(build_chain_groups());
     groups
 }
 
