@@ -7,6 +7,57 @@
   },
   "format_freeze_doc": "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
   "generator": "tests/conformance_corpus.rs",
+  "groups": [
+    {
+      "expected": {
+        "outcome": "valid"
+      },
+      "members": [
+        {
+          "domain_tag": "ai-memory/subkey-cert/v1",
+          "elements": 6,
+          "file": "vectors/subkey_chain/valid/cert.hex",
+          "length_bytes": 159,
+          "pubkey": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "record_type": "subkey_cert",
+          "role": "cert",
+          "signature": "04eb09653200ace9c4322676e6077c9ad0ea54a7861dff569a161a3b569fb42237944a520f7acbacc08752693c21d22e12b9310b033db5b0e782a7692b78d70f"
+        },
+        {
+          "domain_tag": "ai-memory/write/v2",
+          "elements": 11,
+          "file": "vectors/subkey_chain/valid/write.hex",
+          "length_bytes": 191,
+          "pubkey": "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242",
+          "record_type": "signable_write_v2",
+          "role": "write",
+          "signature": "b49a835b0713dad2d4e04890122e00a317117697eab083931c1abc8854da529b273c4d43b24dce18098fc255bbf5d13b0b021daeae763ea81e13cf1382541e01"
+        }
+      ],
+      "name": "subkey_chain/valid",
+      "verdict": "subkey-chain-verify"
+    },
+    {
+      "expected": {
+        "outcome": "reject",
+        "reject_reason": "self_declared_instance"
+      },
+      "members": [
+        {
+          "domain_tag": "ai-memory/write/v2",
+          "elements": 11,
+          "file": "vectors/subkey_chain/self_declared/write.hex",
+          "length_bytes": 191,
+          "pubkey": "34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746",
+          "record_type": "signable_write_v2",
+          "role": "write",
+          "signature": "99d1a139c8bffb31ead48f04fb28ad84fa2605c8b3b1a1ecd37c3ef194076b36ec846c7727750e1028479280e626d67e0542a03a00386e53865c571ba96f3201"
+        }
+      ],
+      "name": "subkey_chain/self_declared",
+      "verdict": "subkey-chain-verify"
+    }
+  ],
   "license": "CC0-1.0",
   "schema_version": 81,
   "spec": "ai-memory/portability/v2",

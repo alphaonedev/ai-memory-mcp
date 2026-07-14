@@ -48,7 +48,7 @@ use ai_memory::identity::equivocation::{
     sign_head_attestation,
 };
 use ai_memory::identity::subkey_cert::{
-    SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert,
+    SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert, sign_subkey_cert,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -98,6 +98,15 @@ enum Verdict {
     /// attestations verify under the embedded subject key, and the pair is a
     /// genuine divergence (same subject/epoch/sequence, different head hash).
     EquivocationProven,
+    /// #1837 obl.3 — a two-link `SubkeyCert`->write chain (a fixture GROUP). The
+    /// reader verifies the cert under the enrolled principal ROOT, THEN the
+    /// write under the cert's certified sub-key, in that fixed order, and
+    /// compares the outcome to the group's manifest `expected` object. A
+    /// self-declared instance (no root-signed cert) MUST be rejected. Distinct
+    /// from `signature-invalid`: a self-declared write can carry a perfectly
+    /// valid sub-key signature and still be rejected on chain-authorization
+    /// grounds, so a bare signature check would wrongly ACCEPT it.
+    SubkeyChainVerify,
 }
 
 impl Verdict {
@@ -107,6 +116,7 @@ impl Verdict {
             Verdict::SignatureValid => "signature-valid",
             Verdict::SignatureInvalid => "signature-invalid",
             Verdict::EquivocationProven => "equivocation-proven",
+            Verdict::SubkeyChainVerify => "subkey-chain-verify",
         }
     }
 }
@@ -131,6 +141,108 @@ struct Vector {
     /// Raw 64-byte detached signature over `bytes` (detached-sig vectors only;
     /// the equivocation proof carries its signatures *inside* `bytes`).
     signature: Option<[u8; 64]>,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-record fixture GROUPS (#1837 obl.2/3/5).
+//
+// Obligations 2/3/5 verify a RELATIONSHIP across several records (a hash
+// chain, a two-link cert->write, a lineage succession), which a single flat
+// hex vector cannot express. Rather than mint a new frozen envelope format
+// (which would violate the corpus rule that every byte comes from a pinned
+// PRODUCTION encoder), each real production record is emitted as its own
+// frozen-encoder hex vector, and the STRUCTURE + expectations live in the
+// manifest — the unsigned answer-key oracle (the Wycheproof model; settled by
+// the 2x5 vote, ai-memory memory eee5396c). A reader walks a group's ordered
+// members, runs the group's verdict procedure, and compares the result to the
+// group's `expected` object. Expectations are NEVER hidden in the frozen bytes.
+// ---------------------------------------------------------------------------
+
+/// One record inside a multi-record fixture [`Group`]. Its `bytes` are still
+/// frozen-encoder output written as an ordinary hex vector under
+/// `vectors/<group>/<role>.hex`.
+struct GroupMember {
+    /// Role within the group's verify procedure, e.g. `cert`, `write`.
+    role: &'static str,
+    /// Record-type family (matches the domain tag's record type).
+    record_type: &'static str,
+    /// The frozen-encoder bytes for this member.
+    bytes: Vec<u8>,
+    /// The frozen domain tag committed at element [0] of the record's array.
+    domain_tag: &'static str,
+    /// Number of positional elements in the member's outer array.
+    elements: usize,
+    /// Raw 32-byte Ed25519 public key the reader verifies this member under
+    /// (e.g. the principal root for `cert`, the certified sub-key for `write`).
+    pubkey: Option<[u8; 32]>,
+    /// Raw 64-byte detached signature over `bytes`.
+    signature: Option<[u8; 64]>,
+}
+
+/// The answer-key `expected` object for a [`Group`] — the outcome a conforming
+/// reader MUST reproduce. Every field is a fixed contract string; absent
+/// fields are omitted from the manifest. The harness asserts EXACT equality on
+/// these (never "some failure detected"), and a negative meta-test proves a
+/// reader that reports the WRONG value fails the suite.
+#[derive(Default)]
+struct Expected {
+    /// The terminal outcome, per verdict family:
+    /// `subkey-chain-verify` -> `valid` | `reject`;
+    /// `chain-verify` -> `intact` | `broken`;
+    /// `lineage-resolve` -> unused (see `expected_state`).
+    outcome: Option<&'static str>,
+    /// `chain-verify`: which break the reader must detect —
+    /// `none` | `midchain-deletion` | `tail-truncation`.
+    break_kind: Option<&'static str>,
+    /// `subkey-chain-verify`: the authorization reason a reject fixture
+    /// exercises — e.g. `self_declared_instance`.
+    reject_reason: Option<&'static str>,
+    /// `lineage-resolve`: the three-valued terminal state —
+    /// `valid` | `indeterminate` | `invalid-revoked`. Serialized as the
+    /// manifest key `expected_state`.
+    state: Option<&'static str>,
+    /// `lineage-resolve`: the corpus-fixed INDETERMINATE/INVALID partition the
+    /// reader must adopt so the three-valued boundary is not reader-chosen.
+    resolution_policy: Option<&'static [(&'static str, &'static str)]>,
+}
+
+impl Expected {
+    fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(v) = self.outcome {
+            obj.insert("outcome".into(), v.into());
+        }
+        if let Some(v) = self.break_kind {
+            obj.insert("break_kind".into(), v.into());
+        }
+        if let Some(v) = self.reject_reason {
+            obj.insert("reject_reason".into(), v.into());
+        }
+        if let Some(v) = self.state {
+            obj.insert("expected_state".into(), v.into());
+        }
+        if let Some(policy) = self.resolution_policy {
+            let mut p = serde_json::Map::new();
+            for (k, val) in policy {
+                p.insert((*k).into(), (*val).into());
+            }
+            obj.insert("resolution_policy".into(), serde_json::Value::Object(p));
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+/// A multi-record fixture: an ordered set of production records the reader
+/// verifies as a relationship, plus the answer-key `expected` outcome.
+struct Group {
+    /// Slash-separated group name, e.g. `subkey_chain/valid`.
+    name: &'static str,
+    /// The verify procedure a reader dispatches on.
+    verdict: Verdict,
+    /// The answer-key outcome (lives in the manifest, not the bytes).
+    expected: Expected,
+    /// Ordered member records.
+    members: Vec<GroupMember>,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +421,128 @@ fn equivocation_real() -> (Vec<u8>, [u8; 32]) {
     (proof.to_bytes(), subject_pubkey)
 }
 
+/// Fixed deterministic seeds for the #1837 obl.3 two-link `SubkeyCert`->write
+/// chain: the principal ROOT, the certified SUB-KEY, and an uncertified
+/// SELF-DECLARED instance key (all documented test seeds, never production).
+const SUBKEY_CHAIN_ROOT_SEED: [u8; 32] = [0x44; 32];
+const SUBKEY_CHAIN_SUBKEY_SEED: [u8; 32] = [0x55; 32];
+const SUBKEY_CHAIN_SELF_DECLARED_SEED: [u8; 32] = [0x66; 32];
+
+/// #1837 obl.3 — the two-link `SubkeyCert`->write chain fixture groups. Spec
+/// §2.3 / §7 step 3: verify the cert under the enrolled principal ROOT, THEN
+/// the write under the cert's certified sub-key. A self-declared instance (a
+/// write asserting an `instance_key_id` with no root-signed cert) is REJECTED
+/// even though its own signature is valid — a chain-authorization reject, which
+/// is why this is NOT `signature-invalid`.
+fn build_subkey_chain_groups() -> Vec<Group> {
+    let root = SigningKey::from_bytes(&SUBKEY_CHAIN_ROOT_SEED);
+    let root_pk = root.verifying_key().to_bytes();
+    let subkey = SigningKey::from_bytes(&SUBKEY_CHAIN_SUBKEY_SEED);
+    let subkey_pk = subkey.verifying_key().to_bytes();
+
+    // Link 1: the principal-root-signed cert binding the sub-key.
+    let cert = SubkeyCert {
+        principal: "ai:claude-code@pop-os",
+        instance_key_id: &subkey_pk,
+        model_version_ref: &[0xab; 32],
+        not_before: "2026-07-11T00:00:00Z",
+        not_after: "2027-07-11T00:00:00Z",
+    };
+    let cert_bytes = canonical_cbor_subkey_cert(&cert);
+    let cert_sig = sign_subkey_cert(&root, &cert);
+
+    // Link 2: a write whose `instance_key_id` IS the certified sub-key, signed
+    // by that sub-key.
+    let write = SignableWriteV2 {
+        agent_id: "ai:claude-code@pop-os",
+        namespace: "global",
+        title: "x",
+        kind: "observation",
+        created_at: "2026-07-11T00:00:00Z",
+        content_digest: Multihash::new(HashCodec::Sha2_256, content_digest("hello")),
+        instance_key_id: &subkey_pk,
+        model_version_ref: &[0xab; 32],
+        session_id: None,
+        suite_tag: SUITE_ED25519_SHA256,
+    };
+    let write_bytes = canonical_cbor_write_v2(&write);
+    let write_sig = subkey.sign(&write_bytes).to_bytes();
+
+    // Negative: a SELF-DECLARED instance — a write asserting an
+    // `instance_key_id` with NO root-signed cert. Its sub-key signature is
+    // perfectly valid; it MUST STILL be rejected (chain-authorization).
+    let self_declared = SigningKey::from_bytes(&SUBKEY_CHAIN_SELF_DECLARED_SEED);
+    let self_declared_pk = self_declared.verifying_key().to_bytes();
+    let sd_write = SignableWriteV2 {
+        agent_id: "ai:claude-code@pop-os",
+        namespace: "global",
+        title: "x",
+        kind: "observation",
+        created_at: "2026-07-11T00:00:00Z",
+        content_digest: Multihash::new(HashCodec::Sha2_256, content_digest("hello")),
+        instance_key_id: &self_declared_pk,
+        model_version_ref: &[0xab; 32],
+        session_id: None,
+        suite_tag: SUITE_ED25519_SHA256,
+    };
+    let sd_bytes = canonical_cbor_write_v2(&sd_write);
+    let sd_sig = self_declared.sign(&sd_bytes).to_bytes();
+
+    vec![
+        Group {
+            name: "subkey_chain/valid",
+            verdict: Verdict::SubkeyChainVerify,
+            expected: Expected {
+                outcome: Some("valid"),
+                ..Default::default()
+            },
+            members: vec![
+                GroupMember {
+                    role: "cert",
+                    record_type: "subkey_cert",
+                    bytes: cert_bytes,
+                    domain_tag: SUBKEY_CERT_V1_DOMAIN,
+                    elements: SUBKEY_CERT_ELEMENTS,
+                    pubkey: Some(root_pk),
+                    signature: Some(cert_sig),
+                },
+                GroupMember {
+                    role: "write",
+                    record_type: "signable_write_v2",
+                    bytes: write_bytes,
+                    domain_tag: WRITE_V2_DOMAIN,
+                    elements: SIGNABLE_WRITE_V2_ELEMENTS,
+                    pubkey: Some(subkey_pk),
+                    signature: Some(write_sig),
+                },
+            ],
+        },
+        Group {
+            name: "subkey_chain/self_declared",
+            verdict: Verdict::SubkeyChainVerify,
+            expected: Expected {
+                outcome: Some("reject"),
+                reject_reason: Some("self_declared_instance"),
+                ..Default::default()
+            },
+            members: vec![GroupMember {
+                role: "write",
+                record_type: "signable_write_v2",
+                bytes: sd_bytes,
+                domain_tag: WRITE_V2_DOMAIN,
+                elements: SIGNABLE_WRITE_V2_ELEMENTS,
+                pubkey: Some(self_declared_pk),
+                signature: Some(sd_sig),
+            }],
+        },
+    ]
+}
+
+/// Assemble the multi-record fixture groups (#1837 obl.2/3/5) in a stable order.
+fn build_groups() -> Vec<Group> {
+    build_subkey_chain_groups()
+}
+
 /// Assemble the full corpus in a stable order.
 fn build_corpus() -> Vec<Vector> {
     let (signed_bytes, signed_pk, signed_sig) = write_v2_signed();
@@ -426,10 +660,17 @@ fn vector_path(root: &Path, name: &str) -> PathBuf {
     root.join(VECTORS_SUBDIR).join(format!("{name}.hex"))
 }
 
+/// Path of a multi-record group member: `vectors/<group>/<role>.hex`.
+fn group_member_path(root: &Path, group: &str, role: &str) -> PathBuf {
+    root.join(VECTORS_SUBDIR)
+        .join(group)
+        .join(format!("{role}.hex"))
+}
+
 /// Build the `manifest.json` value for the whole corpus. Uses only
 /// alphabetically-sorted `serde_json::Map` keys (the default), so the pretty
 /// serialization is deterministic across runs.
-fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
+fn manifest_value(vectors: &[Vector], groups: &[Group]) -> serde_json::Value {
     let entries: Vec<serde_json::Value> = vectors
         .iter()
         .map(|v| {
@@ -454,6 +695,41 @@ fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
         })
         .collect();
 
+    let group_entries: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|g| {
+            let members: Vec<serde_json::Value> = g
+                .members
+                .iter()
+                .map(|m| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("role".into(), m.role.into());
+                    obj.insert("record_type".into(), m.record_type.into());
+                    obj.insert(
+                        "file".into(),
+                        format!("{VECTORS_SUBDIR}/{}/{}.hex", g.name, m.role).into(),
+                    );
+                    obj.insert("domain_tag".into(), m.domain_tag.into());
+                    obj.insert("elements".into(), m.elements.into());
+                    obj.insert("length_bytes".into(), m.bytes.len().into());
+                    if let Some(pk) = m.pubkey {
+                        obj.insert("pubkey".into(), hex::encode(pk).into());
+                    }
+                    if let Some(sig) = m.signature {
+                        obj.insert("signature".into(), hex::encode(sig).into());
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), g.name.into());
+            obj.insert("verdict".into(), g.verdict.as_str().into());
+            obj.insert("expected".into(), g.expected.to_json());
+            obj.insert("members".into(), serde_json::Value::Array(members));
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
     serde_json::json!({
         "spec": "ai-memory/portability/v2",
         "spec_doc": "docs/spec/PORTABILITY-V2.md",
@@ -469,6 +745,7 @@ fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
             "equivocation_proof": EQUIVOCATION_PROOF_V1_DOMAIN,
         },
         "vectors": entries,
+        "groups": group_entries,
     })
 }
 
@@ -500,7 +777,8 @@ fn corpus_schema_version_matches_canonical() {
 fn corpus_matches_pinned_encoder() {
     let root = corpus_root();
     let vectors = build_corpus();
-    let manifest = manifest_text(&manifest_value(&vectors));
+    let groups = build_groups();
+    let manifest = manifest_text(&manifest_value(&vectors, &groups));
 
     if std::env::var(REGEN_ENV).is_ok() {
         for v in &vectors {
@@ -508,6 +786,15 @@ fn corpus_matches_pinned_encoder() {
             std::fs::create_dir_all(path.parent().expect("vector path has a parent"))
                 .expect("create vector dir");
             std::fs::write(&path, format!("{}\n", hex::encode(&v.bytes))).expect("write vector");
+        }
+        for g in &groups {
+            for m in &g.members {
+                let path = group_member_path(&root, g.name, m.role);
+                std::fs::create_dir_all(path.parent().expect("member path has a parent"))
+                    .expect("create group dir");
+                std::fs::write(&path, format!("{}\n", hex::encode(&m.bytes)))
+                    .expect("write group member");
+            }
         }
         std::fs::write(root.join(MANIFEST_FILE), manifest).expect("write manifest");
         return;
@@ -527,6 +814,24 @@ fn corpus_matches_pinned_encoder() {
              conformance_corpus` and commit conformance/vectors/** + manifest.json.",
             v.name,
         );
+    }
+
+    for g in &groups {
+        for m in &g.members {
+            let path = group_member_path(&root, g.name, m.role);
+            let want = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing group member {}: {e}", path.display()))
+                .trim()
+                .to_string();
+            assert_eq!(
+                hex::encode(&m.bytes),
+                want,
+                "group member `{}/{}` drifted from the pinned encoder. Regenerate with \
+                 `{REGEN_ENV}=1 cargo test --test conformance_corpus` and commit.",
+                g.name,
+                m.role,
+            );
+        }
     }
 
     let manifest_path = root.join(MANIFEST_FILE);
