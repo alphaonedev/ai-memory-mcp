@@ -26,7 +26,10 @@ conformance/
 │   ├── signable_write_v2/      3 unsigned encoding vectors
 │   ├── subkey_cert/            1 unsigned encoding vector
 │   ├── peer_head_attestation/  2 unsigned encoding vectors
-│   └── signed/                 3 signed vectors (valid / tampered / proof)
+│   ├── signed/                 3 signed vectors (valid / tampered / proof)
+│   ├── subkey_chain/           obl. 3 group members (cert→write + self-declared)
+│   ├── lineage/                obl. 5 group members (valid / revoked / fork)
+│   └── chain/                  obl. 2 group members (intact / deletion / truncation)
 └── readers/
     ├── reader.py            Python 3 reference reader (stdlib-only)
     └── reader.mjs           Node.js reference reader (stdlib-only, Node ≥ 19)
@@ -58,7 +61,9 @@ AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_corpus
 Top-level fields: `spec`, `spec_doc`, `format_freeze_doc`, `schema_version`
 (the ai-memory schema the corpus is anchored to; a Rust test pins it to the
 code's `CURRENT_SCHEMA_VERSION`), `generator`, `license`, `domain_tags`
-(record-type → frozen domain-tag string), and `vectors[]`.
+(record-type → frozen domain-tag string), `corpus_digest` (the whole-corpus
+SHA-256 integrity anchor — see below), `vectors[]`, and `groups[]` (the
+multi-record fixtures — see "Multi-record fixture groups").
 
 Each `vectors[]` entry:
 
@@ -90,23 +95,23 @@ obligations of spec §7, and what this corpus exercises of each:
    signature half by `signed/*`.*
 2. **Walk the V-4 audit chain** (`prev_hash` + `sequence`) for
    tamper-evidence; with the witness/watermark, detect tail-truncation.
-   *NOT exercised by this corpus revision — needs a signed-events chain
-   fixture (see "Corpus residue" below).*
+   *Exercised by the `chain/{intact, midchain_deletion, tail_truncation}`
+   groups (see "Multi-record fixture groups" below).*
 3. **Verify the SubkeyCert→write chain**: cert under the principal root,
    THEN the write under the certified sub-key; reject self-declared
-   instances. *Partially exercised: `subkey_cert/worked_cert` pins the cert
-   bytes a verifier must re-encode; the full two-link chain fixture is
-   residue.*
+   instances. *Exercised by the `subkey_chain/{valid, self_declared}`
+   groups; `subkey_cert/worked_cert` also pins the cert bytes.*
 4. **Pin suite→key.** The `suite_tag` inside the signed bytes is
    verification-ADVISORY; the enrolled key is the sole authority. Never
-   dispatch the verification algorithm off the wire tag. *Structural: the
-   corpus pins tag values 0 and 1 in the write vectors; behavior is on the
-   implementer.*
+   dispatch the verification algorithm off the wire tag. *BEHAVIORAL: the
+   corpus pins tag values 0 and 1 in the write vectors, but the
+   key-is-sole-authority rule is verifier policy, not byte-forceable.*
 5. **Resolve lineage epoch from the signed succession** for revocation
    windows and equivocation keys; return INDETERMINATE on a stale view.
-   *Behavioral; the proof vector carries the epoch field a resolver keys on.*
+   *Exercised by the `lineage/{valid, invalid_revoked, equivocation_fork}`
+   groups; INDETERMINATE is the byte-forceable equivocation fork.*
 6. **Apply the fail-closed visibility allow-list** to any surfaced set.
-   *Behavioral; not byte-exercisable from vectors alone.*
+   *BEHAVIORAL; not byte-exercisable from vectors alone.*
 7. **Verify an `EquivocationProof` self-contained and offline**, from the
    subject pubkey inside the proof alone. *Fully exercised by
    `signed/equivocation_proof_real`.*
