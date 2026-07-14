@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — v1.0.0 adversarial assessment + NSA CSI MCP re-verification ([#2032](https://github.com/alphaonedev/ai-memory-mcp/issues/2032))
+
+Five-agent adversarial security review of the HTTP/MCP surface (auth & access control, injection/deserialization, SSRF/outbound, transport/deployment exposure, federation-crypto/DoS), OWASP-aligned, motivated by the `7WaySecurity/ai_osint` exposure-recon threat model. Cryptographic core verified sound (macaroon verify, `verify_strict` everywhere, fail-closed federation defaults, comprehensive webhook SSRF guard, parameterized SQL, no command injection, no request-decompression bomb, 2 MiB body cap, constant-time key compare) — no SQLi / command-injection / high-critical SSRF. 13 findings recorded with `file:line` evidence + remediation (1 High + 3 Medium, all bounded to specific deployment postures; the two highest share one root cause: unattested `X-Agent-Id` on the HTTP read/mutate/admin paths). **NSA CSI MCP compliance re-verified GREEN** at the v1.0.0 dev tip — every named test in the control→test matrix (19 controls: NSA concerns a–j + recommendations a–g + 2 meta) re-run: **580 tests, 0 failed**. New public evidence page `docs/compliance/v1.0.0-security-assessment.html`.
+
 ### Changed
 
 - **`ai-memory export` de-silenced: it is a convenience view, not the portability path** ([#1944](https://github.com/alphaonedev/ai-memory-mcp/issues/1944), B_WARN de-silencing, 2×5-agent vote `woaiwndla` / `4d3ea1c5`). The JSON `ai-memory export` command (and its HTTP sibling `GET`-admin export) emits `{memories, links, count, exported_at}` — a **memories + links CONVENIENCE view** that silently omitted the substrate's tamper-evidence + governance spine (governance rules, the append-only revision log, forget tombstones, derivation lineage, per-write attestations, the signed-events audit chain). It now announces that scope instead of dropping it silently:
