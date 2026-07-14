@@ -15804,6 +15804,11 @@ impl MemoryStore for PostgresStore {
                    OR metadata->>'agent_id' = $9
                    OR metadata->>'target_agent_id' = $9
                )
+               AND (
+                   $10::text IS NULL
+                   OR ((valid_from IS NULL OR valid_from <= $10)
+                       AND (valid_until IS NULL OR valid_until > $10))
+               )
                {lifecycle_vis}
              ORDER BY fts_score DESC
              LIMIT $8",
@@ -15819,6 +15824,9 @@ impl MemoryStore for PostgresStore {
         .bind(filter.until)
         .bind(fts_pool)
         .bind(caller_opt)
+        // v1.0.0 #1834 — claim-bitemporal AS-OF ($10); TEXT RFC3339, half-open
+        // [valid_from, valid_until) END-EXCLUSIVE; NULL bounds = unbounded.
+        .bind(filter.valid_at.as_deref())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| to_store_err("recall_hybrid fts pool", e))?;
@@ -15869,6 +15877,11 @@ impl MemoryStore for PostgresStore {
                        OR COALESCE(metadata->>'scope', 'private') <> 'private'
                        OR metadata->>'agent_id' = $9
                    )
+                   AND (
+                       $10::text IS NULL
+                       OR ((valid_from IS NULL OR valid_from <= $10)
+                           AND (valid_until IS NULL OR valid_until > $10))
+                   )
                    {lifecycle_vis}
                  ORDER BY embedding <=> $1
                  LIMIT $8",
@@ -15884,6 +15897,8 @@ impl MemoryStore for PostgresStore {
             .bind(filter.until)
             .bind(ann_pool)
             .bind(caller_opt)
+            // v1.0.0 #1834 — claim-bitemporal AS-OF ($10). See FTS pool above.
+            .bind(filter.valid_at.as_deref())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| to_store_err("recall_hybrid semantic pool", e))?;

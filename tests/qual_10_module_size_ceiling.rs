@@ -314,7 +314,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (mint_recovery_record + prepare_recovery_challenge + append_recovery)
     // + the recovery-branch in append_lineage_record + the persisted-recovery
     // ceremony test land storage/mod.rs at 24_421; ceiling 24_500 (+79).
-    ("src/storage/mod.rs", 24_500),
+    // 2026-07-14 (#1834 claim-bitemporal): threading valid_at through the
+    // hybrid-recall chain (fts_keyword_phase + semantic_phase SQL predicates,
+    // the HNSW Rust re-filter, and the recall_hybrid* wrapper signatures)
+    // lands storage/mod.rs at 24_594; ceiling 24_700 (+106).
+    ("src/storage/mod.rs", 24_700),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
