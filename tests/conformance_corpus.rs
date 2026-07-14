@@ -47,9 +47,18 @@ use ai_memory::identity::equivocation::{
     HeadAttestationEntry, SignableHeadAttestation, canonical_cbor_head_attestation,
     sign_head_attestation,
 };
+use ai_memory::identity::lineage::{
+    CUSTODY_CLASS_SOFTWARE_FILE, LINEAGE_REASON_GENESIS, LINEAGE_REASON_REVOCATION,
+    LINEAGE_REASON_ROTATION,
+};
+use ai_memory::identity::sign::{
+    SignableSuccession, canonical_cbor_succession, lineage_signing_input,
+};
 use ai_memory::identity::subkey_cert::{
     SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert, sign_subkey_cert,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 
@@ -107,6 +116,15 @@ enum Verdict {
     /// valid sub-key signature and still be rejected on chain-authorization
     /// grounds, so a bare signature check would wrongly ACCEPT it.
     SubkeyChainVerify,
+    /// #1837 obl.5 — a lineage succession chain (a fixture GROUP). The reader
+    /// verifies each record's Ed25519 signature under its predecessor over the
+    /// `LINEAGE_DOMAIN`-prefixed canonical bytes, walks `prev_record_hash` +
+    /// monotonic `epoch`, and resolves a THREE-valued terminal state
+    /// (`valid` | `indeterminate` | `invalid-revoked`) against the group's
+    /// manifest `expected_state` + `resolution_policy`. INDETERMINATE is the
+    /// byte-forceable EQUIVOCATION FORK (two successors at the same epoch under
+    /// the same predecessor), never a reader-cache "stale view".
+    LineageResolve,
 }
 
 impl Verdict {
@@ -117,6 +135,7 @@ impl Verdict {
             Verdict::SignatureInvalid => "signature-invalid",
             Verdict::EquivocationProven => "equivocation-proven",
             Verdict::SubkeyChainVerify => "subkey-chain-verify",
+            Verdict::LineageResolve => "lineage-resolve",
         }
     }
 }
@@ -158,25 +177,38 @@ struct Vector {
 // group's `expected` object. Expectations are NEVER hidden in the frozen bytes.
 // ---------------------------------------------------------------------------
 
+/// The wire grammar a member's `bytes` are encoded in. The corpus's original
+/// families are the domain-TAGGED positional ARRAY profile (spec §1); #1837
+/// obl.2/obl.5 add the two production CANONICAL-BYTES families whose domain is
+/// a signing-input PREFIX (not an in-array tag) and whose body is a canonical
+/// CBOR map, so a reader dispatches its re-encode / verify path on this.
+const GRAMMAR_ARRAY_V2: &str = "array-v2";
+const GRAMMAR_LINEAGE_SUCCESSION_V1: &str = "lineage-succession-v1";
+
 /// One record inside a multi-record fixture [`Group`]. Its `bytes` are still
 /// frozen-encoder output written as an ordinary hex vector under
 /// `vectors/<group>/<role>.hex`.
 struct GroupMember {
-    /// Role within the group's verify procedure, e.g. `cert`, `write`.
+    /// Role within the group's verify procedure, e.g. `cert`, `write`, `row_0`.
     role: &'static str,
     /// Record-type family (matches the domain tag's record type).
     record_type: &'static str,
+    /// The wire grammar of `bytes` — how the reader re-encodes / verifies it.
+    grammar: &'static str,
     /// The frozen-encoder bytes for this member.
     bytes: Vec<u8>,
-    /// The frozen domain tag committed at element [0] of the record's array.
-    domain_tag: &'static str,
-    /// Number of positional elements in the member's outer array.
-    elements: usize,
     /// Raw 32-byte Ed25519 public key the reader verifies this member under
-    /// (e.g. the principal root for `cert`, the certified sub-key for `write`).
+    /// (e.g. the principal root for `cert`, the certified sub-key for `write`,
+    /// the predecessor for a lineage record).
     pubkey: Option<[u8; 32]>,
-    /// Raw 64-byte detached signature over `bytes`.
+    /// Raw 64-byte detached signature over the grammar's signing input.
     signature: Option<[u8; 64]>,
+    /// Grammar-specific manifest fields, emitted verbatim (in order) onto the
+    /// member object — the answer-key oracle a reader consumes to drive the
+    /// verify procedure. Array members carry `{domain_tag, elements}`; lineage
+    /// members carry `{predecessor_pubkey, successor_pubkey, epoch, reason}`;
+    /// chain rows carry `{sequence, prev_hash}`.
+    attrs: Vec<(&'static str, serde_json::Value)>,
 }
 
 /// The answer-key `expected` object for a [`Group`] — the outcome a conforming
@@ -500,20 +532,26 @@ fn build_subkey_chain_groups() -> Vec<Group> {
                 GroupMember {
                     role: "cert",
                     record_type: "subkey_cert",
+                    grammar: GRAMMAR_ARRAY_V2,
                     bytes: cert_bytes,
-                    domain_tag: SUBKEY_CERT_V1_DOMAIN,
-                    elements: SUBKEY_CERT_ELEMENTS,
                     pubkey: Some(root_pk),
                     signature: Some(cert_sig),
+                    attrs: vec![
+                        ("domain_tag", SUBKEY_CERT_V1_DOMAIN.into()),
+                        ("elements", SUBKEY_CERT_ELEMENTS.into()),
+                    ],
                 },
                 GroupMember {
                     role: "write",
                     record_type: "signable_write_v2",
+                    grammar: GRAMMAR_ARRAY_V2,
                     bytes: write_bytes,
-                    domain_tag: WRITE_V2_DOMAIN,
-                    elements: SIGNABLE_WRITE_V2_ELEMENTS,
                     pubkey: Some(subkey_pk),
                     signature: Some(write_sig),
+                    attrs: vec![
+                        ("domain_tag", WRITE_V2_DOMAIN.into()),
+                        ("elements", SIGNABLE_WRITE_V2_ELEMENTS.into()),
+                    ],
                 },
             ],
         },
@@ -528,19 +566,196 @@ fn build_subkey_chain_groups() -> Vec<Group> {
             members: vec![GroupMember {
                 role: "write",
                 record_type: "signable_write_v2",
+                grammar: GRAMMAR_ARRAY_V2,
                 bytes: sd_bytes,
-                domain_tag: WRITE_V2_DOMAIN,
-                elements: SIGNABLE_WRITE_V2_ELEMENTS,
                 pubkey: Some(self_declared_pk),
                 signature: Some(sd_sig),
+                attrs: vec![
+                    ("domain_tag", WRITE_V2_DOMAIN.into()),
+                    ("elements", SIGNABLE_WRITE_V2_ELEMENTS.into()),
+                ],
             }],
+        },
+    ]
+}
+
+/// Fixed deterministic seeds for the #1837 obl.5 lineage succession chain:
+/// the genesis key K0, the first rotation successor K1, and a DIVERGENT
+/// successor K1b for the equivocation-fork INDETERMINATE fixture.
+const LINEAGE_K0_SEED: [u8; 32] = [0x77; 32];
+const LINEAGE_K1_SEED: [u8; 32] = [0x88; 32];
+const LINEAGE_K1B_SEED: [u8; 32] = [0x99; 32];
+
+const LINEAGE_AGENT_ID: &str = "ai:claude-code@pop-os";
+
+/// Build a signed lineage succession member: the canonical map body plus the
+/// Ed25519 signature over `LINEAGE_DOMAIN` ∥ body under `signer` (the record's
+/// predecessor `K_old`). The structural fields the reader keys the chain /
+/// equivocation logic on live in `attrs` (the manifest oracle).
+fn lineage_member(
+    role: &'static str,
+    signer: &SigningKey,
+    s: &SignableSuccession<'_>,
+) -> GroupMember {
+    let body = canonical_cbor_succession(s).expect("encode succession");
+    let sig = signer.sign(&lineage_signing_input(&body)).to_bytes();
+    GroupMember {
+        role,
+        record_type: "agent_lineage_succession",
+        grammar: GRAMMAR_LINEAGE_SUCCESSION_V1,
+        bytes: body,
+        pubkey: Some(signer.verifying_key().to_bytes()),
+        signature: Some(sig),
+        attrs: vec![
+            ("predecessor_pubkey", s.predecessor_pubkey.into()),
+            ("successor_pubkey", s.successor_pubkey.into()),
+            ("epoch", s.epoch.into()),
+            ("reason", s.reason.into()),
+        ],
+    }
+}
+
+/// A base v76 succession template — the four additive #1949/#1831 fields stay
+/// at their omitted defaults so the body is a plain 8-field canonical map.
+fn succession<'a>(
+    epoch: u64,
+    reason: &'a str,
+    predecessor_b64: &'a str,
+    successor_b64: &'a str,
+    not_before: &'a str,
+    prev_record_hash: &'a [u8],
+    suspected_compromise_from_seq: Option<u64>,
+) -> SignableSuccession<'a> {
+    SignableSuccession {
+        agent_id: LINEAGE_AGENT_ID,
+        epoch,
+        reason,
+        predecessor_pubkey: predecessor_b64,
+        successor_pubkey: successor_b64,
+        recovery_pubkey: None,
+        not_before,
+        prev_record_hash,
+        custody_class: CUSTODY_CLASS_SOFTWARE_FILE,
+        suspected_compromise_from_seq,
+        guardian_set_id: None,
+        recovery_threshold: None,
+    }
+}
+
+/// #1837 obl.5 — the lineage succession fixture groups (spec §7 step 5). The
+/// three-valued resolution: a clean rotation chain is `valid`; a chain reaching
+/// a `revocation` record is `invalid-revoked`; an EQUIVOCATION FORK (two
+/// successors at the same epoch under the same predecessor, both validly
+/// signed) is `indeterminate` — the byte-forceable unresolvable case, never a
+/// reader-cache "stale view".
+fn build_lineage_groups() -> Vec<Group> {
+    let k0 = SigningKey::from_bytes(&LINEAGE_K0_SEED);
+    let k1 = SigningKey::from_bytes(&LINEAGE_K1_SEED);
+    let k_fork = SigningKey::from_bytes(&LINEAGE_K1B_SEED);
+    let k0_b64 = URL_SAFE_NO_PAD.encode(k0.verifying_key().to_bytes());
+    let k1_b64 = URL_SAFE_NO_PAD.encode(k1.verifying_key().to_bytes());
+    let k_fork_b64 = URL_SAFE_NO_PAD.encode(k_fork.verifying_key().to_bytes());
+    let zero32 = [0u8; 32];
+
+    let genesis = succession(
+        0,
+        LINEAGE_REASON_GENESIS,
+        &k0_b64,
+        &k0_b64,
+        "2026-07-11T00:00:00Z",
+        &zero32,
+        None,
+    );
+    let genesis_hash: [u8; 32] =
+        Sha256::digest(canonical_cbor_succession(&genesis).unwrap()).into();
+
+    let rotation = succession(
+        1,
+        LINEAGE_REASON_ROTATION,
+        &k0_b64,
+        &k1_b64,
+        "2026-07-11T01:00:00Z",
+        &genesis_hash,
+        None,
+    );
+    let rotation_hash: [u8; 32] =
+        Sha256::digest(canonical_cbor_succession(&rotation).unwrap()).into();
+
+    // A revocation record (signed by the current successor K1) marking the key
+    // compromised from a `signed_events` witness sequence high-water.
+    let revocation = succession(
+        2,
+        LINEAGE_REASON_REVOCATION,
+        &k1_b64,
+        &k1_b64,
+        "2026-07-11T02:00:00Z",
+        &rotation_hash,
+        Some(100),
+    );
+
+    // The equivocation fork: a SECOND rotation at the SAME epoch 1 under the
+    // SAME predecessor K0, handing off to a DIFFERENT successor K1b.
+    let rotation_fork = succession(
+        1,
+        LINEAGE_REASON_ROTATION,
+        &k0_b64,
+        &k_fork_b64,
+        "2026-07-11T01:00:01Z",
+        &genesis_hash,
+        None,
+    );
+
+    vec![
+        Group {
+            name: "lineage/valid",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("valid"),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation", &k0, &rotation),
+            ],
+        },
+        Group {
+            name: "lineage/invalid_revoked",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("invalid-revoked"),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation", &k0, &rotation),
+                lineage_member("revocation", &k1, &revocation),
+            ],
+        },
+        Group {
+            name: "lineage/equivocation_fork",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("indeterminate"),
+                resolution_policy: Some(&[
+                    ("on_equivocation", "indeterminate"),
+                    ("on_missing_link", "invalid"),
+                ]),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation_a", &k0, &rotation),
+                lineage_member("rotation_b", &k0, &rotation_fork),
+            ],
         },
     ]
 }
 
 /// Assemble the multi-record fixture groups (#1837 obl.2/3/5) in a stable order.
 fn build_groups() -> Vec<Group> {
-    build_subkey_chain_groups()
+    let mut groups = build_subkey_chain_groups();
+    groups.extend(build_lineage_groups());
+    groups
 }
 
 /// Assemble the full corpus in a stable order.
@@ -705,18 +920,20 @@ fn manifest_value(vectors: &[Vector], groups: &[Group]) -> serde_json::Value {
                     let mut obj = serde_json::Map::new();
                     obj.insert("role".into(), m.role.into());
                     obj.insert("record_type".into(), m.record_type.into());
+                    obj.insert("grammar".into(), m.grammar.into());
                     obj.insert(
                         "file".into(),
                         format!("{VECTORS_SUBDIR}/{}/{}.hex", g.name, m.role).into(),
                     );
-                    obj.insert("domain_tag".into(), m.domain_tag.into());
-                    obj.insert("elements".into(), m.elements.into());
                     obj.insert("length_bytes".into(), m.bytes.len().into());
                     if let Some(pk) = m.pubkey {
                         obj.insert("pubkey".into(), hex::encode(pk).into());
                     }
                     if let Some(sig) = m.signature {
                         obj.insert("signature".into(), hex::encode(sig).into());
+                    }
+                    for (k, v) in &m.attrs {
+                        obj.insert((*k).into(), v.clone());
                     }
                     serde_json::Value::Object(obj)
                 })
