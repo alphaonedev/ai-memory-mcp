@@ -337,9 +337,11 @@ mod tests {
         // capability token on the governed mutation tools.
         // v1.0.0 #1957 R40 — 123 -> 124: APPROVALS (pending-approve m-of-n).
         // v1.0.0 #1959 R55 — 124 -> 125: TRANSITIVE (dependents transitive walk).
+        // v1.0.0 #2024 — 125 -> 127: REASON + UNRETIRE (skill retire/unretire
+        // lifecycle params for memory_skill_retire).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            125,
+            127,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
