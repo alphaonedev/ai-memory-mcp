@@ -9730,17 +9730,45 @@ impl PostgresStore {
         }
         let quorum_n = crate::config::reflect_decorrelation_quorum_n();
 
-        // Direct namespace-scoped corpus read (NOT recall). Bounded by the SSOT
-        // `crate::storage::LIST_MAX_LIMIT` (sqlite-twin parity — the same window
-        // the visibility probe's `PROBE_SCAN_LIMIT` reuses) so this per-write
-        // scan on the reflect hot path can never grow unbounded.
+        // #2028 (sqlite-twin parity of `db::run_decorrelation_write_gate`) —
+        // Full corpus size is an UNCAPPED `COUNT(*)`; it only feeds the
+        // advisory-message denominator and must reflect the true corpus size,
+        // not the scan window.
+        let total_reflections: usize = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM memories \
+             WHERE namespace = $1 AND memory_kind = 'reflection'",
+        )
+        .bind(target_namespace)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            crate::db::ReflectError::Database(to_store_err("decorrelation count", e).to_string())
+        })?
+        .try_into()
+        .unwrap_or(usize::MAX);
+
+        // #2028 — Scan the ATTESTED-CANDIDATE set, NOT the whole corpus. Only a
+        // row carrying the loader-observed attest marker can EVER resolve an
+        // attested family, so marker-filtering is the security-correct
+        // population. The prior unordered `LIMIT LIST_MAX_LIMIT` over the FULL
+        // corpus could push attested rows outside the window whenever a
+        // namespace held more than `LIST_MAX_LIMIT` CLAIMED reflections —
+        // undercounting `attested_rows` below `MIN_REFLECTIONS_FLOOR` so an
+        // attested monoculture silently PROCEEDED instead of being REFUSED under
+        // `enforce`. `LIST_MAX_LIMIT` still caps the hot-path scan and is
+        // security-safe (more candidates only push toward Refuse). The per-row
+        // `pg_model_family_row_exists` still applies the forgery gate.
+        let attest_path = crate::identity::META_KEY_MODEL_FAMILY_ATTEST;
         let scan_limit = i64::try_from(crate::storage::LIST_MAX_LIMIT).unwrap_or(i64::MAX);
         let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
             "SELECT metadata FROM memories \
              WHERE namespace = $1 AND memory_kind = 'reflection' \
-             LIMIT $2",
+               AND metadata->>$2 = $3 \
+             LIMIT $4",
         )
         .bind(target_namespace)
+        .bind(attest_path)
+        .bind(crate::identity::ATTEST_MODEL_LOADER_OBSERVED)
         .bind(scan_limit)
         .fetch_all(&self.pool)
         .await
@@ -9749,7 +9777,6 @@ impl PostgresStore {
         })?;
 
         let mut corpus_attested: Vec<String> = Vec::new();
-        let total_reflections = rows.len();
         for (meta,) in &rows {
             if let Some(fam) = crate::storage::model_attest::attested_family_candidate(meta) {
                 if self.pg_model_family_row_exists(&fam).await? {
