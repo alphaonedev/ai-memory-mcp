@@ -10617,15 +10617,92 @@ impl PostgresStore {
                 crate::signed_events::hex_lower(h.finalize().as_slice())
             })
         };
-        let head_hash = match crate::governance::audit::last_audit_watermark() {
-            Some((anchored_head, anchored_hash)) if head_sequence == anchored_head => {
-                crate::signed_events::compute_head_hash_verdict(
+        // Recompute the memory_revisions head-row canonical hash for the
+        // witness lane (the pg twin of `read_revision_chain_head`; mirrors
+        // `pg_read_revision_head_in_tx` at ~10188 but on `self.pool`).
+        let recomputed_rev_hex: Option<(i64, String)> = {
+            use crate::revisions::{RevisionLeaf, canonical_revision_chain_bytes};
+            type RevHeadRow = (
+                String,
+                String,
+                String,
+                Option<i64>,
+                String,
+                Option<String>,
+                String,
+                Option<Vec<u8>>,
+                i64,
+            );
+            let row: Option<RevHeadRow> = sqlx::query_as(
+                "SELECT id, memory_id, kind, prior_version, namespace, agent_id, created_at, \
+                        signature, sequence \
+                 FROM memory_revisions ORDER BY sequence DESC LIMIT 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+            row.and_then(
+                |(id, memory_id, kind, prior, ns, agent, created_at, sig, seq)| {
+                    use sha2::{Digest, Sha256};
+                    let kind = crate::revisions::RecordKind::from_str_opt(&kind)?;
+                    let leaf = RevisionLeaf {
+                        id,
+                        memory_id,
+                        kind,
+                        prior_version: prior,
+                        namespace: ns,
+                        agent_id: agent,
+                        created_at,
+                        signature: sig,
+                    };
+                    let mut h = Sha256::new();
+                    h.update(canonical_revision_chain_bytes(&leaf, seq));
+                    Some((
+                        seq,
+                        crate::signed_events::hex_lower(h.finalize().as_slice()),
+                    ))
+                },
+            )
+        };
+        // v1.0.0 #1873 — fold every head-hash anchor (forensic watermark +
+        // witness dual for BOTH chains) at equal sequence → IDENTICAL verdict
+        // to sqlite via the SHARED `fold_head_hash_verdicts` (K3 parity).
+        let head_hash = {
+            let witness_dual = witness_cp
+                .as_ref()
+                .and_then(crate::governance::audit::parse_witness_dual_head);
+            let mut verdicts: Vec<crate::signed_events::HeadHashCheck> = Vec::new();
+            if let Some((anchored_head, anchored_hash)) =
+                crate::governance::audit::last_audit_watermark()
+                && head_sequence == anchored_head
+            {
+                verdicts.push(crate::signed_events::compute_head_hash_verdict(
                     Some(&anchored_hash),
                     recomputed_head_hex.as_deref(),
                     "signed_events",
-                )
+                ));
             }
-            _ => crate::signed_events::HeadHashCheck::Unknown,
+            if let Some(dual) = witness_dual {
+                if head_sequence == dual.signed_head_sequence {
+                    verdicts.push(crate::signed_events::compute_head_hash_verdict(
+                        Some(&dual.signed_head_hash),
+                        recomputed_head_hex.as_deref(),
+                        "signed_events",
+                    ));
+                }
+                if let Some((rev_seq, rev_hash)) = &recomputed_rev_hex
+                    && *rev_seq > 0
+                    && *rev_seq == dual.revisions_head_sequence
+                {
+                    verdicts.push(crate::signed_events::compute_head_hash_verdict(
+                        Some(&dual.revisions_head_hash),
+                        Some(rev_hash.as_str()),
+                        "memory_revisions",
+                    ));
+                }
+            }
+            crate::signed_events::fold_head_hash_verdicts(verdicts)
         };
 
         Ok(crate::signed_events::AuditTrailReport {

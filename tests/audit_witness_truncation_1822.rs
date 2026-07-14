@@ -44,10 +44,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use ai_memory::governance::audit as witness;
 use ai_memory::models::ConditionType;
 use ai_memory::signed_events::{
-    CauseBinding, SignedEvent, TruncationCheck, WitnessCheck, append_signed_event,
+    CauseBinding, HeadHashCheck, SignedEvent, TruncationCheck, WitnessCheck, append_signed_event,
     force_emit_audit_head_witness, payload_hash, verify_audit_trail,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 /// Process-global serialisation for the witness ENV + throttle static.
 fn env_lock() -> &'static Mutex<()> {
@@ -662,4 +662,107 @@ mod postgres_parity {
             .ok();
         clear_witness_env();
     }
+}
+
+// ── (#1873) witness-anchor head-hash lane: SAME-LENGTH suffix rewrite ──
+// The witness checkpoint records the REAL head hashes of BOTH chains, so a
+// same-length rewrite (equal row count, recomputed prev_hash) of either head
+// row — which the seq-only WitnessCheck cannot see — is caught by the
+// #1873 head-hash anchor folded into `report.head_hash`.
+
+#[test]
+fn witness_signed_events_same_length_rewrite_is_head_hash_mismatch() {
+    let _g = lock();
+    let kdir = fresh_dir("h-keys");
+    let ddir = fresh_dir("h-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 5);
+    for i in 0..3 {
+        append_rev_leaf(&conn, &format!("mem-{i}"));
+    }
+    force_emit_audit_head_witness(&conn); // binds the REAL signed + mem heads
+
+    // Baseline: both heads match their witnessed hashes.
+    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    assert_eq!(
+        clean.head_hash,
+        HeadHashCheck::NotDetected,
+        "clean={clean:?}"
+    );
+    assert!(clean.is_clean(), "clean={clean:?}");
+
+    // SAME-LENGTH rewrite of the signed_events head row (row count + sequences
+    // unchanged; nothing links from the head → chain walk + seq-only witness
+    // stay clean; only the head-hash anchor catches it).
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 \
+         WHERE sequence = (SELECT MAX(sequence) FROM signed_events)",
+        params![vec![0xEEu8; 32]],
+    )
+    .expect("rewrite signed head in place");
+
+    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    assert!(report.chain_intact, "report={report:?}");
+    assert_eq!(
+        report.witness,
+        WitnessCheck::NotDetected,
+        "report={report:?}"
+    );
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "signed_events"),
+        other => panic!("expected signed_events head-hash Mismatch, got {other:?}; {report:?}"),
+    }
+    assert!(
+        !report.is_clean(),
+        "same-length rewrite must dirty; report={report:?}"
+    );
+
+    clear_witness_env();
+}
+
+#[test]
+fn witness_memory_revisions_same_length_rewrite_is_head_hash_mismatch() {
+    let _g = lock();
+    let kdir = fresh_dir("i-keys");
+    let ddir = fresh_dir("i-db");
+    let _kp = enrol_witness(kdir.path());
+    let (_path, conn) = open_db(ddir.path());
+
+    append_rows(&conn, 3);
+    for i in 0..4 {
+        append_rev_leaf(&conn, &format!("mem-{i}"));
+    }
+    force_emit_audit_head_witness(&conn); // binds the REAL signed + mem heads
+
+    let clean = verify_audit_trail(&conn, None).expect("verify clean");
+    assert_eq!(
+        clean.head_hash,
+        HeadHashCheck::NotDetected,
+        "clean={clean:?}"
+    );
+
+    // SAME-LENGTH rewrite of the memory_revisions head row: flip a field the
+    // canonical revision bytes commit (`namespace`) at MAX(sequence).
+    conn.execute(
+        "UPDATE memory_revisions SET namespace = 'tampered' \
+         WHERE sequence = (SELECT MAX(sequence) FROM memory_revisions)",
+        [],
+    )
+    .expect("rewrite memory_revisions head in place");
+
+    let report = verify_audit_trail(&conn, None).expect("verify rewritten");
+    match &report.head_hash {
+        HeadHashCheck::Mismatch { chain, .. } => assert_eq!(chain, "memory_revisions"),
+        other => {
+            panic!("expected memory_revisions head-hash Mismatch, got {other:?}; {report:?}")
+        }
+    }
+    assert!(
+        !report.is_clean(),
+        "a memory_revisions same-length rewrite must dirty; report={report:?}"
+    );
+
+    clear_witness_env();
 }

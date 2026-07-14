@@ -1472,6 +1472,31 @@ pub fn compute_head_hash_verdict(
     }
 }
 
+/// v1.0.0 #1873 — fold the per-anchor [`HeadHashCheck`] verdicts (the #1850
+/// forensic watermark + the #1822 dual-chain witness, each for the chains it
+/// anchors) into the single `AuditTrailReport.head_hash` verdict. Precedence:
+/// ANY `Mismatch` wins (a same-length rewrite on ANY anchored chain is dirty —
+/// the FIRST such, so the forensic lane is passed first); else if ANY lane
+/// verified a `NotDetected` (a real match happened) the verdict is
+/// `NotDetected`; else `Unknown` (no anchor was comparable → withhold). Pure so
+/// both backends' `verify_audit_trail` fold identically (K3 parity).
+#[must_use]
+pub fn fold_head_hash_verdicts(verdicts: Vec<HeadHashCheck>) -> HeadHashCheck {
+    if let Some(mismatch) = verdicts
+        .iter()
+        .find(|v| matches!(v, HeadHashCheck::Mismatch { .. }))
+    {
+        return mismatch.clone();
+    }
+    if verdicts
+        .iter()
+        .any(|v| matches!(v, HeadHashCheck::NotDetected))
+    {
+        return HeadHashCheck::NotDetected;
+    }
+    HeadHashCheck::Unknown
+}
+
 /// v0.9.0 G9 (#1826) — verdict of the three-key Recorder/Judge/Stopper
 /// signing-layer SEPARATION check, computed by
 /// [`compute_role_separation_verdict`]. Additive/opt-in: with no role keys
@@ -2094,22 +2119,58 @@ pub fn verify_audit_trail(conn: &Connection, since: Option<&str>) -> Result<Audi
     let rollback = crate::governance::audit::compute_rollback_verdict_for_report(head_sequence);
 
     // v1.0.0 #1873 (CWE-354) — audit-head HASH-anchor check. The seq-only
-    // `truncation` verdict above misses a SAME-LENGTH suffix rewrite on an
-    // unsigned daemon (recomputed `prev_hash`, equal row count). Recompute the
-    // surviving head row's canonical hash and compare it against the hash the
-    // #1850 forensic watermark already records at the SAME sequence. The
-    // comparison is meaningful ONLY when the surviving head sequence EQUALS the
-    // anchored sequence: a lower head is a truncation (surfaced by `truncation`)
-    // and a higher head means the chain grew past a now-stale anchor — both
-    // withhold here. Shared `read_chain_head` + `hex_lower` recompute → the
-    // postgres twin computes the identical verdict (K3 parity). See
-    // [`HeadHashCheck`] for the interior-row / sub-interval / #1930 bounds.
-    let head_hash = match crate::governance::audit::last_audit_watermark() {
-        Some((anchored_head, anchored_hash)) if head_sequence == anchored_head => {
-            let recomputed = read_chain_head(conn).ok().map(|(_, d)| hex_lower(&d));
-            compute_head_hash_verdict(Some(&anchored_hash), recomputed.as_deref(), "signed_events")
+    // `truncation` + `witness` verdicts above miss a SAME-LENGTH suffix rewrite
+    // on an unsigned daemon (recomputed `prev_hash`, equal row count). Recompute
+    // the surviving head-row canonical hashes and compare them against EVERY
+    // anchor that records a head hash at the SAME sequence: the #1850 forensic
+    // watermark (signed_events) + the #1822 dual-chain WITNESS (signed_events
+    // AND memory_revisions). Each comparison is meaningful ONLY at equal
+    // sequence (a lower head is a truncation, surfaced above; a higher head is a
+    // stale anchor). Shared `read_chain_head`/`read_revision_chain_head` +
+    // `hex_lower` recompute + the pure `fold_head_hash_verdicts` → the postgres
+    // twin computes an identical verdict (K3 parity). See [`HeadHashCheck`] for
+    // the interior-row / sub-interval / #1930 bounds.
+    let head_hash = {
+        let recomputed_signed = read_chain_head(conn).ok().map(|(_, d)| hex_lower(&d));
+        let witness_dual = latest_witness
+            .as_ref()
+            .and_then(crate::governance::audit::parse_witness_dual_head);
+        let mut verdicts: Vec<HeadHashCheck> = Vec::new();
+        // (a) forensic watermark → signed_events head.
+        if let Some((anchored_head, anchored_hash)) =
+            crate::governance::audit::last_audit_watermark()
+            && head_sequence == anchored_head
+        {
+            verdicts.push(compute_head_hash_verdict(
+                Some(&anchored_hash),
+                recomputed_signed.as_deref(),
+                "signed_events",
+            ));
         }
-        _ => HeadHashCheck::Unknown,
+        // (b) witness dual anchor → signed_events + memory_revisions heads.
+        if let Some(dual) = witness_dual {
+            if head_sequence == dual.signed_head_sequence {
+                verdicts.push(compute_head_hash_verdict(
+                    Some(&dual.signed_head_hash),
+                    recomputed_signed.as_deref(),
+                    "signed_events",
+                ));
+            }
+            let rev = crate::revisions::read_revision_chain_head(conn)
+                .ok()
+                .map(|(seq, d)| (seq, hex_lower(&d)));
+            if let Some((rev_seq, rev_hash)) = rev
+                && rev_seq > 0
+                && rev_seq == dual.revisions_head_sequence
+            {
+                verdicts.push(compute_head_hash_verdict(
+                    Some(&dual.revisions_head_hash),
+                    Some(rev_hash.as_str()),
+                    "memory_revisions",
+                ));
+            }
+        }
+        fold_head_hash_verdicts(verdicts)
     };
 
     Ok(AuditTrailReport {
@@ -2617,6 +2678,30 @@ mod tests {
             }
             other => panic!("expected Mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fold_head_hash_verdicts_precedence() {
+        use HeadHashCheck::{Mismatch, NotDetected, Unknown};
+        let mm = || Mismatch {
+            chain: "signed_events".to_string(),
+            detail: "x".to_string(),
+        };
+        // Empty → Unknown (withhold).
+        assert_eq!(fold_head_hash_verdicts(vec![]), Unknown);
+        // Any Unknown-only → Unknown.
+        assert_eq!(fold_head_hash_verdicts(vec![Unknown, Unknown]), Unknown);
+        // A verified match with no mismatch → NotDetected.
+        assert_eq!(
+            fold_head_hash_verdicts(vec![Unknown, NotDetected]),
+            NotDetected
+        );
+        // ANY mismatch wins over matches/withholds (dirty).
+        assert_eq!(
+            fold_head_hash_verdicts(vec![NotDetected, mm(), Unknown]),
+            mm()
+        );
+        assert_eq!(fold_head_hash_verdicts(vec![mm()]), mm());
     }
 
     #[test]
