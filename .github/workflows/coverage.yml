@@ -210,6 +210,38 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # #2019 — the reranker (cross-encoder/ms-marco-MiniLM-L-6-v2) + embedder
+      # (sentence-transformers/all-MiniLM-L6-v2) tests download their weights via
+      # hf-hub. A flaky HF download made those modules' per-module coverage
+      # NON-DETERMINISTIC: on a failed fetch the tests take the offline/keyword
+      # path, the model-execution lines go uncovered, and reranker.rs /
+      # embeddings.rs / daemon_runtime.rs deterministically drop below floor
+      # (81.71% / 86.01% / 85.97%) — red on main AND every PR until the fetch
+      # succeeds. Cache the HF dir + retry-prefetch so the model tests ALWAYS run.
+      # huggingface_hub writes the same standard hub cache the Rust hf-hub Api reads.
+      - name: Cache HuggingFace models (#2019)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-models-minilm-l6-v2-marco-l6-v2-v1
+
+      - name: Pre-stage HF models with retry (#2019)
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check "huggingface_hub>=0.20" \
+            || pip3 install --quiet "huggingface_hub>=0.20"
+          for m in sentence-transformers/all-MiniLM-L6-v2 cross-encoder/ms-marco-MiniLM-L-6-v2; do
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              if python3 -c "from huggingface_hub import snapshot_download; snapshot_download('$m')"; then
+                echo "::notice::staged $m (attempt $attempt)"; ok=1; break
+              fi
+              echo "::warning::hf fetch $m attempt $attempt failed; retry in $((attempt*10))s"
+              sleep $((attempt*10))
+            done
+            [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
+          done
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
