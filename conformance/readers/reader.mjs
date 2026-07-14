@@ -347,6 +347,36 @@ const GROUP_CHECKS = {
   "chain-verify": checkChain,
 };
 
+/** Recompute the whole-corpus SHA-256 anchor over every referenced record file
+ * and assert it equals the manifest's `corpus_digest`, so the answer-key oracle
+ * cannot drift from the frozen record bytes. */
+async function checkCorpusDigest(manifest, corpus) {
+  const items = [];
+  for (const entry of manifest.vectors)
+    items.push([entry.file, hexToBytes(readFileSync(join(corpus, entry.file), "utf-8"))]);
+  for (const group of manifest.groups ?? [])
+    for (const m of group.members)
+      items.push([m.file, hexToBytes(readFileSync(join(corpus, m.file), "utf-8"))]);
+  items.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const parts = [];
+  const zero = new Uint8Array([0]);
+  for (const [path, data] of items) {
+    parts.push(new TextEncoder().encode(path), zero, data, zero);
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    buf.set(p, off);
+    off += p.length;
+  }
+  const got = Array.from(new Uint8Array(await subtle.digest("SHA-256", buf)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  if (got !== manifest.corpus_digest)
+    throw new ProfileError(`corpus_digest mismatch: computed ${got}, manifest ${manifest.corpus_digest}`);
+}
+
 // --- main ---------------------------------------------------------------------
 
 async function main() {
@@ -365,6 +395,14 @@ async function main() {
   const manifest = JSON.parse(readFileSync(join(corpus, "manifest.json"), "utf-8"));
   const headDomain = manifest.domain_tags.peer_head_attestation;
   let failed = 0;
+
+  try {
+    await checkCorpusDigest(manifest, corpus);
+    console.log("PASS corpus_digest [integrity-anchor]");
+  } catch (err) {
+    console.log(`FAIL corpus_digest: ${err.message}`);
+    failed += 1;
+  }
 
   for (const entry of manifest.vectors) {
     try {
@@ -426,7 +464,7 @@ async function main() {
     }
   }
 
-  const total = manifest.vectors.length + groups.length;
+  const total = manifest.vectors.length + groups.length + 1; // + corpus_digest anchor
   console.log(`\n${total - failed}/${total} items passed${failed === 0 ? "" : " (FAILURES)"}`);
   return failed === 0 ? 0 : 1;
 }

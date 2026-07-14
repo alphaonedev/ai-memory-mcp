@@ -1,4 +1,5 @@
 {
+  "corpus_digest": "82fe21c875664f1086f07abede2f6abb658a4351eba978bd91cd7e57b63c7f3b",
   "domain_tags": {
     "equivocation_proof": "ai-memory/equivocation-proof/v1",
     "peer_head_attestation": "ai-memory/peer-head-attestation-v1",

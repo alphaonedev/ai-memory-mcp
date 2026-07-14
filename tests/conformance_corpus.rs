@@ -885,6 +885,37 @@ fn build_groups() -> Vec<Group> {
     groups
 }
 
+/// The whole-corpus INTEGRITY ANCHOR: a single SHA-256 over EVERY vector +
+/// group-member record, keyed by its corpus-relative file path in sorted order.
+/// Committed as the manifest's `corpus_digest`, so the unsigned answer-key
+/// oracle (the manifest's `expected` objects, pubkeys, signatures) cannot drift
+/// from the frozen record bytes it describes — a reader recomputes this over the
+/// referenced files and refuses the corpus on mismatch. Pre-image per record is
+/// `path || 0x00 || bytes || 0x00`; the readers reproduce it identically.
+fn compute_corpus_digest(vectors: &[Vector], groups: &[Group]) -> String {
+    let mut items: Vec<(String, &[u8])> = Vec::new();
+    for v in vectors {
+        items.push((format!("{VECTORS_SUBDIR}/{}.hex", v.name), &v.bytes));
+    }
+    for g in groups {
+        for m in &g.members {
+            items.push((
+                format!("{VECTORS_SUBDIR}/{}/{}.hex", g.name, m.role),
+                &m.bytes,
+            ));
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (path, bytes) in &items {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes);
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Assemble the full corpus in a stable order.
 fn build_corpus() -> Vec<Vector> {
     let (signed_bytes, signed_pk, signed_sig) = write_v2_signed();
@@ -1088,6 +1119,7 @@ fn manifest_value(vectors: &[Vector], groups: &[Group]) -> serde_json::Value {
             "peer_head_attestation": PEER_HEAD_ATTESTATION_V1_DOMAIN,
             "equivocation_proof": EQUIVOCATION_PROOF_V1_DOMAIN,
         },
+        "corpus_digest": compute_corpus_digest(vectors, groups),
         "vectors": entries,
         "groups": group_entries,
     })

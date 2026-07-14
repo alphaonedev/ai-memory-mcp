@@ -399,10 +399,38 @@ GROUP_CHECKS = {
 }
 
 
+def check_corpus_digest(manifest: dict, corpus: Path) -> None:
+    """Recompute the whole-corpus SHA-256 anchor over every referenced record
+    file and assert it equals the manifest's `corpus_digest`, so the unsigned
+    answer-key oracle cannot drift from the frozen record bytes it describes."""
+    items: list[tuple[str, bytes]] = []
+    for entry in manifest["vectors"]:
+        items.append((entry["file"], bytes.fromhex((corpus / entry["file"]).read_text().strip())))
+    for group in manifest.get("groups", []):
+        for m in group["members"]:
+            items.append((m["file"], bytes.fromhex((corpus / m["file"]).read_text().strip())))
+    items.sort(key=lambda it: it[0])
+    hasher = hashlib.sha256()
+    for path, data in items:
+        hasher.update(path.encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(data)
+        hasher.update(b"\x00")
+    got, want = hasher.hexdigest(), manifest.get("corpus_digest")
+    if got != want:
+        raise ProfileError(f"corpus_digest mismatch: computed {got}, manifest {want}")
+
+
 def run(corpus: Path, verify) -> int:
     manifest = json.loads((corpus / "manifest.json").read_text())
     head_domain = manifest["domain_tags"]["peer_head_attestation"]
     failed = 0
+    try:
+        check_corpus_digest(manifest, corpus)
+        print("PASS corpus_digest [integrity-anchor]")
+    except (ProfileError, ValueError, KeyError, OSError) as exc:
+        print(f"FAIL corpus_digest: {exc}")
+        failed += 1
     for entry in manifest["vectors"]:
         name, verdict = entry["name"], entry["verdict"]
         skips: list[str] = []
@@ -458,7 +486,7 @@ def run(corpus: Path, verify) -> int:
         notes = f" — {'; '.join(skips)}" if skips else ""
         print(f"{status} {name} [{verdict}]{notes}")
 
-    total = len(manifest["vectors"]) + len(groups)
+    total = len(manifest["vectors"]) + len(groups) + 1  # + the corpus_digest anchor
     print(f"\n{total - failed}/{total} items passed", "" if failed == 0 else "(FAILURES)")
     return 0 if failed == 0 else 1
 
