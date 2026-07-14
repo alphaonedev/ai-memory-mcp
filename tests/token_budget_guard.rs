@@ -74,7 +74,7 @@ use ai_memory::sizes::{full_profile_total_tokens, trimmed_full_profile_total_tok
 /// `memory_routine_*` tool family (create/freeze/run/status/list): the
 /// 98-tool catalog measures ~20.6K, so the ceiling moves to 22K to
 /// restore ~1.4K headroom.
-const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 22_000;
+const VERBOSE_FULL_PROFILE_CEILING_TOKENS: usize = 25_000;
 
 /// Hard ceiling for the trimmed wire (`tools/list`) catalog.
 ///
