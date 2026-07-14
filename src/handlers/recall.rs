@@ -420,6 +420,10 @@ async fn recall_response(
         {
             filter.until = Some(dt.into());
         }
+        // v1.0.0 #1834 — carry the claim-bitemporal AS-OF onto the SAL Filter
+        // (RFC3339 shape validated at the entry handlers). Stored as the raw
+        // RFC3339 string; the SAL recall/list SQL binds it directly.
+        filter.valid_at = valid_at.map(str::to_string);
         return match app
             .store
             .recall_hybrid(&ctx_caller, context, query_emb.as_deref(), &filter)
@@ -745,6 +749,8 @@ async fn recall_response(
                 source_uri_owned.as_deref(),
                 // v0.8.0 #1720 A3 — owner-keyed visibility caller.
                 caller_owned.as_deref(),
+                // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                valid_at_owned.as_deref(),
             );
             (r, "hybrid")
         } else {

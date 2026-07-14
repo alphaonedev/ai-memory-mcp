@@ -647,6 +647,8 @@ mod tests {
     fn base(id: &str, updated_at: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Short,
             namespace: "ns".to_string(),

@@ -41,6 +41,7 @@ async fn sqlite_list_clamps_limit_to_list_max_limit_1877() {
         agent_id: None,
         since: None,
         until: None,
+        valid_at: None,
         limit: 5000, // > LIST_MAX_LIMIT
     };
 

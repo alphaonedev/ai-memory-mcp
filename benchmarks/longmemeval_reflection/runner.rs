@@ -784,6 +784,8 @@ where
         let now = Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: scenario_d1.namespace.clone(),

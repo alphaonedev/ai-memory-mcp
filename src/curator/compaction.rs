@@ -590,6 +590,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -773,6 +775,8 @@ mod tests {
             let now = chrono::Utc::now().to_rfc3339();
             Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: id.to_string(),
                 tier,
                 namespace: ns.to_string(),

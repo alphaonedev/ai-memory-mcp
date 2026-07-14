@@ -654,6 +654,12 @@ pub struct Filter {
     pub agent_id: Option<String>,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
+    /// v1.0.0 #1834 — claim-bitemporal AS-OF: RFC3339 point in VALID-time.
+    /// Narrows to claims asserted to hold at this instant (`valid_from <=
+    /// valid_at` AND `valid_until` unset-or-`> valid_at`, end-exclusive).
+    /// DISTINCT from `since`/`until` (which bound `created_at`). `None` = no
+    /// valid-time filter.
+    pub valid_at: Option<String>,
     pub limit: usize,
 }
 
@@ -3842,6 +3848,8 @@ mod tests {
     fn dummy_memory(id: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Mid,
             namespace: "mock".to_string(),

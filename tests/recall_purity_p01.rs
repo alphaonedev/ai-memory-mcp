@@ -249,6 +249,7 @@ fn purity_pure_default_all_sqlite_entry_paths() {
             false,
             None,
             None,
+            None, // #1834 valid_at
         )
         .expect("db::recall");
         let ids: Vec<String> = rows.iter().map(|(m, _)| m.id.clone()).collect();
@@ -277,6 +278,7 @@ fn purity_pure_default_all_sqlite_entry_paths() {
             false,
             None,
             None,
+            None, // #1834 valid_at
         )
         .expect("db::recall_hybrid");
         let hids: Vec<String> = hrows.iter().map(|(m, _)| m.id.clone()).collect();
@@ -334,6 +336,7 @@ fn purity_pure_default_all_sqlite_entry_paths() {
             tags: None,
             since: None,
             until: None,
+            valid_at: None,
             tier: Some("keyword".to_string()),
             as_agent: None,
             budget_tokens: None,

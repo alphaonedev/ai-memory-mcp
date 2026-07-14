@@ -902,6 +902,7 @@ pub async fn load_family_handler(
             agent_id: None,
             since: None,
             until: None,
+            valid_at: None,
             limit: MAX_BULK_SIZE,
         };
         // QC P1 fix (2026-05-20): load_family lists every memory in

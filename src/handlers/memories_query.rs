@@ -131,6 +131,10 @@ pub async fn list_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
+            // v1.0.0 #1834 — list/query path does not yet surface valid_at
+            // (recall is the primary as-of surface); wired when the list DTO
+            // gains the param.
+            valid_at: None,
             limit,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
@@ -308,6 +312,10 @@ pub async fn search_memories(
             agent_id: p.agent_id.clone(),
             since,
             until,
+            // v1.0.0 #1834 — list/query path does not yet surface valid_at
+            // (recall is the primary as-of surface); wired when the list DTO
+            // gains the param.
+            valid_at: None,
             limit,
         };
         // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — replace

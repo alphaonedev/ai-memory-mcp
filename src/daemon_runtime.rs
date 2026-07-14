@@ -7701,6 +7701,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "ns".to_string(),
@@ -7755,6 +7757,8 @@ mod tests {
         for i in 0..3 {
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Long,
                 namespace: "ns-b3".to_string(),
@@ -7843,6 +7847,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Short,
             namespace: "ns-gc".to_string(),
@@ -9134,6 +9140,8 @@ decision = "allow"
         let conn = db::open(&env.db_path).unwrap();
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "vi-1".to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),

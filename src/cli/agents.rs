@@ -910,6 +910,8 @@ mod tests {
         }
         let mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Long,
             namespace: namespace.to_string(),

@@ -209,6 +209,7 @@ fn recall_telemetry_reports_embedding_dimension_mismatch() {
         false,
         None,
         None, // #1720 caller
+        None, // #1834 valid_at
     )
     .expect("recall_hybrid_with_telemetry");
 
@@ -255,6 +256,7 @@ fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
         false,
         None,
         None, // #1720 caller
+        None, // #1834 valid_at
     )
     .expect("recall_hybrid_with_telemetry");
 

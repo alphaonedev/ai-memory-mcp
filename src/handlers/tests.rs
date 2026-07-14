@@ -178,6 +178,8 @@ async fn store_and_retrieve_via_state() {
     let now = Utc::now();
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "test".into(),
@@ -218,6 +220,8 @@ async fn recall_via_state() {
     let now = Utc::now();
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "test".into(),
@@ -262,6 +266,7 @@ async fn recall_via_state() {
         false,
         None,
         None, // #1720 caller
+        None, // #1834 valid_at
     )
     .unwrap();
     assert!(!results.is_empty());
@@ -311,6 +316,8 @@ async fn create_and_update_with_metadata() {
     // Create with metadata
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "test".into(),
@@ -656,6 +663,8 @@ async fn http_update_memory_uses_appstate() {
         let lock = state.lock().await;
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "http-embed-test".into(),
@@ -715,6 +724,8 @@ async fn http_update_memory_enforces_lifecycle_transition_1726() {
     let now = Utc::now().to_rfc3339();
     let mk = |title: &str| Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "http-lc-1726".into(),
@@ -949,6 +960,8 @@ async fn http_sync_push_applies_archives() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "s29".into(),
@@ -1031,6 +1044,8 @@ async fn http_archive_by_ids_happy_path() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "s29".into(),
@@ -1110,6 +1125,8 @@ async fn http_archive_by_ids_default_reason() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "s29-default".into(),
@@ -1567,6 +1584,8 @@ async fn http_contradictions_surfaces_same_topic_candidates_and_synth_link() {
         ] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "contradictions-test".into(),
@@ -1668,6 +1687,8 @@ async fn http_sync_push_applies_deletions() {
         let lock = state.lock().await;
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "delete-fanout".into(),
@@ -1753,6 +1774,8 @@ async fn http_sync_push_applies_incoming_links() {
         let lock = state.lock().await;
         let m1 = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "link-fanout".into(),
@@ -1784,6 +1807,8 @@ async fn http_sync_push_applies_incoming_links() {
         let m1_id = db::insert(&lock.0, &m1).unwrap();
         let m2 = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "link-fanout".into(),
@@ -1884,6 +1909,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
         let lock = state.lock().await;
         let a = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "a3-fed-cycle".into(),
@@ -1915,6 +1942,8 @@ async fn http_sync_push_refuses_reflection_cycle_from_peer() {
         let a_id = db::insert(&lock.0, &a).unwrap();
         let b = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "a3-fed-cycle".into(),
@@ -2023,6 +2052,8 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
         let lock = state.lock().await;
         let s = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "a3-fed-bypass".into(),
@@ -2054,6 +2085,8 @@ async fn http_sync_push_governance_bypass_on_peer_attested() {
         let s_id = db::insert(&lock.0, &s).unwrap();
         let t = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "a3-fed-bypass".into(),
@@ -2143,6 +2176,8 @@ async fn http_sync_since_streams_new_memories_only() {
         for (title, ts) in [("old-mem", old_ts), ("new-mem", new_ts.as_str())] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "since-test".into(),
@@ -2220,6 +2255,8 @@ async fn http_sync_since_includes_s39_diagnostic_fields() {
         for (title, ts) in [("mid", mid_ts), ("newer", newer_ts), ("newest", newest_ts)] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "s39-diag".into(),
@@ -2777,6 +2814,8 @@ async fn update_memory_rejects_oversized_content() {
         let lock = state.lock().await;
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "test".into(),
@@ -2836,6 +2875,8 @@ async fn update_memory_rejects_invalid_confidence() {
         let lock = state.lock().await;
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "test".into(),
@@ -3469,6 +3510,8 @@ async fn insert_test_memory(state: &Db, namespace: &str, title: &str) -> String 
     let now = Utc::now().to_rfc3339();
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: namespace.into(),
@@ -4916,6 +4959,8 @@ async fn http_entity_register_collision_with_non_entity_returns_409() {
         let lock = state.lock().await;
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "collide-ns".into(),
@@ -5145,6 +5190,8 @@ async fn http_kg_timeline_returns_empty_for_unlinked_source() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kg-tl".into(),
@@ -5287,6 +5334,8 @@ async fn http_kg_invalidate_marks_link_as_invalidated() {
         let now = Utc::now().to_rfc3339();
         let mk = |title: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kg-inv".into(),
@@ -5480,6 +5529,8 @@ async fn http_kg_query_returns_empty_for_unlinked_source() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kg-q".into(),
@@ -5660,6 +5711,8 @@ async fn http_get_links_returns_empty_array_for_unlinked_id() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "links-test".into(),
@@ -5720,6 +5773,8 @@ async fn seed_lineage_pair() -> (Db, String, String) {
     let state = test_state();
     let mk = |title: &str, at: &str, meta: serde_json::Value| Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "http-lineage-1859".into(),
@@ -5910,6 +5965,8 @@ async fn http_lineage_private_root_refused_for_stranger_1859() {
     let now = "2026-03-01T00:00:00+00:00";
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: "http-lineage-1859".into(),
@@ -6010,6 +6067,8 @@ async fn http_forget_memories_with_namespace_filter_returns_count() {
         for i in 0..3 {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "forget-target".into(),
@@ -7158,6 +7217,8 @@ async fn http_forget_memories_pattern_only_deletes_matches() {
         {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "h8a-forget-pat".into(),
@@ -7223,6 +7284,8 @@ async fn http_forget_memories_by_tier_only_targets_tier() {
         for (i, tier) in [Tier::Short, Tier::Short, Tier::Long].iter().enumerate() {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: tier.clone(),
                 namespace: "h8a-forget-tier".into(),
@@ -7295,6 +7358,8 @@ async fn http_forget_memories_combined_filters_intersect() {
         ] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.into(),
@@ -8303,6 +8368,8 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
         let now = Utc::now().to_rfc3339();
         let unread = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "_messages/alice".into(),
@@ -8333,6 +8400,8 @@ async fn h8b_get_inbox_unread_only_filter_excludes_read() {
         };
         let read = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "_messages/alice".into(),
@@ -8399,6 +8468,8 @@ async fn h8b_get_inbox_limit_clamps_returned_count() {
         for i in 0..3 {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "_messages/alice".into(),
@@ -8521,6 +8592,8 @@ async fn h8b_session_start_namespace_filter() {
         for (ns, title) in [("target-ns", "in-scope"), ("other-ns", "out")] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.into(),
@@ -8626,6 +8699,8 @@ async fn h8b_session_start_preloads_recent_context() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "global".into(),
@@ -9671,6 +9746,8 @@ async fn http_consolidate_two_into_one_happy_path() {
         let lock = state.lock().await;
         let mk = |title: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "merge-ns".into(),
@@ -9755,6 +9832,8 @@ async fn http_consolidate_fans_out_to_peer_1552() {
         let lock = state.lock().await;
         let mk = |title: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "merge-fed-ns".into(),
@@ -9833,6 +9912,8 @@ async fn http_reflect_fans_out_to_peer_1552() {
         let lock = state.lock().await;
         let base = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "reflect-fed-ns".into(),
@@ -10077,6 +10158,8 @@ async fn http_contradictions_synthesizes_links_for_same_title() {
         // Same title forces UPSERT collapse, so vary metadata.topic for grouping.
         let mk = |title: &str, content: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "contradict-ns".into(),
@@ -10143,6 +10226,8 @@ async fn http_contradictions_namespace_filter_isolates_results() {
         let lock = state.lock().await;
         let mk = |ns: &str, content: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.into(),
@@ -10742,6 +10827,8 @@ async fn http_set_namespace_standard_qs_invalid_governance_returns_400() {
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "qs-set-bad-policy".into(),
@@ -11984,6 +12071,8 @@ async fn http_promote_target_tier_mid_stops_at_mid_keeps_expiry_1623() {
         let now = Utc::now();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "ns-promote-1623".into(),
@@ -12063,6 +12152,8 @@ async fn http_promote_memory_happy_path_clears_expires_at() {
         let now = Utc::now();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "ns-promote".into(),
@@ -14060,6 +14151,8 @@ async fn seed_governance_policy(state: &Db, ns: &str, policy: serde_json::Value)
     let now = Utc::now().to_rfc3339();
     let standard = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: ns.into(),
@@ -14706,6 +14799,8 @@ async fn http_consolidate_accepts_use_llm_without_summary_l7() {
         let lock = state.lock().await;
         let mk = |title: &str, content: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "l7-no-summary".into(),
@@ -14815,6 +14910,8 @@ async fn http_consolidate_response_carries_summary_on_every_key_s51_reads() {
         let lock = state.lock().await;
         let mk = |title: &str, content: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "l7-followup".into(),
@@ -15171,6 +15268,8 @@ fn h5_replay_cache_dedups_identical_tuple() {
 fn to_value_or_500_serialises_typed_struct() {
     let mem = Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: "m1".into(),
         tier: Tier::Long,
         namespace: "ns".into(),
@@ -15451,6 +15550,8 @@ async fn seed_b4_corpus(state: &Db, n: usize) {
     for i in 0..n {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "b4-test".into(),

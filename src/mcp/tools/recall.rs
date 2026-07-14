@@ -1222,6 +1222,8 @@ pub fn handle_recall_dto(
                     source_uri_prefix.as_deref(),
                     // v0.8.0 #1720 A3 — owner-keyed visibility caller.
                     caller,
+                    // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                    valid_at,
                 )
                 .map_err(|e| e.to_string())?;
                 let results = crate::cli::recall::apply_form4_recall_filters(
@@ -1398,6 +1400,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),

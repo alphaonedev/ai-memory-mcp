@@ -1067,6 +1067,7 @@ fn recall_output_byte_identical_around_1706_shadow_sweep() {
             false,
             None,
             None,
+            None, // #1834 valid_at
         )
         .expect("recall")
         .0

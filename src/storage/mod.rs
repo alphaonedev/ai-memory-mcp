@@ -12909,6 +12909,8 @@ pub fn recall_hybrid(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry(
         conn,
@@ -12928,6 +12930,7 @@ pub fn recall_hybrid(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )?;
     Ok((results, outcome))
 }
@@ -12958,6 +12961,8 @@ pub fn recall_hybrid_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
     let (results, outcome, _telemetry) = recall_hybrid_with_telemetry_precomputed_hnsw(
         conn,
@@ -12977,6 +12982,7 @@ pub fn recall_hybrid_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )?;
     Ok((results, outcome))
 }
@@ -13086,13 +13092,18 @@ fn prepare_hybrid_query<'a>(
     // the caller placeholder binds right after the visibility prefixes:
     // FTS ?12 → ?13 (vis ?8..?11, caller ?12); semantic ?10 → ?11
     // (vis ?6..?9, caller ?10).
+    // v1.0.0 #1834 — the claim-bitemporal AS-OF param binds at a FIXED slot
+    // right after `caller` (FTS ?13, semantic ?11) so its fragment is a
+    // constant string on BOTH the uri-present and uri-absent branches; the
+    // optional source_uri param therefore moves up one more slot (FTS
+    // ?13 → ?14, semantic ?11 → ?12) when present.
     let fts_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND m.source_uri LIKE ?13 ESCAPE '\\'"
+        "AND m.source_uri LIKE ?14 ESCAPE '\\'"
     } else {
         ""
     };
     let sem_source_uri_fragment = if source_uri_like_param.is_some() {
-        "AND memories.source_uri LIKE ?11 ESCAPE '\\'"
+        "AND memories.source_uri LIKE ?12 ESCAPE '\\'"
     } else {
         ""
     };
@@ -13125,6 +13136,9 @@ fn fts_keyword_phase(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant (RFC3339) bound at the
+    // fixed ?13 slot; `None` passes every row (the `?13 IS NULL OR …` guard).
+    valid_at: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(Memory, f64, Option<Vec<u8>>)>> {
     // #1909 — same unclamped public `limit`; guard the multiply against
@@ -13159,6 +13173,7 @@ fn fts_keyword_phase(
            AND (?6 IS NULL OR m.created_at <= ?6)
            {fts_archived_fragment}
            {fts_source_uri_fragment}
+           {fts_valid_at_fragment}
            {vis}
            {lifecycle_vis}
          ORDER BY fts_score DESC
@@ -13166,6 +13181,12 @@ fn fts_keyword_phase(
         fts_hierarchy_fragment = prep.fts_hierarchy_fragment,
         fts_archived_fragment = prep.fts_archived_fragment,
         fts_source_uri_fragment = prep.fts_source_uri_fragment,
+        // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?13 slot (binds
+        // right after `caller` ?12). Half-open [valid_from, valid_until)
+        // END-EXCLUSIVE per SQL:2011; NULL bounds = unbounded; `?13 IS NULL`
+        // (no as-of) admits every row.
+        fts_valid_at_fragment = "AND (?13 IS NULL OR ((m.valid_from IS NULL OR m.valid_from <= ?13) \
+             AND (m.valid_until IS NULL OR m.valid_until > ?13)))",
         vis = visibility_clause(8, 12, "m"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // hybrid-recall FTS branch.
@@ -13204,7 +13225,8 @@ fn fts_keyword_phase(
                         vis_u,
                         vis_o,
                         caller,    // ?12
-                        uri_param, // ?13
+                        valid_at,  // ?13 (#1834)
+                        uri_param, // ?14
                     ],
                     fts_row_handler,
                 )?
@@ -13224,7 +13246,8 @@ fn fts_keyword_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        caller, // ?12
+                        caller,   // ?12
+                        valid_at, // ?13 (#1834)
                     ],
                     fts_row_handler,
                 )?
@@ -13317,6 +13340,10 @@ fn semantic_phase(
     tags_filter: Option<&str>,
     since: Option<&str>,
     until: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant (RFC3339). Applied in
+    // SQL on the linear-scan branch (fixed ?11 slot) and in Rust on the
+    // HNSW branch (which carries no SQL WHERE), mirroring since/until.
+    valid_at: Option<&str>,
     limit: usize,
     include_archived: bool,
     source_uri_prefix: Option<&str>,
@@ -13454,6 +13481,19 @@ fn semantic_phase(
             {
                 continue;
             }
+            // v1.0.0 #1834 — claim-bitemporal AS-OF re-filter. The HNSW branch
+            // loads candidates via `get_many` (no SQL WHERE), so the half-open
+            // [valid_from, valid_until) END-EXCLUSIVE window is applied in Rust
+            // here, mirroring the FTS/linear-scan SQL predicate. Exclude a row
+            // whose validity has not started (`valid_from > as-of`) or has
+            // already ended (`valid_until <= as-of`); NULL bounds = unbounded.
+            if let Some(v) = valid_at {
+                if mem.valid_from.as_deref().is_some_and(|f| f > v)
+                    || mem.valid_until.as_deref().is_some_and(|u| u <= v)
+                {
+                    continue;
+                }
+            }
             if !is_visible(mem, &prep.prefixes, prep.caller.as_deref()) {
                 continue;
             }
@@ -13508,11 +13548,18 @@ fn semantic_phase(
            AND (?5 IS NULL OR created_at <= ?5)
            {sem_archived_fragment}
            {sem_source_uri_fragment}
+           {sem_valid_at_fragment}
            {vis}
            {lifecycle_vis}",
         sem_hierarchy_fragment = prep.sem_hierarchy_fragment,
         sem_archived_fragment = prep.sem_archived_fragment,
         sem_source_uri_fragment = prep.sem_source_uri_fragment,
+        // v1.0.0 #1834 — claim-bitemporal AS-OF at the fixed ?11 slot (binds
+        // right after `caller` ?10). Half-open [valid_from, valid_until)
+        // END-EXCLUSIVE; NULL bounds = unbounded; `?11 IS NULL` admits all.
+        sem_valid_at_fragment =
+            "AND (?11 IS NULL OR ((valid_from IS NULL OR valid_from <= ?11) \
+             AND (valid_until IS NULL OR valid_until > ?11)))",
         vis = visibility_clause(6, 10, "memories"),
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // semantic linear-scan branch (unqualified `memories` columns).
@@ -13545,7 +13592,8 @@ fn semantic_phase(
                         vis_u,
                         vis_o,
                         caller,    // ?10
-                        uri_param, // ?11
+                        valid_at,  // ?11 (#1834)
+                        uri_param, // ?12
                     ],
                     sem_row_handler,
                 )?
@@ -13563,7 +13611,8 @@ fn semantic_phase(
                         vis_t,
                         vis_u,
                         vis_o,
-                        caller, // ?10
+                        caller,   // ?10
+                        valid_at, // ?11 (#1834)
                     ],
                     sem_row_handler,
                 )?
@@ -13757,6 +13806,8 @@ pub fn recall_hybrid_with_telemetry(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -13781,6 +13832,7 @@ pub fn recall_hybrid_with_telemetry(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )
 }
 
@@ -13821,6 +13873,8 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -13845,6 +13899,7 @@ pub fn recall_hybrid_with_telemetry_precomputed_hnsw(
         include_archived,
         source_uri_prefix,
         caller,
+        valid_at,
     )
 }
 
@@ -13875,6 +13930,8 @@ fn recall_hybrid_with_telemetry_inner(
     source_uri_prefix: Option<&str>,
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`recall`].
     caller: Option<&str>,
+    // v1.0.0 #1834 — claim-bitemporal AS-OF instant. See [`recall`].
+    valid_at: Option<&str>,
 ) -> Result<(
     Vec<(Memory, f64)>,
     BudgetOutcome,
@@ -13892,7 +13949,7 @@ fn recall_hybrid_with_telemetry_inner(
     );
 
     // Stage 2 — FTS5 keyword phase.
-    let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, limit)?;
+    let fts_results = fts_keyword_phase(conn, &prep, tags_filter, since, until, valid_at, limit)?;
 
     // Fusion pool (id → (memory, fts_score, cosine_score)). FTS rows
     // land first so their inline-fetched embedding-cosine wins; the
@@ -13967,6 +14024,7 @@ fn recall_hybrid_with_telemetry_inner(
         tags_filter,
         since,
         until,
+        valid_at,
         limit,
         include_archived,
         source_uri_prefix,
@@ -16787,6 +16845,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: tier.clone(),
             namespace: ns.to_string(),
@@ -17650,6 +17710,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -17679,6 +17740,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         );
         // May return empty or error, both acceptable
         assert!(results.is_ok() || results.is_err());
@@ -19851,6 +19913,7 @@ mod tests {
             false,
             None,
             None, // #1720 caller
+            None, // #1834 valid_at
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -21652,6 +21715,8 @@ mod tests {
         }
         let standard = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -21799,6 +21864,8 @@ mod tests {
         }
         let standard = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{parent_ns}"),
@@ -23676,6 +23743,8 @@ mod tests {
         // Insert one observation and one reflection memory.
         let obs = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -23706,6 +23775,8 @@ mod tests {
         };
         let ref_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "kind-ns".to_string(),
@@ -23777,6 +23848,8 @@ mod tests {
         let conn = test_db();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "roundtrip-ns".to_string(),
@@ -23828,6 +23901,8 @@ mod tests {
         // First insert: Reflection.
         let mem_reflection = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.clone(),
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),
@@ -23861,6 +23936,8 @@ mod tests {
         // Second upsert: Observation (same title+namespace → triggers ON CONFLICT).
         let mem_obs = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(), // different id, same title+ns
             tier: Tier::Long,
             namespace: "sticky-ns".to_string(),
@@ -24287,6 +24364,7 @@ mod tests {
         let (vis, tomb, quar) = seed_lifecycle_corpus(&conn, "ns/life");
         let (rows, _) = recall(
             &conn, "widget", None, 50, None, None, None, 0, 0, None, None, false, None, None,
+            None, // #1834 valid_at
         )
         .unwrap();
         let ids: Vec<&str> = rows.iter().map(|(m, _)| m.id.as_str()).collect();

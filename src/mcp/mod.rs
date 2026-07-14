@@ -6112,6 +6112,8 @@ mod tests {
         // Insert a memory directly to know the id.
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "m9-get".into(),
@@ -6201,6 +6203,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "m9-del".into(),
@@ -6257,6 +6261,8 @@ mod tests {
         for tag in ["a", "b"] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "m9-link".into(),
@@ -6316,6 +6322,8 @@ mod tests {
         for tag in ["a", "b"] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "h2-link".into(),
@@ -6432,6 +6440,8 @@ mod tests {
         for tag in ["src-a", "src-b", "src-c"] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "issue-815-reflect".into(),
@@ -6603,6 +6613,8 @@ mod tests {
         for tag in ["src-a", "src-b", "src-c"] {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "issue-1315-wire".into(),
@@ -7316,6 +7328,8 @@ mod tests {
         // practice it won't, so the row's parent stays NULL.
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "m9-parent".into(),
@@ -7349,6 +7363,8 @@ mod tests {
         // Seed a child row with parent NULL.
         let child_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "repo/team/sub".into(),
@@ -7425,6 +7441,8 @@ mod tests {
         // Seed two memories so we can register parent and child.
         let parent_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "m9-explicit-parent".into(),
@@ -7458,6 +7476,8 @@ mod tests {
 
         let child_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "m9-explicit-child".into(),
@@ -7528,6 +7548,8 @@ mod tests {
     ) -> String {
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: namespace.into(),
@@ -7823,6 +7845,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-kg".into(),
@@ -7955,6 +7979,8 @@ mod tests {
         // Seed a memory so list returns at least one row.
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-session".into(),
@@ -8180,6 +8206,8 @@ mod tests {
         // Seed a memory we can use as the standard
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-ns".into(),
@@ -8298,6 +8326,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-gov".into(),
@@ -8655,6 +8685,8 @@ mod tests {
         // First insert a memory we can target.
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-update".into(),
@@ -8700,6 +8732,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-meta".into(),
@@ -8784,6 +8818,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-parent/w12-child".into(),
@@ -8833,6 +8869,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-pm".into(),
@@ -8877,6 +8915,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem_a = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-cons".into(),
@@ -9173,6 +9213,8 @@ mod tests {
         // has something to traverse. Use db helpers when possible.
         let parent_mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-explicit-grand".into(),
@@ -9283,6 +9325,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-tier-promote".into(),
@@ -9427,6 +9471,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-gov-ok".into(),
@@ -9485,6 +9531,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-parent-ns".into(),
@@ -9540,6 +9588,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-prefix".into(),
@@ -9588,6 +9638,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-link".into(),
@@ -9645,6 +9697,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-getlinks".into(),
@@ -9695,6 +9749,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-tl".into(),
@@ -9757,6 +9813,8 @@ mod tests {
         // Seed two memories sharing the same source_uri.
         let mk = |ns: &str, t: &str, uri: Option<&str>| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: ns.into(),
@@ -9843,6 +9901,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-kgq".into(),
@@ -10272,6 +10332,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem_a = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-cons-warn".into(),
@@ -10336,6 +10398,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "w12-clear-exp".into(),
@@ -10380,6 +10444,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-update-ns".into(),
@@ -10432,6 +10498,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: "w12-delete-prefix".into(),
@@ -10847,6 +10915,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),
@@ -10894,6 +10964,8 @@ mod tests {
         });
         let standard = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: format!("_standards-{namespace}"),
@@ -11612,6 +11684,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-orphan".into(),
@@ -11772,6 +11846,8 @@ mod tests {
         // Two-hop linear chain: a -> b -> c.
         let mk = |title: &str| Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-fp".into(),
@@ -11882,6 +11958,8 @@ mod tests {
         // 1-element path regardless of the invalidated edge filter.
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-fp-inv".into(),
@@ -12085,6 +12163,8 @@ mod tests {
         // no link row exists.
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vfn".into(),
@@ -12143,6 +12223,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vu".into(),
@@ -12213,6 +12295,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vc".into(),
@@ -12296,6 +12380,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vnk".into(),
@@ -12390,6 +12476,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vss".into(),
@@ -12485,6 +12573,8 @@ mod tests {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let src = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "w12-vts".into(),
@@ -12595,6 +12685,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier,
             namespace: namespace.to_string(),
@@ -12644,6 +12736,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),
@@ -12757,6 +12851,8 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Mid,
             namespace: namespace.to_string(),
@@ -13938,6 +14034,8 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let stale = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "ns-exp".to_string(),
@@ -14251,6 +14349,8 @@ mod tests {
         let std_id = {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "chunkc-prom-pend".into(),
@@ -14323,6 +14423,8 @@ mod tests {
         let std_id = {
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: "chunkc-prom-deny".into(),
@@ -14968,6 +15070,8 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "chunkc-gc-real".to_string(),
@@ -15013,6 +15117,8 @@ mod tests {
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Short,
             namespace: "chunkc-gc-dry".to_string(),
@@ -15196,6 +15302,8 @@ mod backfill_resilience_1595_tests {
         let now = chrono::Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: "bf-1595".to_string(),

@@ -53,6 +53,8 @@ fn mem(id: &str, ns: &str, title: &str, content: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
         cid: None,
+        valid_from: None,
+        valid_until: None,
         id: id.to_string(),
         tier: Tier::Mid,
         namespace: ns.to_string(),

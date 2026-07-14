@@ -2020,6 +2020,8 @@ mod tests {
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "test-id".to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),
@@ -2705,6 +2707,8 @@ mod tests {
             (
                 Memory {
                     cid: None,
+                    valid_from: None,
+                    valid_until: None,
                     id: "a".to_string(),
                     tier: Tier::Mid,
                     namespace: "ns".to_string(),
@@ -2738,6 +2742,8 @@ mod tests {
             (
                 Memory {
                     cid: None,
+                    valid_from: None,
+                    valid_until: None,
                     id: "b".to_string(),
                     tier: Tier::Mid,
                     namespace: "ns".to_string(),
@@ -3098,6 +3104,8 @@ mod mock_tests {
     fn make_memory(title: &str, content: &str) -> Memory {
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: "test-id".to_string(),
             tier: Tier::Mid,
             namespace: "test".to_string(),

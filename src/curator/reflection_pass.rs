@@ -1029,6 +1029,8 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: id.to_string(),
             tier: Tier::Long,
             namespace: ns.to_string(),
@@ -1301,6 +1303,8 @@ mod tests {
             }
             let mem = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Long,
                 namespace: ns.to_string(),
@@ -1628,6 +1632,8 @@ mod tests {
             }
             let m = Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: Tier::Mid,
                 namespace: "ns".to_string(),
@@ -1768,6 +1774,8 @@ mod tests {
                 }
                 let m = Memory {
                     cid: None,
+                    valid_from: None,
+                    valid_until: None,
                     id: uuid::Uuid::new_v4().to_string(),
                     tier: Tier::Long,
                     namespace: "deep".to_string(),

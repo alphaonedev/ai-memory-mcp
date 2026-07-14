@@ -434,6 +434,8 @@ pub(crate) fn run_with_embedder(
                     args.include_archived,
                     args.source_uri_prefix.as_deref(),
                     vis_caller.as_deref(),
+                    // v1.0.0 #1834 — claim-bitemporal AS-OF instant.
+                    args.valid_at.as_deref(),
                 )?;
                 if let Some(ref ce) = reranker {
                     (
@@ -626,6 +628,7 @@ mod tests {
             tags: None,
             since: None,
             until: None,
+            valid_at: None,
             tier: Some("keyword".to_string()),
             as_agent: None,
             budget_tokens: None,
@@ -896,6 +899,8 @@ mod tests {
             let now = chrono::Utc::now().to_rfc3339();
             let mem = crate::models::Memory {
                 cid: None,
+                valid_from: None,
+                valid_until: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 tier: crate::models::Tier::Mid,
                 namespace: "test".to_string(),
@@ -1341,6 +1346,8 @@ limit = 25
         let mut conn = db::open(&db).unwrap();
         let mut mem = crate::models::Memory {
             cid: None,
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: crate::models::Tier::Mid,
             namespace: "test".to_string(),
