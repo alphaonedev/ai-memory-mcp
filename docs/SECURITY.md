@@ -66,6 +66,46 @@ Out of scope (non-goals):
   process-global mutex; malicious writers can queue. Rate-limit
   upstream of the daemon.
 
+### Adopted threat classes — v1.0.0 cross-family adjudication ([#1966](https://github.com/alphaonedev/ai-memory-mcp/issues/1966))
+
+The 2026-07-08/09 perfect-endpoint cross-family assessment (Anthropic ×
+xAI Grok 4.5, adjudicated) adopted three additional threat classes
+beyond the M1 read-path-provenance baseline the 27-requirement target
+spec already carried. They are recorded here as first-class threats
+with the substrate's current posture against each:
+
+- **M2 — complexity tax / core-profile ceiling.** A large advertised
+  surface (101 MCP tools at `--profile full`) is itself an
+  attack-surface and audit-cost risk. Posture: the DEFAULT profile is
+  `core` (7 tools) — the full surface is opt-in per deployment, new
+  tools default off, and the core profile is held minimal as GA
+  discipline.
+- **M4 — economic / availability DoS.** Quota / DLQ / HNSW-rebuild /
+  LLM-cost exhaustion can force an operator into an escape hatch
+  (loosening a gate) without ever forging a quorum. Posture: per-agent
+  write / storage / link quotas (env #49-#51), HTTP admission control
+  with typed `503` shedding (`AI_MEMORY_MAX_INFLIGHT_REQUESTS`, #1733),
+  adaptive federation DLQ replay with an edge-triggered depth WARN
+  (#1544), the vector-index residency cap (#1005), and the
+  inference-plane egress gate (`AI_MEMORY_INFERENCE_EGRESS`, #1963)
+  bound the blast radius. This **supersedes the older blanket "DoS at
+  the database layer is out of scope" note above for the
+  availability-economics class**; raw SQLite write-mutex contention
+  alone remains an upstream rate-limit concern.
+- **M8 — MCP host / parent-process trust.** The MCP stdio transport
+  trusts its parent process (the host launching `ai-memory mcp`); a
+  malicious host is the median real-world threat. Posture: run the
+  daemon as the same-or-lower-privilege user; host-signed L4 capture
+  requires an enrolled pubkey allowlist
+  (`AI_MEMORY_L4_HOST_PUBKEY_ALLOWLIST`, #1414); and the `asi-hard`
+  security profile (`AI_MEMORY_SECURITY_PROFILE=asi-hard`, #1961) pins
+  the fail-closed gates so a compromised host cannot silently weaken
+  them.
+
+Per the adjudication these carry design-level mitigation for v1.0.0 (no
+dedicated build lane); each is split into its own tracking issue if it
+grows one.
+
 ## Trust boundaries
 
 ```
