@@ -16889,7 +16889,14 @@ impl MemoryStore for PostgresStore {
         // ILIKE over title || ' ' || content so the wire contract
         // ("forget anything matching this string") is preserved.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        let pattern_like = pattern.map(|p| format!("%{p}%"));
+        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
+        // caller-supplied pattern so `forget(pattern="%")` matches a
+        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
+        // ILIKE wildcard that would archive+delete the WHOLE scope. The
+        // outer `%…%` stays literal wildcards for the intended substring
+        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
+        // escape character, so no explicit `ESCAPE` clause is required.
+        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let now = chrono::Utc::now().to_rfc3339();
 
         // #1776 — archive + delete MUST be one transaction (mirror `run_gc` /
@@ -17206,7 +17213,14 @@ impl MemoryStore for PostgresStore {
         // every governed namespace, including any whose rows would sort past
         // the #1602 preview cap. 5-agent vote 4d3ea1c5.
         let tier_str = tier.map(|t| t.as_str().to_string());
-        let pattern_like = pattern.map(|p| format!("%{p}%"));
+        // #2032 LM1 — escape LIKE metacharacters (`%` `_` `\\`) in the
+        // caller-supplied pattern so `forget(pattern="%")` matches a
+        // LITERAL `%` (the sqlite/FTS twin's behaviour) instead of the
+        // ILIKE wildcard that would archive+delete the WHOLE scope. The
+        // outer `%…%` stays literal wildcards for the intended substring
+        // match. PostgreSQL LIKE/ILIKE uses backslash as the default
+        // escape character, so no explicit `ESCAPE` clause is required.
+        let pattern_like = pattern.map(|p| format!("%{}%", crate::storage::escape_like_pattern(p)));
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT namespace FROM memories
              WHERE ($1::text IS NULL OR tier = $1)
