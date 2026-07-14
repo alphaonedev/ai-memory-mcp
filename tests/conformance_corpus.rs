@@ -1261,3 +1261,154 @@ fn reused_vectors_match_in_tree_golden() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #1837 — negative meta-test. An INDEPENDENT (third) resolver re-derives every
+// group's outcome from its member records, proving the committed `expected`
+// oracle both (a) matches reality and (b) is load-bearing: the resolver
+// discriminates the cases, so a wrong `expected` would be caught.
+// ---------------------------------------------------------------------------
+
+/// Read a member's grammar-specific manifest attr.
+fn member_attr<'a>(m: &'a GroupMember, key: &str) -> Option<&'a serde_json::Value> {
+    m.attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// obligation-2 resolver — `(outcome, break_kind)`.
+fn resolve_chain(g: &Group) -> (&'static str, &'static str) {
+    let members = &g.members;
+    let mut link_broken = false;
+    let mut gap = false;
+    for i in 1..members.len() {
+        let seq_i = member_attr(&members[i], "sequence")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let seq_prev = member_attr(&members[i - 1], "sequence")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        if seq_i != seq_prev + 1 {
+            gap = true;
+        }
+        let prev_hash = member_attr(&members[i], "prev_hash")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        if prev_hash != hex::encode(Sha256::digest(&members[i - 1].bytes)) {
+            link_broken = true;
+        }
+    }
+    if link_broken || gap {
+        return ("broken", "midchain-deletion");
+    }
+    // The witness watermark is EXTERNAL evidence (here, the fixture's declared
+    // head); a surviving MAX(sequence) below it is a tail truncation.
+    if let Some(witness) = g.expected.witness_head_sequence {
+        let max_seq = members
+            .iter()
+            .map(|m| member_attr(m, "sequence").unwrap().as_i64().unwrap())
+            .max()
+            .unwrap();
+        if max_seq < i64::try_from(witness).unwrap_or(i64::MAX) {
+            return ("broken", "tail-truncation");
+        }
+    }
+    ("intact", "none")
+}
+
+/// obligation-5 resolver — the three-valued state.
+fn resolve_lineage(g: &Group) -> &'static str {
+    use std::collections::{HashMap, HashSet};
+    let mut forks: HashMap<(i64, String), HashSet<String>> = HashMap::new();
+    for m in &g.members {
+        let epoch = member_attr(m, "epoch").unwrap().as_i64().unwrap();
+        let pred = member_attr(m, "predecessor_pubkey")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let succ = member_attr(m, "successor_pubkey")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        forks.entry((epoch, pred)).or_default().insert(succ);
+    }
+    if forks.values().any(|s| s.len() > 1) {
+        "indeterminate"
+    } else if g
+        .members
+        .iter()
+        .any(|m| member_attr(m, "reason").unwrap().as_str() == Some("revocation"))
+    {
+        "invalid-revoked"
+    } else {
+        "valid"
+    }
+}
+
+/// obligation-3 resolver — `(outcome, reject_reason)`.
+fn resolve_subkey(g: &Group) -> (&'static str, Option<&'static str>) {
+    if g.members.iter().any(|m| m.role == "cert") {
+        ("valid", None)
+    } else {
+        ("reject", Some("self_declared_instance"))
+    }
+}
+
+#[test]
+fn group_expected_is_reproduced_and_discriminating() {
+    let groups = build_groups();
+
+    // (a) Every committed `expected` is exactly what an independent resolver
+    // re-derives from the member records.
+    let mut chain_outcomes = std::collections::HashSet::new();
+    let mut chain_breaks = std::collections::HashSet::new();
+    let mut lineage_states = std::collections::HashSet::new();
+    let mut subkey_outcomes = std::collections::HashSet::new();
+    for g in &groups {
+        match g.verdict {
+            Verdict::ChainVerify => {
+                let (outcome, break_kind) = resolve_chain(g);
+                assert_eq!(Some(outcome), g.expected.outcome, "{} outcome", g.name);
+                assert_eq!(
+                    Some(break_kind),
+                    g.expected.break_kind,
+                    "{} break_kind",
+                    g.name
+                );
+                chain_outcomes.insert(outcome);
+                chain_breaks.insert(break_kind);
+            }
+            Verdict::LineageResolve => {
+                let state = resolve_lineage(g);
+                assert_eq!(Some(state), g.expected.state, "{} state", g.name);
+                lineage_states.insert(state);
+            }
+            Verdict::SubkeyChainVerify => {
+                let (outcome, reason) = resolve_subkey(g);
+                assert_eq!(Some(outcome), g.expected.outcome, "{} outcome", g.name);
+                assert_eq!(reason, g.expected.reject_reason, "{} reject_reason", g.name);
+                subkey_outcomes.insert(outcome);
+            }
+            _ => {}
+        }
+    }
+
+    // (b) Load-bearing: the resolver DISCRIMINATES — the corpus exercises both
+    // sides of each decision, so `expected` cannot be a constant that passes
+    // vacuously. A reader that hard-codes one verdict fails half these groups.
+    assert!(chain_outcomes.contains("intact") && chain_outcomes.contains("broken"));
+    assert!(chain_breaks.contains("midchain-deletion") && chain_breaks.contains("tail-truncation"));
+    assert!(
+        lineage_states.contains("valid")
+            && lineage_states.contains("invalid-revoked")
+            && lineage_states.contains("indeterminate")
+    );
+    assert!(subkey_outcomes.contains("valid") && subkey_outcomes.contains("reject"));
+
+    // (c) An explicitly WRONG expectation must not match the re-derivation.
+    let intact = groups.iter().find(|g| g.name == "chain/intact").unwrap();
+    assert_ne!(resolve_chain(intact).1, "midchain-deletion");
+}
