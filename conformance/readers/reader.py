@@ -37,9 +37,16 @@ Exit status: 0 when no vector FAILs (SKIPs allowed), 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
+
+# Domain-separation prefix the lineage-succession signature is minted over:
+# LINEAGE_DOMAIN || canonical_body (src/identity/sign.rs::LINEAGE_DOMAIN). It is
+# a SIGNING prefix, not an in-body tag — the lineage grammar is a canonical CBOR
+# map, distinct from the domain-tagged array profile above.
+LINEAGE_DOMAIN = b"agent-lineage-succession-v1\x00"
 
 # --- restricted CBOR profile (spec section 1 / Appendix A.1) ---------------
 
@@ -270,6 +277,128 @@ def check_equivocation(value, head_domain: str, verify) -> list[str]:
     return []
 
 
+# --- multi-record fixture groups (#1837 obl.2/3/5) --------------------------
+#
+# A group's structure + expectations live in manifest.json (the answer-key
+# oracle), never hidden in the frozen bytes. A reader walks the ordered members,
+# runs the group's verify procedure per its `grammar`, and EXACT-matches the
+# `expected` object. Anything it cannot check (Ed25519 without pyca) is a SKIP,
+# never a silent pass.
+
+
+def _member_bytes(corpus: Path, member: dict) -> bytes:
+    return bytes.fromhex((corpus / member["file"]).read_text().strip())
+
+
+def check_subkey_chain(group: dict, corpus: Path, verify) -> list[str]:
+    """spec section 7 obligation 3 — verify the cert under the principal ROOT,
+    then the write under the certified sub-key; reject a self-declared instance
+    (a write with no root-signed cert) even when its own signature is valid."""
+    members = {m["role"]: m for m in group["members"]}
+    expected = group["expected"]
+    skips: list[str] = []
+    # Every member is an array-profile record: decode + re-encode-match.
+    raws = {}
+    for role, m in members.items():
+        raw = _member_bytes(corpus, m)
+        value = decode(raw)
+        if encode(value) != raw:
+            raise ProfileError(f"member {role} re-encode differs from original")
+        raws[role] = (raw, value)
+    if "cert" not in members:
+        outcome, reason = "reject", "self_declared_instance"
+    elif verify is None:
+        skips.append("subkey-chain signature checks skipped (no Ed25519 in stdlib)")
+        # Structurally a cert is present; the valid/invalid split is crypto.
+        outcome, reason = expected.get("outcome"), expected.get("reject_reason")
+    else:
+        cert_raw, cert_val = raws["cert"]
+        write_raw, _ = raws["write"]
+        cert, write = members["cert"], members["write"]
+        if not verify(bytes.fromhex(cert["pubkey"]), bytes.fromhex(cert["signature"]), cert_raw):
+            raise ProfileError("cert signature does not verify under the principal root")
+        certified_subkey = cert_val[2]  # element [2] = instance_key_id (raw bytes)
+        if not isinstance(certified_subkey, bytes) or len(certified_subkey) != 32:
+            raise ProfileError("cert instance_key_id is not 32 raw bytes")
+        if not verify(certified_subkey, bytes.fromhex(write["signature"]), write_raw):
+            raise ProfileError("write signature does not verify under the certified sub-key")
+        outcome, reason = "valid", None
+    if outcome != expected.get("outcome") or reason != expected.get("reject_reason"):
+        raise ProfileError(
+            f"resolved (outcome={outcome!r}, reject_reason={reason!r}) != "
+            f"expected {expected!r}"
+        )
+    return skips
+
+
+def check_lineage(group: dict, corpus: Path, verify) -> list[str]:
+    """spec section 7 obligation 5 — verify each succession record under its
+    predecessor over LINEAGE_DOMAIN || body, then resolve a THREE-valued state:
+    an equivocation fork (two successors at one epoch under one predecessor) is
+    INDETERMINATE; a revocation record is INVALID-REVOKED; else VALID."""
+    members = group["members"]
+    expected = group["expected"]
+    skips: list[str] = []
+    for m in members:
+        body = _member_bytes(corpus, m)
+        if verify is None:
+            continue
+        if not verify(bytes.fromhex(m["pubkey"]), bytes.fromhex(m["signature"]), LINEAGE_DOMAIN + body):
+            raise ProfileError(f"lineage record {m['role']} signature does not verify")
+    if verify is None:
+        skips.append("lineage signature checks skipped (no Ed25519 in stdlib)")
+    # Resolution from the signed structural fields (mirrored in the manifest).
+    forks: dict[tuple, set] = {}
+    for m in members:
+        forks.setdefault((m["epoch"], m["predecessor_pubkey"]), set()).add(m["successor_pubkey"])
+    if any(len(succ) > 1 for succ in forks.values()):
+        state = "indeterminate"
+    elif any(m["reason"] == "revocation" for m in members):
+        state = "invalid-revoked"
+    else:
+        state = "valid"
+    if state != expected.get("expected_state"):
+        raise ProfileError(f"resolved state {state!r} != expected {expected.get('expected_state')!r}")
+    return skips
+
+
+def check_chain(group: dict, corpus: Path) -> list[str]:
+    """spec section 7 obligation 2 — walk the V-4 hash chain: each row's
+    prev_hash must equal SHA-256 of the prior row's canonical bytes and the
+    sequence must be consecutive (a gap + mismatch is a midchain deletion); a
+    surviving MAX(sequence) below the witness watermark is a tail truncation."""
+    members = group["members"]
+    expected = group["expected"]
+    bodies = [_member_bytes(corpus, m) for m in members]
+    seqs = [m["sequence"] for m in members]
+    link_broken = False
+    gap = False
+    for i in range(1, len(members)):
+        if seqs[i] != seqs[i - 1] + 1:
+            gap = True
+        if members[i]["prev_hash"] != hashlib.sha256(bodies[i - 1]).hexdigest():
+            link_broken = True
+    witness = expected.get("witness_head_sequence")
+    if link_broken or gap:
+        outcome, break_kind = "broken", "midchain-deletion"
+    elif witness is not None and max(seqs) < witness:
+        outcome, break_kind = "broken", "tail-truncation"
+    else:
+        outcome, break_kind = "intact", "none"
+    if outcome != expected.get("outcome") or break_kind != expected.get("break_kind"):
+        raise ProfileError(
+            f"resolved (outcome={outcome!r}, break_kind={break_kind!r}) != expected {expected!r}"
+        )
+    return []
+
+
+GROUP_CHECKS = {
+    "subkey-chain-verify": lambda g, c, v: check_subkey_chain(g, c, v),
+    "lineage-resolve": lambda g, c, v: check_lineage(g, c, v),
+    "chain-verify": lambda g, c, v: check_chain(g, c),
+}
+
+
 def run(corpus: Path, verify) -> int:
     manifest = json.loads((corpus / "manifest.json").read_text())
     head_domain = manifest["domain_tags"]["peer_head_attestation"]
@@ -312,8 +441,25 @@ def run(corpus: Path, verify) -> int:
         status = "PASS" if not skips else "PASS (partial)"
         notes = f" — {'; '.join(skips)}" if skips else ""
         print(f"{status} {name} [{verdict}]{notes}")
-    total = len(manifest["vectors"])
-    print(f"\n{total - failed}/{total} vectors passed", "" if failed == 0 else "(FAILURES)")
+
+    groups = manifest.get("groups", [])
+    for group in groups:
+        name, verdict = group["name"], group["verdict"]
+        try:
+            check = GROUP_CHECKS.get(verdict)
+            if check is None:
+                raise ProfileError(f"unknown group verdict {verdict!r}")
+            skips = check(group, corpus, verify)
+        except (ProfileError, ValueError, KeyError, OSError) as exc:
+            print(f"FAIL {name}: {exc}")
+            failed += 1
+            continue
+        status = "PASS" if not skips else "PASS (partial)"
+        notes = f" — {'; '.join(skips)}" if skips else ""
+        print(f"{status} {name} [{verdict}]{notes}")
+
+    total = len(manifest["vectors"]) + len(groups)
+    print(f"\n{total - failed}/{total} items passed", "" if failed == 0 else "(FAILURES)")
     return 0 if failed == 0 else 1
 
 
