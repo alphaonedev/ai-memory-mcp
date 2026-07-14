@@ -47,9 +47,19 @@ use ai_memory::identity::equivocation::{
     HeadAttestationEntry, SignableHeadAttestation, canonical_cbor_head_attestation,
     sign_head_attestation,
 };
-use ai_memory::identity::subkey_cert::{
-    SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert,
+use ai_memory::identity::lineage::{
+    CUSTODY_CLASS_SOFTWARE_FILE, LINEAGE_REASON_GENESIS, LINEAGE_REASON_REVOCATION,
+    LINEAGE_REASON_ROTATION,
 };
+use ai_memory::identity::sign::{
+    SignableSuccession, canonical_cbor_succession, lineage_signing_input,
+};
+use ai_memory::identity::subkey_cert::{
+    SUBKEY_CERT_ELEMENTS, SubkeyCert, canonical_cbor_subkey_cert, sign_subkey_cert,
+};
+use ai_memory::signed_events::{SignedEvent, canonical_chain_bytes};
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 
@@ -98,6 +108,32 @@ enum Verdict {
     /// attestations verify under the embedded subject key, and the pair is a
     /// genuine divergence (same subject/epoch/sequence, different head hash).
     EquivocationProven,
+    /// #1837 obl.3 — a two-link `SubkeyCert`->write chain (a fixture GROUP). The
+    /// reader verifies the cert under the enrolled principal ROOT, THEN the
+    /// write under the cert's certified sub-key, in that fixed order, and
+    /// compares the outcome to the group's manifest `expected` object. A
+    /// self-declared instance (no root-signed cert) MUST be rejected. Distinct
+    /// from `signature-invalid`: a self-declared write can carry a perfectly
+    /// valid sub-key signature and still be rejected on chain-authorization
+    /// grounds, so a bare signature check would wrongly ACCEPT it.
+    SubkeyChainVerify,
+    /// #1837 obl.5 — a lineage succession chain (a fixture GROUP). The reader
+    /// verifies each record's Ed25519 signature under its predecessor over the
+    /// `LINEAGE_DOMAIN`-prefixed canonical bytes, walks `prev_record_hash` +
+    /// monotonic `epoch`, and resolves a THREE-valued terminal state
+    /// (`valid` | `indeterminate` | `invalid-revoked`) against the group's
+    /// manifest `expected_state` + `resolution_policy`. INDETERMINATE is the
+    /// byte-forceable EQUIVOCATION FORK (two successors at the same epoch under
+    /// the same predecessor), never a reader-cache "stale view".
+    LineageResolve,
+    /// #1837 obl.2 — a V-4 `signed_events` hash chain (a fixture GROUP). The
+    /// reader walks the ordered rows checking `prev_hash[i] ==
+    /// SHA-256(canonical_chain_bytes(row[i-1]))` + monotonic `sequence`, and —
+    /// with the group's `witness_head_sequence` off-table watermark — detects
+    /// tail-truncation. Resolves `intact` vs `broken`; on a break the manifest
+    /// `break_kind` (`none` | `midchain-deletion` | `tail-truncation`) is the
+    /// EXACT detection the reader must reproduce.
+    ChainVerify,
 }
 
 impl Verdict {
@@ -107,6 +143,9 @@ impl Verdict {
             Verdict::SignatureValid => "signature-valid",
             Verdict::SignatureInvalid => "signature-invalid",
             Verdict::EquivocationProven => "equivocation-proven",
+            Verdict::SubkeyChainVerify => "subkey-chain-verify",
+            Verdict::LineageResolve => "lineage-resolve",
+            Verdict::ChainVerify => "chain-verify",
         }
     }
 }
@@ -131,6 +170,129 @@ struct Vector {
     /// Raw 64-byte detached signature over `bytes` (detached-sig vectors only;
     /// the equivocation proof carries its signatures *inside* `bytes`).
     signature: Option<[u8; 64]>,
+}
+
+// ---------------------------------------------------------------------------
+// Multi-record fixture GROUPS (#1837 obl.2/3/5).
+//
+// Obligations 2/3/5 verify a RELATIONSHIP across several records (a hash
+// chain, a two-link cert->write, a lineage succession), which a single flat
+// hex vector cannot express. Rather than mint a new frozen envelope format
+// (which would violate the corpus rule that every byte comes from a pinned
+// PRODUCTION encoder), each real production record is emitted as its own
+// frozen-encoder hex vector, and the STRUCTURE + expectations live in the
+// manifest — the unsigned answer-key oracle (the Wycheproof model; settled by
+// the 2x5 vote, ai-memory memory eee5396c). A reader walks a group's ordered
+// members, runs the group's verdict procedure, and compares the result to the
+// group's `expected` object. Expectations are NEVER hidden in the frozen bytes.
+// ---------------------------------------------------------------------------
+
+/// The wire grammar a member's `bytes` are encoded in. The corpus's original
+/// families are the domain-TAGGED positional ARRAY profile (spec §1); #1837
+/// obl.2/obl.5 add the two production CANONICAL-BYTES families whose domain is
+/// a signing-input PREFIX (not an in-array tag) and whose body is a canonical
+/// CBOR map, so a reader dispatches its re-encode / verify path on this.
+const GRAMMAR_ARRAY_V2: &str = "array-v2";
+const GRAMMAR_LINEAGE_SUCCESSION_V1: &str = "lineage-succession-v1";
+const GRAMMAR_SIGNED_EVENTS_CHAIN_V1: &str = "signed-events-chain-v1";
+
+/// One record inside a multi-record fixture [`Group`]. Its `bytes` are still
+/// frozen-encoder output written as an ordinary hex vector under
+/// `vectors/<group>/<role>.hex`.
+struct GroupMember {
+    /// Role within the group's verify procedure, e.g. `cert`, `write`, `row_0`.
+    role: &'static str,
+    /// Record-type family (matches the domain tag's record type).
+    record_type: &'static str,
+    /// The wire grammar of `bytes` — how the reader re-encodes / verifies it.
+    grammar: &'static str,
+    /// The frozen-encoder bytes for this member.
+    bytes: Vec<u8>,
+    /// Raw 32-byte Ed25519 public key the reader verifies this member under
+    /// (e.g. the principal root for `cert`, the certified sub-key for `write`,
+    /// the predecessor for a lineage record).
+    pubkey: Option<[u8; 32]>,
+    /// Raw 64-byte detached signature over the grammar's signing input.
+    signature: Option<[u8; 64]>,
+    /// Grammar-specific manifest fields, emitted verbatim (in order) onto the
+    /// member object — the answer-key oracle a reader consumes to drive the
+    /// verify procedure. Array members carry `{domain_tag, elements}`; lineage
+    /// members carry `{predecessor_pubkey, successor_pubkey, epoch, reason}`;
+    /// chain rows carry `{sequence, prev_hash}`.
+    attrs: Vec<(&'static str, serde_json::Value)>,
+}
+
+/// The answer-key `expected` object for a [`Group`] — the outcome a conforming
+/// reader MUST reproduce. Every field is a fixed contract string; absent
+/// fields are omitted from the manifest. The harness asserts EXACT equality on
+/// these (never "some failure detected"), and a negative meta-test proves a
+/// reader that reports the WRONG value fails the suite.
+#[derive(Default)]
+struct Expected {
+    /// The terminal outcome, per verdict family:
+    /// `subkey-chain-verify` -> `valid` | `reject`;
+    /// `chain-verify` -> `intact` | `broken`;
+    /// `lineage-resolve` -> unused (see `expected_state`).
+    outcome: Option<&'static str>,
+    /// `chain-verify`: which break the reader must detect —
+    /// `none` | `midchain-deletion` | `tail-truncation`.
+    break_kind: Option<&'static str>,
+    /// `subkey-chain-verify`: the authorization reason a reject fixture
+    /// exercises — e.g. `self_declared_instance`.
+    reject_reason: Option<&'static str>,
+    /// `lineage-resolve`: the three-valued terminal state —
+    /// `valid` | `indeterminate` | `invalid-revoked`. Serialized as the
+    /// manifest key `expected_state`.
+    state: Option<&'static str>,
+    /// `lineage-resolve`: the corpus-fixed INDETERMINATE/INVALID partition the
+    /// reader must adopt so the three-valued boundary is not reader-chosen.
+    resolution_policy: Option<&'static [(&'static str, &'static str)]>,
+    /// `chain-verify`: the off-table witness watermark head `sequence`. When the
+    /// surviving rows' `MAX(sequence)` is below this, the reader MUST detect a
+    /// tail-truncation (the break a bare in-chain walk cannot see).
+    witness_head_sequence: Option<u64>,
+}
+
+impl Expected {
+    fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        if let Some(v) = self.outcome {
+            obj.insert("outcome".into(), v.into());
+        }
+        if let Some(v) = self.break_kind {
+            obj.insert("break_kind".into(), v.into());
+        }
+        if let Some(v) = self.reject_reason {
+            obj.insert("reject_reason".into(), v.into());
+        }
+        if let Some(v) = self.state {
+            obj.insert("expected_state".into(), v.into());
+        }
+        if let Some(policy) = self.resolution_policy {
+            let mut p = serde_json::Map::new();
+            for (k, val) in policy {
+                p.insert((*k).into(), (*val).into());
+            }
+            obj.insert("resolution_policy".into(), serde_json::Value::Object(p));
+        }
+        if let Some(seq) = self.witness_head_sequence {
+            obj.insert("witness_head_sequence".into(), seq.into());
+        }
+        serde_json::Value::Object(obj)
+    }
+}
+
+/// A multi-record fixture: an ordered set of production records the reader
+/// verifies as a relationship, plus the answer-key `expected` outcome.
+struct Group {
+    /// Slash-separated group name, e.g. `subkey_chain/valid`.
+    name: &'static str,
+    /// The verify procedure a reader dispatches on.
+    verdict: Verdict,
+    /// The answer-key outcome (lives in the manifest, not the bytes).
+    expected: Expected,
+    /// Ordered member records.
+    members: Vec<GroupMember>,
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +471,451 @@ fn equivocation_real() -> (Vec<u8>, [u8; 32]) {
     (proof.to_bytes(), subject_pubkey)
 }
 
+/// Fixed deterministic seeds for the #1837 obl.3 two-link `SubkeyCert`->write
+/// chain: the principal ROOT, the certified SUB-KEY, and an uncertified
+/// SELF-DECLARED instance key (all documented test seeds, never production).
+const SUBKEY_CHAIN_ROOT_SEED: [u8; 32] = [0x44; 32];
+const SUBKEY_CHAIN_SUBKEY_SEED: [u8; 32] = [0x55; 32];
+const SUBKEY_CHAIN_SELF_DECLARED_SEED: [u8; 32] = [0x66; 32];
+
+/// #1837 obl.3 — the two-link `SubkeyCert`->write chain fixture groups. Spec
+/// §2.3 / §7 step 3: verify the cert under the enrolled principal ROOT, THEN
+/// the write under the cert's certified sub-key. A self-declared instance (a
+/// write asserting an `instance_key_id` with no root-signed cert) is REJECTED
+/// even though its own signature is valid — a chain-authorization reject, which
+/// is why this is NOT `signature-invalid`.
+fn build_subkey_chain_groups() -> Vec<Group> {
+    let root = SigningKey::from_bytes(&SUBKEY_CHAIN_ROOT_SEED);
+    let root_pk = root.verifying_key().to_bytes();
+    let subkey = SigningKey::from_bytes(&SUBKEY_CHAIN_SUBKEY_SEED);
+    let subkey_pk = subkey.verifying_key().to_bytes();
+
+    // Link 1: the principal-root-signed cert binding the sub-key.
+    let cert = SubkeyCert {
+        principal: "ai:claude-code@pop-os",
+        instance_key_id: &subkey_pk,
+        model_version_ref: &[0xab; 32],
+        not_before: "2026-07-11T00:00:00Z",
+        not_after: "2027-07-11T00:00:00Z",
+    };
+    let cert_bytes = canonical_cbor_subkey_cert(&cert);
+    let cert_sig = sign_subkey_cert(&root, &cert);
+
+    // Link 2: a write whose `instance_key_id` IS the certified sub-key, signed
+    // by that sub-key.
+    let write = SignableWriteV2 {
+        agent_id: "ai:claude-code@pop-os",
+        namespace: "global",
+        title: "x",
+        kind: "observation",
+        created_at: "2026-07-11T00:00:00Z",
+        content_digest: Multihash::new(HashCodec::Sha2_256, content_digest("hello")),
+        instance_key_id: &subkey_pk,
+        model_version_ref: &[0xab; 32],
+        session_id: None,
+        suite_tag: SUITE_ED25519_SHA256,
+    };
+    let write_bytes = canonical_cbor_write_v2(&write);
+    let write_sig = subkey.sign(&write_bytes).to_bytes();
+
+    // Negative: a SELF-DECLARED instance — a write asserting an
+    // `instance_key_id` with NO root-signed cert. Its sub-key signature is
+    // perfectly valid; it MUST STILL be rejected (chain-authorization).
+    let self_declared = SigningKey::from_bytes(&SUBKEY_CHAIN_SELF_DECLARED_SEED);
+    let self_declared_pk = self_declared.verifying_key().to_bytes();
+    let sd_write = SignableWriteV2 {
+        agent_id: "ai:claude-code@pop-os",
+        namespace: "global",
+        title: "x",
+        kind: "observation",
+        created_at: "2026-07-11T00:00:00Z",
+        content_digest: Multihash::new(HashCodec::Sha2_256, content_digest("hello")),
+        instance_key_id: &self_declared_pk,
+        model_version_ref: &[0xab; 32],
+        session_id: None,
+        suite_tag: SUITE_ED25519_SHA256,
+    };
+    let sd_bytes = canonical_cbor_write_v2(&sd_write);
+    let sd_sig = self_declared.sign(&sd_bytes).to_bytes();
+
+    vec![
+        Group {
+            name: "subkey_chain/valid",
+            verdict: Verdict::SubkeyChainVerify,
+            expected: Expected {
+                outcome: Some("valid"),
+                ..Default::default()
+            },
+            members: vec![
+                GroupMember {
+                    role: "cert",
+                    record_type: "subkey_cert",
+                    grammar: GRAMMAR_ARRAY_V2,
+                    bytes: cert_bytes,
+                    pubkey: Some(root_pk),
+                    signature: Some(cert_sig),
+                    attrs: vec![
+                        ("domain_tag", SUBKEY_CERT_V1_DOMAIN.into()),
+                        ("elements", SUBKEY_CERT_ELEMENTS.into()),
+                    ],
+                },
+                GroupMember {
+                    role: "write",
+                    record_type: "signable_write_v2",
+                    grammar: GRAMMAR_ARRAY_V2,
+                    bytes: write_bytes,
+                    pubkey: Some(subkey_pk),
+                    signature: Some(write_sig),
+                    attrs: vec![
+                        ("domain_tag", WRITE_V2_DOMAIN.into()),
+                        ("elements", SIGNABLE_WRITE_V2_ELEMENTS.into()),
+                    ],
+                },
+            ],
+        },
+        Group {
+            name: "subkey_chain/self_declared",
+            verdict: Verdict::SubkeyChainVerify,
+            expected: Expected {
+                outcome: Some("reject"),
+                reject_reason: Some("self_declared_instance"),
+                ..Default::default()
+            },
+            members: vec![GroupMember {
+                role: "write",
+                record_type: "signable_write_v2",
+                grammar: GRAMMAR_ARRAY_V2,
+                bytes: sd_bytes,
+                pubkey: Some(self_declared_pk),
+                signature: Some(sd_sig),
+                attrs: vec![
+                    ("domain_tag", WRITE_V2_DOMAIN.into()),
+                    ("elements", SIGNABLE_WRITE_V2_ELEMENTS.into()),
+                ],
+            }],
+        },
+    ]
+}
+
+/// Fixed deterministic seeds for the #1837 obl.5 lineage succession chain:
+/// the genesis key K0, the first rotation successor K1, and a DIVERGENT
+/// successor K1b for the equivocation-fork INDETERMINATE fixture.
+const LINEAGE_K0_SEED: [u8; 32] = [0x77; 32];
+const LINEAGE_K1_SEED: [u8; 32] = [0x88; 32];
+const LINEAGE_K1B_SEED: [u8; 32] = [0x99; 32];
+
+const LINEAGE_AGENT_ID: &str = "ai:claude-code@pop-os";
+
+/// Build a signed lineage succession member: the canonical map body plus the
+/// Ed25519 signature over `LINEAGE_DOMAIN` ∥ body under `signer` (the record's
+/// predecessor `K_old`). The structural fields the reader keys the chain /
+/// equivocation logic on live in `attrs` (the manifest oracle).
+fn lineage_member(
+    role: &'static str,
+    signer: &SigningKey,
+    s: &SignableSuccession<'_>,
+) -> GroupMember {
+    let body = canonical_cbor_succession(s).expect("encode succession");
+    let sig = signer.sign(&lineage_signing_input(&body)).to_bytes();
+    GroupMember {
+        role,
+        record_type: "agent_lineage_succession",
+        grammar: GRAMMAR_LINEAGE_SUCCESSION_V1,
+        bytes: body,
+        pubkey: Some(signer.verifying_key().to_bytes()),
+        signature: Some(sig),
+        attrs: vec![
+            ("predecessor_pubkey", s.predecessor_pubkey.into()),
+            ("successor_pubkey", s.successor_pubkey.into()),
+            ("epoch", s.epoch.into()),
+            ("reason", s.reason.into()),
+        ],
+    }
+}
+
+/// A base v76 succession template — the four additive #1949/#1831 fields stay
+/// at their omitted defaults so the body is a plain 8-field canonical map.
+fn succession<'a>(
+    epoch: u64,
+    reason: &'a str,
+    predecessor_b64: &'a str,
+    successor_b64: &'a str,
+    not_before: &'a str,
+    prev_record_hash: &'a [u8],
+    suspected_compromise_from_seq: Option<u64>,
+) -> SignableSuccession<'a> {
+    SignableSuccession {
+        agent_id: LINEAGE_AGENT_ID,
+        epoch,
+        reason,
+        predecessor_pubkey: predecessor_b64,
+        successor_pubkey: successor_b64,
+        recovery_pubkey: None,
+        not_before,
+        prev_record_hash,
+        custody_class: CUSTODY_CLASS_SOFTWARE_FILE,
+        suspected_compromise_from_seq,
+        guardian_set_id: None,
+        recovery_threshold: None,
+    }
+}
+
+/// #1837 obl.5 — the lineage succession fixture groups (spec §7 step 5). The
+/// three-valued resolution: a clean rotation chain is `valid`; a chain reaching
+/// a `revocation` record is `invalid-revoked`; an EQUIVOCATION FORK (two
+/// successors at the same epoch under the same predecessor, both validly
+/// signed) is `indeterminate` — the byte-forceable unresolvable case, never a
+/// reader-cache "stale view".
+fn build_lineage_groups() -> Vec<Group> {
+    let k0 = SigningKey::from_bytes(&LINEAGE_K0_SEED);
+    let k1 = SigningKey::from_bytes(&LINEAGE_K1_SEED);
+    let k_fork = SigningKey::from_bytes(&LINEAGE_K1B_SEED);
+    let k0_b64 = URL_SAFE_NO_PAD.encode(k0.verifying_key().to_bytes());
+    let k1_b64 = URL_SAFE_NO_PAD.encode(k1.verifying_key().to_bytes());
+    let k_fork_b64 = URL_SAFE_NO_PAD.encode(k_fork.verifying_key().to_bytes());
+    let zero32 = [0u8; 32];
+
+    let genesis = succession(
+        0,
+        LINEAGE_REASON_GENESIS,
+        &k0_b64,
+        &k0_b64,
+        "2026-07-11T00:00:00Z",
+        &zero32,
+        None,
+    );
+    let genesis_hash: [u8; 32] =
+        Sha256::digest(canonical_cbor_succession(&genesis).unwrap()).into();
+
+    let rotation = succession(
+        1,
+        LINEAGE_REASON_ROTATION,
+        &k0_b64,
+        &k1_b64,
+        "2026-07-11T01:00:00Z",
+        &genesis_hash,
+        None,
+    );
+    let rotation_hash: [u8; 32] =
+        Sha256::digest(canonical_cbor_succession(&rotation).unwrap()).into();
+
+    // A revocation record (signed by the current successor K1) marking the key
+    // compromised from a `signed_events` witness sequence high-water.
+    let revocation = succession(
+        2,
+        LINEAGE_REASON_REVOCATION,
+        &k1_b64,
+        &k1_b64,
+        "2026-07-11T02:00:00Z",
+        &rotation_hash,
+        Some(100),
+    );
+
+    // The equivocation fork: a SECOND rotation at the SAME epoch 1 under the
+    // SAME predecessor K0, handing off to a DIFFERENT successor K1b.
+    let rotation_fork = succession(
+        1,
+        LINEAGE_REASON_ROTATION,
+        &k0_b64,
+        &k_fork_b64,
+        "2026-07-11T01:00:01Z",
+        &genesis_hash,
+        None,
+    );
+
+    vec![
+        Group {
+            name: "lineage/valid",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("valid"),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation", &k0, &rotation),
+            ],
+        },
+        Group {
+            name: "lineage/invalid_revoked",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("invalid-revoked"),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation", &k0, &rotation),
+                lineage_member("revocation", &k1, &revocation),
+            ],
+        },
+        Group {
+            name: "lineage/equivocation_fork",
+            verdict: Verdict::LineageResolve,
+            expected: Expected {
+                state: Some("indeterminate"),
+                resolution_policy: Some(&[
+                    ("on_equivocation", "indeterminate"),
+                    ("on_missing_link", "invalid"),
+                ]),
+                ..Default::default()
+            },
+            members: vec![
+                lineage_member("genesis", &k0, &genesis),
+                lineage_member("rotation_a", &k0, &rotation),
+                lineage_member("rotation_b", &k0, &rotation_fork),
+            ],
+        },
+    ]
+}
+
+const CHAIN_AGENT_ID: &str = "ai:claude-code@pop-os";
+
+/// Build one V-4 `signed_events` chain row and its canonical bytes. `prev_bytes`
+/// is the prior row's canonical bytes (`None` for the genesis row → 32 zero
+/// bytes). The rows are UNSIGNED (the V-4 tamper-evidence is the cross-row hash
+/// chain, independent of per-row signatures), so `chain-verify` walks
+/// `prev_hash` + `sequence` alone. `prev_hash` is NOT part of
+/// `canonical_chain_bytes` — it is stored beside the row (and in the manifest).
+fn chain_row(seq: i64, prev_bytes: Option<&[u8]>) -> (SignedEvent, Vec<u8>) {
+    let prev_hash = match prev_bytes {
+        Some(b) => Sha256::digest(b).to_vec(),
+        None => vec![0u8; 32],
+    };
+    let payload_hash = Sha256::digest(format!("chain-row-{seq}-payload").as_bytes()).to_vec();
+    let row = SignedEvent {
+        id: format!("00000000-0000-4000-8000-{seq:012}"),
+        agent_id: CHAIN_AGENT_ID.to_string(),
+        event_type: "memory.stored".to_string(),
+        payload_hash,
+        signature: None,
+        attest_level: "unsigned".to_string(),
+        timestamp: format!("2026-07-11T0{seq}:00:00Z"),
+        prev_hash,
+        sequence: seq,
+        cause_hash: None,
+    };
+    let bytes = canonical_chain_bytes(&row);
+    (row, bytes)
+}
+
+/// A `chain-verify` group member: the row's canonical bytes plus the `sequence`
+/// and `prev_hash` the reader needs to walk the chain (`prev_hash` is not part
+/// of the canonical bytes, so it is carried in `attrs`).
+fn chain_member(role: &'static str, row: &SignedEvent, bytes: Vec<u8>) -> GroupMember {
+    GroupMember {
+        role,
+        record_type: "signed_events_chain_row",
+        grammar: GRAMMAR_SIGNED_EVENTS_CHAIN_V1,
+        bytes,
+        pubkey: None,
+        signature: None,
+        attrs: vec![
+            ("sequence", row.sequence.into()),
+            ("prev_hash", hex::encode(&row.prev_hash).into()),
+        ],
+    }
+}
+
+/// #1837 obl.2 — the V-4 `signed_events` hash-chain fixture groups (spec §7
+/// step 2). A well-formed 3-row chain is `intact`; deleting the middle row
+/// breaks the `prev_hash` link + leaves a `sequence` gap (`midchain-deletion`);
+/// truncating the tail leaves `MAX(sequence)` below the off-table witness
+/// watermark (`tail-truncation`, undetectable from the surviving rows alone).
+fn build_chain_groups() -> Vec<Group> {
+    let (row1, bytes1) = chain_row(1, None);
+    let (row2, bytes2) = chain_row(2, Some(&bytes1));
+    let (row3, bytes3) = chain_row(3, Some(&bytes2));
+
+    vec![
+        Group {
+            name: "chain/intact",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("intact"),
+                break_kind: Some("none"),
+                ..Default::default()
+            },
+            members: vec![
+                chain_member("row_0", &row1, bytes1.clone()),
+                chain_member("row_1", &row2, bytes2.clone()),
+                chain_member("row_2", &row3, bytes3),
+            ],
+        },
+        Group {
+            name: "chain/midchain_deletion",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("broken"),
+                break_kind: Some("midchain-deletion"),
+                ..Default::default()
+            },
+            // Row 2 removed: row 3's `prev_hash` (= SHA-256 of row 2) no longer
+            // matches SHA-256(row 1), and the `sequence` jumps 1 -> 3.
+            members: vec![
+                chain_member("row_0", &row1, bytes1.clone()),
+                chain_member("row_2", &row3, canonical_chain_bytes(&row3)),
+            ],
+        },
+        Group {
+            name: "chain/tail_truncation",
+            verdict: Verdict::ChainVerify,
+            expected: Expected {
+                outcome: Some("broken"),
+                break_kind: Some("tail-truncation"),
+                witness_head_sequence: Some(3),
+                ..Default::default()
+            },
+            // Rows 1-2 survive, row 3 truncated: the surviving `MAX(sequence)`
+            // (2) is below the witness watermark head (3). Undetectable without
+            // the off-table watermark — that is exactly obligation 2's point.
+            members: vec![
+                chain_member("row_0", &row1, bytes1),
+                chain_member("row_1", &row2, bytes2),
+            ],
+        },
+    ]
+}
+
+/// Assemble the multi-record fixture groups (#1837 obl.2/3/5) in a stable order.
+fn build_groups() -> Vec<Group> {
+    let mut groups = build_subkey_chain_groups();
+    groups.extend(build_lineage_groups());
+    groups.extend(build_chain_groups());
+    groups
+}
+
+/// The whole-corpus INTEGRITY ANCHOR: a single SHA-256 over EVERY vector +
+/// group-member record, keyed by its corpus-relative file path in sorted order.
+/// Committed as the manifest's `corpus_digest`, so the unsigned answer-key
+/// oracle (the manifest's `expected` objects, pubkeys, signatures) cannot drift
+/// from the frozen record bytes it describes — a reader recomputes this over the
+/// referenced files and refuses the corpus on mismatch. Pre-image per record is
+/// `path || 0x00 || bytes || 0x00`; the readers reproduce it identically.
+fn compute_corpus_digest(vectors: &[Vector], groups: &[Group]) -> String {
+    let mut items: Vec<(String, &[u8])> = Vec::new();
+    for v in vectors {
+        items.push((format!("{VECTORS_SUBDIR}/{}.hex", v.name), &v.bytes));
+    }
+    for g in groups {
+        for m in &g.members {
+            items.push((
+                format!("{VECTORS_SUBDIR}/{}/{}.hex", g.name, m.role),
+                &m.bytes,
+            ));
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (path, bytes) in &items {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(bytes);
+        hasher.update([0u8]);
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Assemble the full corpus in a stable order.
 fn build_corpus() -> Vec<Vector> {
     let (signed_bytes, signed_pk, signed_sig) = write_v2_signed();
@@ -426,10 +1033,17 @@ fn vector_path(root: &Path, name: &str) -> PathBuf {
     root.join(VECTORS_SUBDIR).join(format!("{name}.hex"))
 }
 
+/// Path of a multi-record group member: `vectors/<group>/<role>.hex`.
+fn group_member_path(root: &Path, group: &str, role: &str) -> PathBuf {
+    root.join(VECTORS_SUBDIR)
+        .join(group)
+        .join(format!("{role}.hex"))
+}
+
 /// Build the `manifest.json` value for the whole corpus. Uses only
 /// alphabetically-sorted `serde_json::Map` keys (the default), so the pretty
 /// serialization is deterministic across runs.
-fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
+fn manifest_value(vectors: &[Vector], groups: &[Group]) -> serde_json::Value {
     let entries: Vec<serde_json::Value> = vectors
         .iter()
         .map(|v| {
@@ -454,6 +1068,43 @@ fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
         })
         .collect();
 
+    let group_entries: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|g| {
+            let members: Vec<serde_json::Value> = g
+                .members
+                .iter()
+                .map(|m| {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("role".into(), m.role.into());
+                    obj.insert("record_type".into(), m.record_type.into());
+                    obj.insert("grammar".into(), m.grammar.into());
+                    obj.insert(
+                        "file".into(),
+                        format!("{VECTORS_SUBDIR}/{}/{}.hex", g.name, m.role).into(),
+                    );
+                    obj.insert("length_bytes".into(), m.bytes.len().into());
+                    if let Some(pk) = m.pubkey {
+                        obj.insert("pubkey".into(), hex::encode(pk).into());
+                    }
+                    if let Some(sig) = m.signature {
+                        obj.insert("signature".into(), hex::encode(sig).into());
+                    }
+                    for (k, v) in &m.attrs {
+                        obj.insert((*k).into(), v.clone());
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), g.name.into());
+            obj.insert("verdict".into(), g.verdict.as_str().into());
+            obj.insert("expected".into(), g.expected.to_json());
+            obj.insert("members".into(), serde_json::Value::Array(members));
+            serde_json::Value::Object(obj)
+        })
+        .collect();
+
     serde_json::json!({
         "spec": "ai-memory/portability/v2",
         "spec_doc": "docs/spec/PORTABILITY-V2.md",
@@ -468,7 +1119,9 @@ fn manifest_value(vectors: &[Vector]) -> serde_json::Value {
             "peer_head_attestation": PEER_HEAD_ATTESTATION_V1_DOMAIN,
             "equivocation_proof": EQUIVOCATION_PROOF_V1_DOMAIN,
         },
+        "corpus_digest": compute_corpus_digest(vectors, groups),
         "vectors": entries,
+        "groups": group_entries,
     })
 }
 
@@ -500,7 +1153,8 @@ fn corpus_schema_version_matches_canonical() {
 fn corpus_matches_pinned_encoder() {
     let root = corpus_root();
     let vectors = build_corpus();
-    let manifest = manifest_text(&manifest_value(&vectors));
+    let groups = build_groups();
+    let manifest = manifest_text(&manifest_value(&vectors, &groups));
 
     if std::env::var(REGEN_ENV).is_ok() {
         for v in &vectors {
@@ -508,6 +1162,15 @@ fn corpus_matches_pinned_encoder() {
             std::fs::create_dir_all(path.parent().expect("vector path has a parent"))
                 .expect("create vector dir");
             std::fs::write(&path, format!("{}\n", hex::encode(&v.bytes))).expect("write vector");
+        }
+        for g in &groups {
+            for m in &g.members {
+                let path = group_member_path(&root, g.name, m.role);
+                std::fs::create_dir_all(path.parent().expect("member path has a parent"))
+                    .expect("create group dir");
+                std::fs::write(&path, format!("{}\n", hex::encode(&m.bytes)))
+                    .expect("write group member");
+            }
         }
         std::fs::write(root.join(MANIFEST_FILE), manifest).expect("write manifest");
         return;
@@ -527,6 +1190,24 @@ fn corpus_matches_pinned_encoder() {
              conformance_corpus` and commit conformance/vectors/** + manifest.json.",
             v.name,
         );
+    }
+
+    for g in &groups {
+        for m in &g.members {
+            let path = group_member_path(&root, g.name, m.role);
+            let want = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("missing group member {}: {e}", path.display()))
+                .trim()
+                .to_string();
+            assert_eq!(
+                hex::encode(&m.bytes),
+                want,
+                "group member `{}/{}` drifted from the pinned encoder. Regenerate with \
+                 `{REGEN_ENV}=1 cargo test --test conformance_corpus` and commit.",
+                g.name,
+                m.role,
+            );
+        }
     }
 
     let manifest_path = root.join(MANIFEST_FILE);
@@ -579,4 +1260,155 @@ fn reused_vectors_match_in_tree_golden() {
             "corpus vector `{corpus_name}` must byte-match in-tree golden `{golden_rel}`",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1837 — negative meta-test. An INDEPENDENT (third) resolver re-derives every
+// group's outcome from its member records, proving the committed `expected`
+// oracle both (a) matches reality and (b) is load-bearing: the resolver
+// discriminates the cases, so a wrong `expected` would be caught.
+// ---------------------------------------------------------------------------
+
+/// Read a member's grammar-specific manifest attr.
+fn member_attr<'a>(m: &'a GroupMember, key: &str) -> Option<&'a serde_json::Value> {
+    m.attrs.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+}
+
+/// obligation-2 resolver — `(outcome, break_kind)`.
+fn resolve_chain(g: &Group) -> (&'static str, &'static str) {
+    let members = &g.members;
+    let mut link_broken = false;
+    let mut gap = false;
+    for i in 1..members.len() {
+        let seq_i = member_attr(&members[i], "sequence")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let seq_prev = member_attr(&members[i - 1], "sequence")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        if seq_i != seq_prev + 1 {
+            gap = true;
+        }
+        let prev_hash = member_attr(&members[i], "prev_hash")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        if prev_hash != hex::encode(Sha256::digest(&members[i - 1].bytes)) {
+            link_broken = true;
+        }
+    }
+    if link_broken || gap {
+        return ("broken", "midchain-deletion");
+    }
+    // The witness watermark is EXTERNAL evidence (here, the fixture's declared
+    // head); a surviving MAX(sequence) below it is a tail truncation.
+    if let Some(witness) = g.expected.witness_head_sequence {
+        let max_seq = members
+            .iter()
+            .map(|m| member_attr(m, "sequence").unwrap().as_i64().unwrap())
+            .max()
+            .unwrap();
+        if max_seq < i64::try_from(witness).unwrap_or(i64::MAX) {
+            return ("broken", "tail-truncation");
+        }
+    }
+    ("intact", "none")
+}
+
+/// obligation-5 resolver — the three-valued state.
+fn resolve_lineage(g: &Group) -> &'static str {
+    use std::collections::{HashMap, HashSet};
+    let mut forks: HashMap<(i64, String), HashSet<String>> = HashMap::new();
+    for m in &g.members {
+        let epoch = member_attr(m, "epoch").unwrap().as_i64().unwrap();
+        let pred = member_attr(m, "predecessor_pubkey")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let succ = member_attr(m, "successor_pubkey")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        forks.entry((epoch, pred)).or_default().insert(succ);
+    }
+    if forks.values().any(|s| s.len() > 1) {
+        "indeterminate"
+    } else if g
+        .members
+        .iter()
+        .any(|m| member_attr(m, "reason").unwrap().as_str() == Some("revocation"))
+    {
+        "invalid-revoked"
+    } else {
+        "valid"
+    }
+}
+
+/// obligation-3 resolver — `(outcome, reject_reason)`.
+fn resolve_subkey(g: &Group) -> (&'static str, Option<&'static str>) {
+    if g.members.iter().any(|m| m.role == "cert") {
+        ("valid", None)
+    } else {
+        ("reject", Some("self_declared_instance"))
+    }
+}
+
+#[test]
+fn group_expected_is_reproduced_and_discriminating() {
+    let groups = build_groups();
+
+    // (a) Every committed `expected` is exactly what an independent resolver
+    // re-derives from the member records.
+    let mut chain_outcomes = std::collections::HashSet::new();
+    let mut chain_breaks = std::collections::HashSet::new();
+    let mut lineage_states = std::collections::HashSet::new();
+    let mut subkey_outcomes = std::collections::HashSet::new();
+    for g in &groups {
+        match g.verdict {
+            Verdict::ChainVerify => {
+                let (outcome, break_kind) = resolve_chain(g);
+                assert_eq!(Some(outcome), g.expected.outcome, "{} outcome", g.name);
+                assert_eq!(
+                    Some(break_kind),
+                    g.expected.break_kind,
+                    "{} break_kind",
+                    g.name
+                );
+                chain_outcomes.insert(outcome);
+                chain_breaks.insert(break_kind);
+            }
+            Verdict::LineageResolve => {
+                let state = resolve_lineage(g);
+                assert_eq!(Some(state), g.expected.state, "{} state", g.name);
+                lineage_states.insert(state);
+            }
+            Verdict::SubkeyChainVerify => {
+                let (outcome, reason) = resolve_subkey(g);
+                assert_eq!(Some(outcome), g.expected.outcome, "{} outcome", g.name);
+                assert_eq!(reason, g.expected.reject_reason, "{} reject_reason", g.name);
+                subkey_outcomes.insert(outcome);
+            }
+            _ => {}
+        }
+    }
+
+    // (b) Load-bearing: the resolver DISCRIMINATES — the corpus exercises both
+    // sides of each decision, so `expected` cannot be a constant that passes
+    // vacuously. A reader that hard-codes one verdict fails half these groups.
+    assert!(chain_outcomes.contains("intact") && chain_outcomes.contains("broken"));
+    assert!(chain_breaks.contains("midchain-deletion") && chain_breaks.contains("tail-truncation"));
+    assert!(
+        lineage_states.contains("valid")
+            && lineage_states.contains("invalid-revoked")
+            && lineage_states.contains("indeterminate")
+    );
+    assert!(subkey_outcomes.contains("valid") && subkey_outcomes.contains("reject"));
+
+    // (c) An explicitly WRONG expectation must not match the re-derivation.
+    let intact = groups.iter().find(|g| g.name == "chain/intact").unwrap();
+    assert_ne!(resolve_chain(intact).1, "midchain-deletion");
 }
