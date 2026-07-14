@@ -490,7 +490,15 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     -- archiving an encrypted memory carries the ciphertext into the
     -- archive and archive → restore round-trips it losslessly. Nullable;
     -- NULL until at-rest encryption is wired into the write paths.
-    encrypted_envelope    BYTEA
+    encrypted_envelope    BYTEA,
+    -- v1.0.0 #1834 / #2035 (schema v82) — claim-bitemporal VALID-time
+    -- mirror so archive → restore round-trips valid_from / valid_until
+    -- losslessly (the #1025 v49 archived-mirror precedent for the v79
+    -- memories columns). RFC3339 TEXT; nullable; NULL on legacy archived
+    -- rows. The matching migrate_v82 ladder arm adds them via
+    -- `ALTER TABLE ADD COLUMN IF NOT EXISTS` for upgraded installs.
+    valid_from            TEXT,
+    valid_until           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

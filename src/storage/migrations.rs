@@ -856,7 +856,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 81;
+const CURRENT_SCHEMA_VERSION: i64 = 82;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -3514,6 +3514,36 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 );
             } else if !lineage_cols.contains("guardian_set_id") {
                 conn.execute_batch(MIGRATION_V81_SQLITE)?;
+            }
+        }
+        if version < 82 {
+            // v82 (#1834 / #2035) — mirror the claim-bitemporal VALID-time
+            // columns onto `archived_memories` so archive → restore round-trips
+            // `valid_from` / `valid_until` losslessly (the v49 archived-mirror
+            // precedent, here for the #1834 v79 `memories` columns). Pure
+            // additive ALTER ADD COLUMN, no rebuild (the v63/v65 trigger-drop
+            // hazard does not arise). Probe-guarded (SQLite has no ADD COLUMN IF
+            // NOT EXISTS) + table-presence guard (a synthetic fixture may stamp
+            // a version without the v4 archive table — the v49 precedent).
+            let existing: std::collections::HashSet<String> = conn
+                .prepare(PRAGMA_TABLE_INFO_ARCHIVED_MEMORIES)?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if existing.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v82: archived_memories table absent (test fixture); skipping \
+                     claim-bitemporal column mirror"
+                );
+            } else {
+                for col in &[field_names::VALID_FROM, field_names::VALID_UNTIL] {
+                    if !existing.contains(*col) {
+                        conn.execute(
+                            &format!("ALTER TABLE archived_memories ADD COLUMN {col} TEXT"),
+                            [],
+                        )?;
+                    }
+                }
             }
         }
 

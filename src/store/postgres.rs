@@ -309,6 +309,11 @@ const MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION: &str =
 const MIGRATION_V81_LINEAGE_RECOVERY_QUORUM: &str =
     include_str!("../../migrations/postgres/0040_v81_lineage_recovery_quorum.sql");
 
+/// v1.0.0 #1834 / #2035 — mirror the claim-bitemporal VALID-time columns
+/// onto `archived_memories` for a lossless archive → restore round-trip.
+const MIGRATION_V82_ARCHIVED_VALID_TIME: &str =
+    include_str!("../../migrations/postgres/0041_v82_archived_valid_time.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -667,7 +672,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 81;
+const CURRENT_SCHEMA_VERSION: i32 = 82;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1564,8 +1569,11 @@ impl PostgresStore {
         if current_version < 80 {
             self.migrate_v80().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 81 {
             self.migrate_v81().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v82().await?;
         }
 
         Ok(())
@@ -3968,6 +3976,34 @@ impl PostgresStore {
         Ok(())
     }
 
+    /// v1.0.0 #1834 / #2035 — mirror the claim-bitemporal VALID-time columns
+    /// (`valid_from` / `valid_until`) onto `archived_memories` so archive →
+    /// restore round-trips them losslessly (the #1025 v49 archived-mirror
+    /// precedent for the v79 `memories` columns). Idempotent `ADD COLUMN IF
+    /// NOT EXISTS`, no rebuild.
+    async fn migrate_v82(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v82 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V82_ARCHIVED_VALID_TIME)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v82 archived valid-time mirror", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v82 ddl", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v82 applied (#1834/#2035: archived_memories \
+             valid_from + valid_until claim-bitemporal mirror)"
+        );
+        Ok(())
+    }
+
     /// v0.9.0 G8 (#1825) T5 — backfill the additive `cid` / `cid_genesis`
     /// columns for legacy GENESIS rows during the v74 migration (postgres
     /// twin of `crate::storage::migrations::backfill_memory_cids`). Chunked
@@ -4471,7 +4507,7 @@ impl PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -4479,7 +4515,7 @@ impl PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -4832,7 +4868,7 @@ impl PostgresStore {
                  reflection_depth, atomised_into, atom_of, memory_kind,
                  entity_id, persona_version, citations, source_uri, source_span,
                  confidence_source, confidence_signals, confidence_decayed_at,
-                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, NOW(), 'superseded', metadata,
@@ -4840,7 +4876,7 @@ impl PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                    mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
              FROM memories WHERE id = $1
              ON CONFLICT (id) DO NOTHING",
         )
@@ -11319,7 +11355,11 @@ impl PostgresStore {
                     confidence_signals, confidence_decayed_at,
                     mentioned_entity_id,
                     COALESCE(version, 1) AS version,
-                    COALESCE(lifecycle_state, 'open') AS lifecycle_state
+                    COALESCE(lifecycle_state, 'open') AS lifecycle_state,
+                    -- v1.0.0 #1834 / #2035 — carry the claim-bitemporal
+                    -- VALID-time columns on restore (v82 mirrored them onto
+                    -- archived_memories). NULL on legacy pre-v82 archived rows.
+                    valid_from, valid_until
              FROM archived_memories WHERE id = $1",
         )
         .bind(id)
@@ -14269,7 +14309,7 @@ impl MemoryStore for PostgresStore {
                      reflection_depth, atomised_into, atom_of, memory_kind,
                      entity_id, persona_version, citations, source_uri, source_span,
                      confidence_source, confidence_signals, confidence_decayed_at,
-                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope)
+                     mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until)
                  SELECT id, tier, namespace, title, content, tags, priority, confidence,
                         source, access_count, created_at, updated_at, last_accessed_at,
                         expires_at, NOW(), $2, metadata,
@@ -14277,7 +14317,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                  FROM memories WHERE id = $1",
             )
             .bind(id)
@@ -16987,7 +17027,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope
+                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -16996,7 +17036,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope
+                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 FROM memories
                 WHERE ($1::text IS NULL OR namespace = $1)
                   AND ($2::text IS NULL OR tier = $2)
@@ -19096,7 +19136,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope
+                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -19105,7 +19145,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope
+                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 FROM memories
                 WHERE expires_at IS NOT NULL AND expires_at < $1
                 ON CONFLICT (id) DO UPDATE SET
@@ -19246,7 +19286,7 @@ impl MemoryStore for PostgresStore {
                         reflection_depth, atomised_into, atom_of, memory_kind,
                         entity_id, persona_version, citations, source_uri, source_span,
                         confidence_source, confidence_signals, confidence_decayed_at,
-                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                        mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                     )
                     SELECT id, tier, namespace, title, content, tags, priority, confidence,
                            source, access_count, created_at, updated_at, last_accessed_at,
@@ -19255,7 +19295,7 @@ impl MemoryStore for PostgresStore {
                            reflection_depth, atomised_into, atom_of, memory_kind,
                            entity_id, persona_version, citations, source_uri, source_span,
                            confidence_source, confidence_signals, confidence_decayed_at,
-                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope
+                           mentioned_entity_id, version, lifecycle_state, encrypted_envelope, valid_from, valid_until
                     FROM memories
                     WHERE id = $1
                     ON CONFLICT (id) DO UPDATE SET
@@ -19416,7 +19456,7 @@ impl MemoryStore for PostgresStore {
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
                 mentioned_entity_id, version, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis
+                cid, cid_genesis, valid_from, valid_until
             )
             SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                    tags, priority, confidence, source, access_count, created_at,
@@ -19435,7 +19475,10 @@ impl MemoryStore for PostgresStore {
                    COALESCE(version, 1),
                    COALESCE(lifecycle_state, 'open'),
                    encrypted_envelope,
-                   $3::text, $4::bytea
+                   $3::text, $4::bytea,
+                   -- v1.0.0 #1834 / #2035 — carry claim-bitemporal VALID-time
+                   -- (v82 mirrored the columns onto archived_memories).
+                   valid_from, valid_until
             FROM archived_memories WHERE id = $2",
         )
         .bind(now)
@@ -19601,7 +19644,7 @@ impl MemoryStore for PostgresStore {
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
-                    mentioned_entity_id, version, encrypted_envelope
+                    mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 )
                 SELECT id, tier, namespace, title, content, tags, priority, confidence,
                        source, access_count, created_at, updated_at, last_accessed_at,
@@ -19610,7 +19653,7 @@ impl MemoryStore for PostgresStore {
                        reflection_depth, atomised_into, atom_of, memory_kind,
                        entity_id, persona_version, citations, source_uri, source_span,
                        confidence_source, confidence_signals, confidence_decayed_at,
-                       mentioned_entity_id, version, encrypted_envelope
+                       mentioned_entity_id, version, encrypted_envelope, valid_from, valid_until
                 FROM memories WHERE id = $3
                 ON CONFLICT (id) DO UPDATE SET
                     archived_at = EXCLUDED.archived_at,

@@ -223,6 +223,41 @@ fn update_closes_valid_until_while_valid_from_stays_immutable() {
 }
 
 #[test]
+fn archive_restore_roundtrips_valid_from_and_valid_until() {
+    // #2035 (schema v82) — archived_memories mirrors the claim-bitemporal
+    // VALID-time columns, so archive → restore must preserve them (pre-v82
+    // the restored row came back with both NULL — silent data loss).
+    let _g = test_serial()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (_tmp, conn) = fresh_db();
+    let id = storage::insert(&conn, &mem("bravo", Some(T_JAN), Some(T_JUN))).expect("insert");
+
+    assert!(
+        storage::archive_memory(&conn, &id, Some("ttl_expired")).expect("archive"),
+        "archive must locate the row"
+    );
+    // Gone from the live table while archived.
+    assert!(storage::get(&conn, &id).expect("get").is_none());
+
+    assert!(
+        storage::restore_archived(&conn, &id).expect("restore"),
+        "restore must locate the archived row"
+    );
+    let restored = storage::get(&conn, &id).expect("get").expect("restored");
+    assert_eq!(
+        restored.valid_from.as_deref(),
+        Some(T_JAN),
+        "valid_from must survive archive→restore"
+    );
+    assert_eq!(
+        restored.valid_until.as_deref(),
+        Some(T_JUN),
+        "valid_until must survive archive→restore"
+    );
+}
+
+#[test]
 fn validate_valid_at_rejects_non_rfc3339() {
     // The entry surfaces (HTTP recall/list, MCP list, CLI) reject a malformed
     // as-of so it never reaches the lexicographic SQL comparison.

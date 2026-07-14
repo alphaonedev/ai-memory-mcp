@@ -730,7 +730,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // the pg row-map + store/store_batch/apply_remote inserts + DO-UPDATE arms
     // lands postgres.rs at 26_650; ceiling 26_720 (+70, room for the pg
     // recall/list valid_at query predicate landing next on this branch).
-    ("src/store/postgres.rs", 26_720),
+    // 2026-07-14 (#1834/#2035): + the pg recall/list valid_at predicates,
+    // memory_update valid_until COALESCE, and the v82 archived-mirror
+    // (migrate_v82 + archived INSERT/restore column carry) land postgres.rs at
+    // 26_727; ceiling 26_800 (+73).
+    ("src/store/postgres.rs", 26_800),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1118,7 +1122,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // migration, zero speculative surface.
     // 2026-07-11 (#1949 merged): v80 lineage custody/revocation sqlite arm
     // lands the file at 5_300; ceiling 5_360 (+60 headroom).
-    ("src/storage/migrations.rs", 5_360),
+    // 2026-07-14 (#1834/#2035): v82 archived-mirror ladder arm (probe-guarded
+    // valid_from/valid_until ALTERs on archived_memories) lands the file at
+    // 5_369; ceiling 5_420 (+51 headroom).
+    ("src/storage/migrations.rs", 5_420),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
