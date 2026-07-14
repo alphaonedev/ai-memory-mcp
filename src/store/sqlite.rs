@@ -2210,6 +2210,8 @@ impl MemoryStore for SqliteStore {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         let conn = self.state.lock().await;
         db::insert(&conn, &mem).map_err(box_err)

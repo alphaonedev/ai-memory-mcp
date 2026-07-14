@@ -856,6 +856,8 @@ pub async fn bulk_create(
                 version: 1,
                 lifecycle_state: crate::models::LifecycleState::Open,
                 cid: None,
+                valid_from: None,
+                valid_until: None,
             };
 
             // #1919 (CWE-288) — per-row agent attestation, mirroring the

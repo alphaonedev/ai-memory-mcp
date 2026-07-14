@@ -299,6 +299,8 @@ impl<'a> ConsolidationPass<'a> {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         })
     }
 

@@ -396,6 +396,8 @@ async fn set_namespace_standard_inner(
                     version: 1,
                     lifecycle_state: crate::models::LifecycleState::Open,
                     cid: None,
+                    valid_from: None,
+                    valid_until: None,
                 };
                 match app.store.store(&ctx, &placeholder).await {
                     Ok(id) => id,

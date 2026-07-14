@@ -815,6 +815,8 @@ async fn create_memory_postgres(
         version: 1,
         lifecycle_state: crate::models::LifecycleState::Open,
         cid: None,
+        valid_from: None,
+        valid_until: None,
     };
     // v1.0.0 (#1945, spec §4) — epistemic-typing provenance: a caller-
     // supplied `kind` is `declared`; caller silence (the system default) is

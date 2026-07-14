@@ -4810,6 +4810,8 @@ impl PostgresStore {
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -9152,6 +9154,14 @@ impl PostgresStore {
             // on pre-v74 rows (column absent) and rows the backfill left
             // NULL. `cid_genesis` is read on demand by the verify path only.
             cid: row.try_get::<Option<String>, _>(field_names::CID).unwrap_or(None),
+            // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns (schema v79).
+            // `None` on pre-v79 rows / rows the caller never time-bounded.
+            valid_from: row
+                .try_get::<Option<String>, _>(field_names::VALID_FROM)
+                .unwrap_or(None),
+            valid_until: row
+                .try_get::<Option<String>, _>(field_names::VALID_UNTIL)
+                .unwrap_or(None),
         };
 
         // #228 Commit B — at-rest content decryption (postgres parity).
@@ -9473,6 +9483,8 @@ impl PostgresStore {
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         if let Err(e) = consult_governance_pre_write_pg(&candidate) {
             // Map `StoreError::PermissionDenied` (the canonical refusal
@@ -12848,12 +12860,13 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
                 mentioned_entity_id, lifecycle_state, encrypted_envelope,
-                cid, cid_genesis, kind_provenance
+                cid, cid_genesis, kind_provenance,
+                valid_from, valid_until
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                       $18, $19, $20,
                       $21, $22, $23,
                       $24, $25,
-                      $26, $27, $28, $29, $30, $31)
+                      $26, $27, $28, $29, $30, $31, $32, $33)
             ON CONFLICT (title, namespace) DO UPDATE SET
                 content = EXCLUDED.content,
                 -- #228 Commit B — content + envelope move together on upsert
@@ -12940,7 +12953,12 @@ impl MemoryStore for PostgresStore {
                 -- v1.0.0 (#1945) — sqlite parity: the epistemic-typing
                 -- provenance follows the incoming write when present, else
                 -- keeps the stored marker (COALESCE).
-                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance)
+                kind_provenance = COALESCE(EXCLUDED.kind_provenance, memories.kind_provenance),
+                -- v1.0.0 #1834 — sqlite `db::insert` parity: valid_from is
+                -- immutable (stored value wins), valid_until is caller-updatable
+                -- (COALESCE takes a fresh upper bound, else keeps existing).
+                valid_from = memories.valid_from,
+                valid_until = COALESCE(EXCLUDED.valid_until, memories.valid_until)
             RETURNING id",
         )
         .bind(&memory.id)
@@ -12977,6 +12995,9 @@ impl MemoryStore for PostgresStore {
         // ($31), derived from the `metadata.kind_provenance` carrier (sqlite
         // `db::insert` parity via `extract_kind_provenance`).
         .bind(crate::storage::extract_kind_provenance(memory))
+        // v1.0.0 #1834 — claim-bitemporal VALID-TIME columns ($32, $33).
+        .bind(memory.valid_from.as_deref())
+        .bind(memory.valid_until.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory", e))?
@@ -13088,7 +13109,7 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis
+                cid, cid_genesis, valid_from, valid_until
             ) ",
         );
 
@@ -13196,7 +13217,11 @@ impl MemoryStore for PostgresStore {
                 // v0.9.0 G8 (#1825) — genesis content-id pair (positional
                 // order matches the `cid, cid_genesis` column tail above).
                 .push_bind(batch_cid.cid)
-                .push_bind(batch_cid.genesis);
+                .push_bind(batch_cid.genesis)
+                // v1.0.0 #1834 — claim-bitemporal VALID-TIME (order matches the
+                // `valid_from, valid_until` column tail above).
+                .push_bind(memory.valid_from.clone())
+                .push_bind(memory.valid_until.clone());
         });
         if let Some(e) = push_err {
             return Err(e);
@@ -15164,11 +15189,11 @@ impl MemoryStore for PostgresStore {
                 confidence_source, confidence_signals, confidence_decayed_at,
                 entity_id, persona_version, version,
                 mentioned_entity_id, lifecycle_state,
-                cid, cid_genesis
+                cid, cid_genesis, valid_from, valid_until
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26,
-                $27, $28, $29, $30
+                $27, $28, $29, $30, $31, $32
             )
             ON CONFLICT (title, namespace) DO UPDATE SET
                 -- #1631 — every newer-wins arm carries the sqlite
@@ -15310,6 +15335,18 @@ impl MemoryStore for PostgresStore {
                              AND EXCLUDED.id > memories.id)
                         THEN EXCLUDED.lifecycle_state
                     ELSE memories.lifecycle_state
+                END,
+                -- v1.0.0 #1834 — sqlite federation-merge parity: valid_from is
+                -- immutable (local genesis wins, like cid); valid_until follows
+                -- the newer-wins tiebreak so a peer that CLOSED a claim
+                -- replicates that close.
+                valid_from = memories.valid_from,
+                valid_until = CASE
+                    WHEN EXCLUDED.updated_at > memories.updated_at
+                         OR (EXCLUDED.updated_at = memories.updated_at
+                             AND EXCLUDED.id > memories.id)
+                        THEN EXCLUDED.valid_until
+                    ELSE memories.valid_until
                 END
                 -- v0.9.0 G8 (#1825) — cid/cid_genesis OMITTED from DO UPDATE
                 -- SET: the surviving local row keeps its genesis cid on a
@@ -15346,6 +15383,8 @@ impl MemoryStore for PostgresStore {
         .bind(memory.lifecycle_state.as_str())
         .bind(&remote_cid.cid)
         .bind(&remote_cid.genesis)
+        .bind(memory.valid_from.as_deref())
+        .bind(memory.valid_until.as_deref())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| to_store_err("apply_remote_memory upsert", e))?;
@@ -16265,6 +16304,8 @@ impl MemoryStore for PostgresStore {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
 
         self.store(ctx, &mem).await.map(|_| ())
@@ -17422,6 +17463,8 @@ impl MemoryStore for PostgresStore {
             version: crate::models::default_memory_version(),
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
 
@@ -19684,6 +19727,8 @@ impl MemoryStore for PostgresStore {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         self.store(ctx, &mem).await
     }
@@ -21973,6 +22018,8 @@ impl MemoryStore for PostgresStore {
             version: 1,
             lifecycle_state: crate::models::LifecycleState::Open,
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         let written_id = self.store(ctx, &mem).await?;
         let created = prior.is_none();

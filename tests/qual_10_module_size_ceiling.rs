@@ -722,7 +722,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // attested-CANDIDATE set (uncapped COUNT(*) + marker-scoped query) to fix
     // the enforce-bypass; +~30 lines land postgres.rs at 26_603; ceiling
     // 26_650 (+47).
-    ("src/store/postgres.rs", 26_650),
+    // 2026-07-14 (#1834): claim-bitemporal valid_from/valid_until wiring across
+    // the pg row-map + store/store_batch/apply_remote inserts + DO-UPDATE arms
+    // lands postgres.rs at 26_650; ceiling 26_720 (+70, room for the pg
+    // recall/list valid_at query predicate landing next on this branch).
+    ("src/store/postgres.rs", 26_720),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
