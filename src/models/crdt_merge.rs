@@ -498,6 +498,8 @@ pub fn merge_memory(local: &Memory, remote: &Memory) -> Memory {
         // `cid`/`cid_genesis` untouched, so this carried value is
         // informational). `federation_merge_preserves_local_cid`.
         cid: local.cid.clone(),
+        valid_from: local.valid_from.clone(),
+        valid_until: local.valid_until.clone(),
         // `tier` — max durability (short < mid < long); never downgrade.
         tier: merge_tier(&local.tier, &remote.tier),
         // `namespace` — LWW by updated_at (tiebreak id).

@@ -649,6 +649,18 @@ pub(crate) fn row_to_memory(row: &rusqlite::Row) -> rusqlite::Result<Memory> {
             .get::<_, Option<String>>(field_names::CID)
             .ok()
             .flatten(),
+        // v1.0.0 #1834 — schema v79 claim-bitemporal VALID-TIME columns.
+        // `None` on pre-v79 rows (column absent) and on rows the caller never
+        // time-bounded (NULL). `.ok().flatten()` keeps the reader tolerant of
+        // a DB whose migration ladder hasn't reached v79 yet.
+        valid_from: row
+            .get::<_, Option<String>>(field_names::VALID_FROM)
+            .ok()
+            .flatten(),
+        valid_until: row
+            .get::<_, Option<String>>(field_names::VALID_UNTIL)
+            .ok()
+            .flatten(),
     };
 
     // #228 Commit B — at-rest content decryption. The decrypt branch is
@@ -865,8 +877,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // lands here). `prepare_cached` skips the re-parse of this ~60-line
     // upsert on every call after the first.
     let mut insert_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, kind_provenance, valid_from, valid_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — the surviving row KEEPS its own genesis
             -- content-id + pre-image (self-assign, never the excluded
@@ -972,7 +984,15 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             -- incoming write when it carries one, else keeps the stored
             -- value (a re-store that omits the carrier must not blank an
             -- existing marker). COALESCE, like the Form-4/5 columns above.
-            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance)
+            kind_provenance = COALESCE(excluded.kind_provenance, memories.kind_provenance),
+            -- v1.0.0 #1834 — claim-bitemporal validity. `valid_from` is
+            -- IMMUTABLE once set (a correction is a supersede, not a mutation),
+            -- so the stored value always wins on upsert. `valid_until` is the
+            -- one caller-updatable bound (closing a claim), so a re-store that
+            -- carries a non-NULL upper bound sets it; else the existing value
+            -- is kept (COALESCE, matching the Form-4/5 provenance columns).
+            valid_from = memories.valid_from,
+            valid_until = COALESCE(excluded.valid_until, memories.valid_until)
          RETURNING id",
     )?;
     let kind_provenance_col = extract_kind_provenance(mem);
@@ -1009,6 +1029,8 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
             cid_stamp.cid,
             cid_stamp.genesis,
             kind_provenance_col,
+            mem.valid_from,
+            mem.valid_until,
         ],
         |r| r.get(0),
     )?;
@@ -1398,8 +1420,8 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // its `MemoryKind::Reflection` typing and the stored row
             // falls back to the column DEFAULT 'observation'.
             let actual_id: String = conn.query_row(
-                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)
+                "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32)
                  RETURNING id",
                 params![
                     mem.id, mem.tier.as_str(), mem.namespace, mem.title, content_to_store,
@@ -1411,6 +1433,9 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
                     mem.confidence_source.as_str(), confidence_signals_json, mem.confidence_decayed_at,
                     mentioned_entity_id, mem.lifecycle_state.as_str(), encrypted_envelope,
                     cid_stamp.cid, cid_stamp.genesis,
+                    // v1.0.0 #1834 — claim-bitemporal validity replicates verbatim
+                    // (federation carries a claim's asserted validity window).
+                    mem.valid_from, mem.valid_until,
                 ],
                 |r| r.get(0),
             ).map_err(|e| {
@@ -5564,6 +5589,8 @@ pub fn promote_to_namespace(
     let now = Utc::now().to_rfc3339();
     let clone = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: source.valid_from.clone(),
+        valid_until: source.valid_until.clone(),
         id: uuid::Uuid::new_v4().to_string(),
         tier: source.tier.clone(),
         namespace: to_namespace.to_string(),
@@ -6903,6 +6930,8 @@ pub fn consolidate(
             // v0.9.0 G8 (#1825) — stamped below from this candidate's
             // genesis identity; the raw INSERT binds the pair.
             cid: None,
+            valid_from: None,
+            valid_until: None,
         };
         consult_governance_pre_write(&candidate)?;
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
@@ -8213,6 +8242,8 @@ pub fn entity_register(
         let now = Utc::now().to_rfc3339();
         let mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+            valid_from: None,
+            valid_until: None,
             id: uuid::Uuid::new_v4().to_string(),
             tier: Tier::Long,
             namespace: namespace.to_string(),
@@ -9307,6 +9338,8 @@ pub fn register_agent(
 
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: AGENTS_NAMESPACE.to_string(),
@@ -11606,8 +11639,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // once per pulled row; `prepare_cached` amortises the parse of the
     // largest SQL statement in the file across the whole batch.
     let mut newer_wins_stmt = conn.prepare_cached(
-        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+        "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, last_accessed_at, expires_at, metadata, reflection_depth, memory_kind, entity_id, persona_version, citations, source_uri, source_span, confidence_source, confidence_signals, confidence_decayed_at, mentioned_entity_id, version, lifecycle_state, encrypted_envelope, cid, cid_genesis, valid_from, valid_until)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
          ON CONFLICT(title, namespace) DO UPDATE SET
             -- v0.9.0 G8 (#1825) — a federation merge NEVER overwrites the
             -- surviving local row's genesis content-id: keep the local
@@ -11723,7 +11756,15 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             -- update site, so the replicated value is already-validated.
             lifecycle_state = CASE WHEN excluded.updated_at > memories.updated_at
                                         OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
-                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END
+                                   THEN excluded.lifecycle_state ELSE memories.lifecycle_state END,
+            -- v1.0.0 #1834 — claim-bitemporal validity under federation LWW.
+            -- `valid_from` is immutable (local genesis wins, like `cid`);
+            -- `valid_until` follows the newer-wins tiebreak so a peer that
+            -- CLOSED a claim (set the upper bound) replicates that close.
+            valid_from = memories.valid_from,
+            valid_until = CASE WHEN excluded.updated_at > memories.updated_at
+                                 OR (excluded.updated_at = memories.updated_at AND excluded.id > memories.id)
+                               THEN excluded.valid_until ELSE memories.valid_until END
          RETURNING id",
     )?;
     let actual_id: String = newer_wins_stmt.query_row(
@@ -11759,6 +11800,8 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
             encrypted_envelope,
             cid_stamp.cid,
             cid_stamp.genesis,
+            mem.valid_from,
+            mem.valid_until,
         ],
         |r| r.get(0),
     )?;

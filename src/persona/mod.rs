@@ -374,6 +374,8 @@ impl<'a> PersonaGenerator<'a> {
 
         let persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+            valid_from: None,
+            valid_until: None,
             id: persona_id_local.clone(),
             tier: self.config.tier.clone(),
             namespace: namespace.to_string(),

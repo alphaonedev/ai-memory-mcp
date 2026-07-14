@@ -1083,6 +1083,8 @@ pub async fn bulk_create(
             // `attest_level` / adopt the signed `created_at`.
             let mut mem = Memory {
                 cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+                valid_from: None,
+                valid_until: None,
                 id: Uuid::new_v4().to_string(),
                 tier: body.tier,
                 namespace: body.namespace,

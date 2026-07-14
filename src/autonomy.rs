@@ -683,6 +683,8 @@ pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
     let ts = now.to_rfc3339();
     Ok(Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Long,
         namespace: format!("{CURATOR_NAMESPACE}/rollback"),
@@ -754,6 +756,8 @@ pub fn persist_self_report(
     });
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
+        valid_from: None,
+        valid_until: None,
         id: uuid::Uuid::new_v4().to_string(),
         tier: Tier::Mid,
         namespace: format!("{CURATOR_NAMESPACE}/reports"),
