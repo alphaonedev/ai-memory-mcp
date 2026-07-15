@@ -233,6 +233,279 @@ pub fn serve_rustls_acceptor(
         .acceptor(axum_server::accept::NoDelayAcceptor::new())
 }
 
+// ---------------------------------------------------------------------------
+// #2045 L6 — mTLS client-cert ↔ X-Peer-Id cross-check.
+//
+// The inbound federation `/sync/*` path trusted a verbatim `X-Peer-Id`
+// header: any holder of ANY allowlisted client cert could assert any peer
+// identity (the deferred fix flagged in `transport.rs`). This section binds
+// the presenting client cert to the peer identity it is allowed to assert.
+//
+// TRUST MODEL. mTLS here is fingerprint-pinning of (typically self-signed)
+// peer certs (`FingerprintAllowlistVerifier`), so a certificate's own
+// Subject / SAN fields are attacker-chosen and MUST NOT be trusted as the
+// peer identity — an enrolled peer could mint a cert whose SAN names a
+// victim. The trustworthy anchor is the operator-declared fingerprint, so
+// identity is bound through an operator-authored `<sha256-hex> <peer-id>`
+// map file — the same operator-declares-the-pin model as the outbound
+// `load_peer_fingerprint_map` (#1678) — rather than parsing a self-asserted
+// cert SAN.
+// ---------------------------------------------------------------------------
+
+/// Env var naming an operator-authored file that binds each pinned mTLS
+/// client-cert SHA-256 fingerprint to the ONE `x-peer-id` that cert is
+/// allowed to assert on the inbound federation `/sync/*` path (#2045 L6).
+/// Unset / empty ⇒ no bindings ⇒ every cert is "legacy" and the cross-check
+/// degrades to a WARN (never bricks). See [`load_cert_peer_binding_map`].
+pub const FED_CERT_PEER_BINDING_MAP_ENV: &str = "AI_MEMORY_FED_CERT_PEER_BINDING_MAP";
+
+/// Env var selecting the enforcement posture of the mTLS cert↔`X-Peer-Id`
+/// cross-check (#2045 L6): `off` | `warn` | `enforce`. Independent of
+/// `AI_MEMORY_FED_REQUIRE_SIG` — it is the compensating control for the
+/// `FED_REQUIRE_SIG=0` window. Default `warn` (one release, then `enforce`).
+pub const FED_CERT_PEER_BINDING_ENV: &str = "AI_MEMORY_FED_CERT_PEER_BINDING";
+
+/// Error-prefix label for the cert-peer-binding map parser (one named site
+/// for the no-hardcoded-literal gate).
+const CERT_PEER_BINDING_LABEL: &str = "cert peer-binding map";
+
+/// Enforcement posture for the mTLS cert↔`X-Peer-Id` cross-check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertPeerBindingMode {
+    /// Cross-check disabled — verbatim `X-Peer-Id` (pre-#2045 behaviour).
+    Off,
+    /// A mismatch is logged at WARN but the request proceeds (default).
+    Warn,
+    /// A mismatch is rejected with `401 peer_id_cert_mismatch`.
+    Enforce,
+}
+
+impl CertPeerBindingMode {
+    /// Parse the posture token (case-insensitive). Unrecognised ⇒ `Warn`
+    /// (the secure-but-non-bricking default), matching the enum-resolve
+    /// fall-through shape of the other `off|warn|enforce` knobs.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "enforce" => Self::Enforce,
+            _ => Self::Warn,
+        }
+    }
+}
+
+/// Resolve the cross-check posture from `AI_MEMORY_FED_CERT_PEER_BINDING`
+/// (default `warn`). Read per request — the env is cheap and re-reading
+/// lets an operator flip posture without a restart (mirrors the other
+/// direct-read federation knobs).
+#[must_use]
+pub fn cert_peer_binding_mode() -> CertPeerBindingMode {
+    std::env::var(FED_CERT_PEER_BINDING_ENV)
+        .ok()
+        .map_or(CertPeerBindingMode::Warn, |v| {
+            CertPeerBindingMode::parse(&v)
+        })
+}
+
+/// Parse an operator-authored cert-peer-binding map: one
+/// `<sha256-hex> <peer-id>` per line. `#` comments, blank lines and inline
+/// trailing `# …` comments are tolerated (mirrors the allowlist parser);
+/// the fingerprint field accepts the same grammar as the allowlist
+/// (`sha256:` marker + optional `:` separators). Several fingerprints may
+/// bind the same peer-id (cert rotation); a single fingerprint binding two
+/// DIFFERENT peer-ids is a fail-closed parse error (an ambiguous binding
+/// would silently weaken the check).
+pub fn load_cert_peer_binding_map(path: &Path) -> Result<HashMap<[u8; 32], String>> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read {CERT_PEER_BINDING_LABEL} from {}",
+            path.display()
+        )
+    })?;
+    let mut map: HashMap<[u8; 32], String> = HashMap::new();
+    for (idx, raw) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let fp_token = parts
+            .next()
+            .expect("non-empty line has at least one whitespace-delimited field");
+        let Some(peer_id) = parts.next() else {
+            anyhow::bail!(
+                "{CERT_PEER_BINDING_LABEL} line {lineno}: expected `<sha256-hex> <peer-id>`, \
+                 got only `{fp_token}`"
+            );
+        };
+        if parts.next().is_some() {
+            anyhow::bail!(
+                "{CERT_PEER_BINDING_LABEL} line {lineno}: expected exactly two fields \
+                 `<sha256-hex> <peer-id>`"
+            );
+        }
+        let fp = parse_fingerprint_token(fp_token, CERT_PEER_BINDING_LABEL, lineno)?;
+        // Reuse the wire agent-id shape check so a binding cannot smuggle
+        // CRLF / control bytes into the peer-id (same discipline as
+        // `extract_peer_id`).
+        if crate::validate::validate_agent_id(peer_id).is_err() {
+            anyhow::bail!(
+                "{CERT_PEER_BINDING_LABEL} line {lineno}: `{peer_id}` is not a valid peer-id \
+                 (agent-id shape)"
+            );
+        }
+        if let Some(existing) = map.get(&fp) {
+            if existing != peer_id {
+                anyhow::bail!(
+                    "{CERT_PEER_BINDING_LABEL} line {lineno}: fingerprint already bound to \
+                     `{existing}`, cannot re-bind to `{peer_id}`"
+                );
+            }
+        } else {
+            map.insert(fp, peer_id.to_string());
+        }
+    }
+    Ok(map)
+}
+
+/// Resolve the cert-peer-binding map from
+/// `AI_MEMORY_FED_CERT_PEER_BINDING_MAP`. `Ok(None)` ⇒ env unset / empty ⇒
+/// no bindings (the byte-identical pre-#2045 path; the peer-binding
+/// acceptor is not installed).
+pub fn cert_peer_binding_map_from_env() -> Result<Option<HashMap<[u8; 32], String>>> {
+    let Some(raw) = std::env::var_os(FED_CERT_PEER_BINDING_MAP_ENV) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(raw);
+    if path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(load_cert_peer_binding_map(&path)?))
+}
+
+/// Per-request extension injected by [`PeerBindingAcceptor`] on the inbound
+/// mTLS `/sync/*` path (#2045 L6). Carries the operator-bound peer identity
+/// resolved from the presenting client cert's SHA-256 fingerprint:
+///   - `Some(peer_id)` — the fingerprint is bound to exactly this id;
+///   - `None` — the fingerprint has NO binding ("legacy" cert): the
+///     cross-check degrades to WARN and never bricks.
+///
+/// Absence of the extension entirely means the request did not arrive over
+/// the peer-binding mTLS acceptor (plain HTTP / no binding map configured),
+/// so the cross-check is skipped.
+#[derive(Debug, Clone)]
+pub struct ClientCertPeerId(pub Option<String>);
+
+/// Compute the SHA-256(DER) fingerprint of the leaf client cert on a
+/// completed TLS connection and resolve its operator-bound peer-id from
+/// `bindings`. `None` when the peer presented no client cert (non-mTLS) or
+/// the fingerprint carries no binding.
+fn resolve_bound_peer_id(
+    peer_certs: Option<&[rustls::pki_types::CertificateDer<'_>]>,
+    bindings: &HashMap<[u8; 32], String>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let leaf = peer_certs?.first()?;
+    let fp: [u8; 32] = Sha256::digest(leaf.as_ref()).into();
+    bindings.get(&fp).cloned()
+}
+
+/// Per-connection `tower` service wrapper that inserts a [`ClientCertPeerId`]
+/// extension into every request handled on the connection (#2045 L6). One
+/// clone of a small `Option<String>` per request.
+#[derive(Clone)]
+pub struct CertExtensionService<S> {
+    inner: S,
+    cert_peer_id: ClientCertPeerId,
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for CertExtensionService<S>
+where
+    S: tower::Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
+        req.extensions_mut().insert(self.cert_peer_id.clone());
+        self.inner.call(req)
+    }
+}
+
+/// mTLS acceptor that, after the rustls handshake completes, resolves the
+/// presenting client cert's operator-bound peer identity and injects it as
+/// a [`ClientCertPeerId`] request extension (#2045 L6). Wraps the same
+/// `NoDelayAcceptor`-fronted rustls acceptor as [`serve_rustls_acceptor`]
+/// so the `TCP_NODELAY` fix (#1581) and the verifier chain are preserved
+/// verbatim — this ONLY adds the post-handshake extension injection.
+#[derive(Clone)]
+pub struct PeerBindingAcceptor {
+    inner: axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
+    bindings: Arc<HashMap<[u8; 32], String>>,
+}
+
+impl<S> axum_server::accept::Accept<tokio::net::TcpStream, S> for PeerBindingAcceptor
+where
+    S: Send + 'static,
+{
+    type Stream = <axum_server::tls_rustls::RustlsAcceptor<
+        axum_server::accept::NoDelayAcceptor,
+    > as axum_server::accept::Accept<tokio::net::TcpStream, S>>::Stream;
+    type Service = CertExtensionService<S>;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send,
+        >,
+    >;
+
+    fn accept(&self, stream: tokio::net::TcpStream, service: S) -> Self::Future {
+        let inner = axum_server::accept::Accept::accept(&self.inner, stream, service);
+        let bindings = self.bindings.clone();
+        Box::pin(async move {
+            let (tls_stream, service) = inner.await?;
+            // `get_ref().1` is the rustls `ServerConnection`; its
+            // `peer_certificates()` is the client cert the verifier already
+            // fingerprint-pinned. Resolved by inference — no tokio-rustls
+            // type is named.
+            let bound =
+                resolve_bound_peer_id(tls_stream.get_ref().1.peer_certificates(), &bindings);
+            let service = CertExtensionService {
+                inner: service,
+                cert_peer_id: ClientCertPeerId(bound),
+            };
+            Ok((tls_stream, service))
+        })
+    }
+}
+
+/// Build a [`PeerBindingAcceptor`] over the production mTLS config — the
+/// [`serve_rustls_acceptor`] sibling used when an operator has configured a
+/// cert-peer-binding map (#2045 L6). Verifier chain + `TCP_NODELAY` are
+/// identical to [`serve_rustls_acceptor`].
+#[must_use]
+pub fn serve_rustls_acceptor_with_peer_binding(
+    config: &axum_server::tls_rustls::RustlsConfig,
+    bindings: HashMap<[u8; 32], String>,
+) -> PeerBindingAcceptor {
+    PeerBindingAcceptor {
+        inner: serve_rustls_acceptor(config),
+        bindings: Arc::new(bindings),
+    }
+}
+
 /// Parse the allowlist file: one SHA-256 fingerprint per line, case-insensitive
 /// hex with optional `:` separators. Empty lines and `#` comments are skipped.
 pub async fn load_fingerprint_allowlist(path: &Path) -> Result<HashSet<[u8; 32]>> {

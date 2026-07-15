@@ -5632,11 +5632,39 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
         // and accept/reject semantics are unchanged; see
         // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
-        axum_server::bind(socket_addr)
-            .acceptor(tls::serve_rustls_acceptor(&tls_config))
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        //
+        // #2045 L6 — when the operator configures a cert-peer-binding map
+        // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
+        // acceptor so the presenting client cert's operator-bound peer-id is
+        // injected into request extensions for the `/sync/*` cross-check.
+        // Only meaningful under mTLS (peer certs exist only there); with no
+        // map the byte-identical `serve_rustls_acceptor` path is kept.
+        let cert_peer_bindings = if args.mtls_allowlist.is_some() {
+            tls::cert_peer_binding_map_from_env()?
+        } else {
+            None
+        };
+        if let Some(bindings) = cert_peer_bindings {
+            tracing::info!(
+                bound_fingerprints = bindings.len(),
+                "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
+                tls::cert_peer_binding_mode()
+            );
+            axum_server::bind(socket_addr)
+                .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                    &tls_config,
+                    bindings,
+                ))
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        } else {
+            axum_server::bind(socket_addr)
+                .acceptor(tls::serve_rustls_acceptor(&tls_config))
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
     } else {
         tracing::warn!(
             "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
