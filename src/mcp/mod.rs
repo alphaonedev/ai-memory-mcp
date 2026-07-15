@@ -2680,6 +2680,19 @@ fn handle_request(
             {
                 obj.insert("ai_memory_identity".to_string(), identity_block);
             }
+            // #1868 (B7-STREAM) — the advertised capabilities are `tools` +
+            // `prompts` ONLY: NO progress/streaming capability. MCP tool
+            // responses are single-terminal here — the stdio loop dispatches
+            // `handle_request` inline and writes exactly ONE response per
+            // request (stdout is response-only; diagnostics go to stderr; the
+            // one-in-one-out model is pinned by `issue_965_audit_serial_dispatch_*`).
+            // Incremental `notifications/progress` streaming is FEASIBLE on this
+            // inline single-threaded loop (progress writes serialize for free —
+            // it is NOT blocked by any sync↔async transport re-architecture), but
+            // is DEFERRED to v1.x (#2076): shipping the first-ever unsolicited
+            // server→stdout frame + the emit contract at a GA compat freeze,
+            // with zero in-tree consumer and a T1 ripple through `handle_request`,
+            // is premature. Pinned by `initialize_advertises_no_streaming_capability_1868`.
             ok_response(
                 id,
                 json!({
@@ -7274,6 +7287,47 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "ai-memory");
+    }
+
+    /// #1868 (B7-STREAM) — the `initialize` response advertises `tools` +
+    /// `prompts` capabilities ONLY, with NO progress/streaming capability: MCP
+    /// tool responses are single-terminal today (§ the doc at
+    /// `METHOD_INITIALIZE`). This is an observable drift-guard — a future
+    /// `notifications/progress` streaming impl (#2076) would add a progress
+    /// capability here, deliberately flipping this test.
+    #[test]
+    fn initialize_advertises_no_streaming_capability_1868() {
+        let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "initialize".into(),
+            params: json!({"clientInfo": {"name": "test-client"}}),
+        };
+        let resp = invoke_handle_request(&conn, &req);
+        let caps = resp.result.unwrap()["capabilities"].clone();
+        let keys: std::collections::BTreeSet<String> = caps
+            .as_object()
+            .expect("capabilities is an object")
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            ["prompts", "tools"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            "MCP advertises tools+prompts ONLY — no progress/streaming capability \
+             at v1.0.0 (streaming is deferred to #2076); got {keys:?}"
+        );
+        // Explicitly: no progress/streaming/logging capability is advertised.
+        for absent in ["progress", "streaming", "logging", "experimental"] {
+            assert!(
+                caps.get(absent).is_none(),
+                "no `{absent}` capability should be advertised at v1.0.0"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
