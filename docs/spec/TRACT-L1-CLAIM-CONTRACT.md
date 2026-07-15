@@ -249,9 +249,10 @@ differently — the receipt makes NO claim beyond "this forget was recorded."
 ### 8.3 v1.x migration (deferred, 1:1 issues)
 
 Clauses 1-3 are each tracked as their own v1.x issue (never bundled): the
-mandatory `why_trace` write-gate default-flip; immutable-authorship enforcement;
-permanent-dissent conservation (G7). A postgres/HTTP/MCP forget-receipt surface
-(beyond the sqlite CLI) is a separate additive v1.x follow-up.
+mandatory `why_trace` write-gate default-flip (**#2059**); immutable-authorship
+enforcement (**#2060**); permanent-dissent conservation G7 (**#2061**). A
+postgres/HTTP/MCP forget-receipt surface beyond the sqlite CLI is a separate
+additive v1.x follow-up (**#2062**).
 
 ---
 
