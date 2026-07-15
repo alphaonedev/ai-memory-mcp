@@ -985,7 +985,7 @@ impl Embedder {
     /// the dedicated `AI_MEMORY_EMBED_OFFLINE` knob. Used by hermetic CI (the
     /// integration suite sets it to dodge the #1501 cold-download race) and by
     /// air-gapped operators who pre-stage the weights in `FALLBACK_MODEL_SUBDIR`.
-    fn remote_fetch_disabled() -> bool {
+    pub(crate) fn remote_fetch_disabled() -> bool {
         let truthy = |name: &str| {
             std::env::var(name)
                 .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))

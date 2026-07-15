@@ -587,24 +587,71 @@ impl CrossEncoder {
         }
     }
 
+    /// #1969 — resolve the cross-encoder's config/tokenizer/weights, honoring
+    /// the substrate offline guard. When
+    /// [`crate::embeddings::Embedder::remote_fetch_disabled`] is set
+    /// (`AI_MEMORY_EMBED_OFFLINE` / `HF_HUB_OFFLINE`), the files resolve from
+    /// the local HuggingFace cache ONLY — never a network fetch — and an absent
+    /// file bails LOUD. No silent network attempt and no silent lexical
+    /// fallback: `new_neural` logs `reranker.fallback` and the recall response
+    /// surfaces `reranker_used = "degraded_lexical"`. Pre-#1969, `load_neural`
+    /// went straight to `Api::new()` + `repo.get()`, so `AI_MEMORY_EMBED_OFFLINE`
+    /// was silently ignored by the reranker (only hf-hub's native
+    /// `HF_HUB_OFFLINE` was honored) and an offline install made a futile
+    /// network attempt before degrading.
+    fn resolve_cross_encoder_files()
+    -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let repo = Repo::new(CROSS_ENCODER_MODEL_ID.to_string(), RepoType::Model);
+        if crate::embeddings::Embedder::remote_fetch_disabled() {
+            let cache_repo = hf_hub::Cache::default().repo(repo);
+            Self::assemble_offline_cross_encoder_files(|file| cache_repo.get(file))
+        } else {
+            let online = Api::new()
+                .context("failed to init HuggingFace Hub API")?
+                .repo(repo);
+            Ok((
+                online
+                    .get(crate::embeddings::HF_CONFIG_FILE)
+                    .context("failed to download config.json")?,
+                online
+                    .get(crate::embeddings::HF_TOKENIZER_FILE)
+                    .context("failed to download tokenizer.json")?,
+                online
+                    .get(crate::embeddings::HF_WEIGHTS_FILE)
+                    .context("failed to download model.safetensors")?,
+            ))
+        }
+    }
+
+    /// #1969 — pure offline (cache-only) assembly of the three cross-encoder
+    /// file paths, bailing LOUD on the first file the resolver can't produce.
+    /// The resolver is injected (production passes `hf_hub::CacheRepo::get`,
+    /// which is network-free) so the fail-loud offline path is unit-testable
+    /// without env mutation or a network. NEVER touches the network — that is
+    /// the whole point of the offline guard.
+    fn assemble_offline_cross_encoder_files(
+        resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+        let need = |file: &str| -> Result<std::path::PathBuf> {
+            resolve(file).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "offline (AI_MEMORY_EMBED_OFFLINE/HF_HUB_OFFLINE): cross-encoder file \
+                     {file} is not in the local HuggingFace cache; pre-stage \
+                     {CROSS_ENCODER_MODEL_ID} or unset offline to enable neural reranking"
+                )
+            })
+        };
+        Ok((
+            need(crate::embeddings::HF_CONFIG_FILE)?,
+            need(crate::embeddings::HF_TOKENIZER_FILE)?,
+            need(crate::embeddings::HF_WEIGHTS_FILE)?,
+        ))
+    }
+
     fn load_neural() -> Result<Self> {
         let device = Device::Cpu;
 
-        let api = Api::new().context("failed to init HuggingFace Hub API")?;
-        let repo = api.repo(Repo::new(
-            CROSS_ENCODER_MODEL_ID.to_string(),
-            RepoType::Model,
-        ));
-
-        let config_path = repo
-            .get(crate::embeddings::HF_CONFIG_FILE)
-            .context("failed to download config.json")?;
-        let tokenizer_path = repo
-            .get(crate::embeddings::HF_TOKENIZER_FILE)
-            .context("failed to download tokenizer.json")?;
-        let weights_path = repo
-            .get(crate::embeddings::HF_WEIGHTS_FILE)
-            .context("failed to download model.safetensors")?;
+        let (config_path, tokenizer_path, weights_path) = Self::resolve_cross_encoder_files()?;
 
         // Load BERT config
         let config_data = std::fs::read_to_string(&config_path)
@@ -2466,6 +2513,43 @@ mod tests {
         let ce = CrossEncoder::new_neural();
         let s = ce.score("query", "title", "content");
         assert!((0.0..=1.0).contains(&s), "score {s} out of bounds");
+    }
+
+    // -----------------------------------------------------------------
+    // #1969 — offline-guard fail-loud (no silent network attempt, no silent
+    // lexical fallback). Pure resolver-injected assembly, so no env/network.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn offline_cross_encoder_files_bail_loud_when_uncached_1969() {
+        // Offline + an empty cache (resolver finds nothing) must bail LOUD with
+        // the offline message on the FIRST missing file — never a network fetch.
+        // `new_neural` then surfaces `reranker_used = degraded_lexical`.
+        let err = CrossEncoder::assemble_offline_cross_encoder_files(|_| None)
+            .expect_err("uncached offline must bail, not silently fetch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offline"),
+            "must be a loud offline error: {msg}"
+        );
+        assert!(
+            msg.contains(crate::embeddings::HF_CONFIG_FILE),
+            "error must name the missing file: {msg}"
+        );
+    }
+
+    #[test]
+    fn offline_cross_encoder_files_ok_when_prestaged_1969() {
+        // Offline but every file present in the cache → resolves all three paths
+        // with zero network (the air-gapped pre-staged path keeps working).
+        let (config, tokenizer, weights) =
+            CrossEncoder::assemble_offline_cross_encoder_files(|f| {
+                Some(std::path::PathBuf::from(format!("/hf-cache/{f}")))
+            })
+            .expect("pre-staged offline cache resolves");
+        assert!(config.ends_with(crate::embeddings::HF_CONFIG_FILE));
+        assert!(tokenizer.ends_with(crate::embeddings::HF_TOKENIZER_FILE));
+        assert!(weights.ends_with(crate::embeddings::HF_WEIGHTS_FILE));
     }
 
     // -----------------------------------------------------------------
