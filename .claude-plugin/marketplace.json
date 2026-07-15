@@ -1,0 +1,25 @@
+{
+  "name": "ai-memory",
+  "owner": {
+    "name": "AlphaOne LLC",
+    "url": "https://github.com/alphaonedev/ai-memory-mcp"
+  },
+  "metadata": {
+    "description": "Persistent, tier-aware memory for AI agents — the ai-memory substrate as a Claude Code plugin.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "ai-memory",
+      "source": "./plugins/ai-memory",
+      "description": "Persistent memory for Claude Code: the ai-memory MCP server (full memory-tool surface at --profile full), a SessionStart recall hook that boots each session memory-aware, and an opt-in PreToolUse governance gate.",
+      "version": "0.1.0",
+      "author": {
+        "name": "AlphaOne LLC"
+      },
+      "homepage": "https://github.com/alphaonedev/ai-memory-mcp",
+      "license": "Apache-2.0",
+      "keywords": ["memory", "mcp", "persistent-memory", "recall", "governance"]
+    }
+  ]
+}
