@@ -245,6 +245,27 @@ async fn off_mode_disables_binding() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn enforce_for_request_is_inert_when_no_keys_enrolled() {
+    // Single-operator / feature-off posture: with NO enrolled per-agent keys
+    // the gate is inert in EVERY mode — advisory stays zero-WARN and enforce
+    // does NOT brick a named caller (the #1985 unsatisfiable-default trap).
+    use ai_memory::handlers::identity_binding::enforce_for_request;
+    let empty = HashMap::new();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", "shared-transport".parse().unwrap());
+    for mode in [
+        HttpIdentityMode::Off,
+        HttpIdentityMode::Advisory,
+        HttpIdentityMode::Enforce,
+    ] {
+        assert!(
+            enforce_for_request(&empty, mode, &headers, "alice", "get_memory").is_none(),
+            "empty enrolled map must be inert in {mode:?}"
+        );
+    }
+}
+
+#[test]
 fn h1_m1_enforce_refuses_shared_key_named_principal_at_gate() {
     // The gate the memories handlers + require_admin invoke. A shared-key caller
     // (empty/absent per-agent attestation → Claimed) acting as a NAMED principal

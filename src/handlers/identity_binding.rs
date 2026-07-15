@@ -148,6 +148,14 @@ pub fn resolve_auth_level(
 /// ([`enforce_sensitive_identity`]) in one call. Returns `Some(403)` to refuse.
 /// This is the single line every IDOR-sensitive read/mutate handler and
 /// [`crate::handlers::admin_role::require_admin`] invokes.
+///
+/// **Fully inert when no per-agent keys are enrolled** (in EVERY mode): the
+/// feature is off until an operator opts in by enrolling keys. This is what
+/// keeps `advisory` (the v1.0.0 default) zero-WARN for a single-operator
+/// deployment AND stops `enforce` from bricking every named caller when nobody
+/// could possibly be key-attested (the #1985 unsatisfiable-default trap).
+/// Enforcement (advisory WARN / enforce 403) only engages once at least one
+/// per-agent key exists.
 #[must_use]
 pub fn enforce_for_request(
     enrolled: &std::collections::HashMap<String, String>,
@@ -156,6 +164,9 @@ pub fn enforce_for_request(
     caller: &str,
     endpoint: &str,
 ) -> Option<Response> {
+    if enrolled.is_empty() {
+        return None;
+    }
     let level = resolve_auth_level(enrolled, headers, caller);
     enforce_sensitive_identity(mode, level, caller, endpoint)
 }
