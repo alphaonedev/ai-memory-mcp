@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "ai-memory",
+      "args": ["mcp", "--profile", "full"]
+    }
+  }
+}
