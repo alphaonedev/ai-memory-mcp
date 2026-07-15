@@ -869,29 +869,79 @@ fn run_decorrelation_write_gate(
     }
     let quorum_n = crate::config::reflect_decorrelation_quorum_n();
 
-    // Direct namespace-scoped corpus read (NOT recall). Bounded by the SSOT
-    // `crate::storage::LIST_MAX_LIMIT` (the same window the visibility probe's
-    // `PROBE_SCAN_LIMIT` reuses) so this per-write scan on the reflect hot path
-    // can never grow unbounded with the namespace's reflection count.
+    // Empty-attestation short-circuit (M-THROUGHPUT): the write-gate can only
+    // ever REFUSE/ADVISE on an ATTESTED-family signal, and `attested_family_of`
+    // resolves a family ONLY from a `model_attestations` row. With that table
+    // empty (the default posture), every row's attested lookup is `None`, so
+    // `attested_rows == 0` and `decorrelation_write_action` returns `Proceed`
+    // UNCONDITIONALLY (decorrelation_probe.rs — `InsufficientAttested { 0 } =>
+    // Proceed`, silent, mode-independent). Skip the up-to-`LIST_MAX_LIMIT`
+    // corpus scan + per-row JSON parse in that case — provably the same
+    // observable outcome (a bare `Ok(())`, no advisory emitted) at O(1).
+    let any_attested: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM model_attestations)", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| ReflectError::Database(e.to_string()))?;
+    if !any_attested {
+        return Ok(());
+    }
+
+    // #2028 — Full corpus size is an UNCAPPED `COUNT(*)`, distinct from the
+    // bounded attested-candidate scan below. `total_reflections` only feeds the
+    // advisory-message denominator ("N ATTESTED of M corpus"); it must reflect
+    // the true corpus size, not the scan window.
+    let total_reflections: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories \
+             WHERE namespace = ?1 AND memory_kind = 'reflection'",
+            [target_namespace],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| ReflectError::Database(e.to_string()))?
+        .try_into()
+        .unwrap_or(usize::MAX);
+
+    // #2028 — Scan the ATTESTED-CANDIDATE set, NOT the whole corpus. Only a row
+    // whose metadata carries the loader-observed attest marker can EVER resolve
+    // an attested family (`model_attest::attested_family_candidate` requires
+    // `model_family_attest = "loader_observed"` + a non-empty `model_family`),
+    // so marker-filtering IS the security-correct population. The prior
+    // unordered `LIMIT LIST_MAX_LIMIT` over the FULL corpus could push the
+    // attested rows OUTSIDE the window whenever a namespace held more than
+    // `LIST_MAX_LIMIT` CLAIMED reflections — undercounting `attested_rows` below
+    // `MIN_REFLECTIONS_FLOOR` so an attested monoculture silently PROCEEDED
+    // (`InsufficientAttested`) instead of being REFUSED under `enforce`. The
+    // candidate set is naturally bounded by the attest-marked reflection count;
+    // `LIST_MAX_LIMIT` still caps the hot-path scan and is security-safe here
+    // (more candidates only push toward Refuse, never toward the bypass). The
+    // per-row `attested_family_of` (SSOT) still applies the forgery gate
+    // (stamp without a backing `model_attestations` row → CLAIMED).
+    let attest_path = format!("$.{}", crate::identity::META_KEY_MODEL_FAMILY_ATTEST);
     let scan_limit = i64::try_from(crate::storage::LIST_MAX_LIMIT).unwrap_or(i64::MAX);
     let mut corpus_attested: Vec<String> = Vec::new();
-    let mut total_reflections: usize = 0;
     {
         let mut stmt = conn
             .prepare(
                 "SELECT metadata FROM memories \
                  WHERE namespace = ?1 AND memory_kind = 'reflection' \
-                 LIMIT ?2",
+                   AND json_extract(metadata, ?2) = ?3 \
+                 LIMIT ?4",
             )
             .map_err(|e| ReflectError::Database(e.to_string()))?;
         let rows = stmt
-            .query_map((target_namespace, scan_limit), |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                (
+                    target_namespace,
+                    &attest_path,
+                    crate::identity::ATTEST_MODEL_LOADER_OBSERVED,
+                    scan_limit,
+                ),
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|e| ReflectError::Database(e.to_string()))?;
         for r in rows {
             let raw = r.map_err(|e| ReflectError::Database(e.to_string()))?;
-            total_reflections += 1;
             let meta: serde_json::Value =
                 serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
             if let Some(fam) = crate::storage::model_attest::attested_family_of(conn, &meta)

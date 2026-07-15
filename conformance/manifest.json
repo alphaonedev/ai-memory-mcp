@@ -1,4 +1,5 @@
 {
+  "corpus_digest": "82fe21c875664f1086f07abede2f6abb658a4351eba978bd91cd7e57b63c7f3b",
   "domain_tags": {
     "equivocation_proof": "ai-memory/equivocation-proof/v1",
     "peer_head_attestation": "ai-memory/peer-head-attestation-v1",
@@ -7,6 +8,289 @@
   },
   "format_freeze_doc": "docs/v1.0.0/format-decisions/SIGNABLE-WRITE-V2-AND-VERIFIER-SPEC-DRAFT.md",
   "generator": "tests/conformance_corpus.rs",
+  "groups": [
+    {
+      "expected": {
+        "outcome": "valid"
+      },
+      "members": [
+        {
+          "domain_tag": "ai-memory/subkey-cert/v1",
+          "elements": 6,
+          "file": "vectors/subkey_chain/valid/cert.hex",
+          "grammar": "array-v2",
+          "length_bytes": 159,
+          "pubkey": "d759793bbc13a2819a827c76adb6fba8a49aee007f49f2d0992d99b825ad2c48",
+          "record_type": "subkey_cert",
+          "role": "cert",
+          "signature": "04eb09653200ace9c4322676e6077c9ad0ea54a7861dff569a161a3b569fb42237944a520f7acbacc08752693c21d22e12b9310b033db5b0e782a7692b78d70f"
+        },
+        {
+          "domain_tag": "ai-memory/write/v2",
+          "elements": 11,
+          "file": "vectors/subkey_chain/valid/write.hex",
+          "grammar": "array-v2",
+          "length_bytes": 191,
+          "pubkey": "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242",
+          "record_type": "signable_write_v2",
+          "role": "write",
+          "signature": "b49a835b0713dad2d4e04890122e00a317117697eab083931c1abc8854da529b273c4d43b24dce18098fc255bbf5d13b0b021daeae763ea81e13cf1382541e01"
+        }
+      ],
+      "name": "subkey_chain/valid",
+      "verdict": "subkey-chain-verify"
+    },
+    {
+      "expected": {
+        "outcome": "reject",
+        "reject_reason": "self_declared_instance"
+      },
+      "members": [
+        {
+          "domain_tag": "ai-memory/write/v2",
+          "elements": 11,
+          "file": "vectors/subkey_chain/self_declared/write.hex",
+          "grammar": "array-v2",
+          "length_bytes": 191,
+          "pubkey": "34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746",
+          "record_type": "signable_write_v2",
+          "role": "write",
+          "signature": "99d1a139c8bffb31ead48f04fb28ad84fa2605c8b3b1a1ecd37c3ef194076b36ec846c7727750e1028479280e626d67e0542a03a00386e53865c571ba96f3201"
+        }
+      ],
+      "name": "subkey_chain/self_declared",
+      "verdict": "subkey-chain-verify"
+    },
+    {
+      "expected": {
+        "expected_state": "valid"
+      },
+      "members": [
+        {
+          "epoch": 0,
+          "file": "vectors/lineage/valid/genesis.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 280,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "genesis",
+          "record_type": "agent_lineage_succession",
+          "role": "genesis",
+          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
+        },
+        {
+          "epoch": 1,
+          "file": "vectors/lineage/valid/rotation.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 281,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "rotation",
+          "record_type": "agent_lineage_succession",
+          "role": "rotation",
+          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
+        }
+      ],
+      "name": "lineage/valid",
+      "verdict": "lineage-resolve"
+    },
+    {
+      "expected": {
+        "expected_state": "invalid-revoked"
+      },
+      "members": [
+        {
+          "epoch": 0,
+          "file": "vectors/lineage/invalid_revoked/genesis.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 280,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "genesis",
+          "record_type": "agent_lineage_succession",
+          "role": "genesis",
+          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
+        },
+        {
+          "epoch": 1,
+          "file": "vectors/lineage/invalid_revoked/rotation.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 281,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "rotation",
+          "record_type": "agent_lineage_succession",
+          "role": "rotation",
+          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
+        },
+        {
+          "epoch": 2,
+          "file": "vectors/lineage/invalid_revoked/revocation.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 316,
+          "predecessor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w",
+          "pubkey": "b2491d9502ae28630a2bacb2e0c74510ffcdd328c334ff3e1393e75b2d31e7dc",
+          "reason": "revocation",
+          "record_type": "agent_lineage_succession",
+          "role": "revocation",
+          "signature": "429283df9eea168dbe9928fee4b3eeedbd4b298ac6af623f9b22da6ba52c1d4267e4a2dfaeece0a2be452529a30e736a0acc2a515d64d727756b50b4c88d2e0a",
+          "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
+        }
+      ],
+      "name": "lineage/invalid_revoked",
+      "verdict": "lineage-resolve"
+    },
+    {
+      "expected": {
+        "expected_state": "indeterminate",
+        "resolution_policy": {
+          "on_equivocation": "indeterminate",
+          "on_missing_link": "invalid"
+        }
+      },
+      "members": [
+        {
+          "epoch": 0,
+          "file": "vectors/lineage/equivocation_fork/genesis.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 280,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "genesis",
+          "record_type": "agent_lineage_succession",
+          "role": "genesis",
+          "signature": "d8ad692e2279196cdf5e17ebb656f02ffc64201d3762b9ab1df4f883b8de50f422258121088ef240505b87c83f15399a538b2d9e33fb8e9059b99a62b2288000",
+          "successor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc"
+        },
+        {
+          "epoch": 1,
+          "file": "vectors/lineage/equivocation_fork/rotation_a.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 281,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "rotation",
+          "record_type": "agent_lineage_succession",
+          "role": "rotation_a",
+          "signature": "fd4877d135a6814dae37cb0bcc755e1282bf1ca56ca976ddc95cd65878841f57f94b165597573295c0856bb59d74b56b7b01f7a696273e0b4153966dbde5aa08",
+          "successor_pubkey": "skkdlQKuKGMKK6yy4MdFEP_N0yjDNP8-E5PnWy0x59w"
+        },
+        {
+          "epoch": 1,
+          "file": "vectors/lineage/equivocation_fork/rotation_b.hex",
+          "grammar": "lineage-succession-v1",
+          "length_bytes": 281,
+          "predecessor_pubkey": "yFOtDwzSthmuqSzuxP1Wok1kmdWEznklfkXP2BObYKc",
+          "pubkey": "c853ad0f0cd2b619aea92ceec4fd56a24d6499d584ce79257e45cfd8139b60a7",
+          "reason": "rotation",
+          "record_type": "agent_lineage_succession",
+          "role": "rotation_b",
+          "signature": "3857c088af0b7cb0666bab2a18183038d26a61b02b04080bdfc3e9052bb5a5ef7d7be7e4d729fdee6cb64147d608016b0a6a14a60450cdd7090518c02128d206",
+          "successor_pubkey": "My6-jSfLcyOzpAHBwTtd1kvMwOEOzaHCtdEaA3eaheU"
+        }
+      ],
+      "name": "lineage/equivocation_fork",
+      "verdict": "lineage-resolve"
+    },
+    {
+      "expected": {
+        "break_kind": "none",
+        "outcome": "intact"
+      },
+      "members": [
+        {
+          "file": "vectors/chain/intact/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/intact/row_1.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "record_type": "signed_events_chain_row",
+          "role": "row_1",
+          "sequence": 2
+        },
+        {
+          "file": "vectors/chain/intact/row_2.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "record_type": "signed_events_chain_row",
+          "role": "row_2",
+          "sequence": 3
+        }
+      ],
+      "name": "chain/intact",
+      "verdict": "chain-verify"
+    },
+    {
+      "expected": {
+        "break_kind": "midchain-deletion",
+        "outcome": "broken"
+      },
+      "members": [
+        {
+          "file": "vectors/chain/midchain_deletion/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/midchain_deletion/row_2.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "e5b8cc3d72a0e7dac336735ae30ea899fcdb3c9c6b16dce6209628a3751e86ae",
+          "record_type": "signed_events_chain_row",
+          "role": "row_2",
+          "sequence": 3
+        }
+      ],
+      "name": "chain/midchain_deletion",
+      "verdict": "chain-verify"
+    },
+    {
+      "expected": {
+        "break_kind": "tail-truncation",
+        "outcome": "broken",
+        "witness_head_sequence": 3
+      },
+      "members": [
+        {
+          "file": "vectors/chain/tail_truncation/row_0.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+          "record_type": "signed_events_chain_row",
+          "role": "row_0",
+          "sequence": 1
+        },
+        {
+          "file": "vectors/chain/tail_truncation/row_1.hex",
+          "grammar": "signed-events-chain-v1",
+          "length_bytes": 195,
+          "prev_hash": "9f9dd7be98e3d279279ee1bdbba5ede1c661495bd82a21546f670db06fde4dad",
+          "record_type": "signed_events_chain_row",
+          "role": "row_1",
+          "sequence": 2
+        }
+      ],
+      "name": "chain/tail_truncation",
+      "verdict": "chain-verify"
+    }
+  ],
   "license": "CC0-1.0",
   "schema_version": 81,
   "spec": "ai-memory/portability/v2",

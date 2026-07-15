@@ -72,6 +72,22 @@ fn attested_llama_reflection(title: &str) -> Memory {
     )
 }
 
+/// A reflection-kind memory carrying a `llama` family stamp WITHOUT the
+/// loader-observed attest marker — reads CLAIMED, never ATTESTED, and is
+/// excluded from the #2028 attested-candidate scan (no `model_family_attest`
+/// key). Used to flood the corpus so an unordered window would evict the
+/// attested rows.
+fn claimed_reflection(title: &str) -> Memory {
+    base_memory(
+        title,
+        MemoryKind::Reflection,
+        serde_json::json!({
+            "agent_id": "curator",
+            "model_family": "llama",
+        }),
+    )
+}
+
 fn reflect_input(source_ids: Vec<String>, title: &str) -> db::ReflectInput {
     db::ReflectInput {
         source_ids,
@@ -175,6 +191,76 @@ fn enforce_refuses_attested_monoculture_then_off_is_inert() {
         )
         .unwrap();
     assert_eq!(written, 1, "off mode persists the reflection");
+
+    unsafe { std::env::remove_var(MODE_ENV) };
+}
+
+/// #2028 regression — the enforce gate must find an attested monoculture even
+/// when the corpus holds MORE than `LIST_MAX_LIMIT` CLAIMED reflections
+/// inserted BEFORE the attested rows. The pre-fix unordered `LIMIT
+/// LIST_MAX_LIMIT` scan over the whole corpus returned only the leading
+/// claimed rows, missed the trailing attested rows, undercounted
+/// `attested_rows` to 0 (`InsufficientAttested`), and silently PROCEEDED —
+/// a bypass of the enforce gate. The attested-CANDIDATE scan is marker-scoped,
+/// so it finds the attested rows regardless of their corpus position.
+#[test]
+fn enforce_finds_attested_rows_beyond_scan_window_2028() {
+    let conn = db::open(std::path::Path::new(":memory:")).unwrap();
+
+    let base = base_memory(
+        "base-source",
+        MemoryKind::Observation,
+        serde_json::json!({}),
+    );
+    let base_id = db::insert(&conn, &base).expect("insert base");
+
+    // Flood the namespace with LIST_MAX_LIMIT CLAIMED reflections FIRST so the
+    // attested rows land beyond a whole-corpus LIMIT LIST_MAX_LIMIT window.
+    for i in 0..ai_memory::storage::LIST_MAX_LIMIT {
+        let r = claimed_reflection(&format!("claimed-refl-{i}"));
+        db::insert(&conn, &r).expect("insert claimed reflection");
+    }
+    // Then 3 ATTESTED `llama` reflections (an attested monoculture) at the tail.
+    for i in 0..3 {
+        let r = attested_llama_reflection(&format!("attested-tail-{i}"));
+        db::insert(&conn, &r).expect("insert attested reflection");
+    }
+    model_attest::record_loader_observed(&conn, "ollama", "llama3.1:8b", "llama")
+        .expect("record loader attestation");
+
+    unsafe { std::env::set_var(MODE_ENV, "enforce") };
+    let input = reflect_input(vec![base_id], "gated-beyond-window");
+    let err = db::reflect(&conn, &input)
+        .expect_err("enforce must refuse the attested monoculture beyond the scan window");
+    match err {
+        db::ReflectError::DecorrelationRefused {
+            distinct_attested_families,
+            attested_rows,
+            quorum_n,
+            namespace,
+        } => {
+            assert_eq!(
+                distinct_attested_families, 1,
+                "one distinct attested family"
+            );
+            assert!(
+                attested_rows >= 3,
+                "the 3 tail attested rows must be counted despite {} leading claimed rows",
+                ai_memory::storage::LIST_MAX_LIMIT
+            );
+            assert_eq!(quorum_n, 3, "default quorum N");
+            assert_eq!(namespace, NS);
+        }
+        other => panic!("expected DecorrelationRefused, got {other}"),
+    }
+    let gated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE title = 'gated-beyond-window'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(gated, 0, "the refused reflection must not be persisted");
 
     unsafe { std::env::remove_var(MODE_ENV) };
 }

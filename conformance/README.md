@@ -26,7 +26,10 @@ conformance/
 │   ├── signable_write_v2/      3 unsigned encoding vectors
 │   ├── subkey_cert/            1 unsigned encoding vector
 │   ├── peer_head_attestation/  2 unsigned encoding vectors
-│   └── signed/                 3 signed vectors (valid / tampered / proof)
+│   ├── signed/                 3 signed vectors (valid / tampered / proof)
+│   ├── subkey_chain/           obl. 3 group members (cert→write + self-declared)
+│   ├── lineage/                obl. 5 group members (valid / revoked / fork)
+│   └── chain/                  obl. 2 group members (intact / deletion / truncation)
 └── readers/
     ├── reader.py            Python 3 reference reader (stdlib-only)
     └── reader.mjs           Node.js reference reader (stdlib-only, Node ≥ 19)
@@ -58,7 +61,9 @@ AI_MEMORY_REGEN_GOLDEN=1 cargo test --test conformance_corpus
 Top-level fields: `spec`, `spec_doc`, `format_freeze_doc`, `schema_version`
 (the ai-memory schema the corpus is anchored to; a Rust test pins it to the
 code's `CURRENT_SCHEMA_VERSION`), `generator`, `license`, `domain_tags`
-(record-type → frozen domain-tag string), and `vectors[]`.
+(record-type → frozen domain-tag string), `corpus_digest` (the whole-corpus
+SHA-256 integrity anchor — see below), `vectors[]`, and `groups[]` (the
+multi-record fixtures — see "Multi-record fixture groups").
 
 Each `vectors[]` entry:
 
@@ -90,23 +95,23 @@ obligations of spec §7, and what this corpus exercises of each:
    signature half by `signed/*`.*
 2. **Walk the V-4 audit chain** (`prev_hash` + `sequence`) for
    tamper-evidence; with the witness/watermark, detect tail-truncation.
-   *NOT exercised by this corpus revision — needs a signed-events chain
-   fixture (see "Corpus residue" below).*
+   *Exercised by the `chain/{intact, midchain_deletion, tail_truncation}`
+   groups (see "Multi-record fixture groups" below).*
 3. **Verify the SubkeyCert→write chain**: cert under the principal root,
    THEN the write under the certified sub-key; reject self-declared
-   instances. *Partially exercised: `subkey_cert/worked_cert` pins the cert
-   bytes a verifier must re-encode; the full two-link chain fixture is
-   residue.*
+   instances. *Exercised by the `subkey_chain/{valid, self_declared}`
+   groups; `subkey_cert/worked_cert` also pins the cert bytes.*
 4. **Pin suite→key.** The `suite_tag` inside the signed bytes is
    verification-ADVISORY; the enrolled key is the sole authority. Never
-   dispatch the verification algorithm off the wire tag. *Structural: the
-   corpus pins tag values 0 and 1 in the write vectors; behavior is on the
-   implementer.*
+   dispatch the verification algorithm off the wire tag. *BEHAVIORAL: the
+   corpus pins tag values 0 and 1 in the write vectors, but the
+   key-is-sole-authority rule is verifier policy, not byte-forceable.*
 5. **Resolve lineage epoch from the signed succession** for revocation
    windows and equivocation keys; return INDETERMINATE on a stale view.
-   *Behavioral; the proof vector carries the epoch field a resolver keys on.*
+   *Exercised by the `lineage/{valid, invalid_revoked, equivocation_fork}`
+   groups; INDETERMINATE is the byte-forceable equivocation fork.*
 6. **Apply the fail-closed visibility allow-list** to any surfaced set.
-   *Behavioral; not byte-exercisable from vectors alone.*
+   *BEHAVIORAL; not byte-exercisable from vectors alone.*
 7. **Verify an `EquivocationProof` self-contained and offline**, from the
    subject pubkey inside the proof alone. *Fully exercised by
    `signed/equivocation_proof_real`.*
@@ -130,6 +135,35 @@ check element `[0]` equals `domain_tag` and the outer count equals
 Report anything that cannot be checked (e.g. no Ed25519 primitive
 available) as an explicit SKIP, never a silent pass.
 
+## Multi-record fixture groups (#1837 obl. 2 / 3 / 5)
+
+Obligations 2, 3, and 5 verify a **relationship across several records** — a
+hash chain, a two-link cert→write, a lineage succession — which a single flat
+vector cannot express. These live in the manifest's `groups[]` array. Each real
+production record is emitted as its own frozen-encoder hex vector under
+`vectors/<group>/<role>.hex`; the group's **structure and expectations** live in
+the manifest (the answer-key oracle — never hidden in the frozen bytes). A
+group carries a `verdict`, an ordered `members[]` list, and an `expected` object
+the reader must reproduce EXACTLY. Each member declares its wire `grammar`:
+
+- `array-v2` — the domain-tagged positional array profile above (write / cert).
+- `lineage-succession-v1` — a canonical CBOR **map** whose domain is a *signing
+  prefix* (`agent-lineage-succession-v1\0`), not an in-body tag.
+- `signed-events-chain-v1` — the length-prefixed binary V-4 row encoding;
+  `prev_hash` is stored beside the row (in `attrs`), not inside its bytes.
+
+| group `verdict` | Procedure |
+|---|---|
+| `subkey-chain-verify` | Verify the `cert` member under the principal ROOT (its `pubkey`), then the `write` member under the cert's certified sub-key (cert element `[2]`). A group with **no `cert` member** is a self-declared instance → `expected.outcome = "reject"`, `reject_reason = "self_declared_instance"` (NOT `signature-invalid`: the write's own signature is valid; it fails on chain authorization). |
+| `lineage-resolve` | Verify each succession record under its predecessor over `LINEAGE_DOMAIN ‖ body`; resolve a THREE-valued `expected_state`: an **equivocation fork** (two successors at one `epoch` under one `predecessor_pubkey`) → `indeterminate`; a `revocation` record → `invalid-revoked`; else `valid`. `resolution_policy` fixes the indeterminate/invalid boundary so it is corpus-defined, not reader-chosen. |
+| `chain-verify` | Walk the V-4 chain: each row's `prev_hash` must equal SHA-256 of the prior row's canonical bytes and `sequence` must be consecutive (a gap + mismatch → `break_kind = "midchain-deletion"`); a surviving `MAX(sequence)` below the off-table `witness_head_sequence` watermark → `tail-truncation`; otherwise `intact` / `none`. |
+
+The manifest's top-level **`corpus_digest`** is a single SHA-256 over every
+vector + group-member record (keyed by file path, pre-image
+`path ‖ 0x00 ‖ bytes ‖ 0x00`, sorted). A reader recomputes it over the
+referenced files and MUST reject the corpus on mismatch — this binds the
+unsigned answer-key oracle to the frozen record bytes so neither can drift.
+
 ## Reference readers
 
 Both readers are deliberately minimal (a few hundred lines), dependency-free
@@ -152,6 +186,10 @@ Capability matrix:
 | Detached Ed25519 verify (valid + MUST-reject) | SKIP¹ | ✅² | ✅ |
 | Equivocation proof: divergence-key checks | ✅ | ✅ | ✅ |
 | Equivocation proof: embedded signature verify | SKIP¹ | ✅² | ✅ |
+| `corpus_digest` whole-corpus integrity anchor | ✅ | ✅ | ✅ |
+| Group resolution: chain-verify (obl. 2) | ✅ | ✅ | ✅ |
+| Group resolution: subkey-chain / lineage structure (obl. 3 / 5) | ✅ | ✅ | ✅ |
+| Group signatures: subkey-chain + lineage Ed25519 | SKIP¹ | ✅² | ✅ |
 
 ¹ CPython's stdlib has no Ed25519; this project vendors no cryptographic
 code (the sole-authority rule), so the pure-stdlib run reports signature
@@ -159,21 +197,35 @@ checks as SKIP and still enforces every structural obligation.
 ² Via the optional third-party [pyca `cryptography`](https://cryptography.io)
 package, loaded only under the explicit flag.
 
-## Corpus residue (honest scope)
+## Corpus coverage (honest scope)
 
-This corpus revision covers the v2 signed-record FORMAT family end-to-end
-(obligations 1 and 7 fully; 3 partially). A complete R24 acceptance suite
-still needs, tracked under #1837:
+This corpus covers the v2 signed-record FORMAT family end-to-end **and** the
+byte-exercisable spec-§7 obligations, via the single vectors above plus the
+multi-record `groups` (#1837):
 
-- a **signed_events V-4 chain fixture** (multi-record: intact chain, a
-  middle-deletion break, a tail truncation + witness watermark) for
-  obligation 2;
-- a **two-link SubkeyCert→write chain vector** (root key, cert, write signed
-  by the certified sub-key, plus a self-declared-instance negative) for
-  obligation 3;
-- **lineage succession vectors** (epoch walk, a revocation record, a
-  stale-view INDETERMINATE case) for obligation 5;
-- an **L1/L2/L3 export-envelope round-trip fixture** (a small NDJSON/JSON
-  export with signed classes) for Portability v2 §V2-5's data-plane half.
+- **Obligations 1 + 7** — re-encode-never-decode-and-trust and the offline
+  equivocation proof — fully exercised by the single vectors.
+- **Obligation 2** — the V-4 audit chain — the `chain/{intact,
+  midchain_deletion, tail_truncation}` groups.
+- **Obligation 3** — the SubkeyCert→write chain, incl. the self-declared
+  negative — the `subkey_chain/{valid, self_declared}` groups.
+- **Obligation 5** — lineage epoch / revocation / INDETERMINATE — the
+  `lineage/{valid, invalid_revoked, equivocation_fork}` groups.
 
-None of these change frozen bytes — they extend the corpus additively.
+**Obligations 4 and 6 remain BEHAVIORAL — not vector-forceable.** Obligation 4
+(pin suite→key: the enrolled key is the sole authority, the wire `suite_tag` is
+advisory) and obligation 6 (apply the fail-closed visibility allow-list to any
+surfaced set) are verifier-runtime policies, not properties of a static record.
+A corpus of bytes cannot force them; they are the implementer's contract.
+
+**Remaining residue** — one fixture, tracked under **#1944** (v1.x):
+
+- an **L1/L2/L3 export-envelope round-trip fixture** for Portability v2 §V2-5's
+  data-plane half. The envelope FORMAT is frozen (PORTABILITY-V2 §V2-4, schema
+  v80), but the v2-envelope PRODUCER (`ai-memory export`'s portability path) is
+  deferred to v1.x under #1944 — `ai-memory export` today is a memories+links
+  convenience view, not the portability exporter — so this fixture cannot be
+  encoder-generated under the same drift-gated discipline as its siblings until
+  that producer lands. It is intentionally NOT hand-authored.
+
+All groups are additive — they change no frozen bytes.

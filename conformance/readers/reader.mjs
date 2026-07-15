@@ -213,6 +213,170 @@ async function checkEquivocation(value, headDomain) {
     throw new ProfileError("same head hash — agreement, not equivocation");
 }
 
+// --- multi-record fixture groups (#1837 obl.2/3/5) --------------------------
+//
+// A group's structure + expectations live in manifest.json (the answer-key
+// oracle), never in the frozen bytes. Walk the ordered members, run the group's
+// verify procedure per its `grammar`/`verdict`, and EXACT-match the `expected`
+// object. Node >= 19 has WebCrypto Ed25519 + SHA-256, so no check is skipped.
+
+// LINEAGE_DOMAIN signing prefix (src/identity/sign.rs) — a signing-input prefix,
+// not an in-body tag; the lineage grammar is a canonical CBOR map.
+const LINEAGE_DOMAIN = Uint8Array.from([
+  ...new TextEncoder().encode("agent-lineage-succession-v1"),
+  0,
+]);
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function memberBytes(corpus, member) {
+  return hexToBytes(readFileSync(join(corpus, member.file), "utf-8"));
+}
+
+/** Obligation 3 — cert under principal ROOT, then write under the certified
+ * sub-key; a write with no root-signed cert is self-declared -> reject. */
+async function checkSubkeyChain(group, corpus) {
+  const members = Object.fromEntries(group.members.map((m) => [m.role, m]));
+  const expected = group.expected;
+  const raws = {};
+  for (const m of group.members) {
+    const raw = memberBytes(corpus, m);
+    const value = decode(raw);
+    if (!bytesEqual(encode(value), raw))
+      throw new ProfileError(`member ${m.role} re-encode differs from original`);
+    raws[m.role] = { raw, value };
+  }
+  let outcome;
+  let reason;
+  if (!("cert" in members)) {
+    outcome = "reject";
+    reason = "self_declared_instance";
+  } else {
+    const { cert, write } = members;
+    if (!(await ed25519Verify(hexToBytes(cert.pubkey), hexToBytes(cert.signature), raws.cert.raw)))
+      throw new ProfileError("cert signature does not verify under the principal root");
+    const certifiedSubkey = raws.cert.value[2]; // element [2] = instance_key_id
+    if (!(certifiedSubkey instanceof Uint8Array) || certifiedSubkey.length !== 32)
+      throw new ProfileError("cert instance_key_id is not 32 raw bytes");
+    if (!(await ed25519Verify(certifiedSubkey, hexToBytes(write.signature), raws.write.raw)))
+      throw new ProfileError("write signature does not verify under the certified sub-key");
+    outcome = "valid";
+    reason = undefined;
+  }
+  if (outcome !== expected.outcome || (reason ?? null) !== (expected.reject_reason ?? null))
+    throw new ProfileError(
+      `resolved (outcome=${outcome}, reject_reason=${reason}) != expected ${JSON.stringify(expected)}`,
+    );
+}
+
+/** Obligation 5 — verify each succession record under its predecessor over
+ * LINEAGE_DOMAIN || body, then resolve the three-valued state. */
+async function checkLineage(group, corpus) {
+  for (const m of group.members) {
+    const body = memberBytes(corpus, m);
+    const ok = await ed25519Verify(
+      hexToBytes(m.pubkey),
+      hexToBytes(m.signature),
+      concatBytes(LINEAGE_DOMAIN, body),
+    );
+    if (!ok) throw new ProfileError(`lineage record ${m.role} signature does not verify`);
+  }
+  const forks = new Map();
+  for (const m of group.members) {
+    const key = `${m.epoch}|${m.predecessor_pubkey}`;
+    if (!forks.has(key)) forks.set(key, new Set());
+    forks.get(key).add(m.successor_pubkey);
+  }
+  let state;
+  if ([...forks.values()].some((s) => s.size > 1)) state = "indeterminate";
+  else if (group.members.some((m) => m.reason === "revocation")) state = "invalid-revoked";
+  else state = "valid";
+  if (state !== group.expected.expected_state)
+    throw new ProfileError(
+      `resolved state ${state} != expected ${group.expected.expected_state}`,
+    );
+}
+
+/** Obligation 2 — walk the V-4 hash chain: prev_hash == SHA-256(prior row's
+ * canonical bytes) + consecutive sequence; a surviving MAX(sequence) below the
+ * witness watermark is a tail truncation. */
+async function checkChain(group, corpus) {
+  const bodies = group.members.map((m) => memberBytes(corpus, m));
+  const seqs = group.members.map((m) => m.sequence);
+  const expected = group.expected;
+  let linkBroken = false;
+  let gap = false;
+  for (let i = 1; i < group.members.length; i += 1) {
+    if (seqs[i] !== seqs[i - 1] + 1) gap = true;
+    if (group.members[i].prev_hash !== (await sha256Hex(bodies[i - 1]))) linkBroken = true;
+  }
+  let outcome;
+  let breakKind;
+  if (linkBroken || gap) {
+    outcome = "broken";
+    breakKind = "midchain-deletion";
+  } else if (
+    expected.witness_head_sequence !== undefined &&
+    Math.max(...seqs) < expected.witness_head_sequence
+  ) {
+    outcome = "broken";
+    breakKind = "tail-truncation";
+  } else {
+    outcome = "intact";
+    breakKind = "none";
+  }
+  if (outcome !== expected.outcome || breakKind !== expected.break_kind)
+    throw new ProfileError(
+      `resolved (outcome=${outcome}, break_kind=${breakKind}) != expected ${JSON.stringify(expected)}`,
+    );
+}
+
+const GROUP_CHECKS = {
+  "subkey-chain-verify": checkSubkeyChain,
+  "lineage-resolve": checkLineage,
+  "chain-verify": checkChain,
+};
+
+/** Recompute the whole-corpus SHA-256 anchor over every referenced record file
+ * and assert it equals the manifest's `corpus_digest`, so the answer-key oracle
+ * cannot drift from the frozen record bytes. */
+async function checkCorpusDigest(manifest, corpus) {
+  const items = [];
+  for (const entry of manifest.vectors)
+    items.push([entry.file, hexToBytes(readFileSync(join(corpus, entry.file), "utf-8"))]);
+  for (const group of manifest.groups ?? [])
+    for (const m of group.members)
+      items.push([m.file, hexToBytes(readFileSync(join(corpus, m.file), "utf-8"))]);
+  items.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const parts = [];
+  const zero = new Uint8Array([0]);
+  for (const [path, data] of items) {
+    parts.push(new TextEncoder().encode(path), zero, data, zero);
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    buf.set(p, off);
+    off += p.length;
+  }
+  const got = Array.from(new Uint8Array(await subtle.digest("SHA-256", buf)), (b) =>
+    b.toString(16).padStart(2, "0"),
+  ).join("");
+  if (got !== manifest.corpus_digest)
+    throw new ProfileError(`corpus_digest mismatch: computed ${got}, manifest ${manifest.corpus_digest}`);
+}
+
 // --- main ---------------------------------------------------------------------
 
 async function main() {
@@ -231,6 +395,14 @@ async function main() {
   const manifest = JSON.parse(readFileSync(join(corpus, "manifest.json"), "utf-8"));
   const headDomain = manifest.domain_tags.peer_head_attestation;
   let failed = 0;
+
+  try {
+    await checkCorpusDigest(manifest, corpus);
+    console.log("PASS corpus_digest [integrity-anchor]");
+  } catch (err) {
+    console.log(`FAIL corpus_digest: ${err.message}`);
+    failed += 1;
+  }
 
   for (const entry of manifest.vectors) {
     try {
@@ -279,8 +451,21 @@ async function main() {
     }
   }
 
-  const total = manifest.vectors.length;
-  console.log(`\n${total - failed}/${total} vectors passed${failed === 0 ? "" : " (FAILURES)"}`);
+  const groups = manifest.groups ?? [];
+  for (const group of groups) {
+    try {
+      const check = GROUP_CHECKS[group.verdict];
+      if (!check) throw new ProfileError(`unknown group verdict ${group.verdict}`);
+      await check(group, corpus);
+      console.log(`PASS ${group.name} [${group.verdict}]`);
+    } catch (err) {
+      console.log(`FAIL ${group.name}: ${err.message}`);
+      failed += 1;
+    }
+  }
+
+  const total = manifest.vectors.length + groups.length + 1; // + corpus_digest anchor
+  console.log(`\n${total - failed}/${total} items passed${failed === 0 ? "" : " (FAILURES)"}`);
   return failed === 0 ? 0 : 1;
 }
 

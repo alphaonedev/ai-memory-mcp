@@ -718,7 +718,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-12 (#1831 G17): the v81 migrate arm + the guardian_set_id /
     // recovery_threshold columns threaded through the lineage INSERT + read
     // land postgres.rs at 26_503; ceiling 26_600 (+97).
-    ("src/store/postgres.rs", 26_600),
+    // 2026-07-14 (#2028): the decorrelation write-gate twin now scans the
+    // attested-CANDIDATE set (uncapped COUNT(*) + marker-scoped query) to fix
+    // the enforce-bypass; +~30 lines land postgres.rs at 26_603; ceiling
+    // 26_650 (+47).
+    ("src/store/postgres.rs", 26_650),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
