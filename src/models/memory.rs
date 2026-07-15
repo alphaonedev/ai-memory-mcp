@@ -849,7 +849,28 @@ impl Tier {
         }
     }
 
+    /// The per-tier default TTL. Routes through the substrate's
+    /// [`RetentionModel`](crate::retention::RetentionModel) so the retention
+    /// posture is resolved in ONE place (TRACT-gap G15, #1829): the discrete
+    /// per-tier values live in [`Tier::discrete_ttl_secs`], and this delegates
+    /// via the model. Byte-identical to the pre-#1829 direct match — the
+    /// `RetentionModel::DiscreteTtlTiers` arm returns exactly these values — so
+    /// every eviction/TTL-floor caller is unchanged, but the model now has a
+    /// real live consumer (this, the most-called TTL function) rather than
+    /// being an inert anchor.
+    #[must_use]
     pub fn default_ttl_secs(&self) -> Option<i64> {
+        crate::retention::RetentionModel::current().ttl_secs_for(self)
+    }
+
+    /// The raw per-tier TTL under the CURRENT discrete-tier retention model
+    /// (Short 6h / Mid 7d / Long permanent). The canonical value source; callers
+    /// go through [`Tier::default_ttl_secs`] (which routes via
+    /// [`RetentionModel`](crate::retention::RetentionModel)). Kept separate so a
+    /// future continuous cost-of-access model (G15) adds a `RetentionModel`
+    /// variant + its own resolution WITHOUT rewriting these baseline values.
+    #[must_use]
+    pub fn discrete_ttl_secs(&self) -> Option<i64> {
         match self {
             Self::Short => Some(6 * crate::SECS_PER_HOUR),
             Self::Mid => Some(crate::SECS_PER_WEEK),

@@ -300,6 +300,71 @@ a vetted erasure crate (e.g. `reed-solomon-simd`) requires operator sign-off
 construction-independent acceptance invariant for whichever path is authorized:
 **any k-of-n shards reconstruct the original bytes exactly.**
 
+## 10. Retention — discrete TTL tiers, not a cost-of-access gradient (G15, #1829)
+
+TRACT L2 wants retention to be a **continuous cost-of-access (Landauer)
+gradient** — a single cost that scales with archival depth/age and GOVERNS
+eviction, replacing discrete tiers. The substrate's retention/eviction is a
+**discrete 3-tier TTL** model. The executable anchor is `crate::retention`.
+
+> **"Landauer" here is a METAPHOR** (recall/retention should get *more expensive
+> with depth/age*), NOT a literal `kT ln 2` thermodynamic model — the substrate
+> implements no energy accounting, and §10 does not claim one.
+
+### 10.1 Honest current state — do NOT claim "no gradient exists"
+
+The eviction DECISION is discrete: a row's lifetime is `created_at +
+Tier::default_ttl_secs()` (Short 6h / Mid 7d / Long permanent), and GC evicts on
+expiry. That discreteness is the real gap. **But the substrate already has FOUR
+partial age/access-gradient surfaces** — omitting them would be an
+overclaim-by-omission (the inverse of §9's "glib label" trap). None GOVERNS
+eviction; they are unbundled and serve different purposes:
+
+| # | Surface | What it is | Symbol |
+|---|---|---|---|
+| 1 | **Recall ranking** | recency + capped access-count + tier bonus tilt *ordering* toward fresh/hot rows | the FTS score `+ MIN(access_count,50)*0.1 + … + recency_factor + tier_bonus` (`storage::mod`) |
+| 2 | **TTL floor-extend on access** | an access raises `expires_at` by a per-tier floor — frequently-recalled rows live longer | `SHORT_TTL_EXTEND_SECS` / `MID_TTL_EXTEND_SECS` (`models::mod`), #1596 |
+| 3 | **Confidence decay on touch** | a memory's `confidence` decays with age on recall touch | `crate::confidence::decay`, `ConfidenceSource::Decayed` |
+| 4 | **Access-count promotion** | mid→long auto-promotion at 5 accesses; priority increments every 10 | recall-pipeline touch ops |
+
+### 10.2 The true gap (localized)
+
+There is **no single continuous cost that REPLACES discrete-tier eviction**. The
+four surfaces above are *ranking / retention-extend / decay / promotion* signals,
+each a different shape and unit; **none is an eviction-governing cost**, and they
+are not unified. TRACT L2 wants one continuous cost-of-access function that
+subsumes them and decides retention on a gradient rather than a 3-way tier cliff.
+
+### 10.3 The forcing-function anchor
+
+`crate::retention::RetentionModel` is a `#[non_exhaustive]` enum with the single
+posture `DiscreteTtlTiers` and **no `CostOfAccessGradient` variant** — the absent
+variant IS the machine-checked gap. It is **not** a floating anchor:
+`Tier::default_ttl_secs` (the most-called TTL function — every eviction /
+TTL-floor / archival / config-seed path) delegates through
+`RetentionModel::current().ttl_secs_for(tier)`, so the enum has a real live
+consumer on the hot path. The `ttl_secs_for` / `label` / `is_cost_of_access_gradient`
+matches are exhaustive + wildcard-free, so adding a gradient variant hard-breaks
+the build until it is consciously resolved AND this ledger is updated. The wiring
+is provably byte-identical (the `DiscreteTtlTiers` arm returns exactly
+`Tier::discrete_ttl_secs`) — pinned by
+`retention::tests::model_ttl_matches_raw_discrete_values_for_every_tier` — so no
+eviction behavior changed.
+
+**No cost function ships** — not a GA `access_cost()` metric (an arbitrary,
+consumer-less curve would freeze false-precision numbers via Hyrum's Law and
+mint a fifth partial signal), not a test-only reference curve (property tests
+over an unconsumed self-defined function are a tautology). The #1829 5-agent
+vote `4d3ea1c5` rejected both.
+
+### 10.4 v1.x migration (deferred, 1:1 issue)
+
+A unified continuous cost-of-access model that GOVERNS eviction (subsuming the
+four surfaces above) is v1.x, tracked 1:1 as **#2066**. Construction-independent acceptance
+criteria for the eventual cost: **monotonically non-decreasing in age/archival
+depth, non-increasing in recent access, and consistent with the current tier
+ordering (cost `long < mid < short`).**
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except

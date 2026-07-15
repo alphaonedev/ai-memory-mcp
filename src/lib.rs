@@ -707,7 +707,10 @@ pub mod quotas;
 // `recover_from_transcript` handler in this module.
 pub mod recover;
 pub mod replication;
+// v1.0.0 #1829 (TRACT-gap G15) — retention-model anchor (discrete TTL tiers; no
+// cost-of-access gradient). `Tier::default_ttl_secs` routes through it.
 pub mod reranker;
+pub mod retention;
 pub mod revisions;
 pub mod secret_screen;
 // v1.0.0 #1961 (R23/R7) — the `asi-hard` hardened, no-disable security posture.
