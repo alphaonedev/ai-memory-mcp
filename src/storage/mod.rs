@@ -21751,6 +21751,142 @@ mod tests {
         assert_eq!(resolved.core.write, crate::models::GovernanceLevel::Owner);
     }
 
+    // ---- #1863 (TRACT-gap G10.3) promotion-court characterization ----------
+    //
+    // These pin the HONEST current state documented in contract §13: the
+    // `promote` GovernanceLevel governs CALLER-initiated promotion only; the
+    // access-count auto-promote in the fold MAINTENANCE verb is court-blind
+    // (maintenance-exempt, like substrate eviction), and `long` durability is
+    // ALSO reachable via the WRITE lane (gated by `write`, not `promote`). A
+    // future v1.x opt-in to suppress maintenance auto-promote in
+    // adjudicated-permanence namespaces would flip test 1's assertion —
+    // deliberately failing it so the behavior change is a conscious edit here +
+    // a §13 ledger update.
+
+    /// Insert a namespace standard with `promote: Owner` (a configured court)
+    /// but `write: Any` (the write lane open) and return the fresh conn.
+    fn court_ns_conn(ns: &str) -> Connection {
+        use crate::models::{ApproverType, CorePolicy, GovernanceLevel, GovernancePolicy};
+        let conn = test_db();
+        let policy = GovernancePolicy {
+            core: CorePolicy {
+                write: GovernanceLevel::Any,
+                promote: GovernanceLevel::Owner,
+                delete: GovernanceLevel::Owner,
+                approver: ApproverType::Human,
+                inherit: true,
+                max_reflection_depth: None,
+                required_scope: None,
+            },
+            ..Default::default()
+        };
+        let mut standard = make_memory("g10-3-std", &format!("_standards-{ns}"), Tier::Long, 9);
+        standard.metadata = serde_json::json!({"governance": policy});
+        let sid = insert(&conn, &standard).unwrap();
+        set_namespace_standard(&conn, ns, &sid, None).unwrap();
+        conn
+    }
+
+    /// Test 1 — the access-count auto-promote (fold/touch MAINTENANCE verb) is
+    /// COURT-BLIND: a `mid` row in a `promote: Owner` namespace still flips to
+    /// `long` at `PROMOTION_THRESHOLD`, because the fold is callerless frecency
+    /// bookkeeping and never consults the promote court.
+    #[test]
+    fn g10_3_access_count_auto_promote_is_court_blind() {
+        let ns = "g10-3/court";
+        let conn = court_ns_conn(ns);
+        let mut m = make_memory("hot", ns, Tier::Mid, 5);
+        m.access_count = PROMOTION_THRESHOLD - 1;
+        let id = insert(&conn, &m).unwrap();
+        // Drive the maintenance auto-promote (one bump crosses the threshold).
+        touch(
+            &conn,
+            &id,
+            crate::models::SHORT_TTL_EXTEND_SECS,
+            crate::models::MID_TTL_EXTEND_SECS,
+        )
+        .unwrap();
+        let tier: String = conn
+            .query_row(
+                "SELECT tier FROM memories WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tier, "long",
+            "access-count auto-promote is maintenance-exempt / court-blind (G10.3 §13); \
+             a v1.x suppress-in-adjudicated-namespaces opt-in would keep it 'mid'"
+        );
+    }
+
+    /// Test 2 — CALLER-initiated promotion IS court-gated: `enforce_governance`
+    /// with `GovernedAction::Promote` against the `promote: Owner` namespace by
+    /// a non-owner is denied. (Contrast test 1 — same namespace, different lane.)
+    #[test]
+    fn g10_3_caller_promote_is_court_gated() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+        let ns = "g10-3/court-promote";
+        let conn = court_ns_conn(ns);
+        let decision = enforce_governance(
+            &conn,
+            GovernedAction::Promote,
+            ns,
+            "ai:not-the-owner",
+            None,
+            None,
+            &serde_json::json!({"title": "x"}),
+            None,
+        )
+        .expect("enforce_governance must not error");
+        assert!(
+            matches!(decision, GovernanceDecision::Deny(_)),
+            "caller-initiated promote IS court-gated (promote: Owner) — got {decision:?}"
+        );
+    }
+
+    /// Test 3 — the DIRECT `tier=long` WRITE lane uses the `write` level, NOT
+    /// `promote`: a store into the `promote: Owner` (but `write: Any`) namespace
+    /// is Allowed, so `long` durability is reachable WITHOUT the promote court.
+    /// This is why "no `long` past a configured court" is not achievable by
+    /// gating the auto-promote lane alone (§13).
+    #[test]
+    fn g10_3_direct_long_write_uses_write_level_not_promote() {
+        use crate::config::{
+            PermissionsMode, lock_permissions_mode_for_test,
+            override_active_permissions_mode_for_test,
+        };
+        use crate::models::{GovernanceDecision, GovernedAction};
+        let _gate = lock_permissions_mode_for_test();
+        override_active_permissions_mode_for_test(PermissionsMode::Enforce);
+
+        let ns = "g10-3/court-write";
+        let conn = court_ns_conn(ns);
+        let decision = enforce_governance(
+            &conn,
+            GovernedAction::Store,
+            ns,
+            "ai:anyone",
+            None,
+            None,
+            &serde_json::json!({"title": "x", "tier": "long"}),
+            None,
+        )
+        .expect("enforce_governance must not error");
+        assert!(
+            matches!(decision, GovernanceDecision::Allow),
+            "a tier=long store is gated by the WRITE level (Any here), NOT the promote \
+             court — long is reachable via the write lane (§13) — got {decision:?}"
+        );
+    }
+
     /// F1 regression (v0.7.0 round-2-fixes): when a parent namespace
     /// has `governance.write = owner` with `inherit: true` and a deep
     /// child has no standard of its own, the owner-level check must

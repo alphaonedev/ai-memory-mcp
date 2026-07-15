@@ -478,6 +478,59 @@ refusal is freeze-hostile:
 three-lane coverage, private owner-scoping, opt-in default-OFF, dedup/rate-limit,
 best-effort non-fatal, secret-screen, both backends) as acceptance criteria.
 
+## 13. Promotion is not fully court-gated — access-count auto-promote is maintenance (G10.3, #1863)
+
+TRACT L1 wants promotion above a configured tier to require an explicit, audited
+approval flow — "a memory reaches `long` by being adjudicated, not by being
+touched." The substrate has a promotion **court** for CALLER-initiated promotion,
+but `long` (permanent) tier is reachable by two other lanes it does not gate.
+This § pins the honest state; the machine-checks are
+`storage::tests::g10_3_*`.
+
+### 13.1 The three lanes to `long`
+
+| Lane | Mechanism | Governance |
+|---|---|---|
+| **Caller promote** | `memory_promote` (MCP/CLI) | ✅ **court-gated** — `GovernedAction::Promote` → the namespace `promote` `GovernanceLevel` (Deny at `owner`, Pending at `approve`); capability `Ask→Allow`; `pending_approve`. |
+| **Direct write** | `memory_store tier=long`, or upsert `mid→long` escalation (tier-monotonic-max) | ⚠️ gated by `GovernedAction::Store` → `policy.core.**write**`, **not** `promote`. So `long` is reachable via the write lane without the promote court. |
+| **Access-count auto-promote** | the fold "maintenance verb" (`fold_recall_accesses`) flips `mid→long` at `PROMOTION_THRESHOLD = 5` | ❌ **ungoverned** — see §13.2. |
+
+Consequence: **"no `long` past a configured court" is not achievable by gating the
+auto-promote lane alone** — an operator wanting adjudicated-only permanence must
+ALSO gate `write` (and even then access-count auto-promote applies).
+
+### 13.2 Access-count auto-promote is substrate maintenance, not an adjudicable grant
+
+The auto-promote lives in `fold_recall_accesses` — a callerless batch
+**maintenance verb** (#1869) that folds aggregated `recall_observations`
+(`GROUP BY memory_id`) with **no caller identity, no request context**. It is the
+same class as substrate eviction (`substrate:eviction`) and GC, which are
+deliberately exempt from caller-intent governance. Court-gating it is not merely
+inappropriate but **structurally un-runnable**: `enforce_governance`'s promote arm
+needs `agent_id` + `memory_owner` to adjudicate Owner/Approve, and a callerless
+fold has neither — so a court check there could only no-op or convert a retention
+function into court-gated **expiration** (a hot but unadjudicated memory GC'd).
+Gating it on the caller-intent `promote` level is a category error.
+
+### 13.3 The genuine residual (disclosed, not weaponized)
+
+Access-count is caller-**influenceable**: a principal that can recall a row
+`PROMOTION_THRESHOLD` times inflates it to permanent `long`, side-stepping a
+`promote: owner/approve` court by traffic. This is an **access-count-integrity**
+concern (partly mitigated by the #1705 recall-observations identity binding), NOT
+a promote-court concern — the honest fix is not to mis-apply the caller gate to a
+maintenance job.
+
+### 13.4 v1.x migration (deferred, 1:1 issue)
+
+Adjudicated-only permanence is v1.x, tracked as **#2072**: an opt-in, default-OFF
+posture that (a) **suppresses** maintenance auto-promote in adjudicated-permanence
+namespaces (keeping the row `mid` **with an expiry-hold** so it is not silently
+GC'd), (b) **routes the direct `tier=long` write lane** to the promote court, and
+(c) reaches both backends (the postgres set-based fold CTE needs a
+court-namespace exclusion-set bind mirroring `build_namespace_chain`), behind a
+flag + WARN cycle. **Not** court-gating the callerless fold.
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except
