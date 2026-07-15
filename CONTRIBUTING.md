@@ -79,10 +79,13 @@ scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BL
 
 ## Per-module coverage discipline (v0.7.0 forward)
 
-ai-memory enforces **per-module line coverage thresholds** in CI, on top
-of the workspace-wide absolute floor and ratchet that the `Code Coverage`
-job in `ci.yml` already enforces. The per-module gate is the
+ai-memory enforces **per-module line coverage thresholds** in CI, plus a
+workspace-wide global line floor — both owned by the single
 `Per-Module Coverage Thresholds` workflow (`.github/workflows/coverage.yml`).
+The global floor is `coverage/thresholds.toml` `[global].min_line_coverage`
+(>= 90%). (Before #1993 the workspace floor lived in a separate `Code
+Coverage` job in `ci.yml`; that job was removed because it duplicated this
+gate and timed out mid-generation.)
 
 - Thresholds are defined in [`coverage/thresholds.toml`](coverage/thresholds.toml).
 - Thresholds **rise across releases; never fall.** If a module's threshold
@@ -120,7 +123,7 @@ bash coverage/check-thresholds.sh
 
 ## CI infrastructure (v0.7.x — #1148)
 
-The `Code Coverage`, `Per-Module Coverage Thresholds`, and
+The `Per-Module Coverage Thresholds` and
 `Postgres feature gate` jobs run on GitHub-hosted `ubuntu-latest`
 (7 GB RAM + 14 GB swap). Without belt-and-suspenders these workloads
 hit `collect2: signal 7 [Bus error]` linker-OOM under the
@@ -152,7 +155,8 @@ landed a 12-layer mitigation stack you inherit automatically:
 - **`concurrency: cancel-in-progress`** group on both `ci.yml`
   and `coverage.yml` so force-push during PR iteration cancels
   the stale run and frees the runner pool.
-- **`--test-threads=1`** on the Code Coverage job (was 2) caps
+- **`--test-threads=1`** on the `Per-Module Coverage Thresholds` job
+  serialises the sal-postgres suite (shared test DB) and caps
   memory-parallel test execution under the trimmed profile.
 
 If you fork the repo and run CI on your own GitHub-hosted runners,
