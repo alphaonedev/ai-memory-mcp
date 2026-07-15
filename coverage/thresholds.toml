@@ -61,10 +61,12 @@
 # `init-age.sql`-equivalent step ensures both pgvector AND apache/age
 # extensions are loaded before cargo-llvm-cov runs.
 #
-# The `Code Coverage` job in .github/workflows/ci.yml runs a different
-# feature set (`--features sal` only) and has its own absolute floor
-# (90%) plus ratchet against `.coverage-baseline` (93.13). That job is
-# unaffected by this gate.
+# This `min_line_coverage` IS the workspace-total absolute floor (#1993):
+# the redundant `Code Coverage` job in .github/workflows/ci.yml — which
+# used to enforce its own absolute floor + `.coverage-baseline` ratchet on
+# the `--features sal`-only total — was removed because it timed out and
+# duplicated this gate. `coverage.yml` now owns the global floor here plus
+# every per-module floor, measured over `--features sal,sal-postgres`.
 min_line_coverage = 90.0
 
 [modules]
