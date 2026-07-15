@@ -238,6 +238,7 @@ pub async fn verify_link_handler(
     {
         let _ = app;
         let _ = body;
+        let _ = &headers; // #2032 LM3: consumed only by the sal branch's caller-partition resolve
         (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({"error": "verify_link requires --features sal"})),
