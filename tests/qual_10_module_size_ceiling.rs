@@ -1032,7 +1032,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-15 (#2032 M2): the store_url_from_file lax-perms + the
     // allow_plaintext_nonloopback / require_tls bind-guard resolver stubs land
     // daemon_runtime.rs at 10_118; ceiling 10_200 (+82).
-    ("src/daemon_runtime.rs", 10_200), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
+    // 2026-07-15 (#2032 tranche 3, M2): wiring the `tls_bind_guard` (pure
+    // consuming guard + doc + 5 unit tests) into `bootstrap_serve` lands
+    // daemon_runtime.rs at 10_265; ceiling 10_200 → 10_400 (+135 headroom).
+    ("src/daemon_runtime.rs", 10_400), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
