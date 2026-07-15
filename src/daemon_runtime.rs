@@ -5180,6 +5180,46 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — boot-seed the
+    // per-agent api-key principal map ONCE + resolve the identity-binding
+    // posture. ONE `Arc` is shared (cloned) into BOTH `AppState` (the gates
+    // re-derive the caller's AuthLevel from it) and `ApiKeyState` (the
+    // middleware accepts + binds per-agent keys), so both surfaces observe the
+    // same enrolled set. Pure in-memory afterwards — no per-request DB hit on
+    // the hot path (respects the #2032 M3/L2 expensive-verify DoS layering).
+    let http_identity_mode = crate::config::http_attested_identity_mode();
+    let enrolled_agent_keys: std::sync::Arc<std::collections::HashMap<String, String>> = {
+        #[cfg(feature = "sal")]
+        {
+            match store_handle.list_agent_api_keys().await {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let guard = db_state.lock().await;
+            match crate::db::list_agent_api_keys(&guard.0) {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+    };
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
@@ -5277,6 +5317,8 @@ pub async fn bootstrap_serve(
         // federation-sync handlers. Falls back to the compiled
         // `MAX_BULK_SIZE` default when unset.
         max_page_size: app_config.resolve_limits().max_page_size,
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        http_identity_mode,
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -5401,6 +5443,9 @@ pub async fn bootstrap_serve(
         // than installed as a known-empty, attacker-suppliable shared secret.
         key: normalized_api_key,
         mtls_enforced,
+        // #2044 — SAME shared `Arc` + posture as `AppState` (loaded above).
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        identity_mode: http_identity_mode,
     };
     if api_key_state.key.is_some() {
         if mtls_enforced {
@@ -6791,6 +6836,8 @@ mod tests {
             resolved_models: Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            http_identity_mode: crate::config::HttpIdentityMode::default(),
         }
     }
 
@@ -6913,6 +6960,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -6935,6 +6983,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // /metrics
         let r1 = build_router(app_state.clone(), api_key_state.clone())
@@ -6969,6 +7018,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -6993,6 +7043,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7015,6 +7066,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -8483,6 +8535,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // Pick a free port via a transient bind.
         let port = {
@@ -8532,6 +8585,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // 0.0.0.0:0 succeeds; we want a guaranteed failure. Bind to
         // port 1 which requires privileged perms — except on macOS in
@@ -8863,6 +8917,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // POST /api/v1/sync/push with empty body — the api_key_auth
@@ -8902,6 +8957,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // GET /api/v1/memories without x-api-key — bypass is scoped to
@@ -8933,6 +8989,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -8964,6 +9021,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router

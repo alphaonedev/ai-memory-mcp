@@ -82,6 +82,8 @@ fn build_state() -> (AppState, NamedTempFile) {
         resolved_models: Arc::new(ai_memory::config::ResolvedModels::default()),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (state, f)
 }

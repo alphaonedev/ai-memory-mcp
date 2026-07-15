@@ -1246,6 +1246,49 @@ pub trait MemoryStore: Send + Sync {
         Ok(None)
     }
 
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
+    /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
+    /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB
+    /// cannot leak the bearer secret. Re-binding the same digest updates the
+    /// mapping (idempotent enrollment). This is the server-held secret the
+    /// HTTP `X-Agent-Id` principal binds against.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors `bind_agent_pubkey`) so
+    /// an adapter without key provisioning fails loudly rather than silently
+    /// dropping a binding an operator believes is enrolled.
+    async fn bind_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _token_sha256: &str,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "BIND_AGENT_API_KEY".to_string(),
+        })
+    }
+
+    /// #2044 — resolve the `agent_id` bound to a per-agent api-key by its
+    /// `sha256(token)` digest, if any. `Ok(None)` means the presented key is
+    /// not an enrolled per-agent key (e.g. the shared transport `api_key`), in
+    /// which case the caller's principal stays merely *claimed*.
+    ///
+    /// Default returns `Ok(None)`: an adapter without key provisioning behaves
+    /// as "no per-agent keys enrolled" (the inert single-operator posture).
+    async fn agent_id_for_api_key(&self, _token_sha256: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// #2044 — enumerate every enrolled per-agent api-key as
+    /// `(token_sha256, agent_id)`. Used ONCE at daemon boot to seed the
+    /// in-memory principal-binding map ([`crate::handlers::ApiKeyState`]) so the
+    /// hot-path middleware resolves principals without a per-request DB hit
+    /// (respecting the #2032 M3/L2 expensive-verify-DoS layering).
+    ///
+    /// Default returns an empty vec (no enrolled keys — inert).
+    async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Revoke the Ed25519 public key bound to `agent_id` (#626 Layer-3,
     /// Task 1.3 / C5).
     ///

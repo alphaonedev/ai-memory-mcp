@@ -435,6 +435,8 @@ fn test_app_state(db: Db) -> AppState {
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: crate::config::HttpIdentityMode::default(),
     }
 }
 
@@ -1317,6 +1319,8 @@ async fn http_bulk_create_fans_out_with_federation() {
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: crate::config::HttpIdentityMode::default(),
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
@@ -2358,6 +2362,7 @@ fn auth_app(api_key: Option<&str>) -> Router {
     let auth_state = ApiKeyState {
         key: api_key.map(String::from),
         mtls_enforced: false,
+        ..Default::default()
     };
     Router::new()
         .route("/api/v1/health", axum_get(dummy_handler))
@@ -10491,6 +10496,8 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: crate::config::HttpIdentityMode::default(),
     }
 }
 
@@ -15497,6 +15504,7 @@ fn full_router(state: Db) -> axum::Router {
         ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         },
         test_app_state(state),
     )

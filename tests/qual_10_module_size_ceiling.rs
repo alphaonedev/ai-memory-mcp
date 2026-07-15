@@ -314,7 +314,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (mint_recovery_record + prepare_recovery_challenge + append_recovery)
     // + the recovery-branch in append_lineage_record + the persisted-recovery
     // ceremony test land storage/mod.rs at 24_421; ceiling 24_500 (+79).
-    ("src/storage/mod.rs", 24_500),
+    // 2026-07-15 — #2044 (#2032-A) per-agent api-key db helpers
+    // (bind/resolve/list `agent_api_keys`) land storage/mod.rs at 24_519;
+    // ceiling 24_600 (+81).
+    ("src/storage/mod.rs", 24_600),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -725,7 +728,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-15 (#2032 security-hardening tranche): the LM1 forget-LIKE
     // escape + L4 build_find_paths self-guard + release-active assert_age_id
     // wiring land postgres.rs at 26_653; ceiling 26_750 (+97).
-    ("src/store/postgres.rs", 26_750),
+    // 2026-07-15 — #2044 (#2032-A) per-agent api-key SAL impls (migrate_v83 +
+    // bind/resolve/list `agent_api_keys` on PostgresStore) land postgres.rs at
+    // 26_781; ceiling 26_850 (+69).
+    ("src/store/postgres.rs", 26_850),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

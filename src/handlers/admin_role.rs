@@ -294,6 +294,25 @@ pub fn require_admin(
     );
 
     if admitted {
+        // #2044 (v1.0.0, #2032-A / M1 admin spoof) — an allowlisted admin NAME
+        // is admitted above only when the deployment has request authn (or the
+        // legacy header-trust escape hatch). But under a SHARED api_key that
+        // proves possession of the transport secret, NOT of the claimed admin
+        // principal — so a shared-key holder could still assert
+        // `X-Agent-Id: <admin>`. Under the `enforce` posture the admin identity
+        // must additionally be KEY-ATTESTED (a per-agent api-key bound to this
+        // admin id, schema v83); a merely-`Claimed` shared-key caller is refused.
+        // `advisory` (the default) WARNs but admits (inert when no per-agent keys
+        // are enrolled — the single-operator case).
+        if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+            &state.enrolled_agent_keys,
+            state.http_identity_mode,
+            headers,
+            &caller,
+            endpoint,
+        ) {
+            return Err(resp);
+        }
         Ok(caller)
     } else {
         Err((

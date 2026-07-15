@@ -389,6 +389,22 @@ pub struct AppState {
     /// (`offset` / `since`), not an unbounded page size — a single
     /// unbounded request would materialize the whole result set in RAM.
     pub max_page_size: usize,
+
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — the boot-seeded
+    /// per-agent api-key principal map (`sha256(token)` → `agent_id`), SHARED
+    /// (same `Arc`) with [`ApiKeyState::enrolled_agent_keys`]. The IDOR/admin
+    /// gates ([`crate::handlers::identity_binding::resolve_auth_level`]) re-derive
+    /// the caller's [`crate::handlers::identity_binding::AuthLevel`] from this
+    /// map + the presented `X-API-Key`, so the enforcement is self-contained per
+    /// gate (no extension threading through the ~20 `require_admin` callers) and
+    /// keyed to a server-held secret, never a header. Empty for a single-operator
+    /// deployment → the gates are inert.
+    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+
+    /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
+    /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`) consumed
+    /// by the IDOR/admin gates.
+    pub http_identity_mode: crate::config::HttpIdentityMode,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each
@@ -698,6 +714,20 @@ pub(crate) const BULK_FANOUT_CONCURRENCY: usize = 8;
 pub struct ApiKeyState {
     pub key: Option<String>,
     pub mtls_enforced: bool,
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — the boot-seeded
+    /// per-agent api-key principal map: `sha256(token)` (lowercase hex) →
+    /// `agent_id`. Populated ONCE at daemon boot from the `agent_api_keys`
+    /// table (schema v83) so the hot-path middleware resolves a key-derived
+    /// principal with a pure in-memory lookup — no per-request DB hit (respects
+    /// the #2032 M3/L2 expensive-verify-DoS layering: this is a map get, not a
+    /// signature verify). Empty for a single-operator deployment that enrolled
+    /// no per-agent keys → the binding logic is inert (zero WARN).
+    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+    /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
+    /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`).
+    /// Governs whether a presented per-agent key BINDS `X-Agent-Id` and whether
+    /// a self-asserted-header/key mismatch is a `403`.
+    pub identity_mode: crate::config::HttpIdentityMode,
 }
 
 /// Constant-time byte-slice equality. Doesn't short-circuit on the
@@ -767,7 +797,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The `/api/v1/health` endpoint is exempt.
 pub async fn api_key_auth(
     State(auth): State<ApiKeyState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> impl IntoResponse {
     let Some(ref expected) = auth.key else {
@@ -824,56 +854,142 @@ pub async fn api_key_auth(
         return next.run(req).await.into_response();
     }
 
-    // Check X-API-Key header
+    // #2044 — resolve the presented credential (header first, then the
+    // deprecated `?api_key=` query form). We keep the raw token so we can BOTH
+    // transport-authenticate it (constant-time) AND, when it is an ENROLLED
+    // per-agent key, derive its bound principal. `from_query` gates the
+    // once-per-process credential-in-URL deprecation WARN (#1574).
+    let mut presented: Option<String> = None;
+    let mut from_query = false;
     if let Some(header_val) = req.headers().get(crate::HEADER_API_KEY)
         && let Ok(val) = header_val.to_str()
-        && constant_time_eq(val.as_bytes(), expected.as_bytes())
     {
-        return next.run(req).await.into_response();
+        presented = Some(val.to_string());
     }
-
-    // Check ?api_key= query param (ultrareview #337: URL-decode
-    // before comparison. A key with reserved chars like `+`, `%`,
-    // `&` must be percent-encoded by the caller per RFC 3986; the
-    // previous raw-compare path silently mismatched those keys and
-    // opened an encoded-bypass surface where a key containing `%2B`
-    // would compare against `%2B` rather than `+`, producing a
-    // different trust decision depending on caller quoting.)
-    if let Some(query) = req.uri().query() {
+    if presented.is_none()
+        && let Some(query) = req.uri().query()
+    {
         for pair in query.split('&') {
             if let Some(val) = pair.strip_prefix("api_key=") {
-                let decoded = percent_decode_lossy(val);
-                if constant_time_eq(decoded.as_bytes(), expected.as_bytes()) {
-                    // v0.7.0 de-silencing: a credential in the URL query
-                    // string leaks into access logs, the Referer header,
-                    // and proxy logs. Accept it (the v0.7.0 back-compat
-                    // contract) but emit a once-per-process
-                    // operator-visible warn naming the header
-                    // alternative + the deprecation intent (#1574).
-                    static QUERY_KEY_WARN_ONCE: std::sync::Once = std::sync::Once::new();
-                    QUERY_KEY_WARN_ONCE.call_once(|| {
-                        tracing::warn!(
-                            target: "http::auth",
-                            "a request authenticated via the `?api_key=` query \
-                             parameter; URL-embedded credentials leak into access \
-                             logs, Referer headers, and proxy logs. Migrate callers \
-                             to the `x-api-key` request header — the `?api_key=` \
-                             query form is DEPRECATED and will be removed in a \
-                             future release (still accepted for the v0.7.0 \
-                             back-compat contract)."
-                        );
-                    });
-                    return next.run(req).await.into_response();
-                }
+                // ultrareview #337: URL-decode before comparison. A key with
+                // reserved chars (`+`, `%`, `&`) must be percent-encoded per
+                // RFC 3986; the raw-compare path opened an encoded-bypass
+                // surface where `%2B` compared against `%2B` rather than `+`.
+                presented = Some(percent_decode_lossy(val));
+                from_query = true;
+                break;
             }
         }
     }
 
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "missing or invalid API key"})),
-    )
-        .into_response()
+    let Some(token) = presented else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response();
+    };
+
+    // Transport auth: accept the SHARED global key OR any ENROLLED per-agent
+    // key (schema v83 `agent_api_keys`, boot-seeded into `enrolled_agent_keys`).
+    // Both are server-held secrets; a per-agent key is additive + non-breaking.
+    let is_global = constant_time_eq(token.as_bytes(), expected.as_bytes());
+    let token_hash = super::identity_binding::api_key_sha256_hex(&token);
+    let per_agent: Option<String> = if is_global {
+        None
+    } else {
+        auth.enrolled_agent_keys.get(&token_hash).cloned()
+    };
+    if !is_global && per_agent.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response();
+    }
+
+    if from_query {
+        // v0.7.0 de-silencing (#1574): a credential in the URL query string
+        // leaks into access / Referer / proxy logs. Accepted (back-compat) but
+        // warned once per process.
+        static QUERY_KEY_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        QUERY_KEY_WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                target: super::HTTP_AUTH_TRACE_TARGET,
+                "a request authenticated via the `?api_key=` query parameter; \
+                 URL-embedded credentials leak into access logs, Referer headers, \
+                 and proxy logs. Migrate callers to the `x-api-key` request header \
+                 — the `?api_key=` query form is DEPRECATED and will be removed in \
+                 a future release (still accepted for the v0.7.0 back-compat \
+                 contract)."
+            );
+        });
+    }
+
+    // #2044 (#2032-A / H1 IDOR + M1 admin spoof) — per-agent-key PRINCIPAL
+    // BINDING. When the presented key is an enrolled per-agent key AND binding
+    // is not disabled, the key-derived `agent_id` is AUTHORITATIVE: it must
+    // equal the self-asserted `X-Agent-Id` header (or the header is corrected to
+    // it), so a caller can no longer act as / read another agent's data (H1) or
+    // assert a spoofed admin identity (M1). The bound principal is also injected
+    // into the request extensions so the downstream IDOR/admin gates can consume
+    // the `AuthLevel`. Keyed to a server-held secret, NEVER a header.
+    if let Some(agent_id) = per_agent
+        && auth.identity_mode != crate::config::HttpIdentityMode::Off
+    {
+        let header_id = req
+            .headers()
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(ref hid) = header_id
+            && !hid.is_empty()
+            && *hid != agent_id
+        {
+            match auth.identity_mode {
+                crate::config::HttpIdentityMode::Enforce => {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "#2044 enforce: X-Agent-Id {hid:?} does not match the \
+                         principal bound to the presented per-agent api-key \
+                         {agent_id:?}; refusing"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "identity_binding_mismatch",
+                            "message": "X-Agent-Id must match the agent bound to the \
+                                        presented per-agent api-key",
+                        })),
+                    )
+                        .into_response();
+                }
+                crate::config::HttpIdentityMode::Advisory => {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "#2044 advisory: X-Agent-Id {hid:?} does not match the \
+                         principal bound to the presented per-agent api-key \
+                         {agent_id:?}; correcting the request to the key-derived \
+                         identity (set AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=\
+                         enforce to refuse instead)"
+                    );
+                }
+                crate::config::HttpIdentityMode::Off => {}
+            }
+        }
+        // BIND: overwrite `X-Agent-Id` with the key-derived principal so every
+        // downstream handler's header-based resolution honors the attested id.
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&agent_id) {
+            req.headers_mut().insert(crate::HEADER_AGENT_ID, hv);
+        }
+        req.extensions_mut()
+            .insert(super::identity_binding::AuthenticatedPrincipal {
+                agent_id,
+                level: super::identity_binding::AuthLevel::KeyAuthenticated,
+            });
+    }
+
+    next.run(req).await.into_response()
 }
 
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {

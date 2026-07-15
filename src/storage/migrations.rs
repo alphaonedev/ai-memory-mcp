@@ -567,6 +567,14 @@ CREATE INDEX IF NOT EXISTS idx_federation_push_dlq_peer_pending
 CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
     ON federation_push_dlq(memory_id, peer_id)
     WHERE replayed_at IS NULL;
+-- v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1 IDOR + M1
+-- admin spoof). sha256(token) → agent_id; the raw token is never stored.
+CREATE TABLE IF NOT EXISTS agent_api_keys (
+    token_sha256 TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL,
+    bound_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);
 ";
 
 // v17 = v0.6.3.1 (P4, audit G1) governance.inherit backfill.
@@ -856,7 +864,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 82;
+const CURRENT_SCHEMA_VERSION: i64 = 83;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1490,6 +1498,13 @@ const MIGRATION_V81_SQLITE: &str =
 // version-stamp no-op (`migrate_v82`).
 const MIGRATION_V82_SQLITE: &str =
     include_str!("../../migrations/sqlite/0066_v82_skill_retire.sql");
+// v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1 IDOR + M1
+// admin spoof). Additive `CREATE TABLE IF NOT EXISTS agent_api_keys` +
+// index — replay-safe, no full-table rebuild (no trigger-drop hazard). A
+// fresh install ships the table via the bootstrap SCHEMA; this arm covers
+// upgrades. The postgres twin is `migrate_v83`.
+const MIGRATION_V83_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0067_v83_agent_api_keys.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3526,7 +3541,7 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             }
         }
 
-        if version < CURRENT_SCHEMA_VERSION {
+        if version < 82 {
             // v82 (#2024, v1.0.0) — operator-authorized skill retire/unretire
             // lifecycle. Additive nullable `skills` columns (`retired_at`,
             // `retired_by`, `retire_reason`). Probe `retired_at` (SQLite has
@@ -3548,6 +3563,16 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
             } else if !skill_cols.contains("retired_at") {
                 conn.execute_batch(MIGRATION_V82_SQLITE)?;
             }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1
+            // IDOR + M1 admin spoof). Additive `CREATE TABLE IF NOT EXISTS
+            // agent_api_keys` + index. Replay-safe (IF NOT EXISTS) and no
+            // full-table rebuild → no trigger-drop hazard (the v63/v65 lesson
+            // does not arise). A fresh install already ships the table via the
+            // bootstrap SCHEMA; this arm covers upgrades.
+            conn.execute_batch(MIGRATION_V83_SQLITE)?;
         }
 
         conn.execute("DELETE FROM schema_version", [])?;

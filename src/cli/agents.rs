@@ -57,6 +57,21 @@ pub enum AgentsAction {
         #[arg(long)]
         agent_id: String,
     },
+    /// v1.0.0 #2044 (#2032-A / H1 IDOR + M1 admin spoof) — enroll a per-agent
+    /// HTTP api-key so an `X-Agent-Id: <agent>` on the HTTP surface must prove
+    /// possession of THIS token (the server stores only `sha256(token)`; the
+    /// raw token is never persisted). The daemon boot-loads the enrolled set,
+    /// so RESTART the `serve` daemon after enrolling for it to take effect.
+    /// Re-binding the same token rotates the mapping in place.
+    BindApiKey {
+        /// Agent identifier the presenting caller is bound to.
+        #[arg(long)]
+        agent_id: String,
+        /// The per-agent api-key token. Callers present it as the `X-API-Key`
+        /// header; only its SHA-256 digest is stored.
+        #[arg(long)]
+        token: String,
+    },
     /// v1.0.0 crypto-core (#1942, spec §2.3) — pre-enroll a per-instance
     /// sub-key certificate from a JSON file. The cert is verified under the
     /// principal's bound root key (`bind-key` first) BEFORE it is stored, so
@@ -206,6 +221,32 @@ pub fn run_agents(
                 )?;
             } else {
                 writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
+            }
+        }
+        AgentsAction::BindApiKey { agent_id, token } => {
+            validate::validate_agent_id(&agent_id)?;
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("api-key token must not be empty");
+            }
+            let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
+            db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "bound": true,
+                        "agent_id": agent_id,
+                        "token_sha256": token_sha256,
+                    })
+                )?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "bound api-key for {agent_id} (sha256={token_sha256}); \
+                     restart `ai-memory serve` for it to take effect"
+                )?;
             }
         }
         AgentsAction::EnrollSubkeyCert { file } => {
