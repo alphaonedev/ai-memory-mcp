@@ -96,6 +96,12 @@ fn setup_router() -> axum::Router {
 /// POST `/api/v1/sync/push` with an optional `X-Peer-Id` header and an
 /// optional injected `ClientCertPeerId` extension (simulating what the
 /// peer-binding acceptor would have set on a live mTLS connection).
+///
+/// `cert_binding` deliberately distinguishes all THREE mTLS states the
+/// handler treats differently: `None` (no extension — plain HTTP / no
+/// binding map), `Some(None)` (mTLS cert with no operator binding — the
+/// never-brick legacy path), and `Some(Some(id))` (cert bound to `id`).
+#[allow(clippy::option_option)]
 async fn post_sync_push(
     router: &axum::Router,
     peer_id: Option<&str>,
