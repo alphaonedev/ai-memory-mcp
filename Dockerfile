@@ -25,6 +25,11 @@ COPY benches/ benches/
 # fails at compile time. Pre-existing Dockerfile gap that v0.6.2 did
 # not surface (no new migrations).
 COPY migrations/ migrations/
+# #2050 — the `paste` proc-macro dependency is vendored in-tree
+# (vendor/paste, path dep in Cargo.toml) after the upstream
+# alphaonedev/paste fork was deleted. The build context MUST include it
+# or `cargo build` fails: "failed to read /build/vendor/paste/Cargo.toml".
+COPY vendor/ vendor/
 
 RUN cargo build --release && strip target/release/ai-memory
 
