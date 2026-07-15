@@ -1110,7 +1110,9 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // migration, zero speculative surface.
     // 2026-07-11 (#1949 merged): v80 lineage custody/revocation sqlite arm
     // lands the file at 5_300; ceiling 5_360 (+60 headroom).
-    ("src/storage/migrations.rs", 5_360),
+    // 2026-07-15 (#2024): v82 skill retire/delete migration arm lands the
+    // file at 5_372; ceiling 5_400 (+28 headroom). Additive migration only.
+    ("src/storage/migrations.rs", 5_400),
     // llm.rs bumped 3_500 → 5_200 by FX-D2 to accommodate PERF-9
     // (36e2573a3 — `OllamaClient` blocking → async `reqwest::Client`
     // conversion) and the #1361 med/low findings batch fold-in.
