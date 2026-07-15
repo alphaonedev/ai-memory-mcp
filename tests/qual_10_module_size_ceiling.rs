@@ -722,7 +722,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // attested-CANDIDATE set (uncapped COUNT(*) + marker-scoped query) to fix
     // the enforce-bypass; +~30 lines land postgres.rs at 26_603; ceiling
     // 26_650 (+47).
-    ("src/store/postgres.rs", 26_650),
+    // 2026-07-15 (#2032 security-hardening tranche): the LM1 forget-LIKE
+    // escape + L4 build_find_paths self-guard + release-active assert_age_id
+    // wiring land postgres.rs at 26_653; ceiling 26_750 (+97).
+    ("src/store/postgres.rs", 26_750),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -864,7 +867,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // `load_capability_config` owner auto-enroll + one-shot boot note, the
     // `load_owner_issuer_config` free fn, and the two R9 regression tests
     // pushed config.rs from 12_401 to 12_614. 12_700 = 12_614 + 86 headroom.
-    ("src/config.rs", 12_700),
+    // 2026-07-15 (#2032 M3): the resolve_default_max_inflight_requests
+    // CPU-scaled tri-state default + env_tristate_usize + the M2 TLS-bind
+    // resolvers (allow_plaintext_nonloopback / require_tls) land config.rs at
+    // 12_742; ceiling 12_850 (+108).
+    ("src/config.rs", 12_850),
     // daemon_runtime.rs bumped 7_000 → 7_100 by FX-F1 to accommodate
     // the +446-line coverage closure on `apply_anonymize_default` /
     // `resolve_admin_agent_ids` / the `build_llm_client` ladder (the
@@ -1022,7 +1029,10 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // + `url_has_userinfo_password` + their #1927 adversarial tests), the #1926
     // log-redaction fix, and the #1924 HTTP pre-event enforcement-gate install
     // in `serve` landed the file at 9_854; +96 headroom.
-    ("src/daemon_runtime.rs", 10_100), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
+    // 2026-07-15 (#2032 M2): the store_url_from_file lax-perms + the
+    // allow_plaintext_nonloopback / require_tls bind-guard resolver stubs land
+    // daemon_runtime.rs at 10_118; ceiling 10_200 (+82).
+    ("src/daemon_runtime.rs", 10_200), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
