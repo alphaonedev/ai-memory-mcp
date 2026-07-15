@@ -701,31 +701,6 @@ pub struct ApiKeyState {
 }
 
 /// Constant-time byte-slice equality. Doesn't short-circuit on the
-/// Percent-decode a URL-encoded query value in place. Invalid `%XX`
-/// escapes are passed through verbatim (lossy). Ultrareview #337.
-#[inline]
-pub(crate) fn percent_decode_lossy(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let h = (bytes[i + 1] as char).to_digit(16);
-            let l = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(h), Some(l)) = (h, l) {
-                // h and l are single hex digits (0..=15), so h*16 + l
-                // is always in 0..=255. Cast is lossless.
-                out.push(u8::try_from(h * 16 + l).unwrap_or(0));
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// first mismatched byte, preventing timing-oracle leaks of secret
 /// material. Used for API-key comparison (#301 hardening item 3).
 ///
@@ -762,9 +737,16 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// Middleware: reject requests with 401 if `api_key` is configured and request
-/// doesn't provide a matching `X-API-Key` header or `?api_key=` query param.
-/// The `/api/v1/health` endpoint is exempt.
+/// Middleware: reject requests with 401 if `api_key` is configured and the
+/// request doesn't provide a matching `X-API-Key` header. The
+/// `/api/v1/health` endpoint is exempt.
+///
+/// #2032 L1 (v1.0.0) — the legacy `?api_key=` QUERY-STRING credential is NO
+/// LONGER honored. A credential in the URL query string leaks into access /
+/// proxy / Referer logs (OWASP A07/A09), so it is header-only now. The
+/// query form soaked a `?api_key=` deprecation WARN since v0.7.0 (#1574);
+/// v1.0.0 completes the deprecation. Callers MUST send the `x-api-key`
+/// request header.
 pub async fn api_key_auth(
     State(auth): State<ApiKeyState>,
     req: Request,
@@ -832,41 +814,29 @@ pub async fn api_key_auth(
         return next.run(req).await.into_response();
     }
 
-    // Check ?api_key= query param (ultrareview #337: URL-decode
-    // before comparison. A key with reserved chars like `+`, `%`,
-    // `&` must be percent-encoded by the caller per RFC 3986; the
-    // previous raw-compare path silently mismatched those keys and
-    // opened an encoded-bypass surface where a key containing `%2B`
-    // would compare against `%2B` rather than `+`, producing a
-    // different trust decision depending on caller quoting.)
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(val) = pair.strip_prefix("api_key=") {
-                let decoded = percent_decode_lossy(val);
-                if constant_time_eq(decoded.as_bytes(), expected.as_bytes()) {
-                    // v0.7.0 de-silencing: a credential in the URL query
-                    // string leaks into access logs, the Referer header,
-                    // and proxy logs. Accept it (the v0.7.0 back-compat
-                    // contract) but emit a once-per-process
-                    // operator-visible warn naming the header
-                    // alternative + the deprecation intent (#1574).
-                    static QUERY_KEY_WARN_ONCE: std::sync::Once = std::sync::Once::new();
-                    QUERY_KEY_WARN_ONCE.call_once(|| {
-                        tracing::warn!(
-                            target: "http::auth",
-                            "a request authenticated via the `?api_key=` query \
-                             parameter; URL-embedded credentials leak into access \
-                             logs, Referer headers, and proxy logs. Migrate callers \
-                             to the `x-api-key` request header — the `?api_key=` \
-                             query form is DEPRECATED and will be removed in a \
-                             future release (still accepted for the v0.7.0 \
-                             back-compat contract)."
-                        );
-                    });
-                    return next.run(req).await.into_response();
-                }
-            }
-        }
+    // #2032 L1 (v1.0.0) — the legacy `?api_key=` QUERY-STRING credential is
+    // NO LONGER accepted (header-only). URL-embedded credentials leak into
+    // access / proxy / Referer logs (OWASP A07/A09); the deprecation WARN
+    // soaked since v0.7.0 (#1574). If an api_key still rides in the query
+    // string, emit a once-per-process operator-visible WARN naming the
+    // header alternative so a stale caller's 401 is diagnosable, then fall
+    // through to the 401 below.
+    if req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|pair| pair.starts_with("api_key=")))
+    {
+        static QUERY_KEY_REJECT_WARN_ONCE: std::sync::Once = std::sync::Once::new();
+        QUERY_KEY_REJECT_WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                target: "http::auth",
+                "a request presented an `?api_key=` query parameter; the query-string \
+                 credential form was REMOVED in v1.0.0 (#2032 L1) because URL-embedded \
+                 credentials leak into access logs, Referer headers, and proxy logs. \
+                 Send the credential in the `x-api-key` request header instead — the \
+                 query form is rejected (401)."
+            );
+        });
     }
 
     (
@@ -953,22 +923,6 @@ pub async fn prometheus_metrics(State(state): State<Db>) -> impl IntoResponse {
 #[cfg(test)]
 mod transport_helpers_tests {
     use super::*;
-
-    #[test]
-    fn percent_decode_handles_typical_keys() {
-        assert_eq!(percent_decode_lossy("abc"), "abc");
-        assert_eq!(percent_decode_lossy("a%2Bb"), "a+b");
-        assert_eq!(percent_decode_lossy("hello%20world"), "hello world");
-        assert_eq!(percent_decode_lossy("%2F%3D%3F"), "/=?");
-    }
-
-    #[test]
-    fn percent_decode_passes_through_invalid_escapes() {
-        // Invalid hex digits => pass through verbatim.
-        assert_eq!(percent_decode_lossy("a%ZZb"), "a%ZZb");
-        // Truncated escape at end => verbatim.
-        assert_eq!(percent_decode_lossy("a%2"), "a%2");
-    }
 
     #[test]
     fn constant_time_eq_handles_equal_and_diff_inputs() {

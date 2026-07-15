@@ -74,6 +74,54 @@ pub struct VerifyLinkBody {
     pub verification_nonce: Option<String>,
 }
 
+/// #2032 LM3 (v1.0.0, 5-agent vote `4d3ea1c5`) — WARN-carrier for the
+/// `[verify] require_nonce` secure-default flip. The link-verify replay
+/// guard (the [`crate::identity::replay::ReplayCache`], per-caller
+/// partitioned at tranche 2) only fires when the caller PRESENTS a
+/// `verification_nonce`; with `require_nonce = false` (today's default) a
+/// caller may simply OMIT the nonce and skip replay protection entirely.
+/// A future release (v1.1.0) flips the default to `true` (fail-closed).
+///
+/// This once-per-process boot WARN gives operators the heads-up so a
+/// rollout can enroll nonces on every verify caller BEFORE the flip. It
+/// fires only when the knob is still at the permissive default — a
+/// deployment that already set `require_nonce = true` is silent (it is
+/// already on the future default). Nothing is flipped this release.
+///
+/// The pure [`verify_require_nonce_flip_notice`] carries the decision (so
+/// it is unit-testable); this wrapper adds the `Once` de-dup + emit
+/// (mirrors `federation::receive_auth::warn_fed_sig_default_flip_once`).
+pub fn warn_verify_require_nonce_default_once(require_nonce: bool) {
+    let Some(notice) = verify_require_nonce_flip_notice(require_nonce) else {
+        return;
+    };
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(target: "ai_memory::verify", "{notice}");
+    });
+}
+
+/// #2032 LM3 — pure decision half of [`warn_verify_require_nonce_default_once`].
+/// Returns `Some(notice)` when the `[verify] require_nonce` knob is still at
+/// its permissive default (`false`) and the operator should be warned about
+/// the v1.1.0 fail-closed flip; `None` when the knob is already `true` (the
+/// deployment is on the future default, so nothing to say).
+#[must_use]
+pub fn verify_require_nonce_flip_notice(require_nonce: bool) -> Option<&'static str> {
+    if require_nonce {
+        return None;
+    }
+    Some(
+        "[verify] require_nonce is at its permissive default (false): \
+         POST /api/v1/links/verify accepts requests that OMIT \
+         verification_nonce, skipping H5 anti-replay protection. A future \
+         release (v1.1.0) will FLIP this default to `true` (fail-closed, \
+         #2032 LM3). Set [verify] require_nonce = true now to enforce, and \
+         ensure every verify caller sends a fresh UUID-v4 \
+         verification_nonce before the flip.",
+    )
+}
+
 /// `POST /api/v1/links/verify` — re-verify a stored link's signature
 /// (when present) and project the resolved attest level. Wire shape:
 /// `{verified, attest_level, signature_present, observed_by, source_id,
@@ -1163,5 +1211,39 @@ pub async fn get_lineage(
                 crate::handlers::errors::handler_error_500(&e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lm3_require_nonce_carrier_tests {
+    use super::{verify_require_nonce_flip_notice, warn_verify_require_nonce_default_once};
+
+    /// #2032 LM3 — the permissive default (`require_nonce = false`) arms the
+    /// flip notice, naming the v1.1.0 fail-closed flip + the enabling knob.
+    #[test]
+    fn permissive_default_arms_flip_notice() {
+        let notice = verify_require_nonce_flip_notice(false)
+            .expect("require_nonce=false must arm the LM3 flip notice");
+        assert!(
+            notice.contains("require_nonce") && notice.contains("v1.1.0"),
+            "notice must name the knob + the flip release: {notice}"
+        );
+    }
+
+    /// A deployment already on the future default is silent (nothing to warn).
+    #[test]
+    fn strict_deployment_is_silent() {
+        assert!(
+            verify_require_nonce_flip_notice(true).is_none(),
+            "require_nonce=true is already on the future default → no notice"
+        );
+    }
+
+    /// The Once-guarded emitter is callable + idempotent in both postures.
+    #[test]
+    fn emitter_is_idempotent() {
+        warn_verify_require_nonce_default_once(false);
+        warn_verify_require_nonce_default_once(false);
+        warn_verify_require_nonce_default_once(true);
     }
 }
