@@ -105,6 +105,50 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+      # #1987 — baseline regression guard, ADVISORY (never blocks). Compares
+      # this run against the committed performance/baseline.json via the shipped
+      # `bench --baseline` CLI. It self-skips while the committed baseline is a
+      # dev-machine BOOTSTRAP (a dev-vs-ubuntu-latest compare is pure hardware
+      # noise); run the `regenerate-baseline` workflow_dispatch job to capture a
+      # real median-of-3 ubuntu-latest baseline, commit it with bootstrap:false,
+      # and this step activates. Promote to a BLOCKING gate only after a soak
+      # proves <1% false-positive across >=20 runs (ruling d6a366ea wave-2).
+      - name: Baseline regression (advisory, #1987)
+        if: always()
+        run: |
+          set +e
+          if [ ! -f performance/baseline.json ]; then
+            echo "no performance/baseline.json committed — skipping advisory compare" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BOOTSTRAP=$(python3 -c "import json;print(json.load(open('performance/baseline.json')).get('bootstrap', False))")
+          if [ "$BOOTSTRAP" != "False" ]; then
+            {
+              echo '## Baseline regression (advisory, #1987)'
+              echo 'SKIPPED — the committed `performance/baseline.json` is a dev-machine'
+              echo 'BOOTSTRAP. Run the **regenerate-baseline** workflow_dispatch job on'
+              echo 'ubuntu-latest, commit the result with `bootstrap: false`, and this'
+              echo 'advisory compare activates.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          target/release/ai-memory bench --baseline performance/baseline.json \
+            --regression-threshold 50 | tee baseline-compare.txt
+          {
+            echo '## Baseline regression (advisory, #1987)'
+            echo ''
+            echo 'ADVISORY — never fails the build. Median-of-3 baseline vs this run,'
+            echo 'threshold +50%. Promote to blocking only after a soak proves a'
+            echo '<1% false-positive rate across >=20 runs.'
+            echo ''
+            echo '```'
+            cat baseline-compare.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # ADVISORY: swallow `bench --baseline`'s non-zero regression exit so
+          # this step is never a build failure.
+          exit 0
+
       - name: Run bench (JSON for artifact)
         if: always()
         run: target/release/ai-memory bench --json > bench-results.json || true
@@ -124,3 +168,52 @@ jobs:
             bench-table.txt
             bench-table-10k.txt
           if-no-files-found: warn
+
+  # #1987 — the baseline GENERATION recipe. Operator-triggered
+  # (workflow_dispatch) so a real median-of-3 baseline is captured ON the CI
+  # runner class it will gate (never a dev machine). Uploads the result as an
+  # artifact for the operator to commit as performance/baseline.json with
+  # bootstrap:false — the workflow has contents:read and never auto-commits.
+  regenerate-baseline:
+    name: Regenerate bench baseline (ubuntu-latest, median-of-3)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin ai-memory
+
+      - name: Capture median-of-3 baseline
+        env:
+          RUNNER_BASELINE_CLASS: ubuntu-latest
+        run: |
+          for i in 1 2 3; do
+            target/release/ai-memory bench --json > "run-$i.json"
+          done
+          python3 .github/scripts/median_baseline.py "$(git rev-parse --short HEAD)" \
+            run-1.json run-2.json run-3.json > performance/baseline.json
+          {
+            echo '## Regenerated bench baseline (median-of-3, ubuntu-latest)'
+            echo ''
+            echo 'Download the `bench-baseline` artifact and commit it as'
+            echo '`performance/baseline.json` (it already carries `bootstrap: false`)'
+            echo 'to activate the advisory regression compare in the Bench workflow.'
+            echo 'Refresh every minor release.'
+            echo ''
+            echo '```json'
+            cat performance/baseline.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload regenerated baseline
+        uses: actions/upload-artifact@v5
+        with:
+          name: bench-baseline
+          path: performance/baseline.json
+          if-no-files-found: error
