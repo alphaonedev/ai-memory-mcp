@@ -435,6 +435,17 @@ pub const RETRY_BACKOFFS: &[std::time::Duration] = &[
 /// expectations.
 pub const ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// #2032 LM2 — hard ceiling on the webhook ACK response body the daemon
+/// will buffer. The K6 ACK contract is a tiny JSON envelope
+/// (`{"status":"ack","correlation_id":"..."}`), so 64 KiB is generous.
+/// Without this cap a caller-controlled endpoint could stream an
+/// unbounded body into `resp.text()` (up to `ACK_TIMEOUT` worth of
+/// bytes) across up to [`DEFAULT_WEBHOOK_DISPATCH_CONCURRENCY`]
+/// concurrent dispatches — a memory-exhaustion amplification off a
+/// caller-controlled outbound. Mirrors the `read_capped_*` discipline
+/// the LLM client already uses (`src/llm.rs`).
+pub const WEBHOOK_ACK_MAX_BYTES: usize = 64 * 1024;
+
 /// PERF-3 (fix campaign 2026-05-26, FX-10) — default upper bound on the
 /// number of webhook deliveries that may be in flight concurrently.
 ///
@@ -1407,9 +1418,34 @@ fn send(
     // K6 ACK contract: receivers MUST return
     // {"status":"ack","correlation_id":"..."}. A 2xx with a missing /
     // mismatched body is treated as failure so retries kick in.
-    let ack_body = match resp.text() {
-        Ok(s) => s,
-        Err(e) => return Err(format!("ack-read: {e}")),
+    // #2032 LM2 — bound the buffered ACK body at
+    // `WEBHOOK_ACK_MAX_BYTES`. A `Content-Length` over the cap is
+    // rejected up front; a chunked/streamed body is read through a
+    // `Take` limiter so an over-cap stream cannot exhaust memory.
+    if let Some(len) = resp.content_length() {
+        if len > WEBHOOK_ACK_MAX_BYTES as u64 {
+            return Err(format!(
+                "ack-too-large: content-length {len} exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            ));
+        }
+    }
+    let ack_body = {
+        use std::io::Read as _;
+        let mut body = String::new();
+        // Read one byte past the cap so an exactly-at-cap body still
+        // reads fully while an over-cap body is detected and rejected.
+        if let Err(e) = resp
+            .take(WEBHOOK_ACK_MAX_BYTES as u64 + 1)
+            .read_to_string(&mut body)
+        {
+            return Err(format!("ack-read: {e}"));
+        }
+        if body.len() > WEBHOOK_ACK_MAX_BYTES {
+            return Err(format!(
+                "ack-too-large: streamed body exceeds {WEBHOOK_ACK_MAX_BYTES}"
+            ));
+        }
+        body
     };
     let ack: serde_json::Value = match serde_json::from_str(&ack_body) {
         Ok(v) => v,

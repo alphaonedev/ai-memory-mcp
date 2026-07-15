@@ -403,7 +403,7 @@ fn visibility_clause(start: usize, caller_ph: usize, table_alias: &str) -> Strin
 /// `source_uri LIKE 'prefix%'` filter in [`recall`] and
 /// [`recall_hybrid_with_telemetry`] to push the `--source-uri-prefix`
 /// filter into SQL.
-fn escape_like_pattern(s: &str) -> String {
+pub(crate) fn escape_like_pattern(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -16353,6 +16353,19 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn escape_like_pattern_escapes_metacharacters_2032() {
+        // #2032 LM1 — the destructive `forget` ILIKE pattern must treat a
+        // caller-supplied `%` / `_` / `\` as LITERAL, not as a LIKE wildcard,
+        // so `forget(pattern="%")` cannot match (and delete) the whole scope.
+        assert_eq!(escape_like_pattern("%"), r"\%");
+        assert_eq!(escape_like_pattern("_"), r"\_");
+        assert_eq!(escape_like_pattern("\\"), r"\\");
+        assert_eq!(escape_like_pattern("log_2024"), r"log\_2024");
+        // Plain text is untouched.
+        assert_eq!(escape_like_pattern("hello world"), "hello world");
     }
 
     /// v1.0.0 #1831 (G17) — end-to-end persisted M-of-N key-loss recovery:

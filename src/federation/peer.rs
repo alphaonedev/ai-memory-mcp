@@ -142,7 +142,15 @@ impl FederationConfig {
             .timeout(timeout)
             .connect_timeout(Duration::from_secs(2))
             .pool_idle_timeout(FED_CLIENT_POOL_IDLE_TIMEOUT)
-            .tcp_keepalive(FED_CLIENT_TCP_KEEPALIVE);
+            .tcp_keepalive(FED_CLIENT_TCP_KEEPALIVE)
+            // #2032 L3 — refuse redirects. Peers are mTLS/pin-authenticated;
+            // reqwest's default `Policy::limited(10)` would re-resolve DNS
+            // for a 3xx `Location` host and reconnect WITHOUT re-running the
+            // server-cert pin / CA gate, so a compromised peer answering a
+            // redirect could steer the outbound to an unvalidated host. A
+            // 3xx from a federation peer is anomalous and must fail, not
+            // silently follow (mirrors the webhook client's stance).
+            .redirect(reqwest::redirect::Policy::none());
         // #1678 — outbound server-cert pinning. When the operator sets
         // `AI_MEMORY_FED_PEER_FINGERPRINTS`, install a preconfigured rustls
         // config carrying the per-SNI-host pin verifier (fail-CLOSED for any

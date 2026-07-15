@@ -4237,13 +4237,55 @@ pub const ENV_MAX_PAGE_SIZE: &str = "AI_MEMORY_MAX_PAGE_SIZE";
 /// #1733 (Pillar-4 4.A) — env override for `[limits].max_inflight_requests`,
 /// the global HTTP admission-control concurrency cap.
 pub const ENV_MAX_INFLIGHT_REQUESTS: &str = "AI_MEMORY_MAX_INFLIGHT_REQUESTS";
-/// #1733 (Pillar-4 4.A) — compiled default for the HTTP admission-control
-/// in-flight-request cap. `0` means **disabled** (the layer is not composed
-/// at all, so the daemon's concurrency behaviour is byte-identical to a
-/// build without admission control). Admission control is strictly opt-in:
-/// operators set `AI_MEMORY_MAX_INFLIGHT_REQUESTS` (or
-/// `[limits].max_inflight_requests`) to a positive cap to enable load-shedding.
+/// #1733 (Pillar-4 4.A) — the **explicit-disable sentinel** for the HTTP
+/// admission-control in-flight-request cap, and the pre-boot seed for the
+/// [`crate::max_inflight_requests`] atomic. `0` means **disabled** (the layer
+/// is not composed at all, so the daemon's concurrency behaviour is
+/// byte-identical to a build without admission control).
+///
+/// #2032 M3 (class-a, 5-agent vote `4d3ea1c5`) — this is NO LONGER the value
+/// an *unset* knob resolves to. The T3 fail-open→fail-closed flip made the
+/// resolved default for an UNSET knob the CPU-scaled
+/// [`resolve_default_max_inflight_requests`] (floor 256, ceiling 4096) so a
+/// single authenticated caller can no longer saturate the single
+/// `Arc<Mutex<Connection>>` for a DoS. An operator who genuinely wants
+/// admission control OFF now sets `AI_MEMORY_MAX_INFLIGHT_REQUESTS=0` (or
+/// `[limits].max_inflight_requests = 0`) — the tri-state resolver honours the
+/// explicit `0` as disabled, distinct from unset.
 pub const DEFAULT_MAX_INFLIGHT_REQUESTS: usize = 0;
+
+/// #2032 M3 — per-core multiplier for the CPU-scaled admission-control
+/// default. Modelled on [`crate::reranker::resolve_reranker_pool_size`]'s
+/// `available_parallelism()`-driven sizing.
+pub const MAX_INFLIGHT_PER_CORE: usize = 64;
+/// #2032 M3 — floor for the CPU-scaled admission-control default. Even a
+/// 1-core host admits at least this many concurrent in-flight requests
+/// before shedding, so the default never throttles a low-core box below a
+/// usable working set.
+pub const MAX_INFLIGHT_FLOOR: usize = 256;
+/// #2032 M3 — ceiling for the CPU-scaled admission-control default. Bounds
+/// the permit pool on very-high-core hosts so the cap stays a meaningful DoS
+/// guard rather than effectively unbounded.
+pub const MAX_INFLIGHT_CEILING: usize = 4096;
+
+/// #2032 M3 (class-a, 5-agent vote `4d3ea1c5`) — resolve the CPU-scaled
+/// admission-control default for an UNSET
+/// `AI_MEMORY_MAX_INFLIGHT_REQUESTS` / `[limits].max_inflight_requests`
+/// knob: `clamp(available_parallelism * MAX_INFLIGHT_PER_CORE,
+/// MAX_INFLIGHT_FLOOR, MAX_INFLIGHT_CEILING)`. Mirrors the
+/// `available_parallelism()`-with-clamp shape of
+/// [`crate::reranker::resolve_reranker_pool_size`]. A platform query failure
+/// (rare) falls back to a single core before the clamp, so the result is
+/// always at least `MAX_INFLIGHT_FLOOR`.
+#[must_use]
+pub fn resolve_default_max_inflight_requests() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    cores
+        .saturating_mul(MAX_INFLIGHT_PER_CORE)
+        .clamp(MAX_INFLIGHT_FLOOR, MAX_INFLIGHT_CEILING)
+}
 
 /// v0.9 #1005 (G2) — env override for `[limits].vector_index_capacity`,
 /// the in-memory vector-index residency cap (entries). Positive
@@ -8439,15 +8481,32 @@ impl AppConfig {
             .or(page_cfg)
             .unwrap_or(crate::handlers::MAX_BULK_SIZE);
 
-        // #1733 (Pillar-4 4.A) — admission-control cap. `env_pos_usize`
-        // filters `> 0`, so a `0` / negative / garbage env or config value
-        // falls through to the compiled default (`0` = disabled), keeping
-        // admission control strictly opt-in.
-        let inflight_env = env_pos_usize(ENV_MAX_INFLIGHT_REQUESTS);
-        let inflight_cfg = cfg.and_then(|l| l.max_inflight_requests).filter(|n| *n > 0);
+        // #1733 (Pillar-4 4.A) + #2032 M3 (class-a, 5-agent vote `4d3ea1c5`)
+        // — admission-control cap, resolved **TRI-STATE** so an explicit
+        // disable survives the T3 fail-open→fail-closed flip. Unlike the
+        // `env_pos_usize` / `> 0`-filter ladder the other `[limits]` knobs
+        // use (where `0` and unset both collapse to the compiled default),
+        // this knob distinguishes:
+        //   * `Some(0)`  — operator EXPLICITLY disabled admission control
+        //                  (`AI_MEMORY_MAX_INFLIGHT_REQUESTS=0` OR
+        //                  `[limits].max_inflight_requests = 0`);
+        //   * `Some(n)`  — that exact positive cap;
+        //   * `None`     — UNSET / unparseable → the CPU-scaled default
+        //                  (`resolve_default_max_inflight_requests`), so a
+        //                  single authenticated caller can no longer
+        //                  saturate the `Arc<Mutex<Connection>>` for a DoS.
+        // `env_tristate_usize` parses `0` as `Some(0)` and only maps an
+        // absent / unparseable value to `None`; env still beats config.
+        fn env_tristate_usize(name: &str) -> Option<usize> {
+            std::env::var(name)
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+        }
+        let inflight_env = env_tristate_usize(ENV_MAX_INFLIGHT_REQUESTS);
+        let inflight_cfg = cfg.and_then(|l| l.max_inflight_requests);
         let max_inflight_requests = inflight_env
             .or(inflight_cfg)
-            .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUESTS);
+            .unwrap_or_else(resolve_default_max_inflight_requests);
 
         // v0.9 #1005 (G2) — vector-index residency cap. Same
         // non-positive-is-unset ladder as the quota knobs; the
@@ -10939,6 +10998,94 @@ legacy_scoring = false
         assert_eq!(r.max_storage_bytes, 9_000_000_000);
         assert_eq!(r.max_links_per_day, 4_000_000);
         assert_eq!(r.source, ConfigSource::Env);
+        scrub_limits_env();
+    }
+
+    // -----------------------------------------------------------------
+    // #2032 M3 (class-a, 5-agent vote `4d3ea1c5`) — tri-state
+    // admission-control cap. The T3 fail-open→fail-closed flip made an
+    // UNSET knob resolve to the CPU-scaled default (floor 256, ceiling
+    // 4096) while an EXPLICIT `0` still disables. These pin the three
+    // arms so a regression collapsing "explicit 0" and "unset" back
+    // together (the pre-#2032 `env_pos_usize` behaviour) surfaces here.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_default_max_inflight_requests_is_clamped_2032() {
+        // The CPU-scaled default is always within [floor, ceiling] on
+        // every host, regardless of the box's core count.
+        let d = resolve_default_max_inflight_requests();
+        assert!(
+            (MAX_INFLIGHT_FLOOR..=MAX_INFLIGHT_CEILING).contains(&d),
+            "CPU-scaled default {d} out of [{MAX_INFLIGHT_FLOOR}, {MAX_INFLIGHT_CEILING}]"
+        );
+    }
+
+    #[test]
+    fn resolve_limits_inflight_unset_is_cpu_scaled_default_2032() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        // No env, no `[limits]` section → the UNSET knob resolves to the
+        // CPU-scaled default, NOT the compiled `0`-disabled sentinel.
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_inflight_requests,
+            resolve_default_max_inflight_requests(),
+            "#2032 M3: an UNSET inflight knob must resolve to the CPU-scaled default"
+        );
+        assert_ne!(
+            r.max_inflight_requests, DEFAULT_MAX_INFLIGHT_REQUESTS,
+            "#2032 M3: unset must NOT collapse to the 0-disabled sentinel"
+        );
+    }
+
+    #[test]
+    fn resolve_limits_inflight_explicit_zero_env_disables_2032() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_INFLIGHT_REQUESTS, "0");
+        }
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_inflight_requests, 0,
+            "#2032 M3: explicit env `0` must be honoured as DISABLED, not treated as unset"
+        );
+        scrub_limits_env();
+    }
+
+    #[test]
+    fn resolve_limits_inflight_explicit_zero_config_disables_2032() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        // Config `Some(0)` with no env → explicit disable survives.
+        let mut cfg = empty_app_config();
+        cfg.limits = Some(LimitsSection {
+            max_inflight_requests: Some(0),
+            ..LimitsSection::default()
+        });
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_inflight_requests, 0,
+            "#2032 M3: an explicit `[limits].max_inflight_requests = 0` must disable admission"
+        );
+    }
+
+    #[test]
+    fn resolve_limits_inflight_explicit_positive_wins_2032() {
+        let _g = env_var_lock();
+        scrub_limits_env();
+        unsafe {
+            std::env::set_var(ENV_MAX_INFLIGHT_REQUESTS, "512");
+        }
+        let cfg = empty_app_config();
+        let r = cfg.resolve_limits();
+        assert_eq!(
+            r.max_inflight_requests, 512,
+            "#2032 M3: an explicit positive cap must win over the CPU-scaled default"
+        );
         scrub_limits_env();
     }
 

@@ -629,9 +629,10 @@ fn test_limits_garbage_env_falls_through_to_default() {
         ("AI_MEMORY_MAX_PAGE_SIZE", Some("-9")),
         ("AI_MEMORY_MAX_STORAGE_BYTES", Some("lots")),
         ("AI_MEMORY_MAX_LINKS_PER_DAY", None),
-        // #1733 — garbage inflight env must fall through to the compiled
-        // default (`0` = admission control DISABLED), never panic or enable
-        // a bogus cap.
+        // #1733 + #2032 M3 — garbage inflight env is unparseable, so the
+        // tri-state resolver maps it to `None` and falls through the ladder
+        // to the CPU-scaled default (NOT the `0`-disabled sentinel — that is
+        // reserved for an EXPLICIT `0`). Never panic or enable a bogus cap.
         ("AI_MEMORY_MAX_INFLIGHT_REQUESTS", Some("nope")),
     ]);
 
@@ -650,8 +651,8 @@ fn test_limits_garbage_env_falls_through_to_default() {
     assert!(r.max_storage_bytes > 0, "unparseable env must be ignored");
     assert_eq!(
         r.max_inflight_requests,
-        ai_memory::config::DEFAULT_MAX_INFLIGHT_REQUESTS,
-        "garbage inflight env must fall through to the disabled default",
+        ai_memory::config::resolve_default_max_inflight_requests(),
+        "#2032 M3: garbage inflight env must fall through to the CPU-scaled default",
     );
 }
 
@@ -1278,6 +1279,49 @@ fn test_secret_screen_mode_precedence() {
             bare.resolve_secret_screen_mode(),
             SecretScreenMode::Refuse,
             "unparseable env + no config MUST fall through to the compiled default"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #2032 M2 (class-a, DEFINE-ONLY, 5-agent vote `4d3ea1c5`) — the two TLS
+// escape-hatch env resolvers. Tranche 2 lands the resolvers + this census
+// case; the `tls_bind_guard` that consumes them lands in tranche 3, so
+// binding behaviour is unchanged. Each defaults `false` and mirrors the
+// truthy grammar of `require_api_key_strict` (`1` / `true`, case-insensitive).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_m2_tls_escape_hatch_envs_default_and_parse_2032() {
+    use ai_memory::daemon_runtime::{
+        ENV_ALLOW_PLAINTEXT_NONLOOPBACK, ENV_REQUIRE_TLS, allow_plaintext_nonloopback_enabled,
+        require_tls_enabled,
+    };
+
+    // Table of (env-value, expected-bool). `None` = unset (default false).
+    let cases: &[(Option<&str>, bool)] = &[
+        (None, false),
+        (Some("1"), true),
+        (Some("true"), true),
+        (Some("TRUE"), true),
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("garbage"), false),
+    ];
+
+    for &(val, want) in cases {
+        let _g = MultiEnvVarGuard::apply(&[
+            (ENV_ALLOW_PLAINTEXT_NONLOOPBACK, val),
+            (ENV_REQUIRE_TLS, val),
+        ]);
+        assert_eq!(
+            allow_plaintext_nonloopback_enabled(),
+            want,
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK={val:?} must resolve to {want}"
+        );
+        assert_eq!(
+            require_tls_enabled(),
+            want,
+            "AI_MEMORY_REQUIRE_TLS={val:?} must resolve to {want}"
         );
     }
 }
