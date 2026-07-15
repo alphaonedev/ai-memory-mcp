@@ -69,8 +69,8 @@ impl ConformanceLevel {
 pub struct ExportEnvelope {
     /// Always [`SPEC_VERSION_V2`].
     pub spec_version: String,
-    /// The integer storage schema the producer built against (`PRAGMA
-    /// user_version`).
+    /// The integer storage schema the producer built against (the applied
+    /// `schema_version` migration-ledger `MAX(version)`).
     pub db_schema_version: i64,
     /// Free-form producer label.
     pub source: String,
@@ -210,7 +210,19 @@ pub fn build_full_envelope(
     let trust_anchors = collect_trust_anchors();
 
     // ── in-export re-verify pass (the honest conformance signal) ──
-    let chain_ok = crate::signed_events::verify_audit_trail(conn, None)?.is_clean();
+    // Use the DATA-INTRINSIC chain-integrity signal (internally sound chain, no
+    // gaps, no detected truncation) rather than the full `is_clean()` — the
+    // latter also fails on a `WitnessCheck::Missing`, which reflects the
+    // SOURCE's witness-key enrolment (an operational concern) rather than
+    // whether the EXPORTED signed rows re-verify at a destination. A broken
+    // chain (interior delete / gap / truncation) still downgrades to L1.
+    let report = crate::signed_events::verify_audit_trail(conn, None)?;
+    let chain_ok = report.chain_intact
+        && report.sequence_gaps.is_empty()
+        && !matches!(
+            report.truncation,
+            crate::signed_events::TruncationCheck::Detected { .. }
+        );
     let operator_anchored = crate::governance::rules_store::resolve_operator_pubkey().is_some();
 
     let signed_level = if chain_ok {
