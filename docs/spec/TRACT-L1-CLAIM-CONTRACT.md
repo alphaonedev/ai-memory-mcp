@@ -133,6 +133,68 @@ TRACT-CIDv1 `id`; move `links` into the kernel; and enforce no-UPDATE /
 no-silent-DELETE. Gated on the CC0 conformance vectors (G24/#1837, now shipped)
 so it is buildable against test-vectors, not prose.
 
+## 7. Open-predicate relations (G19, #1833) — PROVISIONAL mapping
+
+The Claim `links` field (§1 field 9) is TRACT's **open predicate space over a
+fixed kernel**: a caller authors an arbitrary predicate as a content-addressed
+CID that is INVALID unless its definition-Claim (a gloss + ≥1 example) is
+reachable in the same archive, over a frozen floor of ≤10 kernel relations
+(`supersedes·contradicts·derived_from·caused_by·attests·part_of·relates_to·invalidates`,
+8 load-bearing + 2 reserved). The substrate instead has a **closed 9-variant
+`MemoryLinkRelation` enum + a DB `CHECK`** — a new relation needs a migration +
+code change. The open-predicate mechanism is **UNIMPLEMENTED** at v1.0.0
+(`crate::claim::relation::OPEN_PREDICATES_SUPPORTED = false`); closing it is the
+freeze-hostile v1.x redesign (relax the CHECK, add authored-CID predicates +
+definition-Claim resolution).
+
+### 7.1 PROPOSED kernel mapping (NOT normative — v1.x is authoritative)
+
+The compile-time drift-gate `crate::claim::relation::classify` proposes this
+split; it is a **contestable design judgment surfaced, not settled** (the v1.x
+open-predicate model — the actual consumer — decides). The `match` is exhaustive
+with no wildcard, so a new relation variant breaks the build until classified.
+
+| `MemoryLinkRelation` | Proposed | TRACT kernel / note |
+|---|---|---|
+| `related_to` | kernel | ≈ `relates_to` |
+| `supersedes` | kernel | `supersedes` |
+| `contradicts` | kernel | `contradicts` |
+| `derived_from` | kernel | `derived_from` — ⚠️ but see §7.2 |
+| `reflects_on` | extra | ⚠️ TRACT-homeless yet LOAD-BEARING (transcript replay, curator reflect-verify gate, forensic-bundle walks) |
+| `derives_from` | extra | ⚠️ LINEAGE trio (see §7.2); distinct from `derived_from` (§7.3) |
+| `decomposes_into` | extra | ⚠️ plausibly the inverse of the TRACT kernel `part_of` |
+| `depends_on` | extra | substrate typed-cognition |
+| `advances` | extra | substrate typed-cognition |
+
+**Missing TRACT-kernel relations** (`crate::claim::relation::MISSING_TRACT_KERNEL_RELATIONS`):
+`caused_by`, `attests`, `part_of`, `invalidates` — absent as `MemoryLinkRelation`
+variants, with ZERO producers/consumers today. Adding a bare variant nothing
+emits is dead vocabulary, so these are v1.x work (added with real producers).
+
+### 7.2 Contested edge — the LINEAGE-trio bisection
+
+`MemoryLinkRelation::LINEAGE = {DerivedFrom, ReflectsOn, DerivesFrom}` is a
+single coherent provenance grouping in the code (uniform child→parent /
+newer→older invariant, `is_lineage`). The §7.1 proposal splits it — `DerivedFrom`
+kernel, the other two extras — which contradicts the substrate's own SSOT.
+Whether the trio is one kernel concept or a kernel + two authored predicates is a
+real v1.x decision; the drift-gate test pins that the proposal bisects it so the
+tension can't be lost.
+
+### 7.3 Latent defect — `derived_from` vs `derives_from`
+
+These are NOT duplicates (opposite cardinalities: consolidation-merge N→1 vs
+atomisation-split 1→N) but a near-homophone footgun; tracked as its own 1:1
+issue.
+
+### 7.4 v1.x migration (deferred)
+
+Tracked 1:1 from #1833. Relax the DB `CHECK` to a kernel + open-CID model; add
+caller-authored CID predicates + definition-Claim reachability resolution;
+migrate the 5 substrate extras to authored predicates or reversed-kernel
+mappings; add the 4 missing kernel relations with real producers; resolve the
+§7.2 bisection + the §7.3 near-homophone. Gated on the CC0 vectors (#1837).
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except

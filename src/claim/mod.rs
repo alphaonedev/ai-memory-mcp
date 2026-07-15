@@ -31,6 +31,8 @@
 //! hold, so a future change that silently "fixed" one (or broke the projection)
 //! is caught.
 
+pub mod relation;
+
 use crate::models::{Memory, MemoryLink};
 
 /// The exact points where the [`Memory`] row diverges from the frozen 9-field
