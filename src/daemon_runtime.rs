@@ -4222,26 +4222,23 @@ fn require_api_key_strict() -> bool {
 /// front of the daemon, so a non-loopback bind without in-process TLS is an
 /// accepted posture.
 ///
-/// DEFINE-ONLY at tranche 2: this resolver + its CLAUDE.md env-var row + its
-/// `tests/config_precedence.rs` case land now so tranche 3 can reference a
-/// stable name. The `tls_bind_guard` that CONSUMES it (turning a keyed
-/// non-loopback bind without this ack into a refusal) lands in tranche 3 —
-/// binding behaviour is UNCHANGED this tranche.
+/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a plaintext
+/// non-loopback bind is silently permitted instead of emitting the hard M2
+/// posture WARN.
 pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK";
 
 /// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
 /// fail-closed-now TLS opt-in. When truthy the operator demands in-process
 /// TLS on every bind; a plaintext bind is refused.
 ///
-/// DEFINE-ONLY at tranche 2 (resolver + CLAUDE.md row + precedence test); the
-/// `tls_bind_guard` that CONSUMES it lands in tranche 3. Binding behaviour is
-/// UNCHANGED this tranche.
+/// Consumed by [`tls_bind_guard`] (tranche 3): when set, a bind without a
+/// `--tls-cert` / `--tls-key` pair is refused (fail-closed-now).
 pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
 
 /// #2032 M2 — resolve the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` escape
 /// hatch (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`] (`1` / `true`, case-insensitive). DEFINE-ONLY:
-/// no bind path consults this yet (tranche 3).
+/// [`require_api_key_strict`] (`1` / `true`, case-insensitive). Consumed by
+/// [`tls_bind_guard`].
 #[must_use]
 pub fn allow_plaintext_nonloopback_enabled() -> bool {
     std::env::var(ENV_ALLOW_PLAINTEXT_NONLOOPBACK)
@@ -4251,8 +4248,7 @@ pub fn allow_plaintext_nonloopback_enabled() -> bool {
 
 /// #2032 M2 — resolve the `AI_MEMORY_REQUIRE_TLS` fail-closed opt-in
 /// (default `false`). Mirrors the truthy grammar of
-/// [`require_api_key_strict`]. DEFINE-ONLY: no bind path consults this yet
-/// (tranche 3).
+/// [`require_api_key_strict`]. Consumed by [`tls_bind_guard`].
 #[must_use]
 pub fn require_tls_enabled() -> bool {
     std::env::var(ENV_REQUIRE_TLS)
@@ -4369,6 +4365,72 @@ fn boot_security_posture_warnings(
     warnings
 }
 
+/// #2032 M2 (v1.0.0, 5-agent vote `4d3ea1c5`) — decide the TLS posture of a
+/// bind. The M2 finding: a keyed non-loopback bind still serves the api-key
+/// + memory content in CLEARTEXT unless TLS terminates somewhere, so an
+/// exposure-recon (`ai_osint`-class) scan can discover AND sniff it. This
+/// guard turns that into a loud, contained posture signal without breaking
+/// the reverse-proxy deployment shape.
+///
+/// `tls_present` is in-process TLS (`--tls-cert` + `--tls-key` both set).
+///
+/// Returns:
+///   - `Ok(None)` — nothing to say: in-process TLS is on, OR a loopback
+///     plaintext bind (same-host reverse-proxy / single-tenant default),
+///     OR the operator acknowledged upstream TLS termination via
+///     `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK`;
+///   - `Ok(Some(warning))` — bind permitted but emit a HARD boot WARN
+///     (an unacknowledged plaintext non-loopback bind, the default posture);
+///   - `Err(reason)` — refuse to bind: `AI_MEMORY_REQUIRE_TLS=1` demands
+///     in-process TLS and none is configured (fail-closed-now).
+///
+/// A future release (v1.1.0) promotes the non-loopback plaintext WARN to a
+/// refusal (the `ALLOW_PLAINTEXT_NONLOOPBACK` ack remains the escape path);
+/// this release only warns so the reverse-proxy shape is not broken (the
+/// #1985 surface-scoping lesson — do not ship an unsatisfiable default).
+///
+/// Pulled out of `bootstrap_serve` (the [`api_key_bind_guard`] precedent) so
+/// all three outcomes are unit-testable without standing up a daemon.
+fn tls_bind_guard(
+    tls_present: bool,
+    host: &str,
+    allow_plaintext_nonloopback: bool,
+    require_tls: bool,
+) -> std::result::Result<Option<String>, String> {
+    if tls_present {
+        return Ok(None);
+    }
+    // Plaintext bind from here down.
+    if require_tls {
+        return Err(format!(
+            "refusing to start without in-process TLS: AI_MEMORY_REQUIRE_TLS is set, which \
+             mandates TLS on every bind (requested host {host:?}), but no --tls-cert / --tls-key \
+             pair was configured. Provide the cert+key pair for in-process TLS, or unset \
+             AI_MEMORY_REQUIRE_TLS to fall back to the plaintext-posture WARN. (#2032 M2)"
+        ));
+    }
+    if host_is_loopback(host) {
+        // Same-host reverse-proxy / single-tenant default — off-host
+        // reachability is not in play, so plaintext loopback is fine.
+        return Ok(None);
+    }
+    if allow_plaintext_nonloopback {
+        // Operator asserted a reverse proxy / service-mesh sidecar
+        // terminates TLS upstream — accept the plaintext daemon bind.
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "SECURITY POSTURE (#2032 M2): daemon bound to non-loopback {host:?} WITHOUT in-process \
+         TLS — the API key and all memory content are served in CLEARTEXT and are trivially \
+         sniffable off-host (exposure-recon / `ai_osint`-class discovery). Terminate TLS in \
+         front of the daemon (reverse proxy / service mesh) and set \
+         AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK=1 to acknowledge + silence this, OR pass \
+         --tls-cert / --tls-key for in-process TLS, OR set AI_MEMORY_REQUIRE_TLS=1 to \
+         hard-refuse a plaintext bind now. A future release (v1.1.0) will PROMOTE this WARN to \
+         a refusal for unacknowledged plaintext non-loopback binds."
+    )))
+}
+
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
 ///
@@ -4440,6 +4502,28 @@ pub async fn bootstrap_serve(
             tracing::warn!("{warning}");
         }
     }
+
+    // #2032 M2 (v1.0.0) — cleartext off-host bind posture. A keyed
+    // non-loopback bind still serves the api-key + memory content in
+    // cleartext absent TLS; emit a hard WARN naming the escape hatches (or
+    // refuse under AI_MEMORY_REQUIRE_TLS). Loopback binds are exempt.
+    match tls_bind_guard(
+        args.tls_cert.is_some() && args.tls_key.is_some(),
+        args.host.as_str(),
+        allow_plaintext_nonloopback_enabled(),
+        require_tls_enabled(),
+    ) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!("{warning}"),
+        Err(reason) => anyhow::bail!("{reason}"),
+    }
+
+    // #2032 LM3 (v1.0.0) — WARN-carrier for the `[verify] require_nonce`
+    // secure-default flip. Fires only when the knob is still at the
+    // permissive default; announces the v1.1.0 flip to fail-closed.
+    crate::handlers::warn_verify_require_nonce_default_once(
+        app_config.verify.as_ref().is_some_and(|v| v.require_nonce),
+    );
 
     // v0.10.0 Gate-1' WARN carrier (#1972): the federation secure-default
     // -flip boot WARN. One-shot that self-suppresses unless its condition
@@ -6657,6 +6741,69 @@ mod tests {
         let err = api_key_bind_guard(false, "0.0.0.0", false)
             .expect_err("keyless non-loopback bind MUST be refused");
         assert!(err.contains("refusing to bind to non-loopback"), "{err}");
+    }
+
+    // ----- #2032 M2 tls_bind_guard (cleartext off-host bind posture) -----
+
+    /// In-process TLS present => silent on any host (nothing to warn about).
+    #[test]
+    fn tls_bind_guard_tls_present_silent_2032_m2() {
+        assert_eq!(tls_bind_guard(true, "0.0.0.0", false, false).unwrap(), None);
+        // TLS present satisfies REQUIRE_TLS too.
+        assert_eq!(tls_bind_guard(true, "0.0.0.0", false, true).unwrap(), None);
+    }
+
+    /// Plaintext loopback bind is exempt (same-host reverse-proxy default).
+    #[test]
+    fn tls_bind_guard_plaintext_loopback_silent_2032_m2() {
+        for host in ["127.0.0.1", "::1", "localhost", "[::1]", "0:0:0:0:0:0:0:1"] {
+            assert_eq!(
+                tls_bind_guard(false, host, false, false).unwrap(),
+                None,
+                "plaintext loopback {host} must be silent"
+            );
+        }
+    }
+
+    /// Plaintext non-loopback bind WITHOUT the ack emits the hard M2 WARN
+    /// (permitted, not refused, this release) naming the escape hatches.
+    #[test]
+    fn tls_bind_guard_plaintext_nonloopback_warns_2032_m2() {
+        let warning = tls_bind_guard(false, "0.0.0.0", false, false)
+            .unwrap()
+            .expect("plaintext non-loopback bind must WARN, not bind silently");
+        assert!(
+            warning.contains("CLEARTEXT")
+                && warning.contains("AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK")
+                && warning.contains("AI_MEMORY_REQUIRE_TLS"),
+            "M2 WARN must name cleartext + both escape hatches: {warning}"
+        );
+    }
+
+    /// The upstream-TLS acknowledgement silences the non-loopback WARN.
+    #[test]
+    fn tls_bind_guard_plaintext_nonloopback_acked_silent_2032_m2() {
+        assert_eq!(
+            tls_bind_guard(false, "0.0.0.0", true, false).unwrap(),
+            None,
+            "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK must silence the M2 WARN"
+        );
+    }
+
+    /// REQUIRE_TLS with no in-process TLS is refused (fail-closed-now) on any
+    /// host, INCLUDING loopback — the operator demanded TLS everywhere.
+    #[test]
+    fn tls_bind_guard_require_tls_refuses_plaintext_2032_m2() {
+        for host in ["0.0.0.0", "127.0.0.1"] {
+            let err = tls_bind_guard(false, host, false, true)
+                .expect_err("REQUIRE_TLS + plaintext MUST be refused");
+            assert!(
+                err.contains("AI_MEMORY_REQUIRE_TLS") && err.contains("in-process TLS"),
+                "refusal must name the knob for {host}: {err}"
+            );
+        }
+        // Even the ack does not override an explicit REQUIRE_TLS demand.
+        assert!(tls_bind_guard(false, "0.0.0.0", true, true).is_err());
     }
 
     // ----- R-04 / R-12 boot security-posture warnings (#1798) ------------
