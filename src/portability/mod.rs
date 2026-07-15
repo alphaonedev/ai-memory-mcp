@@ -30,3 +30,4 @@
 //! byte-preservation possible.
 
 pub mod hex_bytes;
+pub mod read;
