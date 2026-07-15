@@ -30,5 +30,6 @@
 //! byte-preservation possible.
 
 pub mod dto;
+pub mod emit;
 pub mod hex_bytes;
 pub mod read;
