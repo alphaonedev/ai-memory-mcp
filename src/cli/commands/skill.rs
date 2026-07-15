@@ -69,6 +69,12 @@ pub enum SkillAction {
     /// Load a skill body together with the reflections declared in its
     /// `composes_with_reflections` frontmatter list.
     Compose(ComposeArgs),
+    /// #2024 — retire (hide + block re-register) or unretire a skill
+    /// lineage / single version.
+    Retire(RetireArgs),
+    /// #2024 — hard-purge an ENTIRE skill lineage (irreversible). Requires
+    /// the lineage to be retired first, or `--confirm` to force.
+    Delete(DeleteArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +122,10 @@ pub struct ListArgs {
     /// Optional substring filter applied to name and description.
     #[arg(long, value_name = "TEXT")]
     pub filter: Option<String>,
+
+    /// #2024 — include RETIRED skills in the listing (default hides them).
+    #[arg(long, default_value_t = false)]
+    pub include_retired: bool,
 
     /// Emit a structured JSON envelope instead of a human table.
     #[arg(long, default_value_t = false)]
@@ -213,6 +223,64 @@ pub struct ComposeArgs {
     pub json: bool,
 }
 
+/// `ai-memory skill retire`
+#[derive(Args, Debug, Clone)]
+pub struct RetireArgs {
+    /// Target a SINGLE version by its skill UUID. Mutually exclusive with
+    /// `--name` at the substrate level (skill_id wins). Mirrors MCP
+    /// `skill_id`.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Target the whole `(namespace, name)` lineage by name. Mirrors MCP
+    /// `name`; pair with `--namespace`.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Namespace of the lineage named by `--name`. Mirrors MCP `namespace`.
+    #[arg(long, value_name = "NS")]
+    pub namespace: Option<String>,
+
+    /// UNRETIRE (reverse a prior retire) instead of retiring.
+    #[arg(long, default_value_t = false)]
+    pub unretire: bool,
+
+    /// Optional free-form reason recorded on the retired rows + audit.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: Option<String>,
+
+    /// Emit a structured JSON envelope instead of a human summary line.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
+/// `ai-memory skill delete` — irreversible hard purge of a lineage.
+#[derive(Args, Debug, Clone)]
+pub struct DeleteArgs {
+    /// A skill UUID whose WHOLE lineage is purged. Mirrors MCP `skill_id`.
+    #[arg(long, value_name = "ID")]
+    pub id: Option<String>,
+
+    /// Purge the `(namespace, name)` lineage by name. Mirrors MCP `name`;
+    /// pair with `--namespace`.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Namespace of the lineage named by `--name`. Mirrors MCP `namespace`.
+    #[arg(long, value_name = "NS")]
+    pub namespace: Option<String>,
+
+    /// Bypass the retire-first safety gate and purge an active lineage
+    /// (maps to MCP `force = true`). Without it, the lineage must already
+    /// be retired.
+    #[arg(long, default_value_t = false)]
+    pub confirm: bool,
+
+    /// Emit a structured JSON envelope instead of a human summary line.
+    #[arg(long, default_value_t = false)]
+    pub json: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
@@ -242,6 +310,8 @@ pub fn run(
         SkillAction::Export(a) => run_export(&conn, a, active_keypair, out),
         SkillAction::Promote(a) => run_promote(&conn, a, active_keypair, out),
         SkillAction::Compose(a) => run_compose(&conn, a, out),
+        SkillAction::Retire(a) => run_retire(&conn, a, active_keypair, out),
+        SkillAction::Delete(a) => run_delete(&conn, a, active_keypair, out),
     }
 }
 
@@ -336,6 +406,9 @@ fn run_list(conn: &rusqlite::Connection, args: &ListArgs, out: &mut CliOutput<'_
     }
     if let Some(ref f) = args.filter {
         params["filter"] = json!(f);
+    }
+    if args.include_retired {
+        params[field_names::INCLUDE_RETIRED] = json!(true);
     }
     match crate::mcp::handle_skill_list(conn, &params) {
         Ok(v) => {
@@ -502,6 +575,89 @@ fn run_compose(
 }
 
 // ---------------------------------------------------------------------------
+// retire (#2024)
+// ---------------------------------------------------------------------------
+
+fn run_retire(
+    conn: &rusqlite::Connection,
+    args: &RetireArgs,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let mut params = json!({ "unretire": args.unretire });
+    if let Some(ref id) = args.id {
+        params["skill_id"] = json!(id);
+    }
+    if let Some(ref nm) = args.name {
+        params["name"] = json!(nm);
+    }
+    if let Some(ref ns) = args.namespace {
+        params["namespace"] = json!(ns);
+    }
+    if let Some(ref r) = args.reason {
+        params["reason"] = json!(r);
+    }
+    match crate::mcp::handle_skill_retire(conn, &params, active_keypair) {
+        Ok(v) => {
+            if args.json {
+                emit_json(out, &v)?;
+            } else {
+                let verb = if args.unretire {
+                    "unretired"
+                } else {
+                    "retired"
+                };
+                let affected = v["affected"].as_u64().unwrap_or(0);
+                let ns = v["namespace"].as_str().unwrap_or("");
+                let nm = v["name"].as_str().unwrap_or("");
+                writeln!(out.stdout, "{verb} {ns}/{nm} ({affected} row(s) affected)")?;
+            }
+            Ok(0)
+        }
+        Err(e) => handler_err_exit(out, "retire", &e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete / purge (#2024)
+// ---------------------------------------------------------------------------
+
+fn run_delete(
+    conn: &rusqlite::Connection,
+    args: &DeleteArgs,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    let mut params = json!({ "force": args.confirm });
+    if let Some(ref id) = args.id {
+        params["skill_id"] = json!(id);
+    }
+    if let Some(ref nm) = args.name {
+        params["name"] = json!(nm);
+    }
+    if let Some(ref ns) = args.namespace {
+        params["namespace"] = json!(ns);
+    }
+    match crate::mcp::handle_skill_delete(conn, &params, active_keypair) {
+        Ok(v) => {
+            if args.json {
+                emit_json(out, &v)?;
+            } else {
+                let affected = v["affected"].as_u64().unwrap_or(0);
+                let ns = v["namespace"].as_str().unwrap_or("");
+                let nm = v["name"].as_str().unwrap_or("");
+                writeln!(
+                    out.stdout,
+                    "purged {ns}/{nm} ({affected} version(s) deleted)"
+                )?;
+            }
+            Ok(0)
+        }
+        Err(e) => handler_err_exit(out, "delete", &e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -565,6 +721,7 @@ mod tests {
             action: SkillAction::List(ListArgs {
                 namespace: Some("testns".to_string()),
                 filter: None,
+                include_retired: false,
                 json: true,
             }),
         };
@@ -741,6 +898,7 @@ mod tests {
             action: SkillAction::List(ListArgs {
                 namespace: Some("testns".to_string()),
                 filter: Some("cli-list-human".to_string()),
+                include_retired: false,
                 json: false,
             }),
         };

@@ -3226,7 +3226,7 @@ mod tests {
         // `sizes::tests::full_profile_total_in_honest_measured_range`.
         let total = v["full_profile_total_tokens"].as_u64().unwrap();
         assert!(
-            (5_000..=22_000).contains(&total),
+            (5_000..=25_000).contains(&total),
             "full_profile_total_tokens out of honest range: {total}"
         );
         assert!(v["active_total_tokens"].as_u64().unwrap() > 0);

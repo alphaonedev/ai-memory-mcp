@@ -319,7 +319,9 @@ pub const META_KEY_TARGET_AGENT_ID: &str = "target_agent_id";
 
 // 2026-07-01 (#1859 G13-mem) — bumped 91 → 92: the derivation lineage-DAG
 // read surface `GET /api/v1/memories/{id}/lineage` (`handlers::get_lineage`).
-pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 92;
+// 2026-07-14 (#2024) — bumped 92 → 93: the skill retire/unretire write
+// surface `POST /api/v1/skill/{id}/retire` (`handlers::skill_retire_route`).
+pub const EXPECTED_PRODUCTION_ROUTES_COUNT: usize = 93;
 // 2026-06-22 (#1718 Commit C) — bumped 89 → 90: the coordination
 // action-transition write surface `POST /api/v1/actions/{id}/transition`
 // (`handlers::transition_action`) — local CAS write + W-of-N federation fanout.
@@ -345,7 +347,9 @@ pub const EXPECTED_TEST_ROUTES_COUNT: usize = 3;
 // `/api/v1/signals` (signal send write surface).
 // 2026-07-01 (#1859 G13-mem) — bumped 77 → 78: the new unique path
 // `/api/v1/memories/{id}/lineage` (derivation lineage-DAG read surface).
-pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 78;
+// 2026-07-14 (#2024) — bumped 78 → 79: the new unique path
+// `/api/v1/skill/{id}/retire` (skill retire/unretire write surface).
+pub const EXPECTED_PRODUCTION_UNIQUE_PATHS_COUNT: usize = 79;
 
 // ---------------------------------------------------------------------------
 // v0.7.0 multi-agent literal-sweep (scanner A, finding F-A3.1) —
@@ -1130,7 +1134,13 @@ pub fn build_router_with_timeout(
             handlers::routes::SKILL_LIST,
             get(handlers::skill_list_route),
         )
-        .route(handlers::routes::SKILL_ID, get(handlers::skill_get_route))
+        // #2024 — DELETE hard-purges the lineage; reuses the existing
+        // `/api/v1/skill/{id}` path (no new unique path), so it rides the
+        // same `.route(...)` registration as GET.
+        .route(
+            handlers::routes::SKILL_ID,
+            get(handlers::skill_get_route).delete(handlers::skill_delete_route),
+        )
         .route(
             handlers::routes::SKILL_ID_RESOURCE,
             get(handlers::skill_resource_route),
@@ -1146,6 +1156,11 @@ pub fn build_router_with_timeout(
         .route(
             handlers::routes::SKILL_ID_COMPOSE,
             post(handlers::skill_compose_route),
+        )
+        // #2024 — operator-authorized skill retire/unretire (admin-gated).
+        .route(
+            handlers::routes::SKILL_ID_RETIRE,
+            post(handlers::skill_retire_route),
         )
         // v0.7.0 #1095 — `POST /api/v1/share` HTTP parity for the
         // MCP-only `memory_share` tool. Closes the SR-4 three-surface

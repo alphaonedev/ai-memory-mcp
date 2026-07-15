@@ -289,14 +289,17 @@ pub fn handle_skill_export(
 
     let digest_hex: String = digest_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
-    Ok(json!({
+    let mut response = json!({
         "exported": true,
         "skill_id": skill_id,
         (field_names::TARGET_FOLDER): target_str,
         "digest": digest_hex,
         "resources_exported": exported_resources.len(),
         "files": exported_resources,
-    }))
+    });
+    // #2024 — surface the retired flag so a by-id caller can honor it.
+    super::skill_retire::apply_retired_fields(conn, skill_id, &mut response);
+    Ok(response)
 }
 
 /// Minimal YAML quoting: wrap in double quotes if the value contains

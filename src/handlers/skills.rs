@@ -87,6 +87,8 @@ pub async fn skill_register_route(
 pub struct SkillListQuery {
     pub namespace: Option<String>,
     pub filter: Option<String>,
+    /// #2024 — include RETIRED skills in the listing (default hides them).
+    pub include_retired: Option<bool>,
 }
 
 pub async fn skill_list_route(
@@ -108,6 +110,9 @@ pub async fn skill_list_route(
     }
     if let Some(f) = q.filter {
         params["filter"] = json!(f);
+    }
+    if let Some(ir) = q.include_retired {
+        params[field_names::INCLUDE_RETIRED] = json!(ir);
     }
     let lock = app.db.lock().await;
     match crate::mcp::handle_skill_list(&lock.0, &params) {
@@ -345,6 +350,97 @@ pub async fn skill_compose_route(
                     Json(json!({"error": crate::errors::msg::INTERNAL_SERVER_ERROR})),
                 )
                     .into_response()
+            }
+        }
+    }
+}
+
+/// `POST /api/v1/skill/{id}/retire` — #2024 operator-authorized skill
+/// retire/unretire. Path `{id}` names the target skill_id; body carries
+/// `{ unretire?, reason?, namespace?, name? }`.
+#[derive(Deserialize, Default)]
+pub struct SkillRetireBody {
+    #[serde(default)]
+    pub unretire: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+pub async fn skill_retire_route(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<SkillRetireBody>>,
+) -> impl IntoResponse {
+    // #2024 — admin-only, like every other skill HTTP surface (#949).
+    // Retire toggles the discovery + re-register lifecycle of an
+    // executable artefact; cross-tenant retire is a supply-chain lever.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_retire") {
+        return resp;
+    }
+    let Json(body) = body.unwrap_or(Json(SkillRetireBody::default()));
+    let mut params = json!({
+        "skill_id": id,
+        "unretire": body.unretire,
+    });
+    if let Some(r) = body.reason {
+        params["reason"] = json!(r);
+    }
+    if let Some(ns) = body.namespace {
+        params["namespace"] = json!(ns);
+    }
+    if let Some(nm) = body.name {
+        params["name"] = json!(nm);
+    }
+    let lock = app.db.lock().await;
+    let kp = (*app.active_keypair).as_ref();
+    match crate::mcp::handle_skill_retire(&lock.0, &params, kp) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
+                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
+            }
+        }
+    }
+}
+
+/// `DELETE /api/v1/skill/{id}` — #2024 operator-authorized HARD PURGE of
+/// the whole lineage the `{id}` skill belongs to. Body carries
+/// `{ force? }` (retire-first gate bypass). Irreversible.
+#[derive(Deserialize, Default)]
+pub struct SkillDeleteBody {
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub async fn skill_delete_route(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<SkillDeleteBody>>,
+) -> impl IntoResponse {
+    // #2024 — admin-only (#949). Purge is irreversible; the substrate's
+    // retire-first safety gate (or explicit force) still applies underneath.
+    if let Err(resp) = crate::handlers::admin_role::require_admin(&app, &headers, "skill_delete") {
+        return resp;
+    }
+    let Json(body) = body.unwrap_or(Json(SkillDeleteBody::default()));
+    let params = json!({ "skill_id": id, "force": body.force });
+    let lock = app.db.lock().await;
+    let kp = (*app.active_keypair).as_ref();
+    match crate::mcp::handle_skill_delete(&lock.0, &params, kp) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => {
+            if e.starts_with(crate::errors::msg::SKILL_NOT_FOUND) {
+                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
             }
         }
     }

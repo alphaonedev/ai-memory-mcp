@@ -96,11 +96,15 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         Option<String>,
         i64,
         Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
     )> = conn
         .query_row(
             "SELECT id, namespace, name, description, license, compatibility, \
                     allowed_tools, metadata, body_blob, digest, signature, \
-                    signing_agent, created_at, superseded_by \
+                    signing_agent, created_at, superseded_by, \
+                    retired_at, retired_by, retire_reason \
              FROM skills WHERE id = ?1",
             [skill_id],
             |row| {
@@ -119,6 +123,9 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                    row.get(16)?,
                 ))
             },
         )
@@ -139,6 +146,9 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         signing_agent,
         created_at,
         superseded_by,
+        retired_at,
+        retired_by,
+        retire_reason,
     )) = row
     else {
         return Err(crate::errors::msg::skill_not_found(skill_id));
@@ -160,7 +170,22 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         (field_names::CREATED_AT): created_at,
         "body": body,
         "current": superseded_by.is_none(),
+        // #2024 — symmetric with `current`: retire is discovery-hide +
+        // re-register-block; it does NOT hard-block activation-by-id
+        // (consistent with superseded-stays-addressable), it just
+        // surfaces the flag so a by-id caller can honor the retirement.
+        (field_names::RETIRED): retired_at.is_some(),
     });
+
+    if let Some(ts) = retired_at {
+        response[field_names::RETIRED_AT] = json!(ts);
+        if let Some(by) = retired_by {
+            response[field_names::RETIRED_BY] = json!(by);
+        }
+        if let Some(reason) = retire_reason {
+            response[field_names::RETIRE_REASON] = json!(reason);
+        }
+    }
 
     if let Some(lic) = license {
         response["license"] = json!(lic);

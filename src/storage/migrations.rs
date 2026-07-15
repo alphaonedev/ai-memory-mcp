@@ -7,7 +7,7 @@
 //! constant, and the `migrate` function out of `src/db.rs` into
 //! this sub-module. Pure refactor — semantics unchanged. The
 //! `MAX_SUPPORTED_SCHEMA` constant in `cli::boot` must still bump
-//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 81).
+//! in lockstep with [`CURRENT_SCHEMA_VERSION`] (current value: 82).
 //! Versions 45/46 are reserved for sibling provenance-write landings
 //! (Gaps 1+2, #884/#885); this crate jumps 44 → 47 for Gap 3 (#886).
 //! v48 (Track D #933) adds the `federation_push_dlq` table so quorum-
@@ -856,7 +856,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_federation_push_dlq_pending_uniq
 /// so no call site carries a bare version literal. The latest migration
 /// always targets THIS tip, so its ladder arm gates on
 /// `version < CURRENT_SCHEMA_VERSION` rather than a version-pinned alias.
-const CURRENT_SCHEMA_VERSION: i64 = 81;
+const CURRENT_SCHEMA_VERSION: i64 = 82;
 
 /// Filename infix tagging a pre-migration safety snapshot. The snapshot
 /// lands as a SIBLING of the live database file (never a temp dir) so a
@@ -1481,6 +1481,15 @@ const MIGRATION_V80_SQLITE: &str =
 // bootstrap SCHEMA already ships the widened table) skips it.
 const MIGRATION_V81_SQLITE: &str =
     include_str!("../../migrations/sqlite/0065_v81_lineage_recovery_quorum.sql");
+// v82 (#2024, v1.0.0) — operator-authorized skill retire/unretire
+// lifecycle. Three additive nullable `skills` columns (`retired_at`,
+// `retired_by`, `retire_reason`). Probe-guarded ALTER (SQLite has no
+// ADD COLUMN IF NOT EXISTS — the v79 precedent). Purely additive, no
+// full-table rebuild → no trigger recreation (the v63/v65 lesson does
+// not arise). skills is SQLite-only; the postgres twin is a
+// version-stamp no-op (`migrate_v82`).
+const MIGRATION_V82_SQLITE: &str =
+    include_str!("../../migrations/sqlite/0066_v82_skill_retire.sql");
 
 // COVERAGE: per-version ALTER/CREATE branches inside this function
 // are guarded by `has_X` column-existence probes and `IF NOT EXISTS`
@@ -3514,6 +3523,30 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
                 );
             } else if !lineage_cols.contains("guardian_set_id") {
                 conn.execute_batch(MIGRATION_V81_SQLITE)?;
+            }
+        }
+
+        if version < CURRENT_SCHEMA_VERSION {
+            // v82 (#2024, v1.0.0) — operator-authorized skill retire/unretire
+            // lifecycle. Additive nullable `skills` columns (`retired_at`,
+            // `retired_by`, `retire_reason`). Probe `retired_at` (SQLite has
+            // no ADD COLUMN IF NOT EXISTS) AND the table's presence (a
+            // synthetic fixture may stamp a version without the v32 `skills`
+            // table — the v58/v77/v80/v81 precedent). Pure ALTER ADD COLUMN,
+            // no rebuild → no trigger drop (the v63/v65 lesson does not
+            // arise; `skills` carries no triggers).
+            let skill_cols: std::collections::HashSet<String> = conn
+                .prepare("PRAGMA table_info(skills)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<_>>()?;
+            if skill_cols.is_empty() {
+                tracing::debug!(
+                    target: TRACE_TARGET,
+                    "v82: skills table absent (test fixture); skipping \
+                     retire-column add"
+                );
+            } else if !skill_cols.contains("retired_at") {
+                conn.execute_batch(MIGRATION_V82_SQLITE)?;
             }
         }
 

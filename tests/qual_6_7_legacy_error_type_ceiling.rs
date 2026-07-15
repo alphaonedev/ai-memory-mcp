@@ -114,7 +114,13 @@ fn count_matches(root: &Path, needle: &str) -> usize {
 /// `forward_store_to_http` (#318) forward-family contract (the value flows
 /// straight back into the `Result<Value, String>` MCP dispatch envelope).
 /// Net acknowledged addition: +2.
-const QUAL_6_CEILING: usize = 114;
+/// 2026-07-15 — raised 114 → 116 for the #2024 skill retire/unretire/purge
+/// lifecycle: the 2 new `handle_skill_retire` + `handle_skill_delete` handlers
+/// each return `Result<Value, String>` to match the established skill-family
+/// contract (`handle_skill_get`/`_list`/`_resource`/`_register`/`_export`/
+/// `_compositional_context` all return `Result<Value, String>` — extending a
+/// uniformly-String family, not seeding a new one). Net acknowledged: +2.
+const QUAL_6_CEILING: usize = 116;
 
 /// QUAL-7 ceiling: 6+ sites at v2-review time + slack. Raised
 /// 25 → 26 for the #1455 fail-CLOSED governance pair in

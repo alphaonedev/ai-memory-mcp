@@ -223,6 +223,8 @@ pub const GOVERNANCE: &str = "governance";
 pub const IMPORTED_FROM_AGENT_ID: &str = "imported_from_agent_id";
 /// `include_invalidated` — wire/row field name.
 pub const INCLUDE_INVALIDATED: &str = "include_invalidated";
+/// `include_retired` — #2024 skill-retire discovery flag wire field name.
+pub const INCLUDE_RETIRED: &str = "include_retired";
 /// v0.9.0 §11.5 B7-SKILL (#1865) — `invocation_record` wire field name.
 /// Carries the `{event_id, recorded_at}` envelope of the `signed_events`
 /// row appended by `memory_skill_get`'s activation-invocation capture.
@@ -311,6 +313,16 @@ pub const REQUESTED_BY: &str = "requested_by";
 pub const REQUIRED_TIER: &str = "required_tier";
 /// `resource_path` — wire/row field name.
 pub const RESOURCE_PATH: &str = "resource_path";
+/// `retire_reason` — #2024 skill-retire lifecycle wire/row field name.
+pub const RETIRE_REASON: &str = "retire_reason";
+/// `retired` — #2024 skill-retire lifecycle response flag (bool; the
+/// symmetric sibling of the skill_get `current` field).
+pub const RETIRED: &str = "retired";
+/// `retired_at` — #2024 skill-retire lifecycle wire/row field name
+/// (epoch secs; NULL/absent = active).
+pub const RETIRED_AT: &str = "retired_at";
+/// `retired_by` — #2024 skill-retire lifecycle wire/row field name.
+pub const RETIRED_BY: &str = "retired_by";
 /// `schema_version` — wire/row field name.
 pub const SCHEMA_VERSION: &str = "schema_version";
 /// `scope_status` — wire/row field name.
@@ -377,6 +389,9 @@ pub const TO_NAMESPACE: &str = "to_namespace";
 pub const TRANSCRIPTS: &str = "transcripts";
 /// `unread_only` — wire/row field name.
 pub const UNREAD_ONLY: &str = "unread_only";
+/// `unretired` — #2024 skill-retire lifecycle response flag (bool; the
+/// UNRETIRE sibling of [`RETIRED`]).
+pub const UNRETIRED: &str = "unretired";
 /// `updated_at` — wire/row field name.
 pub const UPDATED_AT: &str = "updated_at";
 /// `updated_since` — wire/row field name.

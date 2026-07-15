@@ -191,6 +191,23 @@ pub mod event_types {
     /// (`src/mcp/tools/skill_register.rs::226`).
     pub const SKILL_REGISTERED: &str = "skill.registered";
 
+    /// #2024 (v1.0.0) — `signed_events.event_type` for an operator-authorized
+    /// skill RETIRE (`src/mcp/tools/skill_retire.rs`). Daemon-signed
+    /// governance-toggle lane (like `governance.rule_disabled`).
+    pub const SKILL_RETIRED: &str = "skill.retired";
+
+    /// #2024 (v1.0.0) — `signed_events.event_type` for an operator-authorized
+    /// skill UNRETIRE (`src/mcp/tools/skill_retire.rs`). Daemon-signed
+    /// governance-toggle lane (the reverse of [`SKILL_RETIRED`]).
+    pub const SKILL_UNRETIRED: &str = "skill.unretired";
+
+    /// #2024 (v1.0.0) — `signed_events.event_type` for an operator-authorized
+    /// skill HARD PURGE (`src/mcp/tools/skill_retire.rs::handle_skill_delete`).
+    /// Emitted (daemon-signed, carrying the purged ids + digests + ns/name)
+    /// BEFORE the `DELETE`, so the tamper-evident audit record survives the
+    /// content erasure (`signed_events` has no FK to `skills`).
+    pub const SKILL_PURGED: &str = "skill.purged";
+
     /// v0.9.0 §11.5 B7-SKILL (#1865) — `signed_events.event_type` for a
     /// skill-invocation capture, emitted by `memory_skill_get`
     /// (`src/mcp/tools/skill_get.rs`) every time an agent fetches a
