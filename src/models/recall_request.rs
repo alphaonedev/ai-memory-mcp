@@ -37,9 +37,24 @@ use serde_json::Value;
 /// #1558 batch 5 wave 3 — canonical recall-mode label stamped on the
 /// `mode` response field and the `recall_observations` ledger when the
 /// hybrid (FTS+semantic) pipeline ran AND the cross-encoder reranker
-/// re-ordered the results. The plain `"hybrid"` / `"keyword"` labels
-/// stay short literals at the two emit sites.
+/// re-ordered the results.
 pub const RECALL_MODE_HYBRID_RERANK: &str = "hybrid+rerank";
+
+/// #1839 (TRACT-gap G31) — canonical `mode` field label when the hybrid
+/// (FTS + semantic) pipeline ran WITHOUT a reranker re-order. Const-ified
+/// from the bare `"hybrid"` literals at the recall-`mode`-field emit sites so
+/// the mode vocabulary has one typed source of truth (pm-v3.1 no-hardcoded-
+/// literals). Capability-cut (embedder present), NOT a latency tier — see the
+/// contract §11 (G31 degradation ledger).
+pub const RECALL_MODE_HYBRID: &str = "hybrid";
+
+/// #1839 (TRACT-gap G31) — canonical `mode` field label when only the FTS
+/// keyword half ran (no semantic component — embedder absent or degraded).
+/// Const-ified from the bare `"keyword"` literals at the recall-`mode`-field
+/// emit sites. Capability-cut, NOT a latency tier. NB: distinct from the
+/// `meta.recall_mode = "keyword_only"` telemetry label, which is deliberately
+/// a different string and is left untouched.
+pub const RECALL_MODE_KEYWORD: &str = "keyword";
 
 /// v0.7.0 #972 D1.3 (#984) — `kinds` filter shape for `memory_recall`.
 ///
@@ -408,6 +423,16 @@ impl RecallRequest {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// #1839 (G31) — the recall-`mode` vocabulary SSOT. These exact strings are
+    /// the frozen wire contract every recall surface (HTTP/MCP) emits; a change
+    /// here is a wire regression. Capability-cut labels, NOT latency tiers.
+    #[test]
+    fn recall_mode_vocabulary_is_frozen() {
+        assert_eq!(RECALL_MODE_HYBRID_RERANK, "hybrid+rerank");
+        assert_eq!(RECALL_MODE_HYBRID, "hybrid");
+        assert_eq!(RECALL_MODE_KEYWORD, "keyword");
+    }
 
     #[test]
     fn from_mcp_params_requires_context() {

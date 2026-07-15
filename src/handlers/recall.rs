@@ -340,6 +340,11 @@ async fn recall_response(
     // hook_subscribers.rs.
     #[cfg(not(feature = "sal"))]
     let _ = recall_scope_tier;
+    // #1839 (TRACT-gap G31) — time the recall so the already-registered
+    // `ai_memory_recall_latency_seconds` histogram (labeled by `mode`) is
+    // actually observed instead of reporting permanent zeros. Observability
+    // ONLY — no latency governor acts on it (that is the deferred G31 gap).
+    let recall_started = std::time::Instant::now();
     // v0.7.0 Wave-3 Continuation 2 (Phase 10) — postgres-backed
     // hybrid recall via the SAL trait. Embeds the query AND dispatches
     // through `app.store.recall_hybrid` so the postgres adapter applies
@@ -365,9 +370,9 @@ async fn recall_response(
             None
         };
         let mode = if query_emb.is_some() {
-            "hybrid"
+            crate::models::RECALL_MODE_HYBRID
         } else {
-            "keyword"
+            crate::models::RECALL_MODE_KEYWORD
         };
 
         // `as_agent` is the explicit query-param override (admin /
@@ -557,6 +562,9 @@ async fn recall_response(
                 if let Some(b) = budget_tokens {
                     resp[field_names::BUDGET_TOKENS] = json!(b);
                 }
+                // #1839 G31 — observe recall latency (postgres path), labeled
+                // by the final post-rerank `mode`.
+                crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
                 // #1579 B4 — serialize per the negotiated format.
                 crate::handlers::wire_format::memories_response(format, resp)
             }
@@ -741,7 +749,7 @@ async fn recall_response(
                 // v0.8.0 #1720 A3 — owner-keyed visibility caller.
                 caller_owned.as_deref(),
             );
-            (r, "hybrid")
+            (r, crate::models::RECALL_MODE_HYBRID)
         } else {
             let r = db::recall(
                 conn,
@@ -759,7 +767,7 @@ async fn recall_response(
                 source_uri_owned.as_deref(),
                 caller_owned.as_deref(),
             );
-            (r, "keyword")
+            (r, crate::models::RECALL_MODE_KEYWORD)
         }
     })
     .await;
@@ -918,6 +926,9 @@ async fn recall_response(
                     "budget_overflow": outcome.budget_overflow,
                 });
             }
+            // #1839 G31 — observe recall latency (sqlite path), labeled by the
+            // final post-rerank `mode`.
+            crate::metrics::record_recall(mode, recall_started.elapsed().as_secs_f64());
             // #1579 B4 — serialize per the negotiated format.
             crate::handlers::wire_format::memories_response(format, resp)
         }

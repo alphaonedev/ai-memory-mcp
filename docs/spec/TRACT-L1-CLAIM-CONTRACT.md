@@ -365,6 +365,59 @@ criteria for the eventual cost: **monotonically non-decreasing in age/archival
 depth, non-increasing in recent access, and consistent with the current tier
 ordering (cost `long < mid < short`).**
 
+## 11. No latency-SLO degrade governor (G31, #1839)
+
+TRACT L2 (Pillar 14) wants a **latency governor** that reads recall p95 and
+selects a named degradation tier on a **latency budget** (full → drop rerank →
+drop semantic → keyword-only), surfaced in the response — so "graceful
+degradation tiers / latency-bounded recall" can be claimed. The substrate has
+**no such governor**. This § pins the honest current state.
+
+### 11.1 Honest current state — degrades are capability/load-cut, NOT latency
+
+Do NOT claim a "degradation ladder." What actually exists:
+
+| Degrade | Trigger | Axis |
+|---|---|---|
+| Embedder-failure → keyword (#1593) | the embedder is absent or `is_degraded()` — the query gets no semantic vector | **capability** (availability), not latency |
+| Reranker-degraded → `degraded_lexical` (`reranker.rs`) | the cross-encoder fell back to a lexical scorer | **capability** |
+| Admission-shed `503` (#1733) | global in-flight request cap exceeded | **load** — and it *rejects* the request (outermost middleware; it never reaches recall, produces no recall envelope, and is NOT a recall tier) |
+
+The recall `mode` field (`hybrid+rerank` / `hybrid` / `keyword`;
+`RECALL_MODE_*` in `models::recall_request`) reflects **which stages ran** — a
+**capability cut** (embedder present → `hybrid`; + reranker re-order →
+`hybrid+rerank`; else `keyword`). It is **not** latency-selected: a
+`hybrid+rerank` recall may be slow and a `keyword` recall fast. All degrades
+fire on FAILURE/LOAD, **never on a latency budget**. There is **no latency
+governor** and **no named degradation ladder**; the G31 ladder's "drop semantic
+*for latency*" rung **never occurs** (a `keyword` result only comes from
+embedder absence, never a deliberate latency-driven semantic drop).
+
+### 11.2 What #1839 shipped (honesty fixes, not the governor)
+
+- **Recall p95 is now measured.** The `ai_memory_recall_latency_seconds`
+  histogram was registered + `/metrics`-exposed (HELP "Recall latency in
+  seconds, labeled by mode") but **never observed** — it reported permanent
+  zeros (a §2.5 lie in the shipped surface). #1839 times the HTTP recall path
+  and `record_recall(mode, elapsed)`s into it, so the scraped metric is now
+  truthful. This is **observability only** — nothing acts on it (measurement ≠
+  governance).
+- **Mode vocabulary const-ified** (`RECALL_MODE_HYBRID`/`RECALL_MODE_KEYWORD`
+  beside the existing `RECALL_MODE_HYBRID_RERANK`) — one typed source of truth,
+  clearing a hardcoded-literal smell. NO degradation-tier type is minted: the
+  recall modes are a 3-value capability vocabulary, and a `DegradationTier`
+  enum would (a) fabricate arity (the 4th "drop-semantic" rung is unreachable),
+  (b) be inert (nothing parses `mode` back — no read side / no forcing
+  function), and (c) overclaim the very "graceful degradation tiers" the gap
+  says cannot be claimed. The #1839 5-agent vote `4d3ea1c5` rejected it.
+
+### 11.3 v1.x migration (deferred, 1:1 issue)
+
+The latency governor (a p95-reading actuator) is v1.x, tracked as **#2068**. Per
+the vote's wrong-axis finding it must reserve an **orthogonal actuation axis**
+(candidate-set caps / per-stage time-boxing / partial results *within* a mode),
+NOT assume the capability stages are the latency ladder.
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except
