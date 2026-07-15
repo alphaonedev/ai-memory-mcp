@@ -29,5 +29,6 @@
 //! honest minimum. See [`hex_bytes`] for the byte-field codec that makes L2
 //! byte-preservation possible.
 
+pub mod dto;
 pub mod hex_bytes;
 pub mod read;
