@@ -153,6 +153,18 @@ pub async fn recall_memories_get(
             return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate on the RECALL
+    // surface: under `enforce` a shared-key `Claimed` caller acting as a named
+    // principal cannot recall the victim's scope=private rows.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &caller_principal,
+        "recall_memories_get",
+    ) {
+        return resp;
+    }
     // v0.7.x #1155 — Accept-Provenance header gates Gap 7 derived
     // decoration on the HTTP recall envelope. Default HTTP shape is
     // bare (v0.6.x backwards compat); the header opts callers into
@@ -216,6 +228,17 @@ pub async fn recall_memories_post(
             return (axum::http::StatusCode::FORBIDDEN, Json(json!({"error": e}))).into_response();
         }
     };
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate (POST recall
+    // parity with the GET surface).
+    if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &caller_principal,
+        "recall_memories_post",
+    ) {
+        return resp;
+    }
     // v0.7.x #1155 — same Accept-Provenance gating as the GET path.
     let provenance_shape = crate::handlers::accept_provenance::resolve_from_headers(&headers);
     recall_response(
