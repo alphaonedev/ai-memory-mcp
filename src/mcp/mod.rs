@@ -549,6 +549,8 @@ mod skill_list;
 mod skill_register;
 #[path = "tools/skill_resource.rs"]
 mod skill_resource;
+#[path = "tools/skill_retire.rs"]
+mod skill_retire;
 #[path = "tools/skill_zstd.rs"]
 mod skill_zstd;
 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop:
@@ -685,6 +687,7 @@ pub use skill_list::handle_skill_list;
 pub use skill_promote::handle_skill_promote_from_reflection;
 pub use skill_register::handle_skill_register;
 pub use skill_resource::handle_skill_resource;
+pub use skill_retire::{handle_skill_delete, handle_skill_retire};
 
 // v0.7.0 #1111 — public re-exports for the HTTP-route closeout. The
 // six MCP handlers below were `pub(super)` so external callers couldn't
@@ -2216,6 +2219,14 @@ fn dispatch_memory_skill_compositional_context(ctx: &ToolDispatchCtx<'_>) -> Res
     handle_skill_compositional_context(ctx.conn, ctx.arguments)
 }
 
+fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_skill_retire(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
+fn dispatch_memory_skill_delete(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_skill_delete(ctx.conn, ctx.arguments, ctx.active_keypair)
+}
+
 /// `memory_offload` dispatch — resolves caller's agent_id through the
 /// same NHI precedence chain `memory_store` uses
 /// (explicit > metadata.agent_id > `mcp_client` > host fallback) so
@@ -2537,6 +2548,14 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         register_mcp_tool!(
             tool_names::MEMORY_SKILL_EXPORT,
             dispatch_memory_skill_export
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_RETIRE,
+            dispatch_memory_skill_retire
+        ),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_DELETE,
+            dispatch_memory_skill_delete
         ),
         register_mcp_tool!(
             tool_names::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,

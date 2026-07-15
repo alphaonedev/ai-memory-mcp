@@ -310,9 +310,10 @@ impl Family {
             | tn::MEMORY_ARCHIVE_PURGE
             | tn::MEMORY_ARCHIVE_RESTORE
             | tn::MEMORY_ARCHIVE_STATS => Some(Self::Archive),
-            // other (9 — 2 baseline + v0.7.0 L1-5 5 skill tools +
+            // other (11 — 2 baseline + v0.7.0 L1-5 5 skill tools +
             // v0.7.0 L2-6 memory_skill_promote_from_reflection (#671) +
-            // v0.7.0 L2-7 memory_skill_compositional_context (#672))
+            // v0.7.0 L2-7 memory_skill_compositional_context (#672) +
+            // #2024 memory_skill_retire + memory_skill_delete)
             tn::MEMORY_LIST_SUBSCRIPTIONS
             | tn::MEMORY_NOTIFY
             | tn::MEMORY_SKILL_REGISTER
@@ -320,6 +321,8 @@ impl Family {
             | tn::MEMORY_SKILL_GET
             | tn::MEMORY_SKILL_RESOURCE
             | tn::MEMORY_SKILL_EXPORT
+            | tn::MEMORY_SKILL_RETIRE
+            | tn::MEMORY_SKILL_DELETE
             | tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
             | tn::MEMORY_SKILL_COMPOSITIONAL_CONTEXT => Some(Self::Other),
             _ => None,
@@ -590,6 +593,10 @@ impl Family {
                 tn::MEMORY_SKILL_GET,
                 tn::MEMORY_SKILL_RESOURCE,
                 tn::MEMORY_SKILL_EXPORT,
+                // #2024 — operator-authorized skill retire/unretire lifecycle.
+                tn::MEMORY_SKILL_RETIRE,
+                // #2024 — hard-delete/purge (irreversible, retire-first gated).
+                tn::MEMORY_SKILL_DELETE,
                 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop.
                 tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
                 // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
@@ -1176,6 +1183,10 @@ mod tests {
             "memory_skill_get",
             "memory_skill_resource",
             "memory_skill_export",
+            // other (#2024 — operator-authorized skill retire/unretire)
+            "memory_skill_retire",
+            // other (#2024 — hard-delete/purge, retire-first gated)
+            "memory_skill_delete",
             // other (v0.7.0 L2-6 — issue #671: reflections become skills)
             "memory_skill_promote_from_reflection",
             // v0.7.0 L2-7 (issue #672) — reflection-skill composition.
@@ -1199,7 +1210,7 @@ mod tests {
         ];
         assert_eq!(
             baseline.len(),
-            66,
+            68,
             "baseline list = 43 (v0.6.3.1) + 1 (v0.7.0 I4 memory_replay) + \
              1 (v0.7 H4 memory_verify) + 1 (v0.7 B1 memory_load_family) + \
              1 (v0.7 B2 memory_smart_load) + \
@@ -1214,7 +1225,8 @@ mod tests {
              1 (v0.7.0 WT-1-C memory_atomise) + \
              1 (v0.7.0 Form 3 memory_ingest_multistep) + \
              1 (v0.7.0 Form 5 memory_calibrate_confidence) + \
-             1 (v0.7.0 issues #224 + #311 memory_share) = 66"
+             1 (v0.7.0 issues #224 + #311 memory_share) + \
+             2 (#2024 memory_skill_retire + memory_skill_delete) = 68"
         );
         for name in baseline {
             assert!(

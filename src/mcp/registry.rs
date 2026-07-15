@@ -145,12 +145,14 @@ pub mod tool_names {
     pub const MEMORY_SIGNAL_SEND: &str = "memory_signal_send";
     pub const MEMORY_SIGNAL_THREAD: &str = "memory_signal_thread";
     pub const MEMORY_SKILL_COMPOSITIONAL_CONTEXT: &str = "memory_skill_compositional_context";
+    pub const MEMORY_SKILL_DELETE: &str = "memory_skill_delete";
     pub const MEMORY_SKILL_EXPORT: &str = "memory_skill_export";
     pub const MEMORY_SKILL_GET: &str = "memory_skill_get";
     pub const MEMORY_SKILL_LIST: &str = "memory_skill_list";
     pub const MEMORY_SKILL_PROMOTE_FROM_REFLECTION: &str = "memory_skill_promote_from_reflection";
     pub const MEMORY_SKILL_REGISTER: &str = "memory_skill_register";
     pub const MEMORY_SKILL_RESOURCE: &str = "memory_skill_resource";
+    pub const MEMORY_SKILL_RETIRE: &str = "memory_skill_retire";
     pub const MEMORY_SMART_LOAD: &str = "memory_smart_load";
     pub const MEMORY_STATS: &str = "memory_stats";
     pub const MEMORY_STORE: &str = "memory_store";
@@ -261,12 +263,14 @@ pub mod tool_names {
         MEMORY_SIGNAL_SEND,
         MEMORY_SIGNAL_THREAD,
         MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
+        MEMORY_SKILL_DELETE,
         MEMORY_SKILL_EXPORT,
         MEMORY_SKILL_GET,
         MEMORY_SKILL_LIST,
         MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
         MEMORY_SKILL_REGISTER,
         MEMORY_SKILL_RESOURCE,
+        MEMORY_SKILL_RETIRE,
         MEMORY_SMART_LOAD,
         MEMORY_STATS,
         MEMORY_STORE,
@@ -448,6 +452,7 @@ pub mod tool_names {
                 MEMORY_SKILL_COMPOSITIONAL_CONTEXT,
                 "memory_skill_compositional_context"
             );
+            assert_eq!(MEMORY_SKILL_DELETE, "memory_skill_delete");
             assert_eq!(MEMORY_SKILL_EXPORT, "memory_skill_export");
             assert_eq!(MEMORY_SKILL_GET, "memory_skill_get");
             assert_eq!(MEMORY_SKILL_LIST, "memory_skill_list");
@@ -457,6 +462,7 @@ pub mod tool_names {
             );
             assert_eq!(MEMORY_SKILL_REGISTER, "memory_skill_register");
             assert_eq!(MEMORY_SKILL_RESOURCE, "memory_skill_resource");
+            assert_eq!(MEMORY_SKILL_RETIRE, "memory_skill_retire");
             assert_eq!(MEMORY_SMART_LOAD, "memory_smart_load");
             assert_eq!(MEMORY_STATS, "memory_stats");
             assert_eq!(MEMORY_STORE, "memory_store");
@@ -810,6 +816,8 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::skill_resource::SkillResourceTool>(),
         RegisteredTool::of::<crate::mcp::skill_export::SkillExportTool>(),
         RegisteredTool::of::<crate::mcp::skill_promote::SkillPromoteFromReflectionTool>(),
+        RegisteredTool::of::<crate::mcp::skill_retire::SkillRetireTool>(),
+        RegisteredTool::of::<crate::mcp::skill_retire::SkillDeleteTool>(),
         RegisteredTool::of::<crate::mcp::skill_compositional_context::SkillCompositionalContextTool>(
         ),
         RegisteredTool::of::<crate::mcp::offload::OffloadTool>(),

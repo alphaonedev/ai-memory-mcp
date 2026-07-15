@@ -274,14 +274,29 @@ pub(super) fn register_core(
         .map_err(|e| format!("skill register BEGIN IMMEDIATE: {e}"))?;
     let conn: &Connection = &tx;
 
-    // Find the current (non-superseded) row for this (namespace, name).
-    let prev_id: Option<String> = conn
+    // Find the current (non-superseded) row for this (namespace, name),
+    // carrying its `retired_at` so we can enforce the #2024 retire REFUSE.
+    let prev: Option<(String, Option<i64>)> = conn
         .query_row(
-            "SELECT id FROM skills WHERE namespace = ?1 AND name = ?2 AND superseded_by IS NULL",
+            "SELECT id, retired_at FROM skills \
+             WHERE namespace = ?1 AND name = ?2 AND superseded_by IS NULL",
             params![namespace, name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
+
+    // #2024 — REFUSE re-registration onto a RETIRED lineage. This runs
+    // INSIDE the BEGIN IMMEDIATE tx (which took the write lock up front),
+    // so a concurrent retire/register cannot race a silent revive: any
+    // retire mutation serialises against us, and the RAII drop of `tx`
+    // rolls back on this early return. Unretire the lineage before
+    // re-registering.
+    if matches!(prev, Some((_, Some(_)))) {
+        return Err(format!(
+            "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
+        ));
+    }
+    let prev_id: Option<String> = prev.map(|(id, _)| id);
 
     // Insert new row.
     conn.execute(

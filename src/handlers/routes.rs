@@ -85,6 +85,8 @@ pub const SKILL_ID_COMPOSE: &str = "/api/v1/skill/{id}/compose";
 pub const SKILL_ID_EXPORT: &str = "/api/v1/skill/{id}/export";
 pub const SKILL_ID_PROMOTE: &str = "/api/v1/skill/{id}/promote";
 pub const SKILL_ID_RESOURCE: &str = "/api/v1/skill/{id}/resource";
+/// #2024 — operator-authorized skill retire/unretire (admin-gated).
+pub const SKILL_ID_RETIRE: &str = "/api/v1/skill/{id}/retire";
 pub const STATS: &str = "/api/v1/stats";
 pub const SUBSCRIPTIONS: &str = "/api/v1/subscriptions";
 pub const SYNC_PUSH: &str = "/api/v1/sync/push";

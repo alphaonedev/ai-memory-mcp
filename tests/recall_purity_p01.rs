@@ -1055,10 +1055,10 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v80, #1949 custody-class +
-    // signed revocation) with the v77 `folded` column present.
+    // Fresh open reaches the current tip (v82, #2024 skill retire columns)
+    // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 81);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 82);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1066,7 +1066,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 81, "fresh open reaches the v81 tip");
+    assert_eq!(version, 82, "fresh open reaches the v82 tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

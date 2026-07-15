@@ -2178,6 +2178,12 @@
           "namespace": {
             "description": "Namespace filter. Omit or '%' = all.",
             "type": "string"
+          },
+          "include_retired": {
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -3205,6 +3211,88 @@
         "type": "object"
       },
       "name": "memory_action_next"
+    },
+    {
+      "description": "Retire (hide + block re-register) or unretire a skill lineage.",
+      "docs": "#2024: reversible RETIRE/UNRETIRE. Default target = whole (namespace,name) lineage; optional single version by skill_id. Idempotent (affected=0). Set unretire=true to reverse.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unretire": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_retire"
+    },
+    {
+      "description": "Hard-purge an entire skill lineage (irreversible; retire-first gated).",
+      "docs": "#2024: IRREVERSIBLE purge of the whole (namespace,name) lineage (all versions + resources). Refused unless the lineage is already retired OR force=true. Emits a signed skill.purged audit row that survives the erasure.",
+      "inputSchema": {
+        "properties": {
+          "agent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "force": {
+            "default": false,
+            "type": "boolean"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory_skill_delete"
     }
   ],
   "toolsVersion": "2026-05-06"

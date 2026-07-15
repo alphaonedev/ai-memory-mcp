@@ -24,17 +24,30 @@ use serde_json::{Value, json};
 pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, String> {
     let namespace = params["namespace"].as_str().unwrap_or("%");
     let filter = params["filter"].as_str().unwrap_or("");
+    // #2024 — discovery HIDES retired skills by default. `include_retired`
+    // drops the retired predicate so operators can enumerate retired
+    // lineages (each such entry carries `retired: true` + its stamp).
+    let include_retired = params[field_names::INCLUDE_RETIRED]
+        .as_bool()
+        .unwrap_or(false);
+    let retired_predicate = if include_retired {
+        ""
+    } else {
+        " AND retired_at IS NULL"
+    };
 
-    // Only return current (non-superseded) skills.
+    // Only return current (non-superseded) skills; retired rows are
+    // hidden unless `include_retired` is set (the predicate above).
+    let sql = format!(
+        "SELECT id, namespace, name, description, license, compatibility, \
+                allowed_tools, metadata, digest, signing_agent, created_at, retired_at \
+         FROM skills \
+         WHERE superseded_by IS NULL \
+           AND (namespace = ?1 OR ?1 = '%'){retired_predicate} \
+         ORDER BY namespace, name, created_at DESC"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id, namespace, name, description, license, compatibility, \
-                    allowed_tools, metadata, digest, signing_agent, created_at \
-             FROM skills \
-             WHERE superseded_by IS NULL \
-               AND (namespace = ?1 OR ?1 = '%') \
-             ORDER BY namespace, name, created_at DESC",
-        )
+        .prepare(&sql)
         .map_err(|e| format!("skill_list prepare: {e}"))?;
 
     let mut skills: Vec<Value> = Vec::new();
@@ -52,6 +65,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
                 row.get::<_, Vec<u8>>(8)?,        // digest
                 row.get::<_, Option<String>>(9)?, // signing_agent
                 row.get::<_, i64>(10)?,           // created_at
+                row.get::<_, Option<i64>>(11)?,   // retired_at
             ))
         })
         .map_err(|e| format!("skill_list query: {e}"))?;
@@ -69,6 +83,7 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             digest_bytes,
             signing_agent,
             created_at,
+            retired_at,
         ) = row.map_err(|e| format!("skill_list row: {e}"))?;
 
         // Apply optional text filter on name or description.
@@ -100,6 +115,12 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
         }
         if let Some(agent) = signing_agent {
             entry[field_names::SIGNING_AGENT] = json!(agent);
+        }
+        // #2024 — surface the retired flag on retired entries (only
+        // reachable when `include_retired` was set).
+        if let Some(ts) = retired_at {
+            entry[field_names::RETIRED] = json!(true);
+            entry[field_names::RETIRED_AT] = json!(ts);
         }
         // metadata is a JSON string — include it parsed.
         if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
@@ -134,6 +155,12 @@ pub struct SkillListRequest {
     /// Text filter on name + description.
     #[serde(default)]
     pub filter: Option<String>,
+
+    /// Include RETIRED skills in the listing (#2024). Default `false`
+    /// hides retired lineages from discovery; `true` drops the retired
+    /// predicate so retired entries appear (each carrying `retired`).
+    #[serde(default)]
+    pub include_retired: Option<bool>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_skill_list`.

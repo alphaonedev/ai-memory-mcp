@@ -241,7 +241,7 @@ pub fn handle_skill_compositional_context(
         }));
     }
 
-    Ok(json!({
+    let mut response = json!({
         "skill_id": skill_id,
         "skill_namespace": namespace,
         (field_names::SKILL_NAME): name,
@@ -251,7 +251,10 @@ pub fn handle_skill_compositional_context(
         (field_names::BUDGET_TOKENS): budget_tokens,
         (field_names::TOKENS_USED): tokens_used,
         (field_names::MEMORIES_DROPPED): dropped,
-    }))
+    });
+    // #2024 — surface the retired flag so a by-id caller can honor it.
+    super::skill_retire::apply_retired_fields(conn, skill_id, &mut response);
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
