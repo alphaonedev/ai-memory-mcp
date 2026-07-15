@@ -1,0 +1,51 @@
+{
+  "_template": "signed-rule-pack/illustrative-v1",
+  "_note": [
+    "#1980 — an ILLUSTRATIVE refuse-by-default agent-action rule template. This is",
+    "NOT a blessed, complete, or prescriptive security policy: the safe refusal set",
+    "is DEPLOYMENT-SPECIFIC. The example matchers below are deliberately fake",
+    "(*.invalid hosts, /example/ paths, example-* tools) so that copying this file",
+    "verbatim refuses NOTHING real. Author + tune every rule for your deployment",
+    "before you sign and enable it.",
+    "",
+    "These rules ship DISABLED and UNSIGNED. refuse-by-default is OPT-IN — the",
+    "substrate does NOT enable them for you. To activate the posture:",
+    "  1. edit these rules for your environment (real matchers, real reasons);",
+    "  2. `ai-memory rules keygen` (once) to mint the operator key;",
+    "  3. `ai-memory rules add --id <id> --kind <kind> --matcher '<json>' --severity refuse \\",
+    "        --reason '<why>' --disabled --sign` for each rule;",
+    "  4. review with `ai-memory rules list`, then `ai-memory rules enable <id> --sign`;",
+    "  5. confirm the installed set with `ai-memory doctor` (the policy-version digest",
+    "     drift check) and pin this file's published hash out-of-band.",
+    "See docs/governance/signed-rule-pack.md for the full workflow + the honest limits."
+  ],
+  "rules": [
+    {
+      "id": "example-fs-refuse",
+      "kind": "filesystem_write",
+      "matcher": { "glob": "/example/forbidden/path/**" },
+      "severity": "refuse",
+      "reason": "EXAMPLE ONLY — refuse writes outside the agent workspace. Replace this glob with your deployment's forbidden write paths.",
+      "namespace": "_global",
+      "enabled": false
+    },
+    {
+      "id": "example-net-refuse",
+      "kind": "network_request",
+      "matcher": { "host": "exfil.example.invalid" },
+      "severity": "refuse",
+      "reason": "EXAMPLE ONLY — refuse egress to an unapproved host. Replace with your deployment's egress denylist.",
+      "namespace": "_global",
+      "enabled": false
+    },
+    {
+      "id": "example-proc-refuse",
+      "kind": "process_spawn",
+      "matcher": { "binary": "example-forbidden-tool" },
+      "severity": "refuse",
+      "reason": "EXAMPLE ONLY — refuse spawning an unapproved tool. Replace with your deployment's binary denylist.",
+      "namespace": "_global",
+      "enabled": false
+    }
+  ]
+}
