@@ -530,6 +530,8 @@ pub mod background;
 // (mirrors `crate::signals`); backs the SAL `checkpoint_*` surface + the
 // future MCP `memory_checkpoint_*` handlers over a bare rusqlite Connection.
 pub mod checkpoints;
+// v1.0.0 #1836 (TRACT-gap G22) — non-authoritative Claim view + divergence record.
+pub mod claim;
 pub mod cli;
 pub mod color;
 /// v0.7.0 Form 5 (issue #758) — auto-confidence + shadow-mode +
