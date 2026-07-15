@@ -6,12 +6,16 @@
 # threshold, this job fails and the PR cannot merge until coverage is
 # restored.
 #
-# Complementary to the `Code Coverage` job in `ci.yml`:
-#   - `Code Coverage` (ci.yml) enforces the absolute floor + ratchet on
-#     TOTAL line coverage (catastrophic-regression backstop).
-#   - `Per-Module Coverage Thresholds` (this file) enforces a per-module
-#     floor so that no single module can quietly slide while the workspace
-#     average stays high.
+# This workflow OWNS code coverage end-to-end (#1993). It enforces both:
+#   - the GLOBAL line floor (`coverage/thresholds.toml [global]
+#     .min_line_coverage`) — the catastrophic-regression backstop that the
+#     former `Code Coverage` job in `ci.yml` used to guard; AND
+#   - the per-module floors, so no single module can quietly slide while
+#     the workspace average stays high.
+# It also posts the sticky coverage PR comment (see the `Post coverage to
+# PR` step below). The redundant `ci.yml` `Code Coverage` job (a second
+# full instrumented `cargo llvm-cov` sweep per PR) was removed in #1993
+# because it timed out mid-generation and duplicated this gate's work.
 #
 # v0.7.0 ship-hardening (2026-05-20) — instrument with live PG+AGE+pgvector
 # service container so postgres-store tests connect at runtime instead of
@@ -223,7 +227,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-models-minilm-l6-v2-marco-l6-v2-v1
+          # Bump the version suffix (…-v2) whenever the pinned model set or
+          # the staged cache layout changes. `restore-keys` lets a stale-but-
+          # compatible cache seed the dir so the pre-stage step only has to
+          # top up deltas instead of a full cold re-download on every key bump.
+          key: hf-models-minilm-l6-v2-marco-l6-v2-v2
+          restore-keys: |
+            hf-models-minilm-l6-v2-marco-l6-v2-
 
       - name: Pre-stage HF models with retry (#2019)
         env:
@@ -246,6 +256,41 @@ jobs:
               sleep $((attempt*10))
             done
             [ "$ok" = 1 ] || { echo "::error::could not stage $m after 5 attempts"; exit 1; }
+          done
+
+      # #2019 — VERIFY the Python-staged cache is resolvable by the RUST
+      # `hf-hub` 0.5 loader the tests actually use. `ApiRepo::get()` is
+      # cache-first: it reads `refs/main` → resolves `snapshots/<commit>/
+      # <file>` and returns it WITHOUT any network call, falling through to
+      # a live download ONLY on a cache MISS. So the reranker
+      # (`Api::new().get(...)`) + embedder (`download_via_hf_hub` → `.get()`)
+      # never touch the network as long as the staged layout matches what
+      # `hf-hub::Cache::get` expects. `huggingface_hub` (the pre-stage tool)
+      # and `hf-hub` (the test loader) are DIFFERENT tools, so this step
+      # asserts the layout the Rust side resolves rather than trusting the
+      # Python writer — a mismatch fails LOUD here (deterministic staging
+      # error) instead of silently degrading to the keyword path and
+      # dropping reranker.rs / embeddings.rs / daemon_runtime.rs below floor.
+      - name: Verify staged HF cache is hf-hub-resolvable (#2019)
+        run: |
+          set -euo pipefail
+          hub="$HOME/.cache/huggingface/hub"
+          # repo dir name = models--<org>--<name>; artifact files mirror the
+          # crate consts HF_{CONFIG,TOKENIZER,WEIGHTS}_FILE in src/embeddings.rs.
+          for repo in \
+            models--sentence-transformers--all-MiniLM-L6-v2 \
+            models--cross-encoder--ms-marco-MiniLM-L-6-v2; do
+            base="$hub/$repo"
+            ref="$base/refs/main"
+            [ -f "$ref" ] || { echo "::error::missing ref $ref — cache not hf-hub-resolvable"; exit 1; }
+            commit="$(tr -d '[:space:]' < "$ref")"
+            snap="$base/snapshots/$commit"
+            [ -d "$snap" ] || { echo "::error::missing snapshot dir $snap for $repo"; exit 1; }
+            for f in config.json tokenizer.json model.safetensors; do
+              # -e follows symlinks (hf cache snapshots are symlinks into blobs/).
+              [ -e "$snap/$f" ] || { echo "::error::missing $f in $snap ($repo)"; exit 1; }
+            done
+            echo "::notice::$repo resolvable at $snap (all 3 artifacts present)"
           done
 
       - name: Install cargo-llvm-cov
@@ -307,10 +352,55 @@ jobs:
         # are unaffected; the 75-minute job timeout absorbs the serial run.
 
       - name: Enforce per-module thresholds
+        id: thresholds
         run: |
           bash coverage/check-thresholds.sh \
             coverage/thresholds.toml \
             coverage/current.json
+
+      # #1993 — the sticky coverage PR comment moved here from the removed
+      # `ci.yml` `Code Coverage` job so `coverage.yml` owns coverage
+      # end-to-end. Rendered from the authoritative `coverage/current.json`
+      # (the same sal,sal-postgres sweep the gate enforces). Runs on
+      # `always()` so the numbers post even when the threshold gate FAILS
+      # (the failed `Enforce per-module thresholds` step still blocks — this
+      # comment is informational, not a bypass).
+      - name: Render coverage comment body (#1993)
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          global_floor=$(grep -E '^min_line_coverage[[:space:]]*=' coverage/thresholds.toml \
+            | head -1 | awk -F= '{print $2}' | awk '{print $1}' | tr -d ' ')
+          if [ -f coverage/current.json ] && command -v jq >/dev/null 2>&1; then
+            global_pct=$(jq -r '.data[0].totals.lines.percent // empty' coverage/current.json 2>/dev/null || echo "")
+          else
+            global_pct=""
+          fi
+          gate="${{ steps.thresholds.outcome }}"
+          case "$gate" in
+            success) gate_line="PASS — all per-module floors + global floor hold" ;;
+            failure) gate_line="FAIL — a module (or the global total) dropped below its floor; see the \`Enforce per-module thresholds\` step log" ;;
+            *)       gate_line="$gate (coverage JSON may be unavailable — see the sweep step log)" ;;
+          esac
+          {
+            echo "### Per-Module Coverage Gate"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| measured (global lines) | **${global_pct:-n/a}%** |"
+            echo "| global floor | ${global_floor:-n/a}% |"
+            echo "| gate result | ${gate_line} |"
+            echo ""
+            echo "Feature set: \`--features sal,sal-postgres --lib --tests --workspace\` (live PG + AGE + pgvector)."
+            echo "Per-module floors live in \`coverage/thresholds.toml\`; the gate is \`coverage/check-thresholds.sh\`."
+          } > coverage/comment.md
+
+      - name: Post coverage to PR (sticky) (#1993)
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage-gate
+          path: coverage/comment.md
 
       - name: Upload coverage JSON
         if: always()
