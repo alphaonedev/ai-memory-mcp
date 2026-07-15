@@ -3656,6 +3656,134 @@ pub fn memory_is_tombstoned(conn: &Connection, memory_id: &str) -> Result<bool> 
     Ok(exists)
 }
 
+/// #1832 (TRACT-gap G18) — a read-only projection of a persisted v71
+/// `forget_tombstones` row: the SIGNED ERASURE ATTESTATION the substrate
+/// ALREADY computes at forget time (`purge_and_tombstone_forget`) and stores,
+/// surfaced so the requester can actually RECEIVE their proof-of-erasure.
+///
+/// # This is a receipt, NOT covenant enforcement
+///
+/// This is deliberately narrow: a right-to-be-forgotten RECEIPT (proof that a
+/// forget was RECORDED), **not** an assertion that the TRACT human↔AI covenant
+/// is enforced (its other clauses — a mandatory `why_trace` write-gate,
+/// immutable-authorship enforcement, permanent-dissent conservation — are
+/// UNIMPLEMENTED; see `docs/spec/TRACT-L1-CLAIM-CONTRACT.md` §8). The receipt is
+/// never re-signed here — it projects the bytes signed once at forget time.
+///
+/// The signature commits ONLY to `{memory_id, namespace, forgotten_at}` (the
+/// [`forget_tombstone_signable_bytes`] pre-image) — NEVER content (a content
+/// fingerprint would re-leak the erased row). [`signed`](Self::signed) is
+/// `false` on an unsigned daemon (no enrolled audit key — a common posture),
+/// in which case the receipt carries identity + time but NO cryptographic
+/// proof: read `signed` BEFORE trusting `signature`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForgetReceipt {
+    /// The forgotten memory's id (a `forget_tombstones` row exists for it).
+    pub memory_id: String,
+    /// The namespace the forgotten memory lived in.
+    pub namespace: String,
+    /// RFC3339 instant the forget was recorded (`forgotten_at`).
+    pub forgotten_at: String,
+    /// The forgotten row's owner `agent_id`, when it carried one. This is the
+    /// VICTIM's owner, NOT the signer (the signer is always the daemon audit
+    /// key).
+    pub agent_id: Option<String>,
+    /// The daemon-audit-key Ed25519 signature over
+    /// [`forget_tombstone_signable_bytes`], when the daemon had an enrolled
+    /// key at forget time. `None` on an unsigned daemon.
+    pub signature: Option<Vec<u8>>,
+    /// `true` iff [`signature`](Self::signature) is present. A convenience
+    /// mirror so a consumer never mistakes an unsigned receipt for a proof.
+    pub signed: bool,
+}
+
+/// #1832 — the verdict of verifying a [`ForgetReceipt`] against a daemon audit
+/// verifying key. An UNSIGNED receipt is [`Unsigned`](Self::Unsigned) — never
+/// [`Valid`](Self::Valid): a missing signature is the absence of proof, not
+/// proof of anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetReceiptVerdict {
+    /// The signature verified against the supplied key over the receipt's own
+    /// recomputed signable bytes.
+    Valid,
+    /// A signature is present but did not verify (wrong key, tampered receipt,
+    /// or malformed signature).
+    Invalid,
+    /// No signature on the receipt — the forget was recorded on an unsigned
+    /// daemon, so there is nothing to verify.
+    Unsigned,
+}
+
+/// #1832 — read the [`ForgetReceipt`] for an already-forgotten `memory_id`, or
+/// `Ok(None)` when no `forget_tombstones` row exists for it. A pure read
+/// projection of the v71 columns — it neither forgets nor re-signs.
+///
+/// # Errors
+/// - The underlying `SELECT` fails (I/O / corruption).
+pub fn get_forget_tombstone(conn: &Connection, memory_id: &str) -> Result<Option<ForgetReceipt>> {
+    use rusqlite::OptionalExtension;
+    let row = conn
+        .query_row(
+            "SELECT memory_id, namespace, forgotten_at, agent_id, signature \
+             FROM forget_tombstones WHERE memory_id = ?1",
+            params![memory_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row.map(
+        |(memory_id, namespace, forgotten_at, agent_id, signature)| {
+            let signed = signature.is_some();
+            ForgetReceipt {
+                memory_id,
+                namespace,
+                forgotten_at,
+                agent_id,
+                signature,
+                signed,
+            }
+        },
+    ))
+}
+
+/// #1832 — verify a [`ForgetReceipt`]'s signature against a daemon audit
+/// `verifying_key`, RECOMPUTING the canonical signable bytes from the receipt's
+/// OWN `{memory_id, namespace, forgotten_at}` (never a presented digest — the
+/// #1464 / #626 discipline). Reuses the already-public
+/// [`forget_tombstone_signable_bytes`] pre-image + Ed25519 `verify_strict`, so
+/// this adds no new crypto contract — only exposes the one the forget path
+/// already froze at schema v71.
+#[must_use]
+pub fn verify_forget_receipt(
+    receipt: &ForgetReceipt,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+) -> ForgetReceiptVerdict {
+    use ed25519_dalek::Signature;
+    let Some(sig_bytes) = receipt.signature.as_deref() else {
+        return ForgetReceiptVerdict::Unsigned;
+    };
+    let Ok(sig) = Signature::from_slice(sig_bytes) else {
+        return ForgetReceiptVerdict::Invalid;
+    };
+    let signable = forget_tombstone_signable_bytes(
+        &receipt.memory_id,
+        &receipt.namespace,
+        &receipt.forgotten_at,
+    );
+    match verifying_key.verify_strict(&signable, &sig) {
+        Ok(()) => ForgetReceiptVerdict::Valid,
+        Err(_) => ForgetReceiptVerdict::Invalid,
+    }
+}
+
 /// v0.9.0 G8 (#1825) — read a row's storage-internal `cid_genesis`
 /// pre-image on demand (it is deliberately NOT a [`Memory`] field). The
 /// verify path uses it to recompute + check the BLAKE3 address. Returns
@@ -16353,6 +16481,90 @@ mod tests {
 
     fn test_db() -> Connection {
         open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    /// #1832 (TRACT-gap G18) — forget-receipt round-trip: a receipt whose
+    /// signature was minted over the canonical [`forget_tombstone_signable_bytes`]
+    /// verifies `Valid`; tampering ANY signed field flips it to `Invalid`; a
+    /// receipt with no signature is `Unsigned` (never `Valid`).
+    #[test]
+    fn forget_receipt_1832_verify_round_trip() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let vk = sk.verifying_key();
+        let (id, ns, at) = ("mem-abc", "team/eng", "2026-07-15T00:00:00Z");
+        let sig = sk.sign(&forget_tombstone_signable_bytes(id, ns, at));
+
+        let receipt = ForgetReceipt {
+            memory_id: id.to_string(),
+            namespace: ns.to_string(),
+            forgotten_at: at.to_string(),
+            agent_id: Some("ai:owner".to_string()),
+            signature: Some(sig.to_bytes().to_vec()),
+            signed: true,
+        };
+        assert_eq!(
+            verify_forget_receipt(&receipt, &vk),
+            ForgetReceiptVerdict::Valid,
+            "a faithfully-signed receipt must verify"
+        );
+
+        // Tamper a signed field — recompute of the signable diverges → Invalid.
+        let mut tampered = receipt.clone();
+        tampered.namespace = "attacker/ns".to_string();
+        assert_eq!(
+            verify_forget_receipt(&tampered, &vk),
+            ForgetReceiptVerdict::Invalid,
+            "tampering the namespace must break verification"
+        );
+
+        // Wrong key → Invalid.
+        let other = SigningKey::from_bytes(&[9u8; 32]).verifying_key();
+        assert_eq!(
+            verify_forget_receipt(&receipt, &other),
+            ForgetReceiptVerdict::Invalid,
+            "a different key must not verify"
+        );
+
+        // Unsigned receipt is never Valid.
+        let unsigned = ForgetReceipt {
+            signature: None,
+            signed: false,
+            ..receipt.clone()
+        };
+        assert_eq!(
+            verify_forget_receipt(&unsigned, &vk),
+            ForgetReceiptVerdict::Unsigned,
+            "a missing signature is the absence of proof, not proof"
+        );
+    }
+
+    /// #1832 — the accessor projects a persisted tombstone; on an unsigned
+    /// test daemon (no audit key) the receipt is present but `signed = false`,
+    /// and a never-forgotten id yields `None`.
+    #[test]
+    fn forget_receipt_1832_accessor_projects_tombstone() {
+        let conn = test_db();
+        conn.execute(
+            "INSERT INTO forget_tombstones \
+                 (memory_id, namespace, forgotten_at, agent_id, signature) \
+             VALUES ('m1', 'ns', '2026-07-15T00:00:00Z', 'ai:owner', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let got = get_forget_tombstone(&conn, "m1").unwrap().unwrap();
+        assert_eq!(got.memory_id, "m1");
+        assert_eq!(got.namespace, "ns");
+        assert_eq!(got.agent_id.as_deref(), Some("ai:owner"));
+        assert!(!got.signed, "NULL signature column → unsigned receipt");
+        assert!(got.signature.is_none());
+
+        assert!(
+            get_forget_tombstone(&conn, "never").unwrap().is_none(),
+            "no tombstone → None"
+        );
     }
 
     /// v1.0.0 #1831 (G17) — end-to-end persisted M-of-N key-loss recovery:

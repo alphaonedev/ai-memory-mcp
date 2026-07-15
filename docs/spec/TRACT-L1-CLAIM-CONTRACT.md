@@ -195,6 +195,64 @@ migrate the 5 substrate extras to authored predicates or reversed-kernel
 mappings; add the 4 missing kernel relations with real producers; resolve the
 §7.2 bisection + the §7.3 near-homophone. Gated on the CC0 vectors (#1837).
 
+## 8. The human↔AI covenant (G18, #1832) — 1-of-4 clauses shipped
+
+TRACT L1's human↔AI covenant is a four-clause mutual-obligation contract. It is
+**NOT enforced** at v1.0.0: three of its four clauses are UNIMPLEMENTED and one
+is shipped as a narrow, honestly-scoped primitive. Nothing in the substrate may
+assert "the covenant is enforced" while §8.1 stands.
+
+### 8.1 Clause ledger (honesty)
+
+| # | Covenant clause | Substrate state at v1.0.0 |
+|---|---|---|
+| 1 | **`why_trace` write-gate** — a mutation must carry a recorded cause | ⚠️ PARTIAL. The cause exists as DATA (`signed_events.cause_hash`, schema v73) + an opt-in VERIFY-time require-mode (`AI_MEMORY_REQUIRE_CAUSE_BINDING`), but it is NOT a mandatory WRITE-gate. Making it mandatory-by-default is a default-flip → **freeze-hostile / v1.x**. |
+| 2 | **Immutable authorship** — authorship cannot be silently rewritten | ⚠️ PARTIAL. `agent_lineage` (schema v76) is an append-only signed succession record + `metadata.agent_id` is preserved across every mutation path, but there is no covenant-level enforcement LAYER binding a write to an immutable author. **Freeze-hostile / v1.x.** |
+| 3 | **Permanent-dissent conservation (G7)** — a recorded dissent is never destroyed | ❌ ABSENT. No net-new dissent-conservation mechanism exists. **Freeze-hostile / v1.x** (net-new representation + write-path enforcement). |
+| 4 | **Signed forget-receipt returned to the requester** — proof-of-erasure the requester actually receives | ✅ SHIPPED (v1.0.0, #1832). See §8.2. |
+
+### 8.2 Clause 4 — the signed erasure attestation (shipped, de-branded)
+
+The forget path (`storage::purge_and_tombstone_forget`) ALREADY computes and
+persists, at forget time, a `forget_tombstones` row `{memory_id, namespace,
+forgotten_at, agent_id, signature}` (schema v71, both backends), where
+`signature` is the daemon audit key's Ed25519 over the versioned, content-FREE
+[`forget_tombstone_signable_bytes`] pre-image (`forget-tombstone-v1\x00 ‖ id ‖
+0x00 ‖ ns ‖ 0x00 ‖ forgotten_at`). Before #1832 that signature was DISCARDED —
+`forget()` returned only a count.
+
+#1832 surfaces it as a **read-only projection**, deliberately minimal so it
+freezes essentially nothing new (the crypto contract — table columns, signable
+pre-image, signature semantics — was already frozen at v71 / v0.8.1):
+
+- `crate::db::ForgetReceipt` — `{memory_id, namespace, forgotten_at, agent_id,
+  signature: Option<…>, signed: bool}`, `#[non_exhaustive]`.
+- `crate::db::get_forget_tombstone(conn, id)` — projects the persisted row; never
+  forgets, never re-signs.
+- `crate::db::verify_forget_receipt(receipt, verifying_key)` — recomputes the
+  signable bytes from the receipt's OWN fields (never a presented digest) and
+  `verify_strict`s; verdict `Valid | Invalid | Unsigned`.
+- CLI: `ai-memory forget --show-receipt <id>` / `--verify-receipt <id>`
+  (query-only sub-modes of the existing `forget` command — no new top-level
+  command, no MCP tool / HTTP route, mirroring the #1727 `undo-edit` CLI-only
+  precedent).
+
+**Honest scope (§2.5 discipline).** This is a right-to-be-forgotten RECEIPT
+(proof a forget was RECORDED), **NOT** covenant enforcement — it is never named
+"covenant" in any symbol. The signature commits ONLY to `{id, ns, forgotten_at}`,
+NEVER content. On an unsigned daemon (no enrolled audit key — a common posture)
+`signed = false` and the receipt carries identity + time but NO cryptographic
+proof; `verify` returns `Unsigned`, never `Valid`. Because clauses 1-3 are
+unenforced, a receipt can attest an erasure the full covenant might have governed
+differently — the receipt makes NO claim beyond "this forget was recorded."
+
+### 8.3 v1.x migration (deferred, 1:1 issues)
+
+Clauses 1-3 are each tracked as their own v1.x issue (never bundled): the
+mandatory `why_trace` write-gate default-flip; immutable-authorship enforcement;
+permanent-dissent conservation (G7). A postgres/HTTP/MCP forget-receipt surface
+(beyond the sqlite CLI) is a separate additive v1.x follow-up.
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except

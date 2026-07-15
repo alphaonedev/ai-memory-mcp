@@ -151,7 +151,7 @@ impl ClaimView {
             confidence_current: mem.confidence,
             attest_level: mem
                 .metadata
-                .get("attest_level")
+                .get(crate::models::field_names::ATTEST_LEVEL)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("claimed")
                 .to_string(),
