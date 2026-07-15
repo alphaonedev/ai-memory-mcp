@@ -64,6 +64,13 @@ pub const CONDITION_TYPE: &str = "condition_type";
 pub const CONFIDENCE: &str = crate::models::field_names::CONFIDENCE;
 pub const CONSUMED: &str = "consumed";
 pub const CONTENT: &str = "content";
+// #1974 — opt-in content patch primitive on `memory_update`. A single
+// append XOR unique-match replace op that assembles the full replacement
+// content from the current stored content (mutually exclusive with the
+// full-replacement `content`).
+pub const CONTENT_APPEND: &str = "content_append";
+pub const CONTENT_REPLACE_FROM: &str = "content_replace_from";
+pub const CONTENT_REPLACE_TO: &str = "content_replace_to";
 pub const CONTEXT: &str = "context";
 pub const CORRELATION_ID: &str = crate::models::field_names::CORRELATION_ID;
 pub const CREATED_AT: &str = crate::models::field_names::CREATED_AT;
@@ -211,6 +218,9 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     CONFIDENCE,
     CONSUMED,
     CONTENT,
+    CONTENT_APPEND,
+    CONTENT_REPLACE_FROM,
+    CONTENT_REPLACE_TO,
     CONTEXT,
     CREATED_AT,
     CREATED_BY,
@@ -333,9 +343,11 @@ mod tests {
         // capability token on the governed mutation tools.
         // v1.0.0 #1957 R40 — 123 -> 124: APPROVALS (pending-approve m-of-n).
         // v1.0.0 #1959 R55 — 124 -> 125: TRANSITIVE (dependents transitive walk).
+        // v1.0.0 #1974 — 125 -> 128: CONTENT_APPEND + CONTENT_REPLACE_FROM +
+        //   CONTENT_REPLACE_TO (memory_update content patch primitive).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            125,
+            128,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }
