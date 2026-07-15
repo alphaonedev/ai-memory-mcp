@@ -15143,15 +15143,16 @@ async fn h5_verify_link_strict_mode_rejects_missing_nonce_with_400() {
 fn h5_replay_cache_dedups_identical_tuple() {
     use crate::identity::replay::{ReplayCache, ReplayDecision};
     let cache = ReplayCache::new();
+    let caller = "host:test-caller";
     let link_id = "src|tgt|related_to";
     let nonce = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
     assert_eq!(
-        cache.record_and_check(link_id, b"", nonce),
+        cache.record_and_check(caller, link_id, b"", nonce),
         ReplayDecision::Fresh,
         "first verify must be fresh"
     );
     assert_eq!(
-        cache.record_and_check(link_id, b"", nonce),
+        cache.record_and_check(caller, link_id, b"", nonce),
         ReplayDecision::Replay,
         "repeat verify with same nonce must trigger replay"
     );

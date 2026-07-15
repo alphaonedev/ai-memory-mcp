@@ -1025,12 +1025,16 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             max_storage_bytes: limits.max_storage_bytes,
             max_links_per_day: limits.max_links_per_day,
         });
-        // #1733 (Pillar-4 4.A) — seed the process-wide HTTP admission-control
-        // in-flight cap from the resolved `[limits]` config (env
-        // `AI_MEMORY_MAX_INFLIGHT_REQUESTS` > `[limits].max_inflight_requests`
-        // > compiled default `0` = disabled). `build_router_with_timeout`
-        // reads it at router-build time. Idempotent; harmless on the mcp/CLI
-        // paths that never build the HTTP router.
+        // #1733 (Pillar-4 4.A) + #2032 M3 — seed the process-wide HTTP
+        // admission-control in-flight cap from the resolved `[limits]` config
+        // (env `AI_MEMORY_MAX_INFLIGHT_REQUESTS` >
+        // `[limits].max_inflight_requests` > CPU-scaled default). Per the
+        // #2032 M3 T3 fail-open→fail-closed flip an UNSET knob resolves to
+        // `config::resolve_default_max_inflight_requests()` (floor 256,
+        // ceiling 4096), so this seeds admission control ON by default; only
+        // an explicit `0` disables it. `build_router_with_timeout` reads it
+        // at router-build time. Idempotent; harmless on the mcp/CLI paths
+        // that never build the HTTP router.
         crate::set_max_inflight_requests(limits.max_inflight_requests);
     }
     // #1579 B7 — seed the process-wide sqlite `PRAGMA mmap_size` from
@@ -4208,6 +4212,50 @@ fn governance_consultation_unavailable_inner(
 /// string-match loopback guard alone cannot protect them.
 fn require_api_key_strict() -> bool {
     std::env::var("AI_MEMORY_REQUIRE_API_KEY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
+/// "TLS terminated upstream" acknowledgement escape hatch. When truthy the
+/// operator asserts a reverse proxy / service-mesh sidecar terminates TLS in
+/// front of the daemon, so a non-loopback bind without in-process TLS is an
+/// accepted posture.
+///
+/// DEFINE-ONLY at tranche 2: this resolver + its CLAUDE.md env-var row + its
+/// `tests/config_precedence.rs` case land now so tranche 3 can reference a
+/// stable name. The `tls_bind_guard` that CONSUMES it (turning a keyed
+/// non-loopback bind without this ack into a refusal) lands in tranche 3 —
+/// binding behaviour is UNCHANGED this tranche.
+pub const ENV_ALLOW_PLAINTEXT_NONLOOPBACK: &str = "AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK";
+
+/// #2032 M2 (class-a, 5-agent vote `4d3ea1c5`) — env name for the
+/// fail-closed-now TLS opt-in. When truthy the operator demands in-process
+/// TLS on every bind; a plaintext bind is refused.
+///
+/// DEFINE-ONLY at tranche 2 (resolver + CLAUDE.md row + precedence test); the
+/// `tls_bind_guard` that CONSUMES it lands in tranche 3. Binding behaviour is
+/// UNCHANGED this tranche.
+pub const ENV_REQUIRE_TLS: &str = "AI_MEMORY_REQUIRE_TLS";
+
+/// #2032 M2 — resolve the `AI_MEMORY_ALLOW_PLAINTEXT_NONLOOPBACK` escape
+/// hatch (default `false`). Mirrors the truthy grammar of
+/// [`require_api_key_strict`] (`1` / `true`, case-insensitive). DEFINE-ONLY:
+/// no bind path consults this yet (tranche 3).
+#[must_use]
+pub fn allow_plaintext_nonloopback_enabled() -> bool {
+    std::env::var(ENV_ALLOW_PLAINTEXT_NONLOOPBACK)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// #2032 M2 — resolve the `AI_MEMORY_REQUIRE_TLS` fail-closed opt-in
+/// (default `false`). Mirrors the truthy grammar of
+/// [`require_api_key_strict`]. DEFINE-ONLY: no bind path consults this yet
+/// (tranche 3).
+#[must_use]
+pub fn require_tls_enabled() -> bool {
+    std::env::var(ENV_REQUIRE_TLS)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }

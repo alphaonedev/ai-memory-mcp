@@ -796,6 +796,16 @@ static MAX_INFLIGHT_REQUESTS: std::sync::atomic::AtomicUsize =
 /// Seed the process-wide HTTP admission-control in-flight cap (#1733).
 /// Called once at daemon boot from the resolved `[limits]` config. `0`
 /// disables admission control (no layer composed).
+///
+/// #2032 M3 (5-agent vote `4d3ea1c5`) — the resolved cap an UNSET knob
+/// produces is now the CPU-scaled
+/// [`config::resolve_default_max_inflight_requests`] (floor 256, ceiling
+/// 4096), so the daemon ships with load-shedding ON by default; only an
+/// explicit `AI_MEMORY_MAX_INFLIGHT_REQUESTS=0` (or
+/// `[limits].max_inflight_requests = 0`) seeds `0` here. The pre-boot
+/// atomic seed stays `DEFAULT_MAX_INFLIGHT_REQUESTS` (`0`, disabled) so
+/// per-binary integration tests that build a router before boot behave
+/// as before until they opt in via this setter.
 pub fn set_max_inflight_requests(cap: usize) {
     MAX_INFLIGHT_REQUESTS.store(cap, std::sync::atomic::Ordering::Relaxed);
 }
