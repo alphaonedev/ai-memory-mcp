@@ -531,6 +531,61 @@ GC'd), (b) **routes the direct `tier=long` write lane** to the promote court, an
 court-namespace exclusion-set bind mirroring `build_namespace_chain`), behind a
 flag + WARN cycle. **Not** court-gating the callerless fold.
 
+## 14. Namespace is a filter, not an enforced trust boundary (G10.4, #1864)
+
+TRACT §26 wants namespace to be a **trust boundary**: cross-namespace recall
+should require an explicit **bridge-capability** (the read-side analogue of the
+shipped G10.1 write-gate joiner). Today it does not — cross-namespace recall is
+**unrestricted**. This § pins the honest state; the machine-checks are
+`storage::tests::g10_4_*`.
+
+### 14.1 Honest current state
+
+- **Recall spans namespaces un-gated.** `RecallRequest.namespace` is an optional
+  filter; `None` returns rows from **every** namespace (the `(?N IS NULL OR
+  namespace = ?N)` predicate). The read path consults **no capability token** —
+  `search`/`recall`/`list`/`session_start` have no `capability` parameter and
+  never call `enforce_governance`.
+- **The filter is EXACT-match, not hierarchical.** `namespace = "team"` does NOT
+  match `team/eng` (`NS_FILTER_SARGABLE = "namespace = $1"`; sqlite exact-match).
+  So only `namespace = None` (span-all) is genuinely "cross-namespace".
+- **The only read isolation is the per-row scope ACL** (`scope = private / team /
+  unit / org` via `is_visible_to_caller` / `scope_idx`) — it bounds
+  *confidentiality*, but it is **not** a namespace bridge.
+
+So namespace is a **filter, not an enforced trust boundary** — an agent/operator
+who assumes namespace isolates reads is wrong at v1.0.0 GA.
+
+### 14.2 Why the bridge-capability is deferred (v1.x, #2074) — not a clean reuse, and underspecified
+
+The G10.1 capability primitive (`Caveat::NamespacePrefix`, `op_level_of("Reflect")
+→ OpLevel::Read`) is the **intended** bridge, but recall does not consume it, and
+wiring it is neither a clean reuse nor fully specified:
+
+- **Not a reuse.** `apply_capability_grant` is a write-gate joiner that only flips
+  `Deny`/`Ask`→`Allow`; recall is Allow-by-default, with no `GovernedAction::Read`
+  / `policy.core.read` and no gate call. A read-bridge must first *invent* a
+  base-`Deny`-on-cross-namespace posture (a security-posture inversion), then
+  thread a token through the recall chain (both SAL backends + MCP/HTTP/CLI
+  edge-parse).
+- **Semantics don't compose.** The exact-match recall filter vs the hierarchical
+  `NamespacePrefix` caveat; and there is **no home-namespace model** — recall's
+  namespace is a per-request filter with no identity referent, so "cross-namespace"
+  has nothing to gate against.
+- **Can't be built to spec.** The B4-4 bridge cap must be **co-signed**, but
+  co-signing/N-of-N is deferred (#1827); `require_bridge` has zero code.
+- **Multi-surface + substrate-dependent.** The boundary would have to hold on
+  recall + list + search + session_start at once, while **exempting** the
+  substrate's own cross-namespace reads (persona synthesis, reflection-pass
+  fan-out, the decorrelation probe, session bootstrap).
+
+### 14.3 v1.x migration (deferred, 1:1 issue)
+
+The read-side bridge-capability is v1.x, tracked as **#2074**, with the home-
+namespace model, exact-vs-hierarchical reconciliation, co-signing, all-read-surface
+token plumbing, substrate exemption, both backends, and a default-OFF flag + WARN
+cycle as acceptance criteria.
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except

@@ -21887,6 +21887,110 @@ mod tests {
         );
     }
 
+    // ---- #1864 (TRACT-gap G10.4) bridge-capability characterization --------
+    //
+    // Pin the HONEST current state documented in contract §14: cross-namespace
+    // recall is UNRESTRICTED — the namespace filter is EXACT-match (not
+    // hierarchical), `None` spans every namespace, and the read path consults
+    // NO capability token (namespace is a filter, not an enforced trust
+    // boundary). A future v1.x read-side bridge-capability would make a
+    // cross-namespace read require a token, flipping test 1 — deliberately
+    // failing it so the behavior change is a conscious edit + a §14 update.
+
+    /// Test 1 — cross-namespace recall SPANS namespaces un-gated: a keyword
+    /// search with `namespace = None` returns rows from BOTH `A` and `B` with
+    /// no capability token presented (the search signature has no capability
+    /// parameter — the read path has no gate).
+    #[test]
+    fn g10_4_cross_namespace_recall_is_unrestricted() {
+        let conn = test_db();
+        let mut a = make_memory("bridgeword alpha", "g10-4/a", Tier::Mid, 5);
+        a.content = "bridgeword payload in namespace a".to_string();
+        let mut b = make_memory("bridgeword beta", "g10-4/b", Tier::Mid, 5);
+        b.content = "bridgeword payload in namespace b".to_string();
+        insert(&conn, &a).unwrap();
+        insert(&conn, &b).unwrap();
+
+        // namespace=None spans ALL namespaces — no capability required.
+        let all = search(
+            &conn,
+            "bridgeword",
+            None, // <- cross-namespace: no boundary, no token
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let namespaces: std::collections::HashSet<&str> =
+            all.iter().map(|m| m.namespace.as_str()).collect();
+        assert!(
+            namespaces.contains("g10-4/a") && namespaces.contains("g10-4/b"),
+            "cross-namespace recall is UNRESTRICTED (G10.4 §14): namespace=None returns \
+             rows from every namespace with NO bridge-capability; got {namespaces:?}"
+        );
+    }
+
+    /// Test 2 — the namespace filter is EXACT-match, NOT hierarchical: a search
+    /// scoped to the ancestor `g10-4` returns NOTHING from the child `g10-4/a`.
+    /// This is why the hierarchical `Caveat::NamespacePrefix` bridge-cap does
+    /// not compose with the recall filter (§14) — a v1.x concern.
+    #[test]
+    fn g10_4_namespace_filter_is_exact_match_not_hierarchical() {
+        let conn = test_db();
+        let mut child = make_memory("exactword one", "g10-4/a", Tier::Mid, 5);
+        child.content = "exactword lives in the child namespace".to_string();
+        insert(&conn, &child).unwrap();
+
+        // Exact-match: the ancestor filter does NOT match the child namespace.
+        let ancestor_scoped = search(
+            &conn,
+            "exactword",
+            Some("g10-4"),
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            ancestor_scoped.is_empty(),
+            "namespace filter is EXACT-match (§14): 'g10-4' does not match child \
+             'g10-4/a' — got {} rows",
+            ancestor_scoped.len()
+        );
+        // The exact child namespace DOES return it.
+        let exact = search(
+            &conn,
+            "exactword",
+            Some("g10-4/a"),
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(exact.len(), 1, "exact-namespace recall returns the row");
+    }
+
     /// F1 regression (v0.7.0 round-2-fixes): when a parent namespace
     /// has `governance.write = owner` with `inherit: true` and a deep
     /// child has no standard of its own, the owner-level check must
