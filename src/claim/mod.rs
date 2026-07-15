@@ -31,6 +31,7 @@
 //! hold, so a future change that silently "fixed" one (or broke the projection)
 //! is caught.
 
+pub mod refusal;
 pub mod relation;
 
 use crate::models::{Memory, MemoryLink};

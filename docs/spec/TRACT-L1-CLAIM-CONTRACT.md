@@ -418,6 +418,66 @@ the vote's wrong-axis finding it must reserve an **orthogonal actuation axis**
 (candidate-set caps / per-stage time-boxing / partial results *within* a mode),
 NOT assume the capability stages are the latency ladder.
 
+## 12. Refusal is a typed error, not a recallable Claim (G10.2, #1862)
+
+TRACT L1 wants a governance refusal to be a first-class **recallable Claim** so a
+refused agent can `memory_recall` "was I denied X?" and let its own denial
+history inform later reasoning + governance review. The substrate does **not**
+persist refusals. The executable anchor is `crate::claim::refusal`.
+
+### 12.1 Honest current state
+
+A governance refusal is a typed `GovernanceRefusal` envelope
+(`src/governance/refusal.rs`: `agent_id` + `action` + `namespace` +
+`denied_level` + `owner` + `reason`) that is **minted in three independent
+lanes** and returned as an **error** — never written to `memories`, never
+recallable:
+
+| Lane | Mint site | Handle |
+|---|---|---|
+| Permission-rule (K9) | `Permissions::evaluate` (`governance::mod`) — *stateless, every input a parameter* | no DB handle |
+| Substrate-governance | `storage::enforce_governance` (`storage::mod`) via `evaluate_level` | `&Connection` (a choke for **this lane only**) |
+| Agent-external | `wire_check::GOVERNANCE_PRE_ACTION` (`OnceLock` hook) | hook-scoped |
+
+The ~21 `Deny` consumption sites (MCP tools + HTTP handlers) each render the
+refusal to a string via the pure, identity-blind formatter
+`governance::deny_message(action, gate, reason)` and return it. `REFUSAL_
+PERSISTED_AS_CLAIM` (`crate::claim::refusal`) is `false`.
+
+### 12.2 The forcing-function anchor
+
+`crate::claim::refusal::RefusalClaim::of_refusal(&GovernanceRefusal)` projects a
+refusal onto the read-only Claim shape it WOULD persist as (asserter + action +
+namespace + denied_level + reason). It is **wired, not floating**:
+`GovernanceRefusal`'s `Display` renders through the projection (its live
+constructor on every refusal-format path), byte-identically — pinned by
+`claim::refusal::tests::display_is_byte_identical_through_the_projection`. The
+`#[non_exhaustive]` type + the `REFUSAL_PERSISTED_AS_CLAIM = false` honesty const
++ the round-trip drift-test machine-check the gap. **No persistence ships.**
+
+### 12.3 Why persistence is deferred (v1.x, #2070) — the safety model is unbuilt
+
+The #1862 5-agent vote (`4d3ea1c5`) verified in-tree that a naive persist-on-
+refusal is freeze-hostile:
+
+- **Re-entrancy.** The refusal-memory write re-enters `consult_governance_pre_
+  write` UNCONDITIONALLY, and `CallerContext::for_admin` does **not** bypass it
+  (it sets only `bypass_visibility`; the gate takes no caller context). So the
+  refusal-write can itself be refused (silent audit loss) or recurse — no guard
+  exists.
+- **No central choke** across the three lanes → a single-lane persist is a
+  misleading partial ledger (an agent reasons "I was never denied X" when it was,
+  on an unwired lane).
+- **Quota** is lose-lose: tool-layer → self-DOS the 1000/day cap under a denied-
+  action retry loop; bypassed → unbounded flooding. No dedup.
+- **Visibility/ownership** of a recallable refusal-Claim is undesigned; the safe
+  answer (`scope=private`, owned by the refused agent) must be a hard acceptance
+  criterion, not an assumption.
+
+#2070 tracks the persist mechanism with the full safety model (re-entrancy guard,
+three-lane coverage, private owner-scoping, opt-in default-OFF, dedup/rate-limit,
+best-effort non-fatal, secret-screen, both backends) as acceptance criteria.
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except
