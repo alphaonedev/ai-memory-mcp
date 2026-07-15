@@ -254,6 +254,52 @@ enforcement (**#2060**); permanent-dissent conservation G7 (**#2061**). A
 postgres/HTTP/MCP forget-receipt surface beyond the sqlite CLI is a separate
 additive v1.x follow-up (**#2062**).
 
+## 9. Durability model — no erasure-coded no-primary cold tier (G16, #1830)
+
+TRACT L2 wants an **(n,k) erasure-coded, no-primary cold tier** so any k-of-n
+shards reconstruct the original. The substrate does **not** have one — durability
+rests on replication/local persistence, not erasure coding. This § pins the
+durability posture the substrate ACTUALLY provides, so the claim cannot silently
+drift; the executable anchor is `crate::durability`.
+
+### 9.1 The actual durability model (honest taxonomy)
+
+Codegraph-verified. There is **no** automatic full-copy replication; the label
+"full-copy replication" would itself be an overclaim.
+
+| Posture | When | Guarantee |
+|---|---|---|
+| **Local single-node** (default) | `synchronous = NORMAL` (`storage::connection::DEFAULT_DB_SYNCHRONOUS`), no quorum | One local SQLite DB (WAL). Survives a process crash; a **power loss** can lose the tail of un-checkpointed commits. **No replication.** |
+| **Local single-node, power-loss-safe** | `AI_MEMORY_DB_SYNCHRONOUS = FULL`/`EXTRA`, or the `asi-hard` posture (#1961) | fsync-per-commit power-loss durability. Still single-node. |
+| **Quorum-replicated** (opt-in) | `--quorum-writes > 0` with configured peers | Opt-in **W-of-N quorum** federation replication (`crate::replication` `QuorumPolicy`/`AckTracker`). This is quorum, **not** full-copy-to-N, and `crate::replication` is scaffolding **not wired into the store write path** (default `quorum_writes = 0`). |
+| **Erasure-coded no-primary cold tier** | — | **UNIMPLEMENTED** (gap G16). No erasure/shard/Reed-Solomon code exists. |
+
+### 9.2 The forcing-function anchor
+
+`crate::durability::DurabilityModel` is a `#[non_exhaustive]` enum with exactly
+the three shipped postures above and **deliberately no erasure variant**;
+`resolve_durability_model` computes the live posture from the REAL config
+(`synchronous` level, `quorum_writes`, peers). The absent variant IS the
+machine-checked gap record: the enum is consumed by wildcard-free exhaustive
+matches (`label`, `is_multi_node`), so adding an erasure-coded cold-tier variant
+hard-breaks the build until the tier is consciously wired AND this ledger is
+updated. (Low fan-out — honest for a total gap: this is a disclosure anchor, not
+a load-bearing projection like §3's `ClaimView`.) No erasure codec ships — not
+compiled, not test-only (a hand-rolled or self-generated reference construction
+would freeze a shard format the eventual audited crate won't match; the #1830
+5-agent vote `4d3ea1c5` rejected it unanimously).
+
+### 9.3 v1.x migration (deferred — subsystem BLOCKED on an operator decision)
+
+#1830 stays on the v1.0.0 tracker (NOT silently re-milestoned). The v1.0.0 slice
+shipped is this §9 disclosure anchor; the erasure **subsystem** (codec + shard
+placement + no-primary coordination + reconstruction-on-read + repair) is v1.x
+and is BLOCKED on an operator **dependency-authorization** decision (**#2064**):
+a vetted erasure crate (e.g. `reed-solomon-simd`) requires operator sign-off
+(sole-authority rule), and hand-rolling was vote-rejected. The
+construction-independent acceptance invariant for whichever path is authorized:
+**any k-of-n shards reconstruct the original bytes exactly.**
+
 ---
 
 *Normative for the v1.x G22 migration; NON-normative about v1.0.0 behavior except
