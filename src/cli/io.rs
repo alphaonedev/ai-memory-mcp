@@ -202,6 +202,20 @@ pub(crate) fn import_from_str(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let data: serde_json::Value = serde_json::from_str(payload)?;
+
+    // v1.0.0 #2006 — a v2 integrity envelope carries `spec_version`. Route it to
+    // the full byte-preserving, re-verifying importer (a faithful round-trip:
+    // preserves every field VERBATIM, so no agent-id restamp — the integrity
+    // guarantee IS verbatim preservation). A v1 payload (memories+links, no
+    // `spec_version`) stays on the L1 path below, UNCHANGED.
+    if data.get("spec_version").is_some() {
+        let envelope: crate::portability::emit::ExportEnvelope = serde_json::from_value(data)?;
+        let conn = db::open(db_path)?;
+        let report = crate::portability::import::import_full_envelope(&conn, &envelope)?;
+        writeln!(out.stdout, "{}", serde_json::to_string_pretty(&report)?)?;
+        return Ok(());
+    }
+
     let memories: Vec<models::Memory> =
         serde_json::from_value(data.get("memories").cloned().unwrap_or_default())?;
     let links: Vec<models::MemoryLink> =

@@ -27,11 +27,12 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
+use serde::Serialize;
 
 use crate::portability::emit::ExportEnvelope;
 
 /// Per-class outcome of an integrity import.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ImportReport {
     pub memories: usize,
     pub links: usize,
