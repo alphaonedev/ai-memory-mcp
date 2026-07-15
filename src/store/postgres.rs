@@ -8171,9 +8171,13 @@ impl PostgresStore {
         // `is_age_runtime_failure` arm falls back to the correct
         // `find_paths_cte`.
         let now_stamp = Utc::now().to_rfc3339();
-        let sql = format!(
-            "SELECT path FROM cypher('memory_graph', $$ {} $$) AS (path agtype)",
+        // #2032 L4 — builder is now self-guarding; propagate its id-safety
+        // error the same way the upstream checks map to InvalidInput.
+        let find_paths_cypher =
             build_find_paths_current_view_cypher(source_id, target_id, depth, cap, &now_stamp)
+                .map_err(|detail| StoreError::InvalidInput { detail })?;
+        let sql = format!(
+            "SELECT path FROM cypher('memory_graph', $$ {find_paths_cypher} $$) AS (path agtype)"
         );
         // #1482 — per-call-unique cypher text (inlined source/target
         // ids + depth + cap); run unnamed so it never enters the
@@ -11811,15 +11815,24 @@ fn build_find_paths_current_view_cypher(
     depth: usize,
     cap: usize,
     now_stamp: &str,
-) -> String {
-    format!(
+) -> Result<String, String> {
+    // #2032 L4 — defense-in-depth co-location. This builder INLINES
+    // `source_id`/`target_id` into the Cypher text (the 2-arg `cypher()`
+    // form cannot bind them), so the id-safety invariant MUST hold HERE,
+    // not only at the current call site. A future caller that inlines
+    // these ids without the upstream check cannot silently reintroduce
+    // AGE Cypher injection. Release-active (returns `Err`), NOT a
+    // `debug_assert!` (which compiles out of release builds).
+    assert_age_id_safe(source_id)?;
+    assert_age_id_safe(target_id)?;
+    Ok(format!(
         "MATCH p = (a)-[*1..{depth}]-(b) \
          WHERE a.id = '{source_id}' AND b.id = '{target_id}' \
            AND ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now_stamp}') \
          RETURN nodes(p) AS path \
          ORDER BY length(p) ASC \
          LIMIT {cap}"
-    )
+    ))
 }
 
 fn age_params_literal(pairs: &[(&str, &str)]) -> String {
@@ -22726,6 +22739,26 @@ mod tests {
     }
 
     #[test]
+    fn build_find_paths_cypher_self_guards_unsafe_ids_2032() {
+        // #2032 L4 — the builder must reject an unsafe id ITSELF (defense in
+        // depth), not only rely on the upstream call-site check. A future
+        // caller that inlines ids without the upstream guard cannot silently
+        // re-open AGE Cypher injection.
+        let ts = "2026-07-15T00:00:00Z";
+        assert!(build_find_paths_current_view_cypher("a'b", "ok", 3, 10, ts).is_err());
+        assert!(build_find_paths_current_view_cypher("ok", "b'; MATCH", 3, 10, ts).is_err());
+        // A pair of safe ids still builds.
+        let good = build_find_paths_current_view_cypher(
+            "0f8fad5b-d9cb-469f-a165-70867728950e",
+            "9c858901-8a57-4791-81fe-4c455b099bc9",
+            3,
+            10,
+            ts,
+        );
+        assert!(good.is_ok());
+    }
+
+    #[test]
     fn assert_age_id_safe_rejects_double_quote_and_backtick() {
         assert!(assert_age_id_safe("a\"b").is_err());
         assert!(assert_age_id_safe("a`b").is_err());
@@ -23338,7 +23371,10 @@ mod tests {
             10usize,
             "2026-06-15T00:00:00+00:00",
         );
-        let cypher = build_find_paths_current_view_cypher(src, dst, depth, cap, now);
+        // #2032 L4 — builder now returns Result (self-guards ids); these are
+        // safe UUIDs so it builds.
+        let cypher = build_find_paths_current_view_cypher(src, dst, depth, cap, now)
+            .expect("safe ids build");
         assert!(
             cypher.contains(&format!(
                 "ALL(e IN relationships(p) WHERE e.valid_until IS NULL OR e.valid_until > '{now}')"
