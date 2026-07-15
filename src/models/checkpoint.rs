@@ -78,6 +78,20 @@ pub enum ConditionType {
     /// `GovernanceVerdict` precedent). Lives under the reserved
     /// [`crate::identity::equivocation::PEER_HEAD_ENTANGLEMENT_NAMESPACE`].
     PeerHeadEntanglement,
+    /// v1.0.0 #2004 (R75) — an operator-invoked crypto-agility RE-ANCHOR
+    /// ceremony record. The `re-anchor/v1` signed bridge (spec §5.3,
+    /// [`crate::identity::re_anchor`]) countersigns "the NEW suite key has seen
+    /// the prior-suite `signed_events` chain head H at sequence N," so a future
+    /// crypto-suite rotation (PQ at checkpoint granularity) does not break the
+    /// audit chain. Its `resolution` carries the `ReAnchorRecord` fields + the
+    /// detached `re_anchor` signature; a verify path re-runs
+    /// [`crate::identity::re_anchor::verify_re_anchor`] +
+    /// [`crate::identity::suite::verify_suite_binding`]. Mirrors the
+    /// [`Self::AuditHeadWitness`] off-daemon-custody, K1-pinnable persistence
+    /// (2×5 vote `4d3ea1c5`; verdict A-synthesis). Free-TEXT condition type —
+    /// no schema migration (the SAL enforces the closed set). Universal
+    /// `suite_tag` across all signed classes stays v1.x-deferred.
+    ReAnchor,
 }
 
 impl ConditionType {
@@ -94,6 +108,7 @@ impl ConditionType {
             Self::GovernanceEnforcement => "governance_enforcement",
             Self::EpochAdvance => "epoch_advance",
             Self::PeerHeadEntanglement => "peer_head_entanglement",
+            Self::ReAnchor => "re_anchor",
         }
     }
 
@@ -110,6 +125,7 @@ impl ConditionType {
             "governance_enforcement" => Some(Self::GovernanceEnforcement),
             "epoch_advance" => Some(Self::EpochAdvance),
             "peer_head_entanglement" => Some(Self::PeerHeadEntanglement),
+            "re_anchor" => Some(Self::ReAnchor),
             _ => None,
         }
     }
