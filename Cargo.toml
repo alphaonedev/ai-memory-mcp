@@ -457,7 +457,7 @@ pkg-fmt = "tgz"
 # pointing cargo-audit at code we attest to. No direct caller in this
 # repo invokes `paste::paste!`; the substitution only feeds transitive
 # consumers (gemm-*, candle-*, etc.).
-paste = { git = "https://github.com/alphaonedev/paste", rev = "6a30252" }
+paste = { path = "vendor/paste" }  # #2050: vendored (alphaonedev/paste fork deleted; rev 6a30252 unfetchable). Self-contained for cold CI.
 
 [profile.release]
 opt-level = 3
