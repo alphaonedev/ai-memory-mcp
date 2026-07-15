@@ -19,18 +19,23 @@
 //! and check against a bounded in-memory LRU. First-time fingerprints
 //! get cached and the verify proceeds; repeats produce 409 Conflict.
 //!
-//! # Memory bound
+//! # Memory bound (partitioned — #2032 LM3, 5-agent vote `4d3ea1c5`)
 //!
-//! The cache is a `Mutex<VecDeque<[u8; 32]>>` with a 10 000-entry
-//! ceiling. At full capacity that's:
+//! The cache is a two-level partitioned structure identical in shape to
+//! [`FederationNonceCache`]: an outer `Mutex<HashMap<caller_id, slot>>`
+//! where each slot is a per-caller `HashSet` + FIFO `VecDeque` capped at
+//! [`VERIFY_REPLAY_CAPACITY_PER_CALLER`] (10 000) fingerprints, and an outer
+//! LRU that bounds the number of distinct caller partitions to
+//! [`VERIFY_REPLAY_MAX_CALLERS`] (1024), evicting the least-recently-touched
+//! caller when a new caller pushes past the ceiling. Worst-case resident
+//! memory is ~320 KB/caller × 1024 ≈ 320 MB, the same envelope
+//! `FederationNonceCache` already accepts.
 //!
-//!   10 000 entries × (32 bytes hash + 8 bytes VecDeque slot overhead)
-//!   ≈ 400 KB heap-resident
-//!
-//! Total cap including VecDeque slack and Mutex overhead lands under
-//! ~512 KB on every supported platform. Eviction is FIFO — when the
-//! deque is full and a new fingerprint comes in, the oldest entry is
-//! evicted before the new one is pushed.
+//! Pre-#2032 the cache was ONE global 100 000-entry FIFO shared across every
+//! caller, so any caller submitting 100 000+ unique fingerprints could evict
+//! a *victim's* fingerprint and re-open the victim's replay window (the
+//! "eviction-flush attack" this doc used to concede). Partitioning by caller
+//! closes that: one caller can now only evict its OWN fingerprints.
 //!
 //! # Threat model
 //!
@@ -46,72 +51,106 @@
 //!    top — the nonce check raises the cost of trivial replay
 //!    without claiming to be a complete authentication primitive.
 //! 2. A Redis or DB-backed cache would be appropriate for a true
-//!    distributed deployment; we punt that to v0.8.
+//!    distributed deployment; disk persistence for THIS cache is a
+//!    tracked follow-up (deferred — the federation nonce cache's #1255
+//!    persistence path is the precedent to mirror).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-/// LRU bound for the replay-protection cache. Chosen so the worst-case
-/// resident-memory cost stays under ~5 MB (see module docs for the
-/// derivation). v0.7.0 #1033 increased the ceiling from the original
-/// 10 000 to 100 000 entries to raise the cost of the
-/// eviction-flush attack (an attacker who can submit 10 000+ unique
-/// nonces per second evicts legitimate replay fingerprints under the
-/// pre-#1033 bound — see the issue for the threat model). Operators
-/// who page on the eviction metric (`evictions_since_boot`) and need
-/// a true distributed cache should escalate to Redis-backed storage
-/// in v0.8.
-pub const SEEN_VERIFICATIONS_CAPACITY: usize = 100_000;
+/// #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — per-CALLER FIFO bound for
+/// the replay-protection cache. Mirrors [`FEDERATION_NONCE_CAPACITY_PER_PEER`]
+/// (10 000): each caller partition holds at most this many
+/// `(link_id, signature, nonce)` fingerprints before FIFO-evicting its own
+/// oldest. Because the cache is now partitioned by caller, an attacker who
+/// floods 10 000+ unique fingerprints only exhausts THEIR OWN slot — they can
+/// no longer flush a victim's fingerprint (the pre-#2032 single-global-FIFO
+/// eviction-flush attack). Was `SEEN_VERIFICATIONS_CAPACITY = 100_000` on the
+/// single global cache.
+pub const VERIFY_REPLAY_CAPACITY_PER_CALLER: usize = 10_000;
 
-/// v0.7.0 #1033 — replay cache backing storage. `HashSet` answers
-/// "have we seen this fingerprint" in O(1) (pre-#1033 the
-/// `VecDeque::iter().any(...)` linear scan was O(N) ≈ 10 000 SHA-256
-/// comparisons per insert at the ceiling — magnified CPU under a
-/// flood). `VecDeque` retains FIFO eviction order. The two are kept
-/// in lockstep: `seen.insert(fp)` ↔ `order.push_back(fp)`,
-/// `seen.remove(&evicted)` ↔ `order.pop_front()`.
+/// #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — outer-HashMap LRU bound on
+/// the number of distinct caller partitions. Mirrors
+/// [`FEDERATION_NONCE_MAX_PEERS`] (1024): each caller slot costs ~320 KB at
+/// full per-caller capacity, so the ceiling caps the worst-case footprint at
+/// ~320 KB × 1024 ≈ 320 MB. When a NEW caller pushes past the ceiling the
+/// least-recently-touched caller slot is evicted.
+pub const VERIFY_REPLAY_MAX_CALLERS: usize = 1024;
+
+/// #2032 LM3 — per-caller replay slot: the same O(1) `HashSet` + FIFO
+/// `VecDeque` shape as [`PeerNonceSlot`], plus a monotonic `last_touch`
+/// stamp so the outer LRU can pick the least-recently-touched caller to
+/// evict. The two collections are kept in lockstep: `seen.insert(fp)` ↔
+/// `order.push_back(fp)`, `seen.remove(&evicted)` ↔ `order.pop_front()`.
 #[derive(Debug, Default)]
-struct ReplayCacheInner {
+struct CallerReplaySlot {
     seen: HashSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
+    last_touch: u64,
 }
 
-/// Bounded FIFO cache of `(link_id, signature, nonce)` SHA-256
-/// fingerprints. Cheap to clone (it's behind an `Arc` in the daemon's
-/// `AppState`); the inner mutex serialises every insert/lookup so the
-/// cache is safe to share across handler invocations.
+/// #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — per-caller partitioned
+/// bounded FIFO cache of `(link_id, signature, nonce)` SHA-256 fingerprints,
+/// structurally identical to [`FederationNonceCache`] but keyed on a CALLER
+/// partition id instead of a peer id and without the (deferred) disk
+/// persistence. Cheap to clone (it's behind an `Arc` in the daemon's
+/// `AppState`); the inner mutex serialises every insert/lookup so the cache
+/// is safe to share across handler invocations.
+///
+/// Partitioning by caller is the LM3 hardening: one caller can only evict its
+/// OWN fingerprints, so it can no longer flush a victim's fingerprint to
+/// re-open the victim's replay window.
 #[derive(Debug, Default)]
 pub struct ReplayCache {
-    inner: Mutex<ReplayCacheInner>,
-    /// v0.7.0 #1033 — cumulative count of FIFO evictions since process
-    /// boot. Non-zero values are a paging signal: either the cache
-    /// ceiling is too low for the operator's verify-flow load OR an
-    /// attacker is flooding unique nonces to evict legitimate
-    /// fingerprints (the issue's flush-attack vector). Surface via
-    /// metrics or `evictions_since_boot()` for ops dashboards.
+    inner: Mutex<HashMap<String, CallerReplaySlot>>,
+    /// Monotonic touch counter. Advances on every `record_and_check`; each
+    /// caller slot stamps its `last_touch` with the value at insert/update
+    /// time so the outer LRU can evict the slot with the smallest value.
+    touch_counter: AtomicU64,
+    /// Cumulative count of per-caller FIFO fingerprint evictions since
+    /// process boot. Non-zero values mean SOME caller hit its per-caller
+    /// ceiling and dropped its own oldest fingerprints — a paging signal for
+    /// verify-flow load, no longer a cross-caller flush signal. Surfaced via
+    /// [`Self::evictions_since_boot`].
     evictions: AtomicU64,
+    /// Cumulative count of outer-LRU caller-slot evictions since boot.
+    /// Non-zero means caller churn hit [`VERIFY_REPLAY_MAX_CALLERS`] and
+    /// dropped an older caller's slot. Surfaced via
+    /// [`Self::caller_evictions_since_boot`].
+    caller_evictions: AtomicU64,
 }
 
 impl ReplayCache {
-    /// Fresh empty cache at the documented capacity.
+    /// Fresh empty cache at the documented per-caller capacity.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Fingerprint `(link_id, signature, nonce)` and check membership.
-    /// Returns `true` if the fingerprint has been seen before — the
-    /// caller should reject the request as a replay. Returns `false`
+    /// Fingerprint `(link_id, signature, nonce)` within `caller_id`'s
+    /// partition and check membership. Returns [`ReplayDecision::Replay`] if
+    /// the fingerprint has been seen before for THIS caller — the caller
+    /// should reject the request as a replay. Returns [`ReplayDecision::Fresh`]
     /// on the first seen value AND inserts it as a side effect.
     ///
-    /// The caller is responsible for producing the nonce (random UUID
-    /// expected) and for choosing whether to bypass this check when
-    /// the request omits the nonce field (back-compat mode).
-    pub fn record_and_check(&self, link_id: &str, signature: &[u8], nonce: &str) -> ReplayDecision {
+    /// `caller_id` partitions the cache (#2032 LM3): fingerprints are isolated
+    /// per caller, so one caller flooding fresh fingerprints can only evict
+    /// its OWN slot. The callers pass the HTTP-resolved agent id (or a fresh
+    /// `anonymous:req-<uuid8>` — an anonymous partition can only evict
+    /// itself). The nonce is still the per-request anti-replay token; the
+    /// wire caller is responsible for producing it and for choosing whether
+    /// to bypass this check when the request omits it (back-compat mode).
+    pub fn record_and_check(
+        &self,
+        caller_id: &str,
+        link_id: &str,
+        signature: &[u8],
+        nonce: &str,
+    ) -> ReplayDecision {
         let fp = Self::fingerprint(link_id, signature, nonce);
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -121,30 +160,55 @@ impl ReplayCache {
             // can log it.
             Err(p) => p.into_inner(),
         };
-        // v0.7.0 #1033 — O(1) HashSet membership check replaces the
-        // pre-#1033 O(N) linear scan over the VecDeque.
-        if guard.seen.contains(&fp) {
+        // #2032 LM3 — bound the outer HashMap to VERIFY_REPLAY_MAX_CALLERS.
+        // When the incoming caller is a NEW entry AND the map is at the
+        // ceiling, evict the least-recently-touched caller (LRU) before
+        // inserting. Re-touch of an existing caller is free (no eviction).
+        if !guard.contains_key(caller_id) && guard.len() >= VERIFY_REPLAY_MAX_CALLERS {
+            if let Some((evict_id, _)) = guard
+                .iter()
+                .min_by_key(|(_, s)| s.last_touch)
+                .map(|(k, s)| (k.clone(), s.last_touch))
+            {
+                guard.remove(&evict_id);
+                self.caller_evictions.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "ai_memory::identity::replay",
+                    evicted_caller = %evict_id,
+                    "ReplayCache: at caller ceiling ({}); evicted LRU caller slot to make \
+                     room (#2032 LM3). Operator-visible via caller_evictions_since_boot().",
+                    VERIFY_REPLAY_MAX_CALLERS,
+                );
+            }
+        }
+        let touch = self.touch_counter.fetch_add(1, Ordering::Relaxed);
+        let slot = guard.entry(caller_id.to_string()).or_default();
+        slot.last_touch = touch;
+        // O(1) HashSet membership check (per-caller).
+        if slot.seen.contains(&fp) {
             return ReplayDecision::Replay;
         }
-        if guard.order.len() >= SEEN_VERIFICATIONS_CAPACITY {
-            // FIFO eviction: the oldest fingerprint is dropped to
-            // make room. Capacity is a hard ceiling, not a soft one.
-            // Keep `seen` + `order` in lockstep.
-            if let Some(evicted) = guard.order.pop_front() {
-                guard.seen.remove(&evicted);
+        if slot.order.len() >= VERIFY_REPLAY_CAPACITY_PER_CALLER {
+            // Per-caller FIFO eviction: the caller's oldest fingerprint is
+            // dropped to make room. Keep `seen` + `order` in lockstep.
+            if let Some(evicted) = slot.order.pop_front() {
+                slot.seen.remove(&evicted);
                 self.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
-        guard.order.push_back(fp);
-        guard.seen.insert(fp);
+        slot.order.push_back(fp);
+        slot.seen.insert(fp);
         ReplayDecision::Fresh
     }
 
-    /// Number of currently-cached fingerprints. Useful for tests and
-    /// for a future metrics exporter.
+    /// Total currently-cached fingerprints across every caller partition.
+    /// Useful for tests and for a future metrics exporter.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.order.len()).unwrap_or(0)
+        self.inner
+            .lock()
+            .map(|g| g.values().map(|s| s.order.len()).sum())
+            .unwrap_or(0)
     }
 
     /// Whether the cache is empty. Trivial helper to satisfy clippy
@@ -154,22 +218,44 @@ impl ReplayCache {
         self.len() == 0
     }
 
-    /// v0.7.0 #1033 — cumulative number of FIFO evictions since
-    /// process boot. Non-zero values mean the cache hit its ceiling
-    /// and dropped older fingerprints to make room. Operators should
-    /// surface this via a metrics exporter and page on sustained
-    /// growth: either legitimate verify-flow load is exceeding the
-    /// documented ceiling (escalate to a true distributed cache) OR
-    /// an attacker is flooding unique nonces to evict legitimate
-    /// fingerprints (the issue's flush-attack vector — investigate
-    /// rate-limit at `/api/v1/links/verify`).
+    /// #2032 LM3 — distinct caller partitions currently resident.
+    #[must_use]
+    pub fn caller_count(&self) -> usize {
+        self.inner.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    /// #2032 LM3 — cached fingerprints for one caller partition.
+    #[must_use]
+    pub fn len_for_caller(&self, caller_id: &str) -> usize {
+        self.inner
+            .lock()
+            .map(|g| g.get(caller_id).map_or(0, |s| s.order.len()))
+            .unwrap_or(0)
+    }
+
+    /// Cumulative number of per-caller FIFO fingerprint evictions since
+    /// process boot. Non-zero values mean SOME caller hit its per-caller
+    /// ceiling and dropped its own oldest fingerprints — a verify-flow load
+    /// signal (no longer the cross-caller flush signal it was pre-#2032).
     #[must_use]
     pub fn evictions_since_boot(&self) -> u64 {
         self.evictions.load(Ordering::Relaxed)
     }
 
+    /// #2032 LM3 — cumulative number of outer-LRU caller-slot evictions
+    /// (a new caller pushed the partition count past
+    /// [`VERIFY_REPLAY_MAX_CALLERS`]). Operators page on sustained growth.
+    #[must_use]
+    pub fn caller_evictions_since_boot(&self) -> u64 {
+        self.caller_evictions.load(Ordering::Relaxed)
+    }
+
     /// Compute the 32-byte SHA-256 fingerprint over the three-element
-    /// tuple. Public for tests; not exported via `pub mod`.
+    /// tuple. Public for tests; not exported via `pub mod`. The caller
+    /// partition id is NOT part of the fingerprint — it is the outer
+    /// HashMap key (so two different callers presenting the same tuple are
+    /// both `Fresh`, which is correct: cross-caller identical tuples are
+    /// not a replay of one authenticated principal's request).
     fn fingerprint(link_id: &str, signature: &[u8], nonce: &str) -> [u8; 32] {
         let mut hasher = Sha256::new();
         // Length prefix every component so concatenation is unambiguous
@@ -204,23 +290,28 @@ pub enum ReplayDecision {
 mod tests {
     use super::*;
 
+    // Every test threads a caller partition id (#2032 LM3). A single
+    // caller reproduces the pre-#2032 single-partition behaviour.
+    const C: &str = "caller-a";
+
     #[test]
     fn first_seen_returns_fresh() {
         let cache = ReplayCache::new();
-        let d = cache.record_and_check("link-a", b"sig", "nonce-1");
+        let d = cache.record_and_check(C, "link-a", b"sig", "nonce-1");
         assert_eq!(d, ReplayDecision::Fresh);
         assert_eq!(cache.len(), 1);
+        assert_eq!(cache.len_for_caller(C), 1);
     }
 
     #[test]
     fn exact_repeat_returns_replay() {
         let cache = ReplayCache::new();
         assert_eq!(
-            cache.record_and_check("link-a", b"sig", "nonce-1"),
+            cache.record_and_check(C, "link-a", b"sig", "nonce-1"),
             ReplayDecision::Fresh
         );
         assert_eq!(
-            cache.record_and_check("link-a", b"sig", "nonce-1"),
+            cache.record_and_check(C, "link-a", b"sig", "nonce-1"),
             ReplayDecision::Replay
         );
         // Replay doesn't grow the cache.
@@ -234,11 +325,11 @@ mod tests {
         // per-request anti-replay token, not a per-link state.
         let cache = ReplayCache::new();
         assert_eq!(
-            cache.record_and_check("link-a", b"sig", "nonce-1"),
+            cache.record_and_check(C, "link-a", b"sig", "nonce-1"),
             ReplayDecision::Fresh
         );
         assert_eq!(
-            cache.record_and_check("link-a", b"sig", "nonce-2"),
+            cache.record_and_check(C, "link-a", b"sig", "nonce-2"),
             ReplayDecision::Fresh
         );
         assert_eq!(cache.len(), 2);
@@ -251,36 +342,36 @@ mod tests {
         // advised to use UUID v4 nonces; we don't enforce.)
         let cache = ReplayCache::new();
         assert_eq!(
-            cache.record_and_check("link-a", b"sig", "nonce"),
+            cache.record_and_check(C, "link-a", b"sig", "nonce"),
             ReplayDecision::Fresh
         );
         assert_eq!(
-            cache.record_and_check("link-b", b"sig", "nonce"),
+            cache.record_and_check(C, "link-b", b"sig", "nonce"),
             ReplayDecision::Fresh
         );
     }
 
     #[test]
-    fn fifo_eviction_at_capacity() {
+    fn fifo_eviction_at_per_caller_capacity() {
         let cache = ReplayCache::new();
-        // Fill to capacity.
-        for i in 0..SEEN_VERIFICATIONS_CAPACITY {
+        // Fill one caller to its per-caller capacity.
+        for i in 0..VERIFY_REPLAY_CAPACITY_PER_CALLER {
             assert_eq!(
-                cache.record_and_check("link", b"sig", &format!("nonce-{i}")),
+                cache.record_and_check(C, "link", b"sig", &format!("nonce-{i}")),
                 ReplayDecision::Fresh
             );
         }
-        assert_eq!(cache.len(), SEEN_VERIFICATIONS_CAPACITY);
-        // One more push evicts the oldest entry (nonce-0).
+        assert_eq!(cache.len_for_caller(C), VERIFY_REPLAY_CAPACITY_PER_CALLER);
+        // One more push evicts the caller's oldest entry (nonce-0).
         assert_eq!(
-            cache.record_and_check("link", b"sig", "nonce-new"),
+            cache.record_and_check(C, "link", b"sig", "nonce-new"),
             ReplayDecision::Fresh
         );
-        assert_eq!(cache.len(), SEEN_VERIFICATIONS_CAPACITY);
+        assert_eq!(cache.len_for_caller(C), VERIFY_REPLAY_CAPACITY_PER_CALLER);
         // The evicted nonce-0 is now "unseen" again — replay
         // protection is best-effort, not unbounded.
         assert_eq!(
-            cache.record_and_check("link", b"sig", "nonce-0"),
+            cache.record_and_check(C, "link", b"sig", "nonce-0"),
             ReplayDecision::Fresh
         );
     }
@@ -298,44 +389,39 @@ mod tests {
     fn is_empty_starts_true() {
         let cache = ReplayCache::new();
         assert!(cache.is_empty());
-        let _ = cache.record_and_check("a", b"b", "c");
+        let _ = cache.record_and_check(C, "a", b"b", "c");
         assert!(!cache.is_empty());
     }
 
     // -----------------------------------------------------------------
-    // v0.7.0 #1033 (Agent-5 #4) regression coverage
+    // v0.7.0 #1033 (Agent-5 #4) + #2032 LM3 regression coverage
     // -----------------------------------------------------------------
 
     #[test]
-    fn evictions_counter_starts_at_zero_1033() {
+    fn evictions_counter_starts_at_zero() {
         // Fresh cache reports zero evictions.
         let cache = ReplayCache::new();
         assert_eq!(cache.evictions_since_boot(), 0);
+        assert_eq!(cache.caller_evictions_since_boot(), 0);
         // Insert below the ceiling — no eviction.
         for i in 0..16 {
-            let _ = cache.record_and_check("l", b"s", &format!("n{i}"));
+            let _ = cache.record_and_check(C, "l", b"s", &format!("n{i}"));
         }
         assert_eq!(cache.evictions_since_boot(), 0);
     }
 
     #[test]
-    fn evictions_counter_bumps_on_capacity_overflow_1033() {
-        // Drive insertions to capacity + N and assert the eviction
-        // counter sees exactly N bumps. Operators page on this metric
-        // to detect the issue's eviction-flush attack vector — non-zero
-        // values mean the cache hit its ceiling and dropped older
-        // fingerprints.
-        //
-        // We don't want a 100 000+ iteration test in the unit suite
-        // (capacity is 100 000 — would be slow). Override behaviour
-        // by reasoning about the contract directly: the FIRST eviction
-        // happens when `order.len() >= CAPACITY` AND a new fingerprint
-        // arrives. We test that at SEEN_VERIFICATIONS_CAPACITY +1
-        // distinct fingerprints, the eviction count is exactly 1.
+    fn evictions_counter_bumps_on_per_caller_capacity_overflow() {
+        // Drive one caller's insertions to per-caller capacity + N and
+        // assert the eviction counter sees exactly N bumps. Non-zero
+        // values mean SOME caller hit its ceiling and dropped its own
+        // oldest fingerprints (a verify-flow load signal). The FIRST
+        // eviction happens when `order.len() >= CAPACITY` AND a new
+        // fingerprint arrives.
         let cache = ReplayCache::new();
-        for i in 0..SEEN_VERIFICATIONS_CAPACITY {
+        for i in 0..VERIFY_REPLAY_CAPACITY_PER_CALLER {
             assert_eq!(
-                cache.record_and_check("l", b"s", &format!("n{i}")),
+                cache.record_and_check(C, "l", b"s", &format!("n{i}")),
                 ReplayDecision::Fresh
             );
         }
@@ -344,9 +430,9 @@ mod tests {
             0,
             "no evictions at exactly capacity"
         );
-        // One more push: the oldest entry is evicted.
+        // One more push: the caller's oldest entry is evicted.
         assert_eq!(
-            cache.record_and_check("l", b"s", "n-new-1"),
+            cache.record_and_check(C, "l", b"s", "n-new-1"),
             ReplayDecision::Fresh
         );
         assert_eq!(
@@ -356,7 +442,7 @@ mod tests {
         );
         // Another push: another eviction.
         assert_eq!(
-            cache.record_and_check("l", b"s", "n-new-2"),
+            cache.record_and_check(C, "l", b"s", "n-new-2"),
             ReplayDecision::Fresh
         );
         assert_eq!(
@@ -367,33 +453,108 @@ mod tests {
     }
 
     #[test]
-    fn o1_lookup_under_sustained_load_1033() {
+    fn o1_lookup_under_sustained_load() {
         // Pre-#1033 each `record_and_check` ran an O(N)
-        // `VecDeque::iter().any(...)` scan — at 10 000-entry capacity
-        // each insert cost ~10 000 SHA-256 comparisons. The HashSet
-        // membership replacement is O(1). We pin the algorithmic
-        // contract by timing N inserts and asserting the total stays
-        // well below a per-insert ceiling that would FAIL if the
-        // implementation regressed to O(N).
-        //
-        // Concretely: 5 000 inserts in <100 ms total wall-clock on
-        // any supported test host. Pre-#1033 the same workload was
-        // observed at ~5 ms per insert in flame-graph traces (5 000
-        // × 5 ms = 25 s total — well over the 100 ms ceiling). The
-        // new shape is sub-microsecond per insert (HashSet probe +
-        // VecDeque push back); 100 ms is a generous bound that still
-        // catches a regression.
+        // `VecDeque::iter().any(...)` scan. The HashSet membership
+        // replacement is O(1). Pin the algorithmic contract by timing N
+        // inserts and asserting the total stays well below a per-insert
+        // ceiling that would FAIL if the implementation regressed to O(N).
         let cache = ReplayCache::new();
         let start = std::time::Instant::now();
         for i in 0..5_000 {
-            let _ = cache.record_and_check("link", b"sig", &format!("n{i}"));
+            let _ = cache.record_and_check(C, "link", b"sig", &format!("n{i}"));
         }
         let elapsed = start.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "post-#1033: 5000 record_and_check calls MUST complete \
-             in <500ms (HashSet lookup). Pre-#1033 O(N) shape would \
-             take seconds; got {elapsed:?}"
+            "5000 record_and_check calls MUST complete in <500ms (HashSet lookup). \
+             O(N) shape would take seconds; got {elapsed:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) — partition hardening.
+    // Ported from `FederationNonceCache`'s outer-LRU test + the NEW
+    // cross-caller isolation invariant.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn outer_lru_evicts_least_recently_touched() {
+        // When the caller HashMap hits VERIFY_REPLAY_MAX_CALLERS, a NEW
+        // caller's insert evicts the least-recently-touched caller slot
+        // (ported from FederationNonceCache::
+        // outer_lru_evicts_least_recently_touched_at_ceiling_1038).
+        let cache = ReplayCache::new();
+        // Fill to exactly the caller ceiling.
+        for i in 0..VERIFY_REPLAY_MAX_CALLERS {
+            let _ = cache.record_and_check(&format!("caller-{i}"), "l", b"s", "n");
+        }
+        assert_eq!(cache.caller_count(), VERIFY_REPLAY_MAX_CALLERS);
+        assert_eq!(cache.caller_evictions_since_boot(), 0);
+        // Touch caller-0 to make it most-recently-touched; caller-1 is
+        // now the LRU candidate.
+        let _ = cache.record_and_check("caller-0", "l", b"s", "n2");
+        // Push a NEW caller past the ceiling — caller-1 (LRU) is evicted.
+        assert_eq!(
+            cache.record_and_check("caller-new", "l", b"s", "n"),
+            ReplayDecision::Fresh
+        );
+        assert_eq!(
+            cache.caller_count(),
+            VERIFY_REPLAY_MAX_CALLERS,
+            "#2032 LM3: at ceiling the outer HashMap must stay at VERIFY_REPLAY_MAX_CALLERS"
+        );
+        assert_eq!(
+            cache.caller_evictions_since_boot(),
+            1,
+            "#2032 LM3: exactly one caller-slot eviction must have fired"
+        );
+        // caller-1 (LRU) is gone; caller-0 (recently touched) survives.
+        assert_eq!(cache.len_for_caller("caller-1"), 0);
+        assert!(cache.len_for_caller("caller-0") > 0);
+    }
+
+    #[test]
+    fn one_caller_cannot_evict_anothers_fingerprint() {
+        // The core LM3 invariant. Caller-B records a fingerprint; caller-A
+        // then floods PAST its own per-caller capacity. Because the cache
+        // is partitioned by caller, caller-A's flood evicts only caller-A's
+        // OWN fingerprints — caller-B's earlier fingerprint is untouched and
+        // still returns Replay on re-presentation. Pre-#2032 (one global
+        // FIFO) caller-A's flood would have evicted caller-B's fingerprint,
+        // re-opening caller-B's replay window (the eviction-flush attack).
+        let cache = ReplayCache::new();
+
+        // Caller-B's victim fingerprint.
+        assert_eq!(
+            cache.record_and_check("caller-b", "link-victim", b"sig", "nonce-victim"),
+            ReplayDecision::Fresh
+        );
+
+        // Caller-A floods to per-caller capacity + 1 (one FIFO eviction
+        // WITHIN caller-A's own slot).
+        for i in 0..=VERIFY_REPLAY_CAPACITY_PER_CALLER {
+            assert_eq!(
+                cache.record_and_check("caller-a", "link-flood", b"sig", &format!("nonce-{i}")),
+                ReplayDecision::Fresh
+            );
+        }
+        // Caller-A DID evict — but only its own oldest fingerprint.
+        assert!(
+            cache.evictions_since_boot() >= 1,
+            "caller-a's flood must have evicted (its OWN) fingerprints"
+        );
+        assert_eq!(
+            cache.len_for_caller("caller-b"),
+            1,
+            "#2032 LM3: caller-b's partition is untouched by caller-a's flood"
+        );
+
+        // Caller-B re-presents its original tuple → STILL a Replay.
+        assert_eq!(
+            cache.record_and_check("caller-b", "link-victim", b"sig", "nonce-victim"),
+            ReplayDecision::Replay,
+            "#2032 LM3: one caller MUST NOT be able to evict another caller's fingerprint"
         );
     }
 }
@@ -401,8 +562,6 @@ mod tests {
 // ---------------------------------------------------------------------------
 // v0.7.0 #922 — federation per-peer nonce replay cache
 // ---------------------------------------------------------------------------
-
-use std::collections::HashMap;
 
 /// v0.7.0 #922 — per-peer LRU bound.
 ///

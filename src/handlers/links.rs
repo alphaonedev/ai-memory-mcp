@@ -88,6 +88,7 @@ pub struct VerifyLinkBody {
 /// [`crate::identity::replay`] for the threat model.
 pub async fn verify_link_handler(
     State(app): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<VerifyLinkBody>,
 ) -> impl IntoResponse {
     if body.source_id.is_none() && body.link_id.is_none() {
@@ -179,10 +180,30 @@ pub async fn verify_link_handler(
                         "{}|{}|{}",
                         report.source_id, report.target_id, report.relation
                     );
+                    // #2032 LM3 (class-a, 5-agent vote `4d3ea1c5`) —
+                    // partition the replay cache by CALLER so one caller
+                    // flooding fresh fingerprints can only evict its OWN
+                    // slot, never a victim's. Pre-#2032 the single global
+                    // 100k FIFO let any caller's 10k+ unique nonces flush
+                    // another caller's fingerprints (the module doc's
+                    // "eviction-flush attack"), re-opening the replay window
+                    // for the victim. Resolve the caller from `X-Agent-Id`
+                    // (like `create_link` / `get_links`), falling back to a
+                    // fresh per-request `anonymous:req-<uuid8>` — an
+                    // anonymous partition can only ever evict itself.
+                    let caller = {
+                        let header_agent_id = headers
+                            .get(crate::HEADER_AGENT_ID)
+                            .and_then(|v| v.to_str().ok());
+                        crate::identity::resolve_http_agent_id(None, header_agent_id)
+                            .unwrap_or_else(|_| crate::identity::anonymous_request_id())
+                    };
                     // Empty bytes as the "signature" component —
                     // the resolved link's identity already binds the
                     // signature material via canonical_id.
-                    let decision = app.replay_cache.record_and_check(&canonical_id, b"", nonce);
+                    let decision =
+                        app.replay_cache
+                            .record_and_check(&caller, &canonical_id, b"", nonce);
                     if matches!(decision, crate::identity::replay::ReplayDecision::Replay) {
                         return (
                             StatusCode::CONFLICT,
@@ -217,6 +238,7 @@ pub async fn verify_link_handler(
     {
         let _ = app;
         let _ = body;
+        let _ = &headers; // #2032 LM3: consumed only by the sal branch's caller-partition resolve
         (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({"error": "verify_link requires --features sal"})),
