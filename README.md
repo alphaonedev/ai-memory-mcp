@@ -775,7 +775,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (93 route registrations 
 - **GitHub Actions CI/CD** -- fmt, clippy, test, build on Ubuntu + macOS, release on tag
 
 ### Coverage Floor (hard CI gate)
-The `Code Coverage` job is a **required status check**. CI re-asserts two invariants on every PR: an **absolute floor of >= 90% lines** (catastrophic-regression backstop, set at the current measurement rounded down to the nearest 5%), and a **ratchet against the value pinned in [`.coverage-baseline`](.coverage-baseline)** with a 0.5% slack window (the day-to-day enforcement). PRs that raise coverage should bump the baseline file in the same commit so future PRs benefit from the new floor; PRs that regress more than 0.5% are blocked from merging. Current measurement: **93.13%** lines.
+The `Per-Module Coverage Thresholds` job (`.github/workflows/coverage.yml`) is the coverage gate. It re-asserts two invariants on every PR over the `--features sal,sal-postgres --lib --tests --workspace` sweep (live PG + AGE + pgvector): a **global line floor** (`coverage/thresholds.toml` `[global].min_line_coverage`, >= 90%, the catastrophic-regression backstop) and a **per-module floor** for every module, so no single module can quietly slide while the workspace average stays high. A PR that drops any module — or the workspace total — below its floor is blocked from merging; thresholds rise across releases and never fall without explicit operator approval. (The redundant `Code Coverage` job in `ci.yml` was removed in #1993 — it duplicated this gate and timed out mid-generation.)
 
 ### Token-Budget Gate (hard CI gate, v0.7 C5)
 The `token-budget` workflow is a **required status check**. It enforces three cl100k_base-measured invariants on every PR:

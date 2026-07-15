@@ -1,0 +1,197 @@
+<!--
+  Copyright 2026 AlphaOne LLC
+  SPDX-License-Identifier: Apache-2.0
+  ai-memory v1.0.0 — Adversarial Security Assessment + NSA CSI MCP re-verification.
+  Companion to nsa-csi-mcp.html and nsa-control-test-matrix.html.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-memory — v1.0.0 Adversarial Security Assessment</title>
+<meta name="description" content="ai-memory v1.0.0 five-agent adversarial security assessment (OWASP-aligned) of the HTTP/MCP surface, plus a full re-verification of NSA CSI MCP compliance: 580 control tests green, 0 failed.">
+<meta name="theme-color" content="#0d1117">
+<link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/compliance/v1.0.0-security-assessment.html">
+<style>
+:root {
+  --bg:#000; --bg-raised:#0a0a0a; --bg-card:#111; --bg-elev:#161616; --bg-code:#1a1a1a;
+  --border:#262626; --border-hl:#3d3d3d;
+  --text:#fff; --text-muted:#999; --text-dim:#666; --accent:#fff;
+  --good:#6ee7ff; --warn:#ffb86b; --bad:#ff6b9d;
+  --pillar-3:#c8a2ff;
+  --font-mono:'SF Mono','Cascadia Code','Fira Code','JetBrains Mono',Consolas,monospace;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  --max-w:1280px;
+}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:5rem}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--text);line-height:1.65;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+a{color:var(--good);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--font-mono);font-size:.82rem;background:var(--bg-code);padding:.12em .35em;border-radius:4px;word-break:break-word}
+.container{max-width:var(--max-w);margin:0 auto;padding:0 1.5rem}
+h1{font-weight:800;letter-spacing:-0.03em;font-size:2.4rem;line-height:1.1;margin-bottom:.75rem}
+h2{font-weight:700;letter-spacing:-0.02em;font-size:1.8rem;line-height:1.2;margin-bottom:.75rem}
+h3{font-weight:700;font-size:1.15rem;margin:1rem 0 .5rem}
+p{color:var(--text-muted);margin-bottom:.85rem}
+.topnav{position:sticky;top:0;z-index:50;background:rgba(0,0,0,0.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--border)}
+.topnav .inner{display:flex;align-items:center;justify-content:space-between;max-width:var(--max-w);margin:0 auto;padding:.9rem 1.5rem;font-size:.875rem}
+.topnav a{color:var(--text-muted);margin-right:1.25rem}
+.topnav a:hover,.topnav a.active{color:var(--text);text-decoration:none}
+.topnav .home-link{color:var(--text);font-weight:600}
+.topnav .right{display:flex;gap:1.25rem;align-items:center}
+@media(max-width:800px){.topnav .right{display:none}}
+.hero{padding:4rem 0 2.5rem;border-bottom:1px solid var(--border)}
+.eyebrow{display:inline-block;padding:.3rem .8rem;border-radius:999px;background:rgba(110,231,255,0.1);color:var(--good);font-size:.72rem;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:1rem;border:1px solid rgba(110,231,255,0.25)}
+.hero .tagline{font-size:1.05rem;color:var(--text-muted);max-width:72ch}
+.hero-pills{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:1.4rem}
+.hero-pill{padding:.4rem .85rem;border-radius:999px;background:var(--bg-elev);color:var(--text);font-size:.8rem;font-weight:600;border:1px solid var(--border-hl)}
+.hero-pill.good{background:rgba(110,231,255,0.08);color:var(--good);border-color:rgba(110,231,255,0.3)}
+.hero-pill.warn{background:rgba(255,184,107,0.08);color:var(--warn);border-color:rgba(255,184,107,0.3)}
+section{padding:2.75rem 0;border-bottom:1px solid var(--border)}
+section:last-child{border-bottom:none}
+.section-eyebrow{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--good);margin-bottom:.85rem}
+.lede{font-size:1.02rem;color:var(--text);max-width:78ch;margin-bottom:1.25rem}
+.scroll-x{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:.83rem;margin:1rem 0}
+thead th{text-align:left;padding:.65rem .75rem;background:var(--bg-elev);color:var(--text);font-weight:700;border-bottom:2px solid var(--border-hl);font-size:.74rem;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+tbody td{padding:.65rem .75rem;border-bottom:1px solid var(--border);vertical-align:top;color:var(--text-muted)}
+tbody td.col-name{color:var(--text);font-weight:600;min-width:17ch}
+tbody tr:hover{background:rgba(255,255,255,0.02)}
+td ul{list-style:none;padding-left:0;margin:0}
+td li{padding:.12rem 0}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.04em;white-space:nowrap}
+.tag.pass{background:rgba(110,231,255,0.12);color:var(--good);border:1px solid rgba(110,231,255,0.3)}
+.tag.cfg{background:rgba(255,184,107,0.12);color:var(--warn);border:1px solid rgba(255,184,107,0.3)}
+.tag.na{background:rgba(200,162,255,0.12);color:var(--pillar-3);border:1px solid rgba(200,162,255,0.3)}
+.tag.none{background:rgba(255,107,157,0.10);color:var(--bad);border:1px solid rgba(255,107,157,0.3)}
+.disclaimer-box{background:var(--bg-card);border-left:3px solid var(--warn);padding:1rem 1.25rem;border-radius:6px;margin:1.5rem 0}
+.disclaimer-box strong{color:var(--warn);display:block;margin-bottom:.35rem}
+.disclaimer-box p{color:var(--text-muted);margin:0;font-size:.9rem}
+.key-box{background:var(--bg-card);border:1px solid var(--border);border-radius:10px;padding:1.25rem 1.4rem;margin:1.25rem 0}
+.key-box h4{color:var(--text);font-size:.9rem;letter-spacing:.05em;text-transform:uppercase;margin-bottom:.6rem}
+.key-box ul{list-style:none;padding-left:0}
+.key-box li{padding:.25rem 0;font-size:.88rem;color:var(--text-muted)}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.25rem;margin:1.25rem 0}
+.stat-card{background:var(--bg-elev);border:1px solid var(--border-hl);border-radius:10px;padding:1.1rem}
+.stat-card .n{font-size:2.2rem;font-weight:800;color:var(--text);letter-spacing:-0.03em;line-height:1}
+.stat-card .n.warn{color:var(--warn)}
+.stat-card .n.good{color:var(--good)}
+.stat-card .l{color:var(--text-muted);font-size:.85rem;margin-top:.35rem}
+footer{padding:3rem 0 4rem;border-top:1px solid var(--border);background:var(--bg-raised);color:var(--text-dim);font-size:.85rem}
+footer a{color:var(--text-muted)}
+</style>
+</head>
+<body>
+<nav class="topnav">
+  <div class="inner">
+    <div>
+      <a class="home-link" href="../index.html">ai-memory</a>
+      <a href="../at-a-glance.html">Atlas</a>
+      <a href="../architectures.html">Architectures</a>
+      <a href="../feature-matrix.html">Feature matrix</a>
+      <a href="../evidence.html">Evidence</a>
+      <a class="active" href="index.html">Compliance</a>
+    </div>
+    <div class="right">
+      <a href="../whats-new-v07.html">v0.7.0</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">GitHub</a>
+    </div>
+  </div>
+</nav>
+<header class="hero">
+  <div class="container">
+    <span class="eyebrow">▸ Verification evidence · Public-facing · v1.0.0</span>
+    <h1>v1.0.0 Adversarial Security Assessment</h1>
+    <p class="tagline">A five-agent adversarial security review of the ai-memory HTTP/MCP surface — authentication &amp; access control, injection/deserialization, SSRF/outbound, transport &amp; deployment exposure, and federation-crypto/DoS — run against the <code>7WaySecurity/ai_osint</code> exposure-recon threat model, <strong>plus a full re-verification of NSA CSI MCP compliance</strong>. Every finding carries a <code>file:line</code> anchor; every NSA control was re-tested by name. Tracking issue: <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/2032">#2032</a>.</p>
+    <div class="hero-pills">
+      <span class="hero-pill good">NSA CSI MCP — 580 control tests green · 0 failed</span>
+      <span class="hero-pill good">crypto core sound — no SQLi / cmd-inj / high SSRF</span>
+      <span class="hero-pill warn">1 High · 3 Medium · 3 Low-Med · 6 Low/Info</span>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ NSA CSI MCP compliance</span>
+    <h2>Re-verified GREEN at the v1.0.0 dev tip.</h2>
+    <p class="lede">Every named test in the <a href="nsa-control-test-matrix.html">Control → Test Matrix</a> was re-run under the default multi-threaded runner (<code>AI_MEMORY_NO_CONFIG=1 cargo test --features sal</code>). All <strong>19 controls</strong> (NSA concerns a–j + recommendations a–g + 2 meta) from <em>NSA CSI, MCP Security Design Considerations, U/OO/6030316-26, May 2026 v1.0</em> remain covered and green.</p>
+    <table>
+      <tr><th>Re-verification part</th><th>Scope</th><th>Result</th></tr>
+      <tr><td>Part 1 — lib-side control tests</td><td>tls · subscriptions SSRF-guard · signed_events · verify_signed_events · validate · mcp server_identity</td><td><strong style="color:var(--good)">203 passed · 0 failed</strong></td></tr>
+      <tr><td>Part 2 — NSA integration binaries (18)</td><td>export_memories_admin_gate_957 · capabilities_v3 · k10_approval_security · k7_hmac · federation_nonce_replay_922 · config_precedence · http_if_match_concurrency · token_budget_guard · k8_daily_reset · per_namespace_quota · federation_dlq_replay · mcp_initialize_server_signing · harness_integration · hooks_timeout_budget · capture_turn_security_integrity · accept_provenance_http · serve_integration · l07_3_chunk_d_http_surface</td><td><strong style="color:var(--good)">377 passed · 0 failed</strong></td></tr>
+      <tr><td><strong>Total</strong></td><td>19 NSA controls</td><td><strong style="color:var(--good)">580 passed · 0 failed</strong></td></tr>
+    </table>
+    <p style="margin-top:1rem">Completed NSA hardening trail: master audit <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1153">#1153</a> · concern-j serverInfo Ed25519 signing <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1154">#1154</a> · recommendation-f Accept-Provenance <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1155">#1155</a> · concern-h per-namespace rate-limit <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1156">#1156</a> · verify_strict hardening <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/1898">#1898</a>. None of the assessment findings regress an NSA control.</p>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Assessment findings</span>
+    <h2>13 findings, de-duplicated across five agents.</h2>
+    <p class="lede">The exploitable residual risk is architectural: the HTTP surface's <em>identity</em> is a self-asserted <code>X-Agent-Id</code> header, cryptographically bound on the <strong>create</strong> path but not on <strong>read/mutate/admin</strong> — the root of the two highest findings. Severities are bounded to the stated deployment posture.</p>
+    <table>
+      <tr><th>ID</th><th>Severity</th><th>OWASP</th><th>Finding</th><th>Anchor</th></tr>
+      <tr><td>H1</td><td><strong style="color:var(--bad)">High</strong></td><td>A01/A07</td><td>Cross-tenant IDOR/BOLA on read+mutate via spoofable <code>X-Agent-Id</code> (multi-principal deployments)</td><td>handlers/memories.rs:98,401,855,1310</td></tr>
+      <tr><td>M1</td><td><strong style="color:var(--warn)">Medium</strong></td><td>A01/A07</td><td>Admin-role elevation via <code>X-Agent-Id</code> spoof (any shared-key holder)</td><td>handlers/admin_role.rs:274</td></tr>
+      <tr><td>M2</td><td><strong style="color:var(--warn)">Medium</strong></td><td>A02/A05</td><td>Non-loopback bind requires api-key but not TLS → cleartext key + content off-host</td><td>tls.rs · transport.rs</td></tr>
+      <tr><td>M3</td><td><strong style="color:var(--warn)">Medium</strong></td><td>A04</td><td>No default concurrency cap over single-Mutex SQLite → authenticated DoS</td><td>lib.rs:1250 · transport.rs:22</td></tr>
+      <tr><td>LM1</td><td>Low–Med</td><td>A03</td><td>Postgres <code>forget</code> unescaped LIKE wildcard over-match on a destructive path (#1724-class)</td><td>store/postgres.rs:16892,17209</td></tr>
+      <tr><td>LM2</td><td>Low–Med</td><td>A10/A05</td><td>Uncapped webhook ACK body read (memory-exhaustion amplification)</td><td>subscriptions.rs:1410</td></tr>
+      <tr><td>LM3</td><td>Low–Med</td><td>A08</td><td>Link-verify replay: optional nonce + single global FIFO cache</td><td>links.rs:74 · identity/replay.rs:68</td></tr>
+      <tr><td>L1</td><td>Low</td><td>A07/A09</td><td><code>?api_key=</code> query-string credential still accepted (log exposure)</td><td>transport.rs:842</td></tr>
+      <tr><td>L2</td><td>Low</td><td>A04/A07</td><td>No rate-limit / lockout on api-key auth attempts</td><td>transport.rs:768</td></tr>
+      <tr><td>L3</td><td>Low</td><td>A10</td><td>Redirect-policy parity gap on federation/LLM clients</td><td>federation/peer.rs · llm.rs</td></tr>
+      <tr><td>L4</td><td>Low</td><td>A03</td><td>AGE Cypher <code>find_paths</code> raw-id interpolation (blocked upstream by validate_id only)</td><td>store/postgres.rs:11815</td></tr>
+      <tr><td>L5</td><td>Info</td><td>A01/A05</td><td>Keyless bind = open data plane (mitigated by loopback default + opt-in REQUIRE_API_KEY)</td><td>transport.rs:773</td></tr>
+      <tr><td>L6</td><td>Info</td><td>A04</td><td>mTLS <code>/sync/*</code> bypass degrades to verbatim <code>X-Peer-Id</code> when <code>FED_REQUIRE_SIG=0</code></td><td>transport.rs:823</td></tr>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Verified safe-by-default</span>
+    <h2>Attempted, could not break.</h2>
+    <div class="key-box">
+      <ul>
+        <li>Macaroon capability <code>verify</code>: version-pinned, closed issuer allowlist, <code>verify_strict</code>, <code>subtle::ct_eq</code> HMAC chain, attenuation-only append-only fold, domain separation. No forgery/attenuation/replay.</li>
+        <li>Webhook SSRF guard: DNS-rebind TOCTOU closed (resolve-then-pin), IPv4-mapped / NAT64 / CGNAT / cloud-metadata canonicalized and blocked, fail-closed DNS, redirects disabled.</li>
+        <li>SQL: parameterized on both backends + centralized <code>escape_like_pattern</code> + FTS5 sanitizer (#1846 OR-tree DoS guard). No <code>Regex::new</code> from user input.</li>
+        <li>Process spawns via <code>Command::new(...).arg()</code> (no shell); hook payload delivered over stdin. Skill-export path traversal fixed (#1453).</li>
+        <li>No request <code>DecompressionLayer</code> (no ingest decompression bomb); global 2 MiB body cap on all routes incl. bulk/import/sync; MCP stdio 16 MiB line cap.</li>
+        <li><code>verify_strict</code> on all Ed25519 paths; fail-closed federation signature defaults at the v1.0 tip; forged signatures rejected regardless of the require-knob.</li>
+        <li>Per-peer partitioned + disk-persisted federation nonce cache; bulk/import admin-gated with per-row attestation (#1919); constant-time api-key compare (#1060); low-cardinality <code>/metrics</code> (no PII/keys/namespaces); admin fail-closed by default.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="container">
+    <span class="section-eyebrow">▸ Remediation</span>
+    <h2>Prioritized plan.</h2>
+    <div class="key-box">
+      <ul>
+        <li><strong style="color:var(--text)">Quick wins</strong> (contained): LM1 forget-LIKE escape · LM2 webhook ACK cap · L3 redirect policy · L4 Cypher self-defense.</li>
+        <li><strong style="color:var(--text)">Hardening defaults</strong>: M2 TLS-or-refuse for non-loopback · M3 default inflight cap · L1 drop <code>?api_key=</code> · L2 auth backoff · L5 default REQUIRE_API_KEY on 0.0.0.0.</li>
+        <li><strong style="color:var(--text)">Architectural</strong> (root of H1/M1): bind the HTTP read/mutate/admin principal cryptographically — per-request attestation/signature or per-agent keys (re-opens the intent of #1570/#1582).</li>
+        <li><strong style="color:var(--text)">Defense-in-depth</strong>: LM3 partition link-verify replay cache + default <code>require_nonce</code> · L6 cert-SAN ↔ <code>X-Peer-Id</code> cross-check.</li>
+      </ul>
+    </div>
+    <p style="margin-top:1rem">Full evidence, exploit scenarios, and per-finding remediation: tracking issue <a href="https://github.com/alphaonedev/ai-memory-mcp/issues/2032">#2032</a>. Reproduce the NSA re-verification from a fresh checkout: <code>AI_MEMORY_NO_CONFIG=1 cargo test --features sal --test &lt;name&gt;</code> per the <a href="nsa-control-test-matrix.html">control-test matrix</a>.</p>
+  </div>
+</section>
+
+<footer>
+  <div class="container">
+    <p style="margin-bottom:.5rem"><strong>ai-memory v1.0.0</strong> · Adversarial Security Assessment + NSA CSI MCP re-verification · public-facing verification evidence · maintained by AlphaOne LLC under Apache 2.0.</p>
+    <p style="margin-bottom:.5rem">Companion pages: <a href="nsa-csi-mcp.html">NSA CSI MCP compliance mapping</a> · <a href="nsa-control-test-matrix.html">Control → Test matrix</a> · <a href="honest-limitations.html">honest-limitations</a> · <a href="index.html">Compliance landing</a>.</p>
+    <p style="color:var(--text-dim);font-size:.85rem">The National Security Agency, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Reference: NSA, <em>Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation</em>, U/OO/6030316-26 | PP-26-1834, Version 1.0, May 2026.</p>
+  </div>
+</footer>
+</body>
+</html>

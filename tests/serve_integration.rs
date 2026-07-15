@@ -29,8 +29,8 @@ use tempfile::TempDir;
 mod common;
 use common::free_port;
 
-// CI's Code Coverage job runs the test binary under `cargo llvm-cov`
-// instrumentation, which inflates startup time by 3-5x. 60s gives
+// CI's `Per-Module Coverage Thresholds` job runs the test binary under
+// `cargo llvm-cov` instrumentation, which inflates startup time by 3-5x. 60s gives
 // enough headroom on every supported CI surface (Linux/macOS/Windows)
 // regardless of instrumentation overhead.
 const SPAWN_TIMEOUT: Duration = Duration::from_mins(1);
