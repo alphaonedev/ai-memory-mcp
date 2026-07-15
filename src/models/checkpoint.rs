@@ -220,6 +220,7 @@ mod tests {
             ConditionType::GovernanceEnforcement,
             ConditionType::EpochAdvance,
             ConditionType::PeerHeadEntanglement,
+            ConditionType::ReAnchor,
         ] {
             assert_eq!(ConditionType::from_str(c.as_str()), Some(c));
         }

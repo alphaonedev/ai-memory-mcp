@@ -2371,6 +2371,45 @@ pub fn force_emit_audit_head_witness(conn: &Connection) {
     maybe_emit_audit_head_witness(conn, head_seq, &head_hash, true);
 }
 
+/// v1.0.0 #2004 (spec §5.3) — OPERATOR-INVOKED crypto-agility re-anchor
+/// ceremony: countersign the CURRENT `signed_events` chain head under the
+/// enrolled suite and persist it as a signed
+/// [`crate::models::ConditionType::ReAnchor`] checkpoint (the #1822
+/// witness-anchor persistence, both backends). Unlike the witness cadence this
+/// is NOT throttled and NOT fire-and-forget — it is an explicit ceremony whose
+/// success / failure the operator must see, so the disposition is returned
+/// rather than swallowed.
+///
+/// Returns `Ok(None)` when no audit-witness key is enrolled (opt-in: the same
+/// distinct off-daemon custody key that signs witness anchors produces the
+/// re-anchor countersignature) or the chain is empty (nothing to anchor). On
+/// success the inserted checkpoint is returned for display / read-back
+/// verification ([`crate::governance::audit::verify_reanchor_checkpoint`]).
+///
+/// # Errors
+/// The head read, witness-key load, checkpoint build (a public-only key), or
+/// the insert failed.
+pub fn emit_reanchor_ceremony(conn: &Connection) -> Result<Option<crate::models::Checkpoint>> {
+    use crate::governance::audit as witness;
+    let (head_seq, head_hash) = read_chain_head(conn).context("re-anchor: read chain head")?;
+    if head_seq <= 0 {
+        return Ok(None); // empty chain — nothing to anchor.
+    }
+    let Some(keypair) = witness::load_witness_signing_key()? else {
+        return Ok(None); // opt-in: no audit-witness key enrolled.
+    };
+    let now_dt = chrono::Utc::now();
+    let cp = witness::build_signed_reanchor_checkpoint(
+        &head_hash,
+        u64::try_from(head_seq).unwrap_or(0),
+        &now_dt.to_rfc3339(),
+        now_dt.timestamp(),
+        &keypair,
+    )?;
+    crate::checkpoints::insert(conn, &cp).context("re-anchor: insert checkpoint")?;
+    Ok(Some(cp))
+}
+
 /// Lowercase-hex encode a byte slice. Centralised so the #1850 watermark
 /// hash and any future hex producer share one stable rendering.
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {

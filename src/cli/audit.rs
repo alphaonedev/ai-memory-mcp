@@ -59,6 +59,13 @@ pub enum AuditAction {
     /// the next `db::open`. The operator signature is the ONLY
     /// discriminator (at the byte level a DR restore IS a rollback).
     RestoreAttest(RestoreAttestArgs),
+    /// v1.0.0 #2004 (spec §5.3) — the crypto-agility RE-ANCHOR ceremony.
+    /// Countersign the CURRENT `signed_events` chain head under the enrolled
+    /// suite and persist it as a signed `re_anchor` checkpoint, so enabling a
+    /// stronger / PQ suite later causes zero record rewrites and every
+    /// pre-break record stays attributable. Signed by the DISTINCT off-daemon
+    /// audit-witness custody key (opt-in — a no-op when none is enrolled).
+    ReAnchor(ReAnchorArgs),
 }
 
 #[derive(Args)]
@@ -145,6 +152,14 @@ pub struct RestoreAttestArgs {
     pub json: bool,
 }
 
+/// v1.0.0 #2004 — arguments for `ai-memory audit re-anchor`.
+#[derive(Args)]
+pub struct ReAnchorArgs {
+    /// Emit a JSON summary instead of the human-readable line.
+    #[arg(long)]
+    pub json: bool,
+}
+
 /// `ai-memory audit` entry point. Returns the desired process exit
 /// code so the caller can surface a non-zero status from the top-level
 /// dispatch without panicking.
@@ -156,7 +171,66 @@ pub fn run(args: AuditArgs, app_config: &AppConfig, out: &mut CliOutput<'_>) -> 
         AuditAction::Path => run_path(audit_dir.as_deref(), app_config, out),
         AuditAction::Show(s) => run_show(&s, app_config, out),
         AuditAction::RestoreAttest(r) => run_restore_attest(&r, app_config, out),
+        AuditAction::ReAnchor(r) => run_re_anchor(&r, app_config, out),
     }
+}
+
+/// v1.0.0 #2004 (spec §5.3) — the crypto-agility re-anchor ceremony. Reads the
+/// current `signed_events` head, countersigns it under the enrolled suite with
+/// the audit-witness custody key, and persists a signed `re_anchor` checkpoint
+/// (both backends). The freshly-persisted anchor is then self-verified via the
+/// read-back path (K1-pinned to the enrolled witness pubkey) so the operator
+/// sees the ceremony round-trip, not just a write.
+fn run_re_anchor(
+    args: &ReAnchorArgs,
+    app_config: &AppConfig,
+    out: &mut CliOutput<'_>,
+) -> Result<i32> {
+    use anyhow::Context;
+    let db_path = app_config.effective_db(std::path::Path::new("ai-memory.db"));
+    let conn = crate::db::open(&db_path)
+        .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
+    let Some(cp) =
+        crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?
+    else {
+        writeln!(
+            out.stderr,
+            "re-anchor: no ceremony emitted — enrol an audit-witness signing key \
+             (AI_MEMORY_WITNESS_KEY_DIR) and ensure the signed_events chain is non-empty"
+        )?;
+        return Ok(0);
+    };
+    // Self-verify the persisted anchor against the OUT-OF-BAND enrolled witness
+    // pubkey (K1) — the same read-back a fresh verifier performs.
+    let verified = match crate::governance::audit::load_enrolled_witness_pubkey()? {
+        Some(vk) => crate::governance::audit::verify_reanchor_checkpoint(&cp, &vk).is_ok(),
+        None => false,
+    };
+    if args.json {
+        writeln!(
+            out.stdout,
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "checkpoint_id": cp.id,
+                "namespace": cp.namespace,
+                "verified": verified,
+            })
+        )?;
+    } else {
+        let readback = if verified {
+            "PASS"
+        } else {
+            "unverified (no enrolled witness pubkey — set AI_MEMORY_WITNESS_PUBKEY to K1-pin)"
+        };
+        writeln!(
+            out.stdout,
+            "re-anchor OK: crypto-agility ceremony anchor {} recorded (namespace {}); \
+             read-back verify: {readback}",
+            cp.id, cp.namespace
+        )?;
+    }
+    Ok(0)
 }
 
 /// v1.0.0 #1946 (A1) — the sanctioned-restore ceremony. Reads the
