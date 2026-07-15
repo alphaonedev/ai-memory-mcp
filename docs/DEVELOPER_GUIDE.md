@@ -4,7 +4,7 @@
 
 `ai-memory` is an AI-agnostic memory management system built as a single Rust binary that serves three roles:
 
-1. **MCP tool server** -- stdio JSON-RPC server exposing 101 advertised entries at `--profile full` (100 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
+1. **MCP tool server** -- stdio JSON-RPC server exposing 102 advertised entries at `--profile full` (101 callable memory tools + the always-on `memory_capabilities` bootstrap) + 2 MCP prompts for any MCP-compatible AI client (Claude AI, OpenAI ChatGPT, xAI Grok, META Llama, and others)
 2. **CLI tool** -- direct SQLite operations for store, recall, search, list, etc. (completely AI-agnostic)
 3. **HTTP daemon** -- an Axum web server exposing the same operations as a REST API with 92 route registrations / 78 unique URL paths (completely AI-agnostic)
 
@@ -85,7 +85,7 @@ When running at the `semantic` tier or higher, ai-memory loads a HuggingFace emb
 
 ### `src/mcp/`
 
-The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **The registry exposes 101 advertised entries at `--profile full`** (100 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
+The MCP (Model Context Protocol) server implementation. MCP is an open standard -- this server works with any MCP-compatible AI client. Runs over stdio, processing one JSON-RPC message per line. **The registry exposes 102 advertised entries at `--profile full`** (101 callable "memory tools" + the always-on `memory_capabilities` bootstrap; both numbers are intentional, see issue [#862](https://github.com/alphaonedev/ai-memory-mcp/issues/862)). Default `--profile core` ships 7 tools (the original 5 + `memory_load_family` + `memory_smart_load`) plus the always-on bootstrap.
 
 The pre-#1066 monolithic `src/mcp.rs` is GONE — the module is split: `src/mcp/registry.rs` owns the canonical `registered_tools()` iterator + `tool_definitions()` view + the `tool_names` const module (100 canonical tool-name consts at v0.8.0 — extracted per #1187 / Wave-1 PR1, then grown through the v0.7.x/v0.8.0 tool additions incl. `memory_capture_turn` and the #1709 coordination tools; `tool_names::ALL.len()` is pinned against `Profile::full().expected_tool_count()`); `src/mcp/tools/*.rs` host per-tool handlers AND each tool's `<ToolName>Request` schemars struct + `McpTool` impl; `src/mcp/mod.rs` wires the JSON-RPC dispatch loop; `src/mcp/jsonrpc.rs` is the JSON-RPC wire-constant SSOT (#1558 batch 3) and `src/mcp/param_names.rs` the tool-call param-name SSOT.
 

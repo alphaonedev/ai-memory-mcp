@@ -895,6 +895,24 @@
               "null"
             ]
           },
+          "content_append": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_replace_from": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_replace_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "edit_source": {
             "type": [
               "string",
@@ -2856,6 +2874,27 @@
         "type": "object"
       },
       "name": "memory_skill_get"
+    },
+    {
+      "description": "Retire (hide from discovery) or",
+      "inputSchema": {
+        "properties": {
+          "retired": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "skill_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill_id"
+        ],
+        "type": "object"
+      },
+      "name": "memory_skill_retire"
     },
     {
       "description": "Fetch + digest-verify a skill",

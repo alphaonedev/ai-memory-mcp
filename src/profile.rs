@@ -318,6 +318,7 @@ impl Family {
             | tn::MEMORY_SKILL_REGISTER
             | tn::MEMORY_SKILL_LIST
             | tn::MEMORY_SKILL_GET
+            | tn::MEMORY_SKILL_RETIRE
             | tn::MEMORY_SKILL_RESOURCE
             | tn::MEMORY_SKILL_EXPORT
             | tn::MEMORY_SKILL_PROMOTE_FROM_REFLECTION
@@ -588,6 +589,8 @@ impl Family {
                 tn::MEMORY_SKILL_REGISTER,
                 tn::MEMORY_SKILL_LIST,
                 tn::MEMORY_SKILL_GET,
+                // #2024 — reversible operator-authorized skill retire.
+                tn::MEMORY_SKILL_RETIRE,
                 tn::MEMORY_SKILL_RESOURCE,
                 tn::MEMORY_SKILL_EXPORT,
                 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop.

@@ -71,6 +71,19 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
             created_at,
         ) = row.map_err(|e| format!("skill_list row: {e}"))?;
 
+        // #2024 — a retired skill (metadata.retired == true) is hidden from
+        // discovery, the same as a superseded one. Parse the metadata JSON
+        // once here so the retire filter and the metadata echo below share it.
+        let meta_val: Option<Value> = serde_json::from_str(&metadata).ok();
+        if meta_val
+            .as_ref()
+            .and_then(|m| m.get("retired"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
+
         // Apply optional text filter on name or description.
         if !filter.is_empty() && !name.contains(filter) && !description.contains(filter) {
             continue;
@@ -101,8 +114,8 @@ pub fn handle_skill_list(conn: &Connection, params: &Value) -> Result<Value, Str
         if let Some(agent) = signing_agent {
             entry[field_names::SIGNING_AGENT] = json!(agent);
         }
-        // metadata is a JSON string — include it parsed.
-        if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
+        // metadata is a JSON string — include it parsed (reuse the parse above).
+        if let Some(meta_val) = meta_val {
             if !meta_val.as_object().map_or(true, |m| m.is_empty()) {
                 entry["metadata"] = meta_val;
             }

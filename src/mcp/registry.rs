@@ -151,6 +151,8 @@ pub mod tool_names {
     pub const MEMORY_SKILL_PROMOTE_FROM_REFLECTION: &str = "memory_skill_promote_from_reflection";
     pub const MEMORY_SKILL_REGISTER: &str = "memory_skill_register";
     pub const MEMORY_SKILL_RESOURCE: &str = "memory_skill_resource";
+    /// #2024 — reversible operator-authorized skill retire / un-retire.
+    pub const MEMORY_SKILL_RETIRE: &str = "memory_skill_retire";
     pub const MEMORY_SMART_LOAD: &str = "memory_smart_load";
     pub const MEMORY_STATS: &str = "memory_stats";
     pub const MEMORY_STORE: &str = "memory_store";
@@ -267,6 +269,7 @@ pub mod tool_names {
         MEMORY_SKILL_PROMOTE_FROM_REFLECTION,
         MEMORY_SKILL_REGISTER,
         MEMORY_SKILL_RESOURCE,
+        MEMORY_SKILL_RETIRE,
         MEMORY_SMART_LOAD,
         MEMORY_STATS,
         MEMORY_STORE,
@@ -457,6 +460,7 @@ pub mod tool_names {
             );
             assert_eq!(MEMORY_SKILL_REGISTER, "memory_skill_register");
             assert_eq!(MEMORY_SKILL_RESOURCE, "memory_skill_resource");
+            assert_eq!(MEMORY_SKILL_RETIRE, "memory_skill_retire");
             assert_eq!(MEMORY_SMART_LOAD, "memory_smart_load");
             assert_eq!(MEMORY_STATS, "memory_stats");
             assert_eq!(MEMORY_STORE, "memory_store");
@@ -807,6 +811,7 @@ pub fn registered_tools() -> Vec<RegisteredTool> {
         RegisteredTool::of::<crate::mcp::skill_register::SkillRegisterTool>(),
         RegisteredTool::of::<crate::mcp::skill_list::SkillListTool>(),
         RegisteredTool::of::<crate::mcp::skill_get::SkillGetTool>(),
+        RegisteredTool::of::<crate::mcp::skill_retire::SkillRetireTool>(),
         RegisteredTool::of::<crate::mcp::skill_resource::SkillResourceTool>(),
         RegisteredTool::of::<crate::mcp::skill_export::SkillExportTool>(),
         RegisteredTool::of::<crate::mcp::skill_promote::SkillPromoteFromReflectionTool>(),

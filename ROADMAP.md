@@ -355,7 +355,7 @@ CI guard (corrected 2026-07-11 per #1938 ruling wf_26d176ac): the Bench workflow
 
 ### 9.7 Surface area shipped (v0.7.0 grand-slam baseline, advanced through v0.8.0 GA)
 
-- **101 MCP tools at `--profile full`** (count pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`; the callable/bootstrap split is whatever that constant declares, plus the always-on `memory_capabilities`; grown from the 74-tool v0.7.0 baseline through the v0.8.0 #1709 coordination tooling). 7 at `--profile core`.
+- **102 MCP tools at `--profile full`** (count pinned by `Profile::full().expected_tool_count()` in `src/profile.rs`; the callable/bootstrap split is whatever that constant declares, plus the always-on `memory_capabilities`; grown from the 74-tool v0.7.0 baseline through the v0.8.0 #1709 coordination tooling). 7 at `--profile core`.
 - **92 production HTTP route registrations** / 78 unique URL paths.
 - **90 CLI subcommands** under `--features sal`/`sal-postgres`; 88 in default build (the 2-variant gap is `Migrate` + `SchemaInit`, both `#[cfg(feature = "sal")]`; grown via #1720 B2 `Reown` + PE-8 `VerifyAuditTrail` + #1727 `UndoEdit` + v0.9.0 #1859 `Lineage` + v0.9.0 #1827 `Capability` (macaroon capability-token lifecycle); pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT=87` / `EXPECTED_CLI_SUBCOMMANDS_SAL=89` + `tests/cli_subcommand_count_invariant.rs`).
 - **27 hook lifecycle events** (17 baseline + 3 transcript-capture additions `PreArchive`/`PreTranscriptStore`/`PostTranscriptStore` + 5 reflection/compaction additions `PreRecallExpand`/`PreReflect`/`PostReflect`/`PreCompaction`/`OnCompactionRollback` + 2 v0.8.0 #1709 signal events `pre_signal_send`/`post_signal_ack` — per `src/hooks/events.rs::HookEvent`; 17+3+5+2=27).

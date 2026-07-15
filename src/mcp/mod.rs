@@ -549,6 +549,8 @@ mod skill_list;
 mod skill_register;
 #[path = "tools/skill_resource.rs"]
 mod skill_resource;
+#[path = "tools/skill_retire.rs"]
+mod skill_retire;
 #[path = "tools/skill_zstd.rs"]
 mod skill_zstd;
 // v0.7.0 L2-6 (issue #671) — closing the recursive-learning loop:
@@ -685,6 +687,7 @@ pub use skill_list::handle_skill_list;
 pub use skill_promote::handle_skill_promote_from_reflection;
 pub use skill_register::handle_skill_register;
 pub use skill_resource::handle_skill_resource;
+pub use skill_retire::handle_skill_retire;
 
 // v0.7.0 #1111 — public re-exports for the HTTP-route closeout. The
 // six MCP handlers below were `pub(super)` so external callers couldn't
@@ -2198,6 +2201,10 @@ fn dispatch_memory_skill_get(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String>
     handle_skill_get(ctx.conn, ctx.arguments)
 }
 
+fn dispatch_memory_skill_retire(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
+    handle_skill_retire(ctx.conn, ctx.arguments)
+}
+
 fn dispatch_memory_skill_resource(ctx: &ToolDispatchCtx<'_>) -> Result<Value, String> {
     handle_skill_resource(ctx.conn, ctx.arguments)
 }
@@ -2530,6 +2537,10 @@ pub(crate) static TOOL_DISPATCH_TABLE: &[(&str, DispatchFn)] = {
         ),
         register_mcp_tool!(tool_names::MEMORY_SKILL_LIST, dispatch_memory_skill_list),
         register_mcp_tool!(tool_names::MEMORY_SKILL_GET, dispatch_memory_skill_get),
+        register_mcp_tool!(
+            tool_names::MEMORY_SKILL_RETIRE,
+            dispatch_memory_skill_retire
+        ),
         register_mcp_tool!(
             tool_names::MEMORY_SKILL_RESOURCE,
             dispatch_memory_skill_resource

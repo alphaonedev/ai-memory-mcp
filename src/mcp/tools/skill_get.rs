@@ -180,6 +180,14 @@ pub fn handle_skill_get(conn: &Connection, params: &Value) -> Result<Value, Stri
         response["superseded_by"] = json!(sup_id);
     }
     if let Ok(meta_val) = serde_json::from_str::<Value>(&metadata) {
+        // #2024 — surface the reversible retire state explicitly (it also
+        // lives inside `metadata`, but callers shouldn't have to dig for it).
+        response["retired"] = json!(
+            meta_val
+                .get("retired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
         response["metadata"] = meta_val;
     }
 
