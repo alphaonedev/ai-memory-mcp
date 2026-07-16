@@ -4450,6 +4450,16 @@ impl PostgresStore {
             ..Memory::default()
         };
         consult_governance_pre_write_pg(&governed)?;
+        // #2060 — TRACT covenant clause 2: authorship-immutability gate,
+        // postgres twin of the sqlite `update_with_expected_version` check.
+        // `leaf_agent_id` was captured above BEFORE `cur_meta` was moved
+        // into `governed`, so it still reflects the row's PRE-update
+        // authorship; `patch.metadata` is the caller's raw, unmerged patch.
+        consult_authorship_immutable_gate_pg(
+            leaf_agent_id.as_deref(),
+            patch.metadata.as_ref(),
+            &leaf_ns,
+        )?;
 
         // #228 Commit B — at-rest content encryption (postgres in-place
         // update parity). Seal the effective NEW content (the patch's
@@ -11311,6 +11321,51 @@ fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
     }
 }
 
+/// #2059 — TRACT covenant clause 1 postgres twin of
+/// `crate::storage::consult_why_trace_gate`. Same downcast-and-map
+/// idiom as [`consult_governance_pre_write_pg`] so a why_trace refusal
+/// surfaces as the identical `403`/`GOVERNANCE_REFUSED` wire shape on
+/// both backends.
+fn consult_why_trace_gate_pg(memory: &Memory) -> StoreResult<()> {
+    match crate::storage::consult_why_trace_gate(memory) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = e
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map_or_else(|| e.to_string(), |r| r.reason.clone());
+            Err(StoreError::PermissionDenied {
+                action: "memory_write".to_string(),
+                target: memory.namespace.clone(),
+                reason,
+            })
+        }
+    }
+}
+
+/// #2060 — TRACT covenant clause 2 postgres twin of
+/// `crate::storage::consult_authorship_immutable_gate`. Same
+/// downcast-and-map idiom as [`consult_governance_pre_write_pg`] so an
+/// authorship-rewrite refusal surfaces identically on both backends.
+fn consult_authorship_immutable_gate_pg(
+    existing_agent_id: Option<&str>,
+    incoming_metadata: Option<&serde_json::Value>,
+    namespace: &str,
+) -> StoreResult<()> {
+    match crate::storage::consult_authorship_immutable_gate(existing_agent_id, incoming_metadata) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = e
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map_or_else(|| e.to_string(), |r| r.reason.clone());
+            Err(StoreError::PermissionDenied {
+                action: "memory_update".to_string(),
+                target: namespace.to_string(),
+                reason,
+            })
+        }
+    }
+}
+
 impl PostgresStore {
     /// FX-C5 — load a row from `archived_memories` shaped as a
     /// [`Memory`] so the substrate
@@ -12767,6 +12822,9 @@ impl MemoryStore for PostgresStore {
         // operator-signed governance. See module-level comment in
         // `src/storage/mod.rs` for the full layering rationale.
         consult_governance_pre_write_pg(memory)?;
+        // #2059 — TRACT covenant clause 1: mandatory why_trace write-gate,
+        // postgres twin of the sqlite `db::insert` check.
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -26688,4 +26746,19 @@ mod tests {
             "the persisted memory_kind is updated"
         );
     }
+
+    // ── #2059 / #2060 — TRACT covenant clauses 1+2, postgres twins ──
+    //
+    // `consult_why_trace_gate_pg` / `consult_authorship_immutable_gate_pg`
+    // are private (module-scoped, no `pub`) thin downcast-and-map wrappers
+    // over the shared `crate::storage` gate — the SAME shape as the
+    // pre-existing `consult_governance_pre_write_pg`, which likewise has no
+    // dedicated in-module unit test (its coverage is transitive via the
+    // live-PG `#[tokio::test]` suite above). A direct unit test here would
+    // need to mutate the process-global `AI_MEMORY_REQUIRE_WHY_TRACE` /
+    // `AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP` env vars, which is unsafe in
+    // this shared multi-threaded `cargo test --lib` binary (see the
+    // sqlite-side note in `storage::tests`); the underlying shared gate
+    // logic is exhaustively covered by the isolated integration-test
+    // process `tests/issue_2059_2060_covenant_write_gates.rs` instead.
 }
