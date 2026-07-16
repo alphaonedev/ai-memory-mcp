@@ -94,6 +94,19 @@ pub fn handle_share(conn: &rusqlite::Connection, params: &Value) -> Result<Value
         // purposes; the original author is preserved in
         // `shared_from_agent_id`.
         obj.insert("agent_id".into(), json!(target_agent_id));
+        // #2122 — covenant clause-1 why_trace path for `memory_share`. The
+        // wholesale metadata clone above already INHERITS the source's
+        // why_trace (a share is a derivation of an already-stored,
+        // already-gated row); an explicit caller-supplied `why_trace` param
+        // overrides it — and is the only way to share a legacy source that
+        // predates the covenant under AI_MEMORY_REQUIRE_WHY_TRACE=1 (the
+        // `db::insert` gate refuses a why_trace-less shared copy under
+        // enforce). The substrate never stamps its own rationale here.
+        if let Some(wt) = params[param_names::WHY_TRACE].as_str()
+            && !wt.trim().is_empty()
+        {
+            obj.insert(param_names::WHY_TRACE.into(), json!(wt));
+        }
     }
 
     let shared_id = uuid::Uuid::new_v4().to_string();
@@ -156,6 +169,14 @@ pub struct ShareRequest {
 
     /// Recipient agent id; must satisfy validate_agent_id.
     pub target_agent_id: String,
+
+    /// Covenant clause-1 rationale (#2122): why this memory is being
+    /// shared. Optional — the shared copy inherits the source's
+    /// metadata.why_trace by default; supply this to override it (or to
+    /// share a legacy source that predates the covenant under
+    /// AI_MEMORY_REQUIRE_WHY_TRACE=1).
+    #[serde(default)]
+    pub why_trace: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_share`.

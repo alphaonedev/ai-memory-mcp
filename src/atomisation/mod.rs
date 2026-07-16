@@ -761,7 +761,7 @@ fn write_atom(
         serde_json::Value::String(source.id.clone()),
     );
 
-    let mem = Memory {
+    let mut mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
         id: atom_id.clone(),
         tier: source.tier.clone(),
@@ -820,6 +820,11 @@ fn write_atom(
         lifecycle_state: crate::models::LifecycleState::Open,
     };
 
+    // #2110 — atoms are substrate-authored (the atomiser decided to split the
+    // source), reached via a direct `db::insert` that bypasses the SAL
+    // authenticated-origin exemption; record the substrate why_trace so the
+    // atom write satisfies AI_MEMORY_REQUIRE_WHY_TRACE (stamp-if-absent).
+    crate::storage::stamp_substrate_why_trace(&mut mem.metadata);
     let actual_id = db::insert(conn, &mem)?;
 
     // Stamp `atom_of` on the freshly inserted row. db::insert does NOT

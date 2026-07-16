@@ -4497,6 +4497,19 @@ impl PostgresStore {
             metadata: patch.metadata.clone().unwrap_or(cur_meta),
             ..Memory::default()
         };
+        // #2060 — TRACT covenant clause 2: authorship-immutability gate,
+        // postgres twin of the sqlite `update_with_expected_version` check.
+        // `leaf_agent_id` was captured above BEFORE `cur_meta` was moved
+        // into `governed`, so it still reflects the row's PRE-update
+        // authorship; `patch.metadata` is the caller's raw, unmerged patch.
+        // #2106 review item 3 — runs BEFORE the governance hook to match the
+        // sqlite ordering (authorship-then-governance) so a write that trips
+        // BOTH surfaces the SAME refusal reason on either backend.
+        consult_authorship_immutable_gate_pg(
+            leaf_agent_id.as_deref(),
+            patch.metadata.as_ref(),
+            &leaf_ns,
+        )?;
         consult_governance_pre_write_pg(&governed)?;
 
         // #228 Commit B — at-rest content encryption (postgres in-place
@@ -4777,6 +4790,18 @@ impl PostgresStore {
 
         let existing = Self::row_to_memory(&existing_pg)?;
 
+        // #2060/#2103 — TRACT covenant clause 2: authorship-immutability gate
+        // on the postgres append-and-archive supersede twin (the sqlite
+        // `update_with_archive_on_supersede` was gated in the #2101 diff; this
+        // postgres twin was the un-wired backend-asymmetry). Sees the OLD row's
+        // authorship + the caller's raw patch metadata; runs before any
+        // mutation so a refused rewrite leaves the OLD row live.
+        consult_authorship_immutable_gate_pg(
+            existing.metadata.get("agent_id").and_then(|v| v.as_str()),
+            patch.metadata.as_ref(),
+            &existing.namespace,
+        )?;
+
         // Optimistic-concurrency gate against the OLD row.
         if let Some(expected) = expected_version
             && expected != existing.version
@@ -4837,10 +4862,18 @@ impl PostgresStore {
             None => existing.expires_at.clone(),
         };
         // Stamp edit_source + superseded_id into the new row's metadata.
-        let mut new_metadata = patch
+        // #2106 review item 2 — preserve the OLD row's immutable provenance
+        // keys (agent_id + derived_from / consolidated_from_agents) onto the
+        // superseding row so a full-object patch that OMITS agent_id does not
+        // silently ERASE authorship (the fresh id means the insert-time ON
+        // CONFLICT preservation never fires; postgres twin of the sqlite
+        // supersede guard).
+        let patched_metadata = patch
             .metadata
             .clone()
             .unwrap_or_else(|| existing.metadata.clone());
+        let mut new_metadata =
+            crate::identity::preserve_provenance_keys(&existing.metadata, &patched_metadata);
         if let serde_json::Value::Object(ref mut m) = new_metadata {
             m.insert(
                 "edit_source".to_string(),
@@ -4898,6 +4931,27 @@ impl PostgresStore {
             cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
+        // #2110/#2113 audit — TRACT covenant clause 1 on the pg append-and-
+        // archive supersede funnel. The superseding row is minted via this
+        // method's own inline `INSERT INTO memories` (below), which bypasses
+        // the `PostgresStore::store` why_trace gate — the last un-gated
+        // postgres create funnel. Mirrors the sqlite twin, whose superseding
+        // row funnels through `insert()` and is therefore why_trace-gated
+        // transitively (ctx-blind refuse-mode, no bypass exemption): a
+        // supersede whose composed metadata carries no `why_trace` is REFUSED
+        // under enforce.
+        //
+        // #2123 — why_trace inheritance across a supersede is WHOLE-OBJECT
+        // ONLY: when the patch OMITS `metadata` entirely, `patched_metadata`
+        // clones `existing.metadata` and the old row's why_trace rides along.
+        // A patch that SUPPLIES a metadata object must re-supply why_trace
+        // itself — `preserve_provenance_keys` overlays ONLY
+        // `IMMUTABLE_PROVENANCE_KEYS` (`agent_id` / `derived_from` /
+        // `consolidated_from_agents`), and why_trace is deliberately NOT in
+        // that set (it is a PER-WRITE rationale, not immutable provenance:
+        // silently inheriting the old rationale onto a rewritten row would
+        // launder the new write past the gate).
+        consult_why_trace_gate_pg(&candidate)?;
 
         // Step 1: archive the OLD row with archive_reason='superseded'.
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.
@@ -9512,7 +9566,17 @@ impl PostgresStore {
                 reflection_meta,
             );
         }
-        let metadata_value = serde_json::Value::Object(metadata);
+        let mut metadata_value = serde_json::Value::Object(metadata);
+        // #2113/#2110 — TRACT covenant clause 1 authenticated-origin stamp on
+        // the pg reflect funnel. An INTERNAL curator reflect runs under
+        // `bypass_visibility` and records the substrate why_trace so the
+        // reflection clears the why_trace gate below; an EXTERNAL
+        // `memory_reflect` (tenant ctx) is NOT stamped and is gated. Stamped
+        // here (before `candidate` is composed) so the persisted INSERT carries
+        // the marker too — postgres parity with `SqliteStore::reflect`.
+        if ctx.bypass_visibility {
+            crate::storage::stamp_substrate_why_trace(&mut metadata_value);
+        }
         validate::validate_metadata(&metadata_value)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
 
@@ -9577,6 +9641,22 @@ impl PostgresStore {
                 other => other.to_string(),
             };
             return Err(ReflectError::HookVeto { reason, code: 403 });
+        }
+        // #2113 — TRACT covenant clause 1 why_trace gate on the pg reflect
+        // funnel (POST /api/v1/reflect). Pre-#2113 this path consulted only
+        // governance, so a tenant reflect on a postgres daemon got ZERO
+        // why_trace enforcement while the sqlite reflect path was gated. The
+        // authenticated SYSTEM principal (bypass_visibility) is exempt — its
+        // candidate was already stamped above; a tenant reflect is REFUSED
+        // when it carries no why_trace under AI_MEMORY_REQUIRE_WHY_TRACE=1.
+        if !ctx.bypass_visibility {
+            if let Err(e) = consult_why_trace_gate_pg(&candidate) {
+                let reason = match &e {
+                    StoreError::PermissionDenied { reason, .. } => reason.clone(),
+                    other => other.to_string(),
+                };
+                return Err(ReflectError::HookVeto { reason, code: 403 });
+            }
         }
 
         let mut tx = self
@@ -11337,6 +11417,12 @@ fn pg_row_to_routine_run(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models
 /// the sqlx-native postgres write paths so multi-tenant
 /// postgres-backed deployments cannot bypass operator-signed
 /// governance.
+/// pm-v3.1 hardcoded-literal gate — shared `StoreError::PermissionDenied.action`
+/// label for a memory-WRITE refusal on the postgres SAL surface. Named so the
+/// literal isn't duplicated across [`consult_governance_pre_write_pg`] and its
+/// #2059 why_trace sibling [`consult_why_trace_gate_pg`].
+const ACTION_MEMORY_WRITE: &str = "memory_write";
+
 fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
     match crate::storage::consult_governance_pre_write(memory) {
         Ok(()) => Ok(()),
@@ -11351,8 +11437,53 @@ fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
                 .downcast_ref::<crate::storage::GovernanceRefusal>()
                 .map_or_else(|| e.to_string(), |r| r.reason.clone());
             Err(StoreError::PermissionDenied {
-                action: "memory_write".to_string(),
+                action: ACTION_MEMORY_WRITE.to_string(),
                 target: memory.namespace.clone(),
+                reason,
+            })
+        }
+    }
+}
+
+/// #2059 — TRACT covenant clause 1 postgres twin of
+/// `crate::storage::consult_why_trace_gate`. Same downcast-and-map
+/// idiom as [`consult_governance_pre_write_pg`] so a why_trace refusal
+/// surfaces as the identical `403`/`GOVERNANCE_REFUSED` wire shape on
+/// both backends.
+fn consult_why_trace_gate_pg(memory: &Memory) -> StoreResult<()> {
+    match crate::storage::consult_why_trace_gate(memory) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = e
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map_or_else(|| e.to_string(), |r| r.reason.clone());
+            Err(StoreError::PermissionDenied {
+                action: ACTION_MEMORY_WRITE.to_string(),
+                target: memory.namespace.clone(),
+                reason,
+            })
+        }
+    }
+}
+
+/// #2060 — TRACT covenant clause 2 postgres twin of
+/// `crate::storage::consult_authorship_immutable_gate`. Same
+/// downcast-and-map idiom as [`consult_governance_pre_write_pg`] so an
+/// authorship-rewrite refusal surfaces identically on both backends.
+fn consult_authorship_immutable_gate_pg(
+    existing_agent_id: Option<&str>,
+    incoming_metadata: Option<&serde_json::Value>,
+    namespace: &str,
+) -> StoreResult<()> {
+    match crate::storage::consult_authorship_immutable_gate(existing_agent_id, incoming_metadata) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let reason = e
+                .downcast_ref::<crate::storage::GovernanceRefusal>()
+                .map_or_else(|| e.to_string(), |r| r.reason.clone());
+            Err(StoreError::PermissionDenied {
+                action: "memory_update".to_string(),
+                target: namespace.to_string(),
                 reason,
             })
         }
@@ -12815,6 +12946,15 @@ impl MemoryStore for PostgresStore {
         // operator-signed governance. See module-level comment in
         // `src/storage/mod.rs` for the full layering rationale.
         consult_governance_pre_write_pg(memory)?;
+        // #2059/#2110 — TRACT covenant clause 1 why_trace write-gate. Keyed on
+        // the write's AUTHENTICATED ORIGIN, never the caller-controlled
+        // `memory_kind`: an authenticated SYSTEM principal
+        // (`CallerContext::bypass_visibility` — curator/autonomy self-writes,
+        // per env #48; external HTTP/MCP tenant callers can NEVER set it) is
+        // exempt; every tenant write is gated.
+        if !ctx.bypass_visibility {
+            consult_why_trace_gate_pg(memory)?;
+        }
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13151,6 +13291,11 @@ impl MemoryStore for PostgresStore {
         // refuse hook that every backend write path consults).
         for memory in memories {
             consult_governance_pre_write_pg(memory)?;
+            // #2059/#2102/#2110 — clause 1 on the bulk-create funnel, exempting
+            // the authenticated SYSTEM principal (bypass_visibility).
+            if !ctx.bypass_visibility {
+                consult_why_trace_gate_pg(memory)?;
+            }
         }
 
         // Keep the LAST occurrence of each (title, namespace) so the
@@ -13443,7 +13588,7 @@ impl MemoryStore for PostgresStore {
     /// quota-recording `store` method).
     async fn capture_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
         self.gate_record_stop()?;
@@ -13470,8 +13615,29 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite
         // L4 path (`storage::capture_turn_idempotent` → `storage::insert`
         // → `consult_governance_pre_write`).
-        let memory = &write.memory;
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) —
+        // `memory_capture_turn` is an ordinary tenant-callable tool that
+        // stores VERBATIM caller content, so the substrate why_trace is
+        // recorded ONLY for the authenticated internal origin
+        // (`ctx.bypass_visibility` — exactly the `store`/`reflect` keying).
+        // A tenant capture with no caller-supplied `metadata.why_trace` is
+        // REFUSED under AI_MEMORY_REQUIRE_WHY_TRACE=1 by the gate below
+        // (postgres parity with the sqlite path, whose `insert` gate fires
+        // transitively).
+        let captured = {
+            let mut m = write.memory.clone();
+            if ctx.bypass_visibility {
+                crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            }
+            m
+        };
+        let memory = &captured;
         consult_governance_pre_write_pg(memory)?;
+        // #2121 — TRACT covenant clause 1 gate on the pg L4 capture funnel
+        // (this method mints the row via its own inline INSERT, bypassing
+        // the `PostgresStore::store` gate). Unconditional defense-in-depth:
+        // the substrate-origin row was stamped above so it passes trivially.
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13677,7 +13843,7 @@ impl MemoryStore for PostgresStore {
     /// deployment can now rehydrate from host transcripts.
     async fn recover_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
         // Step 1 — dual dedup fast-path (no transaction needed for the read).
@@ -13716,8 +13882,25 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite L2
         // path (`storage::recover_turn_idempotent` → `storage::insert` →
         // `consult_governance_pre_write`).
-        let memory = &write.memory;
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // substrate why_trace is recorded ONLY for the authenticated internal
+        // origin (`ctx.bypass_visibility`); the in-process L2 recovery walker
+        // (`crate::recover::recover_from_transcript_store`) runs under a
+        // bypass context (env #95: never lose a recovered turn), while a
+        // tenant-context recover write is gated below.
+        let recovered = {
+            let mut m = write.memory.clone();
+            if ctx.bypass_visibility {
+                crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            }
+            m
+        };
+        let memory = &recovered;
         consult_governance_pre_write_pg(memory)?;
+        // #2121 — covenant clause-1 gate on the pg L2 recovery funnel (inline
+        // INSERT bypasses the `store` gate). Substrate-origin rows were
+        // stamped above and pass trivially.
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13917,6 +14100,12 @@ impl MemoryStore for PostgresStore {
         // refuse rule could be bypassed by routing through the
         // embedded-vector path. See `src/storage/mod.rs` for context.
         consult_governance_pre_write_pg(memory)?;
+        // #2059/#2102/#2110 — clause 1 on the embed-before-store hot path (the
+        // PRIMARY create anchor on postgres daemons), exempting the
+        // authenticated SYSTEM principal (bypass_visibility).
+        if !ctx.bypass_visibility {
+            consult_why_trace_gate_pg(memory)?;
+        }
 
         // Same upsert contract as `store` but additionally writes the
         // pgvector `embedding` column when a vector is supplied. This
@@ -14290,15 +14479,32 @@ impl MemoryStore for PostgresStore {
         // pre-empts the post-UPDATE `rows_affected == 0` NotFound below
         // (kept as a safety net for a concurrent delete between this read
         // and the UPDATE inside the same tx).
-        let cur: Option<(String, String)> =
-            sqlx::query_as("SELECT title, content FROM memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("update read current", e))?;
-        let Some((cur_title, cur_content)) = cur else {
+        let cur: Option<(String, String, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT title, content, metadata, namespace FROM memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("update read current", e))?;
+        let Some((cur_title, cur_content, cur_meta, cur_ns)) = cur else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
+
+        // #2060/#2103 — TRACT covenant clause 2: authorship-immutability gate
+        // on the DEFAULT (non-If-Match) postgres update path. Pre-#2103 this
+        // funnel relied SOLELY on the SQL CASE overlay to keep the stored
+        // agent_id — a silent, unlogged, non-refusing preserve — so a rewrite
+        // attempt got `Ok(())` instead of the 403 the If-Match path
+        // (`update_with_expected_version_once`) returns under enforce. The gate
+        // sees the row's PRE-update authorship + the caller's raw patch
+        // metadata; it runs BEFORE the UPDATE so a refused rewrite mutates
+        // nothing (the tx rolls back on the early return). Ordering mirrors
+        // sqlite (authorship first).
+        consult_authorship_immutable_gate_pg(
+            cur_meta.get("agent_id").and_then(|v| v.as_str()),
+            patch.metadata.as_ref(),
+            &cur_ns,
+        )?;
 
         // `content_changed` is true when the patch supplies a title OR
         // content that differs from the stored row. A metadata / tag /
@@ -15180,6 +15386,11 @@ impl MemoryStore for PostgresStore {
         // mirror is `crate::storage::insert_if_newer`
         // (src/storage/mod.rs:6218).
         consult_governance_pre_write_pg(memory)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the federation-RECEIVE
+        // funnel. Advisory-only (never refuses): a refused inbound write
+        // would diverge replicas (postgres twin of the sqlite
+        // `insert_if_newer` inbound gate).
+        crate::storage::consult_why_trace_gate_inbound(memory);
 
         // Mirrors sqlite db::insert_if_newer:
         //   1. INSERT verbatim if no row matches.
@@ -15485,6 +15696,9 @@ impl MemoryStore for PostgresStore {
         // pushed row must clear the same pre-write governance hook as a
         // locally-authored write.
         consult_governance_pre_write_pg(inbound)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the federation-RECEIVE
+        // merge funnel. Advisory-only (never refuses), CRDT-safe.
+        crate::storage::consult_why_trace_gate_inbound(inbound);
 
         // v0.8.0 Pillar-3 (#1709 / #224) — read the existing row BY id
         // (bypassing the scope=private visibility gate: this is the
@@ -17410,7 +17624,7 @@ impl MemoryStore for PostgresStore {
 
     async fn consolidate(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         title: &str,
         summary: &str,
@@ -17539,7 +17753,18 @@ impl MemoryStore for PostgresStore {
                 serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
-        let merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // consolidated summary is VERBATIM caller content on the tenant
+        // surfaces, so the substrate why_trace is recorded ONLY for the
+        // authenticated internal origin (`ctx.bypass_visibility` — the
+        // curator `ConsolidationPass` runs `for_admin`). A tenant consolidate
+        // is gated below: merged metadata inheriting a source's why_trace
+        // clears it; a why_trace-less one is REFUSED under enforce (postgres
+        // parity with the sqlite `consolidate` keying).
+        if ctx.bypass_visibility {
+            crate::storage::stamp_substrate_why_trace(&mut merged_metadata_value);
+        }
 
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
@@ -17592,6 +17817,13 @@ impl MemoryStore for PostgresStore {
             cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
+        // #2121 — TRACT covenant clause 1 gate on the pg consolidate funnel
+        // (raw INSERT below bypasses the `PostgresStore::store` gate).
+        // Unconditional defense-in-depth: a substrate-origin candidate was
+        // stamped above and passes trivially; a tenant candidate passes only
+        // when the merged metadata carries a why_trace (caller-supplied or
+        // inherited from a source), else REFUSED under enforce.
+        consult_why_trace_gate_pg(&candidate)?;
 
         // Plan C R4 / R5 cert finding: the prior implementation was a plain
         // INSERT that exploded with `duplicate key value violates unique
@@ -19456,6 +19688,12 @@ impl MemoryStore for PostgresStore {
         // BEFORE the INSERT lands.
         let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
         consult_governance_pre_write_pg(&candidate)?;
+        // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
+        // funnel. Advisory-only (never refuses): a legacy archived row that
+        // predates the covenant must stay restorable even under
+        // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
+        // `restore_archived` inbound gate).
+        crate::storage::consult_why_trace_gate_inbound(&candidate);
 
         // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
         // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the
@@ -19814,15 +20052,22 @@ impl MemoryStore for PostgresStore {
         payload: &str,
         priority: Option<i32>,
         tier: Option<&Tier>,
+        why_trace: Option<&str>,
     ) -> StoreResult<String> {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
+        // #2122 — caller-supplied covenant clause-1 rationale (the payload
+        // is verbatim caller content, so the substrate never stamps its own
+        // rationale here; see the trait docs). Sqlite adapter parity.
+        if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
+            metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: resolved_tier,
@@ -26791,4 +27036,19 @@ mod tests {
             "the persisted memory_kind is updated"
         );
     }
+
+    // ── #2059 / #2060 — TRACT covenant clauses 1+2, postgres twins ──
+    //
+    // `consult_why_trace_gate_pg` / `consult_authorship_immutable_gate_pg`
+    // are private (module-scoped, no `pub`) thin downcast-and-map wrappers
+    // over the shared `crate::storage` gate — the SAME shape as the
+    // pre-existing `consult_governance_pre_write_pg`, which likewise has no
+    // dedicated in-module unit test (its coverage is transitive via the
+    // live-PG `#[tokio::test]` suite above). A direct unit test here would
+    // need to mutate the process-global `AI_MEMORY_REQUIRE_WHY_TRACE` /
+    // `AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP` env vars, which is unsafe in
+    // this shared multi-threaded `cargo test --lib` binary (see the
+    // sqlite-side note in `storage::tests`); the underlying shared gate
+    // logic is exhaustively covered by the isolated integration-test
+    // process `tests/issue_2059_2060_covenant_write_gates.rs` instead.
 }

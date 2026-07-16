@@ -412,7 +412,12 @@ pub fn handle_capture_turn(
         }
     }
 
-    let result = crate::storage::capture_turn_idempotent(conn, &write)?;
+    // #2121 — `memory_capture_turn` is a TENANT-callable tool storing
+    // verbatim caller content, so it never claims the substrate-authored
+    // why_trace exemption (`substrate_authored = false`); under
+    // AI_MEMORY_REQUIRE_WHY_TRACE=1 the caller supplies
+    // `metadata.why_trace` or the write is refused at the insert gate.
+    let result = crate::storage::capture_turn_idempotent(conn, &write, false)?;
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if result.dedup_hit {
