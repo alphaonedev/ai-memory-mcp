@@ -26,7 +26,10 @@
 #
 #   cd /Users/fate/v07/v07-fixes
 #   docker compose -f infra/lan-parity-test/docker-compose.yml up -d --build
-#   # wait ~30s for pg-age healthcheck + IronClaw boot
+#   # wait ~30s for pg-age healthcheck + IronClaw boot, then a few more
+#   # seconds for the one-shot ic-parity-peer-key-provisioner to cross-
+#   # enroll alice<->bob (#1803 — no manual peer-key step needed; see
+#   # provision-peer-keys.sh for what it does and why)
 #   docker compose -f infra/lan-parity-test/docker-compose.yml ps
 #   AI_MEMORY_TEST_POSTGRES_URL='postgres://ai_memory:ai_memory_test@127.0.0.1:15432/ai_memory_test' \
 #   AI_MEMORY_NO_CONFIG=1 \
@@ -112,6 +115,14 @@ services:
       # peers lazily on the first store/forward.
       AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
       AI_MEMORY_AGENT_ID: "ai:ic-parity-alice@lan-parity"
+      # #1803 — pin the federation identity explicitly rather than
+      # relying on the `host:<hostname>` fallback (resolver:
+      # src/federation/identity/resolver.rs). This is the exact name
+      # `entrypoint.plan-c.sh` mints a federation push-signing keypair
+      # under, and the exact name `ic-parity-peer-key-provisioner`
+      # below cross-copies into bob's key directory. Pinning it removes
+      # any ambiguity from container-hostname resolution timing.
+      AI_MEMORY_FED_IDENTITY: "host:ic-parity-alice"
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
@@ -192,6 +203,9 @@ services:
       # services must skip preflight or the boot chain deadlocks.
       AI_MEMORY_SKIP_PEER_PREFLIGHT: "1"
       AI_MEMORY_AGENT_ID: "ai:ic-parity-bob@lan-parity"
+      # #1803 — see alice's block above for the pinned-identity
+      # rationale; this is bob's mirror-image counterpart.
+      AI_MEMORY_FED_IDENTITY: "host:ic-parity-bob"
       AI_MEMORY_TIER: autonomous
       AI_MEMORY_LISTEN_HOST: "0.0.0.0"
       AI_MEMORY_LISTEN_PORT: "19077"
@@ -221,6 +235,42 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
+
+  ic-parity-peer-key-provisioner:
+    # #1803 — auto-provisions the alice<->bob federation peer-key
+    # cross-enrollment so a bare `docker compose up` yields a WORKING
+    # enrolled mesh (the manual `.pub`-copy step the 2026-06-24 live
+    # IronClaw A2A campaign had to work around, and which still 401'd
+    # on the daemon's own signed push — see
+    # infra/lan-parity-test/provision-peer-keys.sh for the full root-
+    # cause writeup and entrypoint.plan-c.sh for where each side's
+    # federation-identity-labeled signing keypair actually gets
+    # minted). One-shot: mounts BOTH key volumes read-write, waits for
+    # each daemon's own entrypoint keygen to land its `.pub`, then
+    # cross-copies. Runs the same image as alice/bob (already built by
+    # `compose up --build`) so no extra image pull/build is needed;
+    # overrides the image's normal daemon entrypoint to run the
+    # provisioning script instead.
+    image: ai-memory-lan-parity:latest
+    container_name: ai-memory-lan-parity-peer-key-provisioner
+    entrypoint: ["/bin/sh", "/usr/local/lib/ai-memory/provision-peer-keys.sh"]
+    environment:
+      AI_MEMORY_FED_IDENTITY_ALICE: "host:ic-parity-alice"
+      AI_MEMORY_FED_IDENTITY_BOB: "host:ic-parity-bob"
+      ALICE_KEY_DIR: "/keys/alice"
+      BOB_KEY_DIR: "/keys/bob"
+    volumes:
+      - ./provision-peer-keys.sh:/usr/local/lib/ai-memory/provision-peer-keys.sh:ro
+      - ic-parity-alice-keys:/keys/alice
+      - ic-parity-bob-keys:/keys/bob
+    depends_on:
+      ic-parity-alice:
+        condition: service_healthy
+      ic-parity-bob:
+        condition: service_healthy
+    networks:
+      - ic-parity-mesh
+    restart: "no"
 
 networks:
   # Distinct subnet from infra/plan-c (172.31.78.0/24) so the two
