@@ -33,6 +33,7 @@ use super::{StorageBackend, store_err_to_response};
 pub async fn sync_since(
     State(app): State<AppState>,
     headers: HeaderMap,
+    cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
     OriginalUri(original_uri): OriginalUri,
     Query(q): Query<SyncSinceQuery>,
 ) -> impl IntoResponse {
@@ -48,6 +49,15 @@ pub async fn sync_since(
     // request shape (method + path + query) so byte-equal replays
     // cannot be re-used under a different peer-id.
     let peer_header_for_sig = extract_peer_id(&headers).map(str::to_string);
+    // #2045 L6 — mTLS client cert ↔ asserted `X-Peer-Id` cross-check
+    // (same compensating control as `/sync/push`; see
+    // `federation_receive::enforce_cert_peer_binding`).
+    if let Some(rejection) = super::federation_receive::enforce_cert_peer_binding(
+        cert_peer.as_ref().map(|e| &e.0),
+        peer_header_for_sig.as_deref(),
+    ) {
+        return rejection;
+    }
     if let Some(rejection) = verify_get_signature_or_reject(
         "GET",
         original_uri.path(),

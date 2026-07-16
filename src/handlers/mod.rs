@@ -50,6 +50,11 @@
 /// (#1558 tracing-target SSOT).
 pub(crate) const AUTHZ_TRACE_TARGET: &str = "ai_memory::authz";
 
+/// `tracing` target for HTTP authentication events (`api_key_auth` middleware,
+/// #2044 per-agent-key boot-seed). One SSOT const per the pm-v3.1 no-hardcoded-
+/// literal gate.
+pub(crate) const HTTP_AUTH_TRACE_TARGET: &str = "http::auth";
+
 /// #1558 batch 5 wave 3 — `quota_refused` count field on the
 /// federation `/sync/push` response envelope (sqlite + postgres
 /// arms, quota-413 + success shapes). One spelling across the four
@@ -92,6 +97,7 @@ pub mod federation_sync_since;
 pub mod governance;
 pub mod hook_subscribers;
 pub mod http;
+pub mod identity_binding;
 pub mod kg;
 pub mod links;
 pub mod memories;

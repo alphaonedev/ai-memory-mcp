@@ -82,6 +82,8 @@ fn build_state() -> (AppState, NamedTempFile) {
         resolved_models: Arc::new(ai_memory::config::ResolvedModels::default()),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (state, f)
 }
@@ -109,12 +111,12 @@ fn admin_visibility_bypass_is_authn_gated_1582() {
     mark_request_authn_configured(false);
     unsafe { std::env::remove_var(ENV_ADMIN_HEADER_TRUST) };
     assert!(
-        !is_admin_caller_trusted(&state, ADMIN_ID),
+        !is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), ADMIN_ID),
         "#1582: a self-asserted admin header on a keyless deployment \
          (trust flag off) must NOT receive the visibility bypass"
     );
     assert!(
-        !is_admin_caller_trusted(&state, NON_ADMIN_ID),
+        !is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), NON_ADMIN_ID),
         "non-admin never trusted"
     );
 
@@ -122,11 +124,11 @@ fn admin_visibility_bypass_is_authn_gated_1582() {
     // restores the legacy trust-the-header posture.
     unsafe { std::env::set_var(ENV_ADMIN_HEADER_TRUST, "1") };
     assert!(
-        is_admin_caller_trusted(&state, ADMIN_ID),
+        is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), ADMIN_ID),
         "#1582: explicit header-trust opt-in honors the allowlisted admin"
     );
     assert!(
-        !is_admin_caller_trusted(&state, NON_ADMIN_ID),
+        !is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), NON_ADMIN_ID),
         "trust flag still does not admit a non-allowlisted name"
     );
     unsafe { std::env::remove_var(ENV_ADMIN_HEADER_TRUST) };
@@ -136,11 +138,11 @@ fn admin_visibility_bypass_is_authn_gated_1582() {
     // presented, so the header role-claim is honored.
     mark_request_authn_configured(true);
     assert!(
-        is_admin_caller_trusted(&state, ADMIN_ID),
+        is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), ADMIN_ID),
         "#1582: on an authenticated deployment the allowlisted admin is trusted"
     );
     assert!(
-        !is_admin_caller_trusted(&state, NON_ADMIN_ID),
+        !is_admin_caller_trusted(&state, &axum::http::HeaderMap::new(), NON_ADMIN_ID),
         "authn does not admit a non-allowlisted name"
     );
 

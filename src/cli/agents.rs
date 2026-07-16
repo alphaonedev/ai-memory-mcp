@@ -57,6 +57,30 @@ pub enum AgentsAction {
         #[arg(long)]
         agent_id: String,
     },
+    /// v1.0.0 #2044 (#2032-A / H1 IDOR + M1 admin spoof) — enroll a per-agent
+    /// HTTP api-key so an `X-Agent-Id: <agent>` on the HTTP surface must prove
+    /// possession of THIS token (the server stores only `sha256(token)`; the
+    /// raw token is never persisted). The daemon boot-loads the enrolled set,
+    /// so RESTART the `serve` daemon after enrolling for it to take effect.
+    /// Re-binding the same token rotates the mapping in place.
+    BindApiKey {
+        /// Agent identifier the presenting caller is bound to.
+        #[arg(long)]
+        agent_id: String,
+        /// The per-agent api-key token. Callers present it as the `X-API-Key`
+        /// header; only its SHA-256 digest is stored.
+        #[arg(long)]
+        token: String,
+    },
+    /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
+    /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
+    /// be invalidated by revoking the agent's binding(s). RESTART the `serve`
+    /// daemon after revoking (the enrolled map is boot-loaded).
+    RevokeApiKey {
+        /// Agent identifier whose api-key binding(s) to remove.
+        #[arg(long)]
+        agent_id: String,
+    },
     /// v1.0.0 crypto-core (#1942, spec §2.3) — pre-enroll a per-instance
     /// sub-key certificate from a JSON file. The cert is verified under the
     /// principal's bound root key (`bind-key` first) BEFORE it is stored, so
@@ -206,6 +230,53 @@ pub fn run_agents(
                 )?;
             } else {
                 writeln!(out.stdout, "revoked pubkey for {agent_id}")?;
+            }
+        }
+        AgentsAction::BindApiKey { agent_id, token } => {
+            validate::validate_agent_id(&agent_id)?;
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("api-key token must not be empty");
+            }
+            let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
+            db::bind_agent_api_key(&conn, &agent_id, &token_sha256)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "bound": true,
+                        "agent_id": agent_id,
+                        "token_sha256": token_sha256,
+                    })
+                )?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "bound api-key for {agent_id} (sha256={token_sha256}); \
+                     restart `ai-memory serve` for it to take effect"
+                )?;
+            }
+        }
+        AgentsAction::RevokeApiKey { agent_id } => {
+            validate::validate_agent_id(&agent_id)?;
+            let removed = db::revoke_agent_api_key(&conn, &agent_id)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "agent_id": agent_id,
+                        "bindings_removed": removed,
+                    })
+                )?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "revoked {removed} api-key binding(s) for {agent_id}; \
+                     restart `ai-memory serve` for it to take effect"
+                )?;
             }
         }
         AgentsAction::EnrollSubkeyCert { file } => {
@@ -449,6 +520,88 @@ pub fn run_pending(
                 writeln!(out.stdout, "rejected: {id} (by {agent})")?;
             }
         }
+    }
+    Ok(())
+}
+
+/// #2095 — per-agent HTTP api-key ENROLLMENT against the CONFIGURED SAL store.
+///
+/// Extracted from the `Command::Agents` dispatch in `daemon_runtime.rs` so the
+/// (validate → hash → store → output, incl. json + error branches) logic lives
+/// in one small, fully-unit-testable place instead of dragging the
+/// `daemon_runtime.rs` monolith's per-module coverage floor. The caller
+/// (`daemon_runtime.rs`) resolves the backend via `build_store_handle` and hands
+/// the `Arc<dyn MemoryStore>` here; both sqlite and postgres route identically.
+///
+/// # Errors
+///
+/// Surfaces `validate_agent_id`, empty-token, and SAL `bind_agent_api_key`
+/// failures.
+#[cfg(feature = "sal")]
+pub async fn run_bind_api_key(
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    agent_id: &str,
+    token: &str,
+    json_out: bool,
+) -> Result<()> {
+    validate::validate_agent_id(agent_id)?;
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("api-key token must not be empty");
+    }
+    let token_sha256 = crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
+    let ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+    store
+        .bind_agent_api_key(&ctx, agent_id, &token_sha256)
+        .await?;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({
+                "bound": true,
+                "agent_id": agent_id,
+                "token_sha256": token_sha256,
+            })
+        );
+    } else {
+        println!(
+            "bound api-key for {agent_id} (sha256={token_sha256}); \
+             restart `ai-memory serve` for it to take effect"
+        );
+    }
+    Ok(())
+}
+
+/// #2095 — per-agent HTTP api-key REVOCATION against the CONFIGURED SAL store.
+/// Companion of [`run_bind_api_key`]; invalidates a leaked key (the PK is the
+/// token digest, so revocation is by agent binding).
+///
+/// # Errors
+///
+/// Surfaces `validate_agent_id` + SAL `revoke_agent_api_key` failures.
+#[cfg(feature = "sal")]
+pub async fn run_revoke_api_key(
+    store: &std::sync::Arc<dyn crate::store::MemoryStore>,
+    agent_id: &str,
+    json_out: bool,
+) -> Result<()> {
+    validate::validate_agent_id(agent_id)?;
+    let ctx = crate::store::CallerContext::for_admin(crate::identity::sentinels::DAEMON_PRINCIPAL);
+    let removed = store.revoke_agent_api_key(&ctx, agent_id).await?;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({
+                "revoked": true,
+                "agent_id": agent_id,
+                "bindings_removed": removed,
+            })
+        );
+    } else {
+        println!(
+            "revoked {removed} api-key binding(s) for {agent_id}; \
+             restart `ai-memory serve` for it to take effect"
+        );
     }
     Ok(())
 }
@@ -1699,5 +1852,97 @@ mod tests {
         // The instance_key_id round-trips as a base64 string.
         assert!(cert0["instance_key_id"].as_str().is_some());
         assert!(cert0["id"].as_str().unwrap().starts_with("b3:"));
+    }
+
+    // #2095 — the api-key enrollment/revocation SAL helpers (extracted from the
+    // daemon_runtime dispatch). Exercises every branch: bind happy + json,
+    // revoke happy + json, empty-token error, invalid-agent-id error, and the
+    // round-trip that a bind is visible via the store lookup + revoke removes it.
+    #[cfg(feature = "sal")]
+    fn sal_store(db_path: &std::path::Path) -> std::sync::Arc<dyn crate::store::MemoryStore> {
+        std::sync::Arc::new(
+            crate::store::sqlite::SqliteStore::open(db_path).expect("open SqliteStore"),
+        )
+    }
+
+    #[cfg(feature = "sal")]
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_bind_api_key_binds_and_is_looked_up_2095() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let rt = rt();
+        rt.block_on(run_bind_api_key(&store, "alice", "alice-token", false))
+            .expect("bind ok");
+        // The digest is resolvable, and the raw token was never stored.
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex("alice-token");
+        let resolved = rt
+            .block_on(store.agent_id_for_api_key(&hash))
+            .expect("resolve ok");
+        assert_eq!(resolved.as_deref(), Some("alice"));
+        // json branch.
+        rt.block_on(run_bind_api_key(&store, "bob", "bob-token", true))
+            .expect("bind json ok");
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_bind_api_key_empty_token_errors_2095() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let err = rt()
+            .block_on(run_bind_api_key(&store, "alice", "   ", false))
+            .expect_err("empty token must error");
+        assert!(err.to_string().contains("token must not be empty"));
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_bind_api_key_invalid_agent_id_errors_2095() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        // A whitespace-bearing agent id fails validate_agent_id.
+        let err = rt()
+            .block_on(run_bind_api_key(&store, "bad id", "tok", false))
+            .expect_err("invalid agent id must error");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_revoke_api_key_removes_binding_2095() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let rt = rt();
+        rt.block_on(run_bind_api_key(&store, "carol", "carol-token", false))
+            .expect("bind ok");
+        rt.block_on(run_revoke_api_key(&store, "carol", false))
+            .expect("revoke ok");
+        let hash = crate::handlers::identity_binding::api_key_sha256_hex("carol-token");
+        assert_eq!(
+            rt.block_on(store.agent_id_for_api_key(&hash)).unwrap(),
+            None,
+            "revoked key no longer resolves"
+        );
+        // json branch (idempotent no-op revoke).
+        rt.block_on(run_revoke_api_key(&store, "carol", true))
+            .expect("revoke json ok");
+    }
+
+    #[cfg(feature = "sal")]
+    #[test]
+    fn run_revoke_api_key_invalid_agent_id_errors_2095() {
+        let env = TestEnv::fresh();
+        let store = sal_store(&env.db_path);
+        let err = rt()
+            .block_on(run_revoke_api_key(&store, "bad id", false))
+            .expect_err("invalid agent id must error");
+        assert!(!err.to_string().is_empty());
     }
 }

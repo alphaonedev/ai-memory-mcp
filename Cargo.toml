@@ -82,6 +82,15 @@ gethostname = "0.5"
 # OpenSSL dep; rustls matches reqwest's rustls-tls choice already in
 # use for the sync-daemon's outbound HTTPS.
 axum-server = { version = "0.8", features = ["tls-rustls"] }
+# #2045 L6 — the mTLS cert↔X-Peer-Id peer-binding acceptor
+# (`tls::PeerBindingAcceptor`) hand-writes a per-connection
+# `tower_service::Service` wrapper (`CertExtensionService`) to inject the
+# operator-bound peer identity into request extensions after the TLS
+# handshake. We need ONLY the `Service` trait — `tower-service` is the
+# tiny trait-only crate axum / hyper / tower / tower-http already all
+# pull transitively, so this adds NO new crate to `Cargo.lock` (the full
+# `tower` toolkit stays a dev-dependency, for the test `ServiceExt`).
+tower-service = "0.3"
 # rustls 0.23 requires an explicit CryptoProvider — `ring` matches
 # reqwest's default for the sync-daemon, keeping a single provider
 # across the process. PEM parsing is handled by

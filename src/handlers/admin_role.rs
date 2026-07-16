@@ -175,8 +175,31 @@ pub fn is_admin_caller(state: &AppState, caller: &str) -> bool {
 /// self-asserted `X-Agent-Id` on a keyless deployment bypasses
 /// cross-tenant private-row visibility (the #1582 finding).
 #[must_use]
-pub fn is_admin_caller_trusted(state: &AppState, caller: &str) -> bool {
-    is_admin_caller(state, caller) && (request_authn_configured() || admin_header_trust_enabled())
+pub fn is_admin_caller_trusted(state: &AppState, headers: &HeaderMap, caller: &str) -> bool {
+    // Base #1570 (H6) gate: allowlisted name + request-authn (or the legacy
+    // header-trust escape hatch).
+    if !(is_admin_caller(state, caller)
+        && (request_authn_configured() || admin_header_trust_enabled()))
+    {
+        return false;
+    }
+    // #2093 (#2044 / #2032-A / M1) — this predicate is the SECOND admin-admission
+    // path (alongside `require_admin`), guarding read+destructive admin surfaces
+    // (`purge_archive`, `forget`, kg/power/governance/links admin branches). It
+    // must consume the SAME per-agent-key attestation gate as `require_admin`:
+    // under the `enforce` posture an allowlisted admin NAME must ALSO be
+    // KEY-ATTESTED (a per-agent api-key bound to that id), not merely claimed via
+    // the SHARED transport key. `enforce_for_request` returns `Some(403)` when it
+    // would refuse; the predicate maps that to "not trusted". Fully inert (no
+    // demotion) when no per-agent keys are enrolled — the single-operator case.
+    crate::handlers::identity_binding::enforce_for_request(
+        &state.enrolled_agent_keys,
+        state.http_identity_mode,
+        headers,
+        caller,
+        "is_admin_caller_trusted",
+    )
+    .is_none()
 }
 
 /// Resolve the caller from `headers`, check it against the admin
@@ -294,6 +317,25 @@ pub fn require_admin(
     );
 
     if admitted {
+        // #2044 (v1.0.0, #2032-A / M1 admin spoof) — an allowlisted admin NAME
+        // is admitted above only when the deployment has request authn (or the
+        // legacy header-trust escape hatch). But under a SHARED api_key that
+        // proves possession of the transport secret, NOT of the claimed admin
+        // principal — so a shared-key holder could still assert
+        // `X-Agent-Id: <admin>`. Under the `enforce` posture the admin identity
+        // must additionally be KEY-ATTESTED (a per-agent api-key bound to this
+        // admin id, schema v83); a merely-`Claimed` shared-key caller is refused.
+        // `advisory` (the default) WARNs but admits (inert when no per-agent keys
+        // are enrolled — the single-operator case).
+        if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+            &state.enrolled_agent_keys,
+            state.http_identity_mode,
+            headers,
+            &caller,
+            endpoint,
+        ) {
+            return Err(resp);
+        }
         Ok(caller)
     } else {
         Err((
