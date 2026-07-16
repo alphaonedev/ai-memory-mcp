@@ -35,17 +35,36 @@
 # b02671bf — "grep io::stdin() in test-reachable paths when hunting
 # suite wedges."
 #
-# WHAT IS GATED. The process-global handle acquisition `io::stdin()` /
-# `std::io::stdin()` appearing in TEST-reachable code:
+# WHAT IS GATED. The process-global handle acquisition — `io::stdin()`,
+# `std::io::stdin()`, AND a bare `stdin()` call (e.g. after
+# `use std::io::stdin;`, which evades a pattern anchored on the
+# fully-qualified `io::stdin(` form — issue #2120 finding 1) — appearing
+# in TEST-reachable code:
 #   - every line in a `tests/**/*.rs` integration-test file (wholly test)
 #   - lines at or below the first `mod tests {` boundary in any
 #     `src/**/*.rs`, `examples/**/*.rs`, or `tools/**/*.rs` file (the
-#     in-file test region)
+#     in-file test region), UNION every item-scoped `#[cfg(test)]` range
+#     in the same file (issue #2120 finding 2): a `#[cfg(test)]`-gated
+#     fn/item that sits ABOVE the first `mod tests {}`, or a test module
+#     under `#[cfg(test)]` with a name other than `tests`/`test` (e.g.
+#     `#[cfg(test)] mod repl_smoke { ... }`), is exactly as test-reachable
+#     as code inside `mod tests {}` but the pre-fix heuristic anchored
+#     SOLELY on `mod tests {` left both classes un-gated. The `#[cfg(test)]`
+#     signal is deliberately item-scoped (brace-balanced for a block item,
+#     through the terminating `;` for a no-body item), NOT a second
+#     from-here-to-EOF cutoff — a single-line `#[cfg(test)]`-gated `use`/
+#     `mod foo;` declaration is common well ABOVE a file's real `mod
+#     tests {}` (e.g. `src/mcp/mod.rs`), and a from-here-to-EOF cutoff at
+#     that line would wrongly treat the PRODUCTION code between it and
+#     `mod tests {}` as test-reachable too.
 # The CHILD-process stdin pattern (`ChildStdin`, `Stdio::piped()` +
-# `child.stdin`) is NOT gated — that writes to a spawned subprocess's
-# stdin (RAII-closed), which is the safe pattern the mcp-subprocess tests
-# already use. This gate matches only the `io::stdin(` call form, so
-# `ChildStdin` type references never trip it.
+# `child.stdin`, and a `.stdin(` builder call such as
+# `Command::new(..).stdin(Stdio::piped())`) is NOT gated — that writes to
+# a spawned subprocess's stdin (RAII-closed), which is the safe pattern
+# the mcp-subprocess tests already use. The gate's identifier boundary
+# excludes a leading `.` (method/field access) so `.stdin(` builder calls
+# never trip it, while `io::stdin(` / `std::io::stdin(` / a bare
+# `stdin(` (leading `:` or start-of-line) all do.
 #
 # CARVE-OUT (function-scoped, NOT file-scoped). The single sanctioned
 # site is the body of the `fn with_stdin_lines` helper — it acquires the
@@ -65,26 +84,43 @@
 #   scripts/check-test-stdin-reads.sh
 #     - exit 0 on clean, exit 1 on any violation
 #   scripts/check-test-stdin-reads.sh --self-test
-#     - injects contrived violations (a plain test read AND a same-file
-#       sibling of the helper), verifies the gate catches them, verifies
-#       the sanctioned helper line is NOT flagged, then cleans up. Proves
-#       the gate is load-bearing AND that the narrow carve-out did not
-#       over-widen (pm-v3.2 NO FAIL MISSION closure discipline). Exit 0
-#       on PASS.
+#     - injects contrived violations (a plain test read, a same-file
+#       sibling of the helper, a bare `stdin()` call after
+#       `use std::io::stdin;`, and a `#[cfg(test)]`-gated fn placed ABOVE
+#       `mod tests {}`), verifies the gate catches all of them, verifies
+#       the sanctioned helper line and a `.stdin(` builder call are NOT
+#       flagged, then cleans up. Proves the gate is load-bearing AND that
+#       the narrow carve-out did not over-widen (pm-v3.2 NO FAIL MISSION
+#       closure discipline; issue #2120 residual-vector hardening).
+#       Exit 0 on PASS.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Process-global stdin handle acquisition. Matches `io::stdin(` and
-# `std::io::stdin(` (a leading `std::` is just more `:`), but NOT the
-# `ChildStdin` type (no `(` call) nor a `child.stdin` field access.
-STDIN_PATTERN='(^|[^A-Za-z0-9_])io::stdin[[:space:]]*\('
+# `std::io::stdin(` (a leading `std::` is just more `:`) AND a bare
+# `stdin(` call (issue #2120 finding 1 — a test that does
+# `use std::io::stdin;` then calls the imported name unqualified evades
+# a pattern anchored on the fully-qualified `io::stdin(` form). The
+# excluded-leading-char class `[^A-Za-z0-9_.]` keeps the identifier
+# boundary AND excludes a leading `.` so a `.stdin(` builder call (e.g.
+# `Command::new(..).stdin(Stdio::piped())`, `cmd.stdin(Stdio::null())`)
+# is never matched — that is the child-process pattern (`Command::stdin`
+# takes a `Stdio`; it configures a spawned subprocess's stdin, it never
+# touches our-process stdin).
+STDIN_PATTERN='(^|[^A-Za-z0-9_.])stdin[[:space:]]*\('
 
 # find_test_boundary <file>
 # Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
 # or `mod test {`); echoes `1` if the file lives under tests/ (wholly a
-# test file); echoes `999999999` if no test module is found.
+# test file); echoes `999999999` if no test module is found. This is
+# ONE of two independent test-reachability signals — see `cfg_test_ranges`
+# below for the item-scoped `#[cfg(test)]` signal (issue #2120 finding 2).
+# It stays a single from-here-to-EOF cutoff (rather than being folded into
+# the ranged scan) because `mod tests { ... }` is conventionally the LAST
+# item in a file, so "everything at or below this line" is the correct
+# (and simplest) characterization for it specifically.
 find_test_boundary () {
     local f="$1"
     local rel="${f#"${ROOT}/"}"
@@ -121,9 +157,53 @@ helper_ranges () {
     ' "$f" 2>/dev/null
 }
 
-# line_in_helper <lineno> <ranges-payload>
-# Returns 0 (true) when <lineno> falls within any `start:end` range.
-line_in_helper () {
+# cfg_test_ranges <file>
+# Echoes one `start:end` line-range per `#[cfg(test)]`-attributed ITEM in
+# the file (issue #2120 finding 2). Each range starts at the `#[cfg(test)]`
+# attribute line and extends only over THAT item — a brace-balanced scan
+# for a block-bodied item (`fn`/`mod`/`impl`/`struct { ... }`), or through
+# the first statement-terminating `;` for a no-body item (`mod foo;`,
+# `use ...;`, a tuple-struct `struct Foo(..);`). This is deliberately
+# ITEM-scoped rather than a single from-here-to-EOF cutoff: a
+# `#[cfg(test)]`-gated single-line `use` or module DECLARATION (no body)
+# is extremely common ABOVE the file's real `mod tests {}` (e.g.
+# `#[cfg(test)] pub(super) mod parity_test_helpers;` in `src/mcp/mod.rs`),
+# and a from-here-to-EOF cutoff at that line would wrongly treat every
+# production line between it and `mod tests {}` as test-reachable —
+# false-positiving on `src/mcp/mod.rs`'s real `io::stdin()` production
+# read loop was caught during this fix's repo-wide verification run.
+# Stacked attribute lines directly following `#[cfg(test)]` (e.g. a
+# `#[test]` line before the fn signature) are skipped while scanning for
+# the item's opening brace / terminating semicolon.
+cfg_test_ranges () {
+    local f="$1"
+    awk '
+    {
+        line = $0
+        if (!active && line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+            active = 1; start = NR; depth = 0; opened = 0
+        }
+        if (active) {
+            if (opened == 0 && NR != start && line ~ /^[[:space:]]*#\[/) {
+                # stacked attribute line before the item itself — skip
+            } else {
+                o = gsub(/\{/, "{", line); depth += o; if (o > 0) opened = 1
+                c = gsub(/\}/, "}", line); depth -= c
+                if (opened == 1) {
+                    if (depth <= 0) { print start":"NR; active = 0 }
+                } else if (line ~ /;[[:space:]]*(\/\/.*)?$/) {
+                    print start":"NR; active = 0
+                }
+            }
+        }
+    }
+    ' "$f" 2>/dev/null
+}
+
+# line_in_ranges <lineno> <ranges-payload>
+# Returns 0 (true) when <lineno> falls within any `start:end` range
+# (one per line, as emitted by `helper_ranges` / `cfg_test_ranges`).
+line_in_ranges () {
     local lineno="$1"
     local ranges="$2"
     [[ -z "$ranges" ]] && return 1
@@ -141,9 +221,10 @@ line_in_helper () {
 
 # scan_test_lines <file>
 # Emits "<repo-relative-file>:<lineno>:<content>" for STDIN_PATTERN
-# matches in TEST-reachable code (at or below the file's test boundary),
-# skipping comment/doc-comment lines and any match inside a sanctioned
-# `with_stdin_lines` helper body.
+# matches in TEST-reachable code — at or below the file's `mod tests {}`
+# boundary, OR inside any item-scoped `#[cfg(test)]` range (issue #2120
+# finding 2) — skipping comment/doc-comment lines and any match inside a
+# sanctioned `with_stdin_lines` helper body.
 scan_test_lines () {
     local f="$1"
     local boundary
@@ -152,16 +233,21 @@ scan_test_lines () {
     local matches
     matches="$(grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true)"
     [[ -z "$matches" ]] && return 0
+    local cfg_ranges
+    cfg_ranges="$(cfg_test_ranges "$f")"
     local ranges
     ranges="$(helper_ranges "$f")"
     while IFS=: read -r lineno content; do
         [[ -z "$lineno" ]] && continue
-        # Only TEST-reachable lines (at or below the boundary).
-        if (( lineno < boundary )); then
+        # TEST-reachable lines: at/below the `mod tests {}` boundary, OR
+        # inside an item-scoped `#[cfg(test)]` range (issue #2120 finding
+        # 2). Neither signal alone is sufficient — see the comments on
+        # `find_test_boundary` / `cfg_test_ranges` above.
+        if (( lineno < boundary )) && ! line_in_ranges "$lineno" "$cfg_ranges"; then
             continue
         fi
         # Skip the sanctioned helper body.
-        if line_in_helper "$lineno" "$ranges"; then
+        if line_in_ranges "$lineno" "$ranges"; then
             continue
         fi
         # Skip comments and doc-comment lines.
@@ -186,8 +272,22 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # sibling MUST be caught and the helper's own stdin() line MUST NOT.
     # A tests/ file is test code from line 1, so both functions are in
     # the test region and the function-scoped carve-out is exercised.
+    # This probe ALSO carries a `.stdin(` builder call (a spawned
+    # subprocess's stdin config) to prove the #2120-broadened pattern
+    # still spares it.
     probe2="${ROOT}/tests/.stdin_gate_sibling_probe.rs"
-    for p in "$probe1" "$probe2"; do
+    # Case 3 (#2120 finding 1): a bare `stdin()` call after
+    # `use std::io::stdin;` — must be caught even though it never
+    # spells `io::stdin(`.
+    probe3="${ROOT}/tests/.stdin_gate_bare_import_probe.rs"
+    # Case 4 (#2120 finding 2): a `#[cfg(test)]`-gated fn placed ABOVE
+    # the file's first `mod tests {` — must be caught even though it
+    # sits before the pre-fix boundary marker. Lives under src/ (not
+    # tests/, which is test-code-from-line-1 unconditionally) so the
+    # in-file boundary heuristic is actually exercised; it is not
+    # `mod`-included anywhere so cargo never compiles it.
+    probe4="${ROOT}/src/.stdin_gate_cfg_boundary_probe.rs"
+    for p in "$probe1" "$probe2" "$probe3" "$probe4"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run — remove manually)" >&2
@@ -216,27 +316,67 @@ fn sibling_reads_real_stdin() {
     let mut buf = String::new();
     let _ = std::io::stdin().read_line(&mut buf);
 }
+#[test]
+fn benign_child_stdin_builder() {
+    let _cmd_ok_not_flagged = std::process::Command::new("true")
+        .stdin(std::process::Stdio::piped());
+}
+EOF
+    cat > "$probe3" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2120 finding 1: a bare `stdin()` call after
+// `use std::io::stdin;` evades a pattern anchored on `io::stdin(`.
+use std::io::stdin;
+#[test]
+fn contrived_bare_stdin_after_import() {
+    let mut buf = String::new();
+    let _ = stdin().read_line(&mut buf);
+}
+EOF
+    cat > "$probe4" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2120 finding 2: a #[cfg(test)]-gated fn placed ABOVE
+// the file's first `mod tests {` must still be test-reachable.
+#[cfg(test)]
+fn contrived_cfg_gated_reads_stdin() {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+
+mod tests {
+    // Padding so `mod tests {` is not the first test marker in the
+    // file — the fn above it must still be caught via the earlier
+    // `#[cfg(test)]` attribute line.
+}
 EOF
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
-    rm -f "$probe1" "$probe2"
+    rm -f "$probe1" "$probe2" "$probe3" "$probe4"
     printf '%s\n' "$gate_output"
-    # PASS requires: non-zero exit, BOTH probe violations reported, and
-    # the sanctioned helper line (_sanctioned) NOT reported.
+    # PASS requires: non-zero exit, ALL FOUR probe violations reported,
+    # and the sanctioned helper line + the benign builder call NOT
+    # reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.stdin_gate_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'sibling_reads_real_stdin\|\.stdin_gate_sibling_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_bare_stdin_after_import\|\.stdin_gate_bare_import_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'contrived_cfg_gated_reads_stdin\|\.stdin_gate_cfg_boundary_probe\.rs' || ok=0
     if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
         echo "" >&2
         echo "Test-stdin gate self-test: FAIL (carve-out over-widened: the sanctioned helper line was flagged)" >&2
         exit 1
     fi
+    if printf '%s' "$gate_output" | grep -q 'benign_child_stdin_builder\|cmd_ok_not_flagged'; then
+        echo "" >&2
+        echo "Test-stdin gate self-test: FAIL (over-widened: a .stdin( child-process builder call was flagged)" >&2
+        exit 1
+    fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-stdin gate self-test: PASS (caught both contrived violations, spared the sanctioned helper; exit=${gate_exit})"
+        echo "Test-stdin gate self-test: PASS (caught all four contrived violations, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
