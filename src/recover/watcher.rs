@@ -54,8 +54,9 @@
 //! [`crate::curator::run_daemon`]) driven by an `Arc<AtomicBool>`
 //! checked every [`SHUTDOWN_POLL_TICK`]. The CLI async wrapper
 //! (`daemon_runtime::run_watch_daemon_with_primitives`) bridges a
-//! `tokio::sync::Notify` (fired on SIGINT) into that flag via
-//! `spawn_blocking` — the identical bridge the curator daemon uses.
+//! `tokio::sync::Notify` (fired on SIGINT, or — on unix — SIGTERM; see
+//! `crate::cli::watch::run`) into that flag via `spawn_blocking` — the
+//! identical bridge the curator daemon uses.
 //!
 //! ## Opt-in
 //!
@@ -129,6 +130,60 @@ pub struct HostPollState {
     path: Option<PathBuf>,
     mtime: Option<SystemTime>,
     len: u64,
+    /// `true` when the LAST recovery for this host hit the per-tick
+    /// `--limit` cap (`RecoverReport.lines_skipped_limit > 0`), leaving
+    /// an un-drained tail. The next tick MUST re-run recovery even when
+    /// the file's `(mtime, len)` are unchanged, or the remainder of an
+    /// oversized transcript that then goes static is never recovered
+    /// (issue #2117 — contradicting the module doc "the remainder is
+    /// picked up on later ticks"). Dedup keeps the re-poll idempotent:
+    /// already-atomised lines are skipped, only the tail advances.
+    pending_drain: bool,
+}
+
+/// The per-host diff decision for a single poll tick — the PURE core of
+/// [`poll_once`]'s change detection, split out so the new-file /
+/// unchanged / grown / limit-tail branches are directly unit-testable
+/// without a real `$HOME`-rooted resolver walk (issue #2118). Given the
+/// prior [`HostPollState`] plus this tick's freshly-observed candidate
+/// path + `(mtime, len)`, it decides whether recovery must run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollDecision {
+    /// No transcript candidate resolved this tick — a benign steady
+    /// state. `poll_once` clears any prior state and does not touch the
+    /// DB.
+    NoCandidate,
+    /// A candidate resolved but it is byte-identical to the last
+    /// observation (same path, `mtime`, and `len`) AND no prior tick
+    /// left an un-drained limit-tail — skip recovery for this tick.
+    Unchanged,
+    /// Recovery must run: a new path, a grown / mtime-advanced file, OR
+    /// an identical-but-still-draining file whose prior tick capped out
+    /// on `--limit` (`pending_drain`, issue #2117).
+    Recover,
+}
+
+/// Pure change-detection decision for one host-tick. See
+/// [`PollDecision`]. Deliberately free of any filesystem / DB / resolver
+/// side effect so every branch is covered by fast unit tests.
+#[must_use]
+pub fn decide_poll(
+    prev: &HostPollState,
+    candidate: Option<&std::path::Path>,
+    observed_mtime: Option<SystemTime>,
+    observed_len: u64,
+) -> PollDecision {
+    let Some(path) = candidate else {
+        return PollDecision::NoCandidate;
+    };
+    let identical = prev.path.as_deref() == Some(path)
+        && prev.mtime == observed_mtime
+        && prev.len == observed_len;
+    if identical && !prev.pending_drain {
+        PollDecision::Unchanged
+    } else {
+        PollDecision::Recover
+    }
 }
 
 /// Poll-loop configuration. Built once at CLI dispatch time and moved
@@ -224,8 +279,15 @@ impl WatchReport {
                 self.changes_detected += 1;
             }
             if let Some(r) = &o.recover_report {
-                self.memories_captured +=
-                    u64::try_from(r.memories_created.len()).unwrap_or(u64::MAX);
+                // Count the REAL number of lines atomised this tick, NOT
+                // `memories_created.len()` — the latter is truncated to
+                // `QUIET_MEMORY_ID_PREVIEW_CAP` (10) because `poll_once`
+                // runs recovery in `quiet` mode, and DEFAULT_WATCH_LIMIT
+                // (100) ≫ 10, so the headline metric would under-report
+                // by up to 10× in the common case (issue #2116).
+                // `lines_atomised` is the untruncated count (and, in
+                // `--dry-run`, the would-be-written count).
+                self.memories_captured += u64::from(r.lines_atomised);
             }
             if o.error.is_some() {
                 self.errors += 1;
@@ -239,7 +301,17 @@ impl WatchReport {
 /// `states` with the freshly observed `(path, mtime, len)` per host and
 /// returning the per-host outcome. Deliberately free of any sleep/loop
 /// concern so it is directly unit-testable — [`run_watch_daemon`] is a
-/// thin sleep-and-repeat wrapper around this function.
+/// thin sleep-and-repeat wrapper around this function. The pure
+/// new/unchanged/grown/limit-tail branch decision lives in
+/// [`decide_poll`] (issue #2118).
+///
+/// Each tick resolves each host's transcript candidate against the
+/// process working directory. The daemon deliberately tracks the
+/// project rooted at the directory it was launched from; that directory
+/// is invariant for the process's lifetime, so re-reading it every tick
+/// (rather than capturing it once) is a harmless equivalent — a
+/// `watch --daemon` started from a given cwd watches THAT cwd's session
+/// transcripts for its whole run.
 ///
 /// # Panics
 ///
@@ -269,61 +341,79 @@ pub fn poll_once(
 
         let entry = states.entry(host).or_default();
 
-        let Some(path) = candidate else {
-            // No transcript for this host as of this tick — clear any
-            // prior state (a previously-resolved file may have been
-            // deleted / rotated away) and move on; benign steady state.
-            *entry = HostPollState::default();
-            outcomes.push(HostTickOutcome::unchanged(host));
-            continue;
-        };
-
-        let metadata = std::fs::metadata(&path).ok();
+        // Observe this tick's freshness (a no-candidate tick observes
+        // nothing), then let the pure decider pick the branch.
+        let metadata = candidate.as_ref().and_then(|p| std::fs::metadata(p).ok());
         let mtime = metadata.as_ref().and_then(|m| m.modified().ok());
         let len = metadata.as_ref().map_or(0, std::fs::Metadata::len);
 
-        let unchanged = entry.path.as_deref() == Some(path.as_path())
-            && entry.mtime == mtime
-            && entry.len == len;
+        match decide_poll(entry, candidate.as_deref(), mtime, len) {
+            PollDecision::NoCandidate => {
+                // No transcript for this host as of this tick — clear any
+                // prior state (a previously-resolved file may have been
+                // deleted / rotated away) and move on; benign steady
+                // state.
+                *entry = HostPollState::default();
+                outcomes.push(HostTickOutcome::unchanged(host));
+            }
+            PollDecision::Unchanged => {
+                outcomes.push(HostTickOutcome::unchanged(host));
+            }
+            PollDecision::Recover => {
+                // `candidate` is `Some` on this branch (decide_poll only
+                // returns `Recover`/`Unchanged` when a candidate
+                // resolved).
+                let path = candidate.expect("Recover implies a resolved candidate");
 
-        if unchanged {
-            outcomes.push(HostTickOutcome::unchanged(host));
-            continue;
-        }
+                // Detected: a new path, the same path grew / its mtime
+                // advanced, OR a prior tick left an un-drained limit-tail
+                // (issue #2117). Feed the change into the shared L2
+                // recovery pipeline, pinning the exact path this tick
+                // observed (bypassing the resolver's own re-walk since
+                // we've already picked the winner for this tick).
+                let opts = RecoverOpts {
+                    host,
+                    transcript_override: Some(path.clone()),
+                    since_iso: None,
+                    namespace: cfg.namespace.clone(),
+                    limit: cfg.limit,
+                    dry_run: cfg.dry_run,
+                    quiet: true,
+                    agent_id: cfg.agent_id.clone(),
+                };
 
-        // Detected: a new path, or the same path grew / its mtime
-        // advanced. Feed the change into the shared L2 recovery
-        // pipeline, pinning the exact path this tick observed
-        // (bypassing the resolver's own re-walk since we've already
-        // picked the winner for this tick).
-        let opts = RecoverOpts {
-            host,
-            transcript_override: Some(path.clone()),
-            since_iso: None,
-            namespace: cfg.namespace.clone(),
-            limit: cfg.limit,
-            dry_run: cfg.dry_run,
-            quiet: true,
-            agent_id: cfg.agent_id.clone(),
-        };
+                entry.path = Some(path.clone());
+                entry.mtime = mtime;
+                entry.len = len;
 
-        entry.path = Some(path.clone());
-        entry.mtime = mtime;
-        entry.len = len;
-
-        match recover_from_transcript(db_path, &opts) {
-            Ok(report) => outcomes.push(HostTickOutcome {
-                host,
-                changed: true,
-                recover_report: Some(report),
-                error: None,
-            }),
-            Err(e) => outcomes.push(HostTickOutcome {
-                host,
-                changed: true,
-                recover_report: None,
-                error: Some(e.to_string()),
-            }),
+                match recover_from_transcript(db_path, &opts) {
+                    Ok(report) => {
+                        // Carry an un-drained limit-tail forward so the
+                        // next tick re-runs recovery on the (now static)
+                        // file until every deduped line is consumed
+                        // (issue #2117).
+                        entry.pending_drain = report.lines_skipped_limit > 0;
+                        outcomes.push(HostTickOutcome {
+                            host,
+                            changed: true,
+                            recover_report: Some(report),
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        // A recovery error is not evidence of an
+                        // un-drained tail — clear the flag so a
+                        // persistently-failing host doesn't busy-poll.
+                        entry.pending_drain = false;
+                        outcomes.push(HostTickOutcome {
+                            host,
+                            changed: true,
+                            recover_report: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -353,10 +443,14 @@ pub fn run_watch_daemon(db_path: PathBuf, cfg: WatchConfig, shutdown: Arc<Atomic
                 tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_str());
             } else if let Some(r) = &o.recover_report {
                 tracing::info!(
-                    "L3 watch: {} captured {} new memories (skipped_dedup={}, errors={})",
+                    "L3 watch: {} captured {} new memories \
+                     (skipped_dedup={}, skipped_limit={}, errors={})",
                     o.host.as_str(),
-                    r.memories_created.len(),
+                    // `lines_atomised`, not the quiet-truncated
+                    // `memories_created.len()` (issue #2116).
+                    r.lines_atomised,
                     r.lines_skipped_dedup,
+                    r.lines_skipped_limit,
                     r.errors.len(),
                 );
             }
@@ -508,6 +602,7 @@ mod tests {
     fn watch_report_absorb_tick_accumulates_counters() {
         let mut report = WatchReport::default();
         let mut rr = RecoverReport::new(HostKind::ClaudeCode, 82);
+        rr.lines_atomised = 2;
         rr.memories_created = vec!["a".to_string(), "b".to_string()];
         report.absorb_tick(vec![
             HostTickOutcome {
@@ -536,6 +631,128 @@ mod tests {
         assert_eq!(report.ticks, 2);
         assert_eq!(report.changes_detected, 2);
         assert_eq!(report.last_tick.len(), 1);
+    }
+
+    /// Issue #2116 — the headline `memories_captured` metric must be
+    /// driven by `lines_atomised`, NOT the quiet-truncated
+    /// `memories_created` preview vec (capped at
+    /// `QUIET_MEMORY_ID_PREVIEW_CAP` = 10). A tick that atomised more
+    /// than the preview cap must report the full count.
+    #[test]
+    fn absorb_tick_counts_lines_atomised_not_truncated_preview() {
+        use crate::recover::QUIET_MEMORY_ID_PREVIEW_CAP;
+        let mut report = WatchReport::default();
+        let mut rr = RecoverReport::new(HostKind::ClaudeCode, 82);
+        // 42 lines atomised this tick, but `quiet` mode truncated the
+        // echoed-ID vec to the 10-id preview cap (exactly what
+        // `poll_once` produces).
+        rr.lines_atomised = 42;
+        rr.memories_created = (0..QUIET_MEMORY_ID_PREVIEW_CAP)
+            .map(|i| format!("id-{i}"))
+            .collect();
+        assert_eq!(rr.memories_created.len(), QUIET_MEMORY_ID_PREVIEW_CAP);
+        report.absorb_tick(vec![HostTickOutcome {
+            host: HostKind::ClaudeCode,
+            changed: true,
+            recover_report: Some(rr),
+            error: None,
+        }]);
+        assert_eq!(
+            report.memories_captured, 42,
+            "must count lines_atomised (42), not the 10-id truncated preview"
+        );
+    }
+
+    /// Issue #2118 — pure change-detection: a fresh host (default state)
+    /// with a resolved candidate must decide to recover.
+    #[test]
+    fn decide_poll_new_transcript_recovers() {
+        let prev = HostPollState::default();
+        let path = std::path::Path::new("/x/session.jsonl");
+        let decision = decide_poll(&prev, Some(path), Some(SystemTime::UNIX_EPOCH), 100);
+        assert_eq!(decision, PollDecision::Recover);
+    }
+
+    /// Issue #2118 — an identical `(path, mtime, len)` with no pending
+    /// limit-tail is unchanged (skip recovery).
+    #[test]
+    fn decide_poll_unchanged_skips() {
+        let path = PathBuf::from("/x/session.jsonl");
+        let mtime = Some(SystemTime::UNIX_EPOCH);
+        let prev = HostPollState {
+            path: Some(path.clone()),
+            mtime,
+            len: 100,
+            pending_drain: false,
+        };
+        assert_eq!(
+            decide_poll(&prev, Some(&path), mtime, 100),
+            PollDecision::Unchanged
+        );
+    }
+
+    /// Issue #2118 — the same path that GREW (larger `len`) must
+    /// recover, as must an mtime-advanced file.
+    #[test]
+    fn decide_poll_grown_or_mtime_advanced_recovers() {
+        let path = PathBuf::from("/x/session.jsonl");
+        let prev = HostPollState {
+            path: Some(path.clone()),
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            len: 100,
+            pending_drain: false,
+        };
+        // Grew.
+        assert_eq!(
+            decide_poll(&prev, Some(&path), Some(SystemTime::UNIX_EPOCH), 200),
+            PollDecision::Recover
+        );
+        // mtime advanced (same len).
+        assert_eq!(
+            decide_poll(
+                &prev,
+                Some(&path),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                100
+            ),
+            PollDecision::Recover
+        );
+    }
+
+    /// Issue #2118 — no candidate resolved this tick is `NoCandidate`
+    /// regardless of prior state.
+    #[test]
+    fn decide_poll_no_candidate() {
+        let prev = HostPollState {
+            path: Some(PathBuf::from("/x/session.jsonl")),
+            mtime: Some(SystemTime::UNIX_EPOCH),
+            len: 100,
+            pending_drain: false,
+        };
+        assert_eq!(decide_poll(&prev, None, None, 0), PollDecision::NoCandidate);
+    }
+
+    /// Issue #2117 — the limit-tail case: a file whose `(mtime, len)` are
+    /// byte-identical to the last observation but whose prior recovery
+    /// hit the `--limit` cap (`pending_drain`) MUST re-run recovery so
+    /// the un-drained tail of an oversized-then-static transcript is
+    /// eventually recovered (module doc "remainder is picked up on later
+    /// ticks").
+    #[test]
+    fn decide_poll_pending_drain_forces_recover_on_static_file() {
+        let path = PathBuf::from("/x/session.jsonl");
+        let mtime = Some(SystemTime::UNIX_EPOCH);
+        let prev = HostPollState {
+            path: Some(path.clone()),
+            mtime,
+            len: 100,
+            pending_drain: true,
+        };
+        // Identical freshness, yet the un-drained tail forces a re-poll.
+        assert_eq!(
+            decide_poll(&prev, Some(&path), mtime, 100),
+            PollDecision::Recover
+        );
     }
 
     #[test]

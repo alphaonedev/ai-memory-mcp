@@ -169,7 +169,33 @@ pub async fn run(
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_for_signal = shutdown.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        // Honour BOTH SIGINT (ctrl_c, cross-platform) and — on unix —
+        // SIGTERM, so `systemd stop` / `docker stop` / `kill` trigger the
+        // same clean between-ticks shutdown the `--daemon` doc promises
+        // (issue #2119). On non-unix targets only SIGINT is available.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).ok();
+            let term_fut = async {
+                match term.as_mut() {
+                    Some(t) => {
+                        t.recv().await;
+                    }
+                    // No SIGTERM handler could be installed — park
+                    // forever so `select!` resolves on ctrl_c alone.
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                () = term_fut => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         shutdown_for_signal.notify_one();
     });
 
