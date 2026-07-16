@@ -89,7 +89,12 @@ use serde_json::json;
 // (11000, still green) — the tighter 6500 remains the "we still care
 // about per-session token cost" tripwire. Decided by a 5-agent
 // adversarial vote (operator crossroads protocol, #1709 comment).
-const FULL_PROFILE_TOKEN_CEILING: usize = 6_500;
+// 2026-07-16 — raised 6500 -> 6650: #2024/#2037 landed the skill
+// retire/delete MCP tools (memory_skill_retire + memory_skill_delete,
+// 101 -> 103 advertised), whose property-restored (#859) schemas grew the
+// full-profile tools/list payload to ~6563 cl100k_base tokens. 6650 = 6563
+// + 87 margin; still 4350 below the 11000 structural backstop.
+const FULL_PROFILE_TOKEN_CEILING: usize = 6_650;
 
 fn mem_with_content(id: &str, content: &str) -> Memory {
     Memory {
