@@ -121,9 +121,26 @@ fn print_watch_report(r: &watcher::WatchReport, out: &mut CliOutput<'_>) -> Resu
             o.changed
         )?;
         if let Some(e) = &o.error {
-            writeln!(out.stdout, " error={e}")?;
-        } else {
-            writeln!(out.stdout)?;
+            write!(out.stdout, " error={e}")?;
+        }
+        // Surface errors EMBEDDED in an otherwise-successful
+        // `RecoverReport` (parse failure returns `Ok(report)` with
+        // `report.errors` set; per-turn write failures land there too).
+        // Without this the human `--once` report printed
+        // `errors_total: 0` on a parse-failed tick — the `--json` path
+        // already embeds `last_tick`, so only this human path was blind
+        // (issue #2136).
+        let recover_errors = o
+            .recover_report
+            .as_ref()
+            .map(|rr| rr.errors.as_slice())
+            .unwrap_or_default();
+        if !recover_errors.is_empty() {
+            write!(out.stdout, " recover_errors={}", recover_errors.len())?;
+        }
+        writeln!(out.stdout)?;
+        for e in recover_errors {
+            writeln!(out.stdout, "    recover_error: {e}")?;
         }
     }
     Ok(())
@@ -383,6 +400,32 @@ mod tests {
         // real (cargo-captured) stdout by the dispatch else-branch.
         args.hosts = vec!["codex".to_string()];
         dispatch(&db, &args, Some("ai:test:watch")).await.unwrap();
+    }
+
+    /// Issue #2136 — the human `--once` report must render errors
+    /// embedded in a successful `RecoverReport` (a parse-failed tick),
+    /// not just the outcome-level `error`. Pre-fix it printed
+    /// `errors_total: 0` with zero indication anything had failed.
+    #[test]
+    fn print_watch_report_surfaces_embedded_recover_errors_2136() {
+        let mut env = TestEnv::fresh();
+        let mut rr = crate::recover::RecoverReport::new(HostKind::ClaudeCode, 82);
+        rr.errors = vec!["parse failed: bad json".to_string()];
+        let mut report = watcher::WatchReport::default();
+        report.absorb_tick(vec![watcher::HostTickOutcome {
+            host: HostKind::ClaudeCode,
+            changed: true,
+            recover_report: Some(rr),
+            error: None,
+        }]);
+        {
+            let mut out = env.output();
+            print_watch_report(&report, &mut out).unwrap();
+        }
+        let s = env.stdout_str();
+        assert!(s.contains("errors_total:      1"), "cumulative count: {s}");
+        assert!(s.contains("recover_errors=1"), "per-host count: {s}");
+        assert!(s.contains("parse failed: bad json"), "detail line: {s}");
     }
 
     /// `dispatch` propagates [`run`]'s missing-mode error (neither

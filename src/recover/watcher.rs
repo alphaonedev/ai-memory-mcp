@@ -288,6 +288,16 @@ impl WatchReport {
                 // `lines_atomised` is the untruncated count (and, in
                 // `--dry-run`, the would-be-written count).
                 self.memories_captured += u64::from(r.lines_atomised);
+                // Surface errors EMBEDDED in an otherwise-successful
+                // `RecoverReport` (a transcript parse failure returns
+                // `Ok(report)` with `report.errors` set — the deliberate
+                // never-wedge contract in `recover_from_transcript`; per-turn
+                // `write_recovered_turn` failures land here too). Without
+                // this a parse-failed tick counted these as zero and the
+                // `errors_total` metric lied (issue #2136). The `Ok` arm sets
+                // `o.error = None`, so this never double-counts with the
+                // outcome-level bump below.
+                self.errors += u64::try_from(r.errors.len()).unwrap_or(u64::MAX);
             }
             if o.error.is_some() {
                 self.errors += 1;
@@ -416,12 +426,21 @@ where
                     bypass_fast_path: true,
                 };
 
-                entry.path = Some(path.clone());
-                entry.mtime = mtime;
-                entry.len = len;
-
                 match recover_from_transcript(db_path, &opts) {
                     Ok(report) => {
+                        // Advance the per-host `(path, mtime, len)`
+                        // watermark ONLY now that recovery succeeded
+                        // (issue #2134). Advancing it BEFORE the outcome is
+                        // known would mark a change "seen" even when its
+                        // capture failed, so a transient failure whose
+                        // transcript then goes static is never retried — the
+                        // same capture-loss class as #2117/#2126, via the
+                        // Err path. On success dedup makes any re-observation
+                        // idempotent, so committing the watermark here is
+                        // safe.
+                        entry.path = Some(path);
+                        entry.mtime = mtime;
+                        entry.len = len;
                         // Carry an un-drained limit-tail forward so the
                         // next tick re-runs recovery on the (now static)
                         // file until every deduped line is consumed
@@ -442,10 +461,21 @@ where
                         });
                     }
                     Err(e) => {
-                        // A recovery error is not evidence of an
-                        // un-drained tail — clear the flag so a
-                        // persistently-failing host doesn't busy-poll.
-                        entry.pending_drain = false;
+                        // Recovery failed (a transient DB-open error while a
+                        // live MCP session shares the DB, or a partial
+                        // write). Leave the prior `(path, mtime, len)`
+                        // watermark UNADVANCED and `pending_drain` UNTOUCHED
+                        // (issue #2134): the next tick then re-detects the
+                        // SAME `(mtime, len)` delta — or the still-armed
+                        // `pending_drain` for a failed drain re-run — and
+                        // retries recovery even on a now-static transcript.
+                        // Dedup keeps the retry idempotent; it is bounded to
+                        // one attempt per `--interval-secs` tick and
+                        // CONVERGES once the transient failure clears (unlike
+                        // the non-converging dry-run re-parse #2126 case (b)
+                        // guards against), so it is not a busy-loop of that
+                        // kind. Embedded per-turn `RecoverReport.errors` on
+                        // the `Ok` arm are surfaced separately (issue #2136).
                         outcomes.push(HostTickOutcome {
                             host,
                             changed: true,
@@ -951,5 +981,116 @@ mod tests {
             "dry-run over a static oversized transcript must not re-parse every tick"
         );
         assert!(o2[0].recover_report.is_none());
+    }
+
+    /// Issue #2134 — a change whose recovery fails transiently (e.g. a
+    /// DB-open error while a live MCP session shares the DB) MUST be
+    /// retried on a later tick even when the transcript has since gone
+    /// static. The fix advances the per-host `(mtime, len)` watermark
+    /// ONLY after a successful recovery, so a failed tick leaves the same
+    /// delta re-detectable. Drives the real `poll_once` change-detection
+    /// end-to-end (NOT a `decide_poll`-only check) per the audit's
+    /// "do not bypass poll_once" requirement.
+    #[test]
+    fn poll_once_retries_after_transient_recovery_failure_on_static_file_2134() {
+        let dir = fresh_dir();
+        // A directory is not an openable sqlite file → RecoverError::DbOpen,
+        // a hermetic stand-in for the transient DB-open failure #2134
+        // describes (a live session holding the write lock, a disk blip).
+        let bad_db = dir.path().join("unopenable-db-dir");
+        std::fs::create_dir_all(&bad_db).unwrap();
+        let good_db = dir.path().join("mem.db");
+        // Static transcript: written ONCE, never modified between ticks, so
+        // the ONLY thing that can drive a tick-2 recover is an unadvanced
+        // watermark (the bug: tick 1 advanced it despite failing).
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let cfg = base_config("ai:test:2134");
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Tick 1: change detected, but recovery fails (DB-open) → `changed`
+        // with an error and NO report. The watermark must stay UNADVANCED.
+        let o1 = poll_once_with_resolver(&bad_db, &cfg, &mut states, resolve);
+        assert!(o1[0].changed, "a fresh transcript is a detected change");
+        assert!(
+            o1[0].error.is_some(),
+            "recovery must fail against an unopenable db path"
+        );
+        assert!(o1[0].recover_report.is_none());
+
+        // Tick 2: SAME static transcript, now a good db. Because tick 1 left
+        // the watermark unadvanced, the same `(mtime, len)` delta is
+        // re-detected and recovery runs — the un-captured line is finally
+        // atomised instead of stranded (pre-fix this tick was `Unchanged`).
+        let o2 = poll_once_with_resolver(&good_db, &cfg, &mut states, resolve);
+        assert!(
+            o2[0].changed,
+            "the failed change must be retried on a static file, not stranded"
+        );
+        let r2 = o2[0].recover_report.as_ref().expect("report");
+        assert_eq!(
+            r2.lines_atomised, 1,
+            "the previously-failed line is captured on retry"
+        );
+
+        // Tick 3: recovery having succeeded, the watermark advanced, so the
+        // still-static file short-circuits to Unchanged (no busy re-parse).
+        let o3 = poll_once_with_resolver(&good_db, &cfg, &mut states, resolve);
+        assert!(
+            !o3[0].changed,
+            "a successfully-drained static file must be Unchanged (no busy-loop)"
+        );
+    }
+
+    /// Issue #2136 — errors EMBEDDED in an otherwise-successful
+    /// `RecoverReport` (a transcript parse failure returns `Ok(report)`
+    /// with `report.errors` set — the never-wedge contract; per-turn
+    /// `write_recovered_turn` failures land there too) MUST reach the
+    /// cumulative `WatchReport.errors` (`errors_total`), else a
+    /// parse-failed tick reports `errors_total: 0`.
+    #[test]
+    fn absorb_tick_surfaces_embedded_recover_errors_2136() {
+        let mut report = WatchReport::default();
+        let mut rr = RecoverReport::new(HostKind::ClaudeCode, 82);
+        rr.lines_atomised = 0; // parse failed → nothing captured this tick
+        rr.errors = vec![
+            "parse failed: unexpected end of input".to_string(),
+            "skipping turn with malformed sha256: zz".to_string(),
+        ];
+        report.absorb_tick(vec![HostTickOutcome {
+            host: HostKind::ClaudeCode,
+            changed: true,
+            recover_report: Some(rr),
+            error: None,
+        }]);
+        assert_eq!(
+            report.errors, 2,
+            "embedded RecoverReport.errors must reach the errors_total counter"
+        );
+        assert_eq!(report.memories_captured, 0);
+
+        // A mixed second tick: an outcome-level error (report `None`) plus
+        // an embedded-error report — both count, no double-count (the `Ok`
+        // arm always sets `error = None`).
+        let mut rr2 = RecoverReport::new(HostKind::Codex, 82);
+        rr2.errors = vec!["parse failed: x".to_string()];
+        report.absorb_tick(vec![
+            HostTickOutcome {
+                host: HostKind::ClaudeCode,
+                changed: true,
+                recover_report: None,
+                error: Some("db-open boom".to_string()),
+            },
+            HostTickOutcome {
+                host: HostKind::Codex,
+                changed: true,
+                recover_report: Some(rr2),
+                error: None,
+            },
+        ]);
+        assert_eq!(
+            report.errors, 4,
+            "outcome-level (+1) and embedded (+1) both accrue, no double-count"
+        );
     }
 }
