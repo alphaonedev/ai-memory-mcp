@@ -1041,7 +1041,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-15 (#2032 tranche 3, M2): wiring the `tls_bind_guard` (pure
     // consuming guard + doc + 5 unit tests) into `bootstrap_serve` lands
     // daemon_runtime.rs at 10_265; ceiling 10_200 → 10_400 (+135 headroom).
-    ("src/daemon_runtime.rs", 10_500), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999); 2026-07-15 #2095 route agents bind/revoke-api-key verbs through the SAL store (build_store_handle) so postgres enrollment works → 10_407 */
+    // 2026-07-15 (#2045 L6): the `cert_peer_binding_boot_warnings` helper
+    // (inert-posture + open-L6-window boot WARNs) + 3 unit tests + serve
+    // wiring land daemon_runtime.rs at 10_409; ceiling 10_400 → 10_500 (+91).
+    // 2026-07-15 (#2095): route agents bind/revoke-api-key verbs through the SAL
+    // store (build_store_handle) so postgres enrollment works, + dispatch
+    // coverage tests. Combined with #2045 L6 this lands daemon_runtime.rs
+    // above 10_500; ceiling 10_500 → 10_650.
+    ("src/daemon_runtime.rs", 10_650), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

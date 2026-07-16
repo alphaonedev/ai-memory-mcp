@@ -819,18 +819,21 @@ pub async fn api_key_auth(
     // an mTLS peer cannot spoof `X-Peer-Id` because the signed-message
     // gate downstream verifies the sig against the claimed peer-id's
     // enrolled key — the claim is bound to a cryptographic identity
-    // separate from the cert fingerprint. Operators running with
-    // `AI_MEMORY_FED_REQUIRE_SIG=0` (legacy peer-rollout posture) lose
-    // this defense and trust X-Peer-Id verbatim; that mode is
-    // explicitly documented as UNSAFE in the CLAUDE.md env-var table.
+    // separate from the cert fingerprint.
     //
-    // A deeper hardening — extract peer-id from the client cert's
-    // Subject CN / SAN and cross-check against X-Peer-Id — requires
-    // axum to expose the peer certificate via request extensions; a
-    // focused follow-up still tracks that surface change — once planned
-    // for v0.8 but unlanded and still open as of v0.9.0. In the meantime
-    // the #1031 signed-GET gate + the env-default-secure posture
-    // close the acute exploitability surface.
+    // #2045 L6 (v1.0.0) — the compensating control for the
+    // `AI_MEMORY_FED_REQUIRE_SIG=0` window is now LANDED: the
+    // `tls::PeerBindingAcceptor` binds the presenting client cert (by
+    // operator-declared SHA-256 fingerprint) to the ONE `x-peer-id` it may
+    // assert, injects it as a `ClientCertPeerId` request extension, and the
+    // `/sync/{push,since}` handlers cross-check it via
+    // `federation_receive::enforce_cert_peer_binding`
+    // (`AI_MEMORY_FED_CERT_PEER_BINDING = off|warn|enforce`). Because the
+    // mTLS trust model here is fingerprint-pinning of self-signed peer certs,
+    // a cert's own Subject CN / SAN is attacker-chosen and is deliberately
+    // NOT used as the identity anchor; the operator-declared fingerprint is.
+    // The axum peer-cert-in-extensions plumbing this comment once said was
+    // "unlanded" is what the acceptor now provides.
     let path = req.uri().path();
     if auth.mtls_enforced && path.starts_with("/api/v1/sync/") {
         return next.run(req).await.into_response();
