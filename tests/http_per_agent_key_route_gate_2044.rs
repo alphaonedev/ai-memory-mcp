@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
+use ai_memory::handlers::admin_role::is_admin_caller_trusted;
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
@@ -253,7 +254,6 @@ fn headers_with_key(api_key: &str, agent_id: &str) -> axum::http::HeaderMap {
 async fn m1_2093_is_admin_caller_trusted_refuses_shared_key_admin_under_enforce() {
     let _dir = fresh_dir();
     let (_router, app, _f) = build_enforce_router();
-    use ai_memory::handlers::admin_role::is_admin_caller_trusted;
 
     // Shared transport key + a forged admin X-Agent-Id → Claimed → NOT trusted
     // under enforce. This is the #2093 fix: pre-fix this returned `true` (the
