@@ -252,15 +252,75 @@ fn http_client() -> reqwest::blocking::Client {
         .unwrap()
 }
 
+/// Bounded retry window for a test's *first* real HTTP request against a
+/// freshly-spawned daemon, layered on top of [`try_spawn_serve_once`]'s own
+/// `/api/v1/health` readiness gate (#1994).
+///
+/// `spawn_serve` already blocks until `/health` returns 2xx before handing
+/// back a [`ServeChild`], but CI observed an intermittent Windows-only
+/// connection-refused panic on the very next request a test issues on a
+/// brand-new `reqwest::blocking::Client` (a fresh TCP connection) even
+/// though the readiness probe just succeeded moments earlier — a narrow
+/// listen-queue/accept race distinct from the `free_port()` TOCTOU bind
+/// race `spawn_serve` already retries on (see #1994). [`send_first_request`]
+/// closes that residual window by retrying the caller's first request on a
+/// connection-level error only; a real HTTP error status or body-content
+/// mismatch is never retried and surfaces immediately, so this cannot mask
+/// an assertion failure.
+const FIRST_REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Sends the request `build` constructs, retrying on a connection-level
+/// error (not-yet-listening / connection-refused / reset) until
+/// [`FIRST_REQUEST_RETRY_TIMEOUT`] elapses. `build` is invoked once per
+/// attempt so each retry opens a genuinely fresh TCP connection rather than
+/// reusing one that may have raced the daemon's listener. See
+/// [`FIRST_REQUEST_RETRY_TIMEOUT`] for why this exists in addition to
+/// `spawn_serve`'s own `/health` gate.
+fn send_first_request<F>(mut build: F) -> reqwest::blocking::Response
+where
+    F: FnMut() -> reqwest::blocking::RequestBuilder,
+{
+    let deadline = Instant::now() + FIRST_REQUEST_RETRY_TIMEOUT;
+    loop {
+        match build().send() {
+            Ok(resp) => return resp,
+            Err(e) if e.is_connect() && Instant::now() < deadline => {
+                std::thread::sleep(READINESS_POLL_INTERVAL);
+            }
+            Err(e) => panic!(
+                "first request after spawn_serve's readiness gate still failed \
+                 (connection-level error, not an assertion failure): {e}"
+            ),
+        }
+    }
+}
+
+/// Polls `<base_url>/api/v1/health` until it returns 2xx or `timeout`
+/// elapses. Shared readiness-gate helper for spawn paths that cannot reuse
+/// `spawn_serve` (e.g. [`serve_api_key_required_when_configured`], which
+/// needs a custom `HOME` + must NOT set `AI_MEMORY_NO_CONFIG`) but still
+/// need the same bounded retry-until-listening contract (#1994).
+fn wait_for_health(client: &reqwest::blocking::Client, base_url: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if client
+            .get(format!("{base_url}/api/v1/health"))
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return true;
+        }
+        std::thread::sleep(READINESS_POLL_INTERVAL);
+    }
+    false
+}
+
 #[test]
 fn serve_health_endpoint_returns_200() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = http_client()
-        .get(serve.url("/api/v1/health"))
-        .send()
-        .unwrap();
+    let resp = send_first_request(|| http_client().get(serve.url("/api/v1/health")));
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().unwrap();
     assert_eq!(body["status"], "ok");
@@ -272,7 +332,7 @@ fn serve_metrics_endpoint_at_root_path() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = http_client().get(serve.url("/metrics")).send().unwrap();
+    let resp = send_first_request(|| http_client().get(serve.url("/metrics")));
     assert!(resp.status().is_success());
     let ct = resp
         .headers()
@@ -297,10 +357,7 @@ fn serve_metrics_endpoint_at_v1_path() {
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let serve = spawn_serve(&db, &[], &[]);
-    let resp = http_client()
-        .get(serve.url("/api/v1/metrics"))
-        .send()
-        .unwrap();
+    let resp = send_first_request(|| http_client().get(serve.url("/api/v1/metrics")));
     assert!(resp.status().is_success());
     let body = resp.text().unwrap();
     assert!(body.contains("# HELP") || body.contains("# TYPE"));
@@ -328,12 +385,12 @@ fn serve_create_then_get_memory() {
         "title": "serve-roundtrip",
         "content": "serve roundtrip body"
     });
-    let resp = client
-        .post(serve.url("/api/v1/memories"))
-        .header("X-Agent-Id", AGENT)
-        .json(&create_body)
-        .send()
-        .unwrap();
+    let resp = send_first_request(|| {
+        client
+            .post(serve.url("/api/v1/memories"))
+            .header("X-Agent-Id", AGENT)
+            .json(&create_body)
+    });
     assert!(
         resp.status().is_success(),
         "create returned {}: {:?}",
@@ -408,28 +465,19 @@ fn serve_api_key_required_when_configured() {
 
     let client = http_client();
     let url = format!("http://127.0.0.1:{port}");
-    // Wait for /health (exempt from auth) to come up.
-    let deadline = Instant::now() + SPAWN_TIMEOUT;
-    let mut ready = false;
-    while Instant::now() < deadline {
-        if client
-            .get(format!("{url}/api/v1/health"))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // Wait for /health (exempt from auth) to come up — shared readiness
+    // gate (#1994); see `wait_for_health` doc-comment.
+    let ready = wait_for_health(&client, &url, SPAWN_TIMEOUT);
     let guard = ServeChild {
         child: Some(child),
         port,
     };
     assert!(ready, "auth-protected daemon never came up");
 
-    // No header → 401
-    let resp = client.get(format!("{}/api/v1/stats", &url)).send().unwrap();
+    // No header → 401. Retried on a connection-level error (not the
+    // assertion below) — see [`send_first_request`] for why this is
+    // needed even after the readiness gate above (#1994).
+    let resp = send_first_request(|| client.get(format!("{}/api/v1/stats", &url)));
     assert_eq!(resp.status().as_u16(), 401);
 
     // With header → 200 (admin id threaded via X-Agent-Id per #1001).

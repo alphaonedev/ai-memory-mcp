@@ -2431,7 +2431,11 @@ async fn api_key_missing_header_rejected() {
 }
 
 #[tokio::test]
-async fn api_key_valid_query_param_allows() {
+async fn api_key_valid_query_param_rejected_2032_l1() {
+    // #2032 L1 (v1.0.0) — the `?api_key=` query-string credential is NO
+    // LONGER honored (header-only). Even a value matching the configured
+    // key must be rejected with 401 when it rides in the query string;
+    // URL-embedded credentials leak into access / proxy / Referer logs.
     let app = auth_app(Some("secret123"));
     let resp = app
         .oneshot(
@@ -2442,7 +2446,7 @@ async fn api_key_valid_query_param_allows() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -11455,59 +11459,11 @@ async fn http_set_qs_fanout_peer_receives_post_on_happy_path() {
 //
 // After W8 + W11, handlers.rs sits ~88-90%. The runs below target
 // small uncovered chunks scattered across the surface — internal
-// helpers (percent_decode_lossy, constant_time_eq), additional middleware
-// arms, and HTTP error/happy paths the existing fixture doesn't reach.
+// helpers (constant_time_eq), additional middleware arms, and HTTP
+// error/happy paths the existing fixture doesn't reach.
 // -------------------------------------------------------------------
 
-// ---- percent_decode_lossy / constant_time_eq unit tests ----
-
-#[test]
-fn percent_decode_lossy_passes_through_plain_ascii() {
-    let s = percent_decode_lossy("hello-world_123");
-    assert_eq!(s, "hello-world_123");
-}
-
-#[test]
-fn percent_decode_lossy_decodes_basic_escape() {
-    let s = percent_decode_lossy("a%20b");
-    assert_eq!(s, "a b");
-}
-
-#[test]
-fn percent_decode_lossy_decodes_plus_and_ampersand() {
-    // %2B -> '+', %26 -> '&'
-    let s = percent_decode_lossy("a%2Bb%26c");
-    assert_eq!(s, "a+b&c");
-}
-
-#[test]
-fn percent_decode_lossy_handles_invalid_hex_passthrough() {
-    // %ZZ is not a valid hex escape — emit the bytes verbatim.
-    let s = percent_decode_lossy("a%ZZb");
-    assert_eq!(s, "a%ZZb");
-}
-
-#[test]
-fn percent_decode_lossy_handles_truncated_escape() {
-    // Trailing `%X` (only one hex char left) — passthrough.
-    let s = percent_decode_lossy("a%2");
-    assert_eq!(s, "a%2");
-    let s2 = percent_decode_lossy("%");
-    assert_eq!(s2, "%");
-}
-
-#[test]
-fn percent_decode_lossy_decodes_full_byte_range() {
-    // %FF -> 0xFF; resulting bytes round-trip through utf8_lossy.
-    let s = percent_decode_lossy("%41%42%43");
-    assert_eq!(s, "ABC");
-}
-
-#[test]
-fn percent_decode_lossy_empty_input_returns_empty() {
-    let s = percent_decode_lossy("");
-    assert_eq!(s, "");
-}
+// ---- constant_time_eq unit tests ----
 
 #[test]
 fn constant_time_eq_returns_true_for_equal_bytes() {
@@ -11536,13 +11492,13 @@ fn constant_time_eq_compares_high_bytes_correctly() {
     assert!(!constant_time_eq(&a, &c));
 }
 
-// ---- api_key_auth: query-param percent-decoded match ----
+// ---- api_key_auth: #2032 L1 query-param credential is header-only now ----
 
 #[tokio::test]
-async fn api_key_query_param_with_percent_encoded_chars_matches() {
-    // Key contains '+' which must be percent-encoded as %2B in the
-    // query string. The middleware decodes before comparison
-    // (ultrareview #337) so the encoded form must still match.
+async fn api_key_query_param_percent_encoded_rejected_2032_l1() {
+    // #2032 L1 (v1.0.0) — the query-string credential is removed. Even a
+    // (previously percent-decoded) matching value in `?api_key=` must be
+    // rejected with 401; only the `x-api-key` header is honored.
     let app = auth_app(Some("a+b"));
     let resp = app
         .oneshot(
@@ -11553,7 +11509,7 @@ async fn api_key_query_param_with_percent_encoded_chars_matches() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -11572,10 +11528,9 @@ async fn api_key_query_param_wrong_value_rejected() {
 }
 
 #[tokio::test]
-async fn api_key_query_param_with_other_pairs_still_matches() {
-    // Non-`api_key=` pairs in the query string don't disturb the
-    // match — the middleware iterates pairs and only inspects
-    // `api_key=`.
+async fn api_key_query_param_with_other_pairs_rejected_2032_l1() {
+    // #2032 L1 — a matching `api_key=` value co-resident with other query
+    // pairs is still rejected; the query form is no longer consulted.
     let app = auth_app(Some("secret"));
     let resp = app
         .oneshot(
@@ -11586,14 +11541,31 @@ async fn api_key_query_param_with_other_pairs_still_matches() {
         )
         .await
         .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn api_key_header_valid_allows_after_l1() {
+    // #2032 L1 — with the query form removed, the `x-api-key` HEADER
+    // remains the sole accepted channel and still admits a valid key.
+    let app = auth_app(Some("secret"));
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/memories")
+                .header("x-api-key", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
 async fn api_key_header_with_invalid_utf8_falls_through() {
-    // Header bytes that aren't valid UTF-8 fail `to_str()` and the
-    // middleware moves on to the query check. Without a query match
-    // the result is 401.
+    // Header bytes that aren't valid UTF-8 fail `to_str()`; without a
+    // valid header the result is 401.
     let app = auth_app(Some("secret"));
     // HeaderValue::from_bytes accepts all bytes, but to_str rejects non-UTF8.
     let bytes = [0x80u8, 0x81u8];
