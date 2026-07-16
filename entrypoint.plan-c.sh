@@ -50,6 +50,66 @@ if [ ! -f "$KEY_DIR/$DAEMON_KEY_LABEL.priv" ]; then
     --key-dir "$KEY_DIR" --agent-id "$DAEMON_KEY_LABEL" --json
 fi
 
+# #1803 — federation push-signing key auto-provisioning.
+#
+# `ai-memory serve`'s `FederationConfig::build()` loads the OUTBOUND
+# `/sync/push` signing key via
+# `governance::audit::load_daemon_signing_key(&sender_agent_id)`
+# (src/federation/peer.rs), keyed by the RESOLVED federation identity
+# (`federation::identity::resolver::resolve_federation_identity`:
+# AI_MEMORY_FED_IDENTITY env > configured identity > `host:<hostname>`)
+# — a DIFFERENT on-disk file from the fixed `DAEMON_KEYPAIR_LABEL =
+# "daemon"` keypair generated just above (that one backs link/audit
+# signing only, per the block comment there). The RECEIVING side's
+# `identity::verify::lookup_peer_public_key_in` looks up the SAME
+# `<sender_agent_id>.pub` name in ITS OWN key directory, so the two
+# ends must agree on that exact filename for signature verification
+# (and the `AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT` "peer_not_enrolled"
+# gate, which consults the identical lookup) to pass.
+#
+# Unlike the "daemon" key, `ai-memory serve` has NO auto-generate-on-
+# boot fallback for this one — absent, federation pushes go out
+# silently UNSIGNED and any peer enforcing `AI_MEMORY_FED_REQUIRE_SIG`
+# / `AI_MEMORY_FED_REQUIRE_WRITE_SIG` (both v0.7.0+/v1.0.0 secure
+# defaults) rejects them with a 401. This was the root cause behind
+# "manual .pub enrollment doesn't unblock the live mesh" in #1803: a
+# peer's `.pub` copied under the resolved identity name has nothing to
+# verify against unless THIS side also minted a real keypair under
+# that same name. Pre-provisioning it here means a bare `docker
+# compose up` (paired with the peer-key cross-copy step in
+# infra/lan-parity-test/provision-peer-keys.sh) yields a daemon that
+# can sign, and be verified, out of the box.
+#
+# Computed with the SAME precedence `resolve_federation_identity` uses
+# for this deployment shape (env > host — no `[federation]` config
+# section is ever written above, so the "configured" layer never
+# applies here). Deliberately NOT reusing $KEY_DIR: that var defaults
+# to /etc/ai-memory/keys for back-compat with Plan C's historical bind
+# mount, but `ai-memory serve` resolves its OWN key directory via
+# `identity::keypair::default_key_dir()` (AI_MEMORY_KEY_DIR env, else
+# the platform config dir — `$HOME/.config/ai-memory/keys` on Linux),
+# so this key MUST land wherever THAT resolves or `serve` will never
+# find it.
+#
+# Hostname fallback deliberately reads /proc/sys/kernel/hostname (always
+# present on Linux, no extra package needed) rather than shelling out to
+# the external `hostname` binary, which this image's runtime stage does
+# NOT install — falls through to `hostname` (in case some other base
+# image lacks /proc) and finally to the literal `unknown-host`, mirroring
+# `resolve_federation_identity`'s own `UNKNOWN_HOSTNAME_FALLBACK`
+# (src/federation/identity/resolver.rs) so the degenerate case matches
+# the Rust side byte-for-byte. This branch is a no-op for lan-parity
+# (which always sets AI_MEMORY_FED_IDENTITY explicitly below) and only
+# matters for other deployments (e.g. Plan C) using this entrypoint
+# without an explicit override.
+FED_KEY_DIR="${AI_MEMORY_KEY_DIR:-$HOME/.config/ai-memory/keys}"
+FED_IDENTITY="${AI_MEMORY_FED_IDENTITY:-host:$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname 2>/dev/null || echo unknown-host)}"
+mkdir -p "$FED_KEY_DIR"
+if [ ! -f "$FED_KEY_DIR/$FED_IDENTITY.priv" ]; then
+  /usr/local/bin/ai-memory identity generate \
+    --key-dir "$FED_KEY_DIR" --agent-id "$FED_IDENTITY" --json
+fi
+
 # #845: optional api_key when AI_MEMORY_API_KEY is set. NOTE the
 # substrate error message says "set [api] api_key" but the actual
 # AppConfig schema (src/config.rs:2283) has `api_key` as a TOP-LEVEL
