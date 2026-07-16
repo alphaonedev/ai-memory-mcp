@@ -47,6 +47,11 @@ pub struct NotifyArgs {
     #[arg(long, value_name = "TIER")]
     pub tier: Option<String>,
 
+    /// Covenant clause-1 rationale (#2122): why this notification is
+    /// being sent. Required under AI_MEMORY_REQUIRE_WHY_TRACE=1.
+    #[arg(long = "why-trace", value_name = "TEXT")]
+    pub why_trace: Option<String>,
+
     /// Emit the raw JSON envelope.
     #[arg(long)]
     pub json: bool,
@@ -79,6 +84,11 @@ pub fn cmd_notify(
     if let Some(t) = &args.tier {
         params["tier"] = json!(t);
     }
+    // #2122 — thread the caller's covenant clause-1 rationale (three-surface
+    // parity with the MCP param + HTTP body field).
+    if let Some(wt) = &args.why_trace {
+        params[db::META_KEY_WHY_TRACE] = json!(wt);
+    }
 
     let envelope = crate::mcp::handle_notify(&conn, &params, &resolved_ttl, None)
         .map_err(|e| anyhow::anyhow!("notify: {e}"))?;
@@ -110,6 +120,7 @@ mod tests {
             payload: "body".into(),
             priority: None,
             tier: None,
+            why_trace: None,
             json: true,
         };
         let mut out = env.output();
@@ -128,6 +139,7 @@ mod tests {
             payload: "body".into(),
             priority: Some(7),
             tier: Some("mid".into()),
+            why_trace: None,
             json: true,
         };
         {

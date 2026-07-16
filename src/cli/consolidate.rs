@@ -60,6 +60,11 @@ pub fn run(
     validate::validate_consolidate(&ids, &args.title, &args.summary, &namespace)?;
     let conn = db::open(db_path)?;
     let consolidator_agent_id = identity::resolve_agent_id(cli_agent_id, None)?;
+    // #2121 — the CLI is a CALLER-origin authoring surface for the covenant
+    // clause-1 gate (same posture as CLI `store` / `import`, whose writes are
+    // insert-gated): never substrate-authored. Under
+    // AI_MEMORY_REQUIRE_WHY_TRACE=1 the merged metadata must carry a
+    // why_trace (typically inherited from a gated source row).
     let new_id = db::consolidate(
         &conn,
         &ids,
@@ -69,6 +74,7 @@ pub fn run(
         &Tier::Long,
         "cli",
         &consolidator_agent_id,
+        false,
     )?;
     if json_out {
         writeln!(
@@ -178,6 +184,8 @@ pub fn run_auto(
                     .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
                     .collect::<Vec<_>>()
                     .join("\n");
+                // #2121 — CLI caller-origin surface (see `run` above):
+                // never substrate-authored.
                 db::consolidate(
                     &conn,
                     &ids,
@@ -187,6 +195,7 @@ pub fn run_auto(
                     &Tier::Long,
                     "auto-consolidate",
                     &consolidator_agent_id,
+                    false,
                 )?;
                 consolidated_ids.extend(ids);
                 total += group.len();

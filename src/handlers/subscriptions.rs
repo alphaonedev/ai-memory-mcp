@@ -75,6 +75,12 @@ pub struct NotifyBody {
     /// Optional explicit sender id — falls back to `X-Agent-Id` header.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// #2122 — caller-supplied covenant clause-1 rationale
+    /// (`metadata.why_trace`). Required under
+    /// `AI_MEMORY_REQUIRE_WHY_TRACE=1` (the payload is caller content, so
+    /// the substrate never stamps its own rationale on a notify).
+    #[serde(default)]
+    pub why_trace: Option<String>,
 }
 
 pub async fn notify(
@@ -140,6 +146,7 @@ pub async fn notify(
                 &payload,
                 priority_i32,
                 resolved_tier.as_ref(),
+                body.why_trace.as_deref(),
             )
             .await
         {
@@ -189,6 +196,11 @@ pub async fn notify(
     }
     if let Some(t) = body.tier {
         params["tier"] = json!(t);
+    }
+    // #2122 — thread the caller's covenant clause-1 rationale through to
+    // the MCP notify handler (parity with the postgres SAL branch above).
+    if let Some(wt) = body.why_trace {
+        params[crate::storage::META_KEY_WHY_TRACE] = json!(wt);
     }
 
     let lock = app.db.lock().await;

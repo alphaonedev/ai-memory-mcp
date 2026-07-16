@@ -627,6 +627,21 @@ pub(crate) fn handle_store(
     // queued merge + delete and returns the echo response (the new
     // row insert is then skipped — the merge subsumed the incoming
     // fact).
+    // #2121/#2122 funnel audit — TRACT covenant clause-1 gate on the
+    // synthesis UPDATE detour. When the synthesiser elects an Update, the
+    // incoming CALLER content is merged into an existing row via
+    // `db::update` and the handler returns BEFORE the gated `db::insert`
+    // below — so a why_trace-less tenant `memory_store` whose content drew
+    // an Update verdict escaped enforcement entirely (and the #2122
+    // substrate-stamped provenance row would persist the caller-derived
+    // merge). Consult the same gate the insert tail enforces so a
+    // `memory_store` without why_trace is refused under
+    // AI_MEMORY_REQUIRE_WHY_TRACE=1 REGARDLESS of which verdict its
+    // content draws. Advisory default (env unset) is unchanged: the gate
+    // only WARNs and the detour proceeds.
+    if !synthesis_outcome.updates.is_empty() {
+        crate::storage::consult_why_trace_gate(&mem).map_err(|e| e.to_string())?;
+    }
     if let Some(resp) = synthesis::apply_synthesis_updates_and_deletes(
         conn,
         &mem,
@@ -655,6 +670,15 @@ pub(crate) fn handle_store(
         None
     };
     if let Some(dup) = exact_dup {
+        // #2121/#2122 funnel audit — clause-1 gate on the exact-dup merge
+        // detour. This tool-layer `(title, namespace)` dedup applies the
+        // incoming CALLER content via `db::update` and returns before the
+        // gated `db::insert` tail — while the SAME write on the raw
+        // `db::insert` funnel (HTTP create / CLI) is refused BEFORE its
+        // merge-upsert fires. Consult the gate here for surface parity so
+        // enforce mode cannot be dodged by re-storing an existing
+        // (title, namespace). Advisory default unchanged (WARN-only).
+        crate::storage::consult_why_trace_gate(&mem).map_err(|e| e.to_string())?;
         // Update existing memory instead of creating a duplicate.
         // Preserve the original agent_id (provenance is immutable) — the
         // existing memory's metadata.agent_id wins over anything in the
