@@ -101,7 +101,15 @@ capture_wedge() {
       local k
       for k in $kids; do next+=("$k"); done
     done
-    frontier=("${next[@]}")
+    # Reassign frontier from `next`. Guard the empty case explicitly: on
+    # bash < 4.4, expanding an empty array as `("${next[@]}")` under `set -u`
+    # errors ("unbound variable"); bash >= 4.4 is fine, but the explicit
+    # branch is portable and self-documenting.
+    if [ "${#next[@]}" -gt 0 ]; then
+      frontier=("${next[@]}")
+    else
+      frontier=()
+    fi
   done
 
   {
