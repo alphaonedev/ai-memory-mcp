@@ -32,6 +32,8 @@
 //!   [`sync_cycle_once`] — the sync-daemon body.
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
+//! - [`run_watch_daemon_with_primitives`] — the L3 substrate
+//!   poll-watcher daemon body (issue #1978).
 
 use crate::models::field_names;
 use std::io::Write as _;
@@ -75,6 +77,7 @@ use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
 use crate::cli::verify::VerifyChainArgs;
 use crate::cli::verify_signed_events::VerifySignedEventsChainArgs;
+use crate::cli::watch::WatchArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
@@ -450,6 +453,19 @@ pub enum Command {
     RecoverPreviousSession(
         crate::cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
     ),
+    /// v1.0.0 (issue #1978) — L3 substrate watcher: a std-only,
+    /// poll-based filesystem-watcher capture daemon (no `notify`
+    /// crate — operator-gated under the sole-authority
+    /// no-external-injection rule). `--once` runs a single poll tick
+    /// and prints the report; `--daemon` loops with `--interval-secs`
+    /// between ticks. Each tick diffs `std::fs::metadata` mtime/size
+    /// per watched host transcript and, on a detected change, feeds
+    /// the shared L2 parser pipeline
+    /// ([`crate::recover::recover_from_transcript`]) — same
+    /// idempotency, same dedup table, same graceful degradation. Opt-in:
+    /// never runs unless explicitly invoked. See
+    /// `crate::recover::watcher` for the full design rationale.
+    Watch(WatchArgs),
     /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
     /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
     /// long-form memory into atomic propositions; surfaces every
@@ -1859,6 +1875,28 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             match code {
                 0 => Ok(()),
                 code => std::process::exit(code),
+            }
+        }
+        Command::Watch(a) => {
+            // Mirrors the `Curator` arm: `--daemon` runs indefinitely on a
+            // `spawn_blocking` worker that itself calls `tracing::info!`;
+            // holding the process-wide `Stdout::lock()` across that would
+            // risk a cross-thread ReentrantMutex deadlock, so route
+            // `--daemon` output to `io::sink()` and only lock real
+            // stdout/stderr for `--once` (which actually emits a report).
+            init_tracing();
+            if a.daemon {
+                let mut so = std::io::sink();
+                let mut se = std::io::sink();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::watch::run(&db_path, &a, cli_agent_id.as_deref(), &mut out).await
+            } else {
+                let stdout = std::io::stdout();
+                let stderr = std::io::stderr();
+                let mut so = stdout.lock();
+                let mut se = stderr.lock();
+                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
+                cli::watch::run(&db_path, &a, cli_agent_id.as_deref(), &mut out).await
             }
         }
         Command::Atomise(a) => {
@@ -6319,6 +6357,32 @@ pub async fn run_curator_daemon_with_primitives(
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
+    Ok(())
+}
+
+/// Watch-daemon loop body (issue #1978 L3 substrate watcher). Bridges
+/// the CLI's `tokio::sync::Notify` shutdown signal into the
+/// `Arc<AtomicBool>` [`crate::recover::watcher::run_watch_daemon`]
+/// checks every 500ms, then drives the blocking poll loop via
+/// `spawn_blocking` — the identical bridge pattern
+/// [`run_curator_daemon_with_primitives`] uses for the curator daemon.
+pub async fn run_watch_daemon_with_primitives(
+    db_path: PathBuf,
+    cfg: crate::recover::watcher::WatchConfig,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let shutdown_flag_for_signal = shutdown_flag.clone();
+    tokio::spawn(async move {
+        shutdown.notified().await;
+        shutdown_flag_for_signal.store(true, Ordering::Relaxed);
+    });
+
+    tokio::task::spawn_blocking(move || {
+        crate::recover::watcher::run_watch_daemon(db_path, cfg, shutdown_flag);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("watch daemon join: {e}"))?;
     Ok(())
 }
 

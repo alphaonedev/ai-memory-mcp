@@ -29,6 +29,9 @@ pub mod durability;
 pub mod nag;
 pub mod parsers;
 pub mod transcript_paths;
+// v1.0.0 #1978 — L3 substrate watcher: std-only poll-based filesystem
+// capture daemon feeding this module's `recover_from_transcript` pipeline.
+pub mod watcher;
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;

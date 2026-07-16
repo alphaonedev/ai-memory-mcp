@@ -214,7 +214,7 @@ ai-memory integrates with any AI platform that supports the **Model Context Prot
 | **OpenClaw** | MCP stdio | JSON (`mcp.servers` in config) | Fully supported |
 | **Any MCP client** | MCP stdio or HTTP | Varies | Universal |
 
-MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (93 route registrations / 79 unique URL paths on localhost) and the **CLI** (89 subcommands under `--features sal` OR `--features sal-postgres`; 87 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
+MCP is the primary integration layer. For AI platforms that do not yet support MCP natively, the **HTTP API** (93 route registrations / 79 unique URL paths on localhost) and the **CLI** (91 subcommands under `--features sal` OR `--features sal-postgres`; 89 in the default build (post-#1389 L2 `RecoverPreviousSession` for cross-session context rehydration + #1443 `Expand` for the `ai-memory expand` query-expansion surface + #1598 `Reembed` for the `ai-memory reembed` vector-space migration surface + #1978 `Watch` for the L3 substrate poll-based filesystem-watcher capture daemon); SSOT pinned by `ai_memory::EXPECTED_CLI_SUBCOMMANDS_DEFAULT` + `EXPECTED_CLI_SUBCOMMANDS_SAL` + the mechanical `tests/cli_subcommand_count_invariant.rs` parity test) provide universal access -- any AI, script, or automation that can make HTTP calls or run shell commands can use ai-memory.
 
 ---
 
@@ -748,7 +748,7 @@ Beyond MCP, ai-memory also exposes a full HTTP REST API (93 route registrations 
 
 ### Interfaces
 - **92 HTTP routes (78 unique paths)** -- full REST API on 127.0.0.1:9077 (works with any AI or tool)
-- **89 CLI subcommands under `--features sal` OR `--features sal-postgres`** (87 in the default build) -- complete CLI with identical capabilities
+- **91 CLI subcommands under `--features sal` OR `--features sal-postgres`** (89 in the default build) -- complete CLI with identical capabilities
 - **101 MCP tools** at full profile (7 default; verified against `Profile::full().expected_tool_count()`) -- native integration for any MCP-compatible AI
 - **Interactive REPL shell** -- recall, search, list, get, stats, namespaces, delete with color output
 - **JSON output** -- `--json` flag on all CLI commands
