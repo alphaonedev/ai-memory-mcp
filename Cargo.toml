@@ -86,11 +86,11 @@ axum-server = { version = "0.8", features = ["tls-rustls"] }
 # (`tls::PeerBindingAcceptor`) hand-writes a per-connection
 # `tower_service::Service` wrapper (`CertExtensionService`) to inject the
 # operator-bound peer identity into request extensions after the TLS
-# handshake. `tower` re-exports that `Service` trait. It is already a
-# transitive dependency (axum / axum-server / tower-http) AND already a
-# dev-dependency below; this promotes it to a normal dependency so the
-# wrapper can be written in production code. No novel crate.
-tower = { version = "0.5", features = ["util"] }
+# handshake. We need ONLY the `Service` trait — `tower-service` is the
+# tiny trait-only crate axum / hyper / tower / tower-http already all
+# pull transitively, so this adds NO new crate to `Cargo.lock` (the full
+# `tower` toolkit stays a dev-dependency, for the test `ServiceExt`).
+tower-service = "0.3"
 # rustls 0.23 requires an explicit CryptoProvider — `ring` matches
 # reqwest's default for the sync-daemon, keeping a single provider
 # across the process. PEM parsing is handled by

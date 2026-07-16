@@ -333,22 +333,12 @@ pub fn load_cert_peer_binding_map(path: &Path) -> Result<HashMap<[u8; 32], Strin
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let fp_token = parts
-            .next()
-            .expect("non-empty line has at least one whitespace-delimited field");
-        let Some(peer_id) = parts.next() else {
-            anyhow::bail!(
-                "{CERT_PEER_BINDING_LABEL} line {lineno}: expected `<sha256-hex> <peer-id>`, \
-                 got only `{fp_token}`"
-            );
-        };
-        if parts.next().is_some() {
-            anyhow::bail!(
-                "{CERT_PEER_BINDING_LABEL} line {lineno}: expected exactly two fields \
-                 `<sha256-hex> <peer-id>`"
-            );
-        }
+        let (fp_token, peer_id) = two_whitespace_fields(
+            line,
+            CERT_PEER_BINDING_LABEL,
+            "`<sha256-hex> <peer-id>`",
+            lineno,
+        )?;
         let fp = parse_fingerprint_token(fp_token, CERT_PEER_BINDING_LABEL, lineno)?;
         // Reuse the wire agent-id shape check so a binding cannot smuggle
         // CRLF / control bytes into the peer-id (same discipline as
@@ -424,9 +414,20 @@ pub struct CertExtensionService<S> {
     cert_peer_id: ClientCertPeerId,
 }
 
-impl<S, B> tower::Service<axum::http::Request<B>> for CertExtensionService<S>
+impl<S> CertExtensionService<S> {
+    /// The [`ClientCertPeerId`] this wrapper injects into every request it
+    /// serves — the operator-bound peer identity [`PeerBindingAcceptor`]
+    /// resolved from the presenting client cert. Read accessor so the
+    /// acceptor's post-handshake resolution is assertable end-to-end.
+    #[must_use]
+    pub fn client_cert_peer_id(&self) -> &ClientCertPeerId {
+        &self.cert_peer_id
+    }
+}
+
+impl<S, B> tower_service::Service<axum::http::Request<B>> for CertExtensionService<S>
 where
-    S: tower::Service<axum::http::Request<B>>,
+    S: tower_service::Service<axum::http::Request<B>>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -568,6 +569,30 @@ fn parse_fingerprint_token(token: &str, label: &str, lineno: usize) -> Result<[u
     Ok(bytes)
 }
 
+/// Split a comment-stripped, non-empty pin-file line into EXACTLY two
+/// whitespace-delimited fields, or bail with `label` / `grammar` / `lineno`
+/// context. Shared by the two `<a> <b>` pin-file parsers
+/// ([`load_peer_fingerprint_map`] #1678, [`load_cert_peer_binding_map`]
+/// #2045) so the "exactly two fields" grammar lives in one place.
+fn two_whitespace_fields<'a>(
+    line: &'a str,
+    label: &str,
+    grammar: &str,
+    lineno: usize,
+) -> Result<(&'a str, &'a str)> {
+    let mut parts = line.split_whitespace();
+    let first = parts
+        .next()
+        .expect("non-empty line has at least one whitespace-delimited field");
+    let Some(second) = parts.next() else {
+        anyhow::bail!("{label} line {lineno}: expected {grammar}, got only `{first}`");
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("{label} line {lineno}: expected exactly two fields {grammar}");
+    }
+    Ok((first, second))
+}
+
 /// Normalise an operator-written host token into the canonical key used by
 /// `FingerprintPinServerVerifier`'s map. An IP literal is round-tripped
 /// through `std::net::IpAddr` (canonical form); a DNS name is lowercased.
@@ -615,20 +640,8 @@ pub fn load_peer_fingerprint_map(path: &Path) -> Result<HashMap<String, HashSet<
         if line.is_empty() {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let host = parts
-            .next()
-            .expect("non-empty line has at least one whitespace-delimited field");
-        let Some(fp_token) = parts.next() else {
-            anyhow::bail!(
-                "{PEER_FP_LABEL} line {lineno}: expected `<host> <sha256-hex>`, got only `{host}`"
-            );
-        };
-        if parts.next().is_some() {
-            anyhow::bail!(
-                "{PEER_FP_LABEL} line {lineno}: expected exactly two fields `<host> <sha256-hex>`"
-            );
-        }
+        let (host, fp_token) =
+            two_whitespace_fields(line, PEER_FP_LABEL, "`<host> <sha256-hex>`", lineno)?;
         let fp = parse_fingerprint_token(fp_token, PEER_FP_LABEL, lineno)?;
         map.entry(normalize_host_key(host)).or_default().insert(fp);
     }
@@ -2174,6 +2187,77 @@ mod tests {
         assert!(
             err.to_string().contains("failed to read mTLS allowlist"),
             "got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #2045 L6 — cert-peer-binding acceptor glue.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_bound_peer_id_matches_and_degrades() {
+        use sha2::{Digest, Sha256};
+        let leaf = rustls::pki_types::CertificateDer::from(vec![1u8, 2, 3, 4]);
+        let fp: [u8; 32] = Sha256::digest([1u8, 2, 3, 4]).into();
+        let mut map: HashMap<[u8; 32], String> = HashMap::new();
+        map.insert(fp, "peer-x".to_string());
+        // Presenting leaf's fingerprint is bound → its operator peer-id.
+        assert_eq!(
+            resolve_bound_peer_id(Some(std::slice::from_ref(&leaf)), &map).as_deref(),
+            Some("peer-x")
+        );
+        // No client cert at all (non-mTLS) → None.
+        assert_eq!(resolve_bound_peer_id(None, &map), None);
+        assert_eq!(resolve_bound_peer_id(Some(&[]), &map), None);
+        // Cert present but its fingerprint carries no binding (legacy) → None.
+        let other = rustls::pki_types::CertificateDer::from(vec![9u8, 9, 9]);
+        assert_eq!(
+            resolve_bound_peer_id(Some(std::slice::from_ref(&other)), &map),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cert_extension_service_injects_extension() {
+        use tower::ServiceExt as _;
+        // Inner service echoes back whatever ClientCertPeerId the wrapper
+        // inserted into the request extensions.
+        let inner = tower::service_fn(|req: axum::http::Request<()>| async move {
+            let got = req.extensions().get::<ClientCertPeerId>().cloned();
+            Ok::<_, std::convert::Infallible>(got)
+        });
+        let svc = CertExtensionService {
+            inner,
+            cert_peer_id: ClientCertPeerId(Some("peer-x".to_string())),
+        };
+        let echoed = svc
+            .oneshot(axum::http::Request::new(()))
+            .await
+            .expect("inner service infallible");
+        assert_eq!(
+            echoed.expect("extension must be present").0.as_deref(),
+            Some("peer-x"),
+            "CertExtensionService::call must inject the ClientCertPeerId extension"
+        );
+    }
+
+    #[test]
+    fn two_whitespace_fields_enforces_exactly_two() {
+        assert_eq!(
+            two_whitespace_fields("a  b", "L", "`<a> <b>`", 1).unwrap(),
+            ("a", "b")
+        );
+        assert!(
+            two_whitespace_fields("a", "L", "`<a> <b>`", 1)
+                .unwrap_err()
+                .to_string()
+                .contains("got only")
+        );
+        assert!(
+            two_whitespace_fields("a b c", "L", "`<a> <b>`", 1)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly two")
         );
     }
 }

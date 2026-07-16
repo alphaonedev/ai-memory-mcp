@@ -84,9 +84,22 @@ pub(super) fn enforce_cert_peer_binding(
     if mode == crate::tls::CertPeerBindingMode::Off {
         return None;
     }
-    // Only a bound cert paired with an asserted, DIFFERENT peer-id is a
-    // mismatch. `?` short-circuits every never-brick degradation above.
-    let bound = cert_peer?.0.as_deref()?;
+    // No extension at all ⇒ the request did not arrive over the peer-binding
+    // mTLS acceptor (plain HTTP / no binding map) — nothing to cross-check.
+    let cert_peer = cert_peer?;
+    let Some(bound) = cert_peer.0.as_deref() else {
+        // mTLS cert present but its fingerprint carries NO operator binding
+        // (a "legacy" cert). De-silenced: emit a trace so the degrade is
+        // observable, then proceed — a bound-less cert must never brick.
+        tracing::debug!(
+            target: ATTESTATION_TRACE_TARGET,
+            asserted_peer_id = asserted_peer_id.unwrap_or(""),
+            "cert↔x-peer-id: presenting client cert has no operator binding \
+             (legacy) — cross-check skipped, never bricks (#2045)"
+        );
+        return None;
+    };
+    // A bound cert with no asserted peer-id has nothing to contradict.
     let asserted = asserted_peer_id?;
     if asserted == bound {
         return None;

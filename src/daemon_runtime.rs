@@ -4431,6 +4431,55 @@ fn tls_bind_guard(
     )))
 }
 
+/// #2045 L6 — boot-time posture warnings for the mTLS cert↔X-Peer-Id
+/// cross-check. Returns the operator-facing WARN lines (empty ⇒ silent) so
+/// the logic is unit-testable independent of the tracing sink (the
+/// [`tls_bind_guard`] pattern).
+///
+/// Two silent-footgun states are surfaced:
+/// - **INERT posture** — `enforce`/`warn` is selected but nothing feeds the
+///   check (mTLS not configured, or no binding map), so the operator BELIEVES
+///   the control is on while it is a no-op.
+/// - **OPEN L6 WINDOW** — `AI_MEMORY_FED_REQUIRE_SIG=0` (the permissive
+///   opt-out this control compensates for) while the cross-check is not
+///   `enforce`: the exact still-spoofable state #2032 L6 described.
+fn cert_peer_binding_boot_warnings(
+    mode: tls::CertPeerBindingMode,
+    mtls_configured: bool,
+    binding_map_present: bool,
+    fed_require_sig: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if mode != tls::CertPeerBindingMode::Off {
+        if !mtls_configured {
+            out.push(
+                "AI_MEMORY_FED_CERT_PEER_BINDING is set but mTLS is not configured (no \
+                 --mtls-allowlist) — the cert↔x-peer-id cross-check is INERT (peer certs exist \
+                 only under mTLS). (#2045 L6)"
+                    .to_string(),
+            );
+        } else if !binding_map_present {
+            out.push(
+                "AI_MEMORY_FED_CERT_PEER_BINDING is set but AI_MEMORY_FED_CERT_PEER_BINDING_MAP \
+                 provides no fingerprint→peer-id bindings — the cross-check is INERT. Point it at \
+                 a `<sha256-hex> <peer-id>` file. (#2045 L6)"
+                    .to_string(),
+            );
+        }
+    }
+    if !fed_require_sig && mode != tls::CertPeerBindingMode::Enforce {
+        out.push(
+            "AI_MEMORY_FED_REQUIRE_SIG=0 with cert↔x-peer-id binding NOT enforcing \
+             (AI_MEMORY_FED_CERT_PEER_BINDING != enforce) — the #2032 L6 peer-id spoof window is \
+             OPEN on the mTLS /sync path: any holder of an allowlisted client cert can assert any \
+             x-peer-id. Set AI_MEMORY_FED_CERT_PEER_BINDING=enforce (with a binding map) to close \
+             it. (#2045 L6)"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
 ///
@@ -5728,6 +5777,17 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         } else {
             None
         };
+        // #2045 L6 — surface the inert-posture + open-L6-window footguns at
+        // boot so a set-but-ineffective control (or the still-vulnerable
+        // FED_REQUIRE_SIG=0 state) is loud, not silent.
+        for warning in cert_peer_binding_boot_warnings(
+            tls::cert_peer_binding_mode(),
+            args.mtls_allowlist.is_some(),
+            cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
+            crate::federation::signing::require_sig(),
+        ) {
+            tracing::warn!(target: "federation::attestation", "{warning}");
+        }
         if let Some(bindings) = cert_peer_bindings {
             tracing::info!(
                 bound_fingerprints = bindings.len(),
@@ -6787,6 +6847,62 @@ mod tests {
         }
         // Even the ack does not override an explicit REQUIRE_TLS demand.
         assert!(tls_bind_guard(false, "0.0.0.0", true, true).is_err());
+    }
+
+    // ----- #2045 L6 cert-peer-binding boot posture warnings --------------
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_silent_when_off() {
+        // Posture off + require_sig on ⇒ nothing to warn about.
+        assert!(
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Off, true, true, true)
+                .is_empty()
+        );
+        // Fully-configured enforce with sig on ⇒ silent.
+        assert!(
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_flag_inert_posture() {
+        // Posture set but mTLS not configured ⇒ INERT warning.
+        let w = cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Warn, false, false, true);
+        assert!(
+            w.iter().any(|s| s.contains("INERT") && s.contains("mTLS")),
+            "must warn mTLS-not-configured inert: {w:?}"
+        );
+        // mTLS on but no binding map ⇒ INERT warning.
+        let w =
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, false, true);
+        assert!(
+            w.iter()
+                .any(|s| s.contains("INERT") && s.contains("BINDING_MAP")),
+            "must warn no-binding-map inert: {w:?}"
+        );
+    }
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_flag_open_l6_window() {
+        // require_sig=0 with binding not enforcing ⇒ the OPEN L6 window WARN.
+        for mode in [
+            tls::CertPeerBindingMode::Off,
+            tls::CertPeerBindingMode::Warn,
+        ] {
+            let w = cert_peer_binding_boot_warnings(mode, true, true, false);
+            assert!(
+                w.iter().any(|s| s.contains("spoof window is OPEN")),
+                "require_sig=0 + non-enforce must warn open window (mode {mode:?}): {w:?}"
+            );
+        }
+        // require_sig=0 but ENFORCE closes it ⇒ no open-window warning.
+        let w =
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, false);
+        assert!(
+            !w.iter().any(|s| s.contains("spoof window is OPEN")),
+            "enforce must NOT warn open window: {w:?}"
+        );
     }
 
     // ----- R-04 / R-12 boot security-posture warnings (#1798) ------------
