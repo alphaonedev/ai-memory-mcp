@@ -84,6 +84,20 @@ pub async fn list_memories(
         }
     };
 
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate on the BULK read
+    // surface: under `enforce` a shared-key `Claimed` caller acting as a named
+    // principal cannot enumerate the victim's scope=private rows via the
+    // `is_visible_to_caller` filter below.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &caller,
+        "list_memories",
+    ) {
+        return resp;
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The trait's `Filter` shape carries
     // `(namespace, tier, tags_any, agent_id, since, until, limit)`,
@@ -274,6 +288,18 @@ pub async fn search_memories(
             })),
         )
             .into_response();
+    }
+
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate on the SEARCH
+    // surface (same `visibility_clause`/private-row exposure as list).
+    if let Some(resp) = crate::handlers::identity_binding::enforce_for_request(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        &resolved_caller,
+        "search_memories",
+    ) {
+        return resp;
     }
 
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
