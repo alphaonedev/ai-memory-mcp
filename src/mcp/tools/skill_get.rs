@@ -595,4 +595,51 @@ mod tests {
         // metadata key should NOT be present in response (parse failure).
         assert!(v.get("metadata").is_none());
     }
+
+    #[test]
+    fn get_surfaces_retired_state_2024() {
+        // #2024 (Gate-3 coverage fix) — the `retired` field skill_get surfaces
+        // (skill_get.rs) had no test: the 8 skill_retire tests only ever call
+        // skill_list, never skill_get. Guard the full retire→get chain so a
+        // refactor that drops / misreads the surfacing (a caller relying on
+        // `skill_get(..).retired` to detect retirement) fails CI.
+        let conn = open_db();
+        let id = "77777777-7777-7777-7777-777777777777";
+        insert_min_skill(&conn, id, "ns-r", "retire-me", "# body");
+
+        // Un-retired skill → retired surfaces EXPLICITLY as false (not absent).
+        let v = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        assert_eq!(
+            v["retired"],
+            json!(false),
+            "an un-retired skill must surface retired=false"
+        );
+
+        // Retire via the real handler → skill_get now surfaces retired=true.
+        crate::mcp::skill_retire::handle_skill_retire(&conn, &json!({"skill_id": id})).unwrap();
+        let v2 = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        assert_eq!(
+            v2["retired"],
+            json!(true),
+            "a retired skill must surface retired=true"
+        );
+        assert_eq!(
+            v2["metadata"]["retired"],
+            json!(true),
+            "the raw metadata must also carry the retired flag"
+        );
+
+        // Un-retire (the reversible path) → surfaces false again.
+        crate::mcp::skill_retire::handle_skill_retire(
+            &conn,
+            &json!({"skill_id": id, "retired": false}),
+        )
+        .unwrap();
+        let v3 = handle_skill_get(&conn, &json!({"skill_id": id})).unwrap();
+        assert_eq!(
+            v3["retired"],
+            json!(false),
+            "un-retiring must surface retired=false again"
+        );
+    }
 }
