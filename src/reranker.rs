@@ -603,7 +603,15 @@ impl CrossEncoder {
     -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
         let repo = Repo::new(CROSS_ENCODER_MODEL_ID.to_string(), RepoType::Model);
         if crate::embeddings::Embedder::remote_fetch_disabled() {
-            let cache_repo = hf_hub::Cache::default().repo(repo);
+            // #1969 fix (Gate-3 review): resolve the cache root WITHOUT
+            // `hf_hub::Cache::default()`, which `.expect()`s on `dirs::home_dir()`
+            // and hard-aborts the daemon at boot when `HOME` is unset — the
+            // ordinary systemd-service / minimal-container offline posture this
+            // feature targets — AND ignores `HF_HOME`. Resolve panic-free and let
+            // an unresolvable cache flow up as the loud `Err` → `new_neural`
+            // lexical degrade, honoring the offline contract instead of crashing.
+            let cache_path = Self::hf_cache_path(std::env::var_os("HF_HOME"), dirs::home_dir())?;
+            let cache_repo = hf_hub::Cache::new(cache_path).repo(repo);
             Self::assemble_offline_cross_encoder_files(|file| cache_repo.get(file))
         } else {
             let online = Api::new()
@@ -646,6 +654,37 @@ impl CrossEncoder {
             need(crate::embeddings::HF_TOKENIZER_FILE)?,
             need(crate::embeddings::HF_WEIGHTS_FILE)?,
         ))
+    }
+
+    /// #1969 — resolve the local HuggingFace cache root for the OFFLINE reranker
+    /// path, panic-free. Mirrors `hf_hub::Cache::{from_env,default}`'s layout
+    /// (`<HF_HOME>/hub`, else `<home>/.cache/huggingface/hub`) but returns a LOUD
+    /// `Err` instead of `Cache::default()`'s `.expect()` boot-abort when neither
+    /// `HF_HOME` nor a home directory is resolvable (the systemd-service /
+    /// minimal-container offline posture with no `HOME`). Pure over its inputs
+    /// (the real env var + `dirs::home_dir()` are threaded in by the caller) so
+    /// every branch — including the no-`HOME` degrade — is unit-testable without
+    /// env mutation.
+    fn hf_cache_path(
+        hf_home: Option<std::ffi::OsString>,
+        home: Option<std::path::PathBuf>,
+    ) -> Result<std::path::PathBuf> {
+        if let Some(hf_home) = hf_home.filter(|v| !v.is_empty()) {
+            let mut path = std::path::PathBuf::from(hf_home);
+            path.push("hub");
+            return Ok(path);
+        }
+        let mut path = home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "offline (AI_MEMORY_EMBED_OFFLINE/HF_HUB_OFFLINE): neither HF_HOME nor a home \
+                 directory is resolvable, so the local HuggingFace cache cannot be located; set \
+                 HF_HOME to the directory holding the pre-staged {CROSS_ENCODER_MODEL_ID} cache"
+            )
+        })?;
+        path.push(".cache");
+        path.push("huggingface");
+        path.push("hub");
+        Ok(path)
     }
 
     fn load_neural() -> Result<Self> {
@@ -2550,6 +2589,56 @@ mod tests {
         assert!(config.ends_with(crate::embeddings::HF_CONFIG_FILE));
         assert!(tokenizer.ends_with(crate::embeddings::HF_TOKENIZER_FILE));
         assert!(weights.ends_with(crate::embeddings::HF_WEIGHTS_FILE));
+    }
+
+    // #1969 (Gate-3 review fix) — the OFFLINE cache-root resolution branch
+    // (`resolve_cross_encoder_files`) must never panic on a missing `HOME`
+    // (systemd / minimal-container posture) and must honor `HF_HOME`. These pin
+    // the pure `hf_cache_path` the branch delegates to — the exact logic a prior
+    // `hf_hub::Cache::default().expect()` would have boot-aborted on.
+
+    #[test]
+    fn hf_cache_path_honors_hf_home_1969() {
+        // HF_HOME set → `<HF_HOME>/hub`, mirroring hf_hub::Cache::from_env.
+        let p = CrossEncoder::hf_cache_path(
+            Some(std::ffi::OsString::from("/srv/hf")),
+            Some(std::path::PathBuf::from("/home/svc")),
+        )
+        .expect("HF_HOME resolves without touching home");
+        assert_eq!(p, std::path::PathBuf::from("/srv/hf/hub"));
+    }
+
+    #[test]
+    fn hf_cache_path_falls_back_to_home_when_hf_home_absent_1969() {
+        // No HF_HOME but a home dir → `<home>/.cache/huggingface/hub`, mirroring
+        // hf_hub::Cache::default's layout (empty HF_HOME is treated as absent).
+        for hf_home in [None, Some(std::ffi::OsString::from(""))] {
+            let p =
+                CrossEncoder::hf_cache_path(hf_home, Some(std::path::PathBuf::from("/home/svc")))
+                    .expect("home fallback resolves");
+            assert_eq!(
+                p,
+                std::path::PathBuf::from("/home/svc/.cache/huggingface/hub")
+            );
+        }
+    }
+
+    #[test]
+    fn hf_cache_path_no_home_degrades_loud_not_panic_1969() {
+        // The regression this fix closes: no HF_HOME AND no home dir (a systemd
+        // service with no HOME, air-gapped) must be a LOUD Err → new_neural
+        // lexical degrade, NOT `hf_hub::Cache::default().expect()` boot-abort.
+        let err = CrossEncoder::hf_cache_path(None, None)
+            .expect_err("no HF_HOME + no home must be a loud Err, never a panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("offline"),
+            "must be a loud offline error: {msg}"
+        );
+        assert!(
+            msg.contains("HF_HOME"),
+            "must name the HF_HOME remedy: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------
