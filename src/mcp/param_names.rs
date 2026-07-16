@@ -177,6 +177,11 @@ pub const UNTIL: &str = "until";
 pub const URL: &str = "url";
 pub const VALID_AT: &str = "valid_at";
 pub const VALID_UNTIL: &str = crate::models::field_names::VALID_UNTIL;
+/// #2122 — caller-supplied covenant clause-1 rationale param
+/// (`memory_notify` / `memory_share`). SSOT-aliased to the storage
+/// metadata key so the tool param and the gated metadata key can never
+/// drift.
+pub const WHY_TRACE: &str = crate::storage::META_KEY_WHY_TRACE;
 
 /// Every canonical MCP tool-call parameter name, surfaced as a single
 /// allowlist slice for the parity test in
@@ -317,6 +322,7 @@ pub const ALL_PARAM_NAMES: &[&str] = &[
     URL,
     VALID_AT,
     VALID_UNTIL,
+    WHY_TRACE,
 ];
 
 #[cfg(test)]
@@ -339,9 +345,11 @@ mod tests {
         // v1.0.0 #1959 R55 — 124 -> 125: TRANSITIVE (dependents transitive walk).
         // v1.0.0 #2024 — 125 -> 127: REASON + UNRETIRE (skill retire/unretire
         // lifecycle params for memory_skill_retire).
+        // v1.0.0 #2122 — 127 -> 128: WHY_TRACE (covenant clause-1 rationale
+        // param on memory_notify / memory_share).
         assert_eq!(
             ALL_PARAM_NAMES.len(),
-            127,
+            128,
             "MCP param-name SSOT census drifted from v0.7.0 baseline"
         );
     }

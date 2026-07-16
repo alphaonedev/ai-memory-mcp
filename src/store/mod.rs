@@ -992,6 +992,14 @@ pub trait MemoryStore: Send + Sync {
     /// sqlite MCP handler and the HTTP `memory_capture_turn` route both
     /// reach it via `app.store`. Default returns `UnsupportedCapability`
     /// so a future test/in-memory adapter round-trips cleanly.
+    ///
+    /// #2121 — covenant clause 1: adapters MUST key the substrate
+    /// `metadata.why_trace` stamp on `ctx.bypass_visibility` (authenticated
+    /// internal origin), never stamp unconditionally — `memory_capture_turn`
+    /// is tenant-callable and stores verbatim caller content, so an
+    /// unconditional stamp is an `AI_MEMORY_REQUIRE_WHY_TRACE=1` bypass. A
+    /// tenant capture with no caller-supplied why_trace is REFUSED under
+    /// enforce.
     async fn capture_turn_idempotent(
         &self,
         _ctx: &CallerContext,
@@ -1014,6 +1022,10 @@ pub trait MemoryStore: Send + Sync {
     /// `recover_from_transcript` reaches the same logic via
     /// [`crate::storage::recover_turn_idempotent`]. Default returns
     /// `UnsupportedCapability` so a test/in-memory adapter round-trips cleanly.
+    ///
+    /// #2121 — covenant clause 1: adapters key the substrate why_trace stamp
+    /// on `ctx.bypass_visibility` (see [`Self::capture_turn_idempotent`]);
+    /// the internal L2 walker runs under a bypass context.
     async fn recover_turn_idempotent(
         &self,
         _ctx: &CallerContext,
@@ -1894,6 +1906,14 @@ pub trait MemoryStore: Send + Sync {
     /// 6. Record source ids in `metadata.derived_from`.
     /// 7. Delete the source rows.
     ///
+    /// #2121 — covenant clause 1: adapters MUST key the substrate
+    /// `metadata.why_trace` stamp on `ctx.bypass_visibility` (authenticated
+    /// internal origin — the curator `ConsolidationPass` runs `for_admin`),
+    /// never stamp unconditionally: `memory_consolidate` is tenant-callable
+    /// and the summary is verbatim caller content. A tenant consolidate
+    /// whose merged metadata carries no why_trace is REFUSED under
+    /// `AI_MEMORY_REQUIRE_WHY_TRACE=1`.
+    ///
     /// Default returns `UnsupportedCapability`.
     async fn consolidate(
         &self,
@@ -2632,6 +2652,13 @@ pub trait MemoryStore: Send + Sync {
     /// with the supplied payload + `metadata.target_agent_id =
     /// target_agent`. Returns the new memory's id.
     ///
+    /// #2122 — `why_trace` is the caller-supplied covenant clause-1
+    /// rationale landing on `metadata.why_trace`. The payload is verbatim
+    /// caller content, so adapters MUST NOT stamp the substrate rationale
+    /// on a tenant notify (#2121 bypass class); under
+    /// `AI_MEMORY_REQUIRE_WHY_TRACE=1` a why_trace-less notify is refused
+    /// by the store gate.
+    ///
     /// Default returns `UnsupportedCapability`.
     async fn notify(
         &self,
@@ -2641,6 +2668,7 @@ pub trait MemoryStore: Send + Sync {
         _payload: &str,
         _priority: Option<i32>,
         _tier: Option<&Tier>,
+        _why_trace: Option<&str>,
     ) -> StoreResult<String> {
         Err(StoreError::UnsupportedCapability {
             capability: "NOTIFY".to_string(),
@@ -4420,7 +4448,7 @@ mod tests {
             StoreError::UnsupportedCapability { .. }
         ));
         assert!(matches!(
-            s.notify(&ctx, "agent", "t", "p", None, None)
+            s.notify(&ctx, "agent", "t", "p", None, None, None)
                 .await
                 .unwrap_err(),
             StoreError::UnsupportedCapability { .. }

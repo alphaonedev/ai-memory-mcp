@@ -212,7 +212,7 @@ fn write_notification(
         pending.invalidated_id, pending.dependent_id
     );
 
-    let metadata = json!({
+    let mut metadata = json!({
         "agent_id": signing_agent_id,
         "notification_kind": "reflection_invalidation",
         "dependent_id": pending.dependent_id,
@@ -220,6 +220,13 @@ fn write_notification(
         "invalidating_id": pending.invalidating_id,
         "timestamp": pending.timestamp,
     });
+    // #2122 — TRACT covenant clause 1: the invalidation cascade is a GENUINE
+    // internal writer (title + content are substrate-composed from row ids —
+    // no verbatim caller content), unreachable as a direct tenant funnel.
+    // Without the substrate rationale, `storage::insert`'s why_trace gate
+    // refused every cascade notification under AI_MEMORY_REQUIRE_WHY_TRACE=1,
+    // silently breaking reflection-invalidation propagation.
+    crate::storage::stamp_substrate_why_trace(&mut metadata);
 
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory

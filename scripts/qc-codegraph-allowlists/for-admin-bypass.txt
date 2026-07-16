@@ -21,3 +21,10 @@ src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
 src/migrate.rs:AI_MIGRATE
 src/store/postgres.rs:EXPORT_INTERNAL
 src/store/postgres.rs:GOVERNANCE_INTERNAL
+src/cli/stop.rs:AI_OPERATOR
+# #2121 — L2 transcript-recovery walker (recover_from_transcript_store): a
+# substrate re-store reading LOCAL host transcripts (CLI recover-previous-
+# session + session boot only; never a tenant-facing handler). The bypass
+# ctx keys the covenant clause-1 substrate why_trace stamp, matching the
+# direct-sqlite path's substrate_authored=true.
+src/recover/mod.rs:opts.agent_id

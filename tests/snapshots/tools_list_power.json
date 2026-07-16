@@ -750,6 +750,12 @@
           },
           "target_agent_id": {
             "type": "string"
+          },
+          "why_trace": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

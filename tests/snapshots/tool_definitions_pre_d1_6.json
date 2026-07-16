@@ -1381,6 +1381,13 @@
           "target_agent_id": {
             "description": "Recipient agent id; must satisfy validate_agent_id.",
             "type": "string"
+          },
+          "why_trace": {
+            "description": "Covenant clause-1 rationale (#2122): why this memory is being shared. Optional — the shared copy inherits the source's metadata.why_trace by default; supply this to override it (or to share a legacy source that predates the covenant under AI_MEMORY_REQUIRE_WHY_TRACE=1).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1899,6 +1906,13 @@
           "title": {
             "description": "Subject (<=200 chars).",
             "type": "string"
+          },
+          "why_trace": {
+            "description": "Covenant clause-1 rationale (#2122): why this notification is being sent. Required under AI_MEMORY_REQUIRE_WHY_TRACE=1 (the payload is caller content, so the substrate never stamps its own rationale).",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

@@ -498,7 +498,17 @@ pub async fn recover_from_transcript_store(
     let mut timer = RecoverTimer::new();
     let schema_version = crate::storage::migrations::current_schema_version();
     let mut report = RecoverReport::new(opts.host, schema_version);
-    let ctx = crate::store::CallerContext::for_agent(&opts.agent_id);
+    // #2121 — the L2 recovery walker is a SUBSTRATE re-store (it reads host
+    // transcripts off the LOCAL disk under the operator's own uid; env #95:
+    // never lose a recovered turn), so it runs under the authenticated
+    // internal principal (`bypass_visibility`) — the same posture as the
+    // direct-sqlite path, which passes `substrate_authored = true` — so the
+    // SAL `recover_turn_idempotent` stamps the substrate why_trace and both
+    // backends behave identically under AI_MEMORY_REQUIRE_WHY_TRACE=1. This
+    // is a background/CLI-only entry (`recover-previous-session` + session
+    // boot), never a tenant-facing handler. C8 allowlist:
+    // `scripts/qc-codegraph-allowlists/for-admin-bypass.txt`.
+    let ctx = crate::store::CallerContext::for_admin(&opts.agent_id);
 
     // Step 1 — resolve the transcript (identical to the sqlite path).
     let path = match opts.transcript_override.clone() {
@@ -778,7 +788,12 @@ fn write_recovered_turn(
 ) -> Result<String, String> {
     let write =
         prepare_recover_turn_write(turn, sha_bytes, namespace, host_kind, transcript_path, opts);
-    crate::storage::recover_turn_idempotent(conn, &write).map(|r| r.memory_id)
+    // #2121 — the in-process L2 recovery walker is a genuine SUBSTRATE
+    // re-store (reads host transcripts off the LOCAL disk; env #95: never
+    // lose a recovered turn), so it claims the substrate-authored why_trace
+    // stamp. Tenant-context writes reach `recover_turn_idempotent` only via
+    // the SAL trait, which keys on `ctx.bypass_visibility`.
+    crate::storage::recover_turn_idempotent(conn, &write, true).map(|r| r.memory_id)
 }
 
 /// Errors that escape [`recover_from_transcript`]. Most failure

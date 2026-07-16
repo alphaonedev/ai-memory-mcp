@@ -371,6 +371,16 @@ pub(super) fn apply_synthesis_updates_and_deletes(
         provenance_row.content = merged_content.clone();
         provenance_row.metadata =
             crate::identity::preserve_provenance_keys(&target.metadata, &mem.metadata);
+        // #2122 — TRACT covenant clause 1: this provenance row is a GENUINE
+        // internal bookkeeping writer — it exists only so the `supersedes`
+        // edge has a structurally-valid FK endpoint after a synthesis Update
+        // verdict merged the incoming fact into `target` (content already
+        // merged into an existing, already-gated row). Without the substrate
+        // rationale, `db::insert`'s why_trace gate refused it under
+        // AI_MEMORY_REQUIRE_WHY_TRACE=1 and the supersedes lineage edge was
+        // silently dropped (warn-only path below). Stamp-if-absent: a
+        // caller-supplied why_trace on the incoming memory wins.
+        crate::storage::stamp_substrate_why_trace(&mut provenance_row.metadata);
         // The (title, namespace) UNIQUE constraint on `memories`
         // would otherwise collide with the live target — append a
         // stable per-target suffix so the provenance row claims a

@@ -985,7 +985,13 @@ impl Embedder {
     /// the dedicated `AI_MEMORY_EMBED_OFFLINE` knob. Used by hermetic CI (the
     /// integration suite sets it to dodge the #1501 cold-download race) and by
     /// air-gapped operators who pre-stage the weights in `FALLBACK_MODEL_SUBDIR`.
-    fn remote_fetch_disabled() -> bool {
+    ///
+    /// `pub(crate)` (#2086) — the reranker's cross-encoder loader
+    /// (`crate::reranker::CrossEncoder::resolve_cross_encoder_files`) shares
+    /// this same offline knob so `AI_MEMORY_EMBED_OFFLINE`/`HF_HUB_OFFLINE`
+    /// gates network fetches for BOTH the embedder and the reranker
+    /// consistently, one substrate-wide offline posture rather than two.
+    pub(crate) fn remote_fetch_disabled() -> bool {
         let truthy = |name: &str| {
             std::env::var(name)
                 .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
@@ -2099,13 +2105,12 @@ fn load_from_fallback_succeeds_when_files_present() {
     // populated with placeholder files. This exercises the Ok-branch
     // (lines 272-273) without requiring real model files — Tokenizer
     // loading is not part of `load_from_fallback`.
-    use std::sync::Mutex;
-    // Serialize on a global mutex — env::set_var is process-wide and would
-    // race with parallel tests that also touch HOME.
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2115: serialize on the crate-canonical process-global env lock so this
+    // $HOME-mutating test does not race the reranker module's own
+    // $HOME-mutating tests cross-module under parallel `cargo test`
+    // (std::env::set_var is unsound multithreaded — a module-local Mutex only
+    // covers this file's tests).
+    let _guard = crate::config::test_env_lock();
 
     let tmp = std::env::temp_dir().join(format!("ai-memory-w12h-fallback-{}", std::process::id()));
     let model_dir = tmp.join(
@@ -2141,13 +2146,10 @@ fn offline_env_skips_network_and_errors_fast_on_empty_cache() {
     // must take the no-network branch and surface the fallback error fast
     // (the caller then degrades to keyword). This proves the cold-download
     // race can't happen: no HF-Hub fetch is attempted at all.
-    use std::sync::Mutex;
-    // env::set_var + HOME are process-wide; serialize against the other
-    // env-mutating tests in this module.
-    static LOCK: Mutex<()> = Mutex::new(());
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // #2115: shared crate-canonical env lock (see the sibling fallback test)
+    // so this $HOME + AI_MEMORY_EMBED_OFFLINE mutation serializes cross-module
+    // against the reranker tests, not just within this file.
+    let _guard = crate::config::test_env_lock();
 
     let tmp = std::env::temp_dir().join(format!(
         "ai-memory-1501-offline-{}-{}",
