@@ -469,11 +469,15 @@ async fn purity_pure_default_http_entry_path() {
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let router = ai_memory::build_router(
         ai_memory::handlers::ApiKeyState {
             key: None,
             mtls_enforced: false,
+            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            identity_mode: ai_memory::config::HttpIdentityMode::default(),
         },
         app_state,
     );
@@ -1055,10 +1059,10 @@ fn v77_migration_backfills_preexisting_rows_folded() {
     let dir = tempfile::tempdir_in(&root).expect("tempdir");
     let path = dir.path().join("v77.db");
 
-    // Fresh open reaches the current tip (v82, #2024 skill retire columns)
+    // Fresh open reaches the current tip (v83, #2044 agent_api_keys)
     // with the v77 `folded` column present.
     let conn = db::open(&path).expect("open");
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 82);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 83);
     let version: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -1066,7 +1070,7 @@ fn v77_migration_backfills_preexisting_rows_folded() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 82, "fresh open reaches the v82 tip");
+    assert_eq!(version, 83, "fresh open reaches the current tip");
     assert!(
         conn.prepare("SELECT folded FROM recall_observations LIMIT 0")
             .is_ok(),

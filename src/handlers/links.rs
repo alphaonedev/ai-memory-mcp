@@ -946,7 +946,8 @@ pub async fn get_links(
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
-    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+    let caller_is_admin =
+        crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
 
     // v0.7.0 Wave-3 + FX-C2 (ARCH-2 followup) — Postgres-backed daemons
     // ride the SAL `get_links_for_anchor` trait method. Pre-FX-C2 this
@@ -1142,7 +1143,8 @@ pub async fn get_lineage(
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
-    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+    let caller_is_admin =
+        crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
 
     #[cfg(feature = "sal")]
     if matches!(app.storage_backend, StorageBackend::Postgres) {

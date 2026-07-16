@@ -1438,6 +1438,44 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             cli::archive::run(&db_path, a, j, &mut out)
         }
         Command::Agents(a) => {
+            // #2095 MAJOR 1 — the HTTP per-agent api-key enrollment/revocation
+            // verbs must write to the CONFIGURED backend so a postgres-backed
+            // daemon (whose `serve` boot-seeds the enrolled map from postgres,
+            // not sqlite) actually observes them. Route BindApiKey/RevokeApiKey
+            // through the SAL store (`build_store_handle` selects sqlite vs
+            // postgres from `--store-url` / the #1927 non-argv channel); every
+            // other `agents` verb stays on the local sqlite path unchanged.
+            #[cfg(feature = "sal")]
+            {
+                use crate::cli::agents::AgentsAction;
+                // The two api-key verbs resolve the CONFIGURED backend and
+                // delegate to the fully-unit-tested `cli::agents` helpers; every
+                // other `agents` verb stays on the local sqlite path below.
+                if matches!(
+                    &a.action,
+                    Some(AgentsAction::BindApiKey { .. } | AgentsAction::RevokeApiKey { .. })
+                ) {
+                    // #1927 non-argv store-url channel (env/file); resolved
+                    // inside `build_store_handle` (None cli-arg).
+                    let (_backend, store) = build_store_handle(
+                        None,
+                        &db_path,
+                        None,
+                        None,
+                        crate::store::PoolConfig::default(),
+                    )
+                    .await?;
+                    return match &a.action {
+                        Some(AgentsAction::BindApiKey { agent_id, token }) => {
+                            cli::agents::run_bind_api_key(&store, agent_id, token, j).await
+                        }
+                        Some(AgentsAction::RevokeApiKey { agent_id }) => {
+                            cli::agents::run_revoke_api_key(&store, agent_id, j).await
+                        }
+                        _ => unreachable!("guarded by the matches! above"),
+                    };
+                }
+            }
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
@@ -4431,6 +4469,55 @@ fn tls_bind_guard(
     )))
 }
 
+/// #2045 L6 — boot-time posture warnings for the mTLS cert↔X-Peer-Id
+/// cross-check. Returns the operator-facing WARN lines (empty ⇒ silent) so
+/// the logic is unit-testable independent of the tracing sink (the
+/// [`tls_bind_guard`] pattern).
+///
+/// Two silent-footgun states are surfaced:
+/// - **INERT posture** — `enforce`/`warn` is selected but nothing feeds the
+///   check (mTLS not configured, or no binding map), so the operator BELIEVES
+///   the control is on while it is a no-op.
+/// - **OPEN L6 WINDOW** — `AI_MEMORY_FED_REQUIRE_SIG=0` (the permissive
+///   opt-out this control compensates for) while the cross-check is not
+///   `enforce`: the exact still-spoofable state #2032 L6 described.
+fn cert_peer_binding_boot_warnings(
+    mode: tls::CertPeerBindingMode,
+    mtls_configured: bool,
+    binding_map_present: bool,
+    fed_require_sig: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if mode != tls::CertPeerBindingMode::Off {
+        if !mtls_configured {
+            out.push(
+                "AI_MEMORY_FED_CERT_PEER_BINDING is set but mTLS is not configured (no \
+                 --mtls-allowlist) — the cert↔x-peer-id cross-check is INERT (peer certs exist \
+                 only under mTLS). (#2045 L6)"
+                    .to_string(),
+            );
+        } else if !binding_map_present {
+            out.push(
+                "AI_MEMORY_FED_CERT_PEER_BINDING is set but AI_MEMORY_FED_CERT_PEER_BINDING_MAP \
+                 provides no fingerprint→peer-id bindings — the cross-check is INERT. Point it at \
+                 a `<sha256-hex> <peer-id>` file. (#2045 L6)"
+                    .to_string(),
+            );
+        }
+    }
+    if !fed_require_sig && mode != tls::CertPeerBindingMode::Enforce {
+        out.push(
+            "AI_MEMORY_FED_REQUIRE_SIG=0 with cert↔x-peer-id binding NOT enforcing \
+             (AI_MEMORY_FED_CERT_PEER_BINDING != enforce) — the #2032 L6 peer-id spoof window is \
+             OPEN on the mTLS /sync path: any holder of an allowlisted client cert can assert any \
+             x-peer-id. Set AI_MEMORY_FED_CERT_PEER_BINDING=enforce (with a binding map) to close \
+             it. (#2045 L6)"
+                .to_string(),
+        );
+    }
+    out
+}
+
 /// Build all daemon state and spawn background tasks. Returns the
 /// aggregated state without binding any sockets — testable in isolation.
 ///
@@ -5264,6 +5351,46 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — boot-seed the
+    // per-agent api-key principal map ONCE + resolve the identity-binding
+    // posture. ONE `Arc` is shared (cloned) into BOTH `AppState` (the gates
+    // re-derive the caller's AuthLevel from it) and `ApiKeyState` (the
+    // middleware accepts + binds per-agent keys), so both surfaces observe the
+    // same enrolled set. Pure in-memory afterwards — no per-request DB hit on
+    // the hot path (respects the #2032 M3/L2 expensive-verify DoS layering).
+    let http_identity_mode = crate::config::http_attested_identity_mode();
+    let enrolled_agent_keys: std::sync::Arc<std::collections::HashMap<String, String>> = {
+        #[cfg(feature = "sal")]
+        {
+            match store_handle.list_agent_api_keys().await {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let guard = db_state.lock().await;
+            match crate::db::list_agent_api_keys(&guard.0) {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+    };
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
@@ -5361,6 +5488,8 @@ pub async fn bootstrap_serve(
         // federation-sync handlers. Falls back to the compiled
         // `MAX_BULK_SIZE` default when unset.
         max_page_size: app_config.resolve_limits().max_page_size,
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        http_identity_mode,
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -5485,6 +5614,9 @@ pub async fn bootstrap_serve(
         // than installed as a known-empty, attacker-suppliable shared secret.
         key: normalized_api_key,
         mtls_enforced,
+        // #2044 — SAME shared `Arc` + posture as `AppState` (loaded above).
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        identity_mode: http_identity_mode,
     };
     if api_key_state.key.is_some() {
         if mtls_enforced {
@@ -5716,11 +5848,50 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // (m)TLS connection — the #1579 P3 fleet finding. Verifier chain
         // and accept/reject semantics are unchanged; see
         // `tls::serve_rustls_acceptor` + tests/mtls_nodelay_acceptor.rs.
-        axum_server::bind(socket_addr)
-            .acceptor(tls::serve_rustls_acceptor(&tls_config))
-            .handle(handle)
-            .serve(app.into_make_service())
-            .await?;
+        //
+        // #2045 L6 — when the operator configures a cert-peer-binding map
+        // (`AI_MEMORY_FED_CERT_PEER_BINDING_MAP`), swap in the peer-binding
+        // acceptor so the presenting client cert's operator-bound peer-id is
+        // injected into request extensions for the `/sync/*` cross-check.
+        // Only meaningful under mTLS (peer certs exist only there); with no
+        // map the byte-identical `serve_rustls_acceptor` path is kept.
+        let cert_peer_bindings = if args.mtls_allowlist.is_some() {
+            tls::cert_peer_binding_map_from_env()?
+        } else {
+            None
+        };
+        // #2045 L6 — surface the inert-posture + open-L6-window footguns at
+        // boot so a set-but-ineffective control (or the still-vulnerable
+        // FED_REQUIRE_SIG=0 state) is loud, not silent.
+        for warning in cert_peer_binding_boot_warnings(
+            tls::cert_peer_binding_mode(),
+            args.mtls_allowlist.is_some(),
+            cert_peer_bindings.as_ref().is_some_and(|m| !m.is_empty()),
+            crate::federation::signing::require_sig(),
+        ) {
+            tracing::warn!(target: "federation::attestation", "{warning}");
+        }
+        if let Some(bindings) = cert_peer_bindings {
+            tracing::info!(
+                bound_fingerprints = bindings.len(),
+                "mTLS cert↔x-peer-id binding active (#2045 L6); posture: {:?}",
+                tls::cert_peer_binding_mode()
+            );
+            axum_server::bind(socket_addr)
+                .acceptor(tls::serve_rustls_acceptor_with_peer_binding(
+                    &tls_config,
+                    bindings,
+                ))
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        } else {
+            axum_server::bind(socket_addr)
+                .acceptor(tls::serve_rustls_acceptor(&tls_config))
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
     } else {
         tracing::warn!(
             "TLS NOT enabled — sync endpoints (/api/v1/sync/push, \
@@ -6761,6 +6932,62 @@ mod tests {
         assert!(tls_bind_guard(false, "0.0.0.0", true, true).is_err());
     }
 
+    // ----- #2045 L6 cert-peer-binding boot posture warnings --------------
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_silent_when_off() {
+        // Posture off + require_sig on ⇒ nothing to warn about.
+        assert!(
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Off, true, true, true)
+                .is_empty()
+        );
+        // Fully-configured enforce with sig on ⇒ silent.
+        assert!(
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_flag_inert_posture() {
+        // Posture set but mTLS not configured ⇒ INERT warning.
+        let w = cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Warn, false, false, true);
+        assert!(
+            w.iter().any(|s| s.contains("INERT") && s.contains("mTLS")),
+            "must warn mTLS-not-configured inert: {w:?}"
+        );
+        // mTLS on but no binding map ⇒ INERT warning.
+        let w =
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, false, true);
+        assert!(
+            w.iter()
+                .any(|s| s.contains("INERT") && s.contains("BINDING_MAP")),
+            "must warn no-binding-map inert: {w:?}"
+        );
+    }
+
+    #[test]
+    fn cert_peer_binding_boot_warnings_flag_open_l6_window() {
+        // require_sig=0 with binding not enforcing ⇒ the OPEN L6 window WARN.
+        for mode in [
+            tls::CertPeerBindingMode::Off,
+            tls::CertPeerBindingMode::Warn,
+        ] {
+            let w = cert_peer_binding_boot_warnings(mode, true, true, false);
+            assert!(
+                w.iter().any(|s| s.contains("spoof window is OPEN")),
+                "require_sig=0 + non-enforce must warn open window (mode {mode:?}): {w:?}"
+            );
+        }
+        // require_sig=0 but ENFORCE closes it ⇒ no open-window warning.
+        let w =
+            cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, false);
+        assert!(
+            !w.iter().any(|s| s.contains("spoof window is OPEN")),
+            "enforce must NOT warn open window: {w:?}"
+        );
+    }
+
     // ----- R-04 / R-12 boot security-posture warnings (#1798) ------------
 
     use crate::config::PermissionsMode;
@@ -6938,6 +7165,8 @@ mod tests {
             resolved_models: Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            http_identity_mode: crate::config::HttpIdentityMode::default(),
         }
     }
 
@@ -7060,6 +7289,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7082,6 +7312,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // /metrics
         let r1 = build_router(app_state.clone(), api_key_state.clone())
@@ -7116,6 +7347,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7140,6 +7372,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7162,6 +7395,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -8197,6 +8431,73 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
+    // `run()` (the SAL-store-routed bind/revoke that make postgres enrollment
+    // work). Under the coverage build (`--features sal`) these drive the
+    // `#[cfg(feature = "sal")]` bind/revoke branches through `build_store_handle`
+    // → SqliteStore (no `--store-url` resolves to the sqlite path over `--db`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_bind_api_key_command_2044() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "alice",
+            "--token",
+            "s3cret-token",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_revoke_api_key_command_2095() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        // Bind first (covers the bind arm too), then revoke (covers the revoke
+        // arm + the `bindings_removed` path).
+        let bind = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "bob",
+            "--token",
+            "bob-token",
+        ])
+        .unwrap();
+        run(bind, &cfg).await.unwrap();
+        let revoke = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "revoke-api-key",
+            "--agent-id",
+            "bob",
+        ])
+        .unwrap();
+        run(revoke, &cfg).await.unwrap();
+    }
+
+    // The api-key verb OUTPUT branches (json), the empty-token + invalid-agent
+    // error branches, and the store round-trip are covered as focused unit tests
+    // on the extracted `cli::agents::{run_bind_api_key,run_revoke_api_key}`
+    // helpers (in `src/cli/agents.rs`); the two `test_run_dispatch_agents_*`
+    // tests above cover the thin daemon_runtime dispatch arm (store resolution +
+    // helper delegation) end-to-end through `run()`.
+
     // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
     // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
     // would `process::exit(2)` and abort the whole test binary. Only the sal
@@ -8630,6 +8931,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // Pick a free port via a transient bind.
         let port = {
@@ -8679,6 +8981,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // 0.0.0.0:0 succeeds; we want a guaranteed failure. Bind to
         // port 1 which requires privileged perms — except on macOS in
@@ -9010,6 +9313,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // POST /api/v1/sync/push with empty body — the api_key_auth
@@ -9049,6 +9353,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // GET /api/v1/memories without x-api-key — bypass is scoped to
@@ -9080,6 +9385,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -9111,6 +9417,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router

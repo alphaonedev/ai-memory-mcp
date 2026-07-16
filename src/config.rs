@@ -4460,6 +4460,17 @@ pub const ENV_HOOKS_ENFORCE_MODE: &str = "AI_MEMORY_HOOKS_ENFORCE_MODE";
 /// (D3-021 → D3-031 → D3-060). See [`reflect_decorrelation_mode`].
 pub const ENV_REFLECT_DECORRELATION_MODE: &str = "AI_MEMORY_REFLECT_DECORRELATION_MODE";
 
+/// #2044 (v1.0.0, #2032-A / H1+M1) — env-only tri-state for the HTTP-surface
+/// per-agent-key principal-binding gate (`off` / `advisory` / `enforce`). Env >
+/// compiled default [`HttpIdentityMode::Advisory`]. A recognised token wins;
+/// anything else (incl. unset) yields the v1.0.0 default `advisory` (rides the
+/// existing ownership-filtering switch → inert + zero WARN for a single-operator
+/// deployment that has enrolled no per-agent keys). See
+/// [`http_attested_identity_mode`]. Direct-read knob (not clap-bound / not a
+/// `[section]` field), so no `config_precedence` `[limits]`-style entry — the
+/// precedence test lives alongside the resolver (mirrors #1718/#1765).
+pub const ENV_HTTP_ATTESTED_IDENTITY: &str = "AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY";
+
 /// v0.8.0 #1764 — env-only override for the producer-dominance threshold above
 /// which the decorrelation probe emits an advisory (a parseable `f64` in
 /// `(0.0, 1.0]` wins; unparseable / out-of-range falls through to the compiled
@@ -4628,6 +4639,36 @@ mod recall_purity_flag_tests {
             "advisory → active → gate suppressed"
         );
         unsafe { std::env::remove_var(ENV_REFLECT_DECORRELATION_MODE) };
+    }
+
+    #[test]
+    fn http_attested_identity_mode_precedence_2044() {
+        // #2044 (#2032-A) — env-only tri-state. Unset / typo → `advisory` (the
+        // v1.0.0 secure default: never silently `off`); explicit tokens win.
+        let _guard = super::test_env_lock();
+        // SAFETY: env mutation serialised by `_guard`; restored on exit.
+        unsafe { std::env::remove_var(ENV_HTTP_ATTESTED_IDENTITY) };
+        assert_eq!(
+            http_attested_identity_mode(),
+            HttpIdentityMode::Advisory,
+            "unset → advisory (secure default)"
+        );
+        unsafe { std::env::set_var(ENV_HTTP_ATTESTED_IDENTITY, "garbage") };
+        assert_eq!(
+            http_attested_identity_mode(),
+            HttpIdentityMode::Advisory,
+            "typo → advisory (never silently off)"
+        );
+        unsafe { std::env::set_var(ENV_HTTP_ATTESTED_IDENTITY, "off") };
+        assert_eq!(http_attested_identity_mode(), HttpIdentityMode::Off);
+        unsafe { std::env::set_var(ENV_HTTP_ATTESTED_IDENTITY, "ENFORCE") };
+        assert_eq!(
+            http_attested_identity_mode(),
+            HttpIdentityMode::Enforce,
+            "case-insensitive"
+        );
+        assert_eq!(HttpIdentityMode::Enforce.as_str(), "enforce");
+        unsafe { std::env::remove_var(ENV_HTTP_ATTESTED_IDENTITY) };
     }
 }
 
@@ -5403,6 +5444,72 @@ pub fn reflect_decorrelation_mode() -> ReflectDecorrelationMode {
     std::env::var(ENV_REFLECT_DECORRELATION_MODE)
         .ok()
         .and_then(|s| ReflectDecorrelationMode::from_str_opt(&s))
+        .unwrap_or_default()
+}
+
+/// #2044 (v1.0.0, #2032-A) — HTTP-surface per-agent-key identity-binding posture.
+///
+/// The `X-Agent-Id` header is a SELF-ASSERTED principal; the shared `api_key` is
+/// only a transport credential. This tri-state governs how a request that
+/// presents an ENROLLED per-agent api-key (server-held secret, `agent_api_keys`
+/// table) binds that key-derived principal against the self-asserted header, and
+/// whether the IDOR-sensitive read/mutate + admin gates REQUIRE a key-derived
+/// principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HttpIdentityMode {
+    /// No binding — legacy self-asserted `X-Agent-Id` (byte-identical to
+    /// pre-#2044). The escape hatch for operators who front the daemon with a
+    /// trusted identity-aware proxy.
+    Off,
+    /// **v1.0.0 default.** A presented per-agent key BINDS `X-Agent-Id` to the
+    /// key-derived principal (a mismatching header is corrected + WARNed, never
+    /// honored). The sensitive gates do NOT hard-refuse a merely-`Claimed`
+    /// (shared-key) principal — they WARN. Inert + zero WARN for a
+    /// single-operator deployment that enrolled no per-agent keys.
+    #[default]
+    Advisory,
+    /// Strict: a per-agent-key/header mismatch is a `403`, AND the IDOR-sensitive
+    /// read/mutate + admin gates REQUIRE a key-derived (`KeyAuthenticated` or
+    /// `SignatureAttested`) principal — a shared-key `Claimed` caller can no
+    /// longer act as / read another agent's private data nor assert admin.
+    Enforce,
+}
+
+impl HttpIdentityMode {
+    /// Lowercase wire string for config / banner / audit surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// Case-insensitive parse of `off` / `advisory` / `enforce`. `None` for
+    /// anything else so the resolver falls through to the compiled default.
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "advisory" => Some(Self::Advisory),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
+}
+
+/// #2044 (v1.0.0, #2032-A) — resolve the HTTP identity-binding mode.
+/// Env-only direct-read (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` > compiled
+/// [`HttpIdentityMode::Advisory`]); a valid `off`/`advisory`/`enforce` token
+/// wins, anything else (incl. unset / typo) yields `advisory` (the secure
+/// default: never silently `off`). Mirrors the [`reflect_decorrelation_mode`]
+/// env-only reader convention.
+#[must_use]
+pub fn http_attested_identity_mode() -> HttpIdentityMode {
+    std::env::var(ENV_HTTP_ATTESTED_IDENTITY)
+        .ok()
+        .and_then(|s| HttpIdentityMode::from_str_opt(&s))
         .unwrap_or_default()
 }
 

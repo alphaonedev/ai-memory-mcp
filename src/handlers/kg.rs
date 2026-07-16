@@ -344,7 +344,7 @@ pub async fn entity_get_by_alias(
                         .unwrap_or_else(|_| crate::identity::anonymous_request_id())
                 };
                 let caller_is_admin =
-                    crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+                    crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
                 let ctx_admin =
                     crate::store::CallerContext::for_admin_checked(caller.clone(), caller_is_admin);
                 let visible = caller_is_admin
@@ -442,7 +442,8 @@ pub async fn entity_get_by_alias(
         crate::identity::resolve_http_agent_id(None, header_agent_id)
             .unwrap_or_else(|_| crate::identity::anonymous_request_id())
     };
-    let caller_is_admin = crate::handlers::admin_role::is_admin_caller_trusted(&app, &caller);
+    let caller_is_admin =
+        crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller);
 
     let lock = app.db.lock().await;
     match db::entity_get_by_alias(&lock.0, alias, namespace) {

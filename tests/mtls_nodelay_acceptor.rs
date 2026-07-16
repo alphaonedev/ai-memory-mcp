@@ -259,3 +259,70 @@ async fn mtls_equiv_missing_cert_rejected_on_legacy_acceptor() {
     let outcome = outcome_via_legacy_acceptor(certless_client_config()).await;
     assert_eq!(outcome, Outcome::Rejected);
 }
+
+// ---------------------------------------------------------------------------
+// #2045 L6 — the peer-binding acceptor resolves the presenting client cert's
+// operator-bound peer-id AFTER the real handshake and hands it to the
+// per-connection service. Exercises `serve_rustls_acceptor_with_peer_binding`
+// → `PeerBindingAcceptor::accept` → `resolve_bound_peer_id` →
+// `CertExtensionService` over a live rustls handshake (the glue the in-process
+// oneshot tests in `mtls_cert_peer_binding_2045.rs` cannot reach).
+// ---------------------------------------------------------------------------
+
+/// Drive ONE live mTLS handshake through the peer-binding acceptor and return
+/// the `ClientCertPeerId` it resolved for the presenting cert. `binding_body`,
+/// when `Some`, is a `<sha256-hex> <peer-id>` map file body.
+async fn peer_binding_resolved(
+    client: rustls::ClientConfig,
+    binding_body: Option<&str>,
+) -> tls::ClientCertPeerId {
+    let config = mtls_config_pinning_fixture_cert().await;
+    let bindings = match binding_body {
+        Some(body) => {
+            let f = tempfile::NamedTempFile::new().expect("tempfile");
+            std::fs::write(f.path(), body).expect("write binding map");
+            tls::load_cert_peer_binding_map(f.path()).expect("parse binding map")
+        }
+        None => std::collections::HashMap::new(),
+    };
+    let acceptor = tls::serve_rustls_acceptor_with_peer_binding(&config, bindings);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    spawn_client(addr, client);
+    let (tcp, _peer) = listener.accept().await.expect("tcp accept");
+    let accept = tokio::time::timeout(HANDSHAKE_BUDGET, acceptor.accept(tcp, ()));
+    let (_stream, service) = accept
+        .await
+        .expect("handshake within budget")
+        .expect("allowlisted cert must complete the handshake");
+    service.client_cert_peer_id().clone()
+}
+
+#[tokio::test]
+async fn peer_binding_acceptor_resolves_bound_peer_id() {
+    // Bind the fixture cert's fingerprint to "peer-fixture".
+    let fp = std::fs::read_to_string(fixture("valid_cert_sha256.txt"))
+        .expect("fixture fingerprint — regenerate via tests/fixtures/tls/regenerate.sh");
+    let body = format!("{} peer-fixture\n", fp.trim());
+    let bound = peer_binding_resolved(allowlisted_client_config().await, Some(&body)).await;
+    assert_eq!(
+        bound.0.as_deref(),
+        Some("peer-fixture"),
+        "the peer-binding acceptor must resolve the presenting cert's SHA-256 \
+         fingerprint to its operator-bound peer-id (#2045 L6)"
+    );
+}
+
+#[tokio::test]
+async fn peer_binding_acceptor_unbound_cert_is_legacy_none() {
+    // No binding map ⇒ the allowlisted cert has no operator binding ⇒ the
+    // cross-check degrades to WARN and never bricks.
+    let bound = peer_binding_resolved(allowlisted_client_config().await, None).await;
+    assert_eq!(
+        bound.0, None,
+        "a cert whose fingerprint carries no operator binding resolves to \
+         None (legacy — never bricks) (#2045 L6)"
+    );
+}

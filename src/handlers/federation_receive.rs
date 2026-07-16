@@ -59,6 +59,81 @@ pub(super) fn extract_peer_id(headers: &HeaderMap) -> Option<&str> {
     Some(raw)
 }
 
+/// #2045 L6 — cross-check the mTLS client cert's operator-bound peer
+/// identity against the `X-Peer-Id` the request asserts. Returns
+/// `Some(Response)` (a `401 peer_id_cert_mismatch`) to short-circuit the
+/// handler when the posture is `enforce` and the asserted id does not match
+/// the cert binding; `None` to proceed.
+///
+/// Degradations that ALWAYS proceed (never brick a working federation):
+///   - posture `off`;
+///   - no [`crate::tls::ClientCertPeerId`] extension (plain HTTP, or no
+///     `AI_MEMORY_FED_CERT_PEER_BINDING_MAP` configured so the peer-binding
+///     acceptor was not installed);
+///   - the presenting cert's fingerprint carries no binding ("legacy" cert);
+///   - the request asserts no `X-Peer-Id`.
+///
+/// A mismatch under `warn` logs and proceeds; under `enforce` it is refused.
+/// This is INDEPENDENT of `AI_MEMORY_FED_REQUIRE_SIG` — it is the
+/// compensating control for the `FED_REQUIRE_SIG=0` window (#2032 L6).
+pub(super) fn enforce_cert_peer_binding(
+    cert_peer: Option<&crate::tls::ClientCertPeerId>,
+    asserted_peer_id: Option<&str>,
+) -> Option<Response> {
+    let mode = crate::tls::cert_peer_binding_mode();
+    if mode == crate::tls::CertPeerBindingMode::Off {
+        return None;
+    }
+    // No extension at all ⇒ the request did not arrive over the peer-binding
+    // mTLS acceptor (plain HTTP / no binding map) — nothing to cross-check.
+    let cert_peer = cert_peer?;
+    let Some(bound) = cert_peer.0.as_deref() else {
+        // mTLS cert present but its fingerprint carries NO operator binding
+        // (a "legacy" cert). De-silenced: emit a trace so the degrade is
+        // observable, then proceed — a bound-less cert must never brick.
+        tracing::debug!(
+            target: ATTESTATION_TRACE_TARGET,
+            asserted_peer_id = asserted_peer_id.unwrap_or(""),
+            "cert↔x-peer-id: presenting client cert has no operator binding \
+             (legacy) — cross-check skipped, never bricks (#2045)"
+        );
+        return None;
+    };
+    // A bound cert with no asserted peer-id has nothing to contradict.
+    let asserted = asserted_peer_id?;
+    if asserted == bound {
+        return None;
+    }
+    if mode == crate::tls::CertPeerBindingMode::Enforce {
+        tracing::warn!(
+            target: ATTESTATION_TRACE_TARGET,
+            bound_peer_id = %bound,
+            asserted_peer_id = %asserted,
+            "cert↔x-peer-id mismatch — refusing (AI_MEMORY_FED_CERT_PEER_BINDING=enforce, #2045)"
+        );
+        return Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "peer_id_cert_mismatch",
+                    "note": "#2045: the asserted x-peer-id does not match the mTLS client cert's \
+                             operator-bound peer identity. Set AI_MEMORY_FED_CERT_PEER_BINDING=warn \
+                             to downgrade to a WARN during rollout.",
+                })),
+            )
+                .into_response(),
+        );
+    }
+    tracing::warn!(
+        target: ATTESTATION_TRACE_TARGET,
+        bound_peer_id = %bound,
+        asserted_peer_id = %asserted,
+        "cert↔x-peer-id mismatch — allowing (AI_MEMORY_FED_CERT_PEER_BINDING=warn; set =enforce to \
+         refuse, #2045)"
+    );
+    None
+}
+
 /// v0.7.0 #238 — render a 403 envelope when the body-claimed
 /// `sender_agent_id` does not attest to the wire-level `x-peer-id`
 /// header. Surfaces both values so the operator can diff exactly
@@ -830,12 +905,25 @@ pub struct SyncSinceQuery {
 pub async fn sync_push(
     State(app): State<AppState>,
     headers: HeaderMap,
+    cert_peer: Option<axum::Extension<crate::tls::ClientCertPeerId>>,
     body_bytes: Bytes,
 ) -> impl IntoResponse {
     // v0.7.0 #791 — verify the per-message signature BEFORE
     // deserialising the body. Keeps the verifier's input identical
     // to the wire bytes (signer + verifier MUST agree byte-for-byte).
     let peer_header_owned = extract_peer_id(&headers).map(str::to_string);
+
+    // #2045 L6 — bind the presenting mTLS client cert to the asserted
+    // `X-Peer-Id`. Refuses (`enforce`) / warns (`warn`) on a cert↔peer-id
+    // mismatch; a no-op when the posture is `off`, no binding map is
+    // configured, or the request did not arrive over the peer-binding mTLS
+    // acceptor. Runs BEFORE the postgres dispatch so both backends gate.
+    if let Some(rejection) = enforce_cert_peer_binding(
+        cert_peer.as_ref().map(|e| &e.0),
+        peer_header_owned.as_deref(),
+    ) {
+        return rejection;
+    }
 
     // v0.7.0 #1056 (Agent-2 #6) — TOFU spoofing guard. The
     // (no sig, no enrolled key) arm of `verify_signature_or_reject`

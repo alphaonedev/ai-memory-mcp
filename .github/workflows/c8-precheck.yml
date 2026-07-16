@@ -154,3 +154,25 @@ jobs:
         # byte in a tmpdir + a clean control; the gate must reject the
         # former and pass the latter.
         run: bash scripts/check-cloud-init-ascii.sh --self-test
+
+  test-stdin-gate:
+    # Issue #1989 — full-suite-wedge regression guard. HARD-BLOCKS any
+    # test-reachable acquisition of the process-global `io::stdin()`
+    # handle outside the sanctioned `with_stdin_lines` helper in
+    # src/cli/shell.rs. The #1989 wedge (root cause commit c10e55b4) was
+    # a test that blocking-read the REAL inherited stdin, which never
+    # EOFs under CI runners / agent harnesses, parking forever while
+    # holding the global Stdin lock and wedging the whole parallel lib
+    # suite until the 1500s watchdog killed it. This gate keeps a new
+    # test from silently re-introducing that class.
+    name: Test-reachable stdin-read gate (#1989)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test-stdin gate
+        run: bash scripts/check-test-stdin-reads.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test stages a tests/ file that blocking-reads the real
+        # process stdin in a #[test]; the gate must reject it.
+        run: bash scripts/check-test-stdin-reads.sh --self-test

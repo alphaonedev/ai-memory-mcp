@@ -1346,3 +1346,12 @@ CREATE TABLE IF NOT EXISTS routine_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_routine_runs_routine ON routine_runs(routine_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_routine_runs_ns_state ON routine_runs(namespace, state);
+
+-- v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1 IDOR + M1
+-- admin spoof). sha256(token) -> agent_id; the raw token is never stored.
+CREATE TABLE IF NOT EXISTS agent_api_keys (
+    token_sha256 TEXT PRIMARY KEY,
+    agent_id     TEXT NOT NULL,
+    bound_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id);

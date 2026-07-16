@@ -106,6 +106,8 @@ fn build_sqlite_app_state() -> (AppState, tempfile::NamedTempFile) {
         resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     (state, tmp)
 }
@@ -117,6 +119,8 @@ async fn s75_capabilities_surfaces_runtime_db_schema_version() {
     let api_key_state = ApiKeyState {
         key: None,
         mtls_enforced: false,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     let (app_state, _tmp) = build_sqlite_app_state();
 
