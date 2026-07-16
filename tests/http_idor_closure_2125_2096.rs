@@ -50,6 +50,25 @@ fn fresh_dir() -> TempDir {
 /// `ALICE_KEY` per-agent api-key. The shared transport key (`SHARED_KEY`)
 /// authenticates transport but resolves to NO per-agent principal.
 fn build_router(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
+    let mut enrolled = HashMap::new();
+    enrolled.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
+    build_router_with(mode, enrolled)
+}
+
+/// Build a router in `mode` with NO per-agent keys enrolled. The identity
+/// gate is fully inert in this posture (the zero-config single-operator
+/// deployment) regardless of `mode` — this is the path the third pass must
+/// preserve for the newly-gated #2135/#2137/#2138/#2140 routes.
+fn build_router_zero_enroll(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
+    build_router_with(mode, HashMap::new())
+}
+
+/// Shared router builder — `enrolled` is the `sha256(token) → agent_id` map
+/// (empty for the zero-enrollment inert path).
+fn build_router_with(
+    mode: HttpIdentityMode,
+    enrolled: HashMap<String, String>,
+) -> (axum::Router, NamedTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -64,8 +83,6 @@ fn build_router(mode: HttpIdentityMode) -> (axum::Router, NamedTempFile) {
     let store: Arc<dyn ai_memory::store::MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
 
-    let mut enrolled = HashMap::new();
-    enrolled.insert(api_key_sha256_hex(ALICE_KEY), "alice".to_string());
     let enrolled = Arc::new(enrolled);
 
     let app_state = AppState {
@@ -191,6 +208,20 @@ fn routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
             "/api/v1/namespaces",
             Some(json!({"namespace": "victimns"})),
         ), // set_namespace_standard_qs
+        // ---- Fable third-pass follow-up: #2135 / #2137 / #2138 / #2140 ----
+        ("POST", "/api/v1/session/start", Some(json!({}))), // #2135 session_start (State<Db>→State<AppState>)
+        (
+            "POST",
+            "/api/v1/memory_load_family",
+            Some(json!({"family": "core"})),
+        ), // #2137 load_family
+        ("POST", "/api/v1/memory_smart_load", Some(json!({}))), // #2137 smart_load (wraps load_family)
+        (
+            "POST",
+            "/api/v1/quota/status",
+            Some(json!({"agent_id": VICTIM})),
+        ), // #2138 quota/status per-agent path
+        ("POST", "/api/v1/memory_reflect", Some(json!({}))), // #2140 reflect (header-forge vector)
     ]
 }
 
@@ -296,4 +327,160 @@ async fn advisory_shared_key_victim_spoof_is_not_403_on_every_route() {
              (corrects+warns, admits) (got {status}, body={text})"
         );
     }
+}
+
+/// Under `enforce`, with NO per-agent keys enrolled, the identity gate is
+/// fully INERT on every route — a shared-key caller forging
+/// `X-Agent-Id: <victim>` never trips `attested_identity_required`. This is
+/// the zero-config single-operator posture the third pass MUST preserve for
+/// the newly-gated #2135/#2137/#2138/#2140 routes (the fix stays dormant
+/// until an operator enrolls at least one per-agent key).
+#[tokio::test]
+async fn zero_enrollment_identity_gate_is_inert_on_every_route() {
+    let _dir = fresh_dir();
+    for (method, uri, body) in routes() {
+        let (router, _f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+        let resp = router
+            .oneshot(req(method, uri, SHARED_KEY, Some(VICTIM), body.as_ref()))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let text = body_text(resp).await;
+        assert!(
+            !(status == StatusCode::FORBIDDEN && text.contains("attested_identity_required")),
+            "third pass: {method} {uri} must NOT identity-403 with zero per-agent \
+             keys enrolled, even under enforce (got {status}, body={text})"
+        );
+    }
+}
+
+// ── #2140 memory_reflect — the forged-BODY vector ────────────────────────
+//
+// Unlike the other four routes, reflect trusted the BODY `agent_id` with the
+// request headers IGNORED, so the header-keyed gate ALONE does not close it:
+// a caller with NO `X-Agent-Id` header could author a reflection as `<victim>`
+// (and read the victim's private sources) purely via the body. The fix binds
+// the effective principal HEADER-AUTHORITATIVELY (the body `agent_id` is a
+// refinement that MUST match), so a divergent body id is refused.
+
+/// A reflection whose BODY `agent_id` diverges from the authenticated
+/// (header-resolved) caller is REFUSED — the forged author cannot be
+/// persisted. No `X-Agent-Id` header is sent, so the body's `victim` claim
+/// disagrees with the anonymous header-resolved id and is rejected.
+#[tokio::test]
+async fn reflect_forged_body_agent_id_is_refused_under_enforce() {
+    use serde_json::json;
+    let _dir = fresh_dir();
+    let (router, _f) = build_router(HttpIdentityMode::Enforce);
+    let body = json!({
+        "source_ids": ["mem-victim-0001"],
+        "title": "t",
+        "content": "c",
+        "agent_id": VICTIM,
+    });
+    let resp = router
+        .oneshot(req(
+            "POST",
+            "/api/v1/memory_reflect",
+            SHARED_KEY,
+            None, // NO X-Agent-Id header — the body-only forge vector
+            Some(&body),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = body_text(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#2140: a reflect with a forged body agent_id and no matching header \
+         must be refused (got {status}, body={text})"
+    );
+    assert!(
+        text.contains("agent_id_body_header_mismatch"),
+        "#2140: the refusal must be the header-authoritative identity binding, \
+         not an incidental substrate error (body={text})"
+    );
+}
+
+/// The legitimate key-bound principal (`alice`, whose `ALICE_KEY` the
+/// middleware binds to `X-Agent-Id=alice`) supplying a MATCHING body
+/// `agent_id` passes both the identity gate and the body-vs-header binding —
+/// control reaches the substrate reflect (a downstream source-not-found /
+/// validation error is route-specific, but never the identity refusal).
+#[tokio::test]
+async fn reflect_key_bound_matching_body_agent_id_passes() {
+    use serde_json::json;
+    let _dir = fresh_dir();
+    let (router, _f) = build_router(HttpIdentityMode::Enforce);
+    let body = json!({
+        "source_ids": ["mem-alice-0001"],
+        "title": "t",
+        "content": "c",
+        "agent_id": "alice",
+    });
+    let resp = router
+        .oneshot(req(
+            "POST",
+            "/api/v1/memory_reflect",
+            ALICE_KEY,
+            None, // middleware binds X-Agent-Id=alice from the enrolled key
+            Some(&body),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = body_text(resp).await;
+    assert!(
+        !(status == StatusCode::FORBIDDEN && text.contains("attested_identity_required")),
+        "#2140: the enrolled per-agent key must NOT trip the identity gate \
+         (got {status}, body={text})"
+    );
+    assert!(
+        !text.contains("agent_id_body_header_mismatch"),
+        "#2140: a body agent_id matching the key-bound caller must NOT be \
+         refused as a mismatch (body={text})"
+    );
+}
+
+/// Zero-enrollment inert path for the forged-body vector: with no per-agent
+/// keys enrolled, the identity GATE is dormant — but the header-authoritative
+/// body binding still refuses a divergent body id (the same #874-class
+/// posture `handle_replay_http` enforces regardless of enrollment). The
+/// point of this test is that the refusal is the binding, NOT the per-agent
+/// identity gate (which stays inert).
+#[tokio::test]
+async fn reflect_zero_enrollment_gate_inert_body_binding_still_refuses() {
+    use serde_json::json;
+    let _dir = fresh_dir();
+    let (router, _f) = build_router_zero_enroll(HttpIdentityMode::Enforce);
+    let body = json!({
+        "source_ids": ["mem-victim-0001"],
+        "title": "t",
+        "content": "c",
+        "agent_id": VICTIM,
+    });
+    let resp = router
+        .oneshot(req(
+            "POST",
+            "/api/v1/memory_reflect",
+            SHARED_KEY,
+            None,
+            Some(&body),
+        ))
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = body_text(resp).await;
+    assert!(
+        !text.contains("attested_identity_required"),
+        "#2140: the per-agent identity gate must stay inert with zero \
+         enrollment (body={text})"
+    );
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "#2140: the header-authoritative body binding still refuses a forged \
+         body agent_id even with zero enrollment (got {status}, body={text})"
+    );
 }

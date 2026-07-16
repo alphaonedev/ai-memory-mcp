@@ -118,6 +118,19 @@ pub async fn handle_smart_load_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2137 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the forwarded load_family
+    // read (smart_load wraps load_family). Pre-fix, a shared-transport-key
+    // caller forging `X-Agent-Id: <victim>` read the victim's private
+    // family-tagged content. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "smart_load",
+    ) {
+        return resp;
+    }
     // #1555 — resolve the caller from headers so the forwarded load_family read
     // applies the scope=private visibility filter (the always-on intent loader
     // must not surface another tenant's private family-tagged rows). Reuses the
@@ -147,9 +160,43 @@ pub async fn handle_smart_load_http(
 /// has a daemon keypair on disk (matching the MCP behaviour).
 pub async fn handle_reflect_http(
     State(app): State<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2140 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate. Under
+    // `enforce`, a shared-transport-key caller forging `X-Agent-Id: <victim>`
+    // is refused before the reflection is written or the victim's private
+    // source memories are read. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "reflect",
+    ) {
+        return resp;
+    }
+    // #2140 — reflect trusted the BODY `agent_id` with the request headers
+    // IGNORED (both the postgres `parse_reflect_input` branch and the sqlite
+    // `handle_reflect` branch read `body.agent_id`), so a caller could read a
+    // victim's private sources AND forge a reflection AUTHORED as the victim
+    // via the body alone — a vector the header-keyed gate above does not close.
+    // Bind the effective principal HEADER-AUTHORITATIVELY (the body `agent_id`
+    // is only a refinement that MUST match), the same posture
+    // `handle_replay_http` / the #874 `resolve_http_agent_id` chain enforce for
+    // every other body-vs-header identity conflict, then OVERRIDE the body
+    // `agent_id` with the bound caller so no downstream branch can honor a
+    // divergent body id. A body `agent_id` that disagrees with the
+    // authenticated header is refused here.
+    let body_agent = body.get("agent_id").and_then(Value::as_str);
+    let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
+    {
+        Ok(id) => id,
+        Err(e) => return err_response(e),
+    };
+    let mut body = body;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("agent_id".to_string(), Value::String(caller));
+    }
     // #1924 (CWE-288) — consult the PRE-REFLECT enforcement gate before the
     // reflection write (HTTP parity with the MCP gate). INERT by default.
     if let Some(resp) = crate::handlers::create::http_pre_event_gate(

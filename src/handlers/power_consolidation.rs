@@ -902,6 +902,21 @@ pub async fn load_family_handler(
             .into_response();
     }
 
+    // #2137 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the caller is resolved from `X-Agent-Id` for the `scope=private`
+    // family-tagged read below. Pre-fix, a shared-transport-key caller forging
+    // `X-Agent-Id: <victim>` resolved `caller=victim` and read the victim's
+    // private family-tagged content (memory_smart_load wraps this handler, so
+    // both routes are closed here). Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "load_family",
+    ) {
+        return resp;
+    }
+
     let k_raw = body.k.unwrap_or(20);
     let k = usize::try_from(k_raw).unwrap_or(usize::MAX).clamp(1, 100);
     let family_name = family.name();

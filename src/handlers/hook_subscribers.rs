@@ -19,11 +19,11 @@ use crate::identity::sentinels;
 use crate::models::{Memory, Tier};
 use crate::validate;
 
+use super::AppState;
 #[cfg(feature = "sal")]
 use super::StorageBackend;
 #[cfg(feature = "sal")]
 use super::store_err_to_response;
-use super::{AppState, Db};
 use super::{fanout_or_pending, list_namespaces, resolve_caller_agent_id};
 
 /// Marker tag on namespace-standard rows (#1558 batch 6).
@@ -1179,7 +1179,7 @@ pub struct SessionStartBody {
 }
 
 pub async fn session_start(
-    State(state): State<Db>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SessionStartBody>,
 ) -> impl IntoResponse {
@@ -1192,6 +1192,22 @@ pub async fn session_start(
             Json(json!({"error": crate::errors::msg::invalid("agent_id", e)})),
         )
             .into_response();
+    }
+    // #2135 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the session-start read resolves + applies its `scope=private` visibility
+    // filter. Pre-fix, a shared-transport-key caller forging `X-Agent-Id:
+    // <victim>` (or `agent_id` body) resolved `caller=victim` and read the
+    // victim's private memory content out of `handle_session_start`. Requires
+    // the enrolled-keys map, hence the `State<AppState>` signature (was
+    // `State<Db>`, which cannot reach `enrolled_agent_keys`). Inert for
+    // zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "session_start",
+    ) {
+        return resp;
     }
     let header_agent_id = headers
         .get(crate::HEADER_AGENT_ID)
@@ -1228,7 +1244,7 @@ pub async fn session_start(
     if let Some(l) = body.limit {
         params["limit"] = json!(l);
     }
-    let lock = state.lock().await;
+    let lock = app.db.lock().await;
     let result = crate::mcp::handle_session_start(&lock.0, &params, None, Some(&caller));
     drop(lock);
     match result {
