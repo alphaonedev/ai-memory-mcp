@@ -79,7 +79,7 @@ jobs:
       # as the "honest measured ceiling"; this CI gate stays the tighter "we
       # still care about token cost" tripwire (now 6500). Decided by a
       # 5-agent adversarial vote (operator crossroads protocol, #1709).
-      - name: full-profile <= 6500 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709)
+      - name: full-profile <= 6650 tokens (v0.7 C5 hard ceiling, post-D1.6 + #1067 + #1709 + #2037 + #2059)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -95,7 +95,7 @@ jobs:
       # The verbose sibling `full_profile_total_tokens` is only reachable
       # via the opt-in `memory_capabilities { verbose: true, … }` path
       # and is not gated here (see tests/budget_tokens.rs rationale).
-      - name: doctor --tokens --json reports trimmed total <= 6500 (v0.7 C5 post-D1.6 + #1709)
+      - name: doctor --tokens --json reports trimmed total <= 6650 (v0.7 C5 post-D1.6 + #1709 + #2037 + #2059)
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: |
@@ -104,9 +104,9 @@ jobs:
           PAYLOAD="$(./target/release/ai-memory doctor --tokens --json)"
           TOTAL="$(printf '%s' "$PAYLOAD" \
             | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["trimmed_full_profile_total_tokens"])')"
-          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 6500, post-D1.6 + #1067 + #1709)"
-          if [ "$TOTAL" -gt 6500 ]; then
-            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 6500, post-D1.6 + #1067 + #1709)."
+          echo "doctor --tokens --json: trimmed_full_profile_total_tokens=$TOTAL (ceiling 6650, post-D1.6 + #1067 + #1709 + #2037 skill tools + #2059 covenant params)"
+          if [ "$TOTAL" -gt 6650 ]; then
+            echo "::error::v0.7 C5 CI gate FAILED: trimmed full-profile tools/list payload is $TOTAL cl100k_base tokens (ceiling: 6650, post-D1.6 + #1067 + #1709 + #2037 + #2059)."
             echo "::error::C2 (split docs field), C3 (collapse schema boilerplate) and C4 (hide rare optional params) drove the wire form from ~7.4K to ~3.5K tokens at v0.6.4; D1.6 schemars metadata + #1067 LLM provider docs took it back to ~5.5K; v0.8.0 #1709 grew the surface 74→100 tools (structural) to ~6.2K. The 6500-token ceiling is the operator-accepted floor (raised from 6000 per the #1709 5-agent vote)."
             echo "::error::Inspect 'cargo run --release -- doctor --tokens --raw-table' to find the offending tool (the per-tool 'tokens' column already reflects the trim). See docs/v0.7/schema-compaction-audit.md."
             exit 1

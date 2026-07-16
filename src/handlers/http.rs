@@ -393,6 +393,8 @@ mod cov897_tests {
             resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            http_identity_mode: crate::config::HttpIdentityMode::default(),
         };
         (app, tmp)
     }

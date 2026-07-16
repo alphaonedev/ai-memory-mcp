@@ -328,9 +328,9 @@ fn migration_v82_applies_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("mig.db");
 
-    // Fresh open reaches the v82 tip with the retire columns present.
+    // Fresh open reaches the current tip with the v82 retire columns present.
     let conn = db::open(&path).unwrap();
-    assert_eq!(db::migrations::current_schema_version_for_tests(), 82);
+    assert_eq!(db::migrations::current_schema_version_for_tests(), 83);
     assert!(
         conn.prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
             .is_ok(),
@@ -338,7 +338,8 @@ fn migration_v82_applies_and_is_idempotent() {
     );
 
     // Simulate a pre-v82 database (columns dropped, version stamped 81),
-    // then re-open: the probe-guarded ALTER re-adds them and reaches 82.
+    // then re-open: the probe-guarded v82 ALTER re-adds them and the ladder
+    // runs on to the current tip.
     conn.execute_batch(
         "ALTER TABLE skills DROP COLUMN retire_reason;\n\
          ALTER TABLE skills DROP COLUMN retired_by;\n\
@@ -357,7 +358,11 @@ fn migration_v82_applies_and_is_idempotent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 82, "upgrade-from-v81 reaches the v82 tip");
+    assert_eq!(
+        version, 83,
+        "upgrade-from-v81 runs the full ladder to the current tip (v82 re-adds the \
+         retire columns; v83 adds agent_api_keys)"
+    );
     assert!(
         conn2
             .prepare("SELECT retired_at, retired_by, retire_reason FROM skills LIMIT 0")
@@ -375,7 +380,7 @@ fn migration_v82_applies_and_is_idempotent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v3, 82, "re-open stays at the v82 tip idempotently");
+    assert_eq!(v3, 83, "re-open stays at the current tip idempotently");
     // A retire round-trips end-to-end on the migrated DB.
     let _: Value = handle_skill_register(
         &conn3,

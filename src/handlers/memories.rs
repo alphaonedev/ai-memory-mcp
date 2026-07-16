@@ -43,6 +43,17 @@ pub async fn get_memory(
             .into_response();
     }
 
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate BEFORE the
+    // ownership / visibility check.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "get_memory",
+    ) {
+        return resp;
+    }
+
     // v0.7.0 Wave-3 — Postgres-backed daemons dispatch through the
     // SAL trait. The legacy `db::resolve_id` path is SQLite-bound (it
     // walks `memories` + `memory_links` directly through the
@@ -214,6 +225,15 @@ pub async fn update_memory(
             Json(json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "update_memory",
+    ) {
+        return resp;
     }
     if let Err(e) = validate::RequestValidator::validate_update(&body) {
         return (
@@ -624,6 +644,17 @@ pub async fn delete_memory(
             .into_response();
     }
 
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate before the
+    // destructive delete.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "delete_memory",
+    ) {
+        return resp;
+    }
+
     // #1924 (CWE-288) — consult the PRE-DELETE enforcement gate before the
     // destructive write, so `enforce_mode = enforce` + required `pre_delete`
     // with no hook DENIES (503) on the HTTP surface as it does on MCP.
@@ -1012,6 +1043,15 @@ pub async fn promote_memory(
             Json(json!({"error": e.to_string()})),
         )
             .into_response();
+    }
+    // #2044 (#2032-A / H1 IDOR) — per-agent-key identity gate.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "promote_memory",
+    ) {
+        return resp;
     }
     // #1924 (CWE-288) — consult the PRE-PROMOTE enforcement gate before the
     // tier-promotion write (HTTP parity with the MCP gate).

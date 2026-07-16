@@ -389,6 +389,22 @@ pub struct AppState {
     /// (`offset` / `since`), not an unbounded page size — a single
     /// unbounded request would materialize the whole result set in RAM.
     pub max_page_size: usize,
+
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — the boot-seeded
+    /// per-agent api-key principal map (`sha256(token)` → `agent_id`), SHARED
+    /// (same `Arc`) with [`ApiKeyState::enrolled_agent_keys`]. The IDOR/admin
+    /// gates ([`crate::handlers::identity_binding::resolve_auth_level`]) re-derive
+    /// the caller's [`crate::handlers::identity_binding::AuthLevel`] from this
+    /// map + the presented `X-API-Key`, so the enforcement is self-contained per
+    /// gate (no extension threading through the ~20 `require_admin` callers) and
+    /// keyed to a server-held secret, never a header. Empty for a single-operator
+    /// deployment → the gates are inert.
+    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+
+    /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
+    /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`) consumed
+    /// by the IDOR/admin gates.
+    pub http_identity_mode: crate::config::HttpIdentityMode,
 }
 
 /// v0.7.0 B3 — canonical 1-2 sentence English descriptors for each
@@ -698,6 +714,20 @@ pub(crate) const BULK_FANOUT_CONCURRENCY: usize = 8;
 pub struct ApiKeyState {
     pub key: Option<String>,
     pub mtls_enforced: bool,
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — the boot-seeded
+    /// per-agent api-key principal map: `sha256(token)` (lowercase hex) →
+    /// `agent_id`. Populated ONCE at daemon boot from the `agent_api_keys`
+    /// table (schema v83) so the hot-path middleware resolves a key-derived
+    /// principal with a pure in-memory lookup — no per-request DB hit (respects
+    /// the #2032 M3/L2 expensive-verify-DoS layering: this is a map get, not a
+    /// signature verify). Empty for a single-operator deployment that enrolled
+    /// no per-agent keys → the binding logic is inert (zero WARN).
+    pub enrolled_agent_keys: Arc<std::collections::HashMap<String, String>>,
+    /// #2044 — the resolved [`crate::config::HttpIdentityMode`]
+    /// (`AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY`, default `advisory`).
+    /// Governs whether a presented per-agent key BINDS `X-Agent-Id` and whether
+    /// a self-asserted-header/key mismatch is a `403`.
+    pub identity_mode: crate::config::HttpIdentityMode,
 }
 
 /// Constant-time byte-slice equality. Doesn't short-circuit on the
@@ -749,7 +779,7 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// request header.
 pub async fn api_key_auth(
     State(auth): State<ApiKeyState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> impl IntoResponse {
     let Some(ref expected) = auth.key else {
@@ -789,29 +819,35 @@ pub async fn api_key_auth(
     // an mTLS peer cannot spoof `X-Peer-Id` because the signed-message
     // gate downstream verifies the sig against the claimed peer-id's
     // enrolled key — the claim is bound to a cryptographic identity
-    // separate from the cert fingerprint. Operators running with
-    // `AI_MEMORY_FED_REQUIRE_SIG=0` (legacy peer-rollout posture) lose
-    // this defense and trust X-Peer-Id verbatim; that mode is
-    // explicitly documented as UNSAFE in the CLAUDE.md env-var table.
+    // separate from the cert fingerprint.
     //
-    // A deeper hardening — extract peer-id from the client cert's
-    // Subject CN / SAN and cross-check against X-Peer-Id — requires
-    // axum to expose the peer certificate via request extensions; a
-    // focused follow-up still tracks that surface change — once planned
-    // for v0.8 but unlanded and still open as of v0.9.0. In the meantime
-    // the #1031 signed-GET gate + the env-default-secure posture
-    // close the acute exploitability surface.
+    // #2045 L6 (v1.0.0) — the compensating control for the
+    // `AI_MEMORY_FED_REQUIRE_SIG=0` window is now LANDED: the
+    // `tls::PeerBindingAcceptor` binds the presenting client cert (by
+    // operator-declared SHA-256 fingerprint) to the ONE `x-peer-id` it may
+    // assert, injects it as a `ClientCertPeerId` request extension, and the
+    // `/sync/{push,since}` handlers cross-check it via
+    // `federation_receive::enforce_cert_peer_binding`
+    // (`AI_MEMORY_FED_CERT_PEER_BINDING = off|warn|enforce`). Because the
+    // mTLS trust model here is fingerprint-pinning of self-signed peer certs,
+    // a cert's own Subject CN / SAN is attacker-chosen and is deliberately
+    // NOT used as the identity anchor; the operator-declared fingerprint is.
+    // The axum peer-cert-in-extensions plumbing this comment once said was
+    // "unlanded" is what the acceptor now provides.
     let path = req.uri().path();
     if auth.mtls_enforced && path.starts_with("/api/v1/sync/") {
         return next.run(req).await.into_response();
     }
 
-    // Check X-API-Key header
+    // #2044 — resolve the presented credential (header only, since #2032 L1
+    // removed the `?api_key=` query form). We keep the raw token so we can BOTH
+    // transport-authenticate it (constant-time) AND, when it is an ENROLLED
+    // per-agent key, derive its bound principal.
+    let mut presented: Option<String> = None;
     if let Some(header_val) = req.headers().get(crate::HEADER_API_KEY)
         && let Ok(val) = header_val.to_str()
-        && constant_time_eq(val.as_bytes(), expected.as_bytes())
     {
-        return next.run(req).await.into_response();
+        presented = Some(val.to_string());
     }
 
     // #2032 L1 (v1.0.0) — the legacy `?api_key=` QUERY-STRING credential is
@@ -839,11 +875,95 @@ pub async fn api_key_auth(
         });
     }
 
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({"error": "missing or invalid API key"})),
-    )
-        .into_response()
+    let Some(token) = presented else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response();
+    };
+
+    // Transport auth: accept the SHARED global key OR any ENROLLED per-agent
+    // key (schema v83 `agent_api_keys`, boot-seeded into `enrolled_agent_keys`).
+    // Both are server-held secrets; a per-agent key is additive + non-breaking.
+    let is_global = constant_time_eq(token.as_bytes(), expected.as_bytes());
+    let token_hash = super::identity_binding::api_key_sha256_hex(&token);
+    let per_agent: Option<String> = if is_global {
+        None
+    } else {
+        auth.enrolled_agent_keys.get(&token_hash).cloned()
+    };
+    if !is_global && per_agent.is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "missing or invalid API key"})),
+        )
+            .into_response();
+    }
+
+    // #2044 (#2032-A / H1 IDOR + M1 admin spoof) — per-agent-key PRINCIPAL
+    // BINDING. When the presented key is an enrolled per-agent key AND binding
+    // is not disabled, the key-derived `agent_id` is AUTHORITATIVE: it must
+    // equal the self-asserted `X-Agent-Id` header (or the header is corrected to
+    // it), so a caller can no longer act as / read another agent's data (H1) or
+    // assert a spoofed admin identity (M1). The bound principal is also injected
+    // into the request extensions so the downstream IDOR/admin gates can consume
+    // the `AuthLevel`. Keyed to a server-held secret, NEVER a header.
+    if let Some(agent_id) = per_agent
+        && auth.identity_mode != crate::config::HttpIdentityMode::Off
+    {
+        let header_id = req
+            .headers()
+            .get(crate::HEADER_AGENT_ID)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let Some(ref hid) = header_id
+            && !hid.is_empty()
+            && *hid != agent_id
+        {
+            match auth.identity_mode {
+                crate::config::HttpIdentityMode::Enforce => {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "#2044 enforce: X-Agent-Id {hid:?} does not match the \
+                         principal bound to the presented per-agent api-key \
+                         {agent_id:?}; refusing"
+                    );
+                    return (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "error": "identity_binding_mismatch",
+                            "message": "X-Agent-Id must match the agent bound to the \
+                                        presented per-agent api-key",
+                        })),
+                    )
+                        .into_response();
+                }
+                crate::config::HttpIdentityMode::Advisory => {
+                    tracing::warn!(
+                        target: super::AUTHZ_TRACE_TARGET,
+                        "#2044 advisory: X-Agent-Id {hid:?} does not match the \
+                         principal bound to the presented per-agent api-key \
+                         {agent_id:?}; correcting the request to the key-derived \
+                         identity (set AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=\
+                         enforce to refuse instead)"
+                    );
+                }
+                crate::config::HttpIdentityMode::Off => {}
+            }
+        }
+        // BIND: overwrite `X-Agent-Id` with the key-derived principal so every
+        // downstream handler's header-based resolution honors the attested id.
+        // The IDOR/admin gates re-derive the `AuthLevel` self-containedly from
+        // the enrolled map + presented `X-API-Key`
+        // (`identity_binding::resolve_auth_level`), so no request-extension
+        // principal is injected here — it would be dead weight nothing reads.
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&agent_id) {
+            req.headers_mut().insert(crate::HEADER_AGENT_ID, hv);
+        }
+    }
+
+    next.run(req).await.into_response()
 }
 
 pub async fn health(State(app): State<AppState>) -> impl IntoResponse {
