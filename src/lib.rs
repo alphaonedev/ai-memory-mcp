@@ -487,6 +487,12 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// underscore prefix is the reserved-namespace convention.
 pub const DEFAULT_NAMESPACE: &str = "global";
 
+/// Canonical operation identifier for the `kg_timeline` surface — the shared
+/// tag used by the HTTP `kg_timeline` handler's #2096 identity gate AND the
+/// postgres SAL adapter's AGE-fallback WARN (`warn_age_fallback`). Hoisted to
+/// one named const (pm-v3.1 no-scattered-literals) so the string lives once.
+pub(crate) const OP_KG_TIMELINE: &str = "kg_timeline";
+
 /// Per-user ai-memory data directory name (`~/.ai-memory`) — home of
 /// reflection exports + persona artefacts (#1558 batch 6).
 pub const AI_MEMORY_HOME_DIR_NAME: &str = ".ai-memory";

@@ -52,6 +52,21 @@ pub async fn list_pending(
 ) -> impl IntoResponse {
     let limit = p.limit.unwrap_or(100).min(1000);
 
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #958 caller-vs-requester post-filter below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot
+    // enumerate the victim's pending governance actions (proposed memory body,
+    // requester id, target namespace topology). Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "list_pending",
+    ) {
+        return resp;
+    }
+
     // #958 (security-medium, 2026-05-20) — caller-vs-requester gate.
     // Pre-#958 the handler took NO `headers: HeaderMap`, resolved no
     // caller, and dispatched directly to the underlying list (sqlite

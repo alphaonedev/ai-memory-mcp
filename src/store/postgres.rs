@@ -7166,7 +7166,7 @@ impl PostgresStore {
                 {
                     Ok(rows) => Ok(rows),
                     Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback("kg_timeline", source_id, &err);
+                        warn_age_fallback(crate::OP_KG_TIMELINE, source_id, &err);
                         self.kg_timeline_cte(source_id, since, until, limit).await
                     }
                     Err(err) => Err(err),
@@ -22349,7 +22349,7 @@ impl MemoryStore for PostgresStore {
                 {
                     Ok(rows) => Ok(rows),
                     Err(err) if is_age_runtime_failure(&err) => {
-                        warn_age_fallback("kg_timeline", source_id, &err);
+                        warn_age_fallback(crate::OP_KG_TIMELINE, source_id, &err);
                         self.kg_timeline_cte(source_id, since, until, limit).await
                     }
                     Err(err) => Err(err),

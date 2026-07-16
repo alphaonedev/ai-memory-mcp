@@ -133,6 +133,20 @@ pub async fn restore_archive(
             .into_response();
     }
 
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #940 caller-vs-row-owner restore below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot pull
+    // the victim's archived rows back into the live working set. Inert for
+    // zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "restore_archive",
+    ) {
+        return resp;
+    }
+
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. Restoring a row pulls it from the archived
     // table back into the live working set; this is a privileged admin
@@ -270,6 +284,16 @@ pub async fn purge_archive(
     headers: HeaderMap,
     Query(q): Query<PurgeQuery>,
 ) -> impl IntoResponse {
+    // #2125/#2093 note: purge_archive is deliberately NOT hard-gated by
+    // `enforce_idor_identity`. Its identity posture is the shipped #2093
+    // `is_admin_caller_trusted` DOWNGRADE (a forged shared-key admin resolves
+    // to NOT-trusted → the DELETE runs in caller scope, never cross-tenant
+    // admin-wide) rather than a 403 refuse — pinned by the route test
+    // `tests/http_per_agent_key_route_gate_2044.rs::m1_2093_purge_archive_
+    // shared_key_admin_does_not_403_but_downgrades`. Adding a 403 gate here
+    // would contradict that shipped contract, so this route stays on the
+    // #2093 downgrade mechanism. See the PR audit table.
+
     // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
     // `archive_purge` permanently deletes archived memories; SOC2-grade
     // deployments must prove "who deleted what when". Forensic-chain
@@ -440,6 +464,20 @@ pub async fn archive_by_ids(
         }
     }
     let reason = body.reason.as_deref().unwrap_or("archive").to_string();
+
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #940 caller-vs-row-owner bulk archive below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot
+    // bulk-archive the victim's live rows (cross-tenant DoS primitive). Inert
+    // for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "archive_by_ids",
+    ) {
+        return resp;
+    }
 
     // #913 (security-medium / SOC2, 2026-05-19) — admin/destructive
     // state-change audit. `archive_by_ids` performs a bulk soft-delete

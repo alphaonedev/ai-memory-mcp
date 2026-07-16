@@ -295,8 +295,6 @@ pub async fn entity_get_by_alias(
     headers: axum::http::HeaderMap,
     Query(p): Query<EntityByAliasQuery>,
 ) -> impl IntoResponse {
-    #[cfg(not(feature = "sal"))]
-    let _ = &headers;
     let alias = p.alias.trim();
     if alias.is_empty() {
         return (
@@ -318,6 +316,21 @@ pub async fn entity_get_by_alias(
             Json(json!({"error": crate::errors::msg::invalid("namespace", e)})),
         )
             .into_response();
+    }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #947 visibility mask below. Under `enforce`, a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` cannot resolve the victim's
+    // private entity by alias. Inert for zero-config deployments. (This gate
+    // also makes `headers` used in every build, so the former non-sal
+    // `let _ = &headers;` suppression is no longer needed.)
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "entity_get_by_alias",
+    ) {
+        return resp;
     }
 
     // v0.7.0 ARCH-2 followup (FX-C2-batch3) — postgres-backed daemons
@@ -536,6 +549,20 @@ pub async fn kg_timeline(
             Json(json!({"error": format!("invalid until: {e}")})),
         )
             .into_response();
+    }
+
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #944 caller-vs-source-owner check below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot read
+    // the victim's private temporal-graph timeline. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        crate::OP_KG_TIMELINE,
+    ) {
+        return resp;
     }
 
     // #944 SECURITY-high (Track A QC sweep, 2026-05-20) —
@@ -813,6 +840,20 @@ pub async fn kg_invalidate(
             Json(json!({"error": format!("invalid valid_until: {e}")})),
         )
             .into_response();
+    }
+
+    // #2125 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #938 caller-vs-source-owner check below. Under `enforce`, a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` cannot forge
+    // temporal-graph state (`valid_until = now()`) on the victim's
+    // `:supersedes`/`:contradicts` edges. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_invalidate",
+    ) {
+        return resp;
     }
 
     // #938 SECURITY-high (Track A QC sweep, 2026-05-20) —

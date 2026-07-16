@@ -44,6 +44,20 @@ pub async fn get_inbox(
     headers: HeaderMap,
     Query(q): Query<InboxQuery>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the inbox read below. The self-asserted `X-Agent-Id` selects the
+    // `_inbox/<owner>` namespace, so under `enforce` a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` (owner == victim) would otherwise
+    // read the victim's inbox; refuse it here. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "get_inbox",
+    ) {
+        return resp;
+    }
     // #901 (security-high, 2026-05-19) — sibling of #874. The pre-#901
     // path TRUSTED `?agent_id=` query as identity, allowing any caller
     // to read any agent's inbox by passing `?agent_id=victim`. Header
@@ -274,6 +288,25 @@ async fn set_namespace_standard_inner(
     body: NamespaceStandardBody,
     headers: Option<&HeaderMap>,
 ) -> axum::response::Response {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #929 caller-vs-recorded-owner mutation check below. A namespace
+    // standard is the governance policy gating EVERY downstream write into the
+    // namespace, and mutation is authorized by `recorded_owner == caller`; so
+    // under `enforce` a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` (caller == recorded_owner == victim) could
+    // otherwise rewrite the victim's namespace policy. Refuse it here. Inert
+    // for zero-config deployments (both public entry points — path + qs forms
+    // — route through this inner helper).
+    if let Some(h) = headers
+        && let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            h,
+            "set_namespace_standard",
+        )
+    {
+        return resp;
+    }
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // `set_namespace_standard` mutates the governance policy that gates
     // EVERY downstream write into the namespace; the chain entry must be

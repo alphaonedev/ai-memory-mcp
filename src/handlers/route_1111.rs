@@ -479,6 +479,19 @@ pub async fn handle_replay_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_replay` applies to the forwarded
+    // caller. Under `enforce`, a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` cannot replay the victim's memory operations.
+    // Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "replay",
+    ) {
+        return resp;
+    }
     // Resolve caller id so the substrate ownership gate has a
     // header-attributed principal. Mirror the inbox handler.
     let body_agent = body.get("agent_id").and_then(Value::as_str);
@@ -511,6 +524,19 @@ pub async fn handle_subscription_replay_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_subscription_replay` applies. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot replay the victim's webhook deliveries. Inert for zero-config
+    // deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "subscription_replay",
+    ) {
+        return resp;
+    }
     let body_agent = body.get("agent_id").and_then(Value::as_str);
     let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
     {
@@ -536,6 +562,19 @@ pub async fn handle_subscription_dlq_list_http(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // #2096 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the substrate ownership gate `handle_subscription_dlq_list` applies.
+    // Under `enforce`, a shared-key `Claimed` caller forging
+    // `X-Agent-Id: <victim>` cannot list the victim's dead-lettered webhook
+    // deliveries. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "subscription_dlq_list",
+    ) {
+        return resp;
+    }
     let body_agent = body.get("agent_id").and_then(Value::as_str);
     let caller = match crate::handlers::parity::resolve_caller_agent_id(body_agent, &headers, None)
     {
