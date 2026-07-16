@@ -11299,6 +11299,12 @@ fn pg_row_to_routine_run(r: &sqlx::postgres::PgRow) -> StoreResult<crate::models
 /// the sqlx-native postgres write paths so multi-tenant
 /// postgres-backed deployments cannot bypass operator-signed
 /// governance.
+/// pm-v3.1 hardcoded-literal gate — shared `StoreError::PermissionDenied.action`
+/// label for a memory-WRITE refusal on the postgres SAL surface. Named so the
+/// literal isn't duplicated across [`consult_governance_pre_write_pg`] and its
+/// #2059 why_trace sibling [`consult_why_trace_gate_pg`].
+const ACTION_MEMORY_WRITE: &str = "memory_write";
+
 fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
     match crate::storage::consult_governance_pre_write(memory) {
         Ok(()) => Ok(()),
@@ -11313,7 +11319,7 @@ fn consult_governance_pre_write_pg(memory: &Memory) -> StoreResult<()> {
                 .downcast_ref::<crate::storage::GovernanceRefusal>()
                 .map_or_else(|| e.to_string(), |r| r.reason.clone());
             Err(StoreError::PermissionDenied {
-                action: "memory_write".to_string(),
+                action: ACTION_MEMORY_WRITE.to_string(),
                 target: memory.namespace.clone(),
                 reason,
             })
@@ -11334,7 +11340,7 @@ fn consult_why_trace_gate_pg(memory: &Memory) -> StoreResult<()> {
                 .downcast_ref::<crate::storage::GovernanceRefusal>()
                 .map_or_else(|| e.to_string(), |r| r.reason.clone());
             Err(StoreError::PermissionDenied {
-                action: "memory_write".to_string(),
+                action: ACTION_MEMORY_WRITE.to_string(),
                 target: memory.namespace.clone(),
                 reason,
             })
