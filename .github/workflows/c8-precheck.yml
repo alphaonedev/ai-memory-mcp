@@ -176,3 +176,31 @@ jobs:
         # --self-test stages a tests/ file that blocking-reads the real
         # process stdin in a #[test]; the gate must reject it.
         run: bash scripts/check-test-stdin-reads.sh --self-test
+
+  test-env-lock-gate:
+    # Issue #2146 — the grep-gate half of issue #2127's Fix section,
+    # not delivered by PR #2142 (Fable pre-merge audit of #2142).
+    # HARD-BLOCKS any src/**/*.rs or tests/**/*.rs file that mutates
+    # the process-global $HOME environment variable
+    # (`std::env::set_var("HOME"` / `std::env::remove_var("HOME"`)
+    # without also referencing the crate-canonical
+    # `crate::config::test_env_lock()` serialization guard somewhere in
+    # the same file. `std::env::set_var` is unsound under concurrent
+    # access; this defect class recurred THREE times (#1998 -> #2115
+    # -> #2127) because a new module kept hand-rolling its own
+    # module-local lock instead of reusing the shared one. This gate
+    # keeps a new module from silently re-introducing that class.
+    name: Test-env $HOME-lock gate (#2146)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run test-env-lock gate
+        run: bash scripts/check-test-env-lock.sh
+      - name: Self-test the gate (regression evidence)
+        # --self-test stages a $HOME-mutating fixture with no
+        # test_env_lock reference (the plain-omission shape) and a
+        # second fixture that hand-rolls its own local lock instead of
+        # the shared one (the #1998/#2115/#2127 recurrent shape); the
+        # gate must reject both and spare a compliant control fixture.
+        run: bash scripts/check-test-env-lock.sh --self-test
