@@ -1045,10 +1045,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (inert-posture + open-L6-window boot WARNs) + 3 unit tests + serve
     // wiring land daemon_runtime.rs at 10_409; ceiling 10_400 → 10_500 (+91).
     // 2026-07-15 (#2095): route agents bind/revoke-api-key verbs through the SAL
-    // store (build_store_handle) so postgres enrollment works, + dispatch
-    // coverage tests. Combined with #2045 L6 this lands daemon_runtime.rs
-    // above 10_500; ceiling 10_500 → 10_650.
-    ("src/daemon_runtime.rs", 10_650), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
+    // store (build_store_handle) so postgres enrollment works, + 5 dispatch
+    // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
+    // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
+    // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
+    ("src/daemon_runtime.rs", 10_750), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0
