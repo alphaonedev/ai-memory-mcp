@@ -204,13 +204,17 @@ mod tests {
         root
     }
 
-    /// Serialize HOME mutations across the env-touching tests in this
-    /// module so they cannot clobber each other under `--test-threads>1`.
+    /// Serialize HOME mutations against every other `$HOME`-mutating test
+    /// in the crate, not just this module's own tests (#2127, residual of
+    /// #2115). A module-local mutex only covers this module's own
+    /// `--test-threads>1` races; it still races the shared `test_env_lock`
+    /// cohort in `src/embeddings.rs` / `src/reranker.rs` / `src/config.rs`
+    /// / `src/cli/commands/config.rs` / `src/cli/rules.rs`, so this
+    /// delegates to the single crate-canonical
+    /// [`crate::config::test_env_lock`] (mirrors
+    /// `src/cli/commands/config.rs::tests::env_lock`).
     fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        crate::config::test_env_lock()
     }
 
     /// RAII guard that points `$HOME` at a temp dir and restores the
