@@ -99,6 +99,7 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+ "tower-service",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
