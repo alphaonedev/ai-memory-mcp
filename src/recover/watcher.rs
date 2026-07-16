@@ -53,7 +53,7 @@
 //! [`run_watch_daemon`] is a synchronous, blocking function (mirrors
 //! [`crate::curator::run_daemon`]) driven by an `Arc<AtomicBool>`
 //! checked every [`SHUTDOWN_POLL_TICK`]. The CLI async wrapper
-//! (`daemon_runtime::run_watch_daemon_with_primitives`) bridges a
+//! (`cli::watch::run_watch_daemon_with_primitives`) bridges a
 //! `tokio::sync::Notify` (fired on SIGINT, or — on unix — SIGTERM; see
 //! `crate::cli::watch::run`) into that flag via `spawn_blocking` — the
 //! identical bridge the curator daemon uses.

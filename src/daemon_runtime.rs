@@ -32,8 +32,13 @@
 //!   [`sync_cycle_once`] — the sync-daemon body.
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
-//! - [`run_watch_daemon_with_primitives`] — the L3 substrate
-//!   poll-watcher daemon body (issue #1978).
+//!
+//! The L3 substrate poll-watcher daemon body (issue #1978) lives in
+//! [`crate::cli::watch`] — the `Command::Watch` arm below is a thin
+//! delegate to [`crate::cli::watch::dispatch`], which owns the
+//! output-routing + `Notify`→`AtomicBool` shutdown bridge (extracted
+//! from this module so the coverable watch logic sits in `cli::watch`,
+//! mirroring #2088's api-key-dispatch move).
 
 use crate::models::field_names;
 use std::io::Write as _;
@@ -1916,26 +1921,12 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             }
         }
         Command::Watch(a) => {
-            // Mirrors the `Curator` arm: `--daemon` runs indefinitely on a
-            // `spawn_blocking` worker that itself calls `tracing::info!`;
-            // holding the process-wide `Stdout::lock()` across that would
-            // risk a cross-thread ReentrantMutex deadlock, so route
-            // `--daemon` output to `io::sink()` and only lock real
-            // stdout/stderr for `--once` (which actually emits a report).
+            // Thin delegate — output-routing (sink-vs-stdout) + the
+            // `Notify`→`AtomicBool` shutdown bridge live in
+            // `cli::watch::dispatch` (extracted from this module, #1978
+            // coverage / #2088 precedent).
             init_tracing();
-            if a.daemon {
-                let mut so = std::io::sink();
-                let mut se = std::io::sink();
-                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                cli::watch::run(&db_path, &a, cli_agent_id.as_deref(), &mut out).await
-            } else {
-                let stdout = std::io::stdout();
-                let stderr = std::io::stderr();
-                let mut so = stdout.lock();
-                let mut se = stderr.lock();
-                let mut out = cli::CliOutput::from_std(&mut so, &mut se);
-                cli::watch::run(&db_path, &a, cli_agent_id.as_deref(), &mut out).await
-            }
+            cli::watch::dispatch(&db_path, &a, cli_agent_id.as_deref()).await
         }
         Command::Atomise(a) => {
             let stdout = std::io::stdout();
@@ -6528,32 +6519,6 @@ pub async fn run_curator_daemon_with_primitives(
     })
     .await
     .map_err(|e| anyhow::anyhow!("curator daemon join: {e}"))?;
-    Ok(())
-}
-
-/// Watch-daemon loop body (issue #1978 L3 substrate watcher). Bridges
-/// the CLI's `tokio::sync::Notify` shutdown signal into the
-/// `Arc<AtomicBool>` [`crate::recover::watcher::run_watch_daemon`]
-/// checks every 500ms, then drives the blocking poll loop via
-/// `spawn_blocking` — the identical bridge pattern
-/// [`run_curator_daemon_with_primitives`] uses for the curator daemon.
-pub async fn run_watch_daemon_with_primitives(
-    db_path: PathBuf,
-    cfg: crate::recover::watcher::WatchConfig,
-    shutdown: Arc<Notify>,
-) -> Result<()> {
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let shutdown_flag_for_signal = shutdown_flag.clone();
-    tokio::spawn(async move {
-        shutdown.notified().await;
-        shutdown_flag_for_signal.store(true, Ordering::Relaxed);
-    });
-
-    tokio::task::spawn_blocking(move || {
-        crate::recover::watcher::run_watch_daemon(db_path, cfg, shutdown_flag);
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("watch daemon join: {e}"))?;
     Ok(())
 }
 

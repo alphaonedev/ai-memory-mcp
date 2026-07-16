@@ -199,8 +199,73 @@ pub async fn run(
         shutdown_for_signal.notify_one();
     });
 
-    crate::daemon_runtime::run_watch_daemon_with_primitives(db_path.to_path_buf(), cfg, shutdown)
-        .await
+    run_watch_daemon_with_primitives(db_path.to_path_buf(), cfg, shutdown).await
+}
+
+/// `Command::Watch` dispatch entry (invoked from
+/// [`crate::daemon_runtime::run`]). Owns the stdout-vs-sink output
+/// routing: `--daemon` runs a blocking poll loop on a `spawn_blocking`
+/// worker that itself logs via `tracing::info!`, so holding the
+/// process-wide `Stdout::lock()` across it risks a cross-thread
+/// `ReentrantMutex` deadlock — daemon output goes to [`std::io::sink`],
+/// while `--once` (which actually emits a report) locks real
+/// stdout/stderr. Extracted from `daemon_runtime` so the coverable watch
+/// logic lives in this module (issue #1978 coverage; #2088 precedent).
+///
+/// # Errors
+///
+/// Propagates [`run`]'s errors (missing `--once`/`--daemon`, unknown
+/// `--host`, agent-id resolution). Per-host recovery failures never
+/// propagate — see [`run`].
+pub async fn dispatch(db_path: &Path, args: &WatchArgs, cli_agent_id: Option<&str>) -> Result<()> {
+    if args.daemon {
+        let mut so = std::io::sink();
+        let mut se = std::io::sink();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(db_path, args, cli_agent_id, &mut out).await
+    } else {
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let mut so = stdout.lock();
+        let mut se = stderr.lock();
+        let mut out = CliOutput::from_std(&mut so, &mut se);
+        run(db_path, args, cli_agent_id, &mut out).await
+    }
+}
+
+/// Watch-daemon loop body (issue #1978 L3 substrate watcher). Bridges
+/// the CLI's [`tokio::sync::Notify`] shutdown signal into the
+/// `Arc<AtomicBool>` [`watcher::run_watch_daemon`] checks every 500 ms,
+/// then drives the blocking poll loop via `spawn_blocking` — the
+/// identical bridge pattern `run_curator_daemon_with_primitives` uses
+/// for the curator daemon. Extracted from `daemon_runtime` (issue #1978
+/// coverage; #2088 precedent).
+///
+/// # Errors
+///
+/// Returns an error only if the `spawn_blocking` join fails (the poll
+/// loop itself never propagates a per-host failure — see
+/// [`watcher::poll_once`]).
+async fn run_watch_daemon_with_primitives(
+    db_path: std::path::PathBuf,
+    cfg: WatchConfig,
+    shutdown: std::sync::Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let shutdown_flag = std::sync::Arc::new(AtomicBool::new(false));
+    let shutdown_flag_for_signal = shutdown_flag.clone();
+    tokio::spawn(async move {
+        shutdown.notified().await;
+        shutdown_flag_for_signal.store(true, Ordering::Relaxed);
+    });
+
+    tokio::task::spawn_blocking(move || {
+        watcher::run_watch_daemon(db_path, cfg, shutdown_flag);
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("watch daemon join: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -303,5 +368,57 @@ mod tests {
         assert!(parse_host("claude-code").is_ok());
         assert!(parse_host("codex").is_ok());
         assert!(parse_host("gemini").is_ok());
+    }
+
+    /// `dispatch --once` routes through the stdout-locking (non-sink)
+    /// branch and returns cleanly. Extracted from `daemon_runtime`'s
+    /// `Command::Watch` arm (issue #1978 coverage; #2088 precedent).
+    #[tokio::test]
+    async fn dispatch_once_returns_ok() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut args = default_args();
+        args.once = true;
+        // Single host keeps the tick light; the report is written to the
+        // real (cargo-captured) stdout by the dispatch else-branch.
+        args.hosts = vec!["codex".to_string()];
+        dispatch(&db, &args, Some("ai:test:watch")).await.unwrap();
+    }
+
+    /// `dispatch` propagates [`run`]'s missing-mode error (neither
+    /// `--once` nor `--daemon`) through the stdout branch.
+    #[tokio::test]
+    async fn dispatch_requires_once_or_daemon() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let args = default_args();
+        let res = dispatch(&db, &args, Some("ai:test:watch")).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("--once or --daemon"));
+    }
+
+    /// The `Notify`→`AtomicBool` shutdown bridge returns cleanly once the
+    /// signal fires. A pre-fired `Notify` stores one permit, so the
+    /// bridge's spawned task observes shutdown immediately and flips the
+    /// flag the blocking poll loop checks every 500 ms. An EMPTY host
+    /// list makes the loop fully hermetic (zero resolver walks) so the
+    /// test neither touches the real `$HOME` nor the DB. Extracted from
+    /// `daemon_runtime` (issue #1978 coverage; #2088 precedent).
+    #[tokio::test]
+    async fn daemon_primitives_bridge_returns_on_shutdown() {
+        let env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let cfg = WatchConfig {
+            hosts: Vec::new(),
+            poll_interval: watcher::clamp_poll_interval(1),
+            agent_id: "ai:test:watch".to_string(),
+            namespace: Some("test-watch".to_string()),
+            limit: watcher::DEFAULT_WATCH_LIMIT,
+            dry_run: false,
+        };
+        let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        shutdown.notify_one();
+        let res = run_watch_daemon_with_primitives(db, cfg, shutdown).await;
+        assert!(res.is_ok());
     }
 }
