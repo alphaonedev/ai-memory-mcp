@@ -5,7 +5,8 @@
 # v1.0.0 (issue #1989 — full-suite wedge regression guard).
 #
 # HARD-BLOCK any TEST-reachable acquisition of the process-global
-# `std::io::stdin()` handle outside the single sanctioned test helper.
+# `std::io::stdin()` handle outside the single sanctioned
+# `with_stdin_lines` test helper.
 #
 # WHY THIS GATE EXISTS (#1989 root cause). The v1.0.0 Gate-1 train hit
 # an intermittent full-lib-suite wedge (~1-in-4 locally; a CI watchdog
@@ -38,18 +39,22 @@
 # `std::io::stdin()` appearing in TEST-reachable code:
 #   - every line in a `tests/**/*.rs` integration-test file (wholly test)
 #   - lines at or below the first `mod tests {` boundary in any
-#     `src/**/*.rs` or `tools/**/*.rs` file (the in-file test region)
+#     `src/**/*.rs`, `examples/**/*.rs`, or `tools/**/*.rs` file (the
+#     in-file test region)
 # The CHILD-process stdin pattern (`ChildStdin`, `Stdio::piped()` +
 # `child.stdin`) is NOT gated — that writes to a spawned subprocess's
 # stdin (RAII-closed), which is the safe pattern the mcp-subprocess tests
 # already use. This gate matches only the `io::stdin(` call form, so
 # `ChildStdin` type references never trip it.
 #
-# ALLOWLIST. Exactly one carve-out: `src/cli/shell.rs`, home of the
-# sanctioned `with_stdin_lines` helper (it acquires the handle only to
-# read fd 0 for the dup2 swap under STDIN_LOCK — it never blocking-reads
-# the real stdin). The file is the carve-out, mirroring the file-level
-# carve-outs in scripts/check-vendor-literals.sh.
+# CARVE-OUT (function-scoped, NOT file-scoped). The single sanctioned
+# site is the body of the `fn with_stdin_lines` helper — it acquires the
+# handle only to read fd 0 for the dup2 swap under STDIN_LOCK; it never
+# blocking-reads the real stdin. The carve-out is the helper FUNCTION,
+# resolved by a brace-balanced scan, so an OTHER stdin-reading test in
+# the SAME file (e.g. a new `cli::shell::tests` test) is still caught —
+# the #1989 wedge test lived in exactly that module, so a whole-file
+# carve-out would have left the recurrence site un-gated (#2107).
 #
 # Production-vs-test boundary heuristic + shell-portability notes mirror
 # scripts/check-vendor-literals.sh (the same first-`mod tests {` boundary,
@@ -60,35 +65,21 @@
 #   scripts/check-test-stdin-reads.sh
 #     - exit 0 on clean, exit 1 on any violation
 #   scripts/check-test-stdin-reads.sh --self-test
-#     - injects a contrived violation, verifies the gate catches it,
-#       removes the violation. Proves the gate is load-bearing
-#       (pm-v3.2 NO FAIL MISSION closure discipline). Exit 0 on PASS.
+#     - injects contrived violations (a plain test read AND a same-file
+#       sibling of the helper), verifies the gate catches them, verifies
+#       the sanctioned helper line is NOT flagged, then cleans up. Proves
+#       the gate is load-bearing AND that the narrow carve-out did not
+#       over-widen (pm-v3.2 NO FAIL MISSION closure discipline). Exit 0
+#       on PASS.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Single file-level carve-out: the sanctioned with_stdin_lines helper.
-ALLOWED_FILES=(
-    "src/cli/shell.rs"
-)
-
 # Process-global stdin handle acquisition. Matches `io::stdin(` and
 # `std::io::stdin(` (a leading `std::` is just more `:`), but NOT the
 # `ChildStdin` type (no `(` call) nor a `child.stdin` field access.
 STDIN_PATTERN='(^|[^A-Za-z0-9_])io::stdin[[:space:]]*\('
-
-# is_allowed_file <repo-root-relative-path>
-is_allowed_file () {
-    local f="$1"
-    local allowed
-    for allowed in "${ALLOWED_FILES[@]}"; do
-        if [[ "$f" == "$allowed" ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
 
 # find_test_boundary <file>
 # Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
@@ -111,10 +102,48 @@ find_test_boundary () {
     fi
 }
 
+# helper_ranges <file>
+# Echoes one `start:end` line-range per `fn with_stdin_lines` body in the
+# file (brace-balanced), so an io::stdin() match inside the sanctioned
+# helper is carved out while an identical call ANYWHERE ELSE in the same
+# file is not. The helper's body carries no braces inside string literals,
+# so a plain `{`/`}` count is exact here.
+helper_ranges () {
+    local f="$1"
+    awk '
+    /(^|[^A-Za-z0-9_])fn[ \t]+with_stdin_lines([^A-Za-z0-9_]|$)/ && !active { active=1; start=NR; depth=0; opened=0 }
+    active {
+        line=$0
+        o=gsub(/\{/,"{",line); depth+=o; if(o>0)opened=1
+        c=gsub(/\}/,"}",line); depth-=c
+        if(opened && depth<=0){ print start":"NR; active=0 }
+    }
+    ' "$f" 2>/dev/null
+}
+
+# line_in_helper <lineno> <ranges-payload>
+# Returns 0 (true) when <lineno> falls within any `start:end` range.
+line_in_helper () {
+    local lineno="$1"
+    local ranges="$2"
+    [[ -z "$ranges" ]] && return 1
+    local r start end
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        start="${r%%:*}"
+        end="${r##*:}"
+        if (( lineno >= start && lineno <= end )); then
+            return 0
+        fi
+    done <<< "$ranges"
+    return 1
+}
+
 # scan_test_lines <file>
 # Emits "<repo-relative-file>:<lineno>:<content>" for STDIN_PATTERN
 # matches in TEST-reachable code (at or below the file's test boundary),
-# skipping comment/doc-comment lines.
+# skipping comment/doc-comment lines and any match inside a sanctioned
+# `with_stdin_lines` helper body.
 scan_test_lines () {
     local f="$1"
     local boundary
@@ -123,10 +152,16 @@ scan_test_lines () {
     local matches
     matches="$(grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true)"
     [[ -z "$matches" ]] && return 0
+    local ranges
+    ranges="$(helper_ranges "$f")"
     while IFS=: read -r lineno content; do
         [[ -z "$lineno" ]] && continue
         # Only TEST-reachable lines (at or below the boundary).
         if (( lineno < boundary )); then
+            continue
+        fi
+        # Skip the sanctioned helper body.
+        if line_in_helper "$lineno" "$ranges"; then
             continue
         fi
         # Skip comments and doc-comment lines.
@@ -139,19 +174,27 @@ scan_test_lines () {
     done <<< "$matches"
 }
 
-# Self-test mode — inject a contrived violation, run the gate, confirm
-# it catches it, then clean up.
+# Self-test mode — inject contrived violations, run the gate, confirm it
+# catches them (and spares the sanctioned helper line), then clean up.
 if [[ "${1:-}" == "--self-test" ]]; then
-    echo "Test-stdin gate: self-test mode (contrived violation -> expect HARD-BLOCK -> cleanup)"
-    # A tests/ file is test code from line 1, so a bare io::stdin() there
-    # reaches the scanner without needing a `mod tests {` boundary.
-    contrived="${ROOT}/tests/.stdin_gate_probe.rs"
-    if [[ -e "$contrived" ]]; then
-        echo "ERROR: self-test scratch file already exists: $contrived" >&2
-        echo "(cleanup may have failed in a prior run — remove manually)" >&2
-        exit 2
-    fi
-    cat > "$contrived" <<'EOF'
+    echo "Test-stdin gate: self-test mode (contrived violations -> expect HARD-BLOCK -> cleanup)"
+    # Case 1: a plain tests/ file that blocking-reads the real stdin in a
+    # #[test] (test code from line 1, no `mod tests {` needed).
+    probe1="${ROOT}/tests/.stdin_gate_probe.rs"
+    # Case 2 (#2107): a file that DEFINES its own `with_stdin_lines`
+    # helper (carved out) AND a SIBLING test that reads real stdin — the
+    # sibling MUST be caught and the helper's own stdin() line MUST NOT.
+    # A tests/ file is test code from line 1, so both functions are in
+    # the test region and the function-scoped carve-out is exercised.
+    probe2="${ROOT}/tests/.stdin_gate_sibling_probe.rs"
+    for p in "$probe1" "$probe2"; do
+        if [[ -e "$p" ]]; then
+            echo "ERROR: self-test scratch file already exists: $p" >&2
+            echo "(cleanup may have failed in a prior run — remove manually)" >&2
+            exit 2
+        fi
+    done
+    cat > "$probe1" <<'EOF'
 // CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
 // This file is created + deleted by the self-test; if it persists,
 // the self-test was killed mid-run — remove it manually.
@@ -161,19 +204,43 @@ fn contrived_reads_real_stdin() {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 EOF
+    cat > "$probe2" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises the FUNCTION-scoped carve-out (#2107): the helper's own
+// stdin() line must be spared; a sibling test's stdin() must be caught.
+fn with_stdin_lines() {
+    let _sanctioned = std::io::stdin();
+}
+#[test]
+fn sibling_reads_real_stdin() {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
+EOF
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
-    rm -f "$contrived"
+    rm -f "$probe1" "$probe2"
     printf '%s\n' "$gate_output"
-    if (( gate_exit != 0 )) && printf '%s' "$gate_output" | grep -q 'Test-reachable real-stdin read'; then
+    # PASS requires: non-zero exit, BOTH probe violations reported, and
+    # the sanctioned helper line (_sanctioned) NOT reported.
+    ok=1
+    (( gate_exit != 0 )) || ok=0
+    printf '%s' "$gate_output" | grep -q '\.stdin_gate_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'sibling_reads_real_stdin\|\.stdin_gate_sibling_probe\.rs' || ok=0
+    if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
+        echo "" >&2
+        echo "Test-stdin gate self-test: FAIL (carve-out over-widened: the sanctioned helper line was flagged)" >&2
+        exit 1
+    fi
+    if (( ok == 1 )); then
         echo ""
-        echo "Test-stdin gate self-test: PASS (gate caught the contrived violation; exit=${gate_exit})"
+        echo "Test-stdin gate self-test: PASS (caught both contrived violations, spared the sanctioned helper; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
-        echo "Test-stdin gate self-test: FAIL (gate did not catch the contrived violation; exit=${gate_exit})" >&2
+        echo "Test-stdin gate self-test: FAIL (gate did not catch a contrived violation; exit=${gate_exit})" >&2
         exit 1
     fi
 fi
@@ -184,16 +251,12 @@ cd "$ROOT"
 stdin_violations=""
 
 while IFS= read -r -d '' f; do
-    rel="${f#"${ROOT}/"}"
-    if is_allowed_file "$rel"; then
-        continue
-    fi
     v=$(scan_test_lines "$f")
     if [[ -n "$v" ]]; then
         stdin_violations+="$v"$'\n'
     fi
 done < <(
-    find "${ROOT}/src" "${ROOT}/tests" "${ROOT}/tools" -type f -name '*.rs' -print0 2>/dev/null
+    find "${ROOT}/src" "${ROOT}/tests" "${ROOT}/examples" "${ROOT}/tools" -type f -name '*.rs' -print0 2>/dev/null
 )
 
 if [[ -n "${stdin_violations//[[:space:]]/}" ]]; then
