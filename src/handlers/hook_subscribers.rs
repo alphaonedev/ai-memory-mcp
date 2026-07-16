@@ -1071,6 +1071,26 @@ async fn clear_namespace_standard_inner(
     ns: &str,
     headers: Option<&HeaderMap>,
 ) -> axum::response::Response {
+    // #2131 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #929 caller-vs-recorded-owner clear check below. Sibling of the
+    // set_namespace_standard gate: clearing a namespace standard DELETES the
+    // governance policy gating EVERY downstream write into the namespace, and
+    // clear is authorized by `recorded_owner == caller`; so under `enforce` a
+    // shared-key `Claimed` caller forging `X-Agent-Id: <victim>` (caller ==
+    // recorded_owner == victim) could otherwise DISARM governance over the
+    // victim's whole namespace by deleting its `namespace_meta` row. Refuse it
+    // here. Inert for zero-config deployments (both public entry points — path
+    // + qs forms — route through this inner helper).
+    if let Some(h) = headers
+        && let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+            &app.enrolled_agent_keys,
+            app.http_identity_mode,
+            h,
+            crate::OP_CLEAR_NAMESPACE_STANDARD,
+        )
+    {
+        return resp;
+    }
     // #913 (security-medium / SOC2, 2026-05-19) — admin governance audit.
     // Clearing a namespace standard removes the governance policy that
     // gates downstream writes; the chain entry MUST land before the

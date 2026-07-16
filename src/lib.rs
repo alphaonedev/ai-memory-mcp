@@ -493,6 +493,12 @@ pub const DEFAULT_NAMESPACE: &str = "global";
 /// one named const (pm-v3.1 no-scattered-literals) so the string lives once.
 pub(crate) const OP_KG_TIMELINE: &str = "kg_timeline";
 
+/// Canonical operation identifier for the `clear_namespace_standard` surface —
+/// the shared tag used by the HTTP handler's #2131 identity gate AND the
+/// postgres SAL adapter's `PermissionDenied` action / `to_store_err` op tag.
+/// Hoisted to one named const (pm-v3.1 no-scattered-literals).
+pub(crate) const OP_CLEAR_NAMESPACE_STANDARD: &str = "clear_namespace_standard";
+
 /// Per-user ai-memory data directory name (`~/.ai-memory`) — home of
 /// reflection exports + persona artefacts (#1558 batch 6).
 pub const AI_MEMORY_HOME_DIR_NAME: &str = ".ai-memory";

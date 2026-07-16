@@ -284,15 +284,25 @@ pub async fn purge_archive(
     headers: HeaderMap,
     Query(q): Query<PurgeQuery>,
 ) -> impl IntoResponse {
-    // #2125/#2093 note: purge_archive is deliberately NOT hard-gated by
-    // `enforce_idor_identity`. Its identity posture is the shipped #2093
-    // `is_admin_caller_trusted` DOWNGRADE (a forged shared-key admin resolves
-    // to NOT-trusted → the DELETE runs in caller scope, never cross-tenant
-    // admin-wide) rather than a 403 refuse — pinned by the route test
-    // `tests/http_per_agent_key_route_gate_2044.rs::m1_2093_purge_archive_
-    // shared_key_admin_does_not_403_but_downgrades`. Adding a 403 gate here
-    // would contradict that shipped contract, so this route stays on the
-    // #2093 downgrade mechanism. See the PR audit table.
+    // #2132 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the destructive purge below. The #2093 `is_admin_caller_trusted`
+    // downgrade only closes the ADMIN-BYPASS vector; it does NOT close the
+    // NON-admin caller-scope forge: under `enforce` a shared-key `Claimed`
+    // caller forging `X-Agent-Id: <victim>` (is_admin=false) hits
+    // `purge_archive_for_caller(caller=victim)` and PERMANENTLY DELETES the
+    // victim's archived rows — the identical IDOR closed for
+    // archive_by_ids/restore_archive, and purge is the most destructive.
+    // Gating here refuses the unattested named principal 403 BEFORE the
+    // caller-scoped DELETE; the key-attested admin/owner path still works
+    // (KeyAuthenticated passes). Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "purge_archive",
+    ) {
+        return resp;
+    }
 
     // #911 (security-medium / SOC2, 2026-05-19) — admin action audit.
     // `archive_purge` permanently deletes archived memories; SOC2-grade

@@ -171,6 +171,26 @@ fn routes() -> Vec<(&'static str, &'static str, Option<serde_json::Value>)> {
             "/api/v1/memory_subscription_dlq_list",
             Some(json!({})),
         ), // handle_subscription_dlq_list
+        // ---- Fable re-audit follow-up: #2131 / #2132 / #2133 ----
+        ("DELETE", "/api/v1/namespaces/victimns/standard", None), // #2131 clear_namespace_standard (path)
+        ("DELETE", "/api/v1/namespaces?namespace=victimns", None), // #2131 clear_namespace_standard (qs)
+        ("DELETE", "/api/v1/archive?older_than_days=3650", None),  // #2132 purge_archive
+        (
+            "POST",
+            "/api/v1/kg/query",
+            Some(json!({"source_id": "mem-victim-0001"})),
+        ), // #2133 kg_query
+        (
+            "POST",
+            "/api/v1/kg/find_paths",
+            Some(json!({"source_id": "mem-victim-0001", "target_id": "mem-victim-0002"})),
+        ), // #2133 kg_find_paths
+        // set_namespace_standard QS form (only the path form was covered before)
+        (
+            "POST",
+            "/api/v1/namespaces",
+            Some(json!({"namespace": "victimns"})),
+        ), // set_namespace_standard_qs
     ]
 }
 

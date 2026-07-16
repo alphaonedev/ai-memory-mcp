@@ -1066,6 +1066,20 @@ pub async fn kg_find_paths(
             .into_response();
     }
 
+    // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #910 caller-keyed path-traversal visibility filter below. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot enumerate the victim's private KG path topology. Inert for
+    // zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_find_paths",
+    ) {
+        return resp;
+    }
+
     // #910 SAL-level — resolve the caller so the trait method's
     // visibility filter (path-traversal flavour) sees the right
     // principal. Header-only authentication on this POST surface;
@@ -1234,6 +1248,19 @@ pub async fn kg_query(
     headers: HeaderMap,
     Json(body): Json<KgQueryBody>,
 ) -> impl IntoResponse {
+    // #2133 (v1.0.0, #2032-A / H1 IDOR) — per-agent-key identity gate BEFORE
+    // the #910 caller-keyed scope=private visibility filter below. Under
+    // `enforce`, a shared-key `Claimed` caller forging `X-Agent-Id: <victim>`
+    // cannot enumerate the victim's private KG target topology by walking from
+    // a public source row. Inert for zero-config deployments.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "kg_query",
+    ) {
+        return resp;
+    }
     // #910 (security-medium, 2026-05-19) — resolve the caller via the
     // `X-Agent-Id` header so the scope=private visibility filter
     // below has a known principal to compare `metadata.agent_id`
