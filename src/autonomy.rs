@@ -701,9 +701,13 @@ pub(crate) fn build_rollback_memory(entry: &RollbackEntry) -> Result<Memory> {
         updated_at: ts,
         last_accessed_at: None,
         expires_at: None,
+        // #2110 — curator rollback rows are substrate-authored, reached via a
+        // direct `db::insert`; record the substrate why_trace so the write
+        // satisfies AI_MEMORY_REQUIRE_WHY_TRACE without a kind-exemption hole.
         metadata: serde_json::json!({
             "agent_id": crate::identity::sentinels::AI_CURATOR,
             "action": entry.action_tag(),
+            "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
         }),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
@@ -768,7 +772,12 @@ pub fn persist_self_report(
         updated_at: ts,
         last_accessed_at: None,
         expires_at: None,
-        metadata: serde_json::json!({"agent_id": crate::identity::sentinels::AI_CURATOR}),
+        // #2110 — curator self-report rows are substrate-authored (direct
+        // `db::insert`); record the substrate why_trace.
+        metadata: serde_json::json!({
+            "agent_id": crate::identity::sentinels::AI_CURATOR,
+            "why_trace": crate::storage::WHY_TRACE_SUBSTRATE_SYSTEM,
+        }),
         reflection_depth: 0,
         memory_kind: crate::models::MemoryKind::Observation,
         entity_id: None,
@@ -808,15 +817,24 @@ pub fn reverse_rollback_entry(conn: &Connection, entry: &RollbackEntry) -> Resul
                 check_no_collision(conn, &m.title, &m.namespace, &m.id)?;
             }
             // Delete the consolidated memory; re-insert the originals.
+            // #2110 — a rollback re-store is a SUBSTRATE-authored re-insertion
+            // (curator autonomy) via a direct `db::insert`; record the
+            // substrate why_trace (stamp-if-absent — a restored original that
+            // already carried one keeps it) so the re-store satisfies
+            // AI_MEMORY_REQUIRE_WHY_TRACE.
             let existed = db::delete(conn, result_id)?;
             for m in originals {
-                db::insert(conn, m)?;
+                let mut m = m.clone();
+                crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+                db::insert(conn, &m)?;
             }
             Ok(existed)
         }
         RollbackEntry::Forget { snapshot } => {
             check_no_collision(conn, &snapshot.title, &snapshot.namespace, &snapshot.id)?;
-            db::insert(conn, snapshot)?;
+            let mut snapshot = snapshot.clone();
+            crate::storage::stamp_substrate_why_trace(&mut snapshot.metadata);
+            db::insert(conn, &snapshot)?;
             Ok(true)
         }
         RollbackEntry::PriorityAdjust {

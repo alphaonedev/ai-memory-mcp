@@ -208,17 +208,33 @@ pub fn why_trace_present(metadata: &serde_json::Value) -> bool {
         .is_some_and(|s| !s.trim().is_empty())
 }
 
-/// #2059 + #2106 review item 4 — memory kinds the SUBSTRATE itself mints
-/// (the curator reflection pass, `db::reflect`, persona generation), which
-/// are EXEMPT from the CALLER-origin why_trace requirement. A
-/// caller-authored provenance rationale cannot meaningfully apply to a
-/// substrate-authored row, and enforcing it would refuse ALL internal
-/// reflection/persona automation the moment an operator sets
-/// `AI_MEMORY_REQUIRE_WHY_TRACE=1` (the #2106 item-4 operational hazard).
-/// Federation-received + archive-restore writes get their own never-refuse
-/// handling via [`consult_why_trace_gate_inbound`].
-fn why_trace_exempt_kind(kind: MemoryKind) -> bool {
-    matches!(kind, MemoryKind::Reflection | MemoryKind::Persona)
+/// #2110 — canonical `metadata.why_trace` rationales the SUBSTRATE stamps on
+/// its OWN internally-authored writes (curator reflection pass, `db::reflect`,
+/// persona generation, atomisation, curator autonomy rollback/report). Because
+/// the #2110 fix keys the why_trace requirement on the write's AUTHENTICATED
+/// ORIGIN — never on the caller-controlled `memory_kind` (which any external
+/// HTTP/MCP caller can set to `reflection`/`persona` to forge an exemption) —
+/// substrate code records its own rationale here so its writes satisfy
+/// `AI_MEMORY_REQUIRE_WHY_TRACE` WITHOUT a forgeable kind-exemption hole. An
+/// external caller cannot reach these construction sites nor set
+/// `CallerContext::bypass_visibility`, so this is an origin marker, not a
+/// self-asserted flag.
+pub const WHY_TRACE_SUBSTRATE_SYSTEM: &str = "substrate:system-authored";
+
+/// #2110 — stamp [`WHY_TRACE_SUBSTRATE_SYSTEM`] on a substrate-authored write's
+/// metadata when it carries no caller-supplied `why_trace`. Idempotent +
+/// non-clobbering (preserves any why_trace already present) and a no-op on a
+/// non-object metadata value.
+pub fn stamp_substrate_why_trace(metadata: &mut serde_json::Value) {
+    if why_trace_present(metadata) {
+        return;
+    }
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            META_KEY_WHY_TRACE.to_string(),
+            serde_json::Value::String(WHY_TRACE_SUBSTRATE_SYSTEM.to_string()),
+        );
+    }
 }
 
 /// #2104 — emit the covenant clause-1 signal on a why_trace miss: an
@@ -281,7 +297,7 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
 /// # Errors
 /// [`GovernanceRefusal`] when why_trace is absent AND require-mode is on.
 pub fn consult_why_trace_gate(mem: &Memory) -> Result<()> {
-    if why_trace_present(&mem.metadata) || why_trace_exempt_kind(mem.memory_kind) {
+    if why_trace_present(&mem.metadata) {
         return Ok(());
     }
     let refused = require_why_trace_enabled();
@@ -308,7 +324,7 @@ pub fn consult_why_trace_gate(mem: &Memory) -> Result<()> {
 /// on the very same funnels (env #95). The covenant miss is still WARNed +
 /// forensically recorded (advisory disposition), never enforced.
 pub fn consult_why_trace_gate_inbound(mem: &Memory) {
-    if why_trace_present(&mem.metadata) || why_trace_exempt_kind(mem.memory_kind) {
+    if why_trace_present(&mem.metadata) {
         return;
     }
     emit_why_trace_signal(mem, false);

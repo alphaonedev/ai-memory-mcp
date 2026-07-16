@@ -12851,9 +12851,15 @@ impl MemoryStore for PostgresStore {
         // operator-signed governance. See module-level comment in
         // `src/storage/mod.rs` for the full layering rationale.
         consult_governance_pre_write_pg(memory)?;
-        // #2059 — TRACT covenant clause 1: mandatory why_trace write-gate,
-        // postgres twin of the sqlite `db::insert` check.
-        consult_why_trace_gate_pg(memory)?;
+        // #2059/#2110 — TRACT covenant clause 1 why_trace write-gate. Keyed on
+        // the write's AUTHENTICATED ORIGIN, never the caller-controlled
+        // `memory_kind`: an authenticated SYSTEM principal
+        // (`CallerContext::bypass_visibility` — curator/autonomy self-writes,
+        // per env #48; external HTTP/MCP tenant callers can NEVER set it) is
+        // exempt; every tenant write is gated.
+        if !ctx.bypass_visibility {
+            consult_why_trace_gate_pg(memory)?;
+        }
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13190,9 +13196,11 @@ impl MemoryStore for PostgresStore {
         // refuse hook that every backend write path consults).
         for memory in memories {
             consult_governance_pre_write_pg(memory)?;
-            // #2059/#2102 — TRACT covenant clause 1 on the bulk-create funnel
-            // (postgres twin of the sqlite `insert` gate).
-            consult_why_trace_gate_pg(memory)?;
+            // #2059/#2102/#2110 — clause 1 on the bulk-create funnel, exempting
+            // the authenticated SYSTEM principal (bypass_visibility).
+            if !ctx.bypass_visibility {
+                consult_why_trace_gate_pg(memory)?;
+            }
         }
 
         // Keep the LAST occurrence of each (title, namespace) so the
@@ -13959,11 +13967,12 @@ impl MemoryStore for PostgresStore {
         // refuse rule could be bypassed by routing through the
         // embedded-vector path. See `src/storage/mod.rs` for context.
         consult_governance_pre_write_pg(memory)?;
-        // #2059/#2102 — TRACT covenant clause 1 on the embed-before-store
-        // hot path (the PRIMARY create anchor on postgres daemons). Without
-        // this the default create-with-embedding flow was entirely
-        // unenforced under AI_MEMORY_REQUIRE_WHY_TRACE=1.
-        consult_why_trace_gate_pg(memory)?;
+        // #2059/#2102/#2110 — clause 1 on the embed-before-store hot path (the
+        // PRIMARY create anchor on postgres daemons), exempting the
+        // authenticated SYSTEM principal (bypass_visibility).
+        if !ctx.bypass_visibility {
+            consult_why_trace_gate_pg(memory)?;
+        }
 
         // Same upsert contract as `store` but additionally writes the
         // pgvector `embedding` column when a vector is supplied. This

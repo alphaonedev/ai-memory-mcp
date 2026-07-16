@@ -149,10 +149,24 @@ impl MemoryStore for SqliteStore {
         crate::store::record_stop::status_sqlite(&conn).map_err(box_err)
     }
 
-    async fn store(&self, _ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+    async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
         self.gate_record_stop()?;
+        // #2110 — TRACT covenant clause 1 authenticated-origin exemption. The
+        // why_trace gate inside `db::insert` keys on PRESENCE, never on the
+        // caller-controlled `memory_kind` (a forgeable exemption an external
+        // caller could set to `reflection`/`persona`). An authenticated SYSTEM
+        // principal (`CallerContext::bypass_visibility` — curator autonomy /
+        // consolidation / rollback re-stores, per env #48; external HTTP/MCP
+        // tenant callers can NEVER set it) records the substrate rationale so
+        // its writes satisfy `AI_MEMORY_REQUIRE_WHY_TRACE` without a bypass.
         let conn = self.state.lock().await;
-        db::insert(&conn, memory).map_err(box_err)
+        if ctx.bypass_visibility {
+            let mut stamped = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::insert(&conn, &stamped).map_err(box_err)
+        } else {
+            db::insert(&conn, memory).map_err(box_err)
+        }
     }
 
     /// v0.7.0 #1416 — L4 layered-capture idempotent write. Delegates to
@@ -1015,7 +1029,7 @@ impl MemoryStore for SqliteStore {
 
     async fn reflect(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         input: &crate::storage::reflect::ReflectInput,
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
@@ -1023,7 +1037,18 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         let mut hooks = db::ReflectHooks::empty();
         hooks.active_keypair = signing_key;
-        db::reflect_with_hooks(&conn, input, &hooks)
+        // #2110 — authenticated-origin why_trace stamp on the INTERNAL reflect
+        // path (curator reflection pass runs under `bypass_visibility`). An
+        // EXTERNAL `memory_reflect` caller (tenant ctx) is NOT stamped, so the
+        // reflection funnel's why_trace gate still enforces on it — a caller
+        // can supply `why_trace` via the reflect input metadata.
+        if ctx.bypass_visibility {
+            let mut stamped = input.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::reflect_with_hooks(&conn, &stamped, &hooks)
+        } else {
+            db::reflect_with_hooks(&conn, input, &hooks)
+        }
     }
 
     async fn get_reflection_origin(

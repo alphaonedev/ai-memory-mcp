@@ -234,3 +234,96 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
     );
     unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
 }
+
+// ── #2110 — authenticated-origin exemption (system principal exempt, tenant
+//    gated regardless of forged kind), end-to-end on both SAL backends ──
+
+/// sqlite SAL: no live PG needed — runs always under `--features sal-postgres`.
+#[tokio::test]
+async fn sqlite_system_principal_exempt_tenant_gated_under_enforce_2110() {
+    use ai_memory::store::sqlite::SqliteStore;
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let store = SqliteStore::open(":memory:").expect("open in-memory store");
+
+    // Tenant principal forging kind:"reflection" → still REFUSED (no origin
+    // exemption; the caller-asserted kind is not trusted — the #2110 fix).
+    let tenant = CallerContext::for_agent("ai:tenant-2110");
+    let mut forged = pg_mem(
+        "sq-forge",
+        "ns/2110-sq",
+        "forged reflection",
+        "tenant",
+        None,
+    );
+    forged.memory_kind = MemoryKind::Reflection;
+    assert!(
+        store.store(&tenant, &forged).await.is_err(),
+        "tenant why_trace-less write refused regardless of forged kind"
+    );
+    let mut forged_p = pg_mem("sq-forge-p", "ns/2110-sq", "forged persona", "tenant", None);
+    forged_p.memory_kind = MemoryKind::Persona;
+    assert!(store.store(&tenant, &forged_p).await.is_err());
+
+    // System principal (`for_admin` → bypass_visibility) → EXEMPT + stamped.
+    let system = CallerContext::for_admin("ai:curator-2110");
+    let sys = pg_mem(
+        "sq-sys",
+        "ns/2110-sq-sys",
+        "system write",
+        "ai:curator",
+        None,
+    );
+    let id = store
+        .store(&system, &sys)
+        .await
+        .expect("authenticated system principal is exempt");
+    let got = store.get(&system, &id).await.expect("get");
+    assert_eq!(
+        got.metadata.get("why_trace").and_then(|v| v.as_str()),
+        Some("substrate:system-authored")
+    );
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+#[tokio::test]
+async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_system_principal_exempt_2110: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2110-{run}");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Tenant forging kind → REFUSED.
+    let tenant = CallerContext::for_agent("ai:tenant-2110");
+    let mut forged = pg_mem(
+        &format!("pf-{run}"),
+        &ns,
+        "forged reflection",
+        "tenant",
+        None,
+    );
+    forged.memory_kind = MemoryKind::Reflection;
+    let err = store
+        .store(&tenant, &forged)
+        .await
+        .expect_err("tenant why_trace-less write refused regardless of forged kind");
+    assert!(is_permission_denied(&err), "got {err:?}");
+
+    // System principal → EXEMPT.
+    let system = CallerContext::for_admin("ai:curator-2110");
+    let sys = pg_mem(
+        &format!("ps-{run}"),
+        &ns,
+        "system write",
+        "ai:curator",
+        None,
+    );
+    store
+        .store(&system, &sys)
+        .await
+        .expect("authenticated system principal is exempt on pg");
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}

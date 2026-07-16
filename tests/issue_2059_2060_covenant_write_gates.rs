@@ -358,31 +358,39 @@ fn update_with_archive_on_supersede_refuses_authorship_rewrite_under_enforce() {
     unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
 }
 
-// ── New-behavior coverage (#2102 reflection exemption / inbound never-refuse;
-//    #2106 item 2 omission-preservation) ───────────────────────────────────
+// ── #2110 — the why_trace exemption keys on AUTHENTICATED ORIGIN, never on
+//    the caller-controlled `memory_kind` (which any external caller can set) ──
 
 #[test]
-fn reflection_kind_is_exempt_from_why_trace_enforce() {
+fn external_caller_cannot_forge_why_trace_exemption_via_kind() {
     let _g = covenant_env_lock();
     unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
     let conn = fresh_conn();
-    // #2106 item 4 — a substrate-authored Reflection row with NO why_trace is
-    // exempt (the reflection funnel `insert_with_conflict(Error)` is wired to
-    // the gate, but the gate never refuses a Reflection/Persona kind), so the
-    // curator reflection pass keeps working under enforce.
-    let mut refl = make_mem("a reflection", "ns/reflect-exempt");
-    refl.memory_kind = MemoryKind::Reflection;
-    assert!(
-        db::insert_with_conflict(&conn, &refl, db::ConflictMode::Error).is_ok(),
-        "enforce must NOT refuse a substrate Reflection write lacking why_trace"
-    );
-    // A caller-origin Observation still gets refused via the same funnel.
-    let obs = make_mem("an observation", "ns/reflect-exempt");
-    let err = db::insert_with_conflict(&conn, &obs, db::ConflictMode::Error)
-        .expect_err("enforce must refuse a why_trace-less Observation via insert_with_conflict");
-    assert!(err.downcast_ref::<GovernanceRefusal>().is_some());
+    // #2110 HIGH — pre-fix, a caller defeated AI_MEMORY_REQUIRE_WHY_TRACE=1 by
+    // setting `kind:"reflection"` (or `"persona"`) since the gate exempted
+    // those substrate-authored kinds by the SELF-ASSERTED `memory_kind`. The
+    // exemption is now removed: a why_trace-less write is REFUSED at the funnel
+    // REGARDLESS of kind. (`db::insert` is the reachable external funnel for MCP
+    // `memory_store` — `src/mcp/tools/store/mod.rs` calls it directly — and the
+    // sqlite HTTP create path.)
+    for kind in [MemoryKind::Reflection, MemoryKind::Persona] {
+        let mut mem = make_mem(&format!("forged {kind:?}"), "ns/2110");
+        mem.memory_kind = kind;
+        let err = db::insert(&conn, &mem).unwrap_err();
+        assert!(
+            err.downcast_ref::<GovernanceRefusal>().is_some(),
+            "enforce must refuse a why_trace-less {kind:?} write (no kind-forged exemption)"
+        );
+        // The forged-kind write with a why_trace present still succeeds.
+        let mut ok = make_mem(&format!("forged {kind:?} with wt"), "ns/2110-ok");
+        ok.memory_kind = kind;
+        ok.metadata = serde_json::json!({"why_trace": "caller rationale"});
+        assert!(db::insert(&conn, &ok).is_ok());
+    }
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
+
+// ── New-behavior coverage (inbound never-refuse; #2106 item 2 omission) ──
 
 #[test]
 fn insert_if_newer_never_refuses_missing_why_trace_under_enforce() {
@@ -442,3 +450,10 @@ fn update_omitting_agent_id_preserves_authorship() {
         "the caller's non-provenance keys still land"
     );
 }
+
+// NOTE (#2110): the authenticated-ORIGIN exemption end-to-end (a
+// `CallerContext::bypass_visibility` system principal is exempt while a tenant
+// caller — even one forging `kind:"reflection"` — is gated) is exercised via
+// the SAL `SqliteStore` / `PostgresStore` in `tests/issue_2059_2060_covenant_pg.rs`
+// (feature `sal-postgres`), since `ai_memory::store` is `sal`-feature-gated and
+// unavailable in this default-features test binary.
