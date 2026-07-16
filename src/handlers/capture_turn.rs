@@ -114,7 +114,10 @@ pub async fn capture_turn(
         // directly under the shared connection lock.
         let state = app.db.clone();
         let lock = state.lock().await;
-        match crate::storage::capture_turn_idempotent(&lock.0, &write) {
+        // #2121 — tenant HTTP surface: never substrate-authored (parity with
+        // the SAL branch above, whose `for_agent` ctx has
+        // `bypass_visibility = false`).
+        match crate::storage::capture_turn_idempotent(&lock.0, &write, false) {
             Ok(result) => capture_turn_ok(&result, &attest_level),
             Err(msg) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

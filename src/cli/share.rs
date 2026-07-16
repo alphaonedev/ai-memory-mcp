@@ -63,6 +63,13 @@ pub struct ShareArgs {
     #[arg(long = "target-agent", value_name = "AGENT_ID")]
     pub target_agent: String,
 
+    /// Covenant clause-1 rationale override (#2122). The shared copy
+    /// inherits the source's metadata.why_trace when omitted; supply this
+    /// to share a legacy source that predates the covenant under
+    /// AI_MEMORY_REQUIRE_WHY_TRACE=1.
+    #[arg(long = "why-trace", value_name = "TEXT")]
+    pub why_trace: Option<String>,
+
     /// Emit the raw JSON envelope (the same shape MCP / HTTP return)
     /// instead of the human-readable summary line.
     #[arg(long)]
@@ -93,10 +100,15 @@ pub fn cmd_share(
     // CLI flag names diverge from the MCP wire shape for shell
     // ergonomics (`--memory-id` vs `source_memory_id`) but the shared
     // dispatcher only sees the canonical MCP field names.
-    let params: Value = json!({
+    let mut params: Value = json!({
         (field_names::SOURCE_MEMORY_ID): args.memory_id,
         (field_names::TARGET_AGENT_ID): args.target_agent,
     });
+    // #2122 — thread the caller's covenant clause-1 rationale override
+    // (three-surface parity with the MCP param + HTTP body field).
+    if let Some(wt) = &args.why_trace {
+        params[db::META_KEY_WHY_TRACE] = json!(wt);
+    }
 
     let envelope = crate::mcp::share::handle_share(&conn, &params)
         .map_err(|e| anyhow::anyhow!("share: {e}"))?;
@@ -164,6 +176,7 @@ mod tests {
         let args = ShareArgs {
             memory_id: src_id.clone(),
             target_agent: "ai:bob".to_string(),
+            why_trace: None,
             json: true,
         };
         {
@@ -217,6 +230,7 @@ mod tests {
         let args = ShareArgs {
             memory_id: src_id,
             target_agent: "ai:bob".to_string(),
+            why_trace: None,
             json: false,
         };
         {
@@ -240,6 +254,7 @@ mod tests {
         let args = ShareArgs {
             memory_id: uuid::Uuid::new_v4().to_string(),
             target_agent: "ai:bob".to_string(),
+            why_trace: None,
             json: true,
         };
         let mut out = env.output();

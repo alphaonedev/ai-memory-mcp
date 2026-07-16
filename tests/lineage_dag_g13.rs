@@ -185,6 +185,7 @@ fn multi_hop_ancestry_store_reflect_consolidate() {
         &Tier::Long,
         "consolidation",
         "ai:consolidator",
+        false,
     )
     .unwrap();
 
@@ -261,6 +262,7 @@ fn consolidate_emits_exactly_one_leaf_per_source() {
         &Tier::Long,
         "consolidation",
         "ai:consolidator",
+        false,
     )
     .unwrap();
 
@@ -301,6 +303,7 @@ fn consolidate_leaf_predicate_matrix() {
         &Tier::Long,
         "consolidation",
         "ai:consolidator",
+        false,
     )
     .unwrap();
     assert!(
@@ -329,6 +332,7 @@ fn consolidate_leaf_predicate_matrix() {
         &Tier::Long,
         "consolidation",
         "ai:consolidator",
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -534,6 +538,7 @@ fn consolidate_flag_off_preserves_legacy() {
         &Tier::Long,
         "consolidation",
         "ai:consolidator",
+        false,
     )
     .unwrap();
 

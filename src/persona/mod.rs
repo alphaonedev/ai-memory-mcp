@@ -372,7 +372,7 @@ impl<'a> PersonaGenerator<'a> {
             }
         });
 
-        let persona_mem = Memory {
+        let mut persona_mem = Memory {
             cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
             id: persona_id_local.clone(),
             tier: self.config.tier.clone(),
@@ -424,6 +424,11 @@ impl<'a> PersonaGenerator<'a> {
             .unchecked_transaction()
             .context("begin persona write transaction")?;
 
+        // #2110 — persona rows are substrate-generated (the QW-2 generator
+        // authored this artifact), reached via a direct `db::insert` that
+        // bypasses the SAL authenticated-origin exemption; record the substrate
+        // why_trace so the persona write satisfies AI_MEMORY_REQUIRE_WHY_TRACE.
+        crate::storage::stamp_substrate_why_trace(&mut persona_mem.metadata);
         let persona_id = db::insert(self.conn, &persona_mem)
             .with_context(|| format!("inserting persona for {entity_id} v{version}"))?;
 

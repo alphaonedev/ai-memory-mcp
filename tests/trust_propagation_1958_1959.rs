@@ -141,6 +141,7 @@ fn consolidate_stamps_min_propagated_trust() {
         &Tier::Long,
         "test",
         "ai:consolidator",
+        false,
     )
     .expect("consolidate");
 
@@ -185,6 +186,7 @@ fn consolidate_sibling_merge_takes_the_min() {
         &Tier::Long,
         "test",
         "ai:consolidator",
+        false,
     )
     .expect("consolidate");
     let merged = db::get(&conn, &cid).unwrap().unwrap();

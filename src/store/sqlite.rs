@@ -149,38 +149,61 @@ impl MemoryStore for SqliteStore {
         crate::store::record_stop::status_sqlite(&conn).map_err(box_err)
     }
 
-    async fn store(&self, _ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+    async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
         self.gate_record_stop()?;
+        // #2110 — TRACT covenant clause 1 authenticated-origin exemption. The
+        // why_trace gate inside `db::insert` keys on PRESENCE, never on the
+        // caller-controlled `memory_kind` (a forgeable exemption an external
+        // caller could set to `reflection`/`persona`). An authenticated SYSTEM
+        // principal (`CallerContext::bypass_visibility` — curator autonomy /
+        // consolidation / rollback re-stores, per env #48; external HTTP/MCP
+        // tenant callers can NEVER set it) records the substrate rationale so
+        // its writes satisfy `AI_MEMORY_REQUIRE_WHY_TRACE` without a bypass.
         let conn = self.state.lock().await;
-        db::insert(&conn, memory).map_err(box_err)
+        if ctx.bypass_visibility {
+            let mut stamped = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::insert(&conn, &stamped).map_err(box_err)
+        } else {
+            db::insert(&conn, memory).map_err(box_err)
+        }
     }
 
     /// v0.7.0 #1416 — L4 layered-capture idempotent write. Delegates to
     /// the sqlite SSOT `db::capture_turn_idempotent`, which the MCP
     /// `memory_capture_turn` handler also calls, so the dedup-lookup +
     /// atomic three-row transaction lives in exactly one place.
+    ///
+    /// #2121 — the covenant clause-1 substrate why_trace stamp is keyed on
+    /// `ctx.bypass_visibility` (authenticated internal origin), exactly like
+    /// [`Self::store`] / [`Self::reflect`]: a tenant capture with no
+    /// caller-supplied `metadata.why_trace` is REFUSED under
+    /// `AI_MEMORY_REQUIRE_WHY_TRACE=1`.
     async fn capture_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::capture_turn_idempotent(&conn, write).map_err(box_err)
+        db::capture_turn_idempotent(&conn, write, ctx.bypass_visibility).map_err(box_err)
     }
 
     /// #1693 — L2 transcript-recovery idempotent write. Delegates to the
     /// sqlite SSOT `db::recover_turn_idempotent`, which the sync recover path
     /// also calls, so the dual-dedup lookup + atomic two-row transaction
     /// lives in exactly one place.
+    ///
+    /// #2121 — substrate why_trace stamp keyed on `ctx.bypass_visibility`
+    /// (see [`Self::capture_turn_idempotent`]).
     async fn recover_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::recover_turn_idempotent(&conn, write).map_err(box_err)
+        db::recover_turn_idempotent(&conn, write, ctx.bypass_visibility).map_err(box_err)
     }
 
     /// #1693 — L2 recovery fast-path watermark (indexed
@@ -1017,9 +1040,15 @@ impl MemoryStore for SqliteStore {
         db::forget_distinct_namespaces(&conn, pattern, tier).map_err(box_err)
     }
 
+    /// #2121 — the covenant clause-1 substrate why_trace stamp on the
+    /// consolidated summary is keyed on `ctx.bypass_visibility`
+    /// (authenticated internal origin — the curator `ConsolidationPass`
+    /// runs `for_admin`), exactly like [`Self::store`] / [`Self::reflect`].
+    /// A tenant consolidate whose merged metadata carries no why_trace is
+    /// REFUSED under `AI_MEMORY_REQUIRE_WHY_TRACE=1`.
     async fn consolidate(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         title: &str,
         summary: &str,
@@ -1039,13 +1068,14 @@ impl MemoryStore for SqliteStore {
             tier,
             source,
             consolidator_agent_id,
+            ctx.bypass_visibility,
         )
         .map_err(box_err)
     }
 
     async fn reflect(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         input: &crate::storage::reflect::ReflectInput,
         signing_key: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> Result<crate::storage::reflect::ReflectOutcome, crate::storage::reflect::ReflectError>
@@ -1053,7 +1083,18 @@ impl MemoryStore for SqliteStore {
         let conn = self.state.lock().await;
         let mut hooks = db::ReflectHooks::empty();
         hooks.active_keypair = signing_key;
-        db::reflect_with_hooks(&conn, input, &hooks)
+        // #2110 — authenticated-origin why_trace stamp on the INTERNAL reflect
+        // path (curator reflection pass runs under `bypass_visibility`). An
+        // EXTERNAL `memory_reflect` caller (tenant ctx) is NOT stamped, so the
+        // reflection funnel's why_trace gate still enforces on it — a caller
+        // can supply `why_trace` via the reflect input metadata.
+        if ctx.bypass_visibility {
+            let mut stamped = input.clone();
+            crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
+            db::reflect_with_hooks(&conn, &stamped, &hooks)
+        } else {
+            db::reflect_with_hooks(&conn, input, &hooks)
+        }
     }
 
     async fn get_reflection_origin(
@@ -2199,6 +2240,7 @@ impl MemoryStore for SqliteStore {
         payload: &str,
         priority: Option<i32>,
         tier: Option<&Tier>,
+        why_trace: Option<&str>,
     ) -> StoreResult<String> {
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
@@ -2206,11 +2248,17 @@ impl MemoryStore for SqliteStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
+        // #2122 — caller-supplied covenant clause-1 rationale (the payload
+        // is verbatim caller content, so the substrate never stamps its own
+        // rationale here; see the trait docs).
+        if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
+            metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: resolved_tier,
@@ -2716,15 +2764,33 @@ mod tests {
         );
     }
 
+    /// `verify` flags a row whose `metadata.agent_id` is missing — the
+    /// integrity check `super::integrity_findings` exists for exactly this
+    /// corruption class (direct on-disk tampering / a legacy pre-covenant
+    /// row), so the corrupt state MUST be established via a RAW write.
+    ///
+    /// #2106 (covenant clause 2, PR #2101) closed the omission-erasure hole:
+    /// `update_with_expected_version` now overlays the OLD row's immutable
+    /// provenance keys (`agent_id` / `derived_from` /
+    /// `consolidated_from_agents`) back onto any patch that omits them, so a
+    /// caller `update(metadata: {})` can NO LONGER wipe authorship — erasure
+    /// being strictly worse than the rewrite the clause-2 gate already
+    /// refuses. The former version of this test corrupted agent_id via that
+    /// very `update(metadata: {})` path; post-#2106 that path preserves
+    /// agent_id, so this test now (a) asserts the covenant preservation and
+    /// (b) exercises the real `verify` detection via a raw metadata wipe.
     #[tokio::test]
-    async fn verify_flags_empty_content() {
+    async fn verify_flags_missing_agent_id_update_preserves_2106() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("hello", "x content long enough to pass validate");
         mem.content = "nonempty for store".to_string();
         let id = store.store(&ctx, &mem).await.expect("store");
-        // Manually corrupt metadata.agent_id via update.
+
+        // #2106 — a full-object metadata patch that OMITS agent_id must NOT
+        // erase the stored author; the provenance overlay preserves it, so
+        // `verify` still sees a clean row.
         store
             .update(
                 &ctx,
@@ -2736,6 +2802,23 @@ mod tests {
             )
             .await
             .expect("update");
+        let preserved = store.verify(&ctx, &id).await.expect("verify");
+        assert!(
+            preserved.integrity_ok,
+            "#2106: an omitting metadata patch must PRESERVE agent_id, not erase it"
+        );
+
+        // Raw on-disk corruption (bypassing the caller preservation overlay)
+        // wipes agent_id — the tampering class the integrity check detects.
+        // Scope the connection guard so it is released before `verify` re-locks.
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "UPDATE memories SET metadata = '{}' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("raw metadata wipe");
+        }
         let report = store.verify(&ctx, &id).await.expect("verify");
         assert!(!report.integrity_ok);
         assert!(
@@ -3555,6 +3638,7 @@ mod tests {
                 "ai:notify-target",
                 "hello",
                 "payload body",
+                None,
                 None,
                 None,
             )

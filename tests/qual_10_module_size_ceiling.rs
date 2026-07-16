@@ -314,10 +314,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (mint_recovery_record + prepare_recovery_challenge + append_recovery)
     // + the recovery-branch in append_lineage_record + the persisted-recovery
     // ceremony test land storage/mod.rs at 24_421; ceiling 24_500 (+79).
-    // 2026-07-15 — #2044 (#2032-A) per-agent api-key db helpers
-    // (bind/resolve/list `agent_api_keys`) land storage/mod.rs at 24_519;
-    // ceiling 24_600 (+81).
-    ("src/storage/mod.rs", 24_600),
+    // 2026-07-15 (#2059/#2060, TRACT covenant clauses 1+2): the write-gate
+    // helpers (`consult_why_trace_gate` / `require_why_trace_enabled` /
+    // `why_trace_present`) + the authorship-immutability gate
+    // (`consult_authorship_immutable_gate` / `require_immutable_authorship_enabled`)
+    // wired into `insert` / `update_with_expected_version` /
+    // `update_with_archive_on_supersede`, plus their in-module regression
+    // tests, land storage/mod.rs at 24_948; ceiling 25_050 (+102).
+    ("src/storage/mod.rs", 25_050),
     // 2026-06-10 (#1579 B6/F5.6, storage lane) — the embed-backfill
     // sweep converted from whole-backlog materialisation to a bounded
     // drain loop over `get_unembedded_ids_batch` (+ the no-progress
@@ -728,10 +732,22 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-15 (#2032 security-hardening tranche): the LM1 forget-LIKE
     // escape + L4 build_find_paths self-guard + release-active assert_age_id
     // wiring land postgres.rs at 26_653; ceiling 26_750 (+97).
-    // 2026-07-15 — #2044 (#2032-A) per-agent api-key SAL impls (migrate_v83 +
-    // bind/resolve/list `agent_api_keys` on PostgresStore) land postgres.rs at
-    // 26_781; ceiling 26_850 (+69).
-    ("src/store/postgres.rs", 26_850),
+    // 2026-07-15 (#2059/#2060, TRACT covenant clauses 1+2): the postgres
+    // twins `consult_why_trace_gate_pg` / `consult_authorship_immutable_gate_pg`
+    // (thin downcast-and-map wrappers over the shared `crate::storage` gate,
+    // mirroring `consult_governance_pre_write_pg`) wired into `store` /
+    // `update_with_expected_version_once`, plus their in-module regression
+    // tests, land postgres.rs at 26_816; ceiling 26_900 (+84).
+    // 2026-07-16 (#2113 + every-funnel audit): the why_trace/authorship/inbound
+    // + substrate-stamp wiring across the remaining pg funnels — reflect_with_hooks
+    // (#2113), capture_turn / recover_turn / consolidate stamps, archive_restore
+    // inbound, and the last un-gated create funnel `update_with_archive_on_supersede`
+    // — lands postgres.rs at 26_901; ceiling 26_980 (+79).
+    // 2026-07-16 (#2101 rebase onto release @ #2088): the covenant pg
+    // funnel-audit wiring (26_980) MERGED with #2044's agent_api_keys SAL
+    // impls (#2088, was 26_850 on release) lands the combined postgres.rs at
+    // 27_054; ceiling 27_150 (+96).
+    ("src/store/postgres.rs", 27_150),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

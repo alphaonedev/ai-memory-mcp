@@ -134,6 +134,12 @@ pub(super) fn handle_consolidate(
             return Err(e.to_string());
         }
     }
+    // #2121 — `memory_consolidate` is a TENANT-facing authoring write (the
+    // summary is verbatim caller content), so it never claims the
+    // substrate-authored why_trace exemption (`substrate_authored = false`);
+    // under AI_MEMORY_REQUIRE_WHY_TRACE=1 the merged metadata must carry a
+    // why_trace (caller-supplied on a source, or inherited) or the write is
+    // refused at the consolidate gate.
     let new_id = match db::consolidate(
         conn,
         &ids,
@@ -143,6 +149,7 @@ pub(super) fn handle_consolidate(
         &Tier::Long,
         crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
+        false,
     ) {
         Ok(id) => id,
         Err(e) => {

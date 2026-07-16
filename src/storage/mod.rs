@@ -172,6 +172,269 @@ pub(crate) fn consult_governance_pre_write(mem: &Memory) -> Result<()> {
     Ok(())
 }
 
+/// #2059 — TRACT covenant clause 1 (`docs/spec/TRACT-L1-CLAIM-CONTRACT.md`
+/// §8.1): env knob gating the WRITE path, mirroring the shape of the
+/// existing VERIFY-time `AI_MEMORY_REQUIRE_CAUSE_BINDING`
+/// (`governance::audit::REQUIRE_CAUSE_BINDING_ENV`) — same truthy grammar,
+/// same secure-opt-in default (`false` = permissive/advisory). Default
+/// `false` keeps every write path byte-identical to pre-#2059 behavior.
+pub const REQUIRE_WHY_TRACE_ENV: &str = "AI_MEMORY_REQUIRE_WHY_TRACE";
+
+/// Metadata key a caller supplies as the write's provenance rationale —
+/// the covenant's `why_trace` (clause 1). Free text; only PRESENCE
+/// (non-empty after trim) is checked here. This is deliberately distinct
+/// from `signed_events.cause_hash` (#1822 G5a): that binds an
+/// identity-derived pre-image into the append-only audit chain for
+/// specific privileged actions, while `why_trace` is a caller-authored
+/// rationale carried on the memory itself, checked at the point of
+/// authorship rather than the point of audit.
+pub const META_KEY_WHY_TRACE: &str = "why_trace";
+
+/// `true` when [`REQUIRE_WHY_TRACE_ENV`] is set truthy (`1`/`true`/`yes`/
+/// `on`). Delegates to the shared `governance::audit::env_flag_enabled`
+/// truthy-grammar helper (#2106 review item 6 — one truthy parser, not a
+/// third copy alongside the K2 witness/cause-binding knobs).
+#[must_use]
+pub fn require_why_trace_enabled() -> bool {
+    crate::governance::audit::env_flag_enabled(REQUIRE_WHY_TRACE_ENV)
+}
+
+/// `true` when `metadata.why_trace` is a non-empty string.
+#[must_use]
+pub fn why_trace_present(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get(META_KEY_WHY_TRACE)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// #2110 — canonical `metadata.why_trace` rationales the SUBSTRATE stamps on
+/// its OWN internally-authored writes (curator reflection pass, `db::reflect`,
+/// persona generation, atomisation, curator autonomy rollback/report). Because
+/// the #2110 fix keys the why_trace requirement on the write's AUTHENTICATED
+/// ORIGIN — never on the caller-controlled `memory_kind` (which any external
+/// HTTP/MCP caller can set to `reflection`/`persona` to forge an exemption) —
+/// substrate code records its own rationale here so its writes satisfy
+/// `AI_MEMORY_REQUIRE_WHY_TRACE` WITHOUT a forgeable kind-exemption hole. An
+/// external caller cannot reach these construction sites nor set
+/// `CallerContext::bypass_visibility`, so this is an origin marker, not a
+/// self-asserted flag.
+pub const WHY_TRACE_SUBSTRATE_SYSTEM: &str = "substrate:system-authored";
+
+/// #2110 — stamp [`WHY_TRACE_SUBSTRATE_SYSTEM`] on a substrate-authored write's
+/// metadata when it carries no caller-supplied `why_trace`. Idempotent +
+/// non-clobbering (preserves any why_trace already present) and a no-op on a
+/// non-object metadata value.
+pub fn stamp_substrate_why_trace(metadata: &mut serde_json::Value) {
+    if why_trace_present(metadata) {
+        return;
+    }
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            META_KEY_WHY_TRACE.to_string(),
+            serde_json::Value::String(WHY_TRACE_SUBSTRATE_SYSTEM.to_string()),
+        );
+    }
+}
+
+/// #2104 — emit the covenant clause-1 signal on a why_trace miss: an
+/// always-on WARN (`covenant.why_trace` target) PLUS a durable forensic
+/// [`crate::governance::audit::record_decision`] row. Both fire BEFORE the
+/// caller's enforce short-circuit so an operator sees the miss server-side
+/// even when the write is refused (#2104 item 1) AND can query it after the
+/// fact (#2104 item 2). `refused` distinguishes the enforce refusal from
+/// the advisory-only disposition in both surfaces.
+fn emit_why_trace_signal(mem: &Memory, refused: bool) {
+    let disposition = if refused { "refused" } else { "advisory" };
+    tracing::warn!(
+        target: "covenant.why_trace",
+        title = %mem.title,
+        namespace = %mem.namespace,
+        disposition,
+        "write missing metadata.{} provenance rationale ({}; set {}=1 to enforce)",
+        META_KEY_WHY_TRACE,
+        disposition,
+        REQUIRE_WHY_TRACE_ENV,
+    );
+    // #2104 item 2 — a DURABLE forensic record on the enforce-mode REFUSAL
+    // only. The advisory (default) posture stays WARN-only: appending a
+    // forensic row on EVERY why_trace-less write would mutate global forensic
+    // chain state on the default hot path for zero enforcement benefit (and is
+    // the reviewer's "at minimum, on every REFUSAL" scope).
+    if refused {
+        let actor = mem
+            .metadata
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        crate::governance::audit::record_decision(
+            actor,
+            disposition,
+            "covenant.why_trace",
+            REQUIRE_WHY_TRACE_ENV,
+            serde_json::json!({ "title": mem.title, "namespace": mem.namespace }),
+        );
+    }
+}
+
+/// #2059 — TRACT covenant clause 1 write-gate, consulted at every
+/// CALLER-ORIGIN store write funnel (`insert`, `insert_with_conflict`,
+/// SAL `MemoryStore::{store,store_batch,store_with_embedding}`) BEFORE the
+/// SQL write. A memory with no `metadata.why_trace` provenance rationale
+/// always emits a WARN + durable forensic record; it additionally REFUSES via
+/// [`GovernanceRefusal`] — the same typed envelope
+/// `consult_governance_pre_write` uses, so both map to the identical 403
+/// `GOVERNANCE_REFUSED` wire shape — when [`require_why_trace_enabled`] is
+/// true. Default (env unset) is a pure advisory WARN, byte-identical write
+/// behavior to pre-#2059.
+///
+/// The federation-receive + archive-restore funnels use the never-refuse
+/// sibling [`consult_why_trace_gate_inbound`] instead (a refused inbound
+/// write would diverge replicas; a refused restore would make legacy
+/// archived data un-restorable).
+///
+/// # Errors
+/// [`GovernanceRefusal`] when why_trace is absent AND require-mode is on.
+pub fn consult_why_trace_gate(mem: &Memory) -> Result<()> {
+    if why_trace_present(&mem.metadata) {
+        return Ok(());
+    }
+    let refused = require_why_trace_enabled();
+    emit_why_trace_signal(mem, refused);
+    if refused {
+        return Err(anyhow::Error::new(GovernanceRefusal {
+            reason: format!(
+                "write refused: metadata.{META_KEY_WHY_TRACE} is required by the TRACT \
+                 covenant clause-1 write-gate ({REQUIRE_WHY_TRACE_ENV}=1)"
+            ),
+        }));
+    }
+    Ok(())
+}
+
+/// #2059 + #2102 — never-refuse variant of [`consult_why_trace_gate`] for
+/// the FEDERATION-RECEIVE + archive-RESTORE funnels (`insert_if_newer`,
+/// `restore_archived`, and the postgres `apply_remote_memory` /
+/// `merge_inbound` twins). Under `AI_MEMORY_REQUIRE_WHY_TRACE=1` a refused
+/// inbound write would diverge replicas (CRDT convergence is the
+/// load-bearing property of the merge primitive) and a refused restore
+/// would make archived legacy data permanently un-restorable, so these
+/// paths ALWAYS proceed — mirroring the secret-screen refuse→redact degrade
+/// on the very same funnels (env #95). The covenant miss is still WARNed +
+/// forensically recorded (advisory disposition), never enforced.
+pub fn consult_why_trace_gate_inbound(mem: &Memory) {
+    if why_trace_present(&mem.metadata) {
+        return;
+    }
+    emit_why_trace_signal(mem, false);
+}
+
+/// #2060 — TRACT covenant clause 2 (§8.1): env knob gating the
+/// UPDATE/merge path's authorship-immutability ENFORCEMENT. This is
+/// distinct from the existing SILENT preserve helpers
+/// (`identity::preserve_agent_id` / `identity::preserve_provenance_keys`),
+/// which fix a caller-supplied `agent_id` rewrite up BEFORE it ever
+/// reaches the storage funnel for a compliant caller — they never
+/// REFUSE. Default `false` keeps every update path byte-identical to
+/// pre-#2060 behavior (mirrors the secure-opt-in shape of every other
+/// `AI_MEMORY_REQUIRE_*` K2-style knob, e.g. `AI_MEMORY_REQUIRE_WITNESS`).
+pub const REQUIRE_IMMUTABLE_AUTHORSHIP_ENV: &str = "AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP";
+
+/// `true` when [`REQUIRE_IMMUTABLE_AUTHORSHIP_ENV`] is set truthy
+/// (`1`/`true`/`yes`/`on`). Delegates to the shared
+/// `governance::audit::env_flag_enabled` truthy-grammar helper (#2106
+/// review item 6 — one truthy parser, not a third copy).
+#[must_use]
+pub fn require_immutable_authorship_enabled() -> bool {
+    crate::governance::audit::env_flag_enabled(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV)
+}
+
+/// #2060 — TRACT covenant clause 2 authorship-immutability gate,
+/// consulted at the update/merge write funnel BEFORE the SQL UPDATE
+/// runs. Detects a caller-supplied `metadata.agent_id` that DIFFERS
+/// from the row's existing authorship (`existing_agent_id`) — an
+/// authorship-rewrite attempt — and is a defense-in-depth layer
+/// INDEPENDENT of the caller-side silent-preserve helpers: those run
+/// upstream (MCP/CLI/HTTP handler layer) and fix the value up before a
+/// compliant caller's write ever reaches this funnel, so this gate
+/// exists to catch a caller that bypassed them (or a direct SAL /
+/// postgres caller) and to give operators a REFUSE posture instead of
+/// only a silent fix-up.
+///
+/// The [`crate::identity::lineage`] succession chain is deliberately
+/// NOT consulted to authorize a rewrite: `agent_lineage` records a
+/// single `agent_id`'s KEY rotation (same identity, new pubkey), not a
+/// hand-off of authorship between two DIFFERENT `agent_id`s, so it
+/// cannot itself justify this class of rewrite. A legitimate identity
+/// migration is the operator `ai-memory reown` tool, not a metadata
+/// patch through this path.
+///
+/// Always WARNs (`covenant.authorship_immutable` target) when a
+/// rewrite attempt is detected; additionally REFUSES via
+/// [`GovernanceRefusal`] when [`require_immutable_authorship_enabled`]
+/// is true. A `None` / empty `existing_agent_id` (no prior authorship
+/// claim to protect) or an unchanged / absent incoming `agent_id` is a
+/// silent no-op.
+///
+/// # Errors
+/// [`GovernanceRefusal`] when a rewrite is detected AND require-mode is on.
+pub fn consult_authorship_immutable_gate(
+    existing_agent_id: Option<&str>,
+    incoming_metadata: Option<&serde_json::Value>,
+) -> Result<()> {
+    let Some(existing_id) = existing_agent_id.filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let Some(incoming_id) = incoming_metadata
+        .and_then(|m| m.get("agent_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    if incoming_id == existing_id {
+        return Ok(());
+    }
+    // #2104 item 1 — the WARN fires UNCONDITIONALLY (before the enforce
+    // short-circuit) so BOTH the advisory posture and an enforce-mode REFUSAL
+    // are visible server-side; the durable forensic record (item 2) fires on
+    // the REFUSAL only. `refused` distinguishes the two dispositions.
+    let refused = require_immutable_authorship_enabled();
+    let disposition = if refused { "refused" } else { "advisory" };
+    tracing::warn!(
+        target: "covenant.authorship_immutable",
+        existing_agent_id = %existing_id,
+        attempted_agent_id = %incoming_id,
+        disposition,
+        "write attempts to rewrite memory authorship ({}; set {}=1 to refuse)",
+        disposition,
+        REQUIRE_IMMUTABLE_AUTHORSHIP_ENV,
+    );
+    // #2104 item 2 — durable forensic record on the enforce-mode REFUSAL only
+    // (the advisory posture stays WARN-only; see the why_trace sibling).
+    if refused {
+        crate::governance::audit::record_decision(
+            existing_id,
+            disposition,
+            "covenant.authorship_immutable",
+            REQUIRE_IMMUTABLE_AUTHORSHIP_ENV,
+            serde_json::json!({
+                "existing_agent_id": existing_id,
+                "attempted_agent_id": incoming_id,
+            }),
+        );
+        return Err(anyhow::Error::new(GovernanceRefusal {
+            reason: format!(
+                "write refused: metadata.agent_id may not be rewritten from '{existing_id}' \
+                 to '{incoming_id}' (TRACT covenant clause-2 authorship-immutability gate, \
+                 {REQUIRE_IMMUTABLE_AUTHORSHIP_ENV}=1); use the operator `ai-memory reown` \
+                 tool for a sanctioned identity migration"
+            ),
+        }));
+    }
+    Ok(())
+}
+
 /// Computed 4-tuple of visibility prefixes for an agent position (Task 1.5).
 /// Index 0 = agent's own namespace (private), 1 = parent (team),
 /// 2 = grandparent (unit), 3 = great-grandparent (org). Missing = `None`.
@@ -775,6 +1038,9 @@ pub fn insert(conn: &Connection, mem: &Memory) -> Result<String> {
     // BEFORE any SQL touches the DB; a refusal returns cleanly with
     // no row written. See module-level comment for layering details.
     consult_governance_pre_write(mem)?;
+    // #2059 — TRACT covenant clause 1: mandatory why_trace write-gate.
+    // Advisory WARN by default; refuses under AI_MEMORY_REQUIRE_WHY_TRACE.
+    consult_why_trace_gate(mem)?;
 
     // v0.8.1 W1 (#1821 / gap G29) + #1844 — origin-blind credential REDACT
     // backstop on the local-authorship funnel. Caller-origin writes are
@@ -1098,6 +1364,21 @@ impl std::error::Error for ConflictError {}
 ///    `transcript_line_dedup` INSERT → `signed_events` chain row →
 ///    COMMIT; any failure rolls all three rows back atomically.
 ///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on the
+/// write's AUTHENTICATED ORIGIN, exactly like `SqliteStore::store`/`reflect`
+/// key on `CallerContext::bypass_visibility`. `memory_capture_turn` is an
+/// ordinary tenant-callable MCP/HTTP tool that stores VERBATIM caller
+/// content, so an unconditional stamp here let a zero-privilege tenant
+/// defeat `AI_MEMORY_REQUIRE_WHY_TRACE=1` by routing writes through this
+/// funnel (the #2110 kind-forge bypass re-committed on a different funnel —
+/// #2121 HIGH). Only the authenticated internal principal
+/// (`ctx.bypass_visibility`) may pass `true`; a tenant capture with no
+/// caller-supplied `metadata.why_trace` is REFUSED under enforce by the
+/// `insert` gate (`MEMORY_INSERT_FAILED`). Callers CAN satisfy the gate by
+/// supplying `why_trace` in the request `metadata`.
+///
 /// # Errors
 ///
 /// String-stable codes per the MCP error convention: `DEDUP_QUERY_FAILED`,
@@ -1106,6 +1387,7 @@ impl std::error::Error for ConflictError {}
 pub fn capture_turn_idempotent(
     conn: &Connection,
     write: &crate::models::CaptureTurnWrite,
+    substrate_authored: bool,
 ) -> std::result::Result<crate::models::CaptureTurnResult, String> {
     use rusqlite::OptionalExtension;
 
@@ -1138,8 +1420,19 @@ pub fn capture_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // substrate why_trace is recorded ONLY for the authenticated internal
+        // origin (`substrate_authored` ⟸ `ctx.bypass_visibility`). A tenant
+        // capture routes through `insert`, whose why_trace gate REFUSES a
+        // why_trace-less turn under AI_MEMORY_REQUIRE_WHY_TRACE=1 — the
+        // caller supplies `metadata.why_trace` to clear it. Stamp is
+        // idempotent + non-clobbering (a caller-supplied rationale wins).
+        let mut captured = write.memory.clone();
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut captured.metadata);
+        }
         let inserted_id =
-            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
 
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
@@ -1193,6 +1486,16 @@ pub fn capture_turn_idempotent(
 /// `SqliteStore::recover_turn_idempotent` through the SAL trait (#1693 gives
 /// postgres-backed daemons a callable L2 surface).
 ///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on the
+/// write's AUTHENTICATED ORIGIN (see [`capture_turn_idempotent`]). The
+/// in-process L2 recovery walker (`crate::recover`) reads host transcripts
+/// off the local disk and passes `true` (a genuine substrate re-store, env
+/// #95: never lose a recovered turn); the SAL trait surface threads
+/// `ctx.bypass_visibility`, so a tenant-context recover write with no
+/// `metadata.why_trace` is REFUSED under enforce by the `insert` gate.
+///
 /// # Errors
 ///
 /// Returns a stringified failure label (`DEDUP_QUERY_FAILED` /
@@ -1202,6 +1505,7 @@ pub fn capture_turn_idempotent(
 pub fn recover_turn_idempotent(
     conn: &Connection,
     write: &crate::models::RecoverTurnWrite,
+    substrate_authored: bool,
 ) -> std::result::Result<crate::models::RecoverTurnResult, String> {
     use rusqlite::OptionalExtension;
 
@@ -1247,8 +1551,15 @@ pub fn recover_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — stamp the
+        // substrate rationale ONLY for the authenticated internal origin; a
+        // tenant-context recover write is gated by `insert` under enforce.
+        let mut recovered = write.memory.clone();
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut recovered.metadata);
+        }
         let inserted_id =
-            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &recovered).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
@@ -1320,6 +1631,16 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // INSERT itself. Refusal here returns no row written and
             // no SELECT performed — symmetric with the Merge path.
             consult_governance_pre_write(mem)?;
+            // #2059/#2102 — TRACT covenant clause 1: the ConflictMode::Error
+            // funnel is the UNCONDITIONAL path used by `db::reflect` (every
+            // `memory_reflect` write) + CLI `--on-conflict error` import, so
+            // it must consult the why_trace gate exactly like `insert` does.
+            // #2110 — the exemption keys on AUTHENTICATED ORIGIN, NOT on the
+            // caller-controlled kind: a substrate-internal reflect goes through
+            // `SqliteStore::reflect` under `bypass_visibility`, which stamps
+            // metadata.why_trace so the write clears this gate; an external
+            // `memory_reflect` (tenant ctx) is NOT stamped and IS gated here.
+            consult_why_trace_gate(mem)?;
             // Existence check + INSERT must be atomic against
             // concurrent writers. We rely on the (title, namespace)
             // UNIQUE index — issue a plain INSERT WITHOUT the upsert
@@ -2128,6 +2449,14 @@ pub fn update_with_expected_version(
         Some(v) => Some(v),
         None => existing.expires_at.as_deref(),
     };
+    // #2060 — TRACT covenant clause 2: authorship-immutability gate.
+    // Consult BEFORE the shadow below so we see the caller's RAW patch
+    // metadata (not whatever an upstream `preserve_provenance_keys` call
+    // may have already restored to `existing`'s value).
+    consult_authorship_immutable_gate(
+        existing.metadata.get("agent_id").and_then(|v| v.as_str()),
+        metadata,
+    )?;
     let metadata = metadata.unwrap_or(&existing.metadata);
 
     // #1451 (SEC, HIGH) — substrate governance pre-write gate on the
@@ -2230,8 +2559,31 @@ pub fn update_with_expected_version(
                 crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT,
             )?;
         }
+        // #2106 review items 1+2 — preserve the immutable provenance keys
+        // (agent_id + the consolidation derived_from / consolidated_from_agents
+        // arrays) across the in-place metadata overwrite, mirroring both the
+        // `insert` ON CONFLICT arm (#1784) and the postgres
+        // `update_with_expected_version_once` CASE overlay so effective
+        // protection is IDENTICAL across backends. `json_patch(?10, <existing
+        // provenance>)` overlays the OLD row's provenance object on top of the
+        // patch (existing-wins) — the bare-column reference `metadata` inside
+        // `json_each` resolves to the pre-UPDATE value in a SQLite UPDATE. This
+        // closes the omission-erasure hole (#2106 item 2): a full-object
+        // metadata patch that OMITS agent_id no longer silently WIPES the
+        // stored author — it is preserved (erasure being strictly worse than
+        // a rewrite, which the clause-2 gate above already refuses).
         let update_res = conn.execute(
-            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9, metadata=?10, source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
+            "UPDATE memories SET tier=?1, namespace=?2, title=?3, content=?4, tags=?5, priority=?6, confidence=?7, updated_at=?8, expires_at=?9,
+                metadata = json_patch(
+                    ?10,
+                    COALESCE(
+                        (SELECT json_group_object(key, value)
+                         FROM json_each(metadata)
+                         WHERE key IN ('agent_id', 'derived_from', 'consolidated_from_agents')),
+                        '{}'
+                    )
+                ),
+                source_uri = COALESCE(?11, source_uri), encrypted_envelope=?14, version = version + 1
              WHERE id=?12 AND (?13 IS NULL OR version = ?13)",
             params![effective_tier.as_str(), namespace, new_title, update_content_to_store, tags_json, priority, confidence, now, expires_at, metadata_json, source_uri, id, expected_version, update_encrypted_envelope],
         );
@@ -2401,6 +2753,15 @@ pub fn update_with_archive_on_supersede(
     drop(rows);
     drop(stmt);
 
+    // #2060 — TRACT covenant clause 2: authorship-immutability gate.
+    // Same detection as `update_with_expected_version`; this append-and-
+    // archive supersede path composes its own new-row metadata below, so
+    // the caller's RAW patch metadata is checked here too.
+    consult_authorship_immutable_gate(
+        existing.metadata.get("agent_id").and_then(|v| v.as_str()),
+        metadata,
+    )?;
+
     // v0.7.0 Provenance Gap 1 (#884) — optimistic-concurrency gate.
     if let Some(expected) = expected_version
         && existing.version != expected
@@ -2448,9 +2809,18 @@ pub fn update_with_archive_on_supersede(
     // Stamp the edit-source provenance into the new row's metadata so
     // downstream observers can tell this row came from an
     // append-and-archive supersede vs. a direct user write.
-    let mut new_metadata = metadata
+    // #2106 review item 2 — preserve the immutable provenance keys
+    // (agent_id + derived_from / consolidated_from_agents) from the OLD row
+    // onto the superseding row so a full-object metadata patch that OMITS
+    // agent_id does not silently ERASE authorship (erasure being strictly
+    // worse than the rewrite the clause-2 gate already refuses). The
+    // superseding row is a fresh id, so `insert`'s ON CONFLICT preservation
+    // never fires — this is the equivalent guard on the mint-new-id path.
+    let patched_metadata = metadata
         .cloned()
         .unwrap_or_else(|| existing.metadata.clone());
+    let mut new_metadata =
+        crate::identity::preserve_provenance_keys(&existing.metadata, &patched_metadata);
     if let serde_json::Value::Object(ref mut m) = new_metadata {
         m.insert(
             "edit_source".to_string(),
@@ -6702,6 +7072,21 @@ pub const CONSOLIDATION_SOURCE: &str = "consolidation";
 /// `update` / dedup metadata overwrite preserves them (existing-wins,
 /// like `agent_id`) instead of silently dropping them. The pointer is
 /// inherently non-navigable (its targets no longer exist) by design.
+///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on
+/// the write's AUTHENTICATED ORIGIN, exactly like `SqliteStore::store` /
+/// `reflect` key on `CallerContext::bypass_visibility`. `memory_consolidate`
+/// is an ordinary tenant-callable MCP/HTTP/CLI tool whose `summary` is
+/// VERBATIM caller content, so an unconditional stamp let a zero-privilege
+/// tenant defeat `AI_MEMORY_REQUIRE_WHY_TRACE=1` through this funnel
+/// (#2121 HIGH). Only the internal curator/autonomy principal passes
+/// `true`; every caller-origin surface passes `false` and the candidate is
+/// gated below — merged metadata that inherits a `why_trace` from a source
+/// clears the gate (a consolidation is a derivation over already-gated
+/// rows), while a why_trace-less tenant consolidate is REFUSED under
+/// enforce.
 #[allow(clippy::too_many_arguments)]
 pub fn consolidate(
     conn: &Connection,
@@ -6712,6 +7097,7 @@ pub fn consolidate(
     tier: &Tier,
     source: &str,
     consolidator_agent_id: &str,
+    substrate_authored: bool,
 ) -> Result<String> {
     // #1955 R45 — record-stop fence for the consolidate funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -6852,7 +7238,17 @@ pub fn consolidate(
                 serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
-        let merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // consolidated summary is VERBATIM caller content on the tenant
+        // surfaces (MCP `memory_consolidate` / HTTP / CLI), so the substrate
+        // rationale is recorded ONLY for the authenticated internal origin
+        // (curator autonomy / SAL `bypass_visibility`). A tenant consolidate
+        // is gated below: merged metadata inheriting a source's why_trace
+        // clears it; a why_trace-less one is REFUSED under enforce.
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut merged_metadata_value);
+        }
         crate::validate::validate_metadata(&merged_metadata_value)
             .context("merged metadata exceeds size limit")?;
         let metadata_json = serde_json::to_string(&merged_metadata_value)?;
@@ -6905,6 +7301,13 @@ pub fn consolidate(
             cid: None,
         };
         consult_governance_pre_write(&candidate)?;
+        // #2121 — TRACT covenant clause 1 gate on the consolidate funnel
+        // (the raw INSERT below bypasses `insert`'s gate). Unconditional
+        // defense-in-depth: the substrate-origin candidate was stamped above
+        // so it passes trivially; a tenant candidate passes only when the
+        // merged metadata carries a why_trace (caller-supplied or inherited
+        // from a source), else it is REFUSED under enforce.
+        consult_why_trace_gate(&candidate)?;
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
         // candidate's genesis identity.
@@ -11122,6 +11525,11 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
         // a refusal short-circuits the transaction (outer ROLLBACK).
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the archive-RESTORE
+        // funnel. Advisory-only (never refuses): a legacy archived row that
+        // predates the covenant must stay restorable even under
+        // AI_MEMORY_REQUIRE_WHY_TRACE=1.
+        consult_why_trace_gate_inbound(&candidate);
         // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id (from
         // the decrypted plaintext) so the restored live row carries the
         // same `b3:` address it had before archival.
@@ -11269,6 +11677,11 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
         // SELECT above.
         let candidate = load_archived_as_memory(conn, id)?;
         consult_governance_pre_write(&candidate)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the archive-RESTORE
+        // funnel. Advisory-only (never refuses): a legacy archived row that
+        // predates the covenant must stay restorable even under
+        // AI_MEMORY_REQUIRE_WHY_TRACE=1.
+        consult_why_trace_gate_inbound(&candidate);
         // v0.9.0 G8 (#1825) — re-mint the genesis content-id (from the
         // decrypted plaintext) so the restored row keeps its `b3:` address.
         let cid_stamp = restored_cid_stamp(conn, id, &candidate)?;
@@ -11589,6 +12002,12 @@ pub fn insert_if_newer(conn: &Connection, mem: &Memory) -> Result<String> {
     // a local rule by routing through a peer would otherwise slip
     // past the gate. The hook fires on every newer-wins merge attempt.
     consult_governance_pre_write(mem)?;
+    // #2059/#2102 — TRACT covenant clause 1 on the federation-RECEIVE
+    // funnel. Advisory-only (never refuses): a refused inbound write would
+    // diverge replicas, so the miss is WARNed + forensically recorded but
+    // the merge always proceeds (mirrors the secret-screen refuse→redact
+    // degrade on this same funnel).
+    consult_why_trace_gate_inbound(mem);
 
     // v0.8.1 W2.3 (#1821 / gap G30) — resurrection guard. If this id has a
     // FORGET tombstone, a peer that still holds the row is trying to revive it
@@ -11882,6 +12301,23 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
     let tx_result = (|| -> Result<Option<String>> {
         match get(conn, &inbound.id)? {
             Some(existing) => {
+                // #2123 — backend parity with `PostgresStore::merge_inbound`:
+                // the same-`id` field-merge path persists via
+                // `overwrite_full_row_by_id`, which (deliberately) bypasses
+                // the `insert` / `insert_if_newer` chokepoints — so pre-#2123
+                // this funnel consulted NEITHER the pre-write governance hook
+                // NOR the covenant clause-1 inbound why_trace gate NOR the
+                // secret screen, while the postgres twin runs all three.
+                // Screen first (ALWAYS redact, NEVER refuse — a refused
+                // inbound row would diverge replicas, env #95), then consult
+                // governance (refusal rolls the merge back, postgres parity),
+                // then the never-refuse inbound why_trace gate (advisory
+                // WARN + forensic record only — CRDT convergence is the
+                // load-bearing property of the merge primitive).
+                let screened = crate::secret_screen::redact_memory_for_storage(inbound);
+                let inbound = screened.as_ref().unwrap_or(inbound);
+                consult_governance_pre_write(inbound)?;
+                consult_why_trace_gate_inbound(inbound);
                 // #1719 item 3a — NEVER trust a peer's self-asserted
                 // attestation for the merge tiebreak: neutralize the
                 // inbound's `metadata.attest_level` to `claimed` so a
@@ -11944,6 +12380,12 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
 /// dedup path. Writes all 27 logical columns + the denormalised
 /// `mentioned_entity_id` (re-derived from the merged row, same as the
 /// `insert` / `insert_if_newer` chokepoints).
+///
+/// Because this writer bypasses those chokepoints, the secret screen +
+/// pre-write governance hook + inbound why_trace gate run in its ONLY
+/// caller, [`merge_inbound`], before the merge (#2123 — postgres
+/// `merge_inbound` parity). Do NOT add further callers without routing
+/// them through the same gates.
 ///
 /// # Errors
 ///
@@ -17322,6 +17764,7 @@ mod tests {
             &Tier::Mid,
             "test",
             "agent-x",
+            false,
         )
         .unwrap();
         let got = get(&conn, &new_id).unwrap().unwrap();
@@ -17915,6 +18358,7 @@ mod tests {
             &Tier::Long,
             "test",
             "test-consolidator",
+            false,
         )
         .unwrap();
         // Original memories should be deleted
@@ -19996,6 +20440,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "test-consolidator",
+            false,
         )
         .unwrap();
 
@@ -20029,6 +20474,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "consolidator-x",
+            false,
         )
         .unwrap();
 
@@ -20120,6 +20566,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "test-consolidator",
+            false,
         );
         let err = result.expect_err("consolidate should fail for oversized merged metadata");
         let msg = err.to_string();
@@ -24536,5 +24983,30 @@ mod tests {
         .unwrap();
         let err = set_lifecycle_state(&conn, &id, crate::models::LifecycleState::Quarantined);
         assert!(err.is_err(), "caller must not be able to set Quarantined");
+    }
+
+    // ── #2059 / #2060 — TRACT covenant clauses 1+2 (issues #2059, #2060) ──
+    //
+    // Only ENV-FREE assertions live here. `AI_MEMORY_REQUIRE_WHY_TRACE` /
+    // `AI_MEMORY_REQUIRE_IMMUTABLE_AUTHORSHIP` are read via bare
+    // `std::env::var` with no test-only override seam, and this module's
+    // `mod tests` shares ONE multi-threaded process with every other unit
+    // test in the crate (`cargo test --lib`) — a local mutex only
+    // serializes tests that explicitly acquire it, it does NOT stop an
+    // unrelated concurrently-running test (e.g. any of the hundreds of
+    // other `insert`/`update_with_expected_version` callers in this very
+    // file) from observing a mutated global env var mid-flight. The
+    // env-mutating enforce/advisory + end-to-end `insert`/`update_*`
+    // coverage for both gates lives in the isolated integration-test
+    // process `tests/issue_2059_2060_covenant_write_gates.rs` instead,
+    // where no other test shares the binary.
+    #[test]
+    fn why_trace_present_detects_presence_and_absence() {
+        assert!(!why_trace_present(&serde_json::json!({})));
+        assert!(!why_trace_present(&serde_json::json!({"why_trace": ""})));
+        assert!(!why_trace_present(&serde_json::json!({"why_trace": "   "})));
+        assert!(why_trace_present(
+            &serde_json::json!({"why_trace": "operator requested a memo of the incident"})
+        ));
     }
 }
