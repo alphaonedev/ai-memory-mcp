@@ -327,3 +327,130 @@ async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
         .expect("authenticated system principal is exempt on pg");
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
+
+// ── #2113 — the pg reflect funnel (POST /api/v1/reflect) was ungated ──
+
+fn reflect_input(
+    ns: &str,
+    source_ids: Vec<String>,
+    why_trace: Option<&str>,
+    title: &str,
+) -> ai_memory::db::ReflectInput {
+    let mut metadata = serde_json::json!({"agent_id": "ai:tenant-2113"});
+    if let Some(wt) = why_trace {
+        metadata["why_trace"] = serde_json::Value::String(wt.to_string());
+    }
+    ai_memory::db::ReflectInput {
+        source_ids,
+        title: format!("reflection {title} over {ns}"),
+        content: "a synthesized reflection".to_string(),
+        namespace: Some(ns.to_string()),
+        tier: Tier::Mid,
+        tags: vec!["r".to_string()],
+        priority: 5,
+        confidence: 1.0,
+        source: "api".to_string(),
+        agent_id: "ai:tenant-2113".to_string(),
+        metadata,
+    }
+}
+
+/// A `why_trace` refusal on the reflect funnel surfaces as `HookVeto` on the pg
+/// path (mapped explicitly) and as `Database` carrying the `GovernanceRefusal`
+/// message on the sqlite path (the `insert_with_conflict` gate refusal
+/// propagates verbatim). Both are the covenant refusal — assert on the reason.
+fn is_reflect_why_trace_refusal(err: &ai_memory::db::ReflectError) -> bool {
+    err.to_string().contains("why_trace")
+}
+
+/// sqlite SAL reflect — runs always under `--features sal-postgres`.
+#[tokio::test]
+async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
+    use ai_memory::store::sqlite::SqliteStore;
+    let store = SqliteStore::open(":memory:").expect("open in-memory store");
+    let system = CallerContext::for_admin("ai:curator-2113");
+    let tenant = CallerContext::for_agent("ai:tenant-2113");
+    let ns = "ns/2113-sq";
+
+    // Seed a source memory as the system principal (exempt), so the reflect
+    // has a valid source_id to synthesize over.
+    let src = pg_mem("sq-src-2113", ns, "source", "ai:curator", None);
+    store.store(&system, &src).await.expect("seed source");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Tenant reflect with NO why_trace → REFUSED (pre-#2113 this was ungated).
+    let err = store
+        .reflect(
+            &tenant,
+            &reflect_input(ns, vec!["sq-src-2113".into()], None, "t1"),
+            None,
+        )
+        .await
+        .expect_err("enforce must refuse a why_trace-less tenant reflect");
+    assert!(is_reflect_why_trace_refusal(&err), "got {err:?}");
+
+    // System principal (bypass_visibility) → EXEMPT (candidate stamped).
+    store
+        .reflect(
+            &system,
+            &reflect_input(ns, vec!["sq-src-2113".into()], None, "sys"),
+            None,
+        )
+        .await
+        .expect("authenticated system principal reflect is exempt");
+
+    // A tenant reflect that DOES carry why_trace succeeds under enforce.
+    store
+        .reflect(
+            &tenant,
+            &reflect_input(
+                ns,
+                vec!["sq-src-2113".into()],
+                Some("caller rationale"),
+                "wt",
+            ),
+            None,
+        )
+        .await
+        .expect("a why_trace-bearing tenant reflect is allowed under enforce");
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+#[tokio::test]
+async fn pg_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_reflect_refuses_tenant_2113: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let system = CallerContext::for_admin("ai:curator-2113");
+    let tenant = CallerContext::for_agent("ai:tenant-2113");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2113-{run}");
+    let src_id = format!("pg-src-2113-{run}");
+
+    let src = pg_mem(&src_id, &ns, "source", "ai:curator", None);
+    store.store(&system, &src).await.expect("seed source");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Tenant reflect with NO why_trace → REFUSED (the #2113 fix; POST /reflect
+    // on a postgres daemon got ZERO why_trace enforcement pre-fix).
+    let err = store
+        .reflect(
+            &tenant,
+            &reflect_input(&ns, vec![src_id.clone()], None, "t1"),
+        )
+        .await
+        .expect_err("enforce must refuse a why_trace-less tenant pg reflect");
+    assert!(is_reflect_why_trace_refusal(&err), "got {err:?}");
+
+    // System principal → EXEMPT.
+    store
+        .reflect(
+            &system,
+            &reflect_input(&ns, vec![src_id.clone()], None, "sys"),
+        )
+        .await
+        .expect("authenticated system principal pg reflect is exempt");
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}

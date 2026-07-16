@@ -9497,7 +9497,17 @@ impl PostgresStore {
                 reflection_meta,
             );
         }
-        let metadata_value = serde_json::Value::Object(metadata);
+        let mut metadata_value = serde_json::Value::Object(metadata);
+        // #2113/#2110 — TRACT covenant clause 1 authenticated-origin stamp on
+        // the pg reflect funnel. An INTERNAL curator reflect runs under
+        // `bypass_visibility` and records the substrate why_trace so the
+        // reflection clears the why_trace gate below; an EXTERNAL
+        // `memory_reflect` (tenant ctx) is NOT stamped and is gated. Stamped
+        // here (before `candidate` is composed) so the persisted INSERT carries
+        // the marker too — postgres parity with `SqliteStore::reflect`.
+        if ctx.bypass_visibility {
+            crate::storage::stamp_substrate_why_trace(&mut metadata_value);
+        }
         validate::validate_metadata(&metadata_value)
             .map_err(|e| ReflectError::Validation(e.to_string()))?;
 
@@ -9562,6 +9572,22 @@ impl PostgresStore {
                 other => other.to_string(),
             };
             return Err(ReflectError::HookVeto { reason, code: 403 });
+        }
+        // #2113 — TRACT covenant clause 1 why_trace gate on the pg reflect
+        // funnel (POST /api/v1/reflect). Pre-#2113 this path consulted only
+        // governance, so a tenant reflect on a postgres daemon got ZERO
+        // why_trace enforcement while the sqlite reflect path was gated. The
+        // authenticated SYSTEM principal (bypass_visibility) is exempt — its
+        // candidate was already stamped above; a tenant reflect is REFUSED
+        // when it carries no why_trace under AI_MEMORY_REQUIRE_WHY_TRACE=1.
+        if !ctx.bypass_visibility {
+            if let Err(e) = consult_why_trace_gate_pg(&candidate) {
+                let reason = match &e {
+                    StoreError::PermissionDenied { reason, .. } => reason.clone(),
+                    other => other.to_string(),
+                };
+                return Err(ReflectError::HookVeto { reason, code: 403 });
+            }
         }
 
         let mut tx = self
@@ -13520,7 +13546,16 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite
         // L4 path (`storage::capture_turn_idempotent` → `storage::insert`
         // → `consult_governance_pre_write`).
-        let memory = &write.memory;
+        // #2110/#2113 audit — L4 transcript capture is a SUBSTRATE re-store
+        // (env #95: never lose a turn); record the substrate why_trace so the
+        // captured row satisfies AI_MEMORY_REQUIRE_WHY_TRACE (postgres parity
+        // with the sqlite `capture_turn_idempotent` stamp).
+        let captured = {
+            let mut m = write.memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            m
+        };
+        let memory = &captured;
         consult_governance_pre_write_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
@@ -13766,7 +13801,15 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite L2
         // path (`storage::recover_turn_idempotent` → `storage::insert` →
         // `consult_governance_pre_write`).
-        let memory = &write.memory;
+        // #2110/#2113 audit — L2 transcript recovery is a SUBSTRATE re-store
+        // (env #95: never lose a turn); stamp the substrate why_trace (postgres
+        // parity with the sqlite `recover_turn_idempotent` stamp).
+        let recovered = {
+            let mut m = write.memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            m
+        };
+        let memory = &recovered;
         consult_governance_pre_write_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
@@ -17565,7 +17608,12 @@ impl MemoryStore for PostgresStore {
                 serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
-        let merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #2110/#2113 audit — the consolidated summary is a SUBSTRATE-DERIVED
+        // merge over already-stored (already-gated) sources; record the
+        // substrate why_trace so it satisfies AI_MEMORY_REQUIRE_WHY_TRACE
+        // (postgres parity with the sqlite `consolidate` stamp).
+        crate::storage::stamp_substrate_why_trace(&mut merged_metadata_value);
 
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
@@ -19482,6 +19530,12 @@ impl MemoryStore for PostgresStore {
         // BEFORE the INSERT lands.
         let candidate = Self::load_archived_as_memory_pg(&mut *tx, id).await?;
         consult_governance_pre_write_pg(&candidate)?;
+        // #2110/#2113 audit — TRACT covenant clause 1 on the archive-RESTORE
+        // funnel. Advisory-only (never refuses): a legacy archived row that
+        // predates the covenant must stay restorable even under
+        // AI_MEMORY_REQUIRE_WHY_TRACE=1 (postgres parity with the sqlite
+        // `restore_archived` inbound gate).
+        crate::storage::consult_why_trace_gate_inbound(&candidate);
 
         // v0.9.0 G8 (#1825) — re-mint the row's genesis content-id from the
         // archived row's ORIGINAL identity + PLAINTEXT content (decrypting the

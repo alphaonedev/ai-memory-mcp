@@ -281,8 +281,7 @@ fn emit_why_trace_signal(mem: &Memory, refused: bool) {
 /// CALLER-ORIGIN store write funnel (`insert`, `insert_with_conflict`,
 /// SAL `MemoryStore::{store,store_batch,store_with_embedding}`) BEFORE the
 /// SQL write. A memory with no `metadata.why_trace` provenance rationale
-/// (and not a substrate-authored [`why_trace_exempt_kind`]) always emits a
-/// WARN + durable forensic record; it additionally REFUSES via
+/// always emits a WARN + durable forensic record; it additionally REFUSES via
 /// [`GovernanceRefusal`] — the same typed envelope
 /// `consult_governance_pre_write` uses, so both map to the identical 403
 /// `GOVERNANCE_REFUSED` wire shape — when [`require_why_trace_enabled`] is
@@ -1405,8 +1404,15 @@ pub fn capture_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
+        // #2110/#2113 audit — L4 transcript capture is a SUBSTRATE/host-authored
+        // re-store (env #95: transcript paths must NEVER lose a turn). It routes
+        // through `insert` (whose why_trace gate would REFUSE a why_trace-less
+        // turn under enforce), so stamp the substrate rationale so capture
+        // always succeeds. Idempotent + non-clobbering.
+        let mut captured = write.memory.clone();
+        stamp_substrate_why_trace(&mut captured.metadata);
         let inserted_id =
-            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
 
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
@@ -1514,8 +1520,13 @@ pub fn recover_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
+        // #2110/#2113 audit — L2 transcript recovery is a SUBSTRATE re-store
+        // (env #95: never lose a recovered turn). Stamp the substrate rationale
+        // so the `insert` why_trace gate never refuses it under enforce.
+        let mut recovered = write.memory.clone();
+        stamp_substrate_why_trace(&mut recovered.metadata);
         let inserted_id =
-            insert(conn, &write.memory).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
+            insert(conn, &recovered).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
         conn.prepare_cached(
             "INSERT INTO transcript_line_dedup \
              (sha256, memory_id, host_kind, transcript_path, \
@@ -1591,8 +1602,11 @@ pub fn insert_with_conflict(conn: &Connection, mem: &Memory, mode: ConflictMode)
             // funnel is the UNCONDITIONAL path used by `db::reflect` (every
             // `memory_reflect` write) + CLI `--on-conflict error` import, so
             // it must consult the why_trace gate exactly like `insert` does.
-            // Reflection rows are `MemoryKind::Reflection` → exempt inside the
-            // gate, so enforce-mode never refuses the reflection automation.
+            // #2110 — the exemption keys on AUTHENTICATED ORIGIN, NOT on the
+            // caller-controlled kind: a substrate-internal reflect goes through
+            // `SqliteStore::reflect` under `bypass_visibility`, which stamps
+            // metadata.why_trace so the write clears this gate; an external
+            // `memory_reflect` (tenant ctx) is NOT stamped and IS gated here.
             consult_why_trace_gate(mem)?;
             // Existence check + INSERT must be atomic against
             // concurrent writers. We rely on the (title, namespace)
@@ -7175,7 +7189,14 @@ pub fn consolidate(
                 serde_json::Value::String(propagated.as_str().to_string()),
             );
         }
-        let merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
+        // #2110/#2113 audit — `consolidate` mints a SUBSTRATE-DERIVED summary
+        // over already-stored (already-gated) source memories via a raw INSERT;
+        // it is a derivation, not fresh caller authorship (you cannot
+        // consolidate content that was never stored). Record the substrate
+        // rationale so the summary satisfies AI_MEMORY_REQUIRE_WHY_TRACE without
+        // a per-funnel gate (stamp-if-absent preserves a caller-supplied one).
+        stamp_substrate_why_trace(&mut merged_metadata_value);
         crate::validate::validate_metadata(&merged_metadata_value)
             .context("merged metadata exceeds size limit")?;
         let metadata_json = serde_json::to_string(&merged_metadata_value)?;
