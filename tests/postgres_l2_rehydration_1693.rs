@@ -69,6 +69,7 @@ fn opts_for(transcript: std::path::PathBuf, namespace: &str, agent_id: &str) -> 
         dry_run: false,
         quiet: false,
         agent_id: agent_id.to_string(),
+        bypass_fast_path: false,
     }
 }
 

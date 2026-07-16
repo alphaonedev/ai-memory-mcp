@@ -221,6 +221,27 @@ pub struct RecoverOpts {
     /// agent_id to attribute recovered memories to. Resolved from
     /// the calling surface (CLI flag / MCP CallerContext / config).
     pub agent_id: String,
+    /// When `true`, skip the step-2 watermark fast-path
+    /// short-circuit and always parse the transcript. The L2
+    /// SessionStart-hook / MCP surfaces leave this `false` — the
+    /// `mtime ≤ MAX(created_at)` short-circuit is their whole
+    /// <100 ms latency optimisation. The L3 poll watcher
+    /// ([`watcher::poll_once`]) sets it `true`: the watcher has
+    /// ALREADY made its own `(mtime, len)` change decision before
+    /// calling recovery, so the watermark short-circuit is
+    /// redundant there — and, worse, actively harmful when a
+    /// prior tick capped out on `--limit` (`pending_drain`) and a
+    /// later same-agent wall-clock write advanced `MAX(created_at)`
+    /// past the now-static file's mtime: the fast-path would then
+    /// report `lines_skipped_limit = 0`, the caller would clear
+    /// `pending_drain`, and the un-drained tail would be SILENTLY
+    /// lost (issue #2126, re-opening the exact #2117 loss the
+    /// `pending_drain` carry-forward was meant to close). Bypassing
+    /// the watermark makes recovery actually parse — respecting
+    /// `limit` and reporting the true `lines_skipped_limit` — so
+    /// the tail drains across ticks and dedup keeps every re-parse
+    /// idempotent. Defaults to `false`.
+    pub bypass_fast_path: bool,
 }
 
 impl RecoverOpts {
@@ -238,6 +259,7 @@ impl RecoverOpts {
             dry_run: false,
             quiet: true,
             agent_id,
+            bypass_fast_path: false,
         }
     }
 }
@@ -342,13 +364,21 @@ pub fn recover_from_transcript(
         .unwrap_or(None);
     report.elapsed_ms_dedup_query = timer.phase_lap();
 
-    if let (Some(mtime), Some(watermark_iso)) = (mtime, watermark.as_deref()) {
-        if let Ok(watermark_dt) = chrono::DateTime::parse_from_rfc3339(watermark_iso) {
-            let mtime_dt: chrono::DateTime<chrono::Utc> = mtime.into();
-            if mtime_dt <= watermark_dt.with_timezone(&chrono::Utc) {
-                report.fast_path_hit = true;
-                report.elapsed_ms = timer.overall_ms();
-                return Ok(report);
+    // The L3 poll watcher opts out of the watermark short-circuit
+    // (`bypass_fast_path`): it owns change-detection via its own
+    // `(mtime, len)` diff, so the watermark is redundant there and
+    // would silently strand a `pending_drain` tail once a same-agent
+    // wall-clock write pushed `MAX(created_at)` past the static file's
+    // mtime (issue #2126). See [`RecoverOpts::bypass_fast_path`].
+    if !opts.bypass_fast_path {
+        if let (Some(mtime), Some(watermark_iso)) = (mtime, watermark.as_deref()) {
+            if let Ok(watermark_dt) = chrono::DateTime::parse_from_rfc3339(watermark_iso) {
+                let mtime_dt: chrono::DateTime<chrono::Utc> = mtime.into();
+                if mtime_dt <= watermark_dt.with_timezone(&chrono::Utc) {
+                    report.fast_path_hit = true;
+                    report.elapsed_ms = timer.overall_ms();
+                    return Ok(report);
+                }
             }
         }
     }
@@ -817,6 +847,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             agent_id: agent_id.to_string(),
+            bypass_fast_path: false,
         }
     }
 
@@ -1121,6 +1152,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             agent_id: "ai:test:cwd".to_string(),
+            bypass_fast_path: false,
         };
         let report = recover_from_transcript(&db, &opts).unwrap();
         assert!(report.errors.is_empty() || report.transcript_path.is_some());

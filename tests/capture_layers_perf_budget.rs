@@ -259,6 +259,7 @@ fn base_recover_opts(transcript: PathBuf, agent: &str) -> RecoverOpts {
         dry_run: false,
         quiet: false,
         agent_id: agent.to_string(),
+        bypass_fast_path: false,
     }
 }
 

@@ -322,11 +322,34 @@ pub fn poll_once(
     cfg: &WatchConfig,
     states: &mut HashMap<HostKind, HostPollState>,
 ) -> Vec<HostTickOutcome> {
+    poll_once_with_resolver(db_path, cfg, states, transcript_paths::resolve_transcript)
+}
+
+/// [`poll_once`] with an injectable transcript resolver. The production
+/// entry point [`poll_once`] passes [`transcript_paths::resolve_transcript`]
+/// (which walks the real `$HOME`-rooted host directories); unit tests
+/// inject a pure resolver so they can drive the change-detection +
+/// recovery wiring hermetically instead of depending on the ambient
+/// filesystem (M-MOCKABLE-SYSCALLS; issue #2118).
+///
+/// # Panics
+///
+/// Does not panic.
+#[must_use]
+pub fn poll_once_with_resolver<R>(
+    db_path: &std::path::Path,
+    cfg: &WatchConfig,
+    states: &mut HashMap<HostKind, HostPollState>,
+    resolve: R,
+) -> Vec<HostTickOutcome>
+where
+    R: Fn(HostKind, &std::path::Path) -> Result<Option<PathBuf>, transcript_paths::ResolveError>,
+{
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut outcomes = Vec::with_capacity(cfg.hosts.len());
 
     for &host in &cfg.hosts {
-        let candidate = match transcript_paths::resolve_transcript(host, &cwd) {
+        let candidate = match resolve(host, &cwd) {
             Ok(p) => p,
             Err(e) => {
                 outcomes.push(HostTickOutcome {
@@ -371,6 +394,16 @@ pub fn poll_once(
                 // recovery pipeline, pinning the exact path this tick
                 // observed (bypassing the resolver's own re-walk since
                 // we've already picked the winner for this tick).
+                //
+                // `bypass_fast_path` is set: the watcher has already made
+                // its own `(mtime, len)` change decision above, so the L2
+                // watermark short-circuit is redundant here — and, on a
+                // `pending_drain` re-drain whose watermark advanced past
+                // the now-static file's mtime, it would fast-path past the
+                // un-drained tail and silently strand it (issue #2126,
+                // re-opening the #2117 loss). Bypassing makes recovery
+                // actually parse so the tail drains across ticks; dedup
+                // keeps every re-parse idempotent.
                 let opts = RecoverOpts {
                     host,
                     transcript_override: Some(path.clone()),
@@ -380,6 +413,7 @@ pub fn poll_once(
                     dry_run: cfg.dry_run,
                     quiet: true,
                     agent_id: cfg.agent_id.clone(),
+                    bypass_fast_path: true,
                 };
 
                 entry.path = Some(path.clone());
@@ -391,8 +425,15 @@ pub fn poll_once(
                         // Carry an un-drained limit-tail forward so the
                         // next tick re-runs recovery on the (now static)
                         // file until every deduped line is consumed
-                        // (issue #2117).
-                        entry.pending_drain = report.lines_skipped_limit > 0;
+                        // (issue #2117). In `--dry-run` NO dedup rows are
+                        // written, so a re-drain can never make progress —
+                        // every tick would re-parse the same first `limit`
+                        // lines forever (a busy-loop). So dry-run never
+                        // arms `pending_drain`: one inspection parse per
+                        // detected `(mtime, len)` change, then the next
+                        // identical tick short-circuits to `Unchanged`
+                        // (issue #2126 case (b)).
+                        entry.pending_drain = !cfg.dry_run && report.lines_skipped_limit > 0;
                         outcomes.push(HostTickOutcome {
                             host,
                             changed: true,
@@ -426,6 +467,21 @@ pub fn poll_once(
 /// granularity). Never panics on a per-host recovery failure — see
 /// [`poll_once`]'s per-host error handling.
 pub fn run_watch_daemon(db_path: PathBuf, cfg: WatchConfig, shutdown: Arc<AtomicBool>) {
+    run_watch_daemon_with_resolver(db_path, cfg, shutdown, transcript_paths::resolve_transcript);
+}
+
+/// [`run_watch_daemon`] with an injectable transcript resolver, so the
+/// shutdown-latency test can drive the loop without walking the real
+/// `$HOME`-rooted host directories (M-MOCKABLE-SYSCALLS; issue #2118).
+/// Production uses [`run_watch_daemon`].
+pub fn run_watch_daemon_with_resolver<R>(
+    db_path: PathBuf,
+    cfg: WatchConfig,
+    shutdown: Arc<AtomicBool>,
+    resolve: R,
+) where
+    R: Fn(HostKind, &std::path::Path) -> Result<Option<PathBuf>, transcript_paths::ResolveError>,
+{
     let mut states: HashMap<HostKind, HostPollState> = HashMap::new();
     let mut report = WatchReport::default();
     let hosts_str: Vec<&str> = cfg.hosts.iter().map(|h| h.as_str()).collect();
@@ -437,7 +493,7 @@ pub fn run_watch_daemon(db_path: PathBuf, cfg: WatchConfig, shutdown: Arc<Atomic
     );
 
     while !shutdown.load(Ordering::Relaxed) {
-        let outcomes = poll_once(&db_path, &cfg, &mut states);
+        let outcomes = poll_once_with_resolver(&db_path, &cfg, &mut states, &resolve);
         for o in outcomes.iter().filter(|o| o.changed) {
             if let Some(e) = &o.error {
                 tracing::warn!("L3 watch: {} tick error: {e}", o.host.as_str());
@@ -501,6 +557,15 @@ mod tests {
 
     const USER_LINE_1: &str = r#"{"timestamp":"2026-05-28T12:00:00Z","type":"user","message":{"content":[{"type":"text","text":"first directive"}]}}"#;
 
+    /// One distinct Claude-Code JSONL user turn per `n` (distinct text +
+    /// timestamp → distinct dedup key → each atomises separately). Used
+    /// to build oversized transcripts for the `--limit` drain tests.
+    fn turn_line(n: u32) -> String {
+        format!(
+            r#"{{"timestamp":"2026-05-28T12:{n:02}:00Z","type":"user","message":{{"content":[{{"type":"text","text":"directive {n}"}}]}}}}"#
+        )
+    }
+
     fn base_config(agent_id: &str) -> WatchConfig {
         WatchConfig {
             hosts: vec![HostKind::ClaudeCode],
@@ -539,13 +604,14 @@ mod tests {
         let dir = fresh_dir();
         let db = dir.path().join("mem.db");
         let cfg = base_config("ai:test:no-transcript");
-        // Point HOME somewhere with no Claude Code project dir by using
-        // a cwd that never resolves. `resolve_transcript` swallows a
-        // missing dir gracefully, so this call must not touch the DB
-        // (a hard failure here would mean we opened a connection for a
-        // no-op tick).
+        // Hermetic: inject a resolver that reports NO candidate for this
+        // host (the steady state on a fresh box) rather than walking the
+        // real `$HOME`-rooted host directories (M-MOCKABLE-SYSCALLS;
+        // issue #2118). A no-candidate tick must not touch the DB — a
+        // hard failure here would mean we opened a connection for a
+        // no-op tick.
         let mut states = HashMap::new();
-        let outcomes = poll_once(&db, &cfg, &mut states);
+        let outcomes = poll_once_with_resolver(&db, &cfg, &mut states, |_host, _cwd| Ok(None));
         assert_eq!(outcomes.len(), 1);
         assert!(!outcomes[0].changed);
         assert!(outcomes[0].error.is_none());
@@ -555,47 +621,37 @@ mod tests {
         );
     }
 
+    /// Renamed from the misleading `detects_new_transcript_*` (issue
+    /// #2118): the old test only called `recover_from_transcript`
+    /// directly and never exercised `poll_once`'s change detection. With
+    /// the injectable resolver seam this now genuinely drives `poll_once`
+    /// end-to-end — first tick detects the fresh transcript + captures
+    /// via the shared L2 pipeline, second tick short-circuits to
+    /// `Unchanged` (belt-and-suspenders dedup keeps it idempotent).
     #[test]
-    fn detects_new_transcript_and_captures_via_l2_pipeline() {
-        use crate::recover::transcript_paths::HostKind as HK;
+    fn poll_once_detects_new_transcript_then_skips_unchanged() {
         let dir = fresh_dir();
         let db = dir.path().join("mem.db");
         let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
-
-        // Directly exercise `poll_once`'s change-detection + recovery
-        // wiring by pre-seeding a `HostPollState` as if `resolve_transcript`
-        // had already returned this exact path with stale (empty) state —
-        // then flip the file to simulate the resolver returning it fresh.
         let cfg = base_config("ai:test:detect");
+        let resolve = |_host: HostKind, _cwd: &std::path::Path| Ok(Some(transcript.clone()));
 
-        // Simulate the resolver having previously seen NOTHING for this
-        // host, then a transcript appears: call the shared recovery path
-        // directly with the resolved candidate to prove the plumbing
-        // (poll_once itself requires a real HOME-rooted resolver walk,
-        // covered end-to-end by `transcript_paths` tests + the CLI test
-        // in `cli::watch::tests`).
-        let opts = RecoverOpts {
-            host: HK::ClaudeCode,
-            transcript_override: Some(transcript.clone()),
-            since_iso: None,
-            namespace: cfg.namespace.clone(),
-            limit: cfg.limit,
-            dry_run: false,
-            quiet: true,
-            agent_id: cfg.agent_id.clone(),
-        };
-        let report = recover_from_transcript(&db, &opts).unwrap();
-        assert_eq!(report.lines_atomised, 1);
-        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        let mut states = HashMap::new();
 
-        // Second call against the SAME unmodified file must dedup to
-        // zero new lines — the same idempotency guarantee L2 gives,
-        // which is exactly what makes repeated polling of an unchanged
-        // file safe once `poll_once`'s own mtime/size diff lets a tick
-        // through anyway (belt-and-suspenders dedup).
-        let report2 = recover_from_transcript(&db, &opts).unwrap();
-        assert_eq!(report2.lines_atomised, 0);
-        assert_eq!(report2.lines_skipped_dedup, 1);
+        // First tick: fresh transcript → detect + capture.
+        let outcomes = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].changed, "fresh transcript must be detected");
+        let r1 = outcomes[0].recover_report.as_ref().expect("report");
+        assert_eq!(r1.lines_atomised, 1);
+        assert!(r1.errors.is_empty(), "errors: {:?}", r1.errors);
+
+        // Second tick: same `(path, mtime, len)`, no pending-drain → the
+        // pure `decide_poll` short-circuits to `Unchanged`, so recovery
+        // does not even run (no DB touch).
+        let outcomes2 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        assert!(!outcomes2[0].changed, "unchanged file must skip recovery");
+        assert!(outcomes2[0].recover_report.is_none());
     }
 
     #[test]
@@ -760,16 +816,15 @@ mod tests {
         let dir = fresh_dir();
         let db = dir.path().join("mem.db");
         let mut cfg = base_config("ai:test:daemon-shutdown");
-        // Point the daemon at a host with no resolvable transcript
-        // (empty HOME-independent hosts list would still walk real
-        // $HOME; scope to ClaudeCode which gracefully no-ops when the
-        // project dir is absent) and a short interval so the test
-        // doesn't wait long even without the shutdown signal.
+        // Hermetic: inject a resolver that never resolves a candidate so
+        // the loop does no DB work and never walks the real `$HOME`
+        // (M-MOCKABLE-SYSCALLS; issue #2118). A short interval keeps the
+        // test quick even absent the shutdown signal.
         cfg.poll_interval = Duration::from_secs(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_for_thread = shutdown.clone();
         let handle = std::thread::spawn(move || {
-            run_watch_daemon(db, cfg, shutdown_for_thread);
+            run_watch_daemon_with_resolver(db, cfg, shutdown_for_thread, |_host, _cwd| Ok(None));
         });
         // Give it a moment to enter the loop, then signal shutdown.
         std::thread::sleep(Duration::from_millis(50));
@@ -785,5 +840,116 @@ mod tests {
             "daemon took too long to shut down: {:?}",
             start.elapsed()
         );
+    }
+
+    /// Issue #2126 (a) — the un-drained `pending_drain` tail of an
+    /// oversized-then-static transcript MUST still drain on later ticks
+    /// even after the agent's `MAX(created_at)` watermark advances PAST
+    /// the file's mtime (a same-agent wall-clock L1 write mid-drain). The
+    /// #2117 fix armed `pending_drain`, but `poll_once` fed recovery a
+    /// fast-path-eligible `RecoverOpts` — so once the watermark passed the
+    /// mtime the drain tick fast-pathed, reported `lines_skipped_limit=0`,
+    /// cleared `pending_drain`, and SILENTLY stranded the tail (re-opening
+    /// the exact #2117 loss). The fix is `bypass_fast_path` on the
+    /// watcher's recovery so it actually parses.
+    #[test]
+    fn pending_drain_tail_drains_even_after_watermark_advances_2126() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let lines = [turn_line(1), turn_line(2), turn_line(3)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let transcript = write_transcript(dir.path(), &refs);
+        let mut cfg = base_config("ai:test:2126");
+        cfg.limit = 1; // one turn/tick → a two-tick tail to drain
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Tick 1: capture turn 1, skip the rest → pending_drain armed.
+        let o1 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        let r1 = o1[0].recover_report.as_ref().expect("report");
+        assert_eq!(r1.lines_atomised, 1);
+        assert!(r1.lines_skipped_limit >= 1);
+        assert!(states[&HostKind::ClaudeCode].pending_drain);
+
+        // Advance the agent watermark PAST the static file's mtime — the
+        // exact #2126 trigger (a same-agent wall-clock L1 write mid-drain).
+        {
+            let conn = crate::storage::open(&db).expect("open");
+            conn.execute(
+                "UPDATE memories SET created_at = '2999-01-01T00:00:00Z' WHERE agent_id_idx = ?1",
+                rusqlite::params![&cfg.agent_id],
+            )
+            .expect("advance watermark");
+        }
+
+        // Tick 2: watermark now far in the future, yet the drain MUST
+        // parse (bypass_fast_path) and capture the tail — never fast-path.
+        let o2 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        let r2 = o2[0].recover_report.as_ref().expect("report");
+        assert!(
+            !r2.fast_path_hit,
+            "watcher must bypass the L2 watermark fast-path (#2126)"
+        );
+        assert_eq!(
+            r2.lines_atomised, 1,
+            "the tail turn must be captured, not silently stranded"
+        );
+
+        // Tick 3: last turn drains, pending_drain clears — no busy-loop.
+        let o3 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        let r3 = o3[0].recover_report.as_ref().expect("report");
+        assert_eq!(r3.lines_atomised, 1);
+        assert_eq!(r3.lines_skipped_limit, 0);
+        assert!(
+            !states[&HostKind::ClaudeCode].pending_drain,
+            "pending_drain must clear once the tail is fully drained"
+        );
+
+        // Tick 4: fully drained + static → Unchanged, no re-parse.
+        let o4 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        assert!(
+            !o4[0].changed,
+            "a fully-drained static file must be Unchanged"
+        );
+    }
+
+    /// Issue #2126 (b) — a `--dry-run` watch over an oversized static
+    /// transcript must NOT busy-loop. Dry-run writes no dedup rows, so a
+    /// re-drain can never make progress; arming `pending_drain` would
+    /// re-parse the same first `limit` lines every tick forever. Dry-run
+    /// therefore does exactly ONE inspection parse per detected change,
+    /// then short-circuits to `Unchanged`.
+    #[test]
+    fn dry_run_oversized_transcript_does_not_busy_loop_2126() {
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let lines = [turn_line(1), turn_line(2), turn_line(3)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let transcript = write_transcript(dir.path(), &refs);
+        let mut cfg = base_config("ai:test:2126-dry");
+        cfg.limit = 1;
+        cfg.dry_run = true;
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Tick 1: inspect (count a would-be write + a skipped tail) but
+        // MUST NOT arm pending_drain.
+        let o1 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        let r1 = o1[0].recover_report.as_ref().expect("report");
+        assert_eq!(r1.lines_atomised, 1);
+        assert!(r1.lines_skipped_limit >= 1);
+        assert!(
+            !states[&HostKind::ClaudeCode].pending_drain,
+            "dry-run must never arm pending_drain (busy-loop guard, #2126 (b))"
+        );
+
+        // Tick 2: same `(path, mtime, len)` + pending_drain=false → the
+        // static file short-circuits to Unchanged (no perpetual re-parse).
+        let o2 = poll_once_with_resolver(&db, &cfg, &mut states, resolve);
+        assert!(
+            !o2[0].changed,
+            "dry-run over a static oversized transcript must not re-parse every tick"
+        );
+        assert!(o2[0].recover_report.is_none());
     }
 }
