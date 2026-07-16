@@ -1438,6 +1438,90 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             cli::archive::run(&db_path, a, j, &mut out)
         }
         Command::Agents(a) => {
+            // #2095 MAJOR 1 — the HTTP per-agent api-key enrollment/revocation
+            // verbs must write to the CONFIGURED backend so a postgres-backed
+            // daemon (whose `serve` boot-seeds the enrolled map from postgres,
+            // not sqlite) actually observes them. Route BindApiKey/RevokeApiKey
+            // through the SAL store (`build_store_handle` selects sqlite vs
+            // postgres from `--store-url` / the #1927 non-argv channel); every
+            // other `agents` verb stays on the local sqlite path unchanged.
+            #[cfg(feature = "sal")]
+            {
+                use crate::cli::agents::AgentsAction;
+                match &a.action {
+                    Some(AgentsAction::BindApiKey { agent_id, token }) => {
+                        crate::validate::validate_agent_id(agent_id)?;
+                        let trimmed = token.trim();
+                        if trimmed.is_empty() {
+                            anyhow::bail!("api-key token must not be empty");
+                        }
+                        let token_sha256 =
+                            crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
+                        let (_backend, store) = build_store_handle(
+                            None, // #1927 non-argv store-url channel (env/file); resolved inside build_store_handle
+                            &db_path,
+                            None,
+                            None,
+                            crate::store::PoolConfig::default(),
+                        )
+                        .await?;
+                        let ctx = crate::store::CallerContext::for_admin(
+                            crate::identity::sentinels::DAEMON_PRINCIPAL,
+                        );
+                        store
+                            .bind_agent_api_key(&ctx, agent_id, &token_sha256)
+                            .await?;
+                        if j {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "bound": true,
+                                    "agent_id": agent_id,
+                                    "token_sha256": token_sha256,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "bound api-key for {agent_id} (sha256={token_sha256}); \
+                                 restart `ai-memory serve` for it to take effect"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Some(AgentsAction::RevokeApiKey { agent_id }) => {
+                        crate::validate::validate_agent_id(agent_id)?;
+                        let (_backend, store) = build_store_handle(
+                            None, // #1927 non-argv store-url channel (env/file); resolved inside build_store_handle
+                            &db_path,
+                            None,
+                            None,
+                            crate::store::PoolConfig::default(),
+                        )
+                        .await?;
+                        let ctx = crate::store::CallerContext::for_admin(
+                            crate::identity::sentinels::DAEMON_PRINCIPAL,
+                        );
+                        let removed = store.revoke_agent_api_key(&ctx, agent_id).await?;
+                        if j {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "revoked": true,
+                                    "agent_id": agent_id,
+                                    "bindings_removed": removed,
+                                })
+                            );
+                        } else {
+                            println!(
+                                "revoked {removed} api-key binding(s) for {agent_id}; \
+                                 restart `ai-memory serve` for it to take effect"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();

@@ -22,10 +22,10 @@
 //! introduces NO new signed request envelope — it reuses the presented
 //! per-agent key.
 //!
-//! The [`crate::handlers::api_key_auth`] middleware resolves an
-//! [`AuthenticatedPrincipal`] from the presented key and injects it into the
-//! request extensions; the IDOR/admin gates consume the carried
-//! [`AuthLevel`]. Posture is the tri-state
+//! The [`crate::handlers::api_key_auth`] middleware BINDS the presented per-agent
+//! key's `agent_id` onto the `X-Agent-Id` header; the IDOR/admin gates re-derive
+//! the caller's [`AuthLevel`] self-containedly from the enrolled map + presented
+//! `X-API-Key` ([`resolve_auth_level`]) and consume it. Posture is the tri-state
 //! [`crate::config::HttpIdentityMode`] (`off`/`advisory`/`enforce`, default
 //! `advisory`).
 
@@ -41,8 +41,8 @@ use crate::config::HttpIdentityMode;
 
 /// The provenance of the caller's resolved `agent_id` on the HTTP surface.
 ///
-/// Carried on [`AuthenticatedPrincipal`] and consumed by the IDOR/admin gates
-/// (via [`enforce_sensitive_identity`]). Ordering is significant:
+/// Re-derived per request by [`resolve_auth_level`] and consumed by the
+/// IDOR/admin gates (via [`enforce_sensitive_identity`]). Ordering is significant:
 /// `Claimed < KeyAuthenticated < SignatureAttested` by assurance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuthLevel {
@@ -78,20 +78,6 @@ impl AuthLevel {
     pub fn is_key_bound(self) -> bool {
         matches!(self, Self::KeyAuthenticated | Self::SignatureAttested)
     }
-}
-
-/// The request principal resolved by [`crate::handlers::api_key_auth`] and
-/// stored in the axum request extensions. Present on EVERY request that
-/// traversed the middleware with an `api_key` configured; absent on the keyless
-/// bind (treated as [`AuthLevel::Claimed`] by the consumers).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthenticatedPrincipal {
-    /// The resolved principal. For a `KeyAuthenticated` level this is the
-    /// key-derived `agent_id`; for `Claimed` it is the self-asserted
-    /// `X-Agent-Id` (or the anonymous fallback).
-    pub agent_id: String,
-    /// How `agent_id` was established.
-    pub level: AuthLevel,
 }
 
 /// Lowercase hex `sha256` of an api-key token — the stored `agent_api_keys`
@@ -224,11 +210,16 @@ pub fn enforce_sensitive_identity(
     if level.is_key_bound() {
         return None;
     }
-    // A request-scoped anonymous id (`anonymous:req-…`) is not an assertion of
-    // another agent's identity — it only ever sees non-private rows and owns
-    // nothing durable, so it is never an IDOR/admin lever. Let it through in
-    // both advisory and enforce (mirrors the create-path anonymous carve-out).
-    if caller.starts_with(crate::identity::sentinels::ANONYMOUS_REQ_PREFIX) {
+    // An anonymous caller is not an assertion of another agent's identity — it
+    // only ever sees non-private rows and owns nothing durable, so it is never an
+    // IDOR/admin lever. Carve out EVERY HTTP anonymous form so the gate is
+    // consistent regardless of which resolver produced the caller string
+    // (`enforce_idor_identity` → `anonymous:req-…` on absent/invalid header;
+    // `http_caller_ctx` → `anonymous:invalid` on a resolve error) — #2095 MINOR
+    // sentinel-divergence alignment. Mirrors the create-path anonymous carve-out.
+    if caller.starts_with(crate::identity::sentinels::ANONYMOUS_REQ_PREFIX)
+        || caller == crate::identity::sentinels::ANONYMOUS_INVALID
+    {
         return None;
     }
     match mode {

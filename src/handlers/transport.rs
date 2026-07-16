@@ -951,14 +951,13 @@ pub async fn api_key_auth(
         }
         // BIND: overwrite `X-Agent-Id` with the key-derived principal so every
         // downstream handler's header-based resolution honors the attested id.
+        // The IDOR/admin gates re-derive the `AuthLevel` self-containedly from
+        // the enrolled map + presented `X-API-Key`
+        // (`identity_binding::resolve_auth_level`), so no request-extension
+        // principal is injected here — it would be dead weight nothing reads.
         if let Ok(hv) = axum::http::HeaderValue::from_str(&agent_id) {
             req.headers_mut().insert(crate::HEADER_AGENT_ID, hv);
         }
-        req.extensions_mut()
-            .insert(super::identity_binding::AuthenticatedPrincipal {
-                agent_id,
-                level: super::identity_binding::AuthLevel::KeyAuthenticated,
-            });
     }
 
     next.run(req).await.into_response()

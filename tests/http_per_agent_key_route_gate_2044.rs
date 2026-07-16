@@ -41,7 +41,7 @@ fn fresh_dir() -> TempDir {
 /// Build a router in `enforce` mode with `alice` enrolled both as an admin and
 /// as the owner of the `ALICE_KEY` per-agent api-key. The shared transport key
 /// (`SHARED_KEY`) authenticates transport but resolves to NO per-agent principal.
-fn build_enforce_router() -> (axum::Router, NamedTempFile) {
+fn build_enforce_router() -> (axum::Router, AppState, NamedTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -98,8 +98,8 @@ fn build_enforce_router() -> (axum::Router, NamedTempFile) {
         enrolled_agent_keys: enrolled,
         identity_mode: HttpIdentityMode::Enforce,
     };
-    let router = ai_memory::build_router(api_key_state, app_state);
-    (router, f)
+    let router = ai_memory::build_router(api_key_state, app_state.clone());
+    (router, app_state, f)
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +109,7 @@ fn build_enforce_router() -> (axum::Router, NamedTempFile) {
 #[tokio::test]
 async fn m1_run_gc_shared_key_admin_spoof_is_403_under_enforce() {
     let _dir = fresh_dir();
-    let (router, _f) = build_enforce_router();
+    let (router, _app, _f) = build_enforce_router();
     // Shared transport key + a configured admin X-Agent-Id — the M1 spoof.
     let req = Request::builder()
         .method("POST")
@@ -130,7 +130,7 @@ async fn m1_run_gc_shared_key_admin_spoof_is_403_under_enforce() {
 #[tokio::test]
 async fn m1_run_gc_per_agent_key_admin_passes() {
     let _dir = fresh_dir();
-    let (router, _f) = build_enforce_router();
+    let (router, _app, _f) = build_enforce_router();
     // alice's enrolled per-agent key → middleware binds X-Agent-Id=alice, the
     // gate sees KeyAuthenticated, require_admin admits → 200.
     let req = Request::builder()
@@ -154,7 +154,7 @@ async fn m1_run_gc_per_agent_key_admin_passes() {
 #[tokio::test]
 async fn h1_list_memories_shared_key_victim_spoof_is_403_under_enforce() {
     let _dir = fresh_dir();
-    let (router, _f) = build_enforce_router();
+    let (router, _app, _f) = build_enforce_router();
     // Shared transport key + a victim X-Agent-Id on the BULK read surface — the
     // H1 cross-tenant enumeration lever. Refused BEFORE the visibility filter.
     let req = Request::builder()
@@ -176,7 +176,7 @@ async fn h1_list_memories_shared_key_victim_spoof_is_403_under_enforce() {
 #[tokio::test]
 async fn h1_list_memories_per_agent_key_passes() {
     let _dir = fresh_dir();
-    let (router, _f) = build_enforce_router();
+    let (router, _app, _f) = build_enforce_router();
     // alice's enrolled per-agent key → bound + key-attested → 200 (her own view).
     let req = Request::builder()
         .method("GET")
@@ -193,9 +193,30 @@ async fn h1_list_memories_per_agent_key_passes() {
 }
 
 #[tokio::test]
+async fn h1_search_shared_key_victim_spoof_is_403_under_enforce() {
+    // #2095 MINOR — the SEARCH bulk-read surface (GET /api/v1/search) shares the
+    // same self-asserted-X-Agent-Id → visibility filter as list/recall.
+    let _dir = fresh_dir();
+    let (router, _app, _f) = build_enforce_router();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/search?q=anything")
+        .header("x-api-key", SHARED_KEY)
+        .header("x-agent-id", "victim")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "#2044 H1: shared-key victim-spoof on search must 403 under enforce"
+    );
+}
+
+#[tokio::test]
 async fn h1_recall_shared_key_victim_spoof_is_403_under_enforce() {
     let _dir = fresh_dir();
-    let (router, _f) = build_enforce_router();
+    let (router, _app, _f) = build_enforce_router();
     let req = Request::builder()
         .method("GET")
         .uri("/api/v1/recall?context=anything")
@@ -208,5 +229,79 @@ async fn h1_recall_shared_key_victim_spoof_is_403_under_enforce() {
         resp.status(),
         StatusCode::FORBIDDEN,
         "#2044 H1: shared-key victim-spoof on recall must 403 under enforce"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M1 (#2093) — the SECOND admin predicate `is_admin_caller_trusted`, consumed
+// by 8 read+destructive admin surfaces (purge_archive, forget-adjacent, kg /
+// power / governance / links admin branches). This is a bool gate (not a
+// 403-returning one): under `enforce` a forged shared-key admin must resolve to
+// NOT-trusted so the handler downgrades to caller-scope (no cross-tenant admin
+// bypass — e.g. no cross-tenant archive purge). One predicate guards all 8
+// sites, so this direct test is the load-bearing guarantee for every one.
+// ---------------------------------------------------------------------------
+
+fn headers_with_key(api_key: &str, agent_id: &str) -> axum::http::HeaderMap {
+    let mut h = axum::http::HeaderMap::new();
+    h.insert("x-api-key", api_key.parse().unwrap());
+    h.insert("x-agent-id", agent_id.parse().unwrap());
+    h
+}
+
+#[tokio::test]
+async fn m1_2093_is_admin_caller_trusted_refuses_shared_key_admin_under_enforce() {
+    let _dir = fresh_dir();
+    let (_router, app, _f) = build_enforce_router();
+    use ai_memory::handlers::admin_role::is_admin_caller_trusted;
+
+    // Shared transport key + a forged admin X-Agent-Id → Claimed → NOT trusted
+    // under enforce. This is the #2093 fix: pre-fix this returned `true` (the
+    // base #1570 gate passed because api_key is configured), letting a shared-key
+    // caller pass the destructive purge_archive / forget admin branches.
+    let shared = headers_with_key(SHARED_KEY, "alice");
+    assert!(
+        !is_admin_caller_trusted(&app, &shared, "alice"),
+        "#2093: a shared-key caller asserting an admin id must NOT be trusted \
+         under enforce (Claimed, not key-attested)"
+    );
+
+    // alice's enrolled per-agent key acting as alice → KeyAuthenticated → trusted.
+    let keyed = headers_with_key(ALICE_KEY, "alice");
+    assert!(
+        is_admin_caller_trusted(&app, &keyed, "alice"),
+        "#2093: alice's enrolled per-agent key must be trusted for admin"
+    );
+
+    // A non-allowlisted caller is never trusted regardless of key.
+    assert!(
+        !is_admin_caller_trusted(&app, &keyed, "bob"),
+        "non-allowlisted caller is never admin-trusted"
+    );
+}
+
+#[tokio::test]
+async fn m1_2093_purge_archive_shared_key_admin_does_not_403_but_downgrades() {
+    // Route-level pin for the DESTRUCTIVE surface (DELETE /api/v1/archive). The
+    // predicate DOWNGRADES (not 403s), so a forged shared-key admin gets a normal
+    // 200 that ran in CALLER scope (no cross-tenant purge) — the security
+    // property is the absence of the admin bypass, pinned directly above. Here we
+    // assert the route stays functional (no crash / no spurious 403) under the
+    // new gate.
+    let _dir = fresh_dir();
+    let (router, _app, _f) = build_enforce_router();
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/archive?older_than_days=3650")
+        .header("x-api-key", SHARED_KEY)
+        .header("x-agent-id", "alice")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "#2093: purge_archive downgrades a forged shared-key admin to caller \
+         scope (200, caller-scoped purge), it does not 403"
     );
 }

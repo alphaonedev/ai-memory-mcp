@@ -629,6 +629,15 @@ impl MemoryStore for SqliteStore {
         db::agent_id_for_api_key(&conn, token_sha256).map_err(box_err)
     }
 
+    async fn revoke_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::revoke_agent_api_key(&conn, agent_id).map_err(box_err)
+    }
+
     async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
         let conn = self.state.lock().await;
         db::list_agent_api_keys(&conn).map_err(box_err)

@@ -21,13 +21,12 @@
 
 use ai_memory::config::HttpIdentityMode;
 use ai_memory::handlers::identity_binding::{
-    self, AuthLevel, api_key_sha256_hex, enforce_sensitive_identity, resolve_auth_level,
+    AuthLevel, api_key_sha256_hex, enforce_sensitive_identity, resolve_auth_level,
 };
 use ai_memory::handlers::{ApiKeyState, api_key_auth};
 use axum::{
     Json, Router,
     body::Body,
-    extract::Extension,
     http::{HeaderMap, Request, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -71,29 +70,46 @@ fn db_bind_resolve_list_roundtrip_is_digest_keyed() {
         Some("alice2".to_string())
     );
     assert_eq!(ai_memory::db::list_agent_api_keys(&conn).unwrap().len(), 1);
+
+    // #2095 — revoke invalidates a leaked key (returns rows removed; idempotent).
+    assert_eq!(
+        ai_memory::db::revoke_agent_api_key(&conn, "alice2").unwrap(),
+        1
+    );
+    assert_eq!(
+        ai_memory::db::agent_id_for_api_key(&conn, &hash).unwrap(),
+        None,
+        "revoked key no longer resolves"
+    );
+    assert!(
+        ai_memory::db::list_agent_api_keys(&conn)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        ai_memory::db::revoke_agent_api_key(&conn, "alice2").unwrap(),
+        0,
+        "revoking an already-revoked agent is a no-op"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // 2. Middleware binding — the api_key_auth layer over an echo handler.
 // ---------------------------------------------------------------------------
 
-/// Echoes the (possibly middleware-bound) `X-Agent-Id` header + the resolved
-/// auth level from the injected [`identity_binding::AuthenticatedPrincipal`]
-/// extension (absent → "none").
-async fn echo(
-    headers: HeaderMap,
-    principal: Option<Extension<identity_binding::AuthenticatedPrincipal>>,
-) -> impl IntoResponse {
+/// Echoes the (possibly middleware-bound) `X-Agent-Id` header. Binding
+/// correctness is fully observable here: a per-agent key OVERWRITES the header to
+/// the key-derived id; a shared key leaves the self-asserted value untouched.
+/// (The `AuthLevel` is re-derived by the gates from the enrolled map + the
+/// presented key — see the `identity_binding` unit tests + the route-gate tests
+/// — so no request-extension principal is injected to read here.)
+async fn echo(headers: HeaderMap) -> impl IntoResponse {
     let agent = headers
         .get("x-agent-id")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let level = principal.map_or_else(
-        || "none".to_string(),
-        |Extension(p)| p.level.as_str().to_string(),
-    );
-    Json(serde_json::json!({ "agent_id": agent, "level": level }))
+    Json(serde_json::json!({ "agent_id": agent }))
 }
 
 fn enrolled(pairs: &[(&str, &str)]) -> Arc<HashMap<String, String>> {
@@ -148,13 +164,11 @@ async fn per_agent_key_binds_x_agent_id_and_injects_principal() {
     let (st, body) = call(&app, "alice-key", None).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["agent_id"], "alice");
-    assert_eq!(body["level"], "key_authenticated");
 
     // alice presents her key WITH a MATCHING header → honored.
     let (st, body) = call(&app, "alice-key", Some("alice")).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["agent_id"], "alice");
-    assert_eq!(body["level"], "key_authenticated");
 }
 
 #[tokio::test]
@@ -174,7 +188,6 @@ async fn h1_advisory_corrects_forged_x_agent_id_to_key_principal() {
         body["agent_id"], "alice",
         "forged X-Agent-Id must be corrected"
     );
-    assert_eq!(body["level"], "key_authenticated");
 }
 
 #[tokio::test]
@@ -207,7 +220,6 @@ async fn shared_key_does_not_bind_or_attest() {
     let (st, body) = call(&app, "shared-transport", Some("victim")).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["agent_id"], "victim"); // self-asserted, unbound
-    assert_eq!(body["level"], "none");
 }
 
 #[tokio::test]
@@ -237,7 +249,6 @@ async fn off_mode_disables_binding() {
     let (st, body) = call(&app, "alice-key", Some("bob")).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(body["agent_id"], "bob"); // not bound under off
-    assert_eq!(body["level"], "none");
 }
 
 // ---------------------------------------------------------------------------

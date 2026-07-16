@@ -72,6 +72,15 @@ pub enum AgentsAction {
         #[arg(long)]
         token: String,
     },
+    /// v1.0.0 #2095 — revoke (invalidate) EVERY enrolled per-agent HTTP api-key
+    /// bound to `agent_id`. The PK is the token digest, so a leaked key can only
+    /// be invalidated by revoking the agent's binding(s). RESTART the `serve`
+    /// daemon after revoking (the enrolled map is boot-loaded).
+    RevokeApiKey {
+        /// Agent identifier whose api-key binding(s) to remove.
+        #[arg(long)]
+        agent_id: String,
+    },
     /// v1.0.0 crypto-core (#1942, spec §2.3) — pre-enroll a per-instance
     /// sub-key certificate from a JSON file. The cert is verified under the
     /// principal's bound root key (`bind-key` first) BEFORE it is stored, so
@@ -245,6 +254,27 @@ pub fn run_agents(
                 writeln!(
                     out.stdout,
                     "bound api-key for {agent_id} (sha256={token_sha256}); \
+                     restart `ai-memory serve` for it to take effect"
+                )?;
+            }
+        }
+        AgentsAction::RevokeApiKey { agent_id } => {
+            validate::validate_agent_id(&agent_id)?;
+            let removed = db::revoke_agent_api_key(&conn, &agent_id)?;
+            if json_out {
+                writeln!(
+                    out.stdout,
+                    "{}",
+                    serde_json::json!({
+                        "revoked": true,
+                        "agent_id": agent_id,
+                        "bindings_removed": removed,
+                    })
+                )?;
+            } else {
+                writeln!(
+                    out.stdout,
+                    "revoked {removed} api-key binding(s) for {agent_id}; \
                      restart `ai-memory serve` for it to take effect"
                 )?;
             }

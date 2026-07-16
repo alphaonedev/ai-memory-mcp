@@ -16599,6 +16599,19 @@ impl MemoryStore for PostgresStore {
         Ok(row.map(|(a,)| a))
     }
 
+    async fn revoke_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<usize> {
+        let res = sqlx::query("DELETE FROM agent_api_keys WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("revoke_agent_api_key", e))?;
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
+    }
+
     async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT token_sha256, agent_id FROM agent_api_keys")
