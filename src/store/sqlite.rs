@@ -2764,15 +2764,33 @@ mod tests {
         );
     }
 
+    /// `verify` flags a row whose `metadata.agent_id` is missing — the
+    /// integrity check `super::integrity_findings` exists for exactly this
+    /// corruption class (direct on-disk tampering / a legacy pre-covenant
+    /// row), so the corrupt state MUST be established via a RAW write.
+    ///
+    /// #2106 (covenant clause 2, PR #2101) closed the omission-erasure hole:
+    /// `update_with_expected_version` now overlays the OLD row's immutable
+    /// provenance keys (`agent_id` / `derived_from` /
+    /// `consolidated_from_agents`) back onto any patch that omits them, so a
+    /// caller `update(metadata: {})` can NO LONGER wipe authorship — erasure
+    /// being strictly worse than the rewrite the clause-2 gate already
+    /// refuses. The former version of this test corrupted agent_id via that
+    /// very `update(metadata: {})` path; post-#2106 that path preserves
+    /// agent_id, so this test now (a) asserts the covenant preservation and
+    /// (b) exercises the real `verify` detection via a raw metadata wipe.
     #[tokio::test]
-    async fn verify_flags_empty_content() {
+    async fn verify_flags_missing_agent_id_update_preserves_2106() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open");
         let ctx = CallerContext::for_agent("alice");
         let mut mem = test_memory("hello", "x content long enough to pass validate");
         mem.content = "nonempty for store".to_string();
         let id = store.store(&ctx, &mem).await.expect("store");
-        // Manually corrupt metadata.agent_id via update.
+
+        // #2106 — a full-object metadata patch that OMITS agent_id must NOT
+        // erase the stored author; the provenance overlay preserves it, so
+        // `verify` still sees a clean row.
         store
             .update(
                 &ctx,
@@ -2784,6 +2802,23 @@ mod tests {
             )
             .await
             .expect("update");
+        let preserved = store.verify(&ctx, &id).await.expect("verify");
+        assert!(
+            preserved.integrity_ok,
+            "#2106: an omitting metadata patch must PRESERVE agent_id, not erase it"
+        );
+
+        // Raw on-disk corruption (bypassing the caller preservation overlay)
+        // wipes agent_id — the tampering class the integrity check detects.
+        // Scope the connection guard so it is released before `verify` re-locks.
+        {
+            let conn = store.state.lock().await;
+            conn.execute(
+                "UPDATE memories SET metadata = '{}' WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .expect("raw metadata wipe");
+        }
         let report = store.verify(&ctx, &id).await.expect("verify");
         assert!(!report.integrity_ok);
         assert!(
