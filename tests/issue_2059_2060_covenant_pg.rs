@@ -77,6 +77,26 @@ fn is_permission_denied(err: &StoreError) -> bool {
     matches!(err, StoreError::PermissionDenied { .. })
 }
 
+/// Serialize the shared-process env mutations (`REQUIRE_WHY_TRACE_ENV` /
+/// `REQUIRE_IMMUTABLE_AUTHORSHIP_ENV`). Mirrors `covenant_env_lock()` in the
+/// sibling `tests/issue_2059_2060_covenant_write_gates.rs`, but as a
+/// `tokio::sync::Mutex` because this file's tests are async and the guard is
+/// held across `.await` points (a std `MutexGuard` there trips
+/// `clippy::await_holding_lock` and risks a deadlock under a multi-thread
+/// runtime). The pg-gated tests skip (return) BEFORE touching the env when no
+/// PG url is set, so the only env-mutators that RUN under a default (no-PG)
+/// `cargo test` are the two unconditional in-memory sqlite tests below;
+/// guarding them keeps the default parallel invocation deterministic (the
+/// live-PG suite additionally runs serial via `-- --test-threads=1`, per the
+/// module header).
+async fn covenant_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    use std::sync::OnceLock;
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 // ── Clause 1 — why_trace on the postgres store funnels (#2102) ────────────
 
 #[tokio::test]
@@ -250,6 +270,7 @@ async fn pg_supersede_refuses_authorship_rewrite_under_enforce() {
 #[tokio::test]
 async fn sqlite_system_principal_exempt_tenant_gated_under_enforce_2110() {
     use ai_memory::store::sqlite::SqliteStore;
+    let _env = covenant_env_lock().await;
     unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
     let store = SqliteStore::open(":memory:").expect("open in-memory store");
 
@@ -320,7 +341,9 @@ async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
         .expect_err("tenant why_trace-less write refused regardless of forged kind");
     assert!(is_permission_denied(&err), "got {err:?}");
 
-    // System principal → EXEMPT.
+    // System principal → EXEMPT + STAMPED (#2124 — parity with the sqlite
+    // twin above, which asserts `substrate:system-authored` persisted; pre
+    // #2124 the pg `store` funnel skipped the gate WITHOUT stamping).
     let system = CallerContext::for_admin("ai:curator-2110");
     let sys = pg_mem(
         &format!("ps-{run}"),
@@ -329,10 +352,16 @@ async fn pg_system_principal_exempt_tenant_gated_under_enforce_2110() {
         "ai:curator",
         None,
     );
-    store
+    let id = store
         .store(&system, &sys)
         .await
         .expect("authenticated system principal is exempt on pg");
+    let got = store.get(&system, &id).await.expect("get");
+    assert_eq!(
+        why_trace_of(&got).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+        "#2124 — pg store must stamp the substrate why_trace for the internal principal"
+    );
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
 
@@ -375,6 +404,7 @@ fn is_reflect_why_trace_refusal(err: &ai_memory::db::ReflectError) -> bool {
 #[tokio::test]
 async fn sqlite_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
     use ai_memory::store::sqlite::SqliteStore;
+    let _env = covenant_env_lock().await;
     let store = SqliteStore::open(":memory:").expect("open in-memory store");
     let system = CallerContext::for_admin("ai:curator-2113");
     let tenant = CallerContext::for_agent("ai:tenant-2113");
@@ -855,5 +885,171 @@ async fn pg_notify_why_trace_param_path_under_enforce_2122() {
         .expect("why_trace param clears the gate");
     let got = store.get(&tenant, &id).await.expect("get");
     assert_eq!(why_trace_of(&got).as_deref(), Some("coordinating handoff"));
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+// ── #2124 (LOW) — cross-backend provenance parity: the pg store FAMILY
+//    (`store` / `store_batch` / `store_with_embedding`) must STAMP the same
+//    substrate why_trace the sqlite `SqliteStore::store` funnel stamps for the
+//    authenticated internal principal (`bypass_visibility`), never SKIP the
+//    gate un-stamped. Pre-#2124 the three pg funnels skipped the gate under
+//    `bypass_visibility` WITHOUT stamping, so internally-authored rows landed
+//    with NO clause-1 rationale on postgres while sqlite recorded
+//    `substrate:system-authored` — the drift this test pins closed. ──────────
+
+/// `SQLite` baseline: the store family already stamps on the internal principal.
+/// This is the parity ORACLE the pg test below mirrors (runs without a PG url).
+#[tokio::test]
+async fn sqlite_store_family_stamps_substrate_why_trace_for_system_2124() {
+    use ai_memory::store::sqlite::SqliteStore;
+    let store = SqliteStore::open(":memory:").expect("open in-memory store");
+    let system = CallerContext::for_admin("ai:curator-2124");
+
+    // store
+    let id_s = store
+        .store(
+            &system,
+            &pg_mem("sq-2124-s", "ns/2124", "sys store", "ai:c", None),
+        )
+        .await
+        .expect("store");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &id_s).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+    );
+
+    // store_with_embedding
+    let id_e = store
+        .store_with_embedding(
+            &system,
+            &pg_mem("sq-2124-e", "ns/2124", "sys embed", "ai:c", None),
+            None,
+        )
+        .await
+        .expect("store_with_embedding");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &id_e).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+    );
+
+    // store_batch
+    let ids_b = store
+        .store_batch(
+            &system,
+            std::slice::from_ref(&pg_mem("sq-2124-b", "ns/2124", "sys batch", "ai:c", None)),
+        )
+        .await
+        .expect("store_batch");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &ids_b[0]).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+    );
+}
+
+/// Postgres regression: the #2124 fix. Each of the three pg store-family
+/// funnels stamps the substrate `why_trace` for the internal principal (parity
+/// with the sqlite oracle above). A tenant write on the SAME funnels stays
+/// gated (refused under enforce) — proving the stamp is keyed on
+/// `bypass_visibility`, not a blanket exemption. Skips when no PG url is set;
+/// CI exercises it under `--features sal,sal-postgres --include-ignored`.
+#[tokio::test]
+async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_store_family_stamps_substrate_why_trace_2124: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2124-{run}");
+    let system = CallerContext::for_admin("ai:curator-2124");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+
+    // store — internal principal → stamped.
+    let id_s = store
+        .store(
+            &system,
+            &pg_mem(&format!("s-{run}"), &ns, "sys store", "ai:c", None),
+        )
+        .await
+        .expect("pg store (system) is exempt");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &id_s).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+        "pg store must stamp the substrate why_trace for the internal principal",
+    );
+
+    // store_with_embedding — internal principal → stamped.
+    let id_e = store
+        .store_with_embedding(
+            &system,
+            &pg_mem(&format!("e-{run}"), &ns, "sys embed", "ai:c", None),
+            None,
+        )
+        .await
+        .expect("pg store_with_embedding (system) is exempt");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &id_e).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+        "pg store_with_embedding must stamp the substrate why_trace",
+    );
+
+    // store_batch — internal principal → stamped.
+    let ids_b = store
+        .store_batch(
+            &system,
+            std::slice::from_ref(&pg_mem(&format!("b-{run}"), &ns, "sys batch", "ai:c", None)),
+        )
+        .await
+        .expect("pg store_batch (system) is exempt");
+    assert_eq!(
+        why_trace_of(&store.get(&system, &ids_b[0]).await.expect("get")).as_deref(),
+        Some(ai_memory::storage::WHY_TRACE_SUBSTRATE_SYSTEM),
+        "pg store_batch must stamp the substrate why_trace",
+    );
+
+    // Tenant on the SAME funnels stays gated (the stamp is keyed on the
+    // authenticated origin, not a blanket exemption).
+    let tenant = CallerContext::for_agent("ai:tenant-2124");
+    assert!(
+        is_permission_denied(
+            &store
+                .store(
+                    &tenant,
+                    &pg_mem(&format!("ts-{run}"), &ns, "tenant store", "t", None)
+                )
+                .await
+                .expect_err("tenant store refused under enforce"),
+        ),
+        "tenant store without why_trace must stay gated",
+    );
+    assert!(
+        store
+            .store_with_embedding(
+                &tenant,
+                &pg_mem(&format!("te-{run}"), &ns, "tenant embed", "t", None),
+                None,
+            )
+            .await
+            .is_err(),
+        "tenant store_with_embedding without why_trace must stay gated",
+    );
+    assert!(
+        store
+            .store_batch(
+                &tenant,
+                std::slice::from_ref(&pg_mem(
+                    &format!("tb-{run}"),
+                    &ns,
+                    "tenant batch",
+                    "t",
+                    None
+                )),
+            )
+            .await
+            .is_err(),
+        "tenant store_batch without why_trace must stay gated",
+    );
+
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
