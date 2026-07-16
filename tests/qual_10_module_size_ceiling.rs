@@ -738,7 +738,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // mirroring `consult_governance_pre_write_pg`) wired into `store` /
     // `update_with_expected_version_once`, plus their in-module regression
     // tests, land postgres.rs at 26_816; ceiling 26_900 (+84).
-    ("src/store/postgres.rs", 26_900),
+    // 2026-07-16 (#2113 + every-funnel audit): the why_trace/authorship/inbound
+    // + substrate-stamp wiring across the remaining pg funnels — reflect_with_hooks
+    // (#2113), capture_turn / recover_turn / consolidate stamps, archive_restore
+    // inbound, and the last un-gated create funnel `update_with_archive_on_supersede`
+    // — lands postgres.rs at 26_901; ceiling 26_980 (+79).
+    ("src/store/postgres.rs", 26_980),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >

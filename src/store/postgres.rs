@@ -4883,6 +4883,18 @@ impl PostgresStore {
             cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
+        // #2110/#2113 audit — TRACT covenant clause 1 on the pg append-and-
+        // archive supersede funnel. The superseding row is minted via this
+        // method's own inline `INSERT INTO memories` (below), which bypasses
+        // the `PostgresStore::store` why_trace gate — the last un-gated
+        // postgres create funnel. Mirrors the sqlite twin, whose superseding
+        // row funnels through `insert()` and is therefore why_trace-gated
+        // transitively (ctx-blind refuse-mode, no bypass exemption): a
+        // supersede whose composed metadata carries no `why_trace` is REFUSED
+        // under enforce. `candidate.metadata` is the preserved provenance
+        // overlay (existing-wins), so a supersede of a why_trace-bearing row
+        // inherits it and clears the gate.
+        consult_why_trace_gate_pg(&candidate)?;
 
         // Step 1: archive the OLD row with archive_reason='superseded'.
         // #1025 (CRITICAL, 2026-05-21) — full v0.7.0 column carry.

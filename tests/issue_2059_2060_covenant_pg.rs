@@ -454,3 +454,62 @@ async fn pg_reflect_refuses_tenant_exempts_system_under_enforce_2113() {
         .expect("authenticated system principal pg reflect is exempt");
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
+
+/// #2113 audit — the pg `update_with_archive_on_supersede` inline INSERT was
+/// the last un-gated postgres create funnel. A why_trace-less supersede is
+/// refused under enforce; a why_trace-bearing one is allowed.
+#[tokio::test]
+async fn pg_supersede_refuses_missing_why_trace_under_enforce_2113() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_supersede_refuses_missing_why_trace_2113: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let system = CallerContext::for_admin("ai:curator-sup-2113");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2113sup-{run}");
+    let id = format!("sup-wt-{run}");
+    // Seed the source as the SYSTEM principal (exempt) so it exists without a
+    // why_trace before enforce is engaged.
+    let src = pg_mem(&id, &ns, "sup source", "alice", None);
+    store.store(&system, &src).await.expect("seed source");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Supersede with a patch carrying NO why_trace → the composed candidate
+    // lacks why_trace (preserve_provenance_keys copies agent_id, not why_trace)
+    // → REFUSED by the newly-gated inline INSERT.
+    let patch_no_wt = UpdatePatch {
+        title: Some("superseding title".to_string()),
+        content: Some("superseding body".to_string()),
+        metadata: Some(serde_json::json!({"agent_id": "alice"})),
+        ..Default::default()
+    };
+    let err = store
+        .update_with_archive_on_supersede(
+            &id,
+            patch_no_wt,
+            None,
+            ai_memory::models::EditSource::Llm,
+        )
+        .await
+        .expect_err("enforce must refuse a why_trace-less pg supersede");
+    assert!(is_permission_denied(&err), "got {err:?}");
+    let still = store.get(&system, &id).await.expect("get");
+    assert_eq!(
+        still.title, "sup source",
+        "the refused supersede left the original live"
+    );
+
+    // A supersede WITH why_trace succeeds.
+    let patch_wt = UpdatePatch {
+        title: Some("superseding title 2".to_string()),
+        content: Some("superseding body 2".to_string()),
+        metadata: Some(serde_json::json!({"agent_id": "alice", "why_trace": "operator edit"})),
+        ..Default::default()
+    };
+    store
+        .update_with_archive_on_supersede(&id, patch_wt, None, ai_memory::models::EditSource::Llm)
+        .await
+        .expect("a why_trace-bearing supersede is allowed under enforce");
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
