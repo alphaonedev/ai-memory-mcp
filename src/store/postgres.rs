@@ -4891,9 +4891,18 @@ impl PostgresStore {
         // row funnels through `insert()` and is therefore why_trace-gated
         // transitively (ctx-blind refuse-mode, no bypass exemption): a
         // supersede whose composed metadata carries no `why_trace` is REFUSED
-        // under enforce. `candidate.metadata` is the preserved provenance
-        // overlay (existing-wins), so a supersede of a why_trace-bearing row
-        // inherits it and clears the gate.
+        // under enforce.
+        //
+        // #2123 — why_trace inheritance across a supersede is WHOLE-OBJECT
+        // ONLY: when the patch OMITS `metadata` entirely, `patched_metadata`
+        // clones `existing.metadata` and the old row's why_trace rides along.
+        // A patch that SUPPLIES a metadata object must re-supply why_trace
+        // itself — `preserve_provenance_keys` overlays ONLY
+        // `IMMUTABLE_PROVENANCE_KEYS` (`agent_id` / `derived_from` /
+        // `consolidated_from_agents`), and why_trace is deliberately NOT in
+        // that set (it is a PER-WRITE rationale, not immutable provenance:
+        // silently inheriting the old rationale onto a rewritten row would
+        // launder the new write past the gate).
         consult_why_trace_gate_pg(&candidate)?;
 
         // Step 1: archive the OLD row with archive_reason='superseded'.
@@ -13531,7 +13540,7 @@ impl MemoryStore for PostgresStore {
     /// quota-recording `store` method).
     async fn capture_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
         self.gate_record_stop()?;
@@ -13558,17 +13567,29 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite
         // L4 path (`storage::capture_turn_idempotent` → `storage::insert`
         // → `consult_governance_pre_write`).
-        // #2110/#2113 audit — L4 transcript capture is a SUBSTRATE re-store
-        // (env #95: never lose a turn); record the substrate why_trace so the
-        // captured row satisfies AI_MEMORY_REQUIRE_WHY_TRACE (postgres parity
-        // with the sqlite `capture_turn_idempotent` stamp).
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) —
+        // `memory_capture_turn` is an ordinary tenant-callable tool that
+        // stores VERBATIM caller content, so the substrate why_trace is
+        // recorded ONLY for the authenticated internal origin
+        // (`ctx.bypass_visibility` — exactly the `store`/`reflect` keying).
+        // A tenant capture with no caller-supplied `metadata.why_trace` is
+        // REFUSED under AI_MEMORY_REQUIRE_WHY_TRACE=1 by the gate below
+        // (postgres parity with the sqlite path, whose `insert` gate fires
+        // transitively).
         let captured = {
             let mut m = write.memory.clone();
-            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            if ctx.bypass_visibility {
+                crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            }
             m
         };
         let memory = &captured;
         consult_governance_pre_write_pg(memory)?;
+        // #2121 — TRACT covenant clause 1 gate on the pg L4 capture funnel
+        // (this method mints the row via its own inline INSERT, bypassing
+        // the `PostgresStore::store` gate). Unconditional defense-in-depth:
+        // the substrate-origin row was stamped above so it passes trivially.
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13774,7 +13795,7 @@ impl MemoryStore for PostgresStore {
     /// deployment can now rehydrate from host transcripts.
     async fn recover_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
         // Step 1 — dual dedup fast-path (no transaction needed for the read).
@@ -13813,16 +13834,25 @@ impl MemoryStore for PostgresStore {
         // ARCH-1 — substrate governance pre-write parity with the sqlite L2
         // path (`storage::recover_turn_idempotent` → `storage::insert` →
         // `consult_governance_pre_write`).
-        // #2110/#2113 audit — L2 transcript recovery is a SUBSTRATE re-store
-        // (env #95: never lose a turn); stamp the substrate why_trace (postgres
-        // parity with the sqlite `recover_turn_idempotent` stamp).
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // substrate why_trace is recorded ONLY for the authenticated internal
+        // origin (`ctx.bypass_visibility`); the in-process L2 recovery walker
+        // (`crate::recover::recover_from_transcript_store`) runs under a
+        // bypass context (env #95: never lose a recovered turn), while a
+        // tenant-context recover write is gated below.
         let recovered = {
             let mut m = write.memory.clone();
-            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            if ctx.bypass_visibility {
+                crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            }
             m
         };
         let memory = &recovered;
         consult_governance_pre_write_pg(memory)?;
+        // #2121 — covenant clause-1 gate on the pg L2 recovery funnel (inline
+        // INSERT bypasses the `store` gate). Substrate-origin rows were
+        // stamped above and pass trivially.
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -17491,7 +17521,7 @@ impl MemoryStore for PostgresStore {
 
     async fn consolidate(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         title: &str,
         summary: &str,
@@ -17621,11 +17651,17 @@ impl MemoryStore for PostgresStore {
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
-        // #2110/#2113 audit — the consolidated summary is a SUBSTRATE-DERIVED
-        // merge over already-stored (already-gated) sources; record the
-        // substrate why_trace so it satisfies AI_MEMORY_REQUIRE_WHY_TRACE
-        // (postgres parity with the sqlite `consolidate` stamp).
-        crate::storage::stamp_substrate_why_trace(&mut merged_metadata_value);
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // consolidated summary is VERBATIM caller content on the tenant
+        // surfaces, so the substrate why_trace is recorded ONLY for the
+        // authenticated internal origin (`ctx.bypass_visibility` — the
+        // curator `ConsolidationPass` runs `for_admin`). A tenant consolidate
+        // is gated below: merged metadata inheriting a source's why_trace
+        // clears it; a why_trace-less one is REFUSED under enforce (postgres
+        // parity with the sqlite `consolidate` keying).
+        if ctx.bypass_visibility {
+            crate::storage::stamp_substrate_why_trace(&mut merged_metadata_value);
+        }
 
         let new_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
@@ -17678,6 +17714,13 @@ impl MemoryStore for PostgresStore {
             cid: None,
         };
         consult_governance_pre_write_pg(&candidate)?;
+        // #2121 — TRACT covenant clause 1 gate on the pg consolidate funnel
+        // (raw INSERT below bypasses the `PostgresStore::store` gate).
+        // Unconditional defense-in-depth: a substrate-origin candidate was
+        // stamped above and passes trivially; a tenant candidate passes only
+        // when the merged metadata carries a why_trace (caller-supplied or
+        // inherited from a source), else REFUSED under enforce.
+        consult_why_trace_gate_pg(&candidate)?;
 
         // Plan C R4 / R5 cert finding: the prior implementation was a plain
         // INSERT that exploded with `duplicate key value violates unique
@@ -19906,15 +19949,22 @@ impl MemoryStore for PostgresStore {
         payload: &str,
         priority: Option<i32>,
         tier: Option<&Tier>,
+        why_trace: Option<&str>,
     ) -> StoreResult<String> {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
+        // #2122 — caller-supplied covenant clause-1 rationale (the payload
+        // is verbatim caller content, so the substrate never stamps its own
+        // rationale here; see the trait docs). Sqlite adapter parity.
+        if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
+            metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: resolved_tier,

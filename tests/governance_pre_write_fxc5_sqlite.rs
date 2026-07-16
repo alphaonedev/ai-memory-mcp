@@ -274,6 +274,7 @@ fn consolidate_fires_hook_on_allow() {
         &Tier::Long,
         "test",
         "ai:fxc5-consolidator",
+        false,
     )
     .expect("Allow verdict must let consolidate succeed");
 
@@ -317,6 +318,7 @@ fn consolidate_refusal_blocks_insert_and_preserves_sources() {
         &Tier::Long,
         "test",
         "ai:fxc5-refuse",
+        false,
     )
     .expect_err("Refuse verdict MUST short-circuit consolidate");
     assert!(

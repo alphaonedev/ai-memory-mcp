@@ -472,6 +472,9 @@ pub async fn consolidate_memories(
             };
         }
     }
+    // #2121 — tenant HTTP surface: never substrate-authored (parity with the
+    // postgres branch above, whose `for_agent` ctx has
+    // `bypass_visibility = false`).
     let consolidate_result = db::consolidate(
         &lock.0,
         &body.ids,
@@ -481,6 +484,7 @@ pub async fn consolidate_memories(
         &tier,
         crate::db::CONSOLIDATION_SOURCE,
         &consolidator_agent_id,
+        false,
     );
     // #1788 — refund the quota charge if the consolidate write failed (mirrors
     // the single-write refund_op path). Best-effort; done inside the lock.

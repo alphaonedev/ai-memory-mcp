@@ -29,6 +29,10 @@ use super::AppState;
 pub struct ShareBody {
     pub source_memory_id: String,
     pub target_agent_id: String,
+    /// #2122 — optional covenant clause-1 rationale override; the shared
+    /// copy inherits the source's `metadata.why_trace` when omitted.
+    #[serde(default)]
+    pub why_trace: Option<String>,
 }
 
 /// `POST /api/v1/share` — copy a memory into the target agent's
@@ -51,10 +55,15 @@ pub async fn share_memory(
     _headers: HeaderMap,
     Json(body): Json<ShareBody>,
 ) -> impl IntoResponse {
-    let params: Value = json!({
+    let mut params: Value = json!({
         (field_names::SOURCE_MEMORY_ID): body.source_memory_id,
         (field_names::TARGET_AGENT_ID): body.target_agent_id,
     });
+    // #2122 — thread the caller's covenant clause-1 rationale override
+    // (parity with the MCP `why_trace` param + CLI `--why-trace` flag).
+    if let Some(wt) = body.why_trace {
+        params[crate::storage::META_KEY_WHY_TRACE] = json!(wt);
+    }
 
     // Route through the existing substrate primitive. Lock the DB,
     // dispatch, release. The MCP path uses the same handler so wire

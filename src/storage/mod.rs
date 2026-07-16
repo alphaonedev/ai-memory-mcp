@@ -1364,6 +1364,21 @@ impl std::error::Error for ConflictError {}
 ///    `transcript_line_dedup` INSERT → `signed_events` chain row →
 ///    COMMIT; any failure rolls all three rows back atomically.
 ///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on the
+/// write's AUTHENTICATED ORIGIN, exactly like `SqliteStore::store`/`reflect`
+/// key on `CallerContext::bypass_visibility`. `memory_capture_turn` is an
+/// ordinary tenant-callable MCP/HTTP tool that stores VERBATIM caller
+/// content, so an unconditional stamp here let a zero-privilege tenant
+/// defeat `AI_MEMORY_REQUIRE_WHY_TRACE=1` by routing writes through this
+/// funnel (the #2110 kind-forge bypass re-committed on a different funnel —
+/// #2121 HIGH). Only the authenticated internal principal
+/// (`ctx.bypass_visibility`) may pass `true`; a tenant capture with no
+/// caller-supplied `metadata.why_trace` is REFUSED under enforce by the
+/// `insert` gate (`MEMORY_INSERT_FAILED`). Callers CAN satisfy the gate by
+/// supplying `why_trace` in the request `metadata`.
+///
 /// # Errors
 ///
 /// String-stable codes per the MCP error convention: `DEDUP_QUERY_FAILED`,
@@ -1372,6 +1387,7 @@ impl std::error::Error for ConflictError {}
 pub fn capture_turn_idempotent(
     conn: &Connection,
     write: &crate::models::CaptureTurnWrite,
+    substrate_authored: bool,
 ) -> std::result::Result<crate::models::CaptureTurnResult, String> {
     use rusqlite::OptionalExtension;
 
@@ -1404,13 +1420,17 @@ pub fn capture_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
-        // #2110/#2113 audit — L4 transcript capture is a SUBSTRATE/host-authored
-        // re-store (env #95: transcript paths must NEVER lose a turn). It routes
-        // through `insert` (whose why_trace gate would REFUSE a why_trace-less
-        // turn under enforce), so stamp the substrate rationale so capture
-        // always succeeds. Idempotent + non-clobbering.
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // substrate why_trace is recorded ONLY for the authenticated internal
+        // origin (`substrate_authored` ⟸ `ctx.bypass_visibility`). A tenant
+        // capture routes through `insert`, whose why_trace gate REFUSES a
+        // why_trace-less turn under AI_MEMORY_REQUIRE_WHY_TRACE=1 — the
+        // caller supplies `metadata.why_trace` to clear it. Stamp is
+        // idempotent + non-clobbering (a caller-supplied rationale wins).
         let mut captured = write.memory.clone();
-        stamp_substrate_why_trace(&mut captured.metadata);
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut captured.metadata);
+        }
         let inserted_id =
             insert(conn, &captured).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
 
@@ -1466,6 +1486,16 @@ pub fn capture_turn_idempotent(
 /// `SqliteStore::recover_turn_idempotent` through the SAL trait (#1693 gives
 /// postgres-backed daemons a callable L2 surface).
 ///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on the
+/// write's AUTHENTICATED ORIGIN (see [`capture_turn_idempotent`]). The
+/// in-process L2 recovery walker (`crate::recover`) reads host transcripts
+/// off the local disk and passes `true` (a genuine substrate re-store, env
+/// #95: never lose a recovered turn); the SAL trait surface threads
+/// `ctx.bypass_visibility`, so a tenant-context recover write with no
+/// `metadata.why_trace` is REFUSED under enforce by the `insert` gate.
+///
 /// # Errors
 ///
 /// Returns a stringified failure label (`DEDUP_QUERY_FAILED` /
@@ -1475,6 +1505,7 @@ pub fn capture_turn_idempotent(
 pub fn recover_turn_idempotent(
     conn: &Connection,
     write: &crate::models::RecoverTurnWrite,
+    substrate_authored: bool,
 ) -> std::result::Result<crate::models::RecoverTurnResult, String> {
     use rusqlite::OptionalExtension;
 
@@ -1520,11 +1551,13 @@ pub fn recover_turn_idempotent(
         .map_err(|e| format!("TX_BEGIN_FAILED: {e}"))?;
 
     let tx_result = (|| -> std::result::Result<String, String> {
-        // #2110/#2113 audit — L2 transcript recovery is a SUBSTRATE re-store
-        // (env #95: never lose a recovered turn). Stamp the substrate rationale
-        // so the `insert` why_trace gate never refuses it under enforce.
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — stamp the
+        // substrate rationale ONLY for the authenticated internal origin; a
+        // tenant-context recover write is gated by `insert` under enforce.
         let mut recovered = write.memory.clone();
-        stamp_substrate_why_trace(&mut recovered.metadata);
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut recovered.metadata);
+        }
         let inserted_id =
             insert(conn, &recovered).map_err(|e| format!("MEMORY_INSERT_FAILED: {e}"))?;
         conn.prepare_cached(
@@ -7039,6 +7072,21 @@ pub const CONSOLIDATION_SOURCE: &str = "consolidation";
 /// `update` / dedup metadata overwrite preserves them (existing-wins,
 /// like `agent_id`) instead of silently dropping them. The pointer is
 /// inherently non-navigable (its targets no longer exist) by design.
+///
+/// # Covenant clause 1 (#2121)
+///
+/// `substrate_authored` keys the `metadata.why_trace` substrate stamp on
+/// the write's AUTHENTICATED ORIGIN, exactly like `SqliteStore::store` /
+/// `reflect` key on `CallerContext::bypass_visibility`. `memory_consolidate`
+/// is an ordinary tenant-callable MCP/HTTP/CLI tool whose `summary` is
+/// VERBATIM caller content, so an unconditional stamp let a zero-privilege
+/// tenant defeat `AI_MEMORY_REQUIRE_WHY_TRACE=1` through this funnel
+/// (#2121 HIGH). Only the internal curator/autonomy principal passes
+/// `true`; every caller-origin surface passes `false` and the candidate is
+/// gated below — merged metadata that inherits a `why_trace` from a source
+/// clears the gate (a consolidation is a derivation over already-gated
+/// rows), while a why_trace-less tenant consolidate is REFUSED under
+/// enforce.
 #[allow(clippy::too_many_arguments)]
 pub fn consolidate(
     conn: &Connection,
@@ -7049,6 +7097,7 @@ pub fn consolidate(
     tier: &Tier,
     source: &str,
     consolidator_agent_id: &str,
+    substrate_authored: bool,
 ) -> Result<String> {
     // #1955 R45 — record-stop fence for the consolidate funnel.
     crate::storage::record_stop::gate_storage_conn(conn)?;
@@ -7190,13 +7239,16 @@ pub fn consolidate(
             );
         }
         let mut merged_metadata_value = serde_json::Value::Object(merged_metadata);
-        // #2110/#2113 audit — `consolidate` mints a SUBSTRATE-DERIVED summary
-        // over already-stored (already-gated) source memories via a raw INSERT;
-        // it is a derivation, not fresh caller authorship (you cannot
-        // consolidate content that was never stored). Record the substrate
-        // rationale so the summary satisfies AI_MEMORY_REQUIRE_WHY_TRACE without
-        // a per-funnel gate (stamp-if-absent preserves a caller-supplied one).
-        stamp_substrate_why_trace(&mut merged_metadata_value);
+        // #2121 (supersedes the #2110/#2113 unconditional stamp) — the
+        // consolidated summary is VERBATIM caller content on the tenant
+        // surfaces (MCP `memory_consolidate` / HTTP / CLI), so the substrate
+        // rationale is recorded ONLY for the authenticated internal origin
+        // (curator autonomy / SAL `bypass_visibility`). A tenant consolidate
+        // is gated below: merged metadata inheriting a source's why_trace
+        // clears it; a why_trace-less one is REFUSED under enforce.
+        if substrate_authored {
+            stamp_substrate_why_trace(&mut merged_metadata_value);
+        }
         crate::validate::validate_metadata(&merged_metadata_value)
             .context("merged metadata exceeds size limit")?;
         let metadata_json = serde_json::to_string(&merged_metadata_value)?;
@@ -7249,6 +7301,13 @@ pub fn consolidate(
             cid: None,
         };
         consult_governance_pre_write(&candidate)?;
+        // #2121 — TRACT covenant clause 1 gate on the consolidate funnel
+        // (the raw INSERT below bypasses `insert`'s gate). Unconditional
+        // defense-in-depth: the substrate-origin candidate was stamped above
+        // so it passes trivially; a tenant candidate passes only when the
+        // merged metadata carries a why_trace (caller-supplied or inherited
+        // from a source), else it is REFUSED under enforce.
+        consult_why_trace_gate(&candidate)?;
         // v0.9.0 G8 (#1825) — a consolidated memory is a fresh genesis, so
         // it mints its own content-id from the (plaintext) summary + the
         // candidate's genesis identity.
@@ -12171,6 +12230,23 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
     let tx_result = (|| -> Result<Option<String>> {
         match get(conn, &inbound.id)? {
             Some(existing) => {
+                // #2123 — backend parity with `PostgresStore::merge_inbound`:
+                // the same-`id` field-merge path persists via
+                // `overwrite_full_row_by_id`, which (deliberately) bypasses
+                // the `insert` / `insert_if_newer` chokepoints — so pre-#2123
+                // this funnel consulted NEITHER the pre-write governance hook
+                // NOR the covenant clause-1 inbound why_trace gate NOR the
+                // secret screen, while the postgres twin runs all three.
+                // Screen first (ALWAYS redact, NEVER refuse — a refused
+                // inbound row would diverge replicas, env #95), then consult
+                // governance (refusal rolls the merge back, postgres parity),
+                // then the never-refuse inbound why_trace gate (advisory
+                // WARN + forensic record only — CRDT convergence is the
+                // load-bearing property of the merge primitive).
+                let screened = crate::secret_screen::redact_memory_for_storage(inbound);
+                let inbound = screened.as_ref().unwrap_or(inbound);
+                consult_governance_pre_write(inbound)?;
+                consult_why_trace_gate_inbound(inbound);
                 // #1719 item 3a — NEVER trust a peer's self-asserted
                 // attestation for the merge tiebreak: neutralize the
                 // inbound's `metadata.attest_level` to `claimed` so a
@@ -12233,6 +12309,12 @@ pub fn merge_inbound(conn: &Connection, inbound: &Memory) -> Result<String> {
 /// dedup path. Writes all 27 logical columns + the denormalised
 /// `mentioned_entity_id` (re-derived from the merged row, same as the
 /// `insert` / `insert_if_newer` chokepoints).
+///
+/// Because this writer bypasses those chokepoints, the secret screen +
+/// pre-write governance hook + inbound why_trace gate run in its ONLY
+/// caller, [`merge_inbound`], before the merge (#2123 — postgres
+/// `merge_inbound` parity). Do NOT add further callers without routing
+/// them through the same gates.
 ///
 /// # Errors
 ///
@@ -17611,6 +17693,7 @@ mod tests {
             &Tier::Mid,
             "test",
             "agent-x",
+            false,
         )
         .unwrap();
         let got = get(&conn, &new_id).unwrap().unwrap();
@@ -18204,6 +18287,7 @@ mod tests {
             &Tier::Long,
             "test",
             "test-consolidator",
+            false,
         )
         .unwrap();
         // Original memories should be deleted
@@ -20285,6 +20369,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "test-consolidator",
+            false,
         )
         .unwrap();
 
@@ -20318,6 +20403,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "consolidator-x",
+            false,
         )
         .unwrap();
 
@@ -20409,6 +20495,7 @@ mod tests {
             &Tier::Long,
             "consolidation",
             "test-consolidator",
+            false,
         );
         let err = result.expect_err("consolidate should fail for oversized merged metadata");
         let msg = err.to_string();

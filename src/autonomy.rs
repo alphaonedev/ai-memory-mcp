@@ -470,6 +470,11 @@ fn consolidate_cluster(
         .max_by_key(tier_rank)
         .unwrap_or(Tier::Mid);
 
+    // #2121 — the autonomy Pass-1 consolidator is the authenticated internal
+    // curator principal (the summary is LLM-derived over already-stored,
+    // already-gated rows; no external caller reaches this path), so it claims
+    // the substrate-authored why_trace stamp — the same posture as the SAL
+    // `ConsolidationPass`, which runs `for_admin` (bypass_visibility).
     let result_id = db::consolidate(
         conn,
         &ids,
@@ -479,6 +484,7 @@ fn consolidate_cluster(
         &tier,
         CURATOR_SOURCE_LABEL,
         crate::identity::sentinels::AI_CURATOR,
+        true,
     )?;
 
     Ok(Some(RollbackEntry::Consolidate {

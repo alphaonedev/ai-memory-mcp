@@ -173,28 +173,37 @@ impl MemoryStore for SqliteStore {
     /// the sqlite SSOT `db::capture_turn_idempotent`, which the MCP
     /// `memory_capture_turn` handler also calls, so the dedup-lookup +
     /// atomic three-row transaction lives in exactly one place.
+    ///
+    /// #2121 — the covenant clause-1 substrate why_trace stamp is keyed on
+    /// `ctx.bypass_visibility` (authenticated internal origin), exactly like
+    /// [`Self::store`] / [`Self::reflect`]: a tenant capture with no
+    /// caller-supplied `metadata.why_trace` is REFUSED under
+    /// `AI_MEMORY_REQUIRE_WHY_TRACE=1`.
     async fn capture_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &CaptureTurnWrite,
     ) -> StoreResult<CaptureTurnResult> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::capture_turn_idempotent(&conn, write).map_err(box_err)
+        db::capture_turn_idempotent(&conn, write, ctx.bypass_visibility).map_err(box_err)
     }
 
     /// #1693 — L2 transcript-recovery idempotent write. Delegates to the
     /// sqlite SSOT `db::recover_turn_idempotent`, which the sync recover path
     /// also calls, so the dual-dedup lookup + atomic two-row transaction
     /// lives in exactly one place.
+    ///
+    /// #2121 — substrate why_trace stamp keyed on `ctx.bypass_visibility`
+    /// (see [`Self::capture_turn_idempotent`]).
     async fn recover_turn_idempotent(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         write: &crate::models::RecoverTurnWrite,
     ) -> StoreResult<crate::models::RecoverTurnResult> {
         self.gate_record_stop()?;
         let conn = self.state.lock().await;
-        db::recover_turn_idempotent(&conn, write).map_err(box_err)
+        db::recover_turn_idempotent(&conn, write, ctx.bypass_visibility).map_err(box_err)
     }
 
     /// #1693 — L2 recovery fast-path watermark (indexed
@@ -1001,9 +1010,15 @@ impl MemoryStore for SqliteStore {
         db::forget_distinct_namespaces(&conn, pattern, tier).map_err(box_err)
     }
 
+    /// #2121 — the covenant clause-1 substrate why_trace stamp on the
+    /// consolidated summary is keyed on `ctx.bypass_visibility`
+    /// (authenticated internal origin — the curator `ConsolidationPass`
+    /// runs `for_admin`), exactly like [`Self::store`] / [`Self::reflect`].
+    /// A tenant consolidate whose merged metadata carries no why_trace is
+    /// REFUSED under `AI_MEMORY_REQUIRE_WHY_TRACE=1`.
     async fn consolidate(
         &self,
-        _ctx: &CallerContext,
+        ctx: &CallerContext,
         ids: &[String],
         title: &str,
         summary: &str,
@@ -1023,6 +1038,7 @@ impl MemoryStore for SqliteStore {
             tier,
             source,
             consolidator_agent_id,
+            ctx.bypass_visibility,
         )
         .map_err(box_err)
     }
@@ -2194,6 +2210,7 @@ impl MemoryStore for SqliteStore {
         payload: &str,
         priority: Option<i32>,
         tier: Option<&Tier>,
+        why_trace: Option<&str>,
     ) -> StoreResult<String> {
         // Compose the notify memory using the same shape as
         // `mcp::handle_notify`: a memory in `_inbox/<target_agent>` with
@@ -2201,11 +2218,17 @@ impl MemoryStore for SqliteStore {
         let now = chrono::Utc::now().to_rfc3339();
         let resolved_tier = tier.cloned().unwrap_or(Tier::Short);
         let priority = priority.unwrap_or(5);
-        let metadata = serde_json::json!({
+        let mut metadata = serde_json::json!({
             "agent_id": &ctx.agent_id,
             (field_names::TARGET_AGENT_ID): target_agent,
             "notify": true,
         });
+        // #2122 — caller-supplied covenant clause-1 rationale (the payload
+        // is verbatim caller content, so the substrate never stamps its own
+        // rationale here; see the trait docs).
+        if let Some(wt) = why_trace.filter(|s| !s.trim().is_empty()) {
+            metadata[crate::storage::META_KEY_WHY_TRACE] = serde_json::json!(wt);
+        }
         let mem = Memory {
             id: uuid::Uuid::new_v4().to_string(),
             tier: resolved_tier,
@@ -3550,6 +3573,7 @@ mod tests {
                 "ai:notify-target",
                 "hello",
                 "payload body",
+                None,
                 None,
                 None,
             )

@@ -45,11 +45,23 @@ pub fn handle_notify(
         .ttl_for_tier(&tier)
         .map(|s| (now + chrono::Duration::seconds(s)).to_rfc3339());
 
-    let metadata = json!({
+    let mut metadata = json!({
         "agent_id": sender.clone(),
         "recipient_agent_id": target,
         "message_kind": "notify",
     });
+    // #2122 — covenant clause-1 why_trace path for `memory_notify`. The
+    // notification `payload` is VERBATIM caller content, so the substrate
+    // does NOT stamp its own rationale here (that would re-open the #2121
+    // tenant-bypass class on this funnel); the CALLER supplies the
+    // rationale via the optional `why_trace` param. Under
+    // AI_MEMORY_REQUIRE_WHY_TRACE=1 a why_trace-less notify is refused by
+    // the `db::insert` gate; default posture is unchanged (advisory).
+    if let Some(wt) = params[param_names::WHY_TRACE].as_str()
+        && !wt.trim().is_empty()
+    {
+        metadata[param_names::WHY_TRACE] = json!(wt);
+    }
 
     let mem = Memory {
         cid: None, // v0.9.0 G8 (#1825) — stamped by db::insert / read via row_to_memory
@@ -203,6 +215,12 @@ pub struct NotifyRequest {
     /// short=6h, mid=7d, long=no expiry.
     #[serde(default)]
     pub tier: Option<String>,
+
+    /// Covenant clause-1 rationale (#2122): why this notification is being
+    /// sent. Required under AI_MEMORY_REQUIRE_WHY_TRACE=1 (the payload is
+    /// caller content, so the substrate never stamps its own rationale).
+    #[serde(default)]
+    pub why_trace: Option<String>,
 }
 
 /// v0.7.0 #972 D1.5 (#986) — `McpTool` impl for `memory_notify`.

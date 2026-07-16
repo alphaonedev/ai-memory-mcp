@@ -679,6 +679,7 @@ async fn notify_writes_inbox_memory_and_schema_version() {
             "you have mail",
             Some(7),
             Some(&Tier::Mid),
+            None,
         )
         .await
         .expect("notify");
