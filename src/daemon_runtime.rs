@@ -1448,78 +1448,32 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             #[cfg(feature = "sal")]
             {
                 use crate::cli::agents::AgentsAction;
-                match &a.action {
-                    Some(AgentsAction::BindApiKey { agent_id, token }) => {
-                        crate::validate::validate_agent_id(agent_id)?;
-                        let trimmed = token.trim();
-                        if trimmed.is_empty() {
-                            anyhow::bail!("api-key token must not be empty");
+                // The two api-key verbs resolve the CONFIGURED backend and
+                // delegate to the fully-unit-tested `cli::agents` helpers; every
+                // other `agents` verb stays on the local sqlite path below.
+                if matches!(
+                    &a.action,
+                    Some(AgentsAction::BindApiKey { .. } | AgentsAction::RevokeApiKey { .. })
+                ) {
+                    // #1927 non-argv store-url channel (env/file); resolved
+                    // inside `build_store_handle` (None cli-arg).
+                    let (_backend, store) = build_store_handle(
+                        None,
+                        &db_path,
+                        None,
+                        None,
+                        crate::store::PoolConfig::default(),
+                    )
+                    .await?;
+                    return match &a.action {
+                        Some(AgentsAction::BindApiKey { agent_id, token }) => {
+                            cli::agents::run_bind_api_key(&store, agent_id, token, j).await
                         }
-                        let token_sha256 =
-                            crate::handlers::identity_binding::api_key_sha256_hex(trimmed);
-                        let (_backend, store) = build_store_handle(
-                            None, // #1927 non-argv store-url channel (env/file); resolved inside build_store_handle
-                            &db_path,
-                            None,
-                            None,
-                            crate::store::PoolConfig::default(),
-                        )
-                        .await?;
-                        let ctx = crate::store::CallerContext::for_admin(
-                            crate::identity::sentinels::DAEMON_PRINCIPAL,
-                        );
-                        store
-                            .bind_agent_api_key(&ctx, agent_id, &token_sha256)
-                            .await?;
-                        if j {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "bound": true,
-                                    "agent_id": agent_id,
-                                    "token_sha256": token_sha256,
-                                })
-                            );
-                        } else {
-                            println!(
-                                "bound api-key for {agent_id} (sha256={token_sha256}); \
-                                 restart `ai-memory serve` for it to take effect"
-                            );
+                        Some(AgentsAction::RevokeApiKey { agent_id }) => {
+                            cli::agents::run_revoke_api_key(&store, agent_id, j).await
                         }
-                        return Ok(());
-                    }
-                    Some(AgentsAction::RevokeApiKey { agent_id }) => {
-                        crate::validate::validate_agent_id(agent_id)?;
-                        let (_backend, store) = build_store_handle(
-                            None, // #1927 non-argv store-url channel (env/file); resolved inside build_store_handle
-                            &db_path,
-                            None,
-                            None,
-                            crate::store::PoolConfig::default(),
-                        )
-                        .await?;
-                        let ctx = crate::store::CallerContext::for_admin(
-                            crate::identity::sentinels::DAEMON_PRINCIPAL,
-                        );
-                        let removed = store.revoke_agent_api_key(&ctx, agent_id).await?;
-                        if j {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "revoked": true,
-                                    "agent_id": agent_id,
-                                    "bindings_removed": removed,
-                                })
-                            );
-                        } else {
-                            println!(
-                                "revoked {removed} api-key binding(s) for {agent_id}; \
-                                 restart `ai-memory serve` for it to take effect"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    _ => {}
+                        _ => unreachable!("guarded by the matches! above"),
+                    };
                 }
             }
             let stdout = std::io::stdout();
@@ -8537,70 +8491,12 @@ mod tests {
         run(revoke, &cfg).await.unwrap();
     }
 
-    /// Covers the `--json` output branches of BOTH api-key dispatch arms
-    /// (bind + revoke) — the `if j { println!(json) }` paths the non-json
-    /// tests above skip.
-    #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn test_run_dispatch_agents_api_key_json_output_2095() {
-        let _g = no_config_env();
-        let env = TestEnv::fresh();
-        let cfg = AppConfig::default();
-        let db = env.db_path.to_str().unwrap();
-        let bind = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            db,
-            "--json",
-            "agents",
-            "bind-api-key",
-            "--agent-id",
-            "carol",
-            "--token",
-            "carol-token",
-        ])
-        .unwrap();
-        run(bind, &cfg).await.unwrap();
-        let revoke = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            db,
-            "--json",
-            "agents",
-            "revoke-api-key",
-            "--agent-id",
-            "carol",
-        ])
-        .unwrap();
-        run(revoke, &cfg).await.unwrap();
-    }
-
-    /// Covers the empty-token error branch of the bind dispatch arm
-    /// (`anyhow::bail!("api-key token must not be empty")`).
-    #[cfg(feature = "sal")]
-    #[tokio::test]
-    async fn test_run_dispatch_agents_bind_api_key_empty_token_errors_2095() {
-        let _g = no_config_env();
-        let env = TestEnv::fresh();
-        let cfg = AppConfig::default();
-        let cli = Cli::try_parse_from([
-            "ai-memory",
-            "--db",
-            env.db_path.to_str().unwrap(),
-            "agents",
-            "bind-api-key",
-            "--agent-id",
-            "dave",
-            "--token",
-            "   ",
-        ])
-        .unwrap();
-        let err = run(cli, &cfg).await.expect_err("empty token must error");
-        assert!(
-            err.to_string().contains("token must not be empty"),
-            "got: {err}"
-        );
-    }
+    // The api-key verb OUTPUT branches (json), the empty-token + invalid-agent
+    // error branches, and the store round-trip are covered as focused unit tests
+    // on the extracted `cli::agents::{run_bind_api_key,run_revoke_api_key}`
+    // helpers (in `src/cli/agents.rs`); the two `test_run_dispatch_agents_*`
+    // tests above cover the thin daemon_runtime dispatch arm (store resolution +
+    // helper delegation) end-to-end through `run()`.
 
     // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
     // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
