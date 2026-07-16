@@ -6,10 +6,12 @@
 
 src/cli/commands/undo_edit.rs:AI_OPERATOR
 src/cli/curator.rs:AI_CURATOR
+src/cli/stop.rs:AI_OPERATOR
 src/curator/compaction.rs:CONSOLIDATOR_AGENT_ID
 src/curator/decorrelation_probe.rs:agent_id
 src/curator/reflection_pass.rs:agent_id
 src/curator/transcript_classify_pass.rs:agent_id
+src/daemon_runtime.rs:DAEMON_PRINCIPAL
 src/daemon_runtime.rs:EMBEDDING_BACKFILL
 src/federation/receive.rs:FEDERATION_CATCHUP
 src/handlers/admin.rs:DAEMON_PRINCIPAL
@@ -19,4 +21,3 @@ src/handlers/subscriptions.rs:SUBSCRIPTION_DISPATCH
 src/migrate.rs:AI_MIGRATE
 src/store/postgres.rs:EXPORT_INTERNAL
 src/store/postgres.rs:GOVERNANCE_INTERNAL
-src/cli/stop.rs:AI_OPERATOR
