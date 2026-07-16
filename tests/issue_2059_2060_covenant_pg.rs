@@ -25,7 +25,9 @@
 #![cfg(feature = "sal-postgres")]
 
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
-use ai_memory::storage::{REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, REQUIRE_WHY_TRACE_ENV};
+use ai_memory::storage::{
+    GOVERNANCE_PRE_WRITE, REQUIRE_IMMUTABLE_AUTHORSHIP_ENV, REQUIRE_WHY_TRACE_ENV,
+};
 use ai_memory::store::postgres::PostgresStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError, UpdatePatch};
 
@@ -1051,5 +1053,192 @@ async fn pg_store_family_stamps_substrate_why_trace_for_system_2124() {
         "tenant store_batch without why_trace must stay gated",
     );
 
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+// ── #2141 — GOVERNANCE_PRE_WRITE gate on the DEFAULT (no-If-Match) postgres
+//    trait `update` funnel (the #1451 store-benign-then-update-into-refused-
+//    shape evasion, postgres twin). ─────────────────────────────────────────
+
+/// A title substring the process-wide governance hook installed below refuses.
+/// A benign store (title lacks it) is allowed; an `update` that rewrites the
+/// title to CONTAIN it must be refused — the row's stored content would then
+/// occupy a shape governance would have refused at store time.
+const GOVREFUSE_MARKER_2141: &str = "GOVREFUSE-2141";
+
+/// Install the process-wide substrate `GOVERNANCE_PRE_WRITE` hook exactly once
+/// (`OnceLock`). It refuses any write whose `title` contains
+/// [`GOVREFUSE_MARKER_2141`] and allows everything else, so the other tests in
+/// this binary (which never use the marker) are byte-unaffected. Mirrors the
+/// dispatcher pattern in `tests/governance_pre_write_postgres_parity.rs`.
+fn ensure_gov_marker_hook_2141() {
+    let _ = GOVERNANCE_PRE_WRITE.set(Box::new(|mem: &Memory| {
+        if mem.title.contains(GOVREFUSE_MARKER_2141) {
+            Err(format!(
+                "governance refuses title marker {GOVREFUSE_MARKER_2141}"
+            ))
+        } else {
+            Ok(())
+        }
+    }));
+}
+
+/// #2141 (SEC, HIGH — #1451 parity) — the pg trait `update` (no-If-Match) path
+/// consults `consult_governance_pre_write_pg` on the POST-MERGE row. Store a
+/// benign memory (title clean → governance allows at store time), then UPDATE
+/// its title into a governance-refused shape via the DEFAULT update path
+/// (no If-Match) → REFUSED. Pre-#2141 this was a silent ACCEPT (the funnel
+/// never consulted the hook), the exact store-benign-then-update-into-refused
+/// evasion #1451 closed on sqlite and FX-C5 closed on the pg supersede path.
+#[tokio::test]
+async fn pg_update_no_if_match_refuses_governance_refused_shape_2141() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_update_no_if_match_refuses_governance_refused_shape_2141: no PG url");
+        return;
+    };
+    ensure_gov_marker_hook_2141();
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let ctx = CallerContext::for_agent("alice");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2141-upd-{run}");
+    let id = format!("u2141-{run}");
+
+    // Store a benign memory: the clean title clears the governance hook.
+    let mem = pg_mem(&id, &ns, "benign title", "alice", Some("seed"));
+    store
+        .store(&ctx, &mem)
+        .await
+        .expect("benign store is allowed");
+
+    // UPDATE the title into the refused shape via the DEFAULT (no-If-Match)
+    // trait path → REFUSED, and the row is left unchanged (tx rollback).
+    let evade = UpdatePatch {
+        title: Some(format!("now {GOVREFUSE_MARKER_2141} laundered")),
+        ..Default::default()
+    };
+    let err = store
+        .update(&ctx, &id, evade)
+        .await
+        .expect_err("update into a governance-refused title must be refused");
+    assert!(is_permission_denied(&err), "got {err:?}");
+    let still = store.get(&ctx, &id).await.expect("get");
+    assert_eq!(
+        still.title, "benign title",
+        "the refused update must leave the stored row untouched"
+    );
+
+    // A benign update via the same path still succeeds (the gate is not a
+    // blanket refusal of the funnel).
+    let ok = UpdatePatch {
+        title: Some("still benign".to_string()),
+        ..Default::default()
+    };
+    store
+        .update(&ctx, &id, ok)
+        .await
+        .expect("a governance-clean update on the no-If-Match path still lands");
+    let after = store.get(&ctx, &id).await.expect("get");
+    assert_eq!(after.title, "still benign");
+}
+
+// ── #2123 item-2 — why_trace cannot be laundered onto a superseding row via
+//    inheritance when the patch SUPPLIES a metadata object omitting it. ───────
+
+/// #2123 — the EXISTING row HAS a `why_trace`, and a supersede patch supplies a
+/// metadata OBJECT that OMITS `why_trace` → REFUSED under enforce. Pins that
+/// `preserve_provenance_keys` overlays ONLY `IMMUTABLE_PROVENANCE_KEYS`
+/// (`agent_id` / `derived_from` / `consolidated_from_agents`) and deliberately
+/// NOT `why_trace`, so the old row's rationale is NOT silently inherited onto a
+/// rewrite. Guards against a future change adding `why_trace` to the preserve
+/// set (which would launder every rewrite past the clause-1 gate).
+#[tokio::test]
+async fn pg_supersede_omitted_why_trace_not_laundered_via_inheritance_2123() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_supersede_omitted_why_trace_2123: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let ctx = CallerContext::for_agent("alice");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2123-sup-{run}");
+    let id = format!("sup2123-{run}");
+    // Seed the source WITH a why_trace so the ONLY way the superseding row
+    // could clear the gate is illegitimate inheritance.
+    let src = pg_mem(
+        &id,
+        &ns,
+        "sup source w/ trace",
+        "alice",
+        Some("original rationale"),
+    );
+    store
+        .store(&ctx, &src)
+        .await
+        .expect("seed source with why_trace");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Patch SUPPLIES a metadata object but OMITS why_trace → the composed
+    // candidate lacks why_trace (agent_id is preserved, why_trace is not) →
+    // REFUSED. If a future change added why_trace to the preserve set, this
+    // would wrongly inherit "original rationale" and pass.
+    let patch = UpdatePatch {
+        title: Some("superseding title".to_string()),
+        content: Some("superseding body".to_string()),
+        metadata: Some(serde_json::json!({"agent_id": "alice"})),
+        ..Default::default()
+    };
+    let err = store
+        .update_with_archive_on_supersede(&id, patch, None, ai_memory::models::EditSource::Llm)
+        .await
+        .expect_err("a metadata-supplying supersede omitting why_trace must be refused");
+    assert!(is_permission_denied(&err), "got {err:?}");
+    // The original row is still live + carries its original why_trace.
+    let still = store.get(&ctx, &id).await.expect("get");
+    assert_eq!(still.title, "sup source w/ trace");
+    assert_eq!(why_trace_of(&still).as_deref(), Some("original rationale"));
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+/// #2123 — the WHOLE-OBJECT inheritance path IS allowed: when the patch OMITS
+/// metadata ENTIRELY, `patched_metadata` clones the existing metadata verbatim
+/// and the source's `why_trace` legitimately rides along, so the superseding
+/// row clears the enforce gate. This is the deliberate distinction from the
+/// metadata-supplied case above (a whole-object edit that keeps everything vs a
+/// selective metadata rewrite that drops the rationale).
+#[tokio::test]
+async fn pg_supersede_whole_object_omission_inherits_why_trace_2123() {
+    let Some(url) = pg_url() else {
+        eprintln!("skip pg_supersede_whole_object_omission_2123: no PG url");
+        return;
+    };
+    let store = PostgresStore::connect(&url).await.expect("connect");
+    let ctx = CallerContext::for_agent("alice");
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let ns = format!("cov2123-inh-{run}");
+    let id = format!("inh2123-{run}");
+    let src = pg_mem(
+        &id,
+        &ns,
+        "inh source w/ trace",
+        "alice",
+        Some("inherited rationale"),
+    );
+    store
+        .store(&ctx, &src)
+        .await
+        .expect("seed source with why_trace");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Patch OMITS metadata entirely → existing metadata (incl. why_trace) is
+    // inherited whole → ALLOWED under enforce.
+    let patch = UpdatePatch {
+        title: Some("superseding title inh".to_string()),
+        content: Some("superseding body inh".to_string()),
+        ..Default::default()
+    };
+    store
+        .update_with_archive_on_supersede(&id, patch, None, ai_memory::models::EditSource::Llm)
+        .await
+        .expect("a whole-object supersede that omits metadata inherits why_trace and is allowed");
     unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
 }
