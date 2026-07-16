@@ -8333,6 +8333,66 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
+    // `run()` (the SAL-store-routed bind/revoke that make postgres enrollment
+    // work). Under the coverage build (`--features sal`) these drive the
+    // `#[cfg(feature = "sal")]` bind/revoke branches through `build_store_handle`
+    // → SqliteStore (no `--store-url` resolves to the sqlite path over `--db`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_bind_api_key_command_2044() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "alice",
+            "--token",
+            "s3cret-token",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_revoke_api_key_command_2095() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        // Bind first (covers the bind arm too), then revoke (covers the revoke
+        // arm + the `bindings_removed` path).
+        let bind = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "bob",
+            "--token",
+            "bob-token",
+        ])
+        .unwrap();
+        run(bind, &cfg).await.unwrap();
+        let revoke = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "revoke-api-key",
+            "--agent-id",
+            "bob",
+        ])
+        .unwrap();
+        run(revoke, &cfg).await.unwrap();
+    }
+
     // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
     // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
     // would `process::exit(2)` and abort the whole test binary. Only the sal
