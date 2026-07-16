@@ -2229,12 +2229,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_rules_sign_seed_neither_layout_falls_through_to_legacy_path_and_errors() {
-        // Serialize HOME/XDG mutation against parallel tests in this
-        // module so we don't race other tests that read those vars.
-        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Serialize HOME/XDG mutation against every other `$HOME`-mutating
+        // test in the crate (#2127, residual of #2115): a module-local
+        // lock only covers this module's own tests, so it still races the
+        // shared `test_env_lock` cohort (e.g. `src/embeddings.rs` /
+        // `src/reranker.rs` / `src/config.rs` / `src/cli/commands/config.rs`)
+        // under parallel `cargo test`.
+        let _guard = crate::config::test_env_lock();
 
         // Snapshot prior values so we restore even on assertion panic.
         let prev_home = std::env::var("HOME").ok();
@@ -2263,7 +2264,8 @@ mod tests {
         let fake_xdg = dir.path().join("fake-xdg-config");
         std::fs::create_dir_all(&fake_home).unwrap();
         std::fs::create_dir_all(&fake_xdg).unwrap();
-        // SAFETY: env mutation is serialized by `HOME_ENV_LOCK` above.
+        // SAFETY: env mutation is serialized by `_guard` (shared
+        // `crate::config::test_env_lock()`) above.
         unsafe {
             std::env::set_var("HOME", &fake_home);
             std::env::set_var("XDG_CONFIG_HOME", &fake_xdg);
@@ -2310,7 +2312,8 @@ mod tests {
 
         // Restore env BEFORE assertions so we don't leak state on
         // assertion panic.
-        // SAFETY: env mutation is serialized by `HOME_ENV_LOCK` above.
+        // SAFETY: env mutation is serialized by `_guard` (shared
+        // `crate::config::test_env_lock()`) above.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
