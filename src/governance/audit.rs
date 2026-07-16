@@ -1111,7 +1111,12 @@ static LAST_WITNESSED_SEQ: AtomicI64 = AtomicI64::new(0);
 /// opt-in shape (default `false`), distinct from the surface-scoped
 /// [`crate::identity::attest::require_agent_attestation_for`] resolver
 /// (#1985) — these audit knobs stay permissive/withhold by default.
-fn env_flag_enabled(name: &str) -> bool {
+///
+/// `pub(crate)` since #2106 review item 6 so the #2059/#2060 covenant
+/// gate resolvers (`crate::storage::{require_why_trace_enabled,
+/// require_immutable_authorship_enabled}`) reuse the SAME truthy grammar
+/// instead of re-implementing a third copy.
+pub(crate) fn env_flag_enabled(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
             let v = v.trim();

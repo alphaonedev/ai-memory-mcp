@@ -227,7 +227,7 @@ fn consult_authorship_immutable_gate_advisory_by_default_enforce_when_required()
 }
 
 #[test]
-fn update_default_allows_authorship_rewrite_enforce_refuses_it() {
+fn update_preserves_authorship_by_default_and_refuses_rewrite_under_enforce() {
     let _g = covenant_env_lock();
     unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
     let conn = fresh_conn();
@@ -235,11 +235,12 @@ fn update_default_allows_authorship_rewrite_enforce_refuses_it() {
     mem.metadata = serde_json::json!({"agent_id": "alice"});
     let id = db::insert(&conn, &mem).unwrap();
 
-    // Default posture: `storage::update_with_expected_version` applies NO
-    // preservation of its own (that happens upstream via
-    // `identity::preserve_provenance_keys` at the MCP/CLI/HTTP layer) — a
-    // direct rewrite attempt at this layer with the gate OFF must remain
-    // byte-identical to pre-#2060.
+    // #2106 review item 1 — with the gate OFF (default), the sqlite
+    // `update_with_expected_version` now PRESERVES the stored agent_id via the
+    // json_patch provenance overlay (backend parity with the postgres CASE
+    // overlay), so a direct rewrite attempt is silently preserved (existing
+    // wins) rather than applied. This closes the backend-divergence hole where
+    // sqlite (unlike postgres) let a bypass-the-caller-helper rewrite land.
     let rewrite = serde_json::json!({"agent_id": "mallory"});
     let (found, _) = db::update_with_expected_version(
         &conn,
@@ -261,8 +262,8 @@ fn update_default_allows_authorship_rewrite_enforce_refuses_it() {
     let stored = db::get(&conn, &id).unwrap().unwrap();
     assert_eq!(
         stored.metadata.get("agent_id").and_then(|v| v.as_str()),
-        Some("mallory"),
-        "default (gate off) must not alter the pre-#2060 update contract"
+        Some("alice"),
+        "gate-off update must PRESERVE the stored authorship (provenance overlay)"
     );
 
     // Re-seed a fresh row owned by alice and retry under enforce.
@@ -355,4 +356,89 @@ fn update_with_archive_on_supersede_refuses_authorship_rewrite_under_enforce() {
         Some("alice")
     );
     unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
+}
+
+// ── New-behavior coverage (#2102 reflection exemption / inbound never-refuse;
+//    #2106 item 2 omission-preservation) ───────────────────────────────────
+
+#[test]
+fn reflection_kind_is_exempt_from_why_trace_enforce() {
+    let _g = covenant_env_lock();
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let conn = fresh_conn();
+    // #2106 item 4 — a substrate-authored Reflection row with NO why_trace is
+    // exempt (the reflection funnel `insert_with_conflict(Error)` is wired to
+    // the gate, but the gate never refuses a Reflection/Persona kind), so the
+    // curator reflection pass keeps working under enforce.
+    let mut refl = make_mem("a reflection", "ns/reflect-exempt");
+    refl.memory_kind = MemoryKind::Reflection;
+    assert!(
+        db::insert_with_conflict(&conn, &refl, db::ConflictMode::Error).is_ok(),
+        "enforce must NOT refuse a substrate Reflection write lacking why_trace"
+    );
+    // A caller-origin Observation still gets refused via the same funnel.
+    let obs = make_mem("an observation", "ns/reflect-exempt");
+    let err = db::insert_with_conflict(&conn, &obs, db::ConflictMode::Error)
+        .expect_err("enforce must refuse a why_trace-less Observation via insert_with_conflict");
+    assert!(err.downcast_ref::<GovernanceRefusal>().is_some());
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+#[test]
+fn insert_if_newer_never_refuses_missing_why_trace_under_enforce() {
+    let _g = covenant_env_lock();
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    let conn = fresh_conn();
+    // Federation-receive funnel: a why_trace-less inbound write must NEVER be
+    // refused (CRDT convergence), only WARNed + forensically recorded.
+    let inbound = make_mem("inbound no wt", "ns/fed-inbound");
+    assert!(
+        db::insert_if_newer(&conn, &inbound).is_ok(),
+        "insert_if_newer must accept a why_trace-less inbound write under enforce"
+    );
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}
+
+#[test]
+fn update_omitting_agent_id_preserves_authorship() {
+    let _g = covenant_env_lock();
+    unsafe { std::env::remove_var(REQUIRE_IMMUTABLE_AUTHORSHIP_ENV) };
+    let conn = fresh_conn();
+    let mut mem = make_mem("owned by alice omit", "ns/authorship-omit");
+    mem.metadata = serde_json::json!({"agent_id": "alice"});
+    let id = db::insert(&conn, &mem).unwrap();
+
+    // #2106 item 2 — a full-object metadata patch that OMITS agent_id must NOT
+    // erase the stored author (erasure is worse than rewrite). The json_patch
+    // provenance overlay preserves it. The authorship gate sees no incoming
+    // agent_id → no violation; preservation does the work.
+    let omit = serde_json::json!({"note": "no agent_id here"});
+    let (found, _) = db::update_with_expected_version(
+        &conn,
+        &id,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&omit),
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(found);
+    let stored = db::get(&conn, &id).unwrap().unwrap();
+    assert_eq!(
+        stored.metadata.get("agent_id").and_then(|v| v.as_str()),
+        Some("alice"),
+        "omitting agent_id on a full-replace update must preserve the stored author"
+    );
+    assert_eq!(
+        stored.metadata.get("note").and_then(|v| v.as_str()),
+        Some("no agent_id here"),
+        "the caller's non-provenance keys still land"
+    );
 }

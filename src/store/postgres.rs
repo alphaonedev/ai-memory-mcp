@@ -4449,17 +4449,20 @@ impl PostgresStore {
             metadata: patch.metadata.clone().unwrap_or(cur_meta),
             ..Memory::default()
         };
-        consult_governance_pre_write_pg(&governed)?;
         // #2060 — TRACT covenant clause 2: authorship-immutability gate,
         // postgres twin of the sqlite `update_with_expected_version` check.
         // `leaf_agent_id` was captured above BEFORE `cur_meta` was moved
         // into `governed`, so it still reflects the row's PRE-update
         // authorship; `patch.metadata` is the caller's raw, unmerged patch.
+        // #2106 review item 3 — runs BEFORE the governance hook to match the
+        // sqlite ordering (authorship-then-governance) so a write that trips
+        // BOTH surfaces the SAME refusal reason on either backend.
         consult_authorship_immutable_gate_pg(
             leaf_agent_id.as_deref(),
             patch.metadata.as_ref(),
             &leaf_ns,
         )?;
+        consult_governance_pre_write_pg(&governed)?;
 
         // #228 Commit B — at-rest content encryption (postgres in-place
         // update parity). Seal the effective NEW content (the patch's
@@ -4739,6 +4742,18 @@ impl PostgresStore {
 
         let existing = Self::row_to_memory(&existing_pg)?;
 
+        // #2060/#2103 — TRACT covenant clause 2: authorship-immutability gate
+        // on the postgres append-and-archive supersede twin (the sqlite
+        // `update_with_archive_on_supersede` was gated in the #2101 diff; this
+        // postgres twin was the un-wired backend-asymmetry). Sees the OLD row's
+        // authorship + the caller's raw patch metadata; runs before any
+        // mutation so a refused rewrite leaves the OLD row live.
+        consult_authorship_immutable_gate_pg(
+            existing.metadata.get("agent_id").and_then(|v| v.as_str()),
+            patch.metadata.as_ref(),
+            &existing.namespace,
+        )?;
+
         // Optimistic-concurrency gate against the OLD row.
         if let Some(expected) = expected_version
             && expected != existing.version
@@ -4799,10 +4814,18 @@ impl PostgresStore {
             None => existing.expires_at.clone(),
         };
         // Stamp edit_source + superseded_id into the new row's metadata.
-        let mut new_metadata = patch
+        // #2106 review item 2 — preserve the OLD row's immutable provenance
+        // keys (agent_id + derived_from / consolidated_from_agents) onto the
+        // superseding row so a full-object patch that OMITS agent_id does not
+        // silently ERASE authorship (the fresh id means the insert-time ON
+        // CONFLICT preservation never fires; postgres twin of the sqlite
+        // supersede guard).
+        let patched_metadata = patch
             .metadata
             .clone()
             .unwrap_or_else(|| existing.metadata.clone());
+        let mut new_metadata =
+            crate::identity::preserve_provenance_keys(&existing.metadata, &patched_metadata);
         if let serde_json::Value::Object(ref mut m) = new_metadata {
             m.insert(
                 "edit_source".to_string(),
@@ -13167,6 +13190,9 @@ impl MemoryStore for PostgresStore {
         // refuse hook that every backend write path consults).
         for memory in memories {
             consult_governance_pre_write_pg(memory)?;
+            // #2059/#2102 — TRACT covenant clause 1 on the bulk-create funnel
+            // (postgres twin of the sqlite `insert` gate).
+            consult_why_trace_gate_pg(memory)?;
         }
 
         // Keep the LAST occurrence of each (title, namespace) so the
@@ -13933,6 +13959,11 @@ impl MemoryStore for PostgresStore {
         // refuse rule could be bypassed by routing through the
         // embedded-vector path. See `src/storage/mod.rs` for context.
         consult_governance_pre_write_pg(memory)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the embed-before-store
+        // hot path (the PRIMARY create anchor on postgres daemons). Without
+        // this the default create-with-embedding flow was entirely
+        // unenforced under AI_MEMORY_REQUIRE_WHY_TRACE=1.
+        consult_why_trace_gate_pg(memory)?;
 
         // Same upsert contract as `store` but additionally writes the
         // pgvector `embedding` column when a vector is supplied. This
@@ -14306,15 +14337,32 @@ impl MemoryStore for PostgresStore {
         // pre-empts the post-UPDATE `rows_affected == 0` NotFound below
         // (kept as a safety net for a concurrent delete between this read
         // and the UPDATE inside the same tx).
-        let cur: Option<(String, String)> =
-            sqlx::query_as("SELECT title, content FROM memories WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("update read current", e))?;
-        let Some((cur_title, cur_content)) = cur else {
+        let cur: Option<(String, String, serde_json::Value, String)> = sqlx::query_as(
+            "SELECT title, content, metadata, namespace FROM memories WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("update read current", e))?;
+        let Some((cur_title, cur_content, cur_meta, cur_ns)) = cur else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
+
+        // #2060/#2103 — TRACT covenant clause 2: authorship-immutability gate
+        // on the DEFAULT (non-If-Match) postgres update path. Pre-#2103 this
+        // funnel relied SOLELY on the SQL CASE overlay to keep the stored
+        // agent_id — a silent, unlogged, non-refusing preserve — so a rewrite
+        // attempt got `Ok(())` instead of the 403 the If-Match path
+        // (`update_with_expected_version_once`) returns under enforce. The gate
+        // sees the row's PRE-update authorship + the caller's raw patch
+        // metadata; it runs BEFORE the UPDATE so a refused rewrite mutates
+        // nothing (the tx rolls back on the early return). Ordering mirrors
+        // sqlite (authorship first).
+        consult_authorship_immutable_gate_pg(
+            cur_meta.get("agent_id").and_then(|v| v.as_str()),
+            patch.metadata.as_ref(),
+            &cur_ns,
+        )?;
 
         // `content_changed` is true when the patch supplies a title OR
         // content that differs from the stored row. A metadata / tag /
@@ -15196,6 +15244,11 @@ impl MemoryStore for PostgresStore {
         // mirror is `crate::storage::insert_if_newer`
         // (src/storage/mod.rs:6218).
         consult_governance_pre_write_pg(memory)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the federation-RECEIVE
+        // funnel. Advisory-only (never refuses): a refused inbound write
+        // would diverge replicas (postgres twin of the sqlite
+        // `insert_if_newer` inbound gate).
+        crate::storage::consult_why_trace_gate_inbound(memory);
 
         // Mirrors sqlite db::insert_if_newer:
         //   1. INSERT verbatim if no row matches.
@@ -15501,6 +15554,9 @@ impl MemoryStore for PostgresStore {
         // pushed row must clear the same pre-write governance hook as a
         // locally-authored write.
         consult_governance_pre_write_pg(inbound)?;
+        // #2059/#2102 — TRACT covenant clause 1 on the federation-RECEIVE
+        // merge funnel. Advisory-only (never refuses), CRDT-safe.
+        crate::storage::consult_why_trace_gate_inbound(inbound);
 
         // v0.8.0 Pillar-3 (#1709 / #224) — read the existing row BY id
         // (bypassing the scope=private visibility gate: this is the
