@@ -667,7 +667,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 82;
+const CURRENT_SCHEMA_VERSION: i32 = 83;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1567,8 +1567,11 @@ impl PostgresStore {
         if current_version < 81 {
             self.migrate_v81().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 82 {
             self.migrate_v82().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v83().await?;
         }
 
         Ok(())
@@ -3992,7 +3995,7 @@ impl PostgresStore {
             .await
             .map_err(|e| to_store_err("begin v82 tx", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        record_schema_version(&mut tx, 82).await?;
 
         tx.commit()
             .await
@@ -4002,6 +4005,51 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v82 applied (#2024: skill retire/unretire columns \
              are sqlite-only; postgres ships no skills table — version-stamp no-op)"
+        );
+        Ok(())
+    }
+
+    /// v83 (#2044, v1.0.0) — per-agent api-key principal binding (H1 IDOR + M1
+    /// admin spoof). Additive `CREATE TABLE IF NOT EXISTS agent_api_keys` +
+    /// index (postgres twin of the sqlite v83 arm). Idempotent — a fresh
+    /// install already ships the table via `postgres_schema.sql`; this arm
+    /// covers upgrades. `token_sha256` is the lowercase hex SHA-256 of the
+    /// per-agent api-key token; the raw token is never stored.
+    async fn migrate_v83(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v83 tx", e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_api_keys (
+                 token_sha256 TEXT PRIMARY KEY,
+                 agent_id     TEXT NOT NULL,
+                 bound_at     TEXT NOT NULL
+             )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v83 create agent_api_keys", e))?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_agent_api_keys_agent ON agent_api_keys(agent_id)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("v83 index agent_api_keys", e))?;
+
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v83 migration", e))?;
+
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v83 applied (#2044: agent_api_keys per-agent \
+             principal-binding table)"
         );
         Ok(())
     }
@@ -16730,6 +16778,61 @@ impl MemoryStore for PostgresStore {
             .map_err(|e| to_store_err("revoke_agent_pubkey commit tx", e))?;
 
         Ok(())
+    }
+
+    // ----- #2044 (v1.0.0, #2032-A) — per-agent api-key principal binding ----
+    async fn bind_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        token_sha256: &str,
+    ) -> StoreResult<()> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO agent_api_keys (token_sha256, agent_id, bound_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (token_sha256)
+             DO UPDATE SET agent_id = EXCLUDED.agent_id, bound_at = EXCLUDED.bound_at",
+        )
+        .bind(token_sha256)
+        .bind(agent_id)
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| to_store_err("bind_agent_api_key", e))?;
+        Ok(())
+    }
+
+    async fn agent_id_for_api_key(&self, token_sha256: &str) -> StoreResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT agent_id FROM agent_api_keys WHERE token_sha256 = $1")
+                .bind(token_sha256)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| to_store_err("agent_id_for_api_key", e))?;
+        Ok(row.map(|(a,)| a))
+    }
+
+    async fn revoke_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<usize> {
+        let res = sqlx::query("DELETE FROM agent_api_keys WHERE agent_id = $1")
+            .bind(agent_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| to_store_err("revoke_agent_api_key", e))?;
+        Ok(usize::try_from(res.rows_affected()).unwrap_or(usize::MAX))
+    }
+
+    async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT token_sha256, agent_id FROM agent_api_keys")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| to_store_err("list_agent_api_keys", e))?;
+        Ok(rows)
     }
 
     // ----- v0.9.0 G13 (#1828) — identity lineage (postgres twins) ------

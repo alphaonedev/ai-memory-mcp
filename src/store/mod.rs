@@ -1258,6 +1258,66 @@ pub trait MemoryStore: Send + Sync {
         Ok(None)
     }
 
+    /// #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — bind a per-agent
+    /// api-key to `agent_id` by its `sha256(token)` digest. The RAW token is
+    /// NEVER passed here or stored (only its lowercase-hex sha256), so the DB
+    /// cannot leak the bearer secret. Re-binding the same digest updates the
+    /// mapping (idempotent enrollment). This is the server-held secret the
+    /// HTTP `X-Agent-Id` principal binds against.
+    ///
+    /// Default returns `UnsupportedCapability` (mirrors `bind_agent_pubkey`) so
+    /// an adapter without key provisioning fails loudly rather than silently
+    /// dropping a binding an operator believes is enrolled.
+    async fn bind_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+        _token_sha256: &str,
+    ) -> StoreResult<()> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "BIND_AGENT_API_KEY".to_string(),
+        })
+    }
+
+    /// #2044 — resolve the `agent_id` bound to a per-agent api-key by its
+    /// `sha256(token)` digest, if any. `Ok(None)` means the presented key is
+    /// not an enrolled per-agent key (e.g. the shared transport `api_key`), in
+    /// which case the caller's principal stays merely *claimed*.
+    ///
+    /// Default returns `Ok(None)`: an adapter without key provisioning behaves
+    /// as "no per-agent keys enrolled" (the inert single-operator posture).
+    async fn agent_id_for_api_key(&self, _token_sha256: &str) -> StoreResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// #2095 (v1.0.0) — revoke EVERY enrolled per-agent api-key bound to
+    /// `agent_id` (invalidate a leaked key). Returns the number of bindings
+    /// removed; revoking an unbound agent is `Ok(0)` (idempotent). Takes effect
+    /// on the daemon's next boot-seed (the in-memory map is boot-loaded).
+    ///
+    /// Default returns `UnsupportedCapability` so an adapter without key
+    /// provisioning fails loudly rather than silently leaving a leaked key live.
+    async fn revoke_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        _agent_id: &str,
+    ) -> StoreResult<usize> {
+        Err(StoreError::UnsupportedCapability {
+            capability: "REVOKE_AGENT_API_KEY".to_string(),
+        })
+    }
+
+    /// #2044 — enumerate every enrolled per-agent api-key as
+    /// `(token_sha256, agent_id)`. Used ONCE at daemon boot to seed the
+    /// in-memory principal-binding map ([`crate::handlers::ApiKeyState`]) so the
+    /// hot-path middleware resolves principals without a per-request DB hit
+    /// (respecting the #2032 M3/L2 expensive-verify-DoS layering).
+    ///
+    /// Default returns an empty vec (no enrolled keys — inert).
+    async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
+
     /// Revoke the Ed25519 public key bound to `agent_id` (#626 Layer-3,
     /// Task 1.3 / C5).
     ///
@@ -5073,6 +5133,92 @@ mod tests {
             Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
             Ok(_) => panic!("default begin_transaction must error"),
         }
+    }
+
+    /// #2044 (v1.0.0, #2032-A) — pins the trait-default contract for the
+    /// per-agent api-key accessors so an adapter that does NOT override them
+    /// behaves as "no per-agent keys enrolled + provisioning unsupported":
+    /// `bind_agent_api_key` fails loudly with `UnsupportedCapability`
+    /// (mirrors `bind_agent_pubkey`), while `agent_id_for_api_key` /
+    /// `list_agent_api_keys` round-trip cleanly as the inert single-operator
+    /// posture (so the HTTP identity gate stays inert on such an adapter).
+    #[test]
+    fn default_agent_api_key_impls_are_inert_and_bind_is_unsupported() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+
+        // bind default → UnsupportedCapability naming the capability.
+        match rt.block_on(store.bind_agent_api_key(&ctx, "alice", "deadbeef")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "BIND_AGENT_API_KEY");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(()) => panic!("default bind_agent_api_key must error"),
+        }
+
+        // resolve default → Ok(None): no per-agent keys enrolled.
+        assert_eq!(
+            rt.block_on(store.agent_id_for_api_key("deadbeef"))
+                .expect("resolve default is infallible"),
+            None
+        );
+
+        // list default → Ok(empty): the boot-seed sees no enrolled keys.
+        assert!(
+            rt.block_on(store.list_agent_api_keys())
+                .expect("list default is infallible")
+                .is_empty()
+        );
+
+        // #2095 — revoke default → UnsupportedCapability (fail loud, mirrors bind).
+        match rt.block_on(store.revoke_agent_api_key(&ctx, "alice")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "REVOKE_AGENT_API_KEY");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(_) => panic!("default revoke_agent_api_key must error"),
+        }
+    }
+
+    /// Companion to the api-key default probe: pins the SAME
+    /// fail-loud-vs-inert contract for the adjacent #626 Layer-3 agent-PUBKEY
+    /// default impls on an adapter that does not override key provisioning.
+    /// `bind`/`revoke` fail loudly with `UnsupportedCapability` (an operator
+    /// who believes a key is bound/revoked gets an error, not a silent drop);
+    /// `agent_pubkey` returns `Ok(None)` (no attestable key), so the write-gate
+    /// disposition decides an unsigned write's fate.
+    #[test]
+    fn default_agent_pubkey_impls_are_inert_and_provisioning_is_unsupported() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = DefaultImplProbeStore;
+        let ctx = CallerContext::for_agent("test-agent");
+
+        match rt.block_on(store.bind_agent_pubkey(&ctx, "alice", "cHVia2V5")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "BIND_AGENT_PUBKEY");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(()) => panic!("default bind_agent_pubkey must error"),
+        }
+
+        match rt.block_on(store.revoke_agent_pubkey(&ctx, "alice")) {
+            Err(StoreError::UnsupportedCapability { capability }) => {
+                assert_eq!(capability, "REVOKE_AGENT_PUBKEY");
+            }
+            Err(other) => panic!("expected UnsupportedCapability, got: {other}"),
+            Ok(()) => panic!("default revoke_agent_pubkey must error"),
+        }
+
+        assert_eq!(
+            rt.block_on(store.agent_pubkey("alice"))
+                .expect("agent_pubkey default is infallible"),
+            None
+        );
     }
 
     /// Pins the human-readable Display contract for the StoreError

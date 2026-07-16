@@ -743,7 +743,11 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // (#2113), capture_turn / recover_turn / consolidate stamps, archive_restore
     // inbound, and the last un-gated create funnel `update_with_archive_on_supersede`
     // — lands postgres.rs at 26_901; ceiling 26_980 (+79).
-    ("src/store/postgres.rs", 26_980),
+    // 2026-07-16 (#2101 rebase onto release @ #2088): the covenant pg
+    // funnel-audit wiring (26_980) MERGED with #2044's agent_api_keys SAL
+    // impls (#2088, was 26_850 on release) lands the combined postgres.rs at
+    // 27_054; ceiling 27_150 (+96).
+    ("src/store/postgres.rs", 27_150),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
@@ -1056,7 +1060,12 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // 2026-07-15 (#2045 L6): the `cert_peer_binding_boot_warnings` helper
     // (inert-posture + open-L6-window boot WARNs) + 3 unit tests + serve
     // wiring land daemon_runtime.rs at 10_409; ceiling 10_400 → 10_500 (+91).
-    ("src/daemon_runtime.rs", 10_500), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
+    // 2026-07-15 (#2095): route agents bind/revoke-api-key verbs through the SAL
+    // store (build_store_handle) so postgres enrollment works, + 5 dispatch
+    // coverage tests (bind/revoke × json/non-json + empty-token error) to clear
+    // the daemon_runtime.rs per-module COVERAGE floor. Combined with #2045 L6
+    // this lands daemon_runtime.rs at 10_676; ceiling 10_500 → 10_750.
+    ("src/daemon_runtime.rs", 10_750), /* 2026-07-12 #1963 inference-egress gate at build_llm_client/build_embedder (9_999) */
     ("src/subscriptions.rs", 4_500),
     ("src/cli/install.rs", 3_500),
     // 2026-06-05 — bumped 3_500 → 3_700 by the #1508 v0.6.4→v0.7.0

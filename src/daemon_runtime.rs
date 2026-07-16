@@ -1438,6 +1438,44 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
             cli::archive::run(&db_path, a, j, &mut out)
         }
         Command::Agents(a) => {
+            // #2095 MAJOR 1 — the HTTP per-agent api-key enrollment/revocation
+            // verbs must write to the CONFIGURED backend so a postgres-backed
+            // daemon (whose `serve` boot-seeds the enrolled map from postgres,
+            // not sqlite) actually observes them. Route BindApiKey/RevokeApiKey
+            // through the SAL store (`build_store_handle` selects sqlite vs
+            // postgres from `--store-url` / the #1927 non-argv channel); every
+            // other `agents` verb stays on the local sqlite path unchanged.
+            #[cfg(feature = "sal")]
+            {
+                use crate::cli::agents::AgentsAction;
+                // The two api-key verbs resolve the CONFIGURED backend and
+                // delegate to the fully-unit-tested `cli::agents` helpers; every
+                // other `agents` verb stays on the local sqlite path below.
+                if matches!(
+                    &a.action,
+                    Some(AgentsAction::BindApiKey { .. } | AgentsAction::RevokeApiKey { .. })
+                ) {
+                    // #1927 non-argv store-url channel (env/file); resolved
+                    // inside `build_store_handle` (None cli-arg).
+                    let (_backend, store) = build_store_handle(
+                        None,
+                        &db_path,
+                        None,
+                        None,
+                        crate::store::PoolConfig::default(),
+                    )
+                    .await?;
+                    return match &a.action {
+                        Some(AgentsAction::BindApiKey { agent_id, token }) => {
+                            cli::agents::run_bind_api_key(&store, agent_id, token, j).await
+                        }
+                        Some(AgentsAction::RevokeApiKey { agent_id }) => {
+                            cli::agents::run_revoke_api_key(&store, agent_id, j).await
+                        }
+                        _ => unreachable!("guarded by the matches! above"),
+                    };
+                }
+            }
             let stdout = std::io::stdout();
             let stderr = std::io::stderr();
             let mut so = stdout.lock();
@@ -5313,6 +5351,46 @@ pub async fn bootstrap_serve(
         );
     }
 
+    // #2044 (v1.0.0, #2032-A / H1 IDOR + M1 admin spoof) — boot-seed the
+    // per-agent api-key principal map ONCE + resolve the identity-binding
+    // posture. ONE `Arc` is shared (cloned) into BOTH `AppState` (the gates
+    // re-derive the caller's AuthLevel from it) and `ApiKeyState` (the
+    // middleware accepts + binds per-agent keys), so both surfaces observe the
+    // same enrolled set. Pure in-memory afterwards — no per-request DB hit on
+    // the hot path (respects the #2032 M3/L2 expensive-verify DoS layering).
+    let http_identity_mode = crate::config::http_attested_identity_mode();
+    let enrolled_agent_keys: std::sync::Arc<std::collections::HashMap<String, String>> = {
+        #[cfg(feature = "sal")]
+        {
+            match store_handle.list_agent_api_keys().await {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+        #[cfg(not(feature = "sal"))]
+        {
+            let guard = db_state.lock().await;
+            match crate::db::list_agent_api_keys(&guard.0) {
+                Ok(rows) => std::sync::Arc::new(rows.into_iter().collect()),
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::handlers::HTTP_AUTH_TRACE_TARGET,
+                        "#2044: failed to load agent_api_keys ({e}); per-agent-key \
+                         binding is inert this boot"
+                    );
+                    std::sync::Arc::new(std::collections::HashMap::new())
+                }
+            }
+        }
+    };
+
     let app_state = AppState {
         db: db_state.clone(),
         embedder: embedder_arc,
@@ -5410,6 +5488,8 @@ pub async fn bootstrap_serve(
         // federation-sync handlers. Falls back to the compiled
         // `MAX_BULK_SIZE` default when unset.
         max_page_size: app_config.resolve_limits().max_page_size,
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        http_identity_mode,
     };
 
     // v0.7.0 Policy-Engine Item 3 — register the deferred-audit
@@ -5534,6 +5614,9 @@ pub async fn bootstrap_serve(
         // than installed as a known-empty, attacker-suppliable shared secret.
         key: normalized_api_key,
         mtls_enforced,
+        // #2044 — SAME shared `Arc` + posture as `AppState` (loaded above).
+        enrolled_agent_keys: enrolled_agent_keys.clone(),
+        identity_mode: http_identity_mode,
     };
     if api_key_state.key.is_some() {
         if mtls_enforced {
@@ -7082,6 +7165,8 @@ mod tests {
             resolved_models: Arc::new(crate::config::ResolvedModels::default()),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
+            enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+            http_identity_mode: crate::config::HttpIdentityMode::default(),
         }
     }
 
@@ -7204,6 +7289,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7226,6 +7312,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // /metrics
         let r1 = build_router(app_state.clone(), api_key_state.clone())
@@ -7260,6 +7347,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7284,6 +7372,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -7306,6 +7395,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -8341,6 +8431,73 @@ mod tests {
         run(cli, &cfg).await.unwrap();
     }
 
+    // #2044/#2095 — cover the `Command::Agents` api-key-verb dispatch arms in
+    // `run()` (the SAL-store-routed bind/revoke that make postgres enrollment
+    // work). Under the coverage build (`--features sal`) these drive the
+    // `#[cfg(feature = "sal")]` bind/revoke branches through `build_store_handle`
+    // → SqliteStore (no `--store-url` resolves to the sqlite path over `--db`).
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_bind_api_key_command_2044() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        let cli = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "alice",
+            "--token",
+            "s3cret-token",
+        ])
+        .unwrap();
+        run(cli, &cfg).await.unwrap();
+    }
+
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn test_run_dispatch_agents_revoke_api_key_command_2095() {
+        let _g = no_config_env();
+        let env = TestEnv::fresh();
+        let cfg = AppConfig::default();
+        // Bind first (covers the bind arm too), then revoke (covers the revoke
+        // arm + the `bindings_removed` path).
+        let bind = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            "bob",
+            "--token",
+            "bob-token",
+        ])
+        .unwrap();
+        run(bind, &cfg).await.unwrap();
+        let revoke = Cli::try_parse_from([
+            "ai-memory",
+            "--db",
+            env.db_path.to_str().unwrap(),
+            "agents",
+            "revoke-api-key",
+            "--agent-id",
+            "bob",
+        ])
+        .unwrap();
+        run(revoke, &cfg).await.unwrap();
+    }
+
+    // The api-key verb OUTPUT branches (json), the empty-token + invalid-agent
+    // error branches, and the store round-trip are covered as focused unit tests
+    // on the extracted `cli::agents::{run_bind_api_key,run_revoke_api_key}`
+    // helpers (in `src/cli/agents.rs`); the two `test_run_dispatch_agents_*`
+    // tests above cover the thin daemon_runtime dispatch arm (store resolution +
+    // helper delegation) end-to-end through `run()`.
+
     // `sal`-gated: under `--no-default-features` (the macOS/Windows Check jobs)
     // `cmd_undo_edit` is the stub that returns exit code 2, so the dispatch arm
     // would `process::exit(2)` and abort the whole test binary. Only the sal
@@ -8774,6 +8931,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // Pick a free port via a transient bind.
         let port = {
@@ -8823,6 +8981,7 @@ mod tests {
         let api_key_state = ApiKeyState {
             key: None,
             mtls_enforced: false,
+            ..Default::default()
         };
         // 0.0.0.0:0 succeeds; we want a guaranteed failure. Bind to
         // port 1 which requires privileged perms — except on macOS in
@@ -9154,6 +9313,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // POST /api/v1/sync/push with empty body — the api_key_auth
@@ -9193,6 +9353,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         // GET /api/v1/memories without x-api-key — bypass is scoped to
@@ -9224,6 +9385,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: false,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router
@@ -9255,6 +9417,7 @@ decision = "allow"
         let api_key_state = ApiKeyState {
             key: Some("s3cret".to_string()),
             mtls_enforced: true,
+            ..Default::default()
         };
         let router = build_router(app_state, api_key_state);
         let resp = router

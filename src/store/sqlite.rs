@@ -636,6 +636,36 @@ impl MemoryStore for SqliteStore {
         db::revoke_agent_pubkey(&conn, agent_id).map_err(box_err)
     }
 
+    // ----- #2044 (v1.0.0, #2032-A) — per-agent api-key principal binding ----
+    async fn bind_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+        token_sha256: &str,
+    ) -> StoreResult<()> {
+        let conn = self.state.lock().await;
+        db::bind_agent_api_key(&conn, agent_id, token_sha256).map_err(box_err)
+    }
+
+    async fn agent_id_for_api_key(&self, token_sha256: &str) -> StoreResult<Option<String>> {
+        let conn = self.state.lock().await;
+        db::agent_id_for_api_key(&conn, token_sha256).map_err(box_err)
+    }
+
+    async fn revoke_agent_api_key(
+        &self,
+        _ctx: &CallerContext,
+        agent_id: &str,
+    ) -> StoreResult<usize> {
+        let conn = self.state.lock().await;
+        db::revoke_agent_api_key(&conn, agent_id).map_err(box_err)
+    }
+
+    async fn list_agent_api_keys(&self) -> StoreResult<Vec<(String, String)>> {
+        let conn = self.state.lock().await;
+        db::list_agent_api_keys(&conn).map_err(box_err)
+    }
+
     // ----- v0.9.0 G13 (#1828) — identity lineage ----------------------
     // Thin delegations to the sqlite SSOT in `crate::storage`, so the
     // C4 single-transaction append and the C1/C3-anchored walk live in

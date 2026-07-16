@@ -9891,6 +9891,77 @@ pub fn agent_pubkey(conn: &Connection, agent_id: &str) -> Result<Option<String>>
     Ok(pubkey)
 }
 
+/// #2044 (v1.0.0, #2032-A) — bind a per-agent api-key to `agent_id` by its
+/// `sha256(token)` digest (schema v83 `agent_api_keys`). Idempotent
+/// `INSERT OR REPLACE` on the digest PK. The RAW token is never stored.
+///
+/// # Errors
+///
+/// Surfaces `INSERT` failures.
+pub fn bind_agent_api_key(conn: &Connection, agent_id: &str, token_sha256: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR REPLACE INTO agent_api_keys (token_sha256, agent_id, bound_at)
+         VALUES (?1, ?2, ?3)",
+        params![token_sha256, agent_id, now],
+    )?;
+    Ok(())
+}
+
+/// #2044 — resolve the `agent_id` bound to a per-agent api-key by its
+/// `sha256(token)` digest, if any.
+///
+/// # Errors
+///
+/// Surfaces `SELECT` failures other than "no row".
+pub fn agent_id_for_api_key(conn: &Connection, token_sha256: &str) -> Result<Option<String>> {
+    // #2095 (MINOR) — `.optional()` maps only the no-row case to `None`; a REAL
+    // query error propagates (aligning with the Postgres `fetch_optional` twin).
+    // The prior `.ok()` swallowed every error into `None`, which would silently
+    // demote an enrolled per-agent key to "not enrolled" on a transient DB fault.
+    use rusqlite::OptionalExtension as _;
+    let agent = conn
+        .query_row(
+            "SELECT agent_id FROM agent_api_keys WHERE token_sha256 = ?1",
+            params![token_sha256],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(agent)
+}
+
+/// #2095 (v1.0.0) — revoke EVERY enrolled per-agent api-key bound to `agent_id`
+/// (the operator's "invalidate agent X's leaked key(s)" action). Returns the
+/// number of rows deleted. Idempotent — revoking an agent with no enrolled key
+/// is a no-op `Ok(0)`.
+///
+/// # Errors
+///
+/// Surfaces `DELETE` failures.
+pub fn revoke_agent_api_key(conn: &Connection, agent_id: &str) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM agent_api_keys WHERE agent_id = ?1",
+        params![agent_id],
+    )?;
+    Ok(n)
+}
+
+/// #2044 — enumerate every enrolled per-agent api-key as
+/// `(token_sha256, agent_id)` for the boot-time in-memory seed.
+///
+/// # Errors
+///
+/// Surfaces prepare / query failures.
+pub fn list_agent_api_keys(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT token_sha256, agent_id FROM agent_api_keys")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// v1.0.0 crypto-core stage 3 (#1942, spec §2.3) — TOFU-persist a verified
 /// [`crate::identity::attest_v2::SubkeyCertRecord`] into the v79
 /// `agent_subkey_certs` table.
