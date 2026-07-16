@@ -133,7 +133,13 @@ impl ContentPatch<'_> {
                 if from.is_empty() {
                     return Err(PatchError::ReplaceFromEmpty);
                 }
-                match current.matches(from).count() {
+                // Count occurrences allowing OVERLAP. `str::matches` is
+                // non-overlapping, so a self-overlapping needle (e.g. "aa" in
+                // "aaa") counts as 1 and would be silently first-match replaced —
+                // violating the documented "occurs EXACTLY once … never a silent
+                // first-match replace" contract, since the target is actually
+                // ambiguous. Overlap-aware counting reports it as >1 → rejected.
+                match count_overlapping(current, from) {
                     0 => Err(PatchError::ReplaceNotFound),
                     1 => Ok(current.replacen(from, to, 1)),
                     n => Err(PatchError::ReplaceMultiple(n)),
@@ -143,6 +149,26 @@ impl ContentPatch<'_> {
             (None, Some(_), None) | (None, None, Some(_)) => Err(PatchError::ReplaceIncomplete),
         }
     }
+}
+
+/// Count occurrences of `needle` in `haystack`, **allowing overlap** — so a
+/// self-overlapping needle (`"aa"` in `"aaa"` → 2, not 1) is correctly seen as
+/// a non-unique match. `str::matches` counts non-overlapping runs, which would
+/// under-count a self-overlapping needle to 1 and let the unique-match replace
+/// silently pick the first. `needle` is assumed non-empty (the caller guards).
+fn count_overlapping(haystack: &str, needle: &str) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while let Some(rel) = haystack[start..].find(needle) {
+        count += 1;
+        // Advance by ONE char from the match start (not the whole match) so an
+        // overlapping next occurrence is still found, staying on a UTF-8
+        // boundary (`char::len_utf8` of the char AT the match start).
+        let abs = start + rel;
+        let step = haystack[abs..].chars().next().map_or(1, char::len_utf8);
+        start = abs + step;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -214,6 +240,46 @@ mod tests {
             p.apply("x x x").unwrap_err(),
             PatchError::ReplaceMultiple(3)
         );
+    }
+
+    #[test]
+    fn replace_self_overlapping_needle_rejected_as_ambiguous() {
+        // Gate-3 review fix: "aa" occurs at OVERLAPPING positions 0 and 1 in
+        // "aaa" — an ambiguous target. Non-overlapping `str::matches` counts it
+        // as 1 and would silently first-match replace; the "exactly once"
+        // contract requires rejecting it. (Deletion form too, to be sure the
+        // overlap check runs before the replace.)
+        let p = ContentPatch {
+            replace_from: Some("aa"),
+            replace_to: Some("X"),
+            ..Default::default()
+        };
+        assert_eq!(p.apply("aaa").unwrap_err(), PatchError::ReplaceMultiple(2));
+        assert_eq!(
+            count_overlapping("aaaa", "aa"),
+            3,
+            "overlapping count of 'aa' in 'aaaa' is 3 (positions 0,1,2)"
+        );
+    }
+
+    #[test]
+    fn replace_non_self_overlapping_unique_still_ok() {
+        // A needle that does not self-overlap and appears exactly once must
+        // still replace — the overlap-aware count must not over-reject.
+        let p = ContentPatch {
+            replace_from: Some("abc"),
+            replace_to: Some("Z"),
+            ..Default::default()
+        };
+        assert_eq!(p.apply("x abc y").unwrap(), "x Z y");
+        // A multibyte, non-overlapping needle appearing once still resolves
+        // (guards the UTF-8 boundary advance).
+        let p2 = ContentPatch {
+            replace_from: Some("café"),
+            replace_to: Some("tea"),
+            ..Default::default()
+        };
+        assert_eq!(p2.apply("a café here").unwrap(), "a tea here");
     }
 
     #[test]
