@@ -103,6 +103,24 @@ const SHUTDOWN_POLL_TICK: Duration = Duration::from_millis(500);
 /// the dedup table + fast-path watermark only ever advance forward.
 pub const DEFAULT_WATCH_LIMIT: usize = DEFAULT_RECOVER_LIMIT;
 
+/// Max number of extra re-parse attempts the `Ok`-arm bounded-retry
+/// (issue #2150) makes for a single `(mtime, len)` delta whose recovery
+/// returned `Ok(report)` with `report.errors` set — a per-turn write
+/// that failed *transiently* (e.g. `SQLITE_BUSY` on the per-turn
+/// `BEGIN IMMEDIATE` while a live MCP session holds the write lock) but
+/// rolled back atomically, so it is retryable. The `#2134` Err-arm
+/// retry only covers the hard `Err` case; this bounds the
+/// `Ok`-with-embedded-errors case so the failed turn is retried across
+/// ticks instead of being stranded once the transcript goes static.
+///
+/// The bound is what makes this CONVERGE (issue #2126): a
+/// *persistently*-erroring turn (a validation reject / quota that never
+/// clears) is re-parsed at most `WATCH_RECOVERY_MAX_RETRIES` times per
+/// delta, then the watermark advances and re-parsing stops — never the
+/// unbounded busy-loop #2126 case (b) forbids (M-DOCUMENTED-MAGIC:
+/// documented magic value).
+pub const WATCH_RECOVERY_MAX_RETRIES: u8 = 3;
+
 /// Clamp an operator-supplied poll interval (seconds) into the sane
 /// `[MIN_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS]` band.
 #[must_use]
@@ -139,6 +157,21 @@ pub struct HostPollState {
     /// picked up on later ticks"). Dedup keeps the re-poll idempotent:
     /// already-atomised lines are skipped, only the tail advances.
     pending_drain: bool,
+    /// Bounded-retry budget spent on the CURRENTLY-armed `(mtime, len)`
+    /// watermark (issue #2150). `0` = not retrying (the steady state);
+    /// `> 0` = a prior tick's recovery returned `Ok(report)` with
+    /// `report.errors` set (a *transient* per-turn write failure that
+    /// rolled back), so the same delta is being re-parsed to retry the
+    /// failed turn. Acts as the "armed" signal for change-detection the
+    /// same way [`pending_drain`](Self::pending_drain) does: while it is
+    /// `> 0`, [`decide_poll`] forces `Recover` even on a byte-identical
+    /// static file, so the failed turn is retried instead of stranded.
+    /// Capped at [`WATCH_RECOVERY_MAX_RETRIES`] then RESET to `0` (with
+    /// the watermark advanced) so a permanently-erroring turn CONVERGES
+    /// (issue #2126) rather than busy-looping. Also reset to `0` whenever
+    /// a genuine new `(mtime, len)` delta is observed — a fresh capture
+    /// opportunity gets a fresh budget.
+    retry_attempts: u8,
 }
 
 /// The per-host diff decision for a single poll tick — the PURE core of
@@ -179,11 +212,39 @@ pub fn decide_poll(
     let identical = prev.path.as_deref() == Some(path)
         && prev.mtime == observed_mtime
         && prev.len == observed_len;
-    if identical && !prev.pending_drain {
+    // An armed retry budget (`retry_attempts > 0`, issue #2150) forces
+    // `Recover` on a byte-identical static file exactly as an un-drained
+    // limit-tail (`pending_drain`, #2117) does: a prior tick's recovery
+    // returned `Ok(report)` with a *transient* per-turn write failure, so
+    // the same delta must be re-parsed to retry the failed turn (dedup
+    // keeps it idempotent). The budget is bounded (#2126), so this cannot
+    // busy-loop.
+    if identical && !prev.pending_drain && prev.retry_attempts == 0 {
         PollDecision::Unchanged
     } else {
         PollDecision::Recover
     }
+}
+
+/// Compose the operator-facing WARN emitted when the issue #2150 bounded
+/// retry gives up on a delta whose recovery keeps returning embedded
+/// per-turn errors ([`WATCH_RECOVERY_MAX_RETRIES`] attempts exhausted).
+/// Extracted as a pure function (M-REGULAR-FN) so the stranded-turn count
+/// + remediation text are unit-testable without a `tracing` subscriber.
+/// Names the stranded-turn count and the two remediations the operator
+/// has: `touch` the transcript so its `(mtime, len)` changes and the
+/// watcher re-detects the delta, or re-run the in-session L2 rehydrator.
+#[must_use]
+fn exhaustion_warning(host: HostKind, transcript: &std::path::Path, stranded: usize) -> String {
+    let transcript = transcript.display();
+    format!(
+        "L3 watch [{host}]: bounded recovery retry exhausted after \
+         {WATCH_RECOVERY_MAX_RETRIES} attempt(s) — {stranded} turn(s) still failing \
+         capture on {transcript} and will NOT be retried further; remediation: \
+         `touch {transcript}` to re-detect the delta, or re-run \
+         `ai-memory recover-previous-session`",
+        host = host.as_str(),
+    )
 }
 
 /// Poll-loop configuration. Built once at CLI dispatch time and moved
@@ -398,6 +459,21 @@ where
                 // resolved).
                 let path = candidate.expect("Recover implies a resolved candidate");
 
+                // Issue #2150 counter-reset: a Recover driven by a GENUINE
+                // new `(mtime, len)` delta (distinct from the currently-armed
+                // retry watermark) is a fresh capture opportunity, so it gets
+                // a fresh retry budget. Only a re-poll of the SAME armed
+                // watermark (a `retry_attempts > 0` re-detection of a static
+                // file) keeps its running count. Computed BEFORE the watermark
+                // is advanced below so a flaky-but-progressing transcript
+                // never exhausts its budget prematurely.
+                let same_as_armed_watermark = entry.path.as_deref() == Some(path.as_path())
+                    && entry.mtime == mtime
+                    && entry.len == len;
+                if !same_as_armed_watermark {
+                    entry.retry_attempts = 0;
+                }
+
                 // Detected: a new path, the same path grew / its mtime
                 // advanced, OR a prior tick left an un-drained limit-tail
                 // (issue #2117). Feed the change into the shared L2
@@ -428,19 +504,81 @@ where
 
                 match recover_from_transcript(db_path, &opts) {
                     Ok(report) => {
-                        // Advance the per-host `(path, mtime, len)`
-                        // watermark ONLY now that recovery succeeded
-                        // (issue #2134). Advancing it BEFORE the outcome is
-                        // known would mark a change "seen" even when its
-                        // capture failed, so a transient failure whose
-                        // transcript then goes static is never retried — the
-                        // same capture-loss class as #2117/#2126, via the
-                        // Err path. On success dedup makes any re-observation
-                        // idempotent, so committing the watermark here is
-                        // safe.
+                        // Issue #2150 — bounded retry of the `Ok`-with-
+                        // embedded-errors case. A recovery that returns
+                        // `Ok(report)` with `report.errors` set had a per-turn
+                        // write fail TRANSIENTLY (e.g. `SQLITE_BUSY` on the
+                        // per-turn `BEGIN IMMEDIATE` while a live MCP session
+                        // holds the write lock) and roll back atomically — no
+                        // dedup row, so the turn is retryable. The #2134
+                        // Err-arm retry does NOT cover this (it is `Ok`, not
+                        // `Err`); left unhandled the watermark would advance
+                        // and, if the transcript then went static, the failed
+                        // turn would be stranded forever (the L2 boot backstop
+                        // is fast-path-gated, src/recover/mod.rs:373-385).
+                        //
+                        // So when a non-dry-run tick returns embedded errors
+                        // and the retry budget is not spent, ADVANCE the
+                        // watermark (so a later genuine delta is
+                        // distinguishable for the counter-reset above) but ARM
+                        // the retry (`retry_attempts > 0`), which forces
+                        // `decide_poll` to `Recover` the SAME static delta next
+                        // tick — dedup keeps the re-parse idempotent, exactly
+                        // like the #2134 Err lane. The budget is BOUNDED to
+                        // `WATCH_RECOVERY_MAX_RETRIES`: a permanently-erroring
+                        // turn (validation reject, quota — errors that never
+                        // clear) is re-parsed at most that many times per delta
+                        // and then CONVERGES (watermark advances, counter
+                        // resets, re-parsing stops), never the unbounded
+                        // busy-loop #2126 case (b) forbids. `--dry-run` never
+                        // arms a retry (no dedup rows ⇒ no progress ⇒ it would
+                        // busy-loop, the same guard as `pending_drain`).
+                        let retry_armed = !cfg.dry_run
+                            && !report.errors.is_empty()
+                            && entry.retry_attempts < WATCH_RECOVERY_MAX_RETRIES;
+
+                        // Advance the `(path, mtime, len)` watermark (issue
+                        // #2134 committed it only on the `Ok` arm; that still
+                        // holds — a hard `Err` leaves it unadvanced below). On
+                        // the retry path advancing is safe *because* the armed
+                        // counter re-detects the delta regardless.
                         entry.path = Some(path);
                         entry.mtime = mtime;
                         entry.len = len;
+
+                        if retry_armed {
+                            // M-DOCUMENTED-MAGIC / num-overflow-explicit: the
+                            // `< WATCH_RECOVERY_MAX_RETRIES` guard bounds the
+                            // `u8` so `+ 1` cannot overflow.
+                            entry.retry_attempts += 1;
+                        } else {
+                            // Success, OR the retry budget is exhausted. On
+                            // EXHAUSTION with errors still present, emit a WARN
+                            // naming the stranded-turn count + remediation so
+                            // the loss is loud, not silent (issue #2136 made it
+                            // visible; this makes the give-up explicit).
+                            if !cfg.dry_run
+                                && !report.errors.is_empty()
+                                && entry.retry_attempts >= WATCH_RECOVERY_MAX_RETRIES
+                            {
+                                // obs-error-chain / M-LOG-STRUCTURED: surfaced
+                                // once, at the give-up boundary, with the
+                                // actionable remediation. `entry.path` was just
+                                // set to the observed path above.
+                                if let Some(stranded_path) = entry.path.as_deref() {
+                                    tracing::warn!(
+                                        "{}",
+                                        exhaustion_warning(
+                                            host,
+                                            stranded_path,
+                                            report.errors.len()
+                                        )
+                                    );
+                                }
+                            }
+                            entry.retry_attempts = 0;
+                        }
+
                         // Carry an un-drained limit-tail forward so the
                         // next tick re-runs recovery on the (now static)
                         // file until every deduped line is consumed
@@ -770,6 +908,7 @@ mod tests {
             mtime,
             len: 100,
             pending_drain: false,
+            retry_attempts: 0,
         };
         assert_eq!(
             decide_poll(&prev, Some(&path), mtime, 100),
@@ -787,6 +926,7 @@ mod tests {
             mtime: Some(SystemTime::UNIX_EPOCH),
             len: 100,
             pending_drain: false,
+            retry_attempts: 0,
         };
         // Grew.
         assert_eq!(
@@ -814,6 +954,7 @@ mod tests {
             mtime: Some(SystemTime::UNIX_EPOCH),
             len: 100,
             pending_drain: false,
+            retry_attempts: 0,
         };
         assert_eq!(decide_poll(&prev, None, None, 0), PollDecision::NoCandidate);
     }
@@ -833,6 +974,7 @@ mod tests {
             mtime,
             len: 100,
             pending_drain: true,
+            retry_attempts: 0,
         };
         // Identical freshness, yet the un-drained tail forces a re-poll.
         assert_eq!(
@@ -1039,6 +1181,237 @@ mod tests {
         assert!(
             !o3[0].changed,
             "a successfully-drained static file must be Unchanged (no busy-loop)"
+        );
+    }
+
+    /// Build a migrated sqlite DB at `name` under `dir`, then install a
+    /// `BEFORE INSERT` trigger on `memories` that `RAISE(ABORT)`s — so
+    /// every L2 per-turn `insert` fails with `MEMORY_INSERT_FAILED`, which
+    /// `recover_from_transcript` surfaces as `Ok(report)` with
+    /// `report.errors` set (the never-wedge contract; a rolled-back per-turn
+    /// write ⇒ no dedup row ⇒ retryable). A hermetic, fast, deterministic
+    /// stand-in for the #2150 TRANSIENT per-turn write failure (the issue
+    /// names `SQLITE_BUSY` on the per-turn `BEGIN IMMEDIATE`; any
+    /// Ok-embedded per-turn write error drives the IDENTICAL `poll_once`
+    /// retry logic). The bootstrap `SCHEMA` re-run on the next `open()`
+    /// uses `CREATE ... IF NOT EXISTS`, so this custom-named trigger
+    /// survives every subsequent open.
+    fn poison_write_db(dir: &std::path::Path, name: &str) -> PathBuf {
+        let db = dir.join(name);
+        let conn = crate::storage::open(&db).expect("open+migrate db");
+        conn.execute_batch(
+            "CREATE TRIGGER ai_memory_2150_poison_insert \
+             BEFORE INSERT ON memories \
+             BEGIN SELECT RAISE(ABORT, 'poisoned-write-2150'); END;",
+        )
+        .expect("install poison trigger");
+        db
+    }
+
+    /// Issue #2150 (transient lane) — a recovery that returns `Ok(report)`
+    /// with `report.errors` set (a per-turn write that failed TRANSIENTLY
+    /// and rolled back, e.g. `SQLITE_BUSY` on the per-turn `BEGIN
+    /// IMMEDIATE`) MUST be retried on a later tick even when the transcript
+    /// has since gone static — the `Ok`-arm sibling of the #2134 Err lane.
+    /// The #2134 fix only covers the hard `Err`; without this, the failed
+    /// turn advances the watermark and is stranded forever (the L2 boot
+    /// backstop is fast-path-gated). Drives the real `poll_once`
+    /// change-detection end-to-end per the audit's "do not bypass
+    /// poll_once" requirement.
+    #[test]
+    fn poll_once_retries_after_transient_embedded_error_on_static_file_2150() {
+        let dir = fresh_dir();
+        let poisoned = poison_write_db(dir.path(), "poisoned.db");
+        // A distinct, initially-nonexistent good db (recover's `open` creates
+        // it) — the environment change that clears the transient error, the
+        // #2134 bad→good db-swap shape but producing an Ok-embedded error.
+        let good = dir.path().join("good.db");
+        // Static transcript: written ONCE, never modified, so the ONLY thing
+        // that can drive a tick-2 recover is the armed retry budget.
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let cfg = base_config("ai:test:2150-transient");
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Tick 1: poisoned db → the per-turn write fails → `Ok(report)` with
+        // embedded errors (NOT an outcome-level `Err`) and NOTHING captured.
+        // The retry budget is armed so the delta is not stranded.
+        let o1 = poll_once_with_resolver(&poisoned, &cfg, &mut states, resolve);
+        assert!(o1[0].changed, "a fresh transcript is a detected change");
+        assert!(
+            o1[0].error.is_none(),
+            "an embedded per-turn error is Ok, not an outcome-level Err"
+        );
+        let r1 = o1[0].recover_report.as_ref().expect("Ok(report), not Err");
+        assert!(
+            !r1.errors.is_empty(),
+            "the failed per-turn write lands in report.errors (#2136)"
+        );
+        assert_eq!(r1.lines_atomised, 0, "the failed turn is NOT captured");
+        assert_eq!(
+            states[&HostKind::ClaudeCode].retry_attempts,
+            1,
+            "the transient-embedded-error tick arms the retry budget"
+        );
+
+        // Tick 2: SAME static transcript, now a GOOD db. The armed retry
+        // forces Recover on the byte-identical file, and the previously-failed
+        // turn is finally captured (pre-#2150 this tick was `Unchanged` — the
+        // permanent-loss lane).
+        let o2 = poll_once_with_resolver(&good, &cfg, &mut states, resolve);
+        assert!(
+            o2[0].changed,
+            "the armed retry re-detects the static delta (#2150 lane closed)"
+        );
+        let r2 = o2[0].recover_report.as_ref().expect("report");
+        assert!(
+            r2.errors.is_empty(),
+            "the transient error cleared on retry: {:?}",
+            r2.errors
+        );
+        assert_eq!(
+            r2.lines_atomised, 1,
+            "the previously-failed turn is captured on retry"
+        );
+        assert_eq!(
+            states[&HostKind::ClaudeCode].retry_attempts,
+            0,
+            "a successful capture resets the retry budget"
+        );
+
+        // Tick 3: captured + watermark advanced → Unchanged (no busy re-parse).
+        let o3 = poll_once_with_resolver(&good, &cfg, &mut states, resolve);
+        assert!(
+            !o3[0].changed,
+            "a captured static file must be Unchanged (no busy-loop)"
+        );
+    }
+
+    /// Issue #2150 convergence invariant (the #2126 guard for the new lane)
+    /// — a PERSISTENTLY-erroring turn on a static transcript (an error that
+    /// never clears: validation reject, quota) MUST converge: exactly
+    /// [`WATCH_RECOVERY_MAX_RETRIES`]`+ 1` re-parses (the initial parse plus
+    /// the bounded retries), then the watermark advances, the counter
+    /// resets, and re-parsing stops. It must NOT reintroduce the #2126
+    /// unbounded busy-loop.
+    #[test]
+    fn poll_once_persistent_embedded_error_converges_bounded_2150_2126() {
+        let dir = fresh_dir();
+        // The SAME poisoned db every tick → the per-turn write ALWAYS fails
+        // (an error that never clears — the non-convergence hazard).
+        let poisoned = poison_write_db(dir.path(), "poisoned.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let cfg = base_config("ai:test:2150-persistent");
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Run well past the budget; record which ticks re-parsed (changed).
+        let total_ticks = u32::from(WATCH_RECOVERY_MAX_RETRIES) + 5;
+        let mut changed_ticks = Vec::new();
+        for _ in 0..total_ticks {
+            let o = poll_once_with_resolver(&poisoned, &cfg, &mut states, resolve);
+            // The write never succeeds, so nothing is ever captured.
+            if let Some(r) = &o[0].recover_report {
+                assert_eq!(r.lines_atomised, 0, "a poisoned write never captures");
+            }
+            changed_ticks.push(o[0].changed);
+        }
+
+        // Exactly (initial parse + N retries) re-parses, then convergence.
+        let reparses = changed_ticks.iter().filter(|c| **c).count();
+        assert_eq!(
+            reparses,
+            usize::from(WATCH_RECOVERY_MAX_RETRIES) + 1,
+            "a persistent embedded error is bounded to the initial parse + \
+             WATCH_RECOVERY_MAX_RETRIES retries, then converges"
+        );
+        // The re-parses are the LEADING ticks; every later tick is Unchanged
+        // (no busy-loop) — the #2126 non-convergence guard for the new lane.
+        for (i, changed) in changed_ticks.iter().enumerate() {
+            let expected = i <= usize::from(WATCH_RECOVERY_MAX_RETRIES);
+            assert_eq!(
+                *changed, expected,
+                "tick {i}: convergence — leading ticks re-parse, the rest are Unchanged"
+            );
+        }
+        assert_eq!(
+            states[&HostKind::ClaudeCode].retry_attempts,
+            0,
+            "the budget is reset to 0 on give-up (armed state cleared)"
+        );
+    }
+
+    /// Issue #2150 counter-reset — an embedded-error tick arms the retry
+    /// budget; a subsequent GENUINE `(mtime, len)` delta (the transcript
+    /// legitimately grew) is a FRESH capture opportunity and MUST reset the
+    /// budget rather than continue the old count, so a flaky-but-progressing
+    /// transcript never exhausts its budget prematurely.
+    #[test]
+    fn poll_once_retry_budget_resets_on_fresh_delta_2150() {
+        let dir = fresh_dir();
+        let poisoned = poison_write_db(dir.path(), "poisoned.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let cfg = base_config("ai:test:2150-reset");
+        let resolve = |_h: HostKind, _c: &std::path::Path| Ok(Some(transcript.clone()));
+        let mut states = HashMap::new();
+
+        // Tick 1 on delta A → embedded error → retry budget armed at 1.
+        let o1 = poll_once_with_resolver(&poisoned, &cfg, &mut states, resolve);
+        assert!(!o1[0].recover_report.as_ref().unwrap().errors.is_empty());
+        assert_eq!(
+            states[&HostKind::ClaudeCode].retry_attempts,
+            1,
+            "delta A arms the retry budget at 1"
+        );
+
+        // The transcript legitimately CHANGES (append a distinct line → the
+        // (mtime, len) grows) — a fresh capture opportunity, NOT a
+        // continuation of delta A's budget. It STILL errors (same poisoned
+        // db), so the ONLY reason the counter is back at 1 (not 2) is the
+        // fresh-delta reset.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(f, "{}", turn_line(2)).unwrap();
+            f.flush().unwrap();
+        }
+
+        let o2 = poll_once_with_resolver(&poisoned, &cfg, &mut states, resolve);
+        assert!(o2[0].changed, "the grown transcript is a detected delta");
+        assert!(
+            !o2[0].recover_report.as_ref().unwrap().errors.is_empty(),
+            "the fresh delta still errors (same poisoned db)"
+        );
+        assert_eq!(
+            states[&HostKind::ClaudeCode].retry_attempts,
+            1,
+            "a fresh (mtime, len) delta RESETS the budget (would be 2 without the reset)"
+        );
+    }
+
+    /// Issue #2150 — the exhaustion WARN names the stranded-turn count and
+    /// both remediations (`touch` / re-run `recover-previous-session`), so
+    /// the give-up is loud + actionable. Asserted on the pure composer so no
+    /// `tracing` subscriber is needed.
+    #[test]
+    fn exhaustion_warning_names_stranded_count_and_remediation_2150() {
+        let w = exhaustion_warning(
+            HostKind::ClaudeCode,
+            std::path::Path::new("/x/session.jsonl"),
+            3,
+        );
+        assert!(
+            w.contains("3 turn(s)"),
+            "names the stranded-turn count: {w}"
+        );
+        assert!(w.contains("/x/session.jsonl"), "names the transcript: {w}");
+        assert!(w.contains("touch"), "names the touch remediation: {w}");
+        assert!(
+            w.contains("recover-previous-session"),
+            "names the recover-previous-session remediation: {w}"
         );
     }
 
