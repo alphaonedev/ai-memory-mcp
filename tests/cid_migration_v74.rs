@@ -76,7 +76,7 @@ fn v74_columns_and_version_both_backends() {
     let conn2 = db::open(&path).unwrap();
     assert_eq!(
         schema_version(&conn2),
-        83,
+        84,
         "re-open stays at the current tip idempotently"
     );
     assert!(

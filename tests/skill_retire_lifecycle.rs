@@ -380,7 +380,7 @@ fn migration_v82_applies_and_is_idempotent() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v3, 83, "re-open stays at the current tip idempotently");
+    assert_eq!(v3, 84, "re-open stays at the current tip idempotently");
     // A retire round-trips end-to-end on the migrated DB.
     let _: Value = handle_skill_register(
         &conn3,
