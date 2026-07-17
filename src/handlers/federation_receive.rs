@@ -1264,6 +1264,17 @@ pub async fn sync_push(
         .as_ref()
         .as_ref()
         .map(crate::embeddings::Embedder::dim);
+    // #2168 (SEC, data-integrity) — the receiver's OWN configured
+    // embedding-space fingerprint (`<canonical_model_id>#<prefix_scheme>`),
+    // resolved from the SAME `app.embedder` the local embed path uses.
+    // Compared per-row against each shipped vector's fingerprint so a
+    // same-dimension vector from a FOREIGN embedding model is never stored
+    // verbatim into the local space (see the receive gate below).
+    let receiver_fp = app
+        .embedder
+        .as_ref()
+        .as_ref()
+        .map(crate::embeddings::Embedder::space_fingerprint);
     let shipped_by_id: std::collections::HashMap<&str, &crate::federation::ShippedEmbedding> = body
         .embeddings
         .iter()
@@ -1509,13 +1520,44 @@ pub async fn sync_push(
                 // `sanitize_shipped_vector` rejects non-finite vectors
                 // and L2-normalizes the rest; `None` (or a dim mismatch)
                 // falls back to a local re-embed.
-                let clean_shipped = shipped_by_id
-                    .get(mem.id.as_str())
-                    .filter(|se| receiver_dim == Some(se.dim) && se.vector.len() == se.dim)
-                    .and_then(|se| {
-                        crate::federation::sanitize_shipped_vector(&se.vector)
-                            .map(|v| (v, se.model.clone()))
-                    });
+                let clean_shipped = shipped_by_id.get(mem.id.as_str()).and_then(|se| {
+                    // #1566 / #1579 B1 — dim gate: store a shipped vector
+                    // directly only when its dimensionality matches the local
+                    // embedder AND the sender's claimed dim matches the payload.
+                    if receiver_dim != Some(se.dim) || se.vector.len() != se.dim {
+                        return None;
+                    }
+                    // #2168 (SEC, data-integrity) — vector-space fingerprint
+                    // gate. A same-dimension vector produced by a DIFFERENT
+                    // embedding model (or the same model under a different
+                    // prefix scheme) lives in a different coordinate space:
+                    // stored verbatim it would silently poison this node's
+                    // cosine recall. Compare the shipped fingerprint against
+                    // the receiver's configured embedder fingerprint; a
+                    // mismatch falls through to the EXISTING deferred local
+                    // re-embed so the row still lands (CRDT-safe) and is
+                    // re-embedded under the LOCAL model. CORE INVARIANT: a
+                    // foreign-fingerprint vector NEVER enters the local space —
+                    // worst case the row is re-embed-pending, never poisoned.
+                    // Degrade, never corrupt.
+                    let shipped_fp = crate::embeddings::embedding_space_fingerprint(&se.model);
+                    if receiver_fp.as_deref() != Some(shipped_fp.as_str()) {
+                        tracing::warn!(
+                            target: ATTESTATION_TRACE_TARGET,
+                            memory_id = %actual_id,
+                            peer_id = %body.sender_agent_id,
+                            shipped_fingerprint = %shipped_fp,
+                            local_fingerprint = %receiver_fp.as_deref().unwrap_or("<none>"),
+                            "sync_push: refusing foreign-embedding-model shipped vector \
+                             (#2168) — deferring local re-embed under the local model"
+                        );
+                        return None;
+                    }
+                    // #1584 (SEC) — finite + L2-norm the accepted
+                    // (matching-space) vector before it is stored.
+                    crate::federation::sanitize_shipped_vector(&se.vector)
+                        .map(|v| (v, se.model.clone()))
+                });
                 match clean_shipped {
                     Some((vector, model)) => {
                         match db::set_embedding(&lock.0, &actual_id, &vector) {
