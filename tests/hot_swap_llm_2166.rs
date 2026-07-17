@@ -15,9 +15,17 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use ai_memory::atomisation::curator::{Curator, LlmCurator};
+use ai_memory::atomisation::{Atomiser, AtomiserConfig};
+use ai_memory::autonomy::AutonomyLlm as _;
 use ai_memory::config::{AppConfig, FeatureTier};
 use ai_memory::llm::OllamaClient;
+use ai_memory::mcp::tools::{AtomiseToolHandler, handle_atomise};
+use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use ai_memory::reload::{Swappable, SwappableLlm, resolve_and_build_mcp_llm};
+use ai_memory::storage;
+use serde_json::json;
+use tempfile::NamedTempFile;
 
 /// Env-var tests must serialize — `resolve_and_build_mcp_llm` reads
 /// `AI_MEMORY_INFERENCE_EGRESS` / `AI_MEMORY_LLM_*` from the process env.
@@ -25,7 +33,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn client(model: &str) -> OllamaClient {
@@ -65,7 +73,6 @@ fn swap_succeeds_current_reflects_new_model_2166() {
     // posture): the AutonomyLlm surface degrades gracefully, never panics.
     swap.store(None);
     assert!(swap.is_none(), "None-current means no client wired");
-    use ai_memory::autonomy::AutonomyLlm as _;
     assert_eq!(swap.auto_tag("t", "c").unwrap(), Vec::<String>::new());
     assert!(!swap.detect_contradiction("a", "b").unwrap());
     assert!(swap.summarize_memories(&[]).is_err());
@@ -113,14 +120,11 @@ fn validate_before_swap_keeps_old_client_2166() {
 
     // The reload guard: on a parse failure, KEEP the old client.
     let swap = SwappableLlm::new(Some(client("keep-me")));
-    match AppConfig::try_load_from(&bad) {
-        Ok(cfg) => {
-            // Never reached — but if it were, this is where a swap happens.
-            let _ = cfg;
-            swap.store(None);
-        }
-        Err(_) => { /* validate-before-swap: keep the current client */ }
-    }
+    if let Ok(cfg) = AppConfig::try_load_from(&bad) {
+        // Never reached — but if it were, this is where a swap happens.
+        let _ = cfg;
+        swap.store(None);
+    } // else: validate-before-swap — keep the current client.
     assert_eq!(
         swap.current()
             .as_ref()
@@ -219,4 +223,109 @@ fn concurrent_swap_and_reads_no_panic_2166() {
         let _ = *generic.current();
     }
     w.join().unwrap();
+}
+
+// Mirrors `src/mcp/mod.rs::build_atomise_handler` — the exact construction the
+// MCP config-mtime reload block performs when it rebuilds the handler from the
+// freshly-resolved `[llm]` client.
+fn atomise_handler_from_client(
+    client: &Arc<OllamaClient>,
+    tier: FeatureTier,
+) -> AtomiseToolHandler {
+    let curator: Box<dyn Curator> = Box::new(LlmCurator::new(Arc::clone(client)));
+    let atomiser = Arc::new(
+        Atomiser::new(curator, None, AtomiserConfig::default(), tier)
+            .with_curator_model(client.model_name()),
+    );
+    AtomiseToolHandler::new(atomiser, tier)
+}
+
+// (e) #2172 REGRESSION — the test that would have caught the boot-captured MCP
+// atomise handler. A handler built from client `model-a` attests `model-a`;
+// REBUILDING from a swapped `model-b` client (exactly what the reload block now
+// does) re-points the atomiser's `curator_model` — the field the signed
+// `atomisation_complete` event reads — at `model-b`, and the rebuilt handler
+// DRIVES `memory_atomise` end-to-end. Pre-#2172 the reload reassigned only
+// `llm`, so this handler stayed bound to the boot model for the process
+// lifetime (silent stale-model + a signed-provenance lie).
+#[test]
+fn atomise_driven_after_swap_uses_new_model_2172() {
+    let tmp = NamedTempFile::new().expect("tempfile");
+    let conn = storage::open(tmp.path()).expect("open db");
+
+    // Boot handler on the boot model.
+    let client_a = Arc::new(client("model-a"));
+    let boot = atomise_handler_from_client(&client_a, FeatureTier::Smart);
+    assert_eq!(
+        boot.atomiser.curator_model(),
+        "model-a",
+        "boot handler attests the boot model"
+    );
+
+    // The config-mtime reload swaps the client → REBUILD the handler.
+    let client_b = Arc::new(client("model-b"));
+    let reloaded = atomise_handler_from_client(&client_b, FeatureTier::Smart);
+    assert_eq!(
+        reloaded.atomiser.curator_model(),
+        "model-b",
+        "post-swap the signed atomisation_complete curator_model attests the NEW model, \
+         never the boot-captured one (#2172)"
+    );
+
+    // Drive memory_atomise end-to-end through the REBUILT handler. A short
+    // source short-circuits `source_too_small` BEFORE any network curator
+    // call (hermetic), proving the swapped handler is the one dispatched —
+    // not a tier-locked None and not the boot handler.
+    let now = chrono::Utc::now().to_rfc3339();
+    let mem = Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Mid,
+        namespace: "hot-swap-2172".to_string(),
+        title: "src-2172".to_string(),
+        content: "tiny".to_string(),
+        source: "test".to_string(),
+        priority: 5,
+        confidence: 1.0,
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: json!({ "agent_id": "test-agent" }),
+        memory_kind: MemoryKind::Observation,
+        confidence_source: ConfidenceSource::CallerProvided,
+        version: 1,
+        ..Memory::default()
+    };
+    let id = storage::insert(&conn, &mem).expect("seed short source");
+
+    let out = handle_atomise(
+        &conn,
+        &json!({ "memory_id": id }),
+        Some(&reloaded),
+        FeatureTier::Smart,
+        None,
+    )
+    .expect("atomise dispatch returns the informational envelope");
+    assert_eq!(
+        out.get("source_too_small")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the REBUILT (model-b) handler is dispatched end-to-end (source_too_small \
+         short-circuit, no network), proving the swap re-armed the funnel (#2172)"
+    );
+
+    // Sanity: a tier-locked None handler would NOT reach `source_too_small` —
+    // it returns the `tier-locked` advisory. Confirms the assertion above is
+    // discriminating between the wired-new-handler and the unwired paths.
+    let locked = handle_atomise(
+        &conn,
+        &json!({ "memory_id": "x" }),
+        None,
+        FeatureTier::Smart,
+        None,
+    )
+    .expect("tier-locked envelope");
+    assert!(
+        locked.get("tier-locked").is_some(),
+        "None handler → tier-locked advisory"
+    );
+    assert!(locked.get("source_too_small").is_none());
 }

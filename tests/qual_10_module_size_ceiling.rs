@@ -380,7 +380,7 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // mandatory-hook-presence enforcement gate (PreEventEnforceGate + install +
     // consult_pre_event_gate + test installer) + consult wiring in the
     // eligible pre-event dispatchers landed the file at 15_482; +48 headroom.
-    ("src/mcp/mod.rs", 15_650), /* 2026-07-12 #1963 inference-egress gate at 2 MCP init sites (15_541) */
+    ("src/mcp/mod.rs", 15_700), /* 2026-07-17 #2172 rebuild atomise/ingest handlers in the mtime-reload block + #2173 torn-read guard + regression unit test (15_674, was 15_650) */
     // postgres.rs bumped 13_000 → 15_200 by FX-D2 to accommodate
     // FX-C2-batch{1..5} ARCH-2 SAL trait method implementations
     // (fdfa69dd9 / 1d2b9553f / 6c8283cdf / dca98bd6b / 5d7f083e4 —

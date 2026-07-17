@@ -30,10 +30,38 @@
 //!   the async [`crate::daemon_runtime::build_llm_client`], which re-runs
 //!   the egress gate for free).
 //!
-//! **Scope: `[llm]` ONLY.** The embedder is deliberately NOT hot-swapped
-//! (changing the embedding model mid-corpus corrupts the shared vector
-//! space; the sanctioned path stays `ai-memory reembed`), and the
+//! **Scope: `[llm]` client + the two per-op LLM handlers.** A reload
+//! rebuilds the `[llm]` chat client, refreshes the `memory_capabilities`
+//! model surface, AND — since #2172 — rebuilds the `memory_atomise`
+//! (`LlmCurator`) and `memory_ingest_multistep` (`OllamaDispatch`) MCP
+//! handlers from the freshly-resolved client, so EVERY per-op LLM consumer
+//! resolves the CURRENT model after a swap (and the signed
+//! `atomisation_complete` `curator_model` attests the client that actually
+//! ran, never the boot string). The embedder is deliberately NOT
+//! hot-swapped (changing the embedding model mid-corpus corrupts the shared
+//! vector space; the sanctioned path stays `ai-memory reembed`), and the
 //! reranker sits in a first-writer-wins `OnceLock` — neither is touched.
+//!
+//! **Restart-only sibling knobs (#2174).** A `[llm]` config edit can
+//! co-move with a few sibling knobs that a reload deliberately does NOT
+//! refresh (worst case: a stale sibling until restart — no data
+//! corruption). Per-sibling disposition:
+//!
+//! - `auto_tag_model` (`[llm.auto_tag].model`) IS `[llm]`-family, but it is
+//!   an `Arc<Option<String>>` `AppState` field constructed at ~140 call
+//!   sites; hot-swapping it is a `Swappable` public-field migration
+//!   tracked as a focused follow-up. Until then a changed auto-tag model
+//!   override needs a restart — auto-tags are disposable/regenerable, so
+//!   this is a convenience gap, not an integrity one.
+//! - `llm_call_timeout` (`llm_call_timeout_secs`) is NOT part of `[llm]` —
+//!   it is a separate top-level knob for the per-call wall-clock timeout,
+//!   independent of which model/provider `[llm]` selects. Restart-only.
+//! - `tier` is NOT `[llm]`-derived — it is a top-level knob that ALSO
+//!   gates the embedder + reranker (which are deliberately not hot-swapped
+//!   above). Refreshing it in an `[llm]`-only reload would half-apply a
+//!   tier change (new tier for the LLM gate, boot tier for the other two
+//!   planes) — an inconsistent state, so a `tier` change stays restart-only
+//!   to re-tier all three planes together.
 //!
 //! **Validate-before-swap.** Reload resolves through
 //! [`AppConfig::try_load`], which PROPAGATES a parse/validate error

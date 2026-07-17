@@ -3343,6 +3343,65 @@ pub const MCP_MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// process supervisor can restart it.
 pub const MCP_MAX_DRAIN_BYTES: usize = 64 * 1024 * 1024;
 
+/// v1.0.0 #2172 — build the `memory_atomise` tool handler from the CURRENT
+/// resolved `[llm]` client.
+///
+/// Called at MCP boot AND rebuilt INSIDE the config-mtime reload block so a
+/// `[llm]` hot-swap re-points the atomiser — and the signed
+/// `atomisation_complete` `curator_model` (#1244) — at the client that
+/// ACTUALLY runs, closing the boot-capture where `memory_atomise` silently
+/// kept driving the OLD model/provider after a swap (and a disabling reload
+/// kept egressing memory content to the old vendor, bypassing the #1963
+/// egress re-eval). Returns `None` when no LLM is wired (keyword/semantic
+/// tier, egress-refused, or an unreachable backend) — the tier-locked
+/// advisory posture.
+fn build_atomise_handler(
+    llm: Option<&Arc<OllamaClient>>,
+    tier_config: &crate::config::TierConfig,
+    active_keypair: Option<&crate::identity::keypair::AgentKeypair>,
+) -> Option<Arc<atomise::AtomiseToolHandler>> {
+    let llm_client = llm?;
+    let curator: Box<dyn crate::atomisation::curator::Curator> = Box::new(
+        crate::atomisation::curator::LlmCurator::new(llm_client.clone()),
+    );
+    let keypair_arc = active_keypair.map(|kp| Arc::new(kp.clone()));
+    // v0.7.0 (#1244) — thread the LIVE model name so the signed
+    // `atomisation_complete` payload's `curator_model` reflects the client
+    // that actually ran (post-swap: the NEW model, never the boot string).
+    let curator_model = llm_client.model_name().to_string();
+    let atomiser = Arc::new(
+        crate::atomisation::Atomiser::new(
+            curator,
+            keypair_arc,
+            crate::atomisation::AtomiserConfig::default(),
+            tier_config.tier,
+        )
+        .with_curator_model(curator_model),
+    );
+    Some(Arc::new(atomise::AtomiseToolHandler::new(
+        atomiser,
+        tier_config.tier,
+    )))
+}
+
+/// v1.0.0 #2172 — build the `memory_ingest_multistep` handler from the
+/// CURRENT resolved `[llm]` client. Rebuilt inside the reload block for the
+/// same reason as [`build_atomise_handler`]: without it a post-swap
+/// `memory_ingest_multistep` silently runs the OLD model/provider.
+fn build_ingest_multistep_handler(
+    llm: Option<&Arc<OllamaClient>>,
+    tier_config: &crate::config::TierConfig,
+) -> Option<Arc<ingest_multistep::IngestMultistepHandler>> {
+    let llm_client = llm?;
+    let dispatch: Arc<dyn crate::multistep_ingest::LlmDispatch> = Arc::new(
+        crate::multistep_ingest::executor::OllamaDispatch::new(llm_client.clone()),
+    );
+    Some(Arc::new(ingest_multistep::IngestMultistepHandler::new(
+        dispatch,
+        tier_config.tier,
+    )))
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(deprecated)] // DOC-6: legacy AppConfig.llm_model / embedding_model fallback
 pub fn run_mcp_server(
@@ -3797,56 +3856,27 @@ pub fn run_mcp_server(
     // require the smart/autonomous tier). On the keyword and semantic
     // tiers (no LLM), the handler is wired as `None` and the dispatch
     // path returns the tier-locked advisory envelope.
-    let atomise_handler: Option<std::sync::Arc<atomise::AtomiseToolHandler>> =
-        if let Some(ref llm_client) = llm {
-            let curator: Box<dyn crate::atomisation::curator::Curator> = Box::new(
-                crate::atomisation::curator::LlmCurator::new(llm_client.clone()),
-            );
-            let keypair_arc = active_keypair
-                .as_ref()
-                .map(|kp| std::sync::Arc::new(kp.clone()));
-            // v0.7.0 (#1244) — thread the resolved LLM model name into
-            // the atomiser so the `atomisation_complete` signed-event
-            // payload's `curator_model` field reflects what actually
-            // ran on this deployment, not the pre-#1244 hardcoded
-            // `"gemma4"`.
-            let curator_model = llm_client.model_name().to_string();
-            let atomiser = std::sync::Arc::new(
-                crate::atomisation::Atomiser::new(
-                    curator,
-                    keypair_arc,
-                    crate::atomisation::AtomiserConfig::default(),
-                    tier_config.tier,
-                )
-                .with_curator_model(curator_model),
-            );
-            eprintln!("ai-memory: atomisation engine ready (curator=LlmCurator)");
-            Some(std::sync::Arc::new(atomise::AtomiseToolHandler::new(
-                atomiser,
-                tier_config.tier,
-            )))
-        } else {
-            None
-        };
+    // v1.0.0 #2172 — built via the shared `build_atomise_handler` helper so
+    // the config-mtime reload block can REBUILD it from the freshly-resolved
+    // client at the same race-free single-threaded swap point as `llm`. Kept
+    // `mut` for exactly that reload rebuild.
+    let mut atomise_handler =
+        build_atomise_handler(llm.as_ref(), &tier_config, active_keypair.as_ref());
+    if atomise_handler.is_some() {
+        eprintln!("ai-memory: atomisation engine ready (curator=LlmCurator)");
+    }
 
     // v0.7.0 Form 3 (issue #756) — `memory_ingest_multistep` MCP tool
     // wiring. The handler is built only when an LLM is available
     // (Form 3 LLM stages require the smart/autonomous tier). On
     // keyword/semantic tiers the handler is wired as `None` and the
     // dispatch returns the tier-locked advisory envelope.
-    let ingest_multistep_handler: Option<std::sync::Arc<ingest_multistep::IngestMultistepHandler>> =
-        if let Some(ref llm_client) = llm {
-            let dispatch: std::sync::Arc<dyn crate::multistep_ingest::LlmDispatch> =
-                std::sync::Arc::new(crate::multistep_ingest::executor::OllamaDispatch::new(
-                    llm_client.clone(),
-                ));
-            eprintln!("ai-memory: multi-step ingest orchestrator ready (Form 3)");
-            Some(std::sync::Arc::new(
-                ingest_multistep::IngestMultistepHandler::new(dispatch, tier_config.tier),
-            ))
-        } else {
-            None
-        };
+    // v1.0.0 #2172 — `mut` + shared helper so the reload block rebuilds it
+    // from the swapped client in lockstep with the atomise handler.
+    let mut ingest_multistep_handler = build_ingest_multistep_handler(llm.as_ref(), &tier_config);
+    if ingest_multistep_handler.is_some() {
+        eprintln!("ai-memory: multi-step ingest orchestrator ready (Form 3)");
+    }
 
     // v0.7.x (issue #1168) — resolve the operator-configured LLM /
     // embeddings / reranker triple once. The triple is process-stable
@@ -4038,29 +4068,80 @@ pub fn run_mcp_server(
         // config never swaps in the compiled-default model). Single-
         // threaded stdio makes this rebuild race-free by construction.
         if let Some(cfg_path) = reload_config_path.as_ref() {
-            let current_mtime = std::fs::metadata(cfg_path)
+            // #2173 — snapshot `(mtime, len)` BEFORE the read so a torn read
+            // of a non-atomically-written config can be detected below.
+            let pre_stat = std::fs::metadata(cfg_path)
                 .ok()
-                .and_then(|m| m.modified().ok());
+                .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+            let current_mtime = pre_stat.map(|(t, _)| t);
             if current_mtime.is_some() && current_mtime != last_config_mtime {
-                last_config_mtime = current_mtime;
                 match crate::config::AppConfig::try_load_from(cfg_path) {
                     Ok(new_cfg) => {
-                        llm = crate::reload::resolve_and_build_mcp_llm(
-                            &new_cfg,
-                            &tier_config,
-                            db_path,
-                            false,
-                        );
-                        resolved_models =
-                            crate::reload::refresh_llm_model_surface(&resolved_models, &new_cfg);
-                        tracing::info!(
-                            "MCP config.toml changed — [llm] client hot-swapped (#2166)"
+                        // #2173 — re-stat AFTER the read. A truncate-then-write
+                        // writer can expose a valid-but-INCOMPLETE TOML window
+                        // (an empty file, or a config truncated after a
+                        // complete table with `[llm]` missing) that parses `Ok`
+                        // and would transiently DOWNGRADE the model. If
+                        // `(mtime, len)` moved during the load the file was
+                        // still being written: DEFER this cycle (do NOT advance
+                        // `last_config_mtime`) so the next request retries
+                        // against the settled file. Self-heals; degrade, never
+                        // corrupt.
+                        let post_stat = std::fs::metadata(cfg_path)
+                            .ok()
+                            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+                        if post_stat != pre_stat {
+                            tracing::warn!(
+                                "MCP config.toml changed mid-read — deferring [llm] reload to \
+                                 the next request (#2173)"
+                            );
+                        } else {
+                            last_config_mtime = current_mtime;
+                            llm = crate::reload::resolve_and_build_mcp_llm(
+                                &new_cfg,
+                                &tier_config,
+                                db_path,
+                                false,
+                            );
+                            resolved_models = crate::reload::refresh_llm_model_surface(
+                                &resolved_models,
+                                &new_cfg,
+                            );
+                            // v1.0.0 #2172 — rebuild BOTH per-op LLM handlers
+                            // from the freshly-resolved client at the SAME
+                            // race-free single-threaded swap point as `llm`, so
+                            // `memory_atomise` / `memory_ingest_multistep`
+                            // resolve the CURRENT model (and the signed
+                            // `atomisation_complete` `curator_model` attests the
+                            // client that actually ran — never the boot string).
+                            // A disabling reload (`llm` → `None`) also disables
+                            // both handlers, so the #1963 egress refusal is
+                            // honored on these funnels instead of leaving them
+                            // egressing to the old vendor.
+                            atomise_handler = build_atomise_handler(
+                                llm.as_ref(),
+                                &tier_config,
+                                active_keypair.as_ref(),
+                            );
+                            ingest_multistep_handler =
+                                build_ingest_multistep_handler(llm.as_ref(), &tier_config);
+                            tracing::info!(
+                                "MCP config.toml changed — [llm] client + atomise/ingest \
+                                 handlers hot-swapped (#2166/#2172)"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // A persistent parse/validate error: advance the mtime
+                        // so the same broken file is not re-attempted (and
+                        // re-logged) on every subsequent request. The current
+                        // working client is KEPT (validate-before-swap).
+                        last_config_mtime = current_mtime;
+                        tracing::warn!(
+                            "MCP config.toml changed but parse/validate FAILED — keeping current \
+                             [llm] client (#2166): {e:#}"
                         );
                     }
-                    Err(e) => tracing::warn!(
-                        "MCP config.toml changed but parse/validate FAILED — keeping current \
-                         [llm] client (#2166): {e:#}"
-                    ),
                 }
             }
         }
@@ -4111,6 +4192,55 @@ mod tests {
     use super::*;
     use crate::models::{Memory, Tier};
     use serde_json::json;
+
+    /// #2172 — the config-mtime reload block rebuilds BOTH per-op LLM
+    /// handlers from the freshly-resolved client. This pins the exact helper
+    /// the reload calls: a handler built from client `model-a` attests
+    /// `model-a`, and REBUILDING from a swapped `model-b` client (the
+    /// reload's action) re-points the atomiser's `curator_model` — the field
+    /// the signed `atomisation_complete` event reads — at `model-b`, never
+    /// the boot-captured string. Proves every per-op consumer resolves the
+    /// CURRENT client after a swap (the exact bug #2172 closes).
+    #[test]
+    fn atomise_ingest_handlers_rebuild_from_swapped_client_2172() {
+        let tier = crate::config::FeatureTier::Smart.config();
+        let client_a = Arc::new(
+            OllamaClient::new_with_url_no_health_check("http://127.0.0.1:11434", "model-a")
+                .expect("construct model-a client"),
+        );
+
+        let boot = build_atomise_handler(Some(&client_a), &tier, None)
+            .expect("smart tier + wired client → handler present");
+        assert_eq!(
+            boot.atomiser.curator_model(),
+            "model-a",
+            "boot handler attests the boot model"
+        );
+        assert!(
+            build_ingest_multistep_handler(Some(&client_a), &tier).is_some(),
+            "ingest handler is wired when a client is present"
+        );
+
+        // The reload's action: rebuild from a swapped client.
+        let client_b = Arc::new(
+            OllamaClient::new_with_url_no_health_check("http://127.0.0.1:11434", "model-b")
+                .expect("construct model-b client"),
+        );
+        let reloaded = build_atomise_handler(Some(&client_b), &tier, None)
+            .expect("handler present after swap");
+        assert_eq!(
+            reloaded.atomiser.curator_model(),
+            "model-b",
+            "post-swap the atomiser (and its signed curator_model) attests the NEW model, \
+             not the boot-captured one (#2172)"
+        );
+
+        // A disabling reload (`llm` → None) disables BOTH handlers so the
+        // #1963 egress refusal is honored on these funnels instead of leaving
+        // them egressing to the old vendor.
+        assert!(build_atomise_handler(None, &tier, None).is_none());
+        assert!(build_ingest_multistep_handler(None, &tier).is_none());
+    }
 
     /// #1714 — with no sink configured the MCP signal-ack hook bundle is inert
     /// (empty), so `dispatch_memory_signal_ack` behaves identically to the
