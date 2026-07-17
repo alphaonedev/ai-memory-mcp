@@ -457,3 +457,94 @@ fn update_omitting_agent_id_preserves_authorship() {
 // the SAL `SqliteStore` / `PostgresStore` in `tests/issue_2059_2060_covenant_pg.rs`
 // (feature `sal-postgres`), since `ai_memory::store` is `sal`-feature-gated and
 // unavailable in this default-features test binary.
+
+// ── #2123 item 1 — the sqlite `merge_inbound` same-`id` field-merge branch
+//    consults the gates cluster (secret screen / GOVERNANCE_PRE_WRITE /
+//    never-refuse inbound why_trace) that `overwrite_full_row_by_id`
+//    deliberately bypasses. Pre-#2123 postgres `merge_inbound` ran all three
+//    while the sqlite twin ran NONE on the same-id branch — the exact
+//    sqlite↔postgres asymmetry class the #2101 "uniform on BOTH backends"
+//    claim advertised as closed. These tests pin the parity so a refactor of
+//    `overwrite_full_row_by_id` cannot silently re-open the gap. ────────────
+
+/// Title marker the process-wide governance hook installed below refuses.
+/// Scoped so every OTHER test in this binary (none uses the marker) is
+/// byte-unaffected by the hook being installed.
+const GOV_MARKER_2123: &str = "GOVREFUSE-2123";
+
+/// Install the marker-scoped `GOVERNANCE_PRE_WRITE` hook exactly once
+/// (`OnceLock::set` is idempotent-by-first-wins). Mirrors the dispatcher
+/// pattern in `tests/governance_update_hook_1451.rs`.
+fn ensure_gov_marker_hook_2123() {
+    let _ = db::GOVERNANCE_PRE_WRITE.set(Box::new(|mem: &Memory| {
+        if mem.title.contains(GOV_MARKER_2123) {
+            Err(format!("governance refuses title marker {GOV_MARKER_2123}"))
+        } else {
+            Ok(())
+        }
+    }));
+}
+
+/// #2123 — the same-`id` merge branch CONSULTS governance: an inbound row
+/// whose merged shape governance refuses is rejected and the merge
+/// transaction rolls back (the stored row is untouched). This is only
+/// possible if `merge_inbound` runs the gate itself — the
+/// `overwrite_full_row_by_id` writer it persists through bypasses the
+/// `insert` / `insert_if_newer` chokepoints where the gate normally lives.
+#[test]
+fn merge_inbound_same_id_consults_governance_pre_write_2123() {
+    let _g = covenant_env_lock();
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+    ensure_gov_marker_hook_2123();
+    let conn = fresh_conn();
+
+    let mut seed = make_mem("benign local row", "ns/2123-merge");
+    seed.metadata = serde_json::json!({"agent_id": "alice", "why_trace": "seed"});
+    db::insert(&conn, &seed).expect("benign seed insert");
+
+    // Same-id inbound whose title governance refuses → merge REFUSED,
+    // stored row unchanged (BEGIN IMMEDIATE tx rolled back).
+    let mut refused = seed.clone();
+    refused.title = format!("now {GOV_MARKER_2123} laundered");
+    refused.updated_at = chrono::Utc::now().to_rfc3339();
+    let err = db::merge_inbound(&conn, &refused)
+        .expect_err("a same-id merge into a governance-refused shape must be refused");
+    assert!(
+        err.downcast_ref::<GovernanceRefusal>().is_some(),
+        "refusal must be the shared GovernanceRefusal envelope, got {err:?}"
+    );
+    let still = db::get(&conn, &seed.id).unwrap().unwrap();
+    assert_eq!(
+        still.title, "benign local row",
+        "the refused merge must leave the stored row untouched"
+    );
+}
+
+/// #2123 — the same-`id` merge branch runs the NEVER-REFUSE inbound
+/// `why_trace` variant: under `AI_MEMORY_REQUIRE_WHY_TRACE=1` a why_trace-less
+/// same-id inbound row still merges (advisory WARN + forensic record only —
+/// a refused inbound write would diverge replicas; CRDT convergence is the
+/// load-bearing property of the merge primitive). Pins the posture so the
+/// gate is never "upgraded" to the refusing sibling by accident.
+#[test]
+fn merge_inbound_same_id_never_refuses_missing_why_trace_under_enforce_2123() {
+    let _g = covenant_env_lock();
+    ensure_gov_marker_hook_2123();
+    let conn = fresh_conn();
+
+    let mut seed = make_mem("benign local row wt", "ns/2123-inbound");
+    seed.metadata = serde_json::json!({"agent_id": "alice", "why_trace": "seed"});
+    db::insert(&conn, &seed).expect("benign seed insert");
+
+    unsafe { std::env::set_var(REQUIRE_WHY_TRACE_ENV, "1") };
+    // Same-id inbound WITHOUT why_trace (the gate evaluates the INBOUND row,
+    // pre-merge) → still applied under enforce.
+    let mut no_wt = seed.clone();
+    no_wt.title = "benign merged title".to_string();
+    no_wt.metadata = serde_json::json!({"agent_id": "alice"});
+    no_wt.updated_at = chrono::Utc::now().to_rfc3339();
+    let id = db::merge_inbound(&conn, &no_wt)
+        .expect("a why_trace-less same-id inbound merge must NEVER be refused");
+    assert_eq!(id, seed.id, "the merge resolves to the existing id");
+    unsafe { std::env::remove_var(REQUIRE_WHY_TRACE_ENV) };
+}

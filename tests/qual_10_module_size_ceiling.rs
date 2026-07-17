@@ -747,7 +747,14 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     // funnel-audit wiring (26_980) MERGED with #2044's agent_api_keys SAL
     // impls (#2088, was 26_850 on release) lands the combined postgres.rs at
     // 27_054; ceiling 27_150 (+96).
-    ("src/store/postgres.rs", 27_150),
+    // 2026-07-16 (#2124 + #2141) — bumped 27_150 → 27_250: the #2124
+    // stamp-then-gate provenance parity on the three store-family funnels
+    // (+~54) plus the #2141 GOVERNANCE_PRE_WRITE gate on the DEFAULT
+    // (no-If-Match) trait `update` funnel (+~48, the #1451 evasion class
+    // closed on the last un-gated pg update surface) land the file at
+    // 27_152. Growth is two security gates on existing write paths, not new
+    // surface. 27_250 = 27_152 + 98 headroom; far under the 1.5x cap.
+    ("src/store/postgres.rs", 27_250),
     // 2026-06-10 (#1579 B7) — bumped 9_000 → 9_150: the
     // `db_mmap_size_bytes` knob (ENV_DB_MMAP_SIZE const +
     // StorageSection/ResolvedStorage fields + the resolve_storage env >
