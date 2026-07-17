@@ -234,7 +234,13 @@ pub struct AppState {
     /// semantic) or when Ollama is unreachable at startup; in either
     /// case the create_memory handler silently skips the hook so the
     /// store still succeeds.
-    pub llm: Arc<Option<crate::llm::OllamaClient>>,
+    /// v1.0.0 #2166 — held behind [`crate::reload::SwappableLlm`] so a
+    /// `SIGHUP` config reload can atomically hot-swap the `[llm]` client
+    /// (model/provider change) WITHOUT a daemon restart. Every read site
+    /// resolves the CURRENT client via `app.llm.current()` (clones a cheap
+    /// `Arc` under a read lock, dropping the guard before any `.await` —
+    /// `anti-lock-across-await`). `None`-current is the LLM-absent posture.
+    pub llm: Arc<crate::reload::SwappableLlm>,
 
     /// v0.7.0 L15 — dedicated model id for `auto_tag` (and other short
     /// structured-output LLM calls). When `Some`, [`maybe_auto_tag`]
@@ -358,8 +364,12 @@ pub struct AppState {
     /// `bootstrap_serve` via [`crate::config::AppConfig::resolve_models`]
     /// and reused for every request — the resolver folds CLI / env /
     /// `[llm]` / legacy / compiled-default precedence, so the resulting
-    /// triple is process-stable.
-    pub resolved_models: Arc<crate::config::ResolvedModels>,
+    /// triple is process-stable EXCEPT the `[llm]` slice, which a #2166
+    /// `SIGHUP` reload refreshes in lockstep with the client swap (held
+    /// behind [`crate::reload::Swappable`] so `memory_capabilities` does
+    /// not lie about the active model post-swap). Read via
+    /// `app.resolved_models.current()`.
+    pub resolved_models: Arc<crate::reload::Swappable<crate::config::ResolvedModels>>,
 
     /// v0.7.x (issue #1174 follow-up #1192 / #1196) — cross-surface
     /// [`crate::runtime_context::RuntimeContext`] handle. Holds the

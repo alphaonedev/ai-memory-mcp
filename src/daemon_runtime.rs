@@ -5474,7 +5474,7 @@ pub async fn bootstrap_serve(
         storage_backend,
         #[cfg(feature = "sal")]
         store: store_handle,
-        llm: Arc::new(llm),
+        llm: Arc::new(crate::reload::SwappableLlm::new(llm)),
         // v0.7.0 L15 — dedicated auto_tag model from config.toml.
         auto_tag_model: Arc::new(app_config.auto_tag_model.clone()),
         // v0.7.0 H8 (round-2) — per-LLM-call timeout (default 30s).
@@ -5549,7 +5549,7 @@ pub async fn bootstrap_serve(
         // banner + the live LLM client), NOT the compiled tier preset.
         // The resolver folds CLI / env / `[llm]` / legacy / compiled-
         // default precedence and the resulting triple is process-stable.
-        resolved_models: Arc::new(app_config.resolve_models()),
+        resolved_models: Arc::new(crate::reload::Swappable::new(app_config.resolve_models())),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         // Operator-resolved `[limits].max_page_size` (env
         // `AI_MEMORY_MAX_PAGE_SIZE`) — per-request page / bulk
@@ -5844,6 +5844,48 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
 
     let addr = format!("{}:{}", args.host, args.port);
     tracing::info!("database: {}", db_path.display());
+
+    // v1.0.0 #2166 — SIGHUP live `[llm]` reload. On unix, install a SIGHUP
+    // handler that re-resolves + rebuilds the `[llm]` client and atomically
+    // hot-swaps it (plus the `memory_capabilities` model surface) into the
+    // shared AppState — a `[llm]` model/provider change WITHOUT a daemon
+    // restart. NOTE: SIGHUP's default disposition TERMINATES the process;
+    // installing this handler DELIBERATELY converts kill→reload (the
+    // conventional daemon-reload pattern — a CHANGELOG-worthy behavior
+    // change). Validate-before-swap: a broken/typo'd config KEEPS the
+    // current working client (see `crate::reload::reload_http_llm`). The
+    // rebuild re-runs the #1963 inference-egress gate, so a reload can
+    // legitimately DISABLE the client. The `Arc` handles are cloned BEFORE
+    // `bootstrap.app_state` is moved into the router below.
+    #[cfg(unix)]
+    {
+        let reload_llm = Arc::clone(&bootstrap.app_state.llm);
+        let reload_models = Arc::clone(&bootstrap.app_state.resolved_models);
+        let reload_tier = app_config.effective_tier(None);
+        let reload_db = db_path.clone();
+        tokio::spawn(async move {
+            let mut hup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        tracing::warn!("SIGHUP [llm] reload listener unavailable: {e} (#2166)");
+                        return;
+                    }
+                };
+            tracing::info!(
+                "SIGHUP [llm] hot-reload armed — send SIGHUP to reload config.toml [llm] (#2166)"
+            );
+            while hup.recv().await.is_some() {
+                crate::reload::reload_http_llm(
+                    &reload_llm,
+                    &reload_models,
+                    reload_tier,
+                    &reload_db,
+                )
+                .await;
+            }
+        });
+    }
 
     // Graceful shutdown. The signal future only waits for ctrl_c and
     // then resolves, which tells axum to begin graceful shutdown of
@@ -7216,7 +7258,7 @@ mod tests {
                     .expect("open SqliteStore for keyword_app_state");
                 Arc::new(s)
             },
-            llm: Arc::new(None),
+            llm: Arc::new(crate::reload::SwappableLlm::new(None)),
             auto_tag_model: Arc::new(None),
             llm_call_timeout: Duration::from_secs(crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS),
             replay_cache: Arc::new(crate::identity::replay::ReplayCache::new()),
@@ -7231,7 +7273,9 @@ mod tests {
             // writes (each test that mutates rules opens its own
             // `fresh_conn()`).
             rule_cache: Arc::new(crate::governance::rule_cache::RuleCache::new()),
-            resolved_models: Arc::new(crate::config::ResolvedModels::default()),
+            resolved_models: Arc::new(crate::reload::Swappable::new(
+                crate::config::ResolvedModels::default(),
+            )),
             runtime: crate::runtime_context::RuntimeContext::global_arc(),
             max_page_size: crate::handlers::MAX_BULK_SIZE,
             enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

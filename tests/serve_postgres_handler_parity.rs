@@ -105,7 +105,7 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
         storage_backend: StorageBackend::Postgres,
         store,
-        llm: Arc::new(None),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -125,7 +125,9 @@ async fn build_postgres_app_state(url: &str) -> AppState {
         // #946/#957/#1027 sweep requires the test agent to be allowlisted.
         admin_agent_ids: Arc::new(vec!["ai:parity-test".to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
