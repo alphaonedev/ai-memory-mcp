@@ -146,6 +146,8 @@ pub async fn list_memories(
             since,
             until,
             limit,
+            // #2167 — list/search never runs the recall space gate.
+            active_embedding_space: None,
         };
         let ctx = crate::store::CallerContext::for_agent(&caller);
         return match app.store.list(&ctx, &filter).await {
@@ -335,6 +337,8 @@ pub async fn search_memories(
             since,
             until,
             limit,
+            // #2167 — list/search never runs the recall space gate.
+            active_embedding_space: None,
         };
         // #942 SECURITY-high (Track A QC sweep, 2026-05-20) — replace
         // the hardcoded `"ai:http"` principal with the header-resolved

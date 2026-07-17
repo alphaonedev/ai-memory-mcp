@@ -1972,6 +1972,18 @@ pub struct RecallTelemetry {
     /// changed and the affected rows need re-embedding. The recall path
     /// also emits one aggregated `warn!` per query when this is non-zero.
     pub embedding_dim_mismatch: usize,
+    /// v1.0.0 #2167 — count of stored embeddings VERIFIED in a DIFFERENT
+    /// embedding space than the active embedder's fingerprint during this
+    /// recall (a same-dim model swap the dim gate cannot catch). Excluded
+    /// from semantic scoring (kept keyword-recallable). `0` in the
+    /// homogeneous steady state; non-zero means a foreign-space corpus
+    /// that `ai-memory reembed` heals.
+    pub embedding_space_mismatch: usize,
+    /// v1.0.0 #2167 — count of stored embeddings with NO provenance token
+    /// (`embedding_space IS NULL` post-adoption, or an ANN hit whose
+    /// row-side vector could not be re-verified) excluded from semantic
+    /// scoring this recall. `0` after a clean boot adoption (§5).
+    pub embedding_unverified_space: usize,
 }
 
 #[derive(Debug, Serialize)]

@@ -220,7 +220,8 @@ fn recall_hybrid_loop_does_not_call_get_embedding_per_row() {
         &scoring,
         false,
         None,
-        None, // #1720 caller
+        None, // #1720 caller,
+        None,
     )
     .expect("recall_hybrid_with_telemetry ok");
     assert!(!results.is_empty(), "expected non-empty recall results");

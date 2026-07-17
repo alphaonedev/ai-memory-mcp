@@ -277,6 +277,7 @@ fn purity_pure_default_all_sqlite_entry_paths() {
             false,
             None,
             None,
+            None,
         )
         .expect("db::recall_hybrid");
         let hids: Vec<String> = hrows.iter().map(|(m, _)| m.id.clone()).collect();

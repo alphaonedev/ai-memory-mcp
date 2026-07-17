@@ -655,6 +655,17 @@ pub struct Filter {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: usize,
+    /// v1.0.0 #2167 §3 — the live embedder's space fingerprint for a
+    /// semantic `recall_hybrid`. `Some(fp)` gates every stored vector
+    /// against `fp` so recall never scores a vector from a different
+    /// embedding space (sqlite via `cosine_similarity_space_checked`;
+    /// postgres via the `AND embedding_space = $fp` SQL predicate).
+    /// `None` = keyword-only / no active embedder (gate skipped —
+    /// semantic scoring is moot without an active space). Threaded via
+    /// `Filter` (not a new positional trait param) so the many existing
+    /// `recall_hybrid` call sites that build a `Filter` are unchanged.
+    /// Set ONLY on the recall path; ignored by `list` / `search`.
+    pub active_embedding_space: Option<String>,
 }
 
 /// The core trait. Every backend implements this; ai-memory's HTTP /

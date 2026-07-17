@@ -454,7 +454,17 @@ pub enum Embedder {
 /// with no operator-visible signal. This enum preserves the same `0.0`
 /// numerical fallback at the call site but lets recall *count and surface*
 /// the mismatch instead of swallowing it.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// v1.0.0 #2167 — the space-identity axis extends this: a stored vector
+/// may share the query's DIMENSION yet live in a DIFFERENT vector space
+/// (a same-dim model swap), which the dim gate alone cannot catch. The
+/// two new variants let [`Embedder::cosine_similarity_space_checked`]
+/// exclude foreign / unverified rows from semantic scoring while recall
+/// counts and surfaces them (degraded, never wrong). `Copy` is dropped
+/// because [`CosineComparison::SpaceMismatch`] carries an owned space
+/// token (M-ERRORS-CANONICAL-STRUCTS — the `DimensionMismatch`
+/// precedent shape is preserved).
+#[derive(Debug, Clone, PartialEq)]
 pub enum CosineComparison {
     /// Both vectors share dimensionality; carries the cosine score.
     Comparable(f32),
@@ -467,6 +477,19 @@ pub enum CosineComparison {
         /// Dimensionality of the stored embedding (legacy model).
         stored_dim: usize,
     },
+    /// v1.0.0 #2167 — the stored vector is VERIFIED in a DIFFERENT
+    /// embedding space than the live query embedder's (its
+    /// `embedding_space` token != the active fingerprint). NEVER scored;
+    /// remains keyword/FTS-recallable. Carries the stored space token so
+    /// telemetry / the heal WARN can name the offending fingerprint.
+    SpaceMismatch {
+        /// The stored row's `embedding_space` token (`<id>#<scheme>`).
+        stored_space: String,
+    },
+    /// v1.0.0 #2167 — the stored vector has NO provenance token
+    /// (`embedding_space IS NULL` after §5 adoption). NEVER scored;
+    /// remains keyword/FTS-recallable.
+    UnverifiedSpace,
 }
 
 impl Embedder {
@@ -1063,6 +1086,54 @@ impl Embedder {
                 stored_dim: stored.len(),
             };
         }
+        CosineComparison::Comparable(Self::cosine_similarity(query, stored))
+    }
+
+    /// v1.0.0 #2167 ★ — fingerprint-gated recall comparison. The load-
+    /// bearing correctness primitive: a stored row is scored **only
+    /// when** its `embedding_space` token equals the live embedder's
+    /// `active` fingerprint EXACTLY. Foreign AND NULL (unverified) rows
+    /// are excluded from semantic scoring — but callers keep them
+    /// keyword/FTS-recallable (degraded, never wrong, never invisible).
+    ///
+    /// The check ORDER is load-bearing (M-DOCUMENTED-MAGIC):
+    /// 1. **space identity** — a Verified-but-foreign row is
+    ///    [`CosineComparison::SpaceMismatch`]; a NULL row is
+    ///    [`CosineComparison::UnverifiedSpace`]. Neither is scored.
+    /// 2. **dim** (defense-in-depth) — a Verified-active row whose
+    ///    vector length nonetheless disagrees is corrupt →
+    ///    [`CosineComparison::DimensionMismatch`].
+    /// 3. **score** — [`CosineComparison::Comparable`].
+    ///
+    /// `stored_space` is the raw column value (`None` = SQL NULL). This
+    /// never substring-matches: the fingerprint is compared as a whole
+    /// value (api-newtype-safety intent, over the shared-String SSOT).
+    #[must_use]
+    pub fn cosine_similarity_space_checked(
+        query: &[f32],
+        stored: &[f32],
+        active: &str,
+        stored_space: Option<&str>,
+    ) -> CosineComparison {
+        // (1) space identity — the fail-closed gate.
+        match stored_space {
+            None => return CosineComparison::UnverifiedSpace,
+            Some(s) if s != active => {
+                return CosineComparison::SpaceMismatch {
+                    stored_space: s.to_string(),
+                };
+            }
+            Some(_) => {}
+        }
+        // (2) dim — defense-in-depth; a same-space vector whose length
+        // disagrees is corrupt, not merely foreign.
+        if query.len() != stored.len() {
+            return CosineComparison::DimensionMismatch {
+                query_dim: query.len(),
+                stored_dim: stored.len(),
+            };
+        }
+        // (3) score.
         CosineComparison::Comparable(Self::cosine_similarity(query, stored))
     }
 
@@ -1678,9 +1749,9 @@ mod tests {
         let plain = Embedder::cosine_similarity(&a, &b);
         match Embedder::cosine_similarity_checked(&a, &b) {
             CosineComparison::Comparable(c) => assert!((c - plain).abs() < 1e-6),
-            CosineComparison::DimensionMismatch { .. } => {
-                panic!("equal-length vectors must compare as Comparable")
-            }
+            // `cosine_similarity_checked` (the dim-only comparator) never
+            // produces the #2167 space variants.
+            other => panic!("equal-length vectors must compare as Comparable, got {other:?}"),
         }
     }
 
@@ -1699,8 +1770,8 @@ mod tests {
                 assert_eq!(query_dim, 5);
                 assert_eq!(stored_dim, 3);
             }
-            CosineComparison::Comparable(_) => {
-                panic!("differing-length vectors must report DimensionMismatch")
+            other => {
+                panic!("differing-length vectors must report DimensionMismatch, got {other:?}")
             }
         }
     }

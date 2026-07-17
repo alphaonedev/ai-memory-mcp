@@ -432,6 +432,7 @@ fn do_hybrid(
         false,
         None,
         caller,
+        None,
     )
     .expect("recall_hybrid ok");
     results

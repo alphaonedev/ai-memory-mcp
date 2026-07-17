@@ -3744,6 +3744,12 @@ pub fn run_mcp_server(
                 {
                     eprintln!("ai-memory: backfill failed: {e}");
                 }
+                // v1.0.0 #2167 §5+§6 — boot ORDER: embedder→adopt→census→
+                // index-seed. Runs AFTER backfill (which stamps the active
+                // space on newly-embedded rows) so the census reflects the
+                // fully-stamped corpus; the index seed (below) then filters
+                // to the active space.
+                db::embedding_space_boot_maintenance(&conn, &emb.space_fingerprint(), emb.dim());
                 Some(emb)
             }
             Ok(None) => None,
@@ -3795,9 +3801,16 @@ pub fn run_mcp_server(
         );
         let warm_idx = std::sync::Arc::clone(&idx);
         let warm_db_path = db_path.to_path_buf();
+        // v1.0.0 #2167 §3.3 layer 1 — the active embedder fingerprint,
+        // owned so it moves into the boot thread; filters the seed set.
+        let warm_active_space = embedder.as_ref().map_or_else(
+            || crate::embeddings::embedding_space_fingerprint("mock-embedder"),
+            |e| e.space_fingerprint(),
+        );
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let Some(entries) = crate::daemon_runtime::load_boot_index_entries(&warm_db_path)
+            let Some(entries) =
+                crate::daemon_runtime::load_boot_index_entries(&warm_db_path, &warm_active_space)
             else {
                 return;
             };

@@ -408,6 +408,16 @@ async fn recall_response(
         let mut filter = crate::store::Filter {
             namespace: namespace.map(str::to_string),
             limit,
+            // v1.0.0 #2167 §3 — stamp the active embedder fingerprint so
+            // the SAL recall gate (sqlite comparator / postgres `AND
+            // embedding_space = $fp` predicate) never scores a foreign or
+            // unverified vector. Only meaningful when we embedded a query.
+            active_embedding_space: query_emb.as_ref().and_then(|_| {
+                app.embedder
+                    .as_ref()
+                    .as_ref()
+                    .map(|e| e.space_fingerprint())
+            }),
             ..Default::default()
         };
         // v0.7.0 (issue #518) — splice `recall_scope.tier` when the
@@ -730,6 +740,15 @@ async fn recall_response(
     let scoring = app.scoring.clone();
     let qe_owned = query_emb.clone();
     let hits_owned = precomputed_hits.clone();
+    // v1.0.0 #2167 §3 — the active embedder fingerprint, owned so it
+    // moves into the read-pool closure; gates the sqlite recall so a
+    // foreign / unverified vector is never scored.
+    let active_space_owned: Option<String> = qe_owned.as_ref().and_then(|_| {
+        app.embedder
+            .as_ref()
+            .as_ref()
+            .map(|e| e.space_fingerprint())
+    });
     let (result, mode) = super::read_pool::db_read_op(app.db.clone(), move |conn| {
         if let Some(qe) = qe_owned.as_deref() {
             // SAFETY: `precomputed_hits` is Some when `query_emb` is
@@ -763,6 +782,8 @@ async fn recall_response(
                 source_uri_owned.as_deref(),
                 // v0.8.0 #1720 A3 — owner-keyed visibility caller.
                 caller_owned.as_deref(),
+                // v1.0.0 #2167 §3 — active embedder fingerprint gate.
+                active_space_owned.as_deref(),
             );
             (r, "hybrid")
         } else {

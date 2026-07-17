@@ -3008,12 +3008,15 @@ pub async fn build_llm_client(
 /// When the embedder is present but the DB is empty (or query errors),
 /// returns `Some(VectorIndex::empty())` so write paths can populate it
 /// in-place.
+///
+/// v1.0.0 #2167 §3.3 layer 1 — `active_space` is the live embedder's
+/// space fingerprint; `None` means no embedder (keyword-only) → no
+/// index. `Some(fp)` filters the seed set to the active space in SQL so
+/// a foreign-fingerprint vector never enters the ANN graph.
 #[must_use]
-pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<VectorIndex> {
-    if !embedder_present {
-        return None;
-    }
-    match db::get_all_embeddings(conn) {
+pub fn build_vector_index(conn: &Connection, active_space: Option<&str>) -> Option<VectorIndex> {
+    let active = active_space?;
+    match db::get_all_embeddings(conn, active) {
         Ok(entries) if !entries.is_empty() => Some(hnsw::VectorIndex::build(entries)),
         _ => Some(hnsw::VectorIndex::empty()),
     }
@@ -3024,7 +3027,12 @@ pub fn build_vector_index(conn: &Connection, embedder_present: bool) -> Option<V
 /// loader thread never touches the request-serving connection;
 /// failures degrade to "no warm-up" with a WARN (the daemon keeps
 /// serving keyword/FTS recall — the pre-#1579 failure posture).
-pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec<f32>)>> {
+pub(crate) fn load_boot_index_entries(
+    db_path: &Path,
+    // v1.0.0 #2167 §3.3 layer 1 — the active embedder fingerprint; the
+    // boot seed set is filtered to it in SQL.
+    active_space: &str,
+) -> Option<Vec<(String, Vec<f32>)>> {
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -3036,7 +3044,7 @@ pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec
             return None;
         }
     };
-    match db::get_all_embeddings(&conn) {
+    match db::get_all_embeddings(&conn, active_space) {
         Ok(entries) => Some(entries),
         Err(e) => {
             tracing::warn!(
@@ -3071,13 +3079,16 @@ pub(crate) fn load_boot_index_entries(db_path: &Path) -> Option<Vec<(String, Vec
 /// time-to-semantic-ready in the daemon log.
 pub fn spawn_vector_index_boot_load(
     db_path: std::path::PathBuf,
+    // v1.0.0 #2167 §3.3 layer 1 — the active embedder space fingerprint,
+    // owned so it can move into the boot thread; filters the seed set.
+    active_space: String,
     // v0.9 #1005 — the shared seam type: boxed [`crate::hnsw::VectorSearchIndex`]
     // (today always the default HNSW backend) behind the AppState mutex.
     vector_index: Arc<tokio::sync::Mutex<Option<Box<dyn crate::hnsw::VectorSearchIndex>>>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let Some(entries) = load_boot_index_entries(&db_path) else {
+        let Some(entries) = load_boot_index_entries(&db_path, &active_space) else {
             return;
         };
         if entries.is_empty() {
@@ -4865,9 +4876,32 @@ pub async fn bootstrap_serve(
                 index_limits.vector_index_hard_fail_at_cap,
             )
         })));
-    if embedder.is_some() {
-        let _boot_index_loader =
-            spawn_vector_index_boot_load(db_path.to_path_buf(), Arc::clone(&vector_index_state));
+    if let Some(emb) = embedder.as_ref() {
+        // v1.0.0 #2167 — boot ORDER is load-bearing (§3.3): embedder →
+        // §5 adoption → §6 census → vector-index seed. Adoption stamps
+        // legacy NULL-space rows so the seed filter (`AND embedding_space
+        // = active`) does not drop them; the census WARNs on any residual
+        // foreign/NULL space. Best-effort over a private connection — a
+        // read-only / locked DB degrades to a skipped WARN, never an error
+        // (recall then treats those rows as excluded — safe, degraded).
+        let active_fp = emb.space_fingerprint();
+        match db::open(db_path) {
+            Ok(boot_conn) => {
+                db::embedding_space_boot_maintenance(&boot_conn, &active_fp, emb.dim());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    err = %e,
+                    "#2167: could not open DB for embedding-space adoption/census at boot; \
+                     legacy NULL-space rows stay excluded until reembed"
+                );
+            }
+        }
+        let _boot_index_loader = spawn_vector_index_boot_load(
+            db_path.to_path_buf(),
+            active_fp,
+            Arc::clone(&vector_index_state),
+        );
     }
 
     // v0.7.0 L5 — build the LLM client for autonomy-hook capable tiers
@@ -7593,14 +7627,19 @@ mod tests {
     fn test_build_vector_index_no_embedder_returns_none() {
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
-        assert!(build_vector_index(&conn, false).is_none());
+        assert!(build_vector_index(&conn, None).is_none());
     }
 
     #[test]
     fn test_build_vector_index_empty_db_returns_empty_index() {
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
-        let idx = build_vector_index(&conn, true);
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        );
         assert!(
             idx.is_some(),
             "empty DB with embedder must yield empty index"
@@ -8195,7 +8234,13 @@ mod tests {
             &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
-        let idx = build_vector_index(&conn, true).expect("populated index");
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        )
+        .expect("populated index");
         assert!(
             idx.len() >= 1,
             "expected non-empty index, got len={}",
@@ -8265,7 +8310,11 @@ mod tests {
         // mutex — exactly what `serve` now constructs before binding.
         let state: Arc<Mutex<Option<Box<dyn hnsw::VectorSearchIndex>>>> =
             Arc::new(Mutex::new(Some(Box::new(hnsw::VectorIndex::empty()) as _)));
-        let handle = spawn_vector_index_boot_load(env.db_path.clone(), Arc::clone(&state));
+        let handle = spawn_vector_index_boot_load(
+            env.db_path.clone(),
+            crate::embeddings::embedding_space_fingerprint("test-space"),
+            Arc::clone(&state),
+        );
 
         // Readiness: the state is immediately lockable (no long-held
         // guard) — a request-path access during warm-up must not
@@ -9715,7 +9764,12 @@ decision = "allow"
             &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
-        let idx = build_vector_index(&conn, true);
+        let idx = build_vector_index(
+            &conn,
+            Some(&crate::embeddings::embedding_space_fingerprint(
+                "test-space",
+            )),
+        );
         assert!(idx.is_some());
     }
 
