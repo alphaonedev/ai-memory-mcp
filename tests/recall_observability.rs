@@ -188,7 +188,7 @@ fn recall_telemetry_reports_embedding_dimension_mismatch() {
         &conn,
         &id,
         &stored_embedding,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("set_embedding");
 
@@ -242,7 +242,7 @@ fn recall_telemetry_reports_no_mismatch_when_dimensions_agree() {
         &conn,
         &id,
         &stored_embedding,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("set_embedding");
 

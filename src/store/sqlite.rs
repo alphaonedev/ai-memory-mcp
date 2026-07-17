@@ -2164,7 +2164,7 @@ impl MemoryStore for SqliteStore {
         _ctx: &CallerContext,
         id: &str,
         embedding: Option<&[f32]>,
-        space: &crate::embeddings::EmbeddingSpace,
+        space: &str,
     ) -> StoreResult<()> {
         let conn = self.state.lock().await;
         match embedding {
@@ -2550,7 +2550,7 @@ mod tests {
             .set_embeddings_batch(
                 &ctx,
                 &[(m.id.clone(), vec![0.4f32, 0.5])],
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .await
             .expect("set_embeddings_batch default");
@@ -4023,7 +4023,7 @@ mod tests {
                 &ctx,
                 &id,
                 Some(&vec),
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .await
             .expect("update_embedding");

@@ -81,7 +81,7 @@ fn archive_preserves_embedding_and_tier_on_restore() {
         &conn,
         &mem.id,
         &embedding,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("set embedding");
 
@@ -145,7 +145,7 @@ fn mixed_dim_write_rejected_after_first_dim_established() {
         &conn,
         &m_a.id,
         &v4,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("first write succeeds");
 
@@ -156,7 +156,7 @@ fn mixed_dim_write_rejected_after_first_dim_established() {
         &conn,
         &m_b.id,
         &v8,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect_err("second write at different dim must error");
     let msg = err.to_string();
@@ -173,7 +173,7 @@ fn mixed_dim_write_rejected_after_first_dim_established() {
         &conn,
         &m_b.id,
         &v4,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("matching dim succeeds");
 
@@ -351,7 +351,7 @@ fn fresh_db_reports_zero_dim_violations() {
         &conn,
         &m.id,
         &v,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("set embedding");
 

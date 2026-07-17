@@ -78,7 +78,7 @@ fn seed_with_embedding(
         conn,
         &stored_id,
         embedding,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("db::set_embedding");
     stored_id

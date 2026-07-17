@@ -595,7 +595,7 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
         .set_embeddings_batch(
             &ctx,
             &[],
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("set_embeddings_batch empty");
@@ -617,7 +617,7 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
         .set_embeddings_batch(
             &ctx,
             &[(id.clone(), vec)],
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("set_embeddings_batch write");
@@ -630,7 +630,7 @@ async fn set_embeddings_batch_empty_is_noop_and_writes_vectors() {
         .set_embeddings_batch(
             &ctx,
             &[(uid("ghost"), ghost_vec)],
-            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+            &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("set_embeddings_batch ghost");

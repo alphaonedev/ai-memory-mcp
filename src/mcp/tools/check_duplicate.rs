@@ -280,7 +280,7 @@ mod tests {
             &conn,
             &id,
             &embedding,
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -317,7 +317,7 @@ mod tests {
             &conn,
             &id,
             &embedding,
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 

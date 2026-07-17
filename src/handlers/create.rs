@@ -415,7 +415,7 @@ fn insert_create_with_quota(
     // #2167 — the live embedder's space fingerprint, stamped alongside the
     // vector. `None` when embeddings are disabled (then `embedding` is `None`
     // too, so it is never read).
-    space: Option<&crate::embeddings::EmbeddingSpace>,
+    space: Option<&str>,
 ) -> Result<String, axum::response::Response> {
     // v0.7.0 Round-2 F7 — per-agent quota gate. Round-1 evidence: 500
     // HTTP stores from a single agent_id incremented zero rows in
@@ -1485,7 +1485,8 @@ pub async fn create_memory(
         .as_ref()
         .as_ref()
         .map(|e| e.space_fingerprint());
-    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding, create_space.as_ref()) {
+    let actual_id = match insert_create_with_quota(&lock, &mem, &embedding, create_space.as_deref())
+    {
         Ok(id) => id,
         Err(resp) => return resp,
     };

@@ -15438,7 +15438,7 @@ mod backfill_resilience_1595_tests {
             &conn,
             &est,
             &[0.1, 0.2, 0.3, 0.4],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         seed(&conn, "new-a", "needs embedding");

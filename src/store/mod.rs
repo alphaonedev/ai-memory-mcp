@@ -763,7 +763,7 @@ pub trait MemoryStore: Send + Sync {
     /// them. Default implementation is a no-op for adapters that
     /// don't store embeddings inline (sqlite — embeddings live in a
     /// side table).
-    /// #2167 — `space` is the [`crate::embeddings::EmbeddingSpace`] the
+    /// #2167 — `space` is the embedding-space fingerprint the
     /// `embedding` was minted under; it is stamped in the SAME statement as
     /// the vector (M-PARAMETER-CONSISTENCY) so a row can never hold a vector
     /// from one space and a stamp from another. A `None` embedding NULLs the
@@ -773,7 +773,7 @@ pub trait MemoryStore: Send + Sync {
         _ctx: &CallerContext,
         _id: &str,
         _embedding: Option<&[f32]>,
-        _space: &crate::embeddings::EmbeddingSpace,
+        _space: &str,
     ) -> StoreResult<()> {
         Ok(())
     }
@@ -819,7 +819,7 @@ pub trait MemoryStore: Send + Sync {
         &self,
         ctx: &CallerContext,
         entries: &[(String, Vec<f32>)],
-        space: &crate::embeddings::EmbeddingSpace,
+        space: &str,
     ) -> StoreResult<usize> {
         let mut written = 0usize;
         for (id, vec) in entries {
@@ -4060,7 +4060,7 @@ mod tests {
             &ctx,
             "any",
             Some(&[0.5_f32]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .expect("noop");
@@ -4947,7 +4947,7 @@ mod tests {
             &self,
             _ctx: &CallerContext,
             _entries: &[(String, Vec<f32>)],
-            _space: &crate::embeddings::EmbeddingSpace,
+            _space: &str,
         ) -> StoreResult<usize> {
             Ok(self.written_per_chunk)
         }
@@ -4984,7 +4984,7 @@ mod tests {
             .set_embeddings_batch(
                 &ctx,
                 &entries,
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .await
             .expect("default batch write");
@@ -5590,7 +5590,7 @@ mod tests {
             &ctx,
             "x",
             None,
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .await
         .unwrap();

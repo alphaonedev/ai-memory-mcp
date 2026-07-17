@@ -1209,7 +1209,7 @@ mod tests {
                 &conn,
                 &m.id,
                 &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
         }
@@ -1277,14 +1277,14 @@ mod tests {
             &conn,
             &a.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &b.id,
             &synth_emb(&[0.0, 1.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -1318,14 +1318,14 @@ mod tests {
             &conn,
             &c.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &d.id,
             &synth_emb(&[0.99, 0.1, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -1673,7 +1673,7 @@ mod tests {
                 &conn,
                 id,
                 &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
         }
@@ -1770,14 +1770,14 @@ mod tests {
             &conn,
             &a.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &b.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -1817,14 +1817,14 @@ mod tests {
             &conn,
             &a.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &b.id,
             &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
 
@@ -2257,7 +2257,7 @@ mod tests {
                 &conn,
                 id,
                 &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
         }
@@ -2333,7 +2333,7 @@ mod tests {
                 &conn,
                 &m.id,
                 &synth_emb(&[1.0, 0.0, 0.0, 0.0]),
-                &crate::embeddings::EmbeddingSpace::mint("test-space"),
+                &crate::embeddings::embedding_space_fingerprint("test-space"),
             )
             .unwrap();
         }

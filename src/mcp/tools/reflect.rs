@@ -1415,7 +1415,7 @@ mod tests {
             &conn,
             &src,
             &stable_seed_embedding,
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .expect("seed 768-dim embedding");
         let emb = MockEmbedder::new_local().unwrap(); // 384-dim

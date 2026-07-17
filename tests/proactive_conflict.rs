@@ -82,7 +82,7 @@ fn insert_with_embedding(conn: &rusqlite::Connection, mem: &Memory, embedding: &
         conn,
         &id,
         embedding,
-        &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        &ai_memory::embeddings::embedding_space_fingerprint("test-space"),
     )
     .expect("set_embedding");
     id

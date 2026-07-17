@@ -2287,14 +2287,14 @@ mod tests {
             &conn,
             &m1.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
         db::set_embedding(
             &conn,
             &m2.id,
             &[1.0, 0.0],
-            &crate::embeddings::EmbeddingSpace::mint("test-space"),
+            &crate::embeddings::embedding_space_fingerprint("test-space"),
         )
         .unwrap();
     }
