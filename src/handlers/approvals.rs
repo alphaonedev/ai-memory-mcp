@@ -630,11 +630,9 @@ pub fn sse_event_visible_to(
 /// subscriber sees only their own pending rows and decisions, plus
 /// rows in namespaces an active K9 `Allow` rule grants them.
 pub async fn approvals_sse(
-    State(_app): State<AppState>,
+    State(app): State<AppState>,
     headers: HeaderMap,
-) -> axum::response::Sse<
-    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
-> {
+) -> axum::response::Response {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use futures_core::Stream;
     use std::pin::Pin;
@@ -642,6 +640,37 @@ pub async fn approvals_sse(
     use std::time::Duration as StdDuration;
     use tokio_stream::wrappers::BroadcastStream;
     use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+
+    // #2154 (#2032-A / H1 IDOR, SSE lane) — per-agent-key identity gate at
+    // STREAM OPEN, BEFORE the broadcast subscription is filtered by the
+    // self-asserted `subscriber_agent`. This is the SSE cousin of the gated
+    // request/response reads (`get_memory` in `memories.rs`, `get_inbox`,
+    // `list_pending`): `X-Agent-Id` is a SELF-ASSERTED principal while the
+    // `api_key` is only a SHARED transport credential, so under `enforce` a
+    // shared-global-key caller (`is_global` → skips the #2044 middleware
+    // binding block) forging `X-Agent-Id: <victim>` would otherwise stream the
+    // victim's `ApprovalEvent` metadata via `sse_event_visible_to`. The gate
+    // refuses such a `Claimed` named principal with `403
+    // attested_identity_required` at open (same status/semantics as the
+    // sibling routes); it is fully inert under zero-enrollment / advisory /
+    // off, so a legitimate subscriber sees no behaviour change.
+    //
+    // The identity decision is made ONCE here (the connection is long-lived).
+    // Below, `subscriber_agent` is read from the (middleware-bound) `X-Agent-Id`
+    // header: an enrolled per-agent key has already been rebound to its
+    // key-derived principal by `api_key_auth`, and under `enforce` this gate
+    // has already refused any merely-`Claimed` named principal — so the value
+    // that reaches `sse_event_visible_to` is the BOUND principal, never a
+    // still-honored forged header. There is no per-event re-resolution of a
+    // mutable id after open.
+    if let Some(resp) = crate::handlers::identity_binding::enforce_idor_identity(
+        &app.enrolled_agent_keys,
+        app.http_identity_mode,
+        &headers,
+        "approvals_stream",
+    ) {
+        return resp;
+    }
 
     // Resolve the subscriber's agent_id from the `X-Agent-Id` header
     // (the K10 SSE endpoint sits behind `api_key_auth`; HMAC signing
@@ -744,5 +773,7 @@ pub async fn approvals_sse(
         inner: BroadcastStream::new(rx),
         subscriber_agent,
     };
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(StdDuration::from_secs(15)))
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(StdDuration::from_secs(15)))
+        .into_response()
 }
