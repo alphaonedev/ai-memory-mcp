@@ -32,6 +32,13 @@
 //!   [`sync_cycle_once`] — the sync-daemon body.
 //! - [`run_curator_daemon_with_shutdown`],
 //!   [`run_curator_daemon_with_primitives`] — the curator-daemon body.
+//!
+//! The L3 substrate poll-watcher daemon body (issue #1978) lives in
+//! [`crate::cli::watch`] — the `Command::Watch` arm below is a thin
+//! delegate to [`crate::cli::watch::dispatch`], which owns the
+//! output-routing + `Notify`→`AtomicBool` shutdown bridge (extracted
+//! from this module so the coverable watch logic sits in `cli::watch`,
+//! mirroring #2088's api-key-dispatch move).
 
 use crate::models::field_names;
 use std::io::Write as _;
@@ -75,6 +82,7 @@ use crate::cli::sync::{SyncArgs, SyncDaemonArgs};
 use crate::cli::update::UpdateArgs;
 use crate::cli::verify::VerifyChainArgs;
 use crate::cli::verify_signed_events::VerifySignedEventsChainArgs;
+use crate::cli::watch::WatchArgs;
 use crate::cli::wrap::WrapArgs;
 use crate::config::{AppConfig, FeatureTier};
 use crate::embeddings::Embedder;
@@ -450,6 +458,19 @@ pub enum Command {
     RecoverPreviousSession(
         crate::cli::commands::recover_previous_session::RecoverPreviousSessionArgs,
     ),
+    /// v1.0.0 (issue #1978) — L3 substrate watcher: a std-only,
+    /// poll-based filesystem-watcher capture daemon (no `notify`
+    /// crate — operator-gated under the sole-authority
+    /// no-external-injection rule). `--once` runs a single poll tick
+    /// and prints the report; `--daemon` loops with `--interval-secs`
+    /// between ticks. Each tick diffs `std::fs::metadata` mtime/size
+    /// per watched host transcript and, on a detected change, feeds
+    /// the shared L2 parser pipeline
+    /// ([`crate::recover::recover_from_transcript`]) — same
+    /// idempotency, same dedup table, same graceful degradation. Opt-in:
+    /// never runs unless explicitly invoked. See
+    /// `crate::recover::watcher` for the full design rationale.
+    Watch(WatchArgs),
     /// v0.7.0 WT-1-F — operator-side wrapper over the atomisation
     /// engine ([`crate::atomisation::Atomiser`]). Decomposes one
     /// long-form memory into atomic propositions; surfaces every
@@ -1898,6 +1919,14 @@ pub async fn run(cli: Cli, app_config: &AppConfig) -> Result<()> {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
+        }
+        Command::Watch(a) => {
+            // Thin delegate — output-routing (sink-vs-stdout) + the
+            // `Notify`→`AtomicBool` shutdown bridge live in
+            // `cli::watch::dispatch` (extracted from this module, #1978
+            // coverage / #2088 precedent).
+            init_tracing();
+            cli::watch::dispatch(&db_path, &a, cli_agent_id.as_deref()).await
         }
         Command::Atomise(a) => {
             let stdout = std::io::stdout();

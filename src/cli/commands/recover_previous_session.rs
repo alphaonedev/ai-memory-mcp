@@ -186,6 +186,9 @@ fn build_opts(args: &RecoverPreviousSessionArgs) -> RecoverOpts {
         dry_run: args.dry_run,
         quiet: args.quiet,
         agent_id,
+        // CLI recovery keeps the watermark fast-path (its latency
+        // optimisation); only the L3 poll watcher bypasses it (#2126).
+        bypass_fast_path: false,
     }
 }
 

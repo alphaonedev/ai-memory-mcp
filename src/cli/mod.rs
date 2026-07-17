@@ -93,6 +93,11 @@ pub mod update;
 pub mod verify;
 pub mod verify_audit_trail;
 pub mod verify_signed_events;
+/// v1.0.0 #1978 — `ai-memory watch` subcommand. CLI surface for the L3
+/// substrate poll-based filesystem-watcher capture daemon
+/// (`crate::recover::watcher`). Opt-in; mirrors the `curator`
+/// `--once` / `--daemon` split.
+pub mod watch;
 pub mod wrap;
 
 #[cfg(test)]
