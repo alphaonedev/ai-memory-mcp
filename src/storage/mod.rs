@@ -3253,7 +3253,7 @@ pub(crate) fn archive_memory_no_tx(
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at,
+              embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -3261,7 +3261,7 @@ pub(crate) fn archive_memory_no_tx(
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -3340,7 +3340,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
          (id, tier, namespace, title, content, tags, priority, confidence,
           source, access_count, created_at, updated_at, last_accessed_at,
           expires_at, archived_at, archive_reason, metadata,
-          embedding, embedding_dim, original_tier, original_expires_at,
+          embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
           reflection_depth, atomised_into, atom_of, memory_kind,
           entity_id, persona_version, citations, source_uri, source_span,
           confidence_source, confidence_signals, confidence_decayed_at,
@@ -3348,7 +3348,7 @@ pub(crate) fn archive_memory_insert_only(conn: &Connection, id: &str, reason: &s
          SELECT id, tier, namespace, title, content, tags, priority, confidence,
                 source, access_count, created_at, updated_at, last_accessed_at,
                 expires_at, ?1, ?2, metadata,
-                embedding, embedding_dim, tier, expires_at,
+                embedding, embedding_dim, embedding_space, tier, expires_at,
                 reflection_depth, atomised_into, atom_of, memory_kind,
                 entity_id, persona_version, citations, source_uri, source_span,
                 confidence_source, confidence_signals, confidence_decayed_at,
@@ -3694,7 +3694,7 @@ pub fn archive_memory_for_caller(
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
               expires_at, archived_at, archive_reason, metadata,
-              embedding, embedding_dim, original_tier, original_expires_at,
+              embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -3702,7 +3702,7 @@ pub fn archive_memory_for_caller(
              SELECT id, tier, namespace, title, content, tags, priority, confidence,
                     source, access_count, created_at, updated_at, last_accessed_at,
                     expires_at, ?1, ?2, metadata,
-                    embedding, embedding_dim, tier, expires_at,
+                    embedding, embedding_dim, embedding_space, tier, expires_at,
                     reflection_depth, atomised_into, atom_of, memory_kind,
                     entity_id, persona_version, citations, source_uri, source_span,
                     confidence_source, confidence_signals, confidence_decayed_at,
@@ -4315,7 +4315,7 @@ pub fn forget(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4323,7 +4323,7 @@ pub fn forget(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4344,7 +4344,7 @@ pub fn forget(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4352,7 +4352,7 @@ pub fn forget(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4777,7 +4777,7 @@ pub fn forget_for_caller(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4785,7 +4785,7 @@ pub fn forget_for_caller(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?4, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -4809,7 +4809,7 @@ pub fn forget_for_caller(
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -4817,7 +4817,7 @@ pub fn forget_for_caller(
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?3, 'forget', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -11047,7 +11047,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                      (id, tier, namespace, title, content, tags, priority, confidence,
                       source, access_count, created_at, updated_at, last_accessed_at,
                       expires_at, archived_at, archive_reason, metadata,
-                      embedding, embedding_dim, original_tier, original_expires_at,
+                      embedding, embedding_dim, embedding_space, original_tier, original_expires_at,
                       reflection_depth, atomised_into, atom_of, memory_kind,
                       entity_id, persona_version, citations, source_uri, source_span,
                       confidence_source, confidence_signals, confidence_decayed_at,
@@ -11055,7 +11055,7 @@ pub fn gc(conn: &Connection, archive: bool) -> Result<usize> {
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
                             expires_at, ?1, 'ttl_expired', metadata,
-                            embedding, embedding_dim, tier, expires_at,
+                            embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
                             confidence_source, confidence_signals, confidence_decayed_at,
@@ -11554,7 +11554,7 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim,
+              expires_at, metadata, embedding, embedding_dim, embedding_space,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -11563,7 +11563,23 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim,
+                    -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
+                    -- archived vector ONLY when its space matches the live
+                    -- active space (?5). A foreign- or NULL-space vector has
+                    -- its whole trio NULLed so the `list_unembedded` backfill
+                    -- re-embeds from the durable text under the LIVE space
+                    -- (self-heal, degrade-never-corrupt). ?5 NULL (no active
+                    -- embedder in this process) keeps any STAMPED vector but
+                    -- still drops an unverifiable NULL-space one.
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_dim ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_space ELSE NULL END,
                     COALESCE(reflection_depth, 0),
                     atomised_into,
                     atom_of,
@@ -11579,7 +11595,15 @@ pub fn restore_archived(conn: &Connection, id: &str) -> Result<bool> {
                     encrypted_envelope,
                     ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id, cid_stamp.cid, cid_stamp.genesis],
+            params![
+                now,
+                id,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
+                // (None → NULL) driving the restore heal above.
+                crate::embeddings::active_embedding_space(),
+            ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). Edges whose other endpoint is permanently gone are
@@ -11699,7 +11723,7 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
             "INSERT INTO memories
              (id, tier, namespace, title, content, tags, priority, confidence,
               source, access_count, created_at, updated_at, last_accessed_at,
-              expires_at, metadata, embedding, embedding_dim,
+              expires_at, metadata, embedding, embedding_dim, embedding_space,
               reflection_depth, atomised_into, atom_of, memory_kind,
               entity_id, persona_version, citations, source_uri, source_span,
               confidence_source, confidence_signals, confidence_decayed_at,
@@ -11708,7 +11732,23 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
              SELECT id, COALESCE(original_tier, 'long'), namespace, title, content,
                     tags, priority, confidence, source, access_count, created_at,
                     ?1, last_accessed_at, original_expires_at, metadata,
-                    embedding, embedding_dim,
+                    -- v1.0.0 #2167 (S8) restore/migrate HEAL: keep the
+                    -- archived vector ONLY when its space matches the live
+                    -- active space (?5). A foreign- or NULL-space vector has
+                    -- its whole trio NULLed so the `list_unembedded` backfill
+                    -- re-embeds from the durable text under the LIVE space
+                    -- (self-heal, degrade-never-corrupt). ?5 NULL (no active
+                    -- embedder in this process) keeps any STAMPED vector but
+                    -- still drops an unverifiable NULL-space one.
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_dim ELSE NULL END,
+                    CASE WHEN embedding_space IS NOT NULL
+                              AND (?5 IS NULL OR embedding_space = ?5)
+                         THEN embedding_space ELSE NULL END,
                     COALESCE(reflection_depth, 0),
                     atomised_into,
                     atom_of,
@@ -11724,7 +11764,15 @@ pub fn restore_archived_for_caller(conn: &Connection, id: &str, caller: &str) ->
                     encrypted_envelope,
                     ?3, ?4
              FROM archived_memories WHERE id = ?2",
-            params![now, id, cid_stamp.cid, cid_stamp.genesis],
+            params![
+                now,
+                id,
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                // v1.0.0 #2167 (S8) — ?5: the process-wide active-space fp
+                // (None → NULL) driving the restore heal above.
+                crate::embeddings::active_embedding_space(),
+            ],
         )?;
         // #1771 — re-insert the preserved edge graph (both-endpoints-exist,
         // idempotent). See [`restore_archived`] for the contract.
