@@ -2085,7 +2085,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_on_empty_db_produces_twelve_sections() {
+    fn local_run_on_empty_db_produces_thirteen_sections() {
         let env = TestEnv::fresh();
         let report = run_local_collect(&env.db_path);
         assert_eq!(report.mode, "local");
@@ -2093,14 +2093,16 @@ mod tests {
         // "LLM Reachability (#1146)"; #1598 added
         // "Embeddings Reachability (#1598)"; #1964 added
         // "Recall Index Coverage (#1964)"; #1965 added
-        // "Corpus Lifecycle (#1965)" — total is now 12.
-        assert_eq!(report.sections.len(), 12);
+        // "Corpus Lifecycle (#1965)"; #2167 added
+        // "Embedding Space Census (#2167)" — total is now 13.
+        assert_eq!(report.sections.len(), 13);
         let names: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "Storage",
                 "Index",
+                "Embedding Space Census (#2167)",
                 "Recall Index Coverage (#1964)",
                 "Corpus Lifecycle (#1965)",
                 "Recall",
