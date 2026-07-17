@@ -19,6 +19,43 @@ use ai_memory::embeddings::embedding_space_fingerprint;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use serde_json::json;
 
+// ---------------------------------------------------------------------------
+// pg `<=>` site-count PIN (§3.4/§9) — every postgres query that consumes the
+// pgvector cosine operator MUST carry the `embedding_space` gate, so a future
+// ungated `<=>` (a cross-space cosine = potential WRONG recall / false dup)
+// cannot land silently. Static source analysis — no DB, feature-independent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pg_cosine_query_sites_all_carry_the_space_gate_2167() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/store/postgres.rs"
+    ))
+    .expect("read src/store/postgres.rs");
+    // Split on the sqlx query builder so each block is one query + its binds.
+    let mut cosine_sites = 0usize;
+    for block in src.split("sqlx::query") {
+        if block.contains("embedding <=>") {
+            cosine_sites += 1;
+            assert!(
+                block.contains("embedding_space"),
+                "a postgres `embedding <=>` cosine query is NOT space-gated (#2167 §3.4): \
+                 {}",
+                &block[..block.len().min(320)]
+            );
+        }
+    }
+    // Pinned: recall_hybrid semantic pool + the two check_duplicate_with_text
+    // arms = 3 cosine query blocks. A new cosine query bumps this and forces
+    // the author to gate it (the assert above) + reconcile the pin.
+    assert_eq!(
+        cosine_sites, 3,
+        "postgres pgvector cosine-query site count drifted (#2167 §3.4 pin); \
+         a new `<=>` query must carry `AND embedding_space = $fp`"
+    );
+}
+
 fn fresh_db() -> (rusqlite::Connection, std::path::PathBuf) {
     let root = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))

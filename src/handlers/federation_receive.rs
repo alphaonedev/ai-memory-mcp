@@ -1287,7 +1287,11 @@ pub async fn sync_push(
         .map(|se| (se.memory_id.as_str(), se))
         .collect();
     let mut deferred_embed: Vec<(String, String)> = Vec::new();
-    let mut hnsw_updates: Vec<(String, Vec<f32>)> = Vec::new();
+    // #2167 §3.3 layer 2 — carry the shipped vector's CLAIMED space alongside
+    // (id, vec) so the ANN-index insert can be gated on claimed == active
+    // (defense-in-depth: a foreign-space vector is stored+flagged but NEVER
+    // indexed, even if it somehow reached this vec).
+    let mut hnsw_updates: Vec<(String, Vec<f32>, String)> = Vec::new();
     for mem in &body.memories {
         if let Err(e) = validate::RequestValidator::validate_memory(mem) {
             tracing::warn!("sync_push: skipping memory {} ({}): {e}", mem.id, mem.title);
@@ -1573,7 +1577,7 @@ pub async fn sync_push(
                         // shipped vector heals via deferred/boot re-embed.
                         let claimed_space = crate::embeddings::embedding_space_fingerprint(&model);
                         match db::set_embedding(&lock.0, &actual_id, &vector, &claimed_space) {
-                            Ok(()) => hnsw_updates.push((actual_id, vector)),
+                            Ok(()) => hnsw_updates.push((actual_id, vector, claimed_space)),
                             Err(e) => {
                                 tracing::warn!(
                                     "sync_push: storing shipped embedding failed for \
@@ -1625,7 +1629,16 @@ pub async fn sync_push(
         if !hnsw_updates.is_empty() {
             let mut idx_lock = app.vector_index.lock().await;
             if let Some(idx) = idx_lock.as_mut() {
-                for (id, vec) in hnsw_updates {
+                // #2167 §3.3 layer 2 — explicit insert-time space gate (see the
+                // success-path loop below): index only claimed == active.
+                let active_space = crate::embeddings::active_embedding_space();
+                for (id, vec, claimed) in hnsw_updates {
+                    if active_space
+                        .as_deref()
+                        .is_some_and(|a| a != claimed.as_str())
+                    {
+                        continue;
+                    }
                     idx.remove(&id);
                     idx.insert(id, vec);
                 }
@@ -2386,7 +2399,20 @@ pub async fn sync_push(
     if !hnsw_updates.is_empty() {
         let mut idx_lock = app.vector_index.lock().await;
         if let Some(idx) = idx_lock.as_mut() {
-            for (id, vec) in hnsw_updates {
+            // #2167 §3.3 layer 2 — explicit insert-time space gate: index a
+            // federated vector ONLY when its claimed space equals the active
+            // space. Skip only when the active space is KNOWN and differs (a
+            // foreign row stays stored + keyword-recallable, never scored); an
+            // unseeded active space trusts the upstream #2168 receive gate, so
+            // this never regresses indexing.
+            let active_space = crate::embeddings::active_embedding_space();
+            for (id, vec, claimed) in hnsw_updates {
+                if active_space
+                    .as_deref()
+                    .is_some_and(|a| a != claimed.as_str())
+                {
+                    continue;
+                }
                 idx.remove(&id);
                 idx.insert(id, vec);
             }
