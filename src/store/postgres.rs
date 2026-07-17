@@ -14536,14 +14536,20 @@ impl MemoryStore for PostgresStore {
         // pre-empts the post-UPDATE `rows_affected == 0` NotFound below
         // (kept as a safety net for a concurrent delete between this read
         // and the UPDATE inside the same tx).
-        let cur: Option<(String, String, serde_json::Value, String)> = sqlx::query_as(
-            "SELECT title, content, metadata, namespace FROM memories WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("update read current", e))?;
-        let Some((cur_title, cur_content, cur_meta, cur_ns)) = cur else {
+        // #2141 — `tier` + `memory_kind` are additionally fetched so the
+        // governance pre-write gate below can evaluate the POST-MERGE row
+        // (the hook payload is namespace/tier/memory_kind/title, see
+        // `install_governance_pre_write_hook` in src/daemon_runtime.rs).
+        let cur: Option<(String, String, serde_json::Value, String, String, String)> =
+            sqlx::query_as(
+                "SELECT title, content, metadata, namespace, tier, memory_kind \
+                 FROM memories WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("update read current", e))?;
+        let Some((cur_title, cur_content, cur_meta, cur_ns, cur_tier, cur_kind)) = cur else {
             return Err(StoreError::NotFound { id: id.to_string() });
         };
 
@@ -14576,6 +14582,41 @@ impl MemoryStore for PostgresStore {
         // an exact title/content comparison.
         let content_changed = snap_title.as_deref().is_some_and(|t| t != cur_title)
             || snap_content.as_deref().is_some_and(|c| c != cur_content);
+
+        // #2141 (SEC, HIGH — #1451 parity) — substrate governance pre-write
+        // gate on the DEFAULT (non-If-Match) postgres update path. Pre-#2141
+        // this funnel was the LAST un-gated postgres update surface: the
+        // If-Match path (`update_with_expected_version_once`, #1451 block)
+        // and the supersede twin (`update_with_archive_on_supersede`, FX-C5)
+        // both consult GOVERNANCE_PRE_WRITE on the post-merge/candidate row,
+        // and the sqlite twin gates ALL updates via
+        // `storage::update_with_expected_version` (src/storage/mod.rs, #1451)
+        // — so on postgres a refuse rule could be evaded by storing benign
+        // content then PUT-ing it (WITHOUT If-Match) into the refused
+        // namespace / tier / title. Build the post-merge candidate exactly
+        // the way the If-Match path does (patch-or-current fields; the
+        // tier-downgrade protection mirrors the SQL `tier_rank` CASE below
+        // so the gate sees the tier that will actually be written) and
+        // consult BEFORE any SQL mutation — a refusal's early return drops
+        // `tx`, rolling back with no row mutated. Ordering mirrors sqlite +
+        // the If-Match path (#2106 item 3): authorship gate FIRST (above),
+        // then governance.
+        let existing_tier = Tier::from_str(&cur_tier).unwrap_or(Tier::Long);
+        let effective_tier = match (patch.tier.as_ref(), existing_tier) {
+            (Some(_), Tier::Long) => Tier::Long,
+            (Some(Tier::Short), Tier::Mid) => Tier::Mid,
+            (Some(req), _) => req.clone(),
+            (None, existing) => existing,
+        };
+        let governed = Memory {
+            namespace: patch.namespace.clone().unwrap_or(cur_ns),
+            tier: effective_tier,
+            title: patch.title.clone().unwrap_or(cur_title),
+            memory_kind: crate::models::MemoryKind::from_str(&cur_kind).unwrap_or_default(),
+            metadata: patch.metadata.clone().unwrap_or(cur_meta),
+            ..Memory::default()
+        };
+        consult_governance_pre_write_pg(&governed)?;
 
         // #1799 — DELETE+INSERT the prior content into `archived_memories`
         // under archive_reason='in_place_edit', SAME memory_id (no fork),
