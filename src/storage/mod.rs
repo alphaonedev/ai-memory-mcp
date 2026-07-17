@@ -7889,14 +7889,27 @@ pub fn check_duplicate(
     // cosine pass happens in Rust because SQLite has no native vector
     // op. We only pull rows with non-NULL embeddings — anything missing
     // an embedding can't be a near-duplicate by this definition.
+    //
+    // v1.0.0 #2167 §9 — a dup-check must NEVER match across embedding spaces:
+    // comparing the live query vector against a foreign-space (same-dim model
+    // swap) or NULL-provenance stored vector is a meaningless cosine that
+    // could produce a FALSE duplicate verdict (silent merge/skip of a distinct
+    // memory = corruption). Gate the candidate pool on the process-wide active
+    // space (`embeddings::active_embedding_space`, the space of the embedder
+    // that produced `query_embedding`); the nullable `IS NULL OR =` form keeps
+    // legacy dim-only behavior when no active space is seeded. (The content-
+    // hash exact-match short-circuit in `check_duplicate_with_text` stays
+    // space-agnostic — identical content IS a duplicate regardless of space.)
+    let active_space = crate::embeddings::active_embedding_space();
     let rows: Vec<(String, String, String, Vec<u8>)> = if let Some(ns) = namespace {
         let mut stmt = conn.prepare(
             "SELECT id, title, namespace, embedding FROM memories
              WHERE embedding IS NOT NULL
                AND (expires_at IS NULL OR expires_at > ?1)
-               AND namespace = ?2",
+               AND namespace = ?2
+               AND (?3 IS NULL OR embedding_space = ?3)",
         )?;
-        let mapped = stmt.query_map(params![now, ns], |row| {
+        let mapped = stmt.query_map(params![now, ns, active_space], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -7909,9 +7922,10 @@ pub fn check_duplicate(
         let mut stmt = conn.prepare(
             "SELECT id, title, namespace, embedding FROM memories
              WHERE embedding IS NOT NULL
-               AND (expires_at IS NULL OR expires_at > ?1)",
+               AND (expires_at IS NULL OR expires_at > ?1)
+               AND (?2 IS NULL OR embedding_space = ?2)",
         )?;
-        let mapped = stmt.query_map(params![now], |row| {
+        let mapped = stmt.query_map(params![now, active_space], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

@@ -22320,6 +22320,15 @@ impl MemoryStore for PostgresStore {
         // `namespace=None`) with a non-null embedding, ordered by
         // cosine ascending (= most similar first), limit 1.
         let emb_pgvec = pgvector::Vector::from(query_embedding.to_vec());
+        // v1.0.0 #2167 §3.4/§9 — a dup-check must NEVER match across embedding
+        // spaces: comparing the live query vector against a foreign-space
+        // (same-dim model swap) stored vector is a meaningless cosine that
+        // could produce a FALSE duplicate verdict (silent merge/skip of a
+        // distinct memory = corruption). Gate on the process-wide active space
+        // (`embeddings::active_embedding_space`, the space of the embedder that
+        // produced `query_embedding`). The nullable-safe `IS NULL OR =` form
+        // preserves legacy dim-only behavior when no active space is seeded.
+        let active_space = crate::embeddings::active_embedding_space();
         let nearest_row = if let Some(ns) = namespace {
             sqlx::query(
                 "SELECT id, title, namespace,
@@ -22328,12 +22337,14 @@ impl MemoryStore for PostgresStore {
                  WHERE embedding IS NOT NULL
                    AND namespace = $2
                    AND (expires_at IS NULL OR expires_at > $3)
+                   AND ($4::text IS NULL OR embedding_space = $4)
                  ORDER BY embedding <=> $1
                  LIMIT 1",
             )
             .bind(&emb_pgvec)
             .bind(ns)
             .bind(now_dt)
+            .bind(active_space.as_ref())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
@@ -22344,11 +22355,13 @@ impl MemoryStore for PostgresStore {
                  FROM memories
                  WHERE embedding IS NOT NULL
                    AND (expires_at IS NULL OR expires_at > $2)
+                   AND ($3::text IS NULL OR embedding_space = $3)
                  ORDER BY embedding <=> $1
                  LIMIT 1",
             )
             .bind(&emb_pgvec)
             .bind(now_dt)
+            .bind(active_space.as_ref())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| to_store_err("check_duplicate_with_text cosine", e))?
