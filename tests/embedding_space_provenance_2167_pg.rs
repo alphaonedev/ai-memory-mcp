@@ -275,7 +275,10 @@ async fn pg_adoption_stamps_legacy_null_space_2179() {
         .adopt_legacy_embedding_space(&active, dim)
         .await
         .expect("adopt");
-    assert!(stamped >= 1, "adoption must stamp the legacy row; got {stamped}");
+    assert!(
+        stamped >= 1,
+        "adoption must stamp the legacy row; got {stamped}"
+    );
     let got: Option<String> =
         sqlx::query_scalar("SELECT embedding_space FROM memories WHERE id = $1")
             .bind(&id)
@@ -342,7 +345,10 @@ async fn pg_adoption_g2_refuses_multispace_2179() {
         .adopt_legacy_embedding_space(&active, dim)
         .await
         .expect("adopt");
-    assert_eq!(stamped, 0, "[G2] must refuse adoption on a multi-space corpus; got {stamped}");
+    assert_eq!(
+        stamped, 0,
+        "[G2] must refuse adoption on a multi-space corpus; got {stamped}"
+    );
     let null_space: Option<String> =
         sqlx::query_scalar("SELECT embedding_space FROM memories WHERE id = $1")
             .bind(&null_id)
