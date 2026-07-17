@@ -36,10 +36,14 @@
 # suite wedges."
 #
 # WHAT IS GATED. The process-global handle acquisition — `io::stdin()`,
-# `std::io::stdin()`, AND a bare `stdin()` call (e.g. after
+# `std::io::stdin()`, a bare `stdin()` call (e.g. after
 # `use std::io::stdin;`, which evades a pattern anchored on the
-# fully-qualified `io::stdin(` form — issue #2120 finding 1) — appearing
-# in TEST-reachable code:
+# fully-qualified `io::stdin(` form — issue #2120 finding 1), AND an
+# item-renaming `stdin as <alias>` import in EITHER its plain form
+# (`use std::io::stdin as input;`, issue #2145) or a GROUPED use-list
+# form (`use std::io::{stdin as input, Write};`, issue #2151 — the `{`
+# breaks the unbroken `io::stdin` substring #2145's fix anchors on, so
+# the grouped spelling evaded it) — appearing in TEST-reachable code:
 #   - every line in a `tests/**/*.rs` integration-test file (wholly test)
 #   - lines at or below the first `mod tests {` boundary in any
 #     `src/**/*.rs`, `examples/**/*.rs`, or `tools/**/*.rs` file (the
@@ -80,6 +84,29 @@
 # the same comment-line skip, the same here-string loop to avoid the
 # macOS bash 3.2 nested-process-substitution SIGTRAP).
 #
+# KNOWN LIMITATION (issue #2152 — threat-model bound, not silently
+# mis-parsed). `cfg_test_ranges`' brace-balance scan strips string
+# literals PER-LINE (`gsub(/"[^"]*"/, "", counted)`), so it has no
+# state for a string that SPANS multiple lines. A multi-line raw
+# string (`r#"..."#`) whose body carries a line with more `}` than `{`
+# can therefore close an item's range one or more braces early — this
+# repo's own `src/` carries live multi-line `r#"`-fixture strings this
+# can affect. A bash grep-gate is fundamentally not a Rust lexer/parser
+# and a full multi-line-string state machine is deliberately OUT OF
+# SCOPE here (fragile, easy to get subtly wrong, and the failure mode
+# it would replace is already bounded below). What this gate DOES do:
+# whenever the per-line brace count drives `depth` NEGATIVE inside an
+# active `#[cfg(test)]` range — the single-line-evaluable subset of the
+# truncation class (e.g. a line whose stripped content carries two net
+# `}` with no matching `{` on that same line) — it emits a loud WARN to
+# stderr naming the file + line, so a truncation in THAT shape is
+# visible rather than silently mis-scoping the range. A truncation that
+# instead lands EXACTLY at `depth == 0` (the coincidental "looks like a
+# normal close" shape) is NOT distinguishable from a legitimate close by
+# a brace-count alone and is NOT WARNed on — that residual is real and
+# stays open; see self-test probe 10 below for the shape this gate CAN
+# catch loud.
+#
 # Usage:
 #   scripts/check-test-stdin-reads.sh
 #     - exit 0 on clean, exit 1 on any violation
@@ -91,13 +118,16 @@
 #       position (#2143), a `#[cfg(test)] mod` whose unbalanced `"}"`
 #       string literal would otherwise truncate the range early (#2144),
 #       an item-renaming `use std::io::stdin as input;` import (#2145),
-#       and a fn-pointer `let f = std::io::stdin;` binding (#2145)),
-#       verifies the gate catches all of them, verifies the sanctioned
-#       helper line and a `.stdin(` builder call are NOT flagged, then
-#       cleans up. Proves the gate is load-bearing AND that the narrow
-#       carve-out did not over-widen (pm-v3.2 NO FAIL MISSION closure
-#       discipline; issue #2120 + #2143/#2144/#2145 residual-vector
-#       hardening). Exit 0 on PASS.
+#       a fn-pointer `let f = std::io::stdin;` binding (#2145), and a
+#       GROUPED item-renaming `use std::io::{stdin as input, Write};`
+#       import (#2151)), verifies the gate catches all of them, verifies
+#       the sanctioned helper line and a `.stdin(` builder call are NOT
+#       flagged, verifies the #2152 negative-brace-balance WARN fires on
+#       a multi-line raw string whose body drives the count negative,
+#       then cleans up. Proves the gate is load-bearing AND that the
+#       narrow carve-out did not over-widen (pm-v3.2 NO FAIL MISSION
+#       closure discipline; issue #2120 + #2143/#2144/#2145/#2151/#2152
+#       residual-vector hardening). Exit 0 on PASS.
 
 set -euo pipefail
 
@@ -131,6 +161,24 @@ STDIN_PATTERN='(^|[^A-Za-z0-9_.])stdin[[:space:]]*\('
 # `io::stdin()` / `std::io::stdin()` call is never double-matched here —
 # STDIN_PATTERN alone already covers it.
 STDIN_TOKEN_PATTERN='(^|[^A-Za-z0-9_.])io::stdin([^A-Za-z0-9_(]|$)'
+
+# A third signal (issue #2151): STDIN_TOKEN_PATTERN requires the
+# literal qualified substring `io::stdin` to appear UNBROKEN, but a
+# GROUPED item-renaming import spells it `io::{stdin as <alias>, ...}`
+# — the `{` sits between `io::` and `stdin`, so the substring never
+# appears and the grouped form evades STDIN_TOKEN_PATTERN even though
+# it is the exact same `stdin as` evasion shape #2145 closed for the
+# single-import spelling (`use std::io::stdin as input;` IS caught,
+# because `io::stdin` survives unbroken there). `rustfmt` does not
+# split or rejoin a grouped `use` item's contents, so this evasion
+# survives the CI fmt gate exactly like #2145's other forms. Anchoring
+# directly on the `stdin as` token (preceded by start-of-line, `{`,
+# space, or comma — the positions a `use`-item name can occupy) covers
+# BOTH the plain and grouped spellings in one pattern; `stdin as` has
+# no legitimate non-import use in this codebase (verified against the
+# real tree at authorship — a bare `stdin` identifier being `as`-cast
+# is not a shape this codebase exhibits).
+STDIN_ALIAS_PATTERN='(^|[{ ,])stdin[[:space:]]+as[[:space:]]'
 
 # find_test_boundary <file>
 # Echoes the line number of the first `mod tests {` (or `pub mod tests {`,
@@ -234,6 +282,20 @@ cfg_test_ranges () {
                 sub(/\/\/.*$/, "", counted)
                 o = gsub(/\{/, "{", counted); depth += o; if (o > 0) opened = 1
                 c = gsub(/\}/, "}", counted); depth -= c
+                # Issue #2152 fail-LOUD partial coverage: a per-line
+                # brace count that drives depth NEGATIVE (not merely to
+                # zero) is a single-line-evaluable symptom of a
+                # multi-line string this per-line strip cannot see
+                # (e.g. a stripped line carrying two net `}` with no
+                # matching `{` on that line). WARN to stderr naming the
+                # file+line so the truncation is visible rather than
+                # silently mis-scoping the range -- see the "KNOWN
+                # LIMITATION (issue #2152)" header comment for the
+                # depth==0 residual this cannot distinguish from a
+                # legitimate close.
+                if (depth < 0) {
+                    print "WARN: scripts/check-test-stdin-reads.sh: cfg_test_ranges brace-balance went NEGATIVE at " FILENAME ":" NR " -- likely a multi-line string literal (e.g. r#\"...\"#) whose body carries an unbalanced closing brace this single-line strip cannot see; the enclosing #[cfg(test)] range may be truncated early (issue #2152)." > "/dev/stderr"
+                }
                 if (opened == 1) {
                     if (depth <= 0) { print start":"NR; active = 0 }
                 } else if (line ~ /;[[:space:]]*(\/\/.*)?$/) {
@@ -242,7 +304,13 @@ cfg_test_ranges () {
             }
         }
     }
-    ' "$f" 2>/dev/null
+    ' "$f"
+    # NOTE: unlike the sibling helper_ranges/find_test_boundary
+    # functions, this awk invocation's stderr is deliberately NOT
+    # redirected to /dev/null -- the issue #2152 negative-depth WARN
+    # above is written to stderr and must reach the caller (and, in
+    # --self-test mode, the captured `"$0" 2>&1` gate_output) for the
+    # fail-LOUD contract to hold.
 }
 
 # line_in_ranges <lineno> <ranges-payload>
@@ -281,6 +349,7 @@ scan_test_lines () {
         {
             grep -En "$STDIN_PATTERN" "$f" 2>/dev/null || true
             grep -En "$STDIN_TOKEN_PATTERN" "$f" 2>/dev/null || true
+            grep -En "$STDIN_ALIAS_PATTERN" "$f" 2>/dev/null || true
         } | sort -t: -k1,1n -u
     )"
     [[ -z "$matches" ]] && return 0
@@ -361,7 +430,20 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # std::io::stdin;`) — same evasion shape as case 7, a paren-less
     # `io::stdin` token with no adjacent call.
     probe8="${ROOT}/tests/.stdin_gate_fn_pointer_probe.rs"
-    for p in "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8"; do
+    # Case 9 (#2151): a GROUPED item-renaming import
+    # (`use std::io::{stdin as input, Write};`) -- the `{` breaks the
+    # unbroken `io::stdin` substring STDIN_TOKEN_PATTERN anchors on, so
+    # only the new STDIN_ALIAS_PATTERN (anchored on the `stdin as`
+    # token itself) catches the import line.
+    probe9="${ROOT}/tests/.stdin_gate_grouped_alias_import_probe.rs"
+    # Case 10 (#2152): a multi-line raw string whose body drives the
+    # cfg_test_ranges brace-balance NEGATIVE (two net `}` on one
+    # stripped line) -- proves the fail-LOUD WARN path fires. This
+    # probe's own stdin read is NOT asserted caught (the range IS
+    # truncated early, same as the documented #2152 residual) -- only
+    # the WARN text is asserted, which is the honest scope of this fix.
+    probe10="${ROOT}/src/.stdin_gate_multiline_negative_depth_probe.rs"
+    for p in "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10"; do
         if [[ -e "$p" ]]; then
             echo "ERROR: self-test scratch file already exists: $p" >&2
             echo "(cleanup may have failed in a prior run — remove manually)" >&2
@@ -478,15 +560,56 @@ fn contrived_fn_pointer_reads_stdin() {
     let _ = f().read_line(&mut buf);
 }
 EOF
+    cat > "$probe9" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2151: a GROUPED item-renaming import survives
+// `cargo fmt --check` (rustfmt does not split/rejoin a grouped `use`
+// item), so `use std::io::{stdin as input, Write};` then `input()`
+// evades STDIN_TOKEN_PATTERN entirely (the `{` breaks the unbroken
+// `io::stdin` substring it anchors on) even though the single-import
+// sibling form (#2145) is already caught.
+use std::io::{stdin as input, Write};
+#[test]
+fn contrived_grouped_alias_import_reads_stdin() {
+    let mut buf = String::new();
+    let _ = input().read_line(&mut buf);
+    let _ = Write::flush(&mut std::io::stdout());
+}
+EOF
+    cat > "$probe10" <<'EOF'
+// CONTRIVED VIOLATION for scripts/check-test-stdin-reads.sh --self-test.
+// Exercises issue #2152's fail-LOUD path: a multi-line raw string whose
+// body carries a line with two net closing-brace characters drives the
+// cfg_test_ranges brace-balance NEGATIVE (not merely to zero) inside a
+// #[cfg(test)] range -- the single-line-evaluable subset of the
+// per-line-string-strip truncation class this gate can cheaply detect
+// and WARN on (see script header "KNOWN LIMITATION (issue #2152)"). A
+// full multi-line-string parser remains explicitly out of scope for
+// this bash gate; the stdin read below is NOT asserted caught by this
+// probe (the range IS truncated early, same as the documented residual)
+// -- only the loud WARN is asserted.
+#[cfg(test)]
+mod sneaky_ml_negative_probe {
+    const K: &str = r#"
+    }}
+    "#;
+    fn contrived_multiline_negative_depth_reads_stdin() {
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+    }
+}
+EOF
     set +e
     gate_output="$("$0" 2>&1)"
     gate_exit=$?
     set -e
-    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8"
+    rm -f "$probe1" "$probe2" "$probe3" "$probe4" "$probe5" "$probe6" "$probe7" "$probe8" "$probe9" "$probe10"
     printf '%s\n' "$gate_output"
-    # PASS requires: non-zero exit, ALL EIGHT probe violations reported,
-    # and the sanctioned helper line + the benign builder call NOT
-    # reported.
+    # PASS requires: non-zero exit, NINE probe violations reported (the
+    # tenth, #2152's negative-depth probe, is asserted via its loud WARN
+    # instead -- its stdin read is deliberately NOT expected caught, see
+    # the probe10 comment above), and the sanctioned helper line + the
+    # benign builder call NOT reported.
     ok=1
     (( gate_exit != 0 )) || ok=0
     printf '%s' "$gate_output" | grep -q '\.stdin_gate_probe\.rs' || ok=0
@@ -497,6 +620,8 @@ EOF
     printf '%s' "$gate_output" | grep -q 'contrived_string_brace_reads_stdin\|\.stdin_gate_string_brace_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'use std::io::stdin as input\|\.stdin_gate_alias_import_probe\.rs' || ok=0
     printf '%s' "$gate_output" | grep -q 'let f = std::io::stdin\|\.stdin_gate_fn_pointer_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'stdin as input\|\.stdin_gate_grouped_alias_import_probe\.rs' || ok=0
+    printf '%s' "$gate_output" | grep -q 'brace-balance went NEGATIVE.*stdin_gate_multiline_negative_depth_probe' || ok=0
     if printf '%s' "$gate_output" | grep -q '_sanctioned'; then
         echo "" >&2
         echo "Test-stdin gate self-test: FAIL (carve-out over-widened: the sanctioned helper line was flagged)" >&2
@@ -509,11 +634,11 @@ EOF
     fi
     if (( ok == 1 )); then
         echo ""
-        echo "Test-stdin gate self-test: PASS (caught all eight contrived violations, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
+        echo "Test-stdin gate self-test: PASS (caught nine contrived violations + fired the #2152 negative-depth WARN, spared the sanctioned helper + benign builder call; exit=${gate_exit})"
         exit 0
     else
         echo "" >&2
-        echo "Test-stdin gate self-test: FAIL (gate did not catch a contrived violation; exit=${gate_exit})" >&2
+        echo "Test-stdin gate self-test: FAIL (gate did not catch a contrived violation or fire the #2152 WARN; exit=${gate_exit})" >&2
         exit 1
     fi
 fi
