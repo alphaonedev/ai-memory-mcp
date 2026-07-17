@@ -7070,6 +7070,54 @@ impl AppConfig {
         }
     }
 
+    /// Validate-before-swap sibling of [`Self::load`] (#2166).
+    ///
+    /// Unlike [`Self::load`] / [`Self::load_from`], which SWALLOW a parse
+    /// or secret-validation error and fall back to [`Self::default`], this
+    /// PROPAGATES the error so a live-reload caller (`SIGHUP` on the HTTP
+    /// daemon; the between-request config-mtime check on the MCP stdio
+    /// loop) never swaps a typo'd config's compiled-default model in over a
+    /// working client. On error the caller KEEPS the current client and
+    /// logs a loud WARN.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `AI_MEMORY_NO_CONFIG` is set (config loading
+    /// is disabled), the config path cannot be resolved, the file cannot
+    /// be read, the TOML fails to parse, or the secret-handling validation
+    /// (`[llm].api_key` inline-literal rejection, etc.) fails.
+    pub fn try_load() -> anyhow::Result<Self> {
+        if std::env::var("AI_MEMORY_NO_CONFIG").is_ok() {
+            anyhow::bail!("AI_MEMORY_NO_CONFIG is set — config loading disabled");
+        }
+        let path = Self::config_path()
+            .ok_or_else(|| anyhow::anyhow!("could not resolve config path (HOME unset)"))?;
+        Self::try_load_from(&path)
+    }
+
+    /// Path-explicit sibling of [`Self::try_load`] / [`Self::load_from`]
+    /// that PROPAGATES parse/validation errors instead of swallowing them
+    /// (#2166). See [`Self::try_load`] for the rationale.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, the TOML fails to
+    /// parse, or `validate_secret_handling` rejects the resolved config.
+    pub fn try_load_from(path: &Path) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        // Mirror `load_from`'s L1 unknown-top-level-key WARN (best-effort;
+        // does not fail the load).
+        Self::warn_unknown_top_level_keys(path, &contents);
+        let cfg: Self = toml::from_str(&contents)
+            .with_context(|| format!("parsing config {}", path.display()))?;
+        cfg.validate_secret_handling()
+            .map_err(|reason| anyhow::anyhow!("config rejected ({}): {reason}", path.display()))?;
+        cfg.warn_legacy_schema_drift(path);
+        Ok(cfg)
+    }
+
     /// v0.7.x (#1146) — emit a one-shot deprecation WARN to stderr
     /// when the loaded config carries legacy v1 flat fields that have
     /// been superseded by the sectioned v2 schema.

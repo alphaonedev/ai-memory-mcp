@@ -104,7 +104,7 @@ fn setup() -> Fixture {
         store: Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
         ),
-        llm: Arc::new(None),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -117,7 +117,9 @@ fn setup() -> Fixture {
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -375,7 +377,7 @@ async fn sync_since_mtls_bypass_still_requires_signature_under_require_sig_1040(
         store: Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"),
         ),
-        llm: Arc::new(None),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -388,7 +390,9 @@ async fn sync_since_mtls_bypass_still_requires_signature_under_require_sig_1040(
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

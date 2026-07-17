@@ -87,7 +87,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store,
-        llm: std::sync::Arc::new(None),
+        llm: std::sync::Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: std::sync::Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: std::sync::Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -101,7 +101,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         deferred_audit_queue: std::sync::Arc::new(None),
         admin_agent_ids: std::sync::Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

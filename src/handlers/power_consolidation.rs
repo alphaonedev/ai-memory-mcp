@@ -107,7 +107,7 @@ async fn resolve_consolidate_summary(
     // (not full content) so the result stays a "summary" rather than a
     // verbatim concat that S51's `is_verbatim_concat` heuristic would
     // flag.
-    let llm_arc = app.llm.clone();
+    let llm_arc = app.llm.current();
     if llm_arc.is_none() || pairs.is_empty() {
         let titles: Vec<String> = pairs.iter().map(|(t, _)| t.clone()).collect();
         return Ok(format!(
@@ -668,7 +668,7 @@ pub async fn auto_tag_handler(
             }
         };
 
-    let llm_arc = app.llm.clone();
+    let llm_arc = app.llm.current();
     let auto_tag_model = app.auto_tag_model.as_ref().clone();
     let title_owned = title;
     let content_owned = content;
@@ -757,7 +757,7 @@ pub async fn expand_query_handler(
             .into_response();
     }
 
-    let llm_arc = app.llm.clone();
+    let llm_arc = app.llm.current();
     let query_owned = query.clone();
     let llm_timeout = app.llm_call_timeout;
     // H8 (v0.7.0 round-2) — bound the Ollama call by the configured
