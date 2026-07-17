@@ -73,6 +73,118 @@ const NOMIC_DIM: usize = 768;
 const NOMIC_PREFIX_DOCUMENT: &str = "search_document: ";
 const NOMIC_PREFIX_QUERY: &str = "search_query: ";
 
+/// #2168 — embedding-space fingerprint prefix-scheme tokens. The scheme
+/// axis records HOW a model prepends retrieval task instructions, so two
+/// peers on the SAME model id but different prefix behaviour (the #1520
+/// nomic asymmetric `search_document:` / `search_query:` scheme vs a
+/// symmetric model) are distinguished at the federation receive gate
+/// (M-DOCUMENTED-MAGIC).
+const PREFIX_SCHEME_NONE: &str = "none";
+const PREFIX_SCHEME_NOMIC_TASK_V1: &str = "nomic-task-v1";
+
+/// #2168 (SEC, data-integrity) — canonical embedding-space fingerprint
+/// used by the federation receive gate (`sync_push`, both backends) to
+/// reject a same-dimension vector produced by a DIFFERENT embedding model
+/// / prefix scheme. A same-dim vector from model A lives in a different
+/// coordinate space than one from model B: stored verbatim it silently
+/// poisons this node's cosine recall (no error, a numerically-valid but
+/// semantically-meaningless score). This generalises the existing
+/// dim-equality gate into a vector-space IDENTITY check.
+///
+/// The fingerprint is `<canonical_model_id>#<prefix_scheme>`; the vector
+/// DIMENSION is DELIBERATELY excluded — it stays on the separate dim gate
+/// (`receiver_dim == se.dim`) so there is one SSOT per axis
+/// (M-DOCUMENTED-MAGIC).
+///
+/// `model` accepts the display prose carried by
+/// [`crate::federation::ShippedEmbedding::model`] /
+/// [`Embedder::model_description`] (`"<id> (<dim>-dim, <origin>)"`) OR a
+/// bare model id: the id is the token before the ` (` suffix, lowercased.
+/// The prefix scheme is derived from that id EXACTLY as the local embed
+/// path derives it ([`Embedder::model_requires_nomic_prefix`], the #1520
+/// predicate), so a receiver and a well-behaved peer on the same model
+/// mint the SAME fingerprint WITHOUT any wire change. Distinct model ids
+/// NEVER collide, so the gate can produce a false MISMATCH (→ a safe
+/// local re-embed) but NEVER a false MATCH (→ corruption): degrade, never
+/// corrupt (#2168 CORE INVARIANT). M-STRONG-TYPES-GUARD.
+#[must_use]
+pub fn embedding_space_fingerprint(model: &str) -> String {
+    let id = model
+        .split_once(" (")
+        .map_or(model, |(head, _)| head)
+        .trim()
+        .to_ascii_lowercase();
+    let scheme = if Embedder::model_requires_nomic_prefix(&id) {
+        PREFIX_SCHEME_NOMIC_TASK_V1
+    } else {
+        PREFIX_SCHEME_NONE
+    };
+    format!("{id}#{scheme}")
+}
+
+#[cfg(test)]
+mod space_fingerprint_2168_tests {
+    use super::embedding_space_fingerprint;
+
+    /// The display prose carried on the wire and a bare model id parse to
+    /// the SAME fingerprint — the receiver derives the shipped fingerprint
+    /// from `se.model` (prose) and its own from `model_description()`
+    /// (prose) with byte-identical logic, and a future bare-id sender
+    /// still matches.
+    #[test]
+    fn prose_and_bare_id_agree() {
+        let prose = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
+        let bare = embedding_space_fingerprint("nomic-embed-text");
+        assert_eq!(prose, bare, "prose suffix must not change the fingerprint");
+        assert_eq!(prose, "nomic-embed-text#nomic-task-v1");
+    }
+
+    /// Two DIFFERENT 768-dim models (the exact #2168 attack: a
+    /// heterogeneous fleet where peer A runs nomic-768 and peer B runs
+    /// granite-768) mint DIFFERENT fingerprints, so the gate refuses the
+    /// foreign vector even though the dim gate would pass.
+    #[test]
+    fn same_dim_foreign_model_differs() {
+        let nomic = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
+        let granite = embedding_space_fingerprint("granite-embedding (768-dim, remote)");
+        assert_ne!(
+            nomic, granite,
+            "same-dim foreign-model fingerprints must differ (#2168)"
+        );
+        assert_eq!(granite, "granite-embedding#none");
+    }
+
+    /// The local MiniLM embedder and a remote nomic embedder mint
+    /// different fingerprints (different id AND different prefix scheme).
+    #[test]
+    fn local_minilm_differs_from_nomic() {
+        let minilm = embedding_space_fingerprint("all-MiniLM-L6-v2 (384-dim, local)");
+        let nomic = embedding_space_fingerprint("nomic-embed-text (768-dim, remote)");
+        assert_eq!(minilm, "all-minilm-l6-v2#none");
+        assert_ne!(minilm, nomic);
+    }
+
+    /// The prefix-scheme axis (#1520): the nomic family carries the
+    /// asymmetric task-prefix scheme; a non-nomic model carries `none`.
+    /// Recording the scheme explicitly guards cross-version drift of the
+    /// prefix logic even when the model id is identical.
+    #[test]
+    fn prefix_scheme_axis_is_recorded() {
+        assert!(embedding_space_fingerprint("nomic-embed-text").ends_with("#nomic-task-v1"));
+        assert!(embedding_space_fingerprint("bge-base-en-v1.5").ends_with("#none"));
+    }
+
+    /// Case / whitespace normalisation so two spellings of the same model
+    /// id do not produce a spurious MISMATCH.
+    #[test]
+    fn id_is_case_and_whitespace_normalised() {
+        assert_eq!(
+            embedding_space_fingerprint("  Nomic-Embed-Text (768-dim, remote)  "),
+            embedding_space_fingerprint("nomic-embed-text"),
+        );
+    }
+}
+
 /// Retrieval role of a text handed to the embedder. Drives the
 /// asymmetric task-instruction prefix for backends that require one
 /// (Ollama nomic-embed-text-v1.5); symmetric backends (the in-process
@@ -529,6 +641,19 @@ impl Embedder {
                 model_name, dim, ..
             } => format!("{model_name} ({dim}-dim, remote)"),
         }
+    }
+
+    /// #2168 (SEC, data-integrity) — this embedder's canonical
+    /// vector-space fingerprint. Thin wrapper over
+    /// [`embedding_space_fingerprint`] applied to
+    /// [`Embedder::model_description`], so the receiver and a well-behaved
+    /// peer on the SAME model mint the SAME fingerprint. Consumed by the
+    /// federation receive gate (`sync_push` on both backends) to reject a
+    /// same-dimension vector produced by a DIFFERENT embedding model /
+    /// prefix scheme before it is stored verbatim into the local space.
+    #[must_use]
+    pub fn space_fingerprint(&self) -> String {
+        embedding_space_fingerprint(&self.model_description())
     }
 
     /// #1598 / #1594 — true when the most recent remote embed call
