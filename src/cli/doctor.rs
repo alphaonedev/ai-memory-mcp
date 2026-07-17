@@ -575,6 +575,7 @@ fn run_local(db_path: &Path) -> Report {
 
     sections.push(section_storage(&conn, db_path));
     sections.push(section_index(&conn));
+    sections.push(section_embedding_space_census_2167(&conn));
     sections.push(section_recall_index_coverage_1964(&conn));
     sections.push(section_corpus_lifecycle_1965(&conn));
     sections.push(section_recall_local());
@@ -691,6 +692,89 @@ fn section_index(conn: &rusqlite::Connection) -> ReportSection {
 
     ReportSection {
         name: "Index".into(),
+        severity,
+        facts,
+        note,
+    }
+}
+
+/// v1.0.0 #2167 §6 — embedding-space census (#2169 fleet-manageability
+/// primitive). Renders the per-space `GROUP BY embedding_space` breakdown of
+/// the embedded corpus so an operator sees whether recall is scoring a single
+/// homogeneous space (healthy) or a heterogeneous mix (a same-dim model swap /
+/// partial reembed / federation import), which recall gates out until
+/// `ai-memory reembed` regenerates the vectors from the durable text.
+///
+/// `reembed_pending` = embedded rows whose space is NULL (unverified) or does
+/// NOT equal the process-wide active space; a non-zero value under >1 distinct
+/// space is a loud WARN naming the heal commands. When no active space is
+/// resolved in the `doctor` process (it builds no embedder), the pending count
+/// falls back to "distinct spaces > 1 OR any NULL" and the active space renders
+/// as "not resolved (run under serve/mcp for the live gate)".
+fn section_embedding_space_census_2167(conn: &rusqlite::Connection) -> ReportSection {
+    let mut facts = Vec::new();
+    let mut severity = Severity::Info;
+    let mut note: Option<String> = None;
+
+    let active = crate::embeddings::active_embedding_space();
+    facts.push((
+        "active_space".into(),
+        active
+            .clone()
+            .unwrap_or_else(|| "not resolved (run under serve/mcp for the live gate)".into()),
+    ));
+    facts.push((
+        "strict_model_match".into(),
+        crate::hnsw::strict_embed_model_match_enabled().to_string(),
+    ));
+
+    match db::distinct_embedding_spaces(conn, None) {
+        Ok(census) => {
+            let mut distinct_non_null = 0u64;
+            let mut unverified = 0u64;
+            let mut reembed_pending = 0u64;
+            for (space, count) in &census {
+                let label = space.clone().unwrap_or_else(|| "NULL (unverified)".into());
+                facts.push((format!("space[{label}]"), count.to_string()));
+                match space {
+                    None => {
+                        unverified = unverified.saturating_add(*count);
+                        reembed_pending = reembed_pending.saturating_add(*count);
+                    }
+                    Some(s) => {
+                        distinct_non_null += 1;
+                        if active.as_deref().is_some_and(|a| a != s.as_str()) {
+                            reembed_pending = reembed_pending.saturating_add(*count);
+                        }
+                    }
+                }
+            }
+            facts.push((
+                "distinct_non_null_spaces".into(),
+                distinct_non_null.to_string(),
+            ));
+            facts.push(("unverified_rows".into(), unverified.to_string()));
+            facts.push(("reembed_pending".into(), reembed_pending.to_string()));
+
+            let heterogeneous = distinct_non_null > 1 || unverified > 0;
+            if heterogeneous {
+                severity = Severity::Warning;
+                note = Some(format!(
+                    "embedding-space census is HETEROGENEOUS ({distinct_non_null} distinct \
+                     space(s) + {unverified} unverified row(s)); recall scores ONLY the active \
+                     space and excludes the rest (degraded-not-wrong). Heal with \
+                     `ai-memory reembed` (re-derive from text) or `ai-memory reembed \
+                     --stamp-only` (attest already-active vectors)."
+                ));
+            }
+        }
+        Err(e) => {
+            facts.push(("census_error".into(), e.to_string()));
+        }
+    }
+
+    ReportSection {
+        name: "Embedding Space Census (#2167)".into(),
         severity,
         facts,
         note,
@@ -3494,6 +3578,71 @@ enabled = true
     /// with the MAX_ENTRIES note. The section only counts
     /// `embedding IS NOT NULL`, so a minimal single-column table keeps
     /// the fixture cheap (one recursive-CTE insert, no full schema).
+    /// #2167 §6 — the census section WARNs on a heterogeneous corpus and
+    /// reports the reembed-pending / unverified counts.
+    #[test]
+    fn embedding_space_census_warns_on_heterogeneous_corpus_2167() {
+        let dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(".local-runs")
+            .join("doctor-census-2167");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join(format!("{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&path).expect("open db");
+
+        // NOTE: deliberately does NOT touch the process-wide active-space
+        // global (parallel lib tests share it) — the heterogeneity WARN fires
+        // on `distinct_non_null > 1 OR any NULL` independent of the active fp,
+        // and unverified NULL rows are always reembed-pending.
+        let active = crate::embeddings::embedding_space_fingerprint("nomic-embed-text");
+        let foreign = crate::embeddings::embedding_space_fingerprint("granite-embedding");
+
+        let mk = |title: &str| crate::models::Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            namespace: "test".into(),
+            title: title.into(),
+            content: "body".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            version: 1,
+            ..crate::models::Memory::default()
+        };
+        let a = db::insert(&conn, &mk("a")).unwrap();
+        let f = db::insert(&conn, &mk("f")).unwrap();
+        let n = db::insert(&conn, &mk("n")).unwrap();
+        db::set_embedding(&conn, &a, &[1.0, 0.0, 0.0, 0.0], &active).unwrap();
+        db::set_embedding(&conn, &f, &[0.0, 1.0, 0.0, 0.0], &foreign).unwrap();
+        db::set_embedding(&conn, &n, &[0.0, 0.0, 1.0, 0.0], &active).unwrap();
+        conn.execute(
+            "UPDATE memories SET embedding_space = NULL WHERE id = ?1",
+            rusqlite::params![n],
+        )
+        .unwrap();
+
+        let section = section_embedding_space_census_2167(&conn);
+        assert_eq!(
+            section.severity,
+            Severity::Warning,
+            "2 distinct non-null spaces + 1 unverified row = heterogeneous"
+        );
+        let facts: std::collections::HashMap<_, _> = section.facts.iter().cloned().collect();
+        assert_eq!(
+            facts.get("distinct_non_null_spaces").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(facts.get("unverified_rows").map(String::as_str), Some("1"));
+        // The NULL (unverified) row is always reembed-pending regardless of the
+        // active space; the note names the heal commands.
+        assert_eq!(facts.get("reembed_pending").map(String::as_str), Some("1"));
+        assert!(
+            section
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reembed")
+        );
+    }
+
     #[test]
     fn index_section_warns_when_hnsw_within_5pct_of_cap() {
         let conn = rusqlite::Connection::open_in_memory().expect("open_in_memory");
