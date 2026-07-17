@@ -52,7 +52,9 @@ use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
+use ai_memory::embeddings::Embedder;
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
+use ai_memory::llm::OllamaClient;
 use ai_memory::store::MemoryStore;
 use ai_memory::store::postgres::PostgresStore;
 
@@ -138,6 +140,86 @@ async fn pg_router(url: &str) -> axum::Router {
         identity_mode: ai_memory::config::HttpIdentityMode::default(),
     };
     ai_memory::build_router(api_key_state, app_state)
+}
+
+/// v1.0.0 #2167/#2168 — a production router backed by a live `PostgresStore`
+/// WITH a configured (remote) embedder whose `space_fingerprint()` we control.
+/// This is the load-bearing condition for the SHIPPED-vector accept arm of
+/// `sync_push_via_store`: `receiver_dim`/`receiver_fp` resolve from THIS
+/// embedder, so a shipped vector whose dim AND model-fingerprint match is
+/// stored directly and STAMPED with the sender's claimed space (#2167 §2-EXC,
+/// federation_signing_check.rs). The `OllamaClient` is built no-health-check so
+/// construction never touches the network; `space_fingerprint()` /`dim()` are
+/// pure. Returns `(router, active_fingerprint, dim)`.
+async fn pg_router_with_embedder(url: &str, model: &str) -> (axum::Router, String, usize) {
+    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("scratch sqlite");
+    let db: Db = Arc::new(Mutex::new((
+        conn,
+        std::path::PathBuf::from(":memory:"),
+        ResolvedTtl::default(),
+        true,
+    )));
+    let pg = PostgresStore::connect(url).await.expect("connect postgres");
+    // Match the embedder dim to the live pgvector column dim so the stamped
+    // `update_embedding` bind succeeds (the shared scratch DB's column dim is
+    // whatever a prior test left it at; read it live rather than assume).
+    let dim = pg
+        .current_embedding_dim()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|d| usize::try_from(d).ok())
+        .unwrap_or(768);
+    let store: Arc<dyn MemoryStore> = Arc::new(pg);
+    let client = OllamaClient::new_with_url_no_health_check("http://127.0.0.1:1", model)
+        .expect("build no-health-check embed client");
+    let embedder = Embedder::new_remote(Arc::new(client), model.to_string(), dim);
+    let active_fp = embedder.space_fingerprint();
+    let app_state = AppState {
+        db,
+        embedder: Arc::new(Some(embedder)),
+        vector_index: Arc::new(Mutex::new(None)),
+        federation: Arc::new(None),
+        tier_config: Arc::new(FeatureTier::Keyword.config()),
+        scoring: Arc::new(ResolvedScoring::default()),
+        profile: Arc::new(ai_memory::profile::Profile::core()),
+        mcp_config: Arc::new(None),
+        active_keypair: Arc::new(None),
+        family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
+        storage_backend: StorageBackend::Postgres,
+        store,
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
+        auto_tag_model: Arc::new(None),
+        llm_call_timeout: Duration::from_secs(30),
+        replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
+        verify_require_nonce: false,
+        federation_nonce_cache: Arc::new(
+            ai_memory::identity::replay::FederationNonceCache::default(),
+        ),
+        autonomous_hooks: false,
+        recall_scope: Arc::new(None),
+        deferred_audit_queue: Arc::new(None),
+        admin_agent_ids: Arc::new(vec!["ai:cov-ga2-pg".to_string()]),
+        rule_cache: Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
+        resolved_models: Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
+        runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
+        max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        http_identity_mode: ai_memory::config::HttpIdentityMode::default(),
+    };
+    let api_key_state = ApiKeyState {
+        key: None,
+        mtls_enforced: false,
+        enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
+        identity_mode: ai_memory::config::HttpIdentityMode::default(),
+    };
+    (
+        ai_memory::build_router(api_key_state, app_state),
+        active_fp,
+        dim,
+    )
 }
 
 async fn decode(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -542,6 +624,91 @@ async fn pg_sync_push_via_store_shipped_embedding_defers_no_embedder() {
         1,
         "row applied; body={b}"
     );
+}
+
+/// v1.0.0 #2167 §2-EXC / #2168 — the SHIPPED-vector ACCEPT-AND-STAMP arm of
+/// `sync_push_via_store` (`clean_shipped = Some((vector, model))`,
+/// federation_signing_check.rs:413-421). With a receiver embedder configured,
+/// a shipped vector whose dim AND model-fingerprint match the receiver's active
+/// space is stored DIRECTLY (one `update_embedding`) and STAMPED with the
+/// sender's CLAIMED space fingerprint (`embedding_space_fingerprint(model)`), so
+/// the S4 recall predicate `AND embedding_space = $fp` can gate it. The
+/// no-embedder companion (`..._defers_no_embedder`) exercises the OPPOSITE
+/// (deferred) arm; this test drives the accept-and-stamp line the coverage job
+/// otherwise never reaches (its receiver had no embedder).
+#[tokio::test]
+async fn pg_sync_push_via_store_shipped_embedding_stamps_space_2167() {
+    let _g = FED_ENV_LOCK.lock().await;
+    let Some(url) = pg_url() else {
+        eprintln!("SKIP pg_sync_push_via_store_shipped_embedding_stamps_space_2167: env unset");
+        return;
+    };
+    clear_fed_env();
+    // SAFETY: this test holds FED_ENV_LOCK for the duration.
+    unsafe {
+        std::env::set_var(ai_memory::federation::signing::REQUIRE_SIG_ENV, "0");
+        std::env::set_var(
+            ai_memory::federation::peer_attestation::TRUST_BODY_AGENT_ID_ENV,
+            "1",
+        );
+    }
+    // An unknown model id → fingerprint `"<lowercased>#none"`, and the receiver
+    // embedder mints the SAME fingerprint from its `model_description()` (the
+    // ` (…dim, remote)` prose suffix is stripped by `embedding_space_fingerprint`),
+    // so the #2168 space gate passes and the vector is accepted+stamped.
+    let model = "test-embed-space-2167";
+    let (r, active_fp, dim) = pg_router_with_embedder(&url, model).await;
+    let peer = uniq("ai:cov-ga2-pg-stamp");
+    let ns = uniq("cov-ga2-pg-stamp");
+    let mid = uniq("ga2pg-stamp-m");
+    // Unit vector (L2-norm 1) so `sanitize_shipped_vector` accepts it.
+    let mut vector = vec![0.0_f32; dim];
+    vector[0] = 1.0;
+    let body = serde_json::to_vec(&json!({
+        "sender_agent_id": peer,
+        "sender_clock": {"entries": {}},
+        "memories": [memory_json(&mid, &ns, &peer)],
+        "embeddings": [{
+            "memory_id": mid,
+            "model": model,
+            "dim": dim,
+            "vector": vector
+        }]
+    }))
+    .unwrap();
+    let (status, b) = decode(&r, push_req(&body, &[])).await;
+    clear_fed_env();
+    assert!(
+        status.is_success(),
+        "shipped-embedding stamp pg push acks; status={status} body={b}"
+    );
+    assert_eq!(
+        b["applied"].as_i64().unwrap_or(0),
+        1,
+        "row applied; body={b}"
+    );
+
+    // Verify the pgvector row was stamped with the sender's claimed space
+    // (proves the accept-and-stamp arm ran, not the deferred fallback).
+    let inspect = PostgresStore::connect(&url)
+        .await
+        .expect("connect inspect store");
+    let got: Option<String> =
+        sqlx::query_scalar("SELECT embedding_space FROM memories WHERE id = $1")
+            .bind(&mid)
+            .fetch_one(inspect.pool())
+            .await
+            .expect("read stamped embedding_space");
+    assert_eq!(
+        got.as_deref(),
+        Some(active_fp.as_str()),
+        "shipped matching-space vector must be stamped with the claimed space \
+         (#2167 §2-EXC); got {got:?}"
+    );
+
+    // Cleanup.
+    let ctx = ai_memory::store::CallerContext::for_agent(&peer);
+    let _ = inspect.forget(&ctx, Some(&ns), None, None, true).await;
 }
 
 #[tokio::test]
