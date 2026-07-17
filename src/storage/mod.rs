@@ -17,6 +17,9 @@ use std::path::Path;
 
 // ── #1558 batch 6 — file-local SQL SSOT (pm-v3.1 hardcoded-literal gate) ──
 const SQL_DELETE_MEMORY_BY_ID: &str = "DELETE FROM memories WHERE id = ?1";
+/// Reused dynamic-query namespace-filter fragment (pm-v3.1 no-scattered-literals
+/// gate — one named const referenced by the `list` + `reembed` keyset builders).
+const SQL_FRAGMENT_AND_NAMESPACE_EQ: &str = " AND namespace = ?";
 const SQL_DELETE_NAMESPACE_META_BY_STANDARD_ID: &str =
     "DELETE FROM namespace_meta WHERE standard_id = ?1";
 const SQL_MEMORY_EXISTS_COUNT: &str = "SELECT COUNT(*) > 0 FROM memories WHERE id = ?1";
@@ -5001,7 +5004,7 @@ pub fn build_list_query(
     let mut sql = String::from(SQL_LIST_BASE);
     let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now.to_string())];
     if let Some(ns) = namespace {
-        sql.push_str(" AND namespace = ?");
+        sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
         params_vec.push(Box::new(ns.to_string()));
     }
     if let Some(t) = tier {
@@ -13129,7 +13132,7 @@ pub fn get_memory_texts_batch(
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     if let Some(ns) = namespace {
-        sql.push_str(" AND namespace = ?");
+        sql.push_str(SQL_FRAGMENT_AND_NAMESPACE_EQ);
         binds.push(Box::new(ns.to_string()));
     }
     if let Some(after) = after_id {
