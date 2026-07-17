@@ -187,9 +187,16 @@ pub struct PeerEndpoint {
 pub struct ShippedEmbedding {
     /// Id of the memory row (in the same push) this vector belongs to.
     pub memory_id: String,
-    /// Human-readable id of the model that produced the vector
-    /// (sender's `Embedder::model_description()`). Observability only —
-    /// the dim gate is the load-bearing safety check.
+    /// Id of the model that produced the vector (sender's
+    /// [`crate::embeddings::Embedder::model_description`]). #2168 — this is
+    /// LOAD-BEARING at the receive gate, not observability: the receiver
+    /// canonicalises it via
+    /// [`crate::embeddings::embedding_space_fingerprint`] and compares it
+    /// against its OWN configured embedder fingerprint before storing the
+    /// vector verbatim. A same-dimension vector from a DIFFERENT model
+    /// lives in a different coordinate space, so the dim gate alone is
+    /// insufficient — a fingerprint mismatch routes the row to the
+    /// deferred local re-embed instead of poisoning the local space.
     pub model: String,
     /// Dimensionality the sender claims for `vector`. Receivers verify
     /// `dim == vector.len()` AND `dim == local embedder dim` before
