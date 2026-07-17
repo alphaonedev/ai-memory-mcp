@@ -12950,11 +12950,30 @@ impl MemoryStore for PostgresStore {
         // the write's AUTHENTICATED ORIGIN, never the caller-controlled
         // `memory_kind`: an authenticated SYSTEM principal
         // (`CallerContext::bypass_visibility` — curator/autonomy self-writes,
-        // per env #48; external HTTP/MCP tenant callers can NEVER set it) is
-        // exempt; every tenant write is gated.
-        if !ctx.bypass_visibility {
-            consult_why_trace_gate_pg(memory)?;
-        }
+        // per env #48; external HTTP/MCP tenant callers can NEVER set it)
+        // records the substrate rationale so its write satisfies
+        // `AI_MEMORY_REQUIRE_WHY_TRACE` without a bypass; every tenant write is
+        // gated on PRESENCE.
+        //
+        // #2124 — stamp the SAME substrate why_trace the sqlite
+        // `SqliteStore::store` funnel stamps (src/store/sqlite.rs) BEFORE the
+        // gate, then consult the gate UNCONDITIONALLY as defense-in-depth (the
+        // substrate-origin row was stamped above so it passes trivially). Pre
+        // #2124 the pg store-family SKIPPED the gate under `bypass_visibility`
+        // WITHOUT stamping, so an internally-authored row landed with NO
+        // clause-1 rationale on postgres while sqlite recorded the substrate
+        // marker — cross-backend provenance drift. Mirrors the pg
+        // reflect/capture_turn/consolidate funnels exactly.
+        let stamped_holder;
+        let memory = if ctx.bypass_visibility {
+            let mut m = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            stamped_holder = m;
+            &stamped_holder
+        } else {
+            memory
+        };
+        consult_why_trace_gate_pg(memory)?;
 
         let created_at = parse_rfc3339_required(&memory.created_at)?;
         let updated_at = parse_rfc3339_required(&memory.updated_at)?;
@@ -13285,17 +13304,41 @@ impl MemoryStore for PostgresStore {
             memories
         };
 
+        // #2124 — stamp the SAME substrate why_trace the sqlite store funnel
+        // stamps (src/store/sqlite.rs `SqliteStore::store`, inherited by the
+        // sqlite `store_batch` trait default that loops `self.store`) onto
+        // EVERY element authored by the authenticated SYSTEM principal
+        // (`bypass_visibility`) BEFORE the gate. Pre #2124 the pg bulk funnel
+        // SKIPPED the gate under `bypass_visibility` WITHOUT stamping, so
+        // internally-authored rows landed with NO clause-1 rationale on
+        // postgres while sqlite recorded the substrate marker — cross-backend
+        // provenance drift. Mirrors the pg reflect/capture_turn/consolidate
+        // funnels. Stays zero-copy (keeps the borrow) for tenant writes.
+        let stamped_holder;
+        let memories: &[Memory] = if ctx.bypass_visibility {
+            stamped_holder = memories
+                .iter()
+                .map(|m| {
+                    let mut m = m.clone();
+                    crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+                    m
+                })
+                .collect::<Vec<_>>();
+            &stamped_holder
+        } else {
+            memories
+        };
+
         // Substrate governance parity: each row still passes the
         // pre-write hook (the caller's HTTP governance gate is the
         // namespace `write=` rule; this is the operator-signed substrate
         // refuse hook that every backend write path consults).
         for memory in memories {
             consult_governance_pre_write_pg(memory)?;
-            // #2059/#2102/#2110 — clause 1 on the bulk-create funnel, exempting
-            // the authenticated SYSTEM principal (bypass_visibility).
-            if !ctx.bypass_visibility {
-                consult_why_trace_gate_pg(memory)?;
-            }
+            // #2059/#2102/#2110/#2124 — clause 1 on the bulk-create funnel,
+            // consulted UNCONDITIONALLY as defense-in-depth (substrate-origin
+            // rows were stamped above so they pass trivially).
+            consult_why_trace_gate_pg(memory)?;
         }
 
         // Keep the LAST occurrence of each (title, namespace) so the
@@ -14101,11 +14144,25 @@ impl MemoryStore for PostgresStore {
         // embedded-vector path. See `src/storage/mod.rs` for context.
         consult_governance_pre_write_pg(memory)?;
         // #2059/#2102/#2110 — clause 1 on the embed-before-store hot path (the
-        // PRIMARY create anchor on postgres daemons), exempting the
-        // authenticated SYSTEM principal (bypass_visibility).
-        if !ctx.bypass_visibility {
-            consult_why_trace_gate_pg(memory)?;
-        }
+        // PRIMARY create anchor on postgres daemons).
+        // #2124 — stamp the SAME substrate why_trace the sqlite
+        // `SqliteStore::store` funnel stamps (src/store/sqlite.rs) BEFORE the
+        // gate, then consult the gate UNCONDITIONALLY as defense-in-depth. Pre
+        // #2124 this funnel SKIPPED the gate under `bypass_visibility` WITHOUT
+        // stamping, so an internally-authored row landed with NO clause-1
+        // rationale on postgres while sqlite recorded the substrate marker —
+        // cross-backend provenance drift. Mirrors the pg
+        // reflect/capture_turn/consolidate funnels.
+        let stamped_holder;
+        let memory = if ctx.bypass_visibility {
+            let mut m = memory.clone();
+            crate::storage::stamp_substrate_why_trace(&mut m.metadata);
+            stamped_holder = m;
+            &stamped_holder
+        } else {
+            memory
+        };
+        consult_why_trace_gate_pg(memory)?;
 
         // Same upsert contract as `store` but additionally writes the
         // pgvector `embedding` column when a vector is supplied. This
