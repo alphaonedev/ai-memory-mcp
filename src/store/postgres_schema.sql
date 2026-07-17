@@ -223,6 +223,12 @@ CREATE TABLE IF NOT EXISTS memories (
     -- migrate_v79().
     valid_from            TEXT,
     valid_until           TEXT,
+    -- v1.0.0 (#2167, schema v84) — embedding vector-space provenance token
+    -- (`<canonical_model_id>#<prefix_scheme>`; NULL = legacy/unverified). The
+    -- recall SQL predicate `AND embedding_space = $fp` on every `<=>` site
+    -- excludes a vector from a different embedding space. Existing schemas
+    -- pick it up via migrate_v84(). Mirrors `models::Memory` provenance.
+    embedding_space       TEXT,
     -- v0.7.0 perf #1579 B2 (schema v57) — stored generated tsvector.
     -- Computed once per WRITE so the search/recall shapes can both
     -- match (`tsv @@ tsquery`) and rank (`ts_rank(tsv, …)`) without
@@ -271,6 +277,12 @@ CREATE INDEX IF NOT EXISTS idx_memories_ns_dim
 -- v0.9.0 G8 (schema v74, #1825) — content-address lookup on the additive
 -- `cid` column (postgres mirror of the sqlite idx_memories_cid arm).
 CREATE INDEX IF NOT EXISTS idx_memories_cid ON memories (cid);
+-- v1.0.0 (#2167, schema v84) — partial index on the embedding-space provenance
+-- token (postgres mirror of the sqlite idx_memories_embedding_space arm) so the
+-- recall `AND embedding_space = $fp` predicate stays cheap in the homogeneous
+-- steady state (empty non-active range).
+CREATE INDEX IF NOT EXISTS idx_memories_embedding_space
+    ON memories (embedding_space) WHERE embedding_space IS NOT NULL;
 -- Partial indexes that reference columns ALTER-added by the migrate
 -- ladder (`atom_of` / `atomised_into` v35 postgres ↔ v36 sqlite;
 -- `entity_id` v36 ↔ v37; `source_uri` v37 ↔ v38; `confidence_source`
@@ -490,7 +502,11 @@ CREATE TABLE IF NOT EXISTS archived_memories (
     -- archiving an encrypted memory carries the ciphertext into the
     -- archive and archive → restore round-trips it losslessly. Nullable;
     -- NULL until at-rest encryption is wired into the write paths.
-    encrypted_envelope    BYTEA
+    encrypted_envelope    BYTEA,
+    -- v1.0.0 (#2167, schema v84) — embedding-space provenance mirror so
+    -- archive → restore preserves the stamp within one space and NULLs a
+    -- foreign-space vector on cross-space restore (§8). Nullable.
+    embedding_space       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS archived_memories_namespace_idx  ON archived_memories (namespace);

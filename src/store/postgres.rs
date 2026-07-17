@@ -309,6 +309,13 @@ const MIGRATION_V80_LINEAGE_CUSTODY_REVOCATION: &str =
 const MIGRATION_V81_LINEAGE_RECOVERY_QUORUM: &str =
     include_str!("../../migrations/postgres/0040_v81_lineage_recovery_quorum.sql");
 
+/// v84 (#2167, v1.0.0) — embedding vector-space provenance (postgres twin of
+/// the sqlite v84 arm). Purely additive: ADD COLUMN IF NOT EXISTS for
+/// `embedding_space` on `memories` + `archived_memories` (NULL =
+/// legacy/unverified) + the ladder-owned partial index. No rewrite.
+const MIGRATION_V84_EMBEDDING_SPACE: &str =
+    include_str!("../../migrations/postgres/0041_v84_embedding_space.sql");
+
 /// v0.7.0 Cluster G — shadow-mode retention + denormalised `source`
 /// column + compound `(namespace, source, observed_at)` index
 /// supporting the calibration scan (issue #767, PERF-4 + PERF-12).
@@ -667,7 +674,7 @@ const MIGRATION_V48_FEDERATION_PUSH_DLQ: &str =
 //       idempotent, replay-safe DDL batch (the v74 precedent). Purely
 //       additive, no full-table rebuild → no trigger recreation.
 //       CURRENT_SCHEMA_VERSION stays pinned in lockstep with sqlite.
-const CURRENT_SCHEMA_VERSION: i32 = 83;
+const CURRENT_SCHEMA_VERSION: i32 = 84;
 
 /// PostgreSQL session-scoped advisory lock key used to serialize
 /// concurrent `migrate()` invocations across processes and across
@@ -1570,8 +1577,11 @@ impl PostgresStore {
         if current_version < 82 {
             self.migrate_v82().await?;
         }
-        if current_version < CURRENT_SCHEMA_VERSION {
+        if current_version < 83 {
             self.migrate_v83().await?;
+        }
+        if current_version < CURRENT_SCHEMA_VERSION {
+            self.migrate_v84().await?;
         }
 
         Ok(())
@@ -4040,7 +4050,9 @@ impl PostgresStore {
         .await
         .map_err(|e| to_store_err("v83 index agent_api_keys", e))?;
 
-        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        // Stamp the LITERAL arm version, not CURRENT_SCHEMA_VERSION — v84
+        // now sits at the ladder head, so v83 must record exactly 83.
+        record_schema_version(&mut tx, 83).await?;
 
         tx.commit()
             .await
@@ -4050,6 +4062,34 @@ impl PostgresStore {
             target: TRACE_TARGET,
             "schema migration v83 applied (#2044: agent_api_keys per-agent \
              principal-binding table)"
+        );
+        Ok(())
+    }
+
+    /// v84 (#2167, v1.0.0) — embedding vector-space provenance. Adds the
+    /// per-row `embedding_space TEXT` column (NULL = legacy/unverified) to
+    /// `memories` + `archived_memories` + the ladder-owned partial index, so
+    /// the recall SQL predicate `AND embedding_space = $fp` can never score a
+    /// vector from a different embedding space. Purely additive
+    /// (`ADD COLUMN IF NOT EXISTS`), no rewrite.
+    async fn migrate_v84(&self) -> StoreResult<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin v84 ddl tx", e))?;
+        sqlx::raw_sql(MIGRATION_V84_EMBEDDING_SPACE)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| to_store_err("apply v84 embedding-space", e))?;
+        record_schema_version(&mut tx, CURRENT_SCHEMA_VERSION).await?;
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("commit v84 migration", e))?;
+        tracing::info!(
+            target: TRACE_TARGET,
+            "schema migration v84 applied (#2167: embedding_space provenance \
+             column on memories + archived_memories)"
         );
         Ok(())
     }
