@@ -115,12 +115,22 @@ async fn store_with_embedding_then_update_embedding_roundtrip() {
     assert_eq!(returned, id);
     // update_embedding clears + resets the vector.
     store
-        .update_embedding(&ctx, &id, None)
+        .update_embedding(
+            &ctx,
+            &id,
+            None,
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
         .await
         .expect("clear embedding");
     let vec2: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.002).collect();
     store
-        .update_embedding(&ctx, &id, Some(&vec2))
+        .update_embedding(
+            &ctx,
+            &id,
+            Some(&vec2),
+            &ai_memory::embeddings::EmbeddingSpace::mint("test-space"),
+        )
         .await
         .expect("reset embedding");
     let got = store.get(&ctx, &id).await.expect("get");
