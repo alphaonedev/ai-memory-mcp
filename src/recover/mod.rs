@@ -543,13 +543,23 @@ pub async fn recover_from_transcript_store(
         .ok()
         .flatten();
     report.elapsed_ms_dedup_query = timer.phase_lap();
-    if let (Some(mtime), Some(w)) = (mtime, watermark.as_deref()) {
-        if let Ok(wdt) = chrono::DateTime::parse_from_rfc3339(w) {
-            let mtime_dt: chrono::DateTime<chrono::Utc> = mtime.into();
-            if mtime_dt <= wdt.with_timezone(&chrono::Utc) {
-                report.fast_path_hit = true;
-                report.elapsed_ms = timer.overall_ms();
-                return Ok(report);
+    // #2130 — mirror the sqlite twin's `bypass_fast_path` gate (recover_from_transcript,
+    // the #2126 fix): the L3 poll watcher opts out of the watermark short-circuit because
+    // it owns change-detection via its own `(mtime, len)` diff, so the watermark is
+    // redundant there and would silently strand a `pending_drain` tail once a same-agent
+    // wall-clock write pushed `MAX(created_at)` past the static file's mtime. Without this
+    // guard the SAL/pg twin still fast-path-skips under `bypass_fast_path = true`, re-opening
+    // the #2126 tail-loss on the postgres path (cross-backend parity). See
+    // [`RecoverOpts::bypass_fast_path`].
+    if !opts.bypass_fast_path {
+        if let (Some(mtime), Some(w)) = (mtime, watermark.as_deref()) {
+            if let Ok(wdt) = chrono::DateTime::parse_from_rfc3339(w) {
+                let mtime_dt: chrono::DateTime<chrono::Utc> = mtime.into();
+                if mtime_dt <= wdt.with_timezone(&chrono::Utc) {
+                    report.fast_path_hit = true;
+                    report.elapsed_ms = timer.overall_ms();
+                    return Ok(report);
+                }
             }
         }
     }
@@ -917,6 +927,75 @@ mod tests {
         assert_eq!(second.lines_atomised, 0);
         assert_eq!(second.lines_skipped_dedup, 2);
         assert!(second.memories_created.is_empty());
+    }
+
+    /// #2130 — the SAL/pg twin `recover_from_transcript_store` must honor
+    /// `RecoverOpts.bypass_fast_path` identically to the sqlite twin
+    /// `recover_from_transcript` (the #2126 fix). Without the guard the
+    /// store twin silently fast-path-skips a limit-tail when the L3 poll
+    /// watcher sets `bypass_fast_path = true`, re-opening the #2126
+    /// tail-loss on the postgres path. Exercised via `SqliteStore`: the
+    /// guard lives in the backend-blind `recover_from_transcript_store`,
+    /// so this covers the exact code path the postgres adapter also runs;
+    /// the live-`PostgresStore` path is covered by the CI postgres feature
+    /// gate (`AI_MEMORY_TEST_POSTGRES_URL`). Cross-backend parity fix.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn store_path_honors_bypass_fast_path_2130() {
+        use crate::models::{Memory, MemoryKind, Tier};
+        let dir = fresh_dir();
+        let db = dir.path().join("mem.db");
+        let transcript = write_transcript(dir.path(), &[USER_LINE_1]);
+        let store = crate::store::sqlite::SqliteStore::open(&db).expect("open store");
+
+        // Seed a memory for this agent with a far-future created_at so the
+        // watermark exceeds the transcript mtime (the fast-path trigger).
+        {
+            let conn = crate::storage::open(&db).unwrap();
+            let mem = Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: Tier::Long,
+                namespace: "test-recover".to_string(),
+                title: "watermark seed".to_string(),
+                content: "seed".to_string(),
+                priority: 5,
+                confidence: 1.0,
+                source: "test".to_string(),
+                metadata: serde_json::json!({"agent_id": "ai:test:2130"}),
+                created_at: "2999-01-01T00:00:00Z".to_string(),
+                updated_at: "2999-01-01T00:00:00Z".to_string(),
+                memory_kind: MemoryKind::Observation,
+                ..Memory::default()
+            };
+            crate::storage::insert(&conn, &mem).unwrap();
+        }
+
+        // Control: default opts (bypass_fast_path = false) → the watermark
+        // short-circuit fires and the tail is skipped (proves the seed is
+        // an effective fast-path trigger).
+        let mut opts = base_opts(transcript, "ai:test:2130");
+        let control = recover_from_transcript_store(&store, &opts).await.unwrap();
+        assert!(
+            control.fast_path_hit,
+            "control: expected fast-path short-circuit"
+        );
+        assert_eq!(control.lines_atomised, 0);
+
+        // Fix: bypass_fast_path = true → the watermark is IGNORED and the
+        // limit-tail is processed (no #2126-class tail-loss on the SAL/pg
+        // twin; parity with the sqlite twin's #2126 fix).
+        opts.bypass_fast_path = true;
+        let bypassed = recover_from_transcript_store(&store, &opts).await.unwrap();
+        assert!(
+            !bypassed.fast_path_hit,
+            "bypass_fast_path must skip the watermark short-circuit (#2130)"
+        );
+        assert_eq!(
+            bypassed.lines_atomised, 1,
+            "bypassed tail must be captured, not dropped: {:?}",
+            bypassed.errors
+        );
+        assert_eq!(bypassed.memories_created.len(), 1);
     }
 
     #[test]
