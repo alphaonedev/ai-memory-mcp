@@ -102,10 +102,10 @@ fn build_llm_router(llm_url: Option<&str>) -> (axum::Router, NamedTempFile, Db) 
     let store: Arc<dyn ai_memory::store::MemoryStore> =
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&db_path).expect("open SqliteStore"));
     let llm = match llm_url {
-        Some(u) => Arc::new(Some(
+        Some(u) => Arc::new(ai_memory::reload::SwappableLlm::new(Some(
             OllamaClient::new_with_url_no_health_check(u, "test-model").expect("llm"),
-        )),
-        None => Arc::new(None),
+        ))),
+        None => Arc::new(ai_memory::reload::SwappableLlm::new(None)),
     };
     let app_state = AppState {
         db: db.clone(),
