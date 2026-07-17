@@ -404,7 +404,7 @@ fn test_app_state(db: Db) -> AppState {
         storage_backend: StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store: test_sqlite_store_handle(),
-        llm: Arc::new(None),
+        llm: Arc::new(crate::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(
             crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS,
@@ -432,7 +432,9 @@ fn test_app_state(db: Db) -> AppState {
         // `tests/*_admin_gate_*.rs` files pin both postures.
         admin_agent_ids: Arc::new(vec!["*".to_string()]),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(crate::reload::Swappable::new(
+            crate::config::ResolvedModels::default(),
+        )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -1300,7 +1302,7 @@ async fn http_bulk_create_fans_out_with_federation() {
         storage_backend: StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store: test_sqlite_store_handle(),
-        llm: Arc::new(None),
+        llm: Arc::new(crate::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(
             crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS,
@@ -1316,7 +1318,9 @@ async fn http_bulk_create_fans_out_with_federation() {
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(crate::reload::Swappable::new(
+            crate::config::ResolvedModels::default(),
+        )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -10484,7 +10488,7 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         storage_backend: StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store: test_sqlite_store_handle(),
-        llm: Arc::new(None),
+        llm: Arc::new(crate::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(
             crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS,
@@ -10497,7 +10501,9 @@ fn h8d_app_state_with_fed(db: Db, peer_urls: Vec<String>, w: usize, timeout_ms: 
         deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(crate::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(crate::reload::Swappable::new(
+            crate::config::ResolvedModels::default(),
+        )),
         runtime: crate::runtime_context::RuntimeContext::global_arc(),
         max_page_size: crate::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),

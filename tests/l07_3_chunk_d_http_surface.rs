@@ -108,7 +108,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
     // default (bare X-Agent-Id on an UNAUTHENTICATED deployment -> 403)
     // is pinned by tests/admin_header_trust_1570.rs in its own process.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    build_router_fixture_with_llm(Arc::new(None))
+    build_router_fixture_with_llm(Arc::new(ai_memory::reload::SwappableLlm::new(None)))
 }
 
 /// #1445 — variant injecting a (mock-backed) LLM so the success-path
@@ -116,7 +116,7 @@ fn build_router_fixture() -> (axum::Router, NamedTempFile) {
 /// can be pinned for three-surface envelope parity. The default
 /// [`build_router_fixture`] delegates here with `Arc::new(None)`.
 fn build_router_fixture_with_llm(
-    llm: Arc<Option<ai_memory::llm::OllamaClient>>,
+    llm: Arc<ai_memory::reload::SwappableLlm>,
 ) -> (axum::Router, NamedTempFile) {
     permissive_attestation_for_tests();
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
@@ -181,7 +181,9 @@ fn build_router_fixture_with_llm(
         // admin-gated GETs via [`get_uri_as_admin`].
         admin_agent_ids: Arc::new(vec![TEST_ADMIN_ID.to_string()]),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -242,7 +244,7 @@ fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
         storage_backend: ai_memory::handlers::StorageBackend::Sqlite,
         #[cfg(feature = "sal")]
         store,
-        llm: Arc::new(None),
+        llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
         auto_tag_model: Arc::new(None),
         llm_call_timeout: std::time::Duration::from_secs(30),
         replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::default()),
@@ -256,7 +258,9 @@ fn build_router_fixture_no_admin() -> (axum::Router, NamedTempFile) {
         // Empty allowlist — the v0.7.0 safe-by-default posture.
         admin_agent_ids: Arc::new(Vec::new()),
         rule_cache: std::sync::Arc::new(ai_memory::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(ai_memory::config::ResolvedModels::default()),
+        resolved_models: std::sync::Arc::new(ai_memory::reload::Swappable::new(
+            ai_memory::config::ResolvedModels::default(),
+        )),
         runtime: ai_memory::runtime_context::RuntimeContext::global_arc(),
         max_page_size: ai_memory::handlers::MAX_BULK_SIZE,
         enrolled_agent_keys: std::sync::Arc::new(std::collections::HashMap::new()),
@@ -1144,7 +1148,8 @@ async fn http_expand_query_success_envelope_uses_expanded_terms_key() {
     let client =
         ai_memory::llm::OllamaClient::new_with_url_no_health_check(&server.uri(), "test-model")
             .expect("construct mock LLM client");
-    let (router, _f) = build_router_fixture_with_llm(Arc::new(Some(client)));
+    let (router, _f) =
+        build_router_fixture_with_llm(Arc::new(ai_memory::reload::SwappableLlm::new(Some(client))));
 
     let (status, payload) = post_json(
         &router,
